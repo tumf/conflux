@@ -29,6 +29,8 @@ use tracing::{debug, error, info, warn};
 pub(super) struct QueueReconciliationOutcome {
     pub queued_added: usize,
     pub repair_added: usize,
+    /// Scheduler-local candidates dropped because reducer intent revoked them.
+    pub revoked_removed: usize,
 }
 
 fn analysis_attempt_id(
@@ -59,6 +61,16 @@ impl QueueReconciliationOutcome {
     pub fn has_repair_additions(self) -> bool {
         self.repair_added > 0
     }
+}
+
+/// Outcome of validating one dynamic queue wake-up hint against reducer intent.
+///
+/// The refusal carries the diagnostic reason and operator-facing log line so the
+/// ingestion loop keeps a single skip path and every refusal is observable.
+#[derive(Debug)]
+enum DynamicQueueAdmission {
+    Admit,
+    Refuse { reason: &'static str, log: String },
 }
 
 #[cfg(test)]
@@ -683,6 +695,19 @@ impl ParallelExecutor {
                 info!(
                     change_id = %change_id,
                     "Skipping ordinary apply dispatch because terminal error requires explicit retry"
+                );
+                continue;
+            }
+
+            // The analysis order is computed from the scheduler-local candidate
+            // list, so a candidate whose queue intent was revoked after it was
+            // added can still appear here whenever some *other* candidate keeps
+            // analysis running. Current reducer intent decides, exactly as it
+            // does in `classify_queued_work`.
+            if dependency_context.withholds_ordinary_queue_intent(change_id) {
+                info!(
+                    change_id = %change_id,
+                    "Skipping ordinary apply dispatch because current reducer intent does not admit ordinary work"
                 );
                 continue;
             }
@@ -1835,6 +1860,64 @@ impl ParallelExecutor {
         let _ = self.retry_deferred_rejection_review_for(change_id).await;
     }
 
+    /// Decide whether one dynamic queue hint may become scheduler-local work.
+    ///
+    /// A dynamic entry is a wake-up hint, never eligibility truth. Every accepted
+    /// path into ordinary work records reducer intent *before* the hint is
+    /// published (`add_to_queue` applies `AddToQueue`/`RetryError` first, start
+    /// queues its resolved targets first), so the reducer is the only authority
+    /// here and this check must fail closed:
+    ///
+    /// - no reducer wired, or a reducer snapshot that cannot be read right now,
+    ///   means eligibility is unproven, so the hint is refused rather than
+    ///   admitted from the catalog;
+    /// - a reducer-unknown ID carries no intent at all;
+    /// - `DequeueChange` does not drain the queue, so a stop-and-dequeue can
+    ///   leave a revoked ID sitting in it.
+    ///
+    /// Refusing costs at most one wake-up: `reconcile_queued_candidates_from_shared_state`
+    /// runs on the same scheduler pass and re-adds every genuinely reducer-queued
+    /// ID from `queued_change_ids()`, so intent that really exists is never lost.
+    fn admit_dynamic_queue_hint(&self, dynamic_id: &str) -> DynamicQueueAdmission {
+        let Some(shared) = &self.shared_orchestrator_state else {
+            return DynamicQueueAdmission::Refuse {
+                reason: "reducer_state_absent",
+                log: format!(
+                    "Ignoring queue entry with no reducer to authorize it: {}",
+                    dynamic_id
+                ),
+            };
+        };
+        let Ok(guard) = shared.try_read() else {
+            return DynamicQueueAdmission::Refuse {
+                reason: "reducer_state_unreadable",
+                log: format!(
+                    "Deferring queue entry until reducer queue intent is readable: {}",
+                    dynamic_id
+                ),
+            };
+        };
+        if guard.is_final_terminal_dispatch_stop(dynamic_id) {
+            return DynamicQueueAdmission::Refuse {
+                reason: "final_terminal",
+                log: format!(
+                    "Ignoring stale queue entry for final terminal change: {}",
+                    dynamic_id
+                ),
+            };
+        }
+        if !guard.is_ordinary_queue_eligible(dynamic_id) {
+            return DynamicQueueAdmission::Refuse {
+                reason: "no_current_queue_intent",
+                log: format!(
+                    "Ignoring stale queue entry without current queue intent: {}",
+                    dynamic_id
+                ),
+            };
+        }
+        DynamicQueueAdmission::Admit
+    }
+
     /// Check dynamic queue for newly added changes and update queued list.
     ///
     /// # Arguments
@@ -1854,25 +1937,18 @@ impl ParallelExecutor {
             let mut queue_changed = false;
             while let Some(dynamic_id) = queue.pop().await {
                 if !queued.iter().any(|c| c.id == dynamic_id) && !in_flight.contains(&dynamic_id) {
-                    if let Some(shared) = &self.shared_orchestrator_state {
-                        if let Ok(guard) = shared.try_read() {
-                            if guard.is_final_terminal_dispatch_stop(&dynamic_id) {
-                                info!(
-                                    change_id = %dynamic_id,
-                                    "Skipping dynamic queue ingestion because change is in a final terminal state"
-                                );
-                                drop(guard);
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::Log(LogEntry::info(format!(
-                                        "Ignoring stale queue entry for final terminal change: {}",
-                                        dynamic_id
-                                    ))),
-                                )
-                                .await;
-                                continue;
-                            }
-                        }
+                    // Reducer-owned intent is validated for every hint, before
+                    // the catalog is consulted at all.
+                    if let DynamicQueueAdmission::Refuse { reason, log } =
+                        self.admit_dynamic_queue_hint(&dynamic_id)
+                    {
+                        info!(
+                            change_id = %dynamic_id,
+                            reason,
+                            "Skipping dynamic queue ingestion because reducer-owned queue intent does not admit it"
+                        );
+                        send_event(&self.event_tx, ParallelEvent::Log(LogEntry::info(log))).await;
+                        continue;
                     }
 
                     match crate::openspec::list_changes_native_from(&self.repo_root) {
@@ -1997,40 +2073,13 @@ impl ParallelExecutor {
         send_event(&self.event_tx, ParallelEvent::Log(message)).await;
     }
 
-    pub(super) async fn reconcile_queued_candidates_from_shared_state(
-        &mut self,
-        queued: &mut Vec<crate::openspec::Change>,
-        in_flight: &HashSet<String>,
-    ) -> QueueReconciliationOutcome {
-        let Some(shared_state) = &self.shared_orchestrator_state else {
-            return QueueReconciliationOutcome::default();
-        };
-
-        let (mut queued_intent_ids, active_ids_from_reducer, terminal_error_ids, merge_wait_ids) =
-            match shared_state.try_read() {
-                Ok(state) => {
-                    let terminal_error_ids = state
-                        .initial_change_ids()
-                        .iter()
-                        .filter(|id| state.is_terminal_error_change(id))
-                        .cloned()
-                        .collect::<std::collections::HashSet<_>>();
-                    (
-                        state.queued_change_ids(),
-                        state.active_change_ids(),
-                        terminal_error_ids,
-                        state.merge_wait_change_ids(),
-                    )
-                }
-                Err(_) => return QueueReconciliationOutcome::default(),
-            };
-
-        let reducer_active_set: std::collections::HashSet<String> =
-            active_ids_from_reducer.into_iter().collect();
-        let reducer_merge_wait_set: std::collections::HashSet<String> =
-            merge_wait_ids.into_iter().collect();
-
-        let base_branch_for_archived_dirty_scan = match self
+    /// Base branch used to prove archived-dirty repair evidence for one
+    /// already-eligible change.
+    ///
+    /// Returns `None` when the base branch cannot be read; the caller then
+    /// leaves the change unresolved instead of guessing a resume phase.
+    async fn resolve_archived_dirty_repair_base_branch(&self) -> Option<String> {
+        match self
             .workspace_manager
             .ensure_original_branch_initialized()
             .await
@@ -2044,100 +2093,120 @@ impl ParallelExecutor {
                 send_event(
                     &self.event_tx,
                     ParallelEvent::Log(LogEntry::warn(format!(
-                        "Queue reconciliation skipped archived-dirty worktree scan: failed_to_determine_base_branch ({})",
+                        "Queue reconciliation skipped archived-dirty repair evidence: failed_to_determine_base_branch ({})",
                         error
                     ))),
                 )
                 .await;
                 None
             }
+        }
+    }
+
+    pub(super) async fn reconcile_queued_candidates_from_shared_state(
+        &mut self,
+        queued: &mut Vec<crate::openspec::Change>,
+        in_flight: &HashSet<String>,
+    ) -> QueueReconciliationOutcome {
+        let Some(shared_state) = &self.shared_orchestrator_state else {
+            return QueueReconciliationOutcome::default();
         };
 
-        match self.workspace_manager.list_worktree_change_ids().await {
-            Ok(worktree_change_ids) => {
-                for worktree_change_id in worktree_change_ids {
-                    if terminal_error_ids.contains(&worktree_change_id) {
-                        self.emit_queue_reconciliation_diagnostic(
-                            QueueReconciliationDiagnosticLevel::Info,
-                            &worktree_change_id,
-                            "terminal_error_retry_required",
-                        )
-                        .await;
-                        continue;
-                    }
-                    if reducer_merge_wait_set.contains(&worktree_change_id) {
-                        self.emit_queue_reconciliation_diagnostic(
-                            QueueReconciliationDiagnosticLevel::Info,
-                            &worktree_change_id,
-                            "manual_merge_wait",
-                        )
-                        .await;
-                        continue;
-                    }
-                    if queued_intent_ids.iter().any(|id| id == &worktree_change_id)
-                        || in_flight.contains(&worktree_change_id)
-                        || reducer_active_set.contains(&worktree_change_id)
-                        || Self::is_post_archive_merge_active_for(&worktree_change_id)
-                    {
-                        continue;
-                    }
+        // A terminal error is not filtered here: `queued_change_ids()` already
+        // excludes every terminal state, so a terminal-error change carries no
+        // ordinary queue intent until `RetryError` clears it. The terminal-error
+        // stop gate itself stays where it can still be reached, in dispatch
+        // selection.
+        let (
+            queued_intent_ids,
+            active_ids_from_reducer,
+            merge_wait_ids,
+            lane_wait_ids,
+            revoked_local_ids,
+        ) = match shared_state.try_read() {
+            Ok(state) => (
+                state.queued_change_ids(),
+                state.active_change_ids(),
+                state.merge_wait_change_ids(),
+                state
+                    .resolve_wait_change_ids()
+                    .into_iter()
+                    .chain(state.reject_wait_change_ids())
+                    .collect::<std::collections::HashSet<String>>(),
+                queued
+                    .iter()
+                    .filter(|change| !state.is_ordinary_queue_eligible(&change.id))
+                    .map(|change| change.id.clone())
+                    .collect::<Vec<String>>(),
+            ),
+            Err(_) => return QueueReconciliationOutcome::default(),
+        };
 
-                    let archived_dirty = if let Some(base_branch) =
-                        &base_branch_for_archived_dirty_scan
-                    {
-                        match self
-                            .workspace_manager
-                            .find_existing_workspace(&worktree_change_id)
-                            .await
-                        {
-                            Ok(Some(workspace)) => archived_dirty_repair_candidate_from_workspace(
-                                &worktree_change_id,
-                                &workspace.path,
-                                base_branch,
-                            )
-                            .await
-                            .is_some(),
-                            Ok(None) => false,
-                            Err(error) => {
-                                warn!(
-                                    change_id = %worktree_change_id,
-                                    "Failed to find workspace during archived dirty queue reconciliation: {}",
-                                    error
-                                );
-                                false
-                            }
-                        }
-                    } else {
-                        false
-                    };
+        let reducer_active_set: std::collections::HashSet<String> =
+            active_ids_from_reducer.into_iter().collect();
+        let reducer_merge_wait_set: std::collections::HashSet<String> =
+            merge_wait_ids.into_iter().collect();
 
-                    if archived_dirty {
-                        info!(
-                            change_id = %worktree_change_id,
-                            "Queue reconciliation discovered archived dirty workspace without reducer queued intent"
-                        );
-                        queued_intent_ids.push(worktree_change_id);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to list worktree change ids during archived dirty queue reconciliation: {}",
-                    e
+        let mut outcome = QueueReconciliationOutcome::default();
+
+        // Reconciliation runs in both directions. Revoked work must leave the
+        // scheduler-local candidate list, not merely be refused at dispatch:
+        // `RemoveFromQueue` and `DequeueChange` clear intent without touching
+        // this list, so a candidate admitted on an earlier pass would otherwise
+        // keep being analysed and keep an otherwise drained run alive. Anything
+        // the reducer or the scheduler still owns as waiting work is kept —
+        // merge, resolve, and reject lanes are reducer-owned intent of their
+        // own, and an in-flight change is already running. A later explicit
+        // `AddToQueue` re-adds the change from `queued_change_ids()` below, so
+        // dropping it here loses nothing an operator asked for.
+        let revoked_local_ids: Vec<String> = revoked_local_ids
+            .into_iter()
+            .filter(|change_id| {
+                !in_flight.contains(change_id)
+                    && !reducer_active_set.contains(change_id)
+                    && !reducer_merge_wait_set.contains(change_id)
+                    && !lane_wait_ids.contains(change_id)
+                    && !self.merge_wait_changes.contains(change_id)
+                    && !self.resolve_wait_changes.contains(change_id)
+                    && !self.reject_wait_changes.contains(change_id)
+            })
+            .collect();
+        if !revoked_local_ids.is_empty() {
+            let revoked: std::collections::HashSet<&String> = revoked_local_ids.iter().collect();
+            queued.retain(|change| !revoked.contains(&change.id));
+            outcome.revoked_removed = revoked_local_ids.len();
+            for change_id in &revoked_local_ids {
+                info!(
+                    change_id = %change_id,
+                    "Queue reconciliation dropped candidate because reducer queue intent was revoked"
                 );
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::Log(LogEntry::warn(format!(
-                        "Queue reconciliation skipped archived-dirty worktree scan: failed_to_list_worktrees ({})",
-                        e
-                    ))),
+                self.emit_queue_reconciliation_diagnostic(
+                    QueueReconciliationDiagnosticLevel::Info,
+                    change_id,
+                    "queue_intent_revoked",
                 )
                 .await;
             }
         }
 
+        // Ordinary execution intent is explicit, never discovered.
+        //
+        // `queued_intent_ids` is the *only* source of ordinary candidates here.
+        // It carries every explicit path: TUI and remote Start apply
+        // `AddToQueue` for their resolved targets before dispatch, Running-mode
+        // queue additions and `RetryError` set the same reducer intent, and CLI
+        // explicit targets are classified into the initial candidate vector
+        // before this function ever runs. `RemoveFromQueue` and `DequeueChange`
+        // drop an ID from this list on the very next pass, which is what makes
+        // revocation immediate.
+        //
+        // Repository-wide worktree enumeration deliberately does not happen:
+        // an archived-dirty worktree is recoverable *evidence*, not an operator
+        // command, and appending it here turned an unselected interrupted
+        // workspace into implicit execution intent. Preserved workspaces are
+        // still inspected below, but only for an ID that is already eligible.
         if queued_intent_ids.is_empty() {
-            return QueueReconciliationOutcome::default();
+            return outcome;
         }
 
         let mut known_changes = match crate::openspec::list_changes_native_from(&self.repo_root) {
@@ -2155,7 +2224,7 @@ impl ParallelExecutor {
                     ))),
                 )
                 .await;
-                return QueueReconciliationOutcome::default();
+                return outcome;
             }
         };
 
@@ -2165,18 +2234,16 @@ impl ParallelExecutor {
                 .map(|change| (change.id.clone(), change))
                 .collect();
 
-        let mut outcome = QueueReconciliationOutcome::default();
+        // Resolved on first use only. Without a repository-wide scan the base
+        // branch is needed only when an already-eligible ID is missing from the
+        // active catalog, so an ordinary reconciliation pass no longer pays for
+        // it at all.
+        let mut base_branch_for_archived_dirty_repair: Option<Option<String>> = None;
 
         for queued_id in queued_intent_ids {
-            if terminal_error_ids.contains(&queued_id) {
-                self.emit_queue_reconciliation_diagnostic(
-                    QueueReconciliationDiagnosticLevel::Info,
-                    &queued_id,
-                    "terminal_error_retry_required",
-                )
-                .await;
-                continue;
-            }
+            // Manual merge wait survives explicit queue intent: a resolve failure
+            // restores `MergeWait` without clearing it, so an explicitly queued
+            // change can sit here waiting for an accepted `ResolveMerge`.
             if reducer_merge_wait_set.contains(&queued_id) {
                 self.emit_queue_reconciliation_diagnostic(
                     QueueReconciliationDiagnosticLevel::Info,
@@ -2218,8 +2285,14 @@ impl ParallelExecutor {
                     outcome.queued_added += 1;
                 }
                 None => {
+                    if base_branch_for_archived_dirty_repair.is_none() {
+                        base_branch_for_archived_dirty_repair =
+                            Some(self.resolve_archived_dirty_repair_base_branch().await);
+                    }
                     let archived_dirty_candidate = if let Some(base_branch) =
-                        &base_branch_for_archived_dirty_scan
+                        base_branch_for_archived_dirty_repair
+                            .as_ref()
+                            .and_then(|branch| branch.as_ref())
                     {
                         match self
                             .workspace_manager
@@ -2324,6 +2397,10 @@ impl ParallelExecutor {
         // the reducer holds neither, the change is dispatched again, and
         // workspace evidence routes a complete unarchived apply revision back to
         // acceptance.
+        let reducer_snapshot = self
+            .shared_orchestrator_state
+            .as_ref()
+            .map(|state| state.try_read().ok());
         let (
             reducer_queued,
             merge_wait_ids,
@@ -2331,21 +2408,35 @@ impl ParallelExecutor {
             reject_wait_ids,
             acceptance_stalled,
             externally_blocked,
-        ) = self
-            .shared_orchestrator_state
-            .as_ref()
-            .and_then(|state| state.try_read().ok())
-            .map(|state| {
-                (
-                    state.queued_change_ids(),
-                    state.merge_wait_change_ids(),
-                    state.resolve_wait_change_ids(),
-                    state.reject_wait_change_ids(),
-                    state.acceptance_stalled_change_ids(),
-                    state.externally_blocked_change_ids(),
-                )
-            })
-            .unwrap_or_default();
+        ) = match reducer_snapshot {
+            Some(Some(state)) => (
+                state.queued_change_ids(),
+                state.merge_wait_change_ids(),
+                state.resolve_wait_change_ids(),
+                state.reject_wait_change_ids(),
+                state.acceptance_stalled_change_ids(),
+                state.externally_blocked_change_ids(),
+            ),
+            // A reducer that exists but cannot be read right now must fail
+            // closed. Falling through with empty wait sets would read as "no
+            // change is waiting" and could classify a `MergeWait`, lane-wait, or
+            // held candidate as dispatchable purely because of lock contention.
+            // Every candidate is instead reported as waiting-but-unavailable, so
+            // this pass dispatches nothing and the next pass reclassifies from a
+            // readable snapshot.
+            Some(None) => {
+                debug!(
+                    queued = queued.len(),
+                    "Deferring queue classification because reducer state is not readable"
+                );
+                classification.candidate_unavailable =
+                    queued.iter().map(|change| change.id.clone()).collect();
+                return classification;
+            }
+            // No reducer is wired at all: there is no reducer-owned wait state to
+            // consult, so scheduler-local candidates are classified on their own.
+            None => Default::default(),
+        };
         // An apply-origin external blocker suppresses dispatch exactly like an
         // acceptance-origin one; only the explanation differs.
         let held: HashSet<String> = acceptance_stalled
@@ -2380,6 +2471,22 @@ impl ParallelExecutor {
                 classification
                     .terminal_error_retry_required
                     .push(change.id.clone());
+                continue;
+            }
+            // Ordinary dispatch requires *current* reducer intent. Sitting in the
+            // scheduler-local candidate list only proves the change was admitted
+            // on an earlier pass: `RemoveFromQueue` and `DequeueChange` revoke
+            // intent without touching that list, so a candidate added before the
+            // revocation would otherwise stay dispatchable for the rest of the
+            // run. Reducer-owned lane waits are classified above, so this gate
+            // removes ordinary eligibility only, and an explicit `AddToQueue`
+            // restores it on the very next pass.
+            if dependency_context.withholds_ordinary_queue_intent(&change.id) {
+                debug!(
+                    change_id = %change.id,
+                    "Withholding queued candidate because current reducer intent does not admit ordinary work"
+                );
+                classification.candidate_unavailable.push(change.id.clone());
                 continue;
             }
             if self.failed_tracker.should_skip(&change.id).is_some() {

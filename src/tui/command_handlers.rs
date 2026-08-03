@@ -952,6 +952,64 @@ mod tests {
         );
     }
 
+    /// The TUI adapter's queue commands are the same explicit-intent boundary
+    /// the scheduler reads. Queue add makes a change ordinarily eligible; queue
+    /// remove and stop-and-dequeue revoke it until an explicit requeue.
+    #[tokio::test]
+    async fn tui_queue_commands_drive_the_scheduler_eligibility_boundary() {
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+
+        assert!(
+            !harness
+                .state
+                .read()
+                .await
+                .is_ordinary_queue_eligible("change-a"),
+            "a visible but unqueued change is not ordinarily eligible"
+        );
+
+        harness
+            .run(&mut app, TuiCommand::AddToQueue("change-a".to_string()))
+            .await;
+        assert!(harness
+            .state
+            .read()
+            .await
+            .is_ordinary_queue_eligible("change-a"));
+
+        harness
+            .run(
+                &mut app,
+                TuiCommand::RemoveFromQueue("change-a".to_string()),
+            )
+            .await;
+        assert!(
+            !harness
+                .state
+                .read()
+                .await
+                .is_ordinary_queue_eligible("change-a"),
+            "queue removal revokes scheduler eligibility immediately"
+        );
+        assert!(
+            !harness.queue.contains("change-a").await,
+            "the dynamic wake-up hint is withdrawn with the intent"
+        );
+
+        harness
+            .run(&mut app, TuiCommand::AddToQueue("change-a".to_string()))
+            .await;
+        assert!(
+            harness
+                .state
+                .read()
+                .await
+                .is_ordinary_queue_eligible("change-a"),
+            "explicit requeue restores scheduler eligibility"
+        );
+    }
+
     // ── Stop-and-dequeue ────────────────────────────────────────────────────
 
     async fn wait_for_status(state: &Arc<RwLock<OrchestratorState>>, id: &str, expected: &str) {

@@ -1404,51 +1404,42 @@ Parallel post-archive status updates SHALL be idempotent and monotonic with resp
 
 ### Requirement: Archived dirty workspaces remain scheduler-recoverable after archive finalization failure
 
-When a parallel workspace has already moved a change into `openspec/changes/archive/` but the archive commit is still incomplete, the runtime SHALL treat that state as recoverable scheduler-owned work rather than as permanently terminal solely because a prior run emitted an archive failure.
+When a parallel workspace has already moved a change into `openspec/changes/archive/` but archive commit finalization remains incomplete, repository evidence SHALL continue to classify that workspace as recoverable rather than permanently terminal solely because an earlier attempt failed. Workspace file state, Git state, and base-tree comparison remain authoritative for the resume phase, and no durable external resume state is required.
 
-Recovery decisions SHALL be derived from repository-visible workspace state, including active change path absence, archive path presence, incomplete archive commit verification, and current git state. The system MUST NOT require durable external resume state to rediscover the workspace.
+Recoverable evidence alone MUST NOT create current-process operator intent. The scheduler SHALL re-own archived-dirty repair on a later cycle or restarted run only after the change is an explicit invocation target, has current reducer `QueueIntent::Queued`, or has applicable reducer-owned `ResolveWait` or `RejectWait` lane intent. An unrequested archived-dirty workspace MUST NOT prevent an otherwise drained run from becoming idle or complete.
 
-The scheduler SHALL be able to re-own and resume archive finalization repair for such an archived dirty workspace on a later cycle or restarted run, unless the bounded recovery policy has been exhausted for the current attempted repair path and the workspace is explicitly classified as terminal.
+#### Scenario: Restart preserves recoverability without automatic execution
 
-#### Scenario: archived dirty workspace is reclaimed on later scheduler cycle
+**Given**: `alpha` is archived-dirty and not merged in its preserved workspace
+**When**: Conflux restarts with no execution marks, queue intent, or lane-wait intent for `alpha`
+**Then**: Workspace evidence still classifies `alpha` as recoverable
+**And**: The scheduler does not execute or mutate `alpha`
+**And**: An otherwise drained run may remain idle or complete
 
-- **GIVEN** change `alpha` has been moved to `openspec/changes/archive/2026-05-08-alpha/` in its workspace
-- **AND** `openspec/changes/alpha/` no longer exists in that workspace
-- **AND** the workspace still lacks a complete `Archive: alpha` commit
-- **WHEN** a later scheduler cycle inspects repository-visible workspace state
-- **THEN** Conflux reclaims `alpha` as archive-finalization recovery work
-- **AND** the scheduler does not remain idle while that recoverable work exists
+#### Scenario: Explicit intent reclaims archived-dirty workspace
 
-#### Scenario: archived dirty recovery does not require full archive command rerun
+**Given**: `alpha` is archived-dirty and not merged
+**And**: A new invocation explicitly targets `alpha` or accepted reducer queue intent exists for `alpha`
+**When**: The scheduler resolves eligible work
+**Then**: It reclaims `alpha` as archive-finalization recovery work
+**And**: It derives the resumed phase from current repository evidence
+**And**: It does not require durable external resume state
 
-- **GIVEN** archive file movement for `alpha` is already correct
-- **AND** only archive commit finalization remains incomplete
-- **WHEN** Conflux resumes recovery for `alpha`
-- **THEN** it resumes archive finalization repair rather than re-running the full archive command unnecessarily
-- **AND** it still verifies that archive file-state has not regressed
+#### Scenario: Archived dirty recovery does not require full archive command rerun
 
-#### Scenario: archive move regression re-enters full archive path
+**Given**: Archive file movement for `alpha` is already correct
+**And**: Only archive commit finalization remains incomplete
+**And**: `alpha` has current explicit execution intent
+**When**: Conflux resumes recovery for `alpha`
+**Then**: It resumes archive finalization repair rather than rerunning the full archive command unnecessarily
+**And**: It verifies that archive file state has not regressed
 
-- **GIVEN** a previously archived dirty workspace for `alpha`
-- **AND** later inspection shows the archive entry is missing or the active change directory has reappeared
-- **WHEN** Conflux evaluates recovery
-- **THEN** it does not treat the workspace as archive-finalization-only recovery
-- **AND** it may require the broader archive path again based on current file state
+#### Scenario: Revoked intent leaves recoverable evidence untouched
 
-#### Scenario: archived dirty state is distinct from terminal archive failure
-
-- **GIVEN** a run previously emitted `Archive commit verification failed` for `alpha`
-- **AND** the workspace still shows archive files present and commit incomplete
-- **WHEN** Conflux derives current runtime state from the workspace
-- **THEN** it exposes a recoverable archived-dirty/archive-finalization-needed state instead of only terminal archive failure
-- **AND** user-visible events/logs distinguish that recoverable state from exhausted terminal failure
-
-#### Scenario: exhausted archive-finalization recovery becomes terminal
-
-- **GIVEN** archived dirty recovery for `alpha` has exhausted its bounded retry policy
-- **WHEN** Conflux reports the final outcome
-- **THEN** it MAY emit a terminal archive failure
-- **AND** the reported blocker identifies the final archive-finalization reason rather than implying the archive move itself never happened
+**Given**: `alpha` remains archived-dirty after its ordinary queue intent is removed or dequeued
+**When**: A later scheduler cycle sees its preserved worktree
+**Then**: The workspace remains recoverable evidence
+**And**: It is not re-owned as execution work until explicit intent is supplied again
 
 ### Requirement: Stalled blocker metadata
 
