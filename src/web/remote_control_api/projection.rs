@@ -18,8 +18,8 @@ use tokio::sync::broadcast;
 
 use crate::events::{ExecutionEvent, LogEntry};
 use crate::orchestration::operator_command::{
-    classify_mark_route, classify_retry_route, is_active_status, is_final_status, MarkRoute,
-    OperatorMode, RetryRoute,
+    classify_mark_route, classify_retry_route, is_active_status, is_final_status, MarkExclusion,
+    MarkRoute, OperatorMode, RetryRoute,
 };
 use crate::orchestration::state::BlockerKind;
 use crate::web::state::OrchestratorStateSnapshot;
@@ -442,7 +442,13 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
                 .unwrap_or_else(|| "not queued".to_string());
             ChangeResource {
                 id: change.id.clone(),
-                actions: classify_actions(mode, &display_status, change.blocker.as_ref()),
+                actions: classify_actions(
+                    mode,
+                    &display_status,
+                    change.blocker.as_ref(),
+                    source.parallel.mode.is_parallel(),
+                    change.parallel.eligible,
+                ),
                 display_status,
                 progress_status: change.status.clone(),
                 completed_tasks: change.completed_tasks,
@@ -467,6 +473,7 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
         app_mode: source.app_mode.clone(),
         is_resolving: source.is_resolving,
         process_error: source.process_error.clone(),
+        parallel: source.parallel.clone(),
         totals: SnapshotTotals {
             total: changes.len(),
             completed: source.completed_changes,
@@ -490,10 +497,18 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
 /// where that matters: the reducer would also accept it for an idle non-terminal
 /// change, but advertising "resolve" on a change that is not waiting on a merge
 /// describes an operation nobody asked for.
+///
+/// `parallel_mode` and `parallel_eligible` gate the mark actions the same way
+/// [`crate::orchestration::operator_command::classify_bulk_mark_row`] gates a
+/// bulk mutation: a row parallel mode would refuse to start must not be
+/// advertised as markable, or a client would mark it and then watch start
+/// refuse the whole set.
 fn classify_actions(
     mode: OperatorMode,
     display_status: &str,
     blocker: Option<&ChangeBlocker>,
+    parallel_mode: bool,
+    parallel_eligible: bool,
 ) -> ChangeActions {
     let final_status = is_final_status(display_status);
     let route = classify_mark_route(mode, display_status);
@@ -506,13 +521,22 @@ fn classify_actions(
         ActionBlockedReason::StatusImmutable
     };
 
+    // Precedence matches `classify_bulk_mark_row`: a final status is reported as
+    // final rather than as a parallel problem, because committing the change
+    // would not make it markable again.
+    let parallel_blocked = parallel_mode && !parallel_eligible && !final_status;
+    let parallel_reason =
+        ActionBlockedReason::from_mark_exclusion(MarkExclusion::ParallelIneligible);
+
     let set_execution_mark = match route {
+        _ if parallel_blocked => ActionEligibility::blocked(parallel_reason),
         MarkRoute::MarkOnly | MarkRoute::QueueIntent => ActionEligibility::allowed(),
         MarkRoute::RetryRequired => ActionEligibility::blocked(ActionBlockedReason::RetryRequired),
         MarkRoute::Immutable => ActionEligibility::blocked(immutable_reason),
     };
 
     let set_queue_intent = match route {
+        _ if parallel_blocked => ActionEligibility::blocked(parallel_reason),
         MarkRoute::QueueIntent => ActionEligibility::allowed(),
         // Select and Stopped have no runtime queue to mutate; a base-lane wait in
         // Running has one but refuses membership changes.
@@ -554,7 +578,8 @@ fn classify_actions(
     }
 }
 
-/// Action eligibility for an `app_mode`/status pair, for tests and fixtures.
+/// Action eligibility for an `app_mode`/status pair in sequential mode, for
+/// tests and fixtures.
 #[cfg(test)]
 pub fn change_actions_for_test(
     app_mode: &str,
@@ -565,6 +590,24 @@ pub fn change_actions_for_test(
         OperatorMode::from_app_mode(app_mode),
         display_status,
         blocker,
+        false,
+        true,
+    )
+}
+
+/// Action eligibility for an `app_mode`/status pair in parallel mode.
+#[cfg(test)]
+pub fn parallel_change_actions_for_test(
+    app_mode: &str,
+    display_status: &str,
+    parallel_eligible: bool,
+) -> ChangeActions {
+    classify_actions(
+        OperatorMode::from_app_mode(app_mode),
+        display_status,
+        None,
+        true,
+        parallel_eligible,
     )
 }
 

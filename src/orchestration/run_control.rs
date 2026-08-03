@@ -23,7 +23,7 @@
 //! durable workflow evidence: a restart drops every reservation and the next
 //! action is recomputed from the workspace alone.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -373,59 +373,12 @@ impl ResolveReservations {
 /// Process-local publication of start-time target eligibility.
 ///
 /// Parallel-mode eligibility is derived from workspace observation that only the
-/// frontend running the refresh loop performs. Publishing it here is what lets
-/// the shared service apply one guard to every frontend instead of letting each
-/// one re-derive it. Remote mutation of the parallel toggle is owned by
-/// `add-remote-parallel-control` and is deliberately not exposed here.
-#[derive(Debug, Default)]
-pub struct StartEligibility {
-    inner: Mutex<StartEligibilityInner>,
-}
-
-#[derive(Debug, Default)]
-struct StartEligibilityInner {
-    parallel_mode: bool,
-    parallel_ineligible: HashSet<String>,
-}
-
-impl StartEligibility {
-    /// Create an empty projection (serial mode, nothing excluded).
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, StartEligibilityInner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Publish the current parallel toggle.
-    pub fn set_parallel_mode(&self, parallel_mode: bool) {
-        self.lock().parallel_mode = parallel_mode;
-    }
-
-    /// Publish the set of changes parallel mode refuses to start.
-    pub fn set_parallel_ineligible(&self, ids: impl IntoIterator<Item = String>) {
-        self.lock().parallel_ineligible = ids.into_iter().collect();
-    }
-
-    /// Targets that parallel mode refuses, in request order.
-    ///
-    /// Returns an empty vector in serial mode: parallel eligibility is not a
-    /// serial-mode constraint.
-    pub fn rejected(&self, targets: &[String]) -> Vec<String> {
-        let guard = self.lock();
-        if !guard.parallel_mode {
-            return Vec::new();
-        }
-        targets
-            .iter()
-            .filter(|id| guard.parallel_ineligible.contains(*id))
-            .cloned()
-            .collect()
-    }
-}
+/// frontend running the refresh loop performs. Publishing it in the shared
+/// [`ParallelRuntime`] is what lets the shared service apply one guard to every
+/// frontend instead of letting each one re-derive it — and it is the same store
+/// the operator command service mutates when a remote client or a keypress
+/// toggles parallel mode, so the guard can never read a toggle nobody set.
+pub use crate::orchestration::operator_command::ParallelRuntime as StartEligibility;
 
 // ============================================================================
 // Ports
@@ -564,6 +517,23 @@ impl RunControlService {
             });
         }
 
+        // The fence is applied to the *complete* marked set before anything is
+        // narrowed down, so parallel start is all-or-nothing: one ineligible
+        // target refuses the whole operation instead of quietly starting the
+        // eligible remainder, which is a target set the operator never asked
+        // for.
+        let rejected = self.eligibility.rejected(&marked);
+        if !rejected.is_empty() {
+            return Err(RunControlError::NoEligibleTarget {
+                command: RunCommandKind::Start,
+                detail: format!(
+                    "parallel mode requires committed changes with no uncommitted files; \
+                     ineligible marked targets: {}",
+                    rejected.join(", ")
+                ),
+            });
+        }
+
         let targets = self.start_targets().await;
         if targets.is_empty() {
             return Err(RunControlError::NoEligibleTarget {
@@ -571,17 +541,6 @@ impl RunControlService {
                 detail: format!(
                     "no marked change is startable ({} marked, none with status '{NOT_QUEUED_STATUS}')",
                     marked.len()
-                ),
-            });
-        }
-
-        let rejected = self.eligibility.rejected(&targets);
-        if !rejected.is_empty() {
-            return Err(RunControlError::NoEligibleTarget {
-                command: RunCommandKind::Start,
-                detail: format!(
-                    "parallel mode requires committed changes; uncommitted: {}",
-                    rejected.join(", ")
                 ),
             });
         }

@@ -15,9 +15,10 @@ use super::auth::CorrelationId;
 
 use super::dto::{
     ApiError, CapabilitiesResponse, CapabilityLimits, ChangeResponse, ChangesResponse, ErrorCode,
-    HealthResponse, InstanceResponse, LogsResponse, StateResponse, TransportDescriptor,
-    ALL_ERROR_CODES, API_VERSION, COMMAND_RECORD_TTL_SECS, MAX_COMMAND_RECORDS,
-    MAX_CORRELATION_ID_LEN, MAX_EVENTS, MAX_LOGS, SUPPORTED_COMMANDS,
+    HealthResponse, InstanceResponse, LogsResponse, ParallelCapabilities, StateResponse,
+    TransportDescriptor, ALL_ERROR_CODES, ALL_PARALLEL_BLOCKED_REASONS, API_VERSION,
+    COMMAND_RECORD_TTL_SECS, MAX_COMMAND_RECORDS, MAX_CORRELATION_ID_LEN, MAX_EVENTS, MAX_LOGS,
+    SUPPORTED_COMMANDS,
 };
 use super::worktrees::{WorktreeCapabilities, WorktreeResponse, WorktreesResponse};
 use super::RemoteControlState;
@@ -51,6 +52,10 @@ pub async fn health() -> Response {
     responses((status = 200, description = "Supported commands, transports, and limits", body = CapabilitiesResponse))
 )]
 pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
+    // Read from the published snapshot rather than from a second source: a
+    // client that compares capabilities with `/api/v2/state` must never see two
+    // different answers about whether parallel execution is available.
+    let parallel = state.projection.snapshot().0.parallel;
     no_store(CapabilitiesResponse {
         api_version: API_VERSION.to_string(),
         instance_id: state.projection.instance_id().to_string(),
@@ -86,6 +91,19 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
         },
         authentication_required: state.auth.is_enforced(),
         worktrees: WorktreeCapabilities::default(),
+        parallel: ParallelCapabilities {
+            available: parallel.available,
+            mode: parallel.mode,
+            max_concurrent: parallel.max_concurrent,
+            vcs_backend: parallel.vcs_backend,
+            blocked_reasons: ALL_PARALLEL_BLOCKED_REASONS
+                .iter()
+                .map(|reason| (*reason).to_string())
+                .collect(),
+            // The same two modes `set_parallel_mode` accepts, so a client can
+            // tell "not now" apart from "not supported" without probing.
+            toggle_modes: vec!["select".to_string(), "stopped".to_string()],
+        },
     })
 }
 
