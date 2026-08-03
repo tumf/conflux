@@ -3686,7 +3686,7 @@ impl ParallelExecutor {
 
     async fn before_dependency_analysis<F>(
         &mut self,
-        queued: &mut Vec<crate::openspec::Change>,
+        queued: &mut [crate::openspec::Change],
         in_flight: &HashSet<String>,
         max_parallelism: usize,
         iteration: u32,
