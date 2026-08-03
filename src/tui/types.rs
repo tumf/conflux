@@ -31,16 +31,21 @@ pub enum StopMode {
     ///
     /// The second Esc only enqueues the shared stop command. Whether the stop is
     /// truthfully a force stop is decided asynchronously from one runtime
-    /// activity snapshot, never from `AppMode::Stopping` alone.
+    /// activity snapshot, never from `AppExecutionMode::Stopping` alone.
     ImmediatePending,
     /// Force stop executed
     ForceStopped,
 }
 
-/// Application mode
-#[derive(Debug, Clone, PartialEq)]
-pub enum AppMode {
+/// Orchestration execution mode of the TUI.
+///
+/// This axis carries lifecycle state only. Transient overlays that own input and
+/// presentation live in [`ModalState`], so opening a popup can never replace,
+/// capture, or restore an execution transition that happened underneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppExecutionMode {
     /// Selection mode - user selects changes to process
+    #[default]
     Select,
     /// Running mode - processing selected changes
     Running,
@@ -48,17 +53,82 @@ pub enum AppMode {
     Stopping,
     /// Stopped mode - processing halted, can modify queue
     Stopped,
-    /// Error mode - an error occurred during processing
+    /// Error mode - a fatal global error occurred during processing
     Error,
-    /// Confirmation dialog for worktree deletion
-    ConfirmWorktreeDelete,
-    /// QR popup mode - showing Web UI QR code
+}
+
+impl AppExecutionMode {
+    /// Project this frontend's execution mode onto the shared operator vocabulary.
+    ///
+    /// The shared matrix is the single command-admission authority, so the
+    /// conversion is total and explicit rather than a defaulted fallback.
+    pub fn operator_mode(self) -> crate::orchestration::operator_command::OperatorMode {
+        use crate::orchestration::operator_command::OperatorMode;
+        match self {
+            AppExecutionMode::Select => OperatorMode::Select,
+            AppExecutionMode::Running => OperatorMode::Running,
+            AppExecutionMode::Stopping => OperatorMode::Stopping,
+            AppExecutionMode::Stopped => OperatorMode::Stopped,
+            AppExecutionMode::Error => OperatorMode::Error,
+        }
+    }
+
+    /// Canonical `app_mode` token shared with the Web/API surface.
+    ///
+    /// Production reads this vocabulary in the other direction — the monitoring
+    /// snapshot carries the token and `OperatorMode::from_app_mode` resolves it —
+    /// so this side exists to pin that the TUI's execution axis and the canonical
+    /// token set stay the same execution-only vocabulary.
+    #[cfg(test)]
+    pub fn app_mode_token(self) -> &'static str {
+        match self {
+            AppExecutionMode::Select => "select",
+            AppExecutionMode::Running => "running",
+            AppExecutionMode::Stopping => "stopping",
+            AppExecutionMode::Stopped => "stopped",
+            AppExecutionMode::Error => "error",
+        }
+    }
+}
+
+/// Transient modal interaction layered over the execution mode.
+///
+/// Each destructive confirmation carries its own identity payload, so a modal and
+/// its target can never diverge: clearing the modal clears the payload with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModalState {
+    /// QR popup - showing the Web UI URL. Carries no destructive payload.
     QrPopup,
-    /// Force-kill confirmation for a single active change
+    /// Confirmation dialog for worktree deletion.
+    ConfirmWorktreeDelete {
+        /// Path of the worktree the confirmation was opened for.
+        path: PathBuf,
+        /// Branch bound to that worktree when the confirmation was opened.
+        branch: Option<String>,
+    },
+    /// Force-kill confirmation for a single active change.
     ConfirmForceKill {
         /// The change ID being confirmed for force-kill
         change_id: String,
     },
+}
+
+impl ModalState {
+    /// Presentation-only header label for this overlay.
+    pub fn title_label(&self) -> &'static str {
+        match self {
+            ModalState::QrPopup => "QR Code",
+            ModalState::ConfirmWorktreeDelete { .. } => "Confirm Delete",
+            ModalState::ConfirmForceKill { .. } => "Confirm Kill",
+        }
+    }
+
+    /// True when this overlay requires an explicit operator decision.
+    ///
+    /// QR is presentation only, so it never blocks a workflow.
+    pub fn is_user_decision(&self) -> bool {
+        !matches!(self, ModalState::QrPopup)
+    }
 }
 
 /// Information about a git worktree
@@ -92,9 +162,114 @@ pub struct MergeConflictInfo {
     pub conflict_files: Vec<String>,
 }
 
-/// Action to perform on a worktree
-#[derive(Debug, Clone, PartialEq)]
-pub enum WorktreeAction {
-    /// Delete the worktree
-    Delete,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::operator_command::OperatorMode;
+
+    #[test]
+    fn execution_mode_defaults_to_select() {
+        assert_eq!(AppExecutionMode::default(), AppExecutionMode::Select);
+    }
+
+    #[test]
+    fn execution_mode_maps_onto_the_shared_operator_matrix() {
+        let pairs = [
+            (AppExecutionMode::Select, OperatorMode::Select),
+            (AppExecutionMode::Running, OperatorMode::Running),
+            (AppExecutionMode::Stopping, OperatorMode::Stopping),
+            (AppExecutionMode::Stopped, OperatorMode::Stopped),
+            (AppExecutionMode::Error, OperatorMode::Error),
+        ];
+
+        for (execution, operator) in pairs {
+            assert_eq!(execution.operator_mode(), operator);
+        }
+    }
+
+    #[test]
+    fn canonical_app_mode_tokens_round_trip_through_the_shared_vocabulary() {
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            assert_eq!(
+                OperatorMode::from_app_mode(mode.app_mode_token()),
+                mode.operator_mode(),
+                "canonical app_mode token must stay execution-only for {:?}",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_modals_carry_their_own_identity_payload() {
+        let worktree = ModalState::ConfirmWorktreeDelete {
+            path: PathBuf::from("/tmp/worktree-a"),
+            branch: Some("feature/a".to_string()),
+        };
+        let kill = ModalState::ConfirmForceKill {
+            change_id: "change-a".to_string(),
+        };
+
+        // Payload identity is part of modal equality, so a modal can never be
+        // "the same modal" while pointing at a different target.
+        assert_ne!(
+            worktree,
+            ModalState::ConfirmWorktreeDelete {
+                path: PathBuf::from("/tmp/worktree-b"),
+                branch: Some("feature/a".to_string()),
+            }
+        );
+        assert_ne!(
+            worktree,
+            ModalState::ConfirmWorktreeDelete {
+                path: PathBuf::from("/tmp/worktree-a"),
+                branch: None,
+            }
+        );
+        assert_ne!(
+            kill,
+            ModalState::ConfirmForceKill {
+                change_id: "change-b".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn only_confirmations_are_user_decisions() {
+        assert!(!ModalState::QrPopup.is_user_decision());
+        assert!(ModalState::ConfirmWorktreeDelete {
+            path: PathBuf::from("/tmp/worktree-a"),
+            branch: None,
+        }
+        .is_user_decision());
+        assert!(ModalState::ConfirmForceKill {
+            change_id: "change-a".to_string(),
+        }
+        .is_user_decision());
+    }
+
+    #[test]
+    fn modal_titles_are_presentation_labels_only() {
+        assert_eq!(ModalState::QrPopup.title_label(), "QR Code");
+        assert_eq!(
+            ModalState::ConfirmWorktreeDelete {
+                path: PathBuf::from("/tmp/worktree-a"),
+                branch: None,
+            }
+            .title_label(),
+            "Confirm Delete"
+        );
+        assert_eq!(
+            ModalState::ConfirmForceKill {
+                change_id: "change-a".to_string(),
+            }
+            .title_label(),
+            "Confirm Kill"
+        );
+    }
 }

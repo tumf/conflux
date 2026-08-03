@@ -264,7 +264,7 @@ mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
     use crate::tui::events::OrchestratorEvent;
-    use crate::tui::types::AppMode;
+    use crate::tui::types::AppExecutionMode;
     use std::collections::HashMap;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
@@ -364,13 +364,13 @@ mod tests {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.current_change = Some("test-change".to_string());
         app.changes[0].selected = true;
 
         app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
 
-        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
         assert_eq!(change.display_status_cache, "error");
         assert!(!change.selected);
@@ -383,12 +383,12 @@ mod tests {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
         app.changes[0].selected = true;
 
         app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
 
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
         assert_eq!(change.display_status_cache, "error");
         assert!(!change.selected);
@@ -598,7 +598,7 @@ mod tests {
             guard.apply_observation("change-a", WorkspaceObservation::WorkspaceArchived);
         }
         app.set_shared_state(shared.clone());
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.clear_resolving();
 
         let deferred = crate::events::ExecutionEvent::MergeDeferred {
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn manual_deferral_before_resolve_started_clears_optimistic_reservation() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
         app.clear_resolving();
@@ -861,7 +861,7 @@ mod tests {
             create_test_change("change-a", 0, 1),
             create_test_change("change-b", 0, 1),
         ]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.changes[1].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
@@ -902,7 +902,7 @@ mod tests {
             guard.apply_observation("change-a", WorkspaceObservation::WorkspaceArchived);
         }
         app.set_shared_state(shared.clone());
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
         app.clear_resolving();
@@ -959,12 +959,12 @@ mod tests {
     fn resolve_failed_transitions_to_select_when_no_active() {
         let changes = vec![create_test_change("change-a", 3, 3)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "resolving".to_string();
         app.set_resolving("__active__");
 
         app.handle_resolve_failed("change-a".to_string(), "conflict".to_string());
 
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
     }
 }

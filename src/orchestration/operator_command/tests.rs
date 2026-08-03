@@ -863,16 +863,24 @@ async fn operator_command_stop_and_dequeue_of_idle_row_needs_no_handle() {
     );
 }
 
+/// The guard is on the *call* `.force_kill(`, not on the words "force kill".
+///
+/// `force_kill` returns a best-effort boolean that says a signal was sent, never
+/// that the task ended, so neither the service nor the TUI adapter may invoke it
+/// and treat the result as termination evidence. The operator-facing feature is
+/// still named force-kill, and identifiers such as `confirm_force_kill` describe
+/// the confirmation that produces a stop-and-dequeue command — they are not calls
+/// into that API and must not trip this guard.
 #[test]
 fn operator_command_force_kill_result_is_not_treated_as_termination_proof() {
     let source = include_str!("../operator_command.rs");
     assert!(
-        !source.contains("force_kill"),
+        !source.contains(".force_kill("),
         "the service must use the cancellation handshake, not force_kill's boolean"
     );
     let handlers = include_str!("../../tui/command_handlers.rs");
     assert!(
-        !handlers.contains("force_kill"),
+        !handlers.contains(".force_kill("),
         "the TUI adapter must not treat force_kill's result as proof of termination"
     );
 }

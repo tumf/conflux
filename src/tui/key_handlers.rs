@@ -7,7 +7,7 @@ use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
 use crate::tui::state::AppState;
-use crate::tui::types::{AppMode, StopMode};
+use crate::tui::types::{AppExecutionMode, ModalState, StopMode};
 use crate::vcs::VcsResult;
 use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -287,7 +287,7 @@ pub(crate) enum EscStopAction {
     /// Second Esc: enqueue the shared immediate-stop command.
     ///
     /// The key path never applies stop effects itself, so it cannot claim a
-    /// force stop from `AppMode::Stopping` alone.
+    /// force stop from `AppExecutionMode::Stopping` alone.
     RequestImmediateStop,
     /// Esc is not a stop control in this state, or an immediate stop was already
     /// requested and must not be duplicated.
@@ -295,17 +295,19 @@ pub(crate) enum EscStopAction {
 }
 
 /// Decide the Esc stop action from typed TUI state only.
-pub(crate) fn esc_stop_action(mode: &AppMode, stop_mode: &StopMode) -> EscStopAction {
+pub(crate) fn esc_stop_action(mode: &AppExecutionMode, stop_mode: &StopMode) -> EscStopAction {
     match mode {
-        AppMode::Running => EscStopAction::RequestGracefulStop,
-        AppMode::Stopping if *stop_mode == StopMode::ImmediatePending => EscStopAction::None,
-        AppMode::Stopping => EscStopAction::RequestImmediateStop,
+        AppExecutionMode::Running => EscStopAction::RequestGracefulStop,
+        AppExecutionMode::Stopping if *stop_mode == StopMode::ImmediatePending => {
+            EscStopAction::None
+        }
+        AppExecutionMode::Stopping => EscStopAction::RequestImmediateStop,
         _ => EscStopAction::None,
     }
 }
 
 pub(crate) async fn handle_esc_key_inner(app: &mut AppState, cmd_tx: &mpsc::Sender<TuiCommand>) {
-    match esc_stop_action(&app.mode, &app.stop_mode) {
+    match esc_stop_action(&app.execution_mode, &app.stop_mode) {
         EscStopAction::RequestGracefulStop => {
             // The stop effect itself belongs to the shared service, so the first
             // Esc enqueues the same command a remote `stop` submits. Recording
@@ -336,7 +338,7 @@ fn handle_start_key_inner(app: &mut AppState) -> Option<TuiCommand> {
     // Handle the configured start key in Stopping mode to cancel graceful stop.
     // Whether a cancellable run still exists is a runtime fact the shared service
     // owns, so the key path only expresses the intent.
-    if app.mode == AppMode::Stopping {
+    if app.execution_mode == AppExecutionMode::Stopping {
         return Some(TuiCommand::CancelStop);
     }
 
@@ -643,6 +645,55 @@ pub(crate) fn handle_warning_popup_key(app: &mut AppState, key: KeyEvent) -> boo
     true
 }
 
+/// Handle input for the active typed modal.
+///
+/// Modal input sits between warning-popup input (highest priority) and ordinary
+/// view input. An active modal consumes *every* key: QR closes on any key, and a
+/// confirmation acts only on its documented keys while still swallowing the rest,
+/// so `x`, navigation, stop, and retry can never leak to the view underneath.
+///
+/// Returns true when the key was consumed by a modal.
+pub(crate) async fn handle_modal_key(key: KeyEvent, ctx: &mut KeyEventContext<'_>) -> bool {
+    let Some(modal) = ctx.app.modal.clone() else {
+        return false;
+    };
+
+    match modal {
+        ModalState::QrPopup => {
+            ctx.app.hide_qr_popup();
+        }
+        ModalState::ConfirmForceKill { .. } => match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+                if let Some(cmd) = ctx.app.confirm_force_kill() {
+                    let _ = ctx.cmd_tx.send(cmd).await;
+                }
+            }
+            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
+                ctx.app.cancel_force_kill();
+            }
+            _ => {}
+        },
+        ModalState::ConfirmWorktreeDelete { .. } => match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+                if let Some(cmd) = ctx.app.confirm_worktree_action_delete() {
+                    let _ = ctx.cmd_tx.send(cmd).await;
+                }
+            }
+            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
+                ctx.app.cancel_worktree_action();
+            }
+            (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) => {
+                if let Some(cmd) = ctx.app.confirm_worktree_action_delete_with_options(true) {
+                    let _ = ctx.cmd_tx.send(cmd).await;
+                }
+            }
+            _ => {}
+        },
+    }
+
+    true
+}
+
 /// Handle the bulk execution-mark toggle (`x`) in the Changes view.
 ///
 /// Eligibility, mode constraints, and exclusion reporting are enforced in
@@ -687,50 +738,7 @@ pub async fn handle_key_event(
         return Ok(None);
     }
 
-    // Handle QrPopup mode - any key closes the popup
-    if ctx.app.mode == AppMode::QrPopup {
-        ctx.app.hide_qr_popup();
-        return Ok(None);
-    }
-
-    // Handle force-kill confirmation mode
-    if let AppMode::ConfirmForceKill { ref change_id } = ctx.app.mode {
-        let cid = change_id.clone();
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
-                ctx.app.mode = AppMode::Running;
-                ctx.app
-                    .add_log(LogEntry::info(format!("Force-kill confirmed: {}", cid)));
-                let _ = ctx.cmd_tx.send(TuiCommand::DequeueChange(cid)).await;
-            }
-            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
-                ctx.app.mode = AppMode::Running;
-                ctx.app
-                    .add_log(LogEntry::info("Force-kill canceled".to_string()));
-            }
-            _ => {}
-        }
-        return Ok(None);
-    }
-
-    // Handle worktree delete confirmation
-    if ctx.app.mode == AppMode::ConfirmWorktreeDelete {
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
-                if let Some(cmd) = ctx.app.confirm_worktree_action_delete() {
-                    let _ = ctx.cmd_tx.send(cmd).await;
-                }
-            }
-            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
-                ctx.app.cancel_worktree_action();
-            }
-            (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) => {
-                if let Some(cmd) = ctx.app.confirm_worktree_action_delete_with_options(true) {
-                    let _ = ctx.cmd_tx.send(cmd).await;
-                }
-            }
-            _ => {}
-        }
+    if handle_modal_key(key, ctx).await {
         return Ok(None);
     }
 
@@ -821,28 +829,9 @@ pub async fn handle_key_event(
             handle_selected_proposal_log_filter_key(ctx.app);
         }
         (KeyCode::Char('K'), _) => {
-            // Enter force-kill confirmation for active changes in Running mode
-            use crate::tui::types::ViewMode;
-            if ctx.app.view_mode == ViewMode::Changes
-                && ctx.app.mode == AppMode::Running
-                && !ctx.app.changes.is_empty()
-                && ctx.app.cursor_index < ctx.app.changes.len()
-            {
-                let change = &ctx.app.changes[ctx.app.cursor_index];
-                if matches!(
-                    change.display_status_cache.as_str(),
-                    "applying" | "accepting" | "archiving" | "resolving"
-                ) {
-                    let cid = change.id.clone();
-                    ctx.app.mode = AppMode::ConfirmForceKill {
-                        change_id: cid.clone(),
-                    };
-                    ctx.app.add_log(LogEntry::warn(format!(
-                        "Confirm force-kill for '{}': press Y to confirm, N/Esc to cancel",
-                        cid
-                    )));
-                }
-            }
+            // Open the force-kill confirmation overlay for active changes in
+            // Running mode. Only the modal axis moves; execution stays Running.
+            ctx.app.request_force_kill_confirmation();
         }
         _ => {}
     }
@@ -1074,7 +1063,7 @@ mod tests {
             create_test_change("merge-wait"),
             create_test_change("run-me"),
         ]);
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
         app.cursor_index = 0;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.changes[1].selected = true;
@@ -1093,9 +1082,13 @@ mod tests {
     /// where the start key withdraws a pending graceful stop.
     #[test]
     fn start_key_emits_one_command_per_mode_class() {
-        for mode in [AppMode::Select, AppMode::Stopped, AppMode::Error] {
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
             let mut app = AppState::new(vec![create_test_change("a")]);
-            app.mode = mode.clone();
+            app.execution_mode = mode;
             app.set_resolving("__active__");
             assert!(
                 matches!(
@@ -1108,7 +1101,7 @@ mod tests {
         }
 
         let mut stopping = AppState::new(vec![create_test_change("a")]);
-        stopping.mode = AppMode::Stopping;
+        stopping.execution_mode = AppExecutionMode::Stopping;
         assert!(matches!(
             handle_start_key_inner(&mut stopping),
             Some(TuiCommand::CancelStop)
@@ -1564,7 +1557,7 @@ mod tests {
             .map(|(id, _, _)| create_test_change(id))
             .collect();
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         for (index, (_, status, selected)) in rows.iter().enumerate() {
             app.changes[index].display_status_cache = status.to_string();
             app.changes[index].selected = *selected;
@@ -1673,11 +1666,11 @@ mod tests {
     #[test]
     fn idle_parallel_stop_second_esc_requests_the_shared_immediate_stop_command() {
         assert_eq!(
-            esc_stop_action(&AppMode::Running, &StopMode::None),
+            esc_stop_action(&AppExecutionMode::Running, &StopMode::None),
             EscStopAction::RequestGracefulStop
         );
         assert_eq!(
-            esc_stop_action(&AppMode::Stopping, &StopMode::GracefulPending),
+            esc_stop_action(&AppExecutionMode::Stopping, &StopMode::GracefulPending),
             EscStopAction::RequestImmediateStop
         );
     }
@@ -1685,11 +1678,11 @@ mod tests {
     #[test]
     fn idle_parallel_stop_repeated_esc_does_not_duplicate_the_stop_request() {
         assert_eq!(
-            esc_stop_action(&AppMode::Stopping, &StopMode::ImmediatePending),
+            esc_stop_action(&AppExecutionMode::Stopping, &StopMode::ImmediatePending),
             EscStopAction::None
         );
         assert_eq!(
-            esc_stop_action(&AppMode::Stopped, &StopMode::None),
+            esc_stop_action(&AppExecutionMode::Stopped, &StopMode::None),
             EscStopAction::None
         );
     }
@@ -1697,7 +1690,7 @@ mod tests {
     #[tokio::test]
     async fn idle_parallel_stop_second_esc_routes_through_force_stop_command() {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Stopping;
+        app.execution_mode = AppExecutionMode::Stopping;
         app.stop_mode = StopMode::GracefulPending;
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
 
@@ -1709,15 +1702,15 @@ mod tests {
         );
         assert_eq!(app.stop_mode, StopMode::ImmediatePending);
         assert_eq!(
-            app.mode,
-            AppMode::Stopping,
+            app.execution_mode,
+            AppExecutionMode::Stopping,
             "the key path must not apply terminal stop effects itself"
         );
         assert!(
             !app.logs
                 .iter()
                 .any(|entry| entry.message.contains("Force stopped")),
-            "the key path must not claim a force stop from AppMode::Stopping alone"
+            "the key path must not claim a force stop from AppExecutionMode::Stopping alone"
         );
         assert!(
             !app.logs
@@ -1730,7 +1723,7 @@ mod tests {
     #[tokio::test]
     async fn idle_parallel_stop_repeated_esc_sends_one_stop_command() {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Stopping;
+        app.execution_mode = AppExecutionMode::Stopping;
         app.stop_mode = StopMode::GracefulPending;
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
 
@@ -1747,7 +1740,7 @@ mod tests {
     #[tokio::test]
     async fn idle_parallel_stop_first_esc_keeps_graceful_stop_contract() {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
 
         handle_esc_key_inner(&mut app, &cmd_tx).await;
@@ -1757,9 +1750,459 @@ mod tests {
         assert_eq!(app.stop_mode, StopMode::GracefulPending);
         assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::Stop)));
         assert_eq!(
-            app.mode,
-            AppMode::Running,
+            app.execution_mode,
+            AppExecutionMode::Running,
             "the key path must not apply the stop transition itself"
         );
+    }
+
+    // ========================================================================
+    // Input routing priority: warning popup → typed modal → view/execution keys
+    // ========================================================================
+
+    /// Keys that would visibly mutate underlying state if an overlay leaked them.
+    const HIGH_IMPACT_KEYS: [KeyCode; 10] = [
+        KeyCode::Char('x'),
+        KeyCode::Char(' '),
+        KeyCode::Down,
+        KeyCode::Up,
+        KeyCode::Char('j'),
+        KeyCode::Char('K'),
+        KeyCode::Char('M'),
+        KeyCode::Esc,
+        KeyCode::F(5),
+        KeyCode::Tab,
+    ];
+
+    /// Underlying state a leaked key would be visible in.
+    #[derive(Debug, PartialEq)]
+    struct UnderlyingState {
+        execution_mode: AppExecutionMode,
+        stop_mode: StopMode,
+        cursor_index: usize,
+        view_mode: ViewMode,
+        marks: Vec<bool>,
+        statuses: Vec<String>,
+    }
+
+    impl UnderlyingState {
+        fn capture(app: &AppState) -> Self {
+            Self {
+                execution_mode: app.execution_mode,
+                stop_mode: app.stop_mode.clone(),
+                cursor_index: app.cursor_index,
+                view_mode: app.view_mode,
+                marks: app.changes.iter().map(|c| c.selected).collect(),
+                statuses: app
+                    .changes
+                    .iter()
+                    .map(|c| c.display_status_cache.clone())
+                    .collect(),
+            }
+        }
+    }
+
+    fn routing_app() -> AppState {
+        let mut app = AppState::new(vec![
+            create_test_change("change-a"),
+            create_test_change("change-b"),
+        ]);
+        app.execution_mode = AppExecutionMode::Running;
+        app.changes[0].set_display_status_cache("applying");
+        app.changes[1].set_display_status_cache("not queued");
+        app.web_url = Some("http://127.0.0.1:8080".to_string());
+        app
+    }
+
+    fn test_terminal() -> DefaultTerminal {
+        ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap()
+    }
+
+    /// Feed one key through the full routing entry point.
+    async fn route_key(app: &mut AppState, code: KeyCode) -> Vec<TuiCommand> {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut terminal = test_terminal();
+        let config = OrchestratorConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let ai_runner = test_ai_runner();
+        let supervisor = idle_supervisor();
+        let worktree_base_dir = temp_dir.path().join("worktrees");
+        let mut ctx = KeyEventContext {
+            app,
+            terminal: &mut terminal,
+            repo_root: temp_dir.path(),
+            config: &config,
+            worktree_base_dir: &worktree_base_dir,
+            tx: &tx,
+            cmd_tx: &cmd_tx,
+            ai_runner: &ai_runner,
+            supervisor: &supervisor,
+        };
+
+        handle_key_event(key(code), &mut ctx).await.unwrap();
+
+        let mut commands = Vec::new();
+        while let Ok(command) = cmd_rx.try_recv() {
+            commands.push(command);
+        }
+        commands
+    }
+
+    #[tokio::test]
+    async fn warning_popup_owns_input_before_the_typed_modal() {
+        let mut app = routing_app();
+        app.show_qr_popup();
+        app.show_warning_popup("warning", "line 1\nline 2\nline 3");
+
+        // A popup scroll key must reach the popup, not the QR overlay under it.
+        let commands = route_key(&mut app, KeyCode::Down).await;
+
+        assert!(commands.is_empty());
+        assert!(app.warning_popup.is_some());
+        assert_eq!(app.warning_popup_scroll, 1);
+        assert_eq!(
+            app.modal,
+            Some(ModalState::QrPopup),
+            "the interaction modal must not process a warning-popup key"
+        );
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
+    }
+
+    #[tokio::test]
+    async fn every_overlay_consumes_high_impact_keys_without_touching_the_view() {
+        type OpenOverlay = fn(&mut AppState);
+        let overlays: Vec<(&str, OpenOverlay)> = vec![
+            ("qr", |app: &mut AppState| app.show_qr_popup()),
+            ("worktree-delete", |app: &mut AppState| {
+                app.modal = Some(ModalState::ConfirmWorktreeDelete {
+                    path: PathBuf::from("/tmp/wt-a"),
+                    branch: Some("change-b".to_string()),
+                });
+            }),
+            ("force-kill", |app: &mut AppState| {
+                app.modal = Some(ModalState::ConfirmForceKill {
+                    change_id: "change-a".to_string(),
+                });
+            }),
+            ("warning-popup", |app: &mut AppState| {
+                app.show_warning_popup("warning", "diagnostic")
+            }),
+        ];
+
+        for (name, open) in overlays {
+            for code in HIGH_IMPACT_KEYS {
+                let mut app = routing_app();
+                open(&mut app);
+                let before = UnderlyingState::capture(&app);
+
+                let commands = route_key(&mut app, code).await;
+
+                assert!(
+                    commands.is_empty(),
+                    "{name} overlay leaked {code:?} as a command"
+                );
+                assert_eq!(
+                    UnderlyingState::capture(&app),
+                    before,
+                    "{name} overlay leaked {code:?} into the underlying view"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_overlay_consumes_the_resolve_key_without_emitting_resolve_merge() {
+        let overlays = [
+            ModalState::QrPopup,
+            ModalState::ConfirmWorktreeDelete {
+                path: PathBuf::from("/tmp/wt-a"),
+                branch: Some("change-b".to_string()),
+            },
+            ModalState::ConfirmForceKill {
+                change_id: "change-a".to_string(),
+            },
+        ];
+
+        for modal in overlays {
+            let mut app = routing_app();
+            app.execution_mode = AppExecutionMode::Select;
+            // A row the resolve key would otherwise act on.
+            app.changes[1].set_display_status_cache("merge wait");
+            app.cursor_index = 1;
+            app.modal = Some(modal.clone());
+
+            let commands = route_key(&mut app, KeyCode::Char('M')).await;
+
+            assert!(
+                commands.is_empty(),
+                "{modal:?} must not let the resolve key through"
+            );
+            assert_eq!(
+                app.execution_mode,
+                AppExecutionMode::Select,
+                "{modal:?} must not let the resolve key move the execution axis"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qr_closes_on_any_key_and_exposes_the_latest_execution_mode() {
+        for code in [KeyCode::Esc, KeyCode::Char('x'), KeyCode::Enter] {
+            let mut app = routing_app();
+            app.show_qr_popup();
+
+            // A background transition lands while the popup is open.
+            app.execution_mode = AppExecutionMode::Stopping;
+
+            let commands = route_key(&mut app, code).await;
+
+            assert!(commands.is_empty());
+            assert!(app.modal.is_none(), "{code:?} must close the QR popup");
+            assert_eq!(
+                app.execution_mode,
+                AppExecutionMode::Stopping,
+                "closing QR must expose the latest execution mode, not a captured one"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn force_kill_confirm_dispatches_stop_and_dequeue_without_rewriting_execution() {
+        let mut app = routing_app();
+        app.execution_mode = AppExecutionMode::Stopping;
+        app.modal = Some(ModalState::ConfirmForceKill {
+            change_id: "change-a".to_string(),
+        });
+
+        let commands = route_key(&mut app, KeyCode::Char('y')).await;
+
+        assert!(
+            matches!(commands.as_slice(), [TuiCommand::DequeueChange(id)] if id == "change-a"),
+            "expected a single stop-and-dequeue command, got {commands:?}"
+        );
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Stopping,
+            "confirming must not rewrite execution back to Running"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_kill_cancel_preserves_the_current_execution_mode() {
+        let mut app = routing_app();
+        app.execution_mode = AppExecutionMode::Stopping;
+        app.modal = Some(ModalState::ConfirmForceKill {
+            change_id: "change-a".to_string(),
+        });
+
+        let commands = route_key(&mut app, KeyCode::Esc).await;
+
+        assert!(commands.is_empty());
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Stopping,
+            "cancel must not restore Running unconditionally"
+        );
+        assert_eq!(app.stop_mode, StopMode::None);
+    }
+
+    #[tokio::test]
+    async fn force_kill_confirm_refuses_a_stale_target_without_dispatching() {
+        let mut app = routing_app();
+        app.modal = Some(ModalState::ConfirmForceKill {
+            change_id: "change-a".to_string(),
+        });
+        // The target settled between display and confirmation input.
+        app.changes[0].set_display_status_cache("archived");
+
+        let commands = route_key(&mut app, KeyCode::Char('y')).await;
+
+        assert!(
+            commands.is_empty(),
+            "a stale force-kill must not reach the shared service"
+        );
+        assert!(app.modal.is_none());
+        assert_eq!(app.changes[0].display_status_cache, "archived");
+        assert!(app
+            .warning_message
+            .as_ref()
+            .is_some_and(|msg| msg.contains("Force-kill canceled")));
+    }
+
+    #[tokio::test]
+    async fn worktree_delete_confirm_dispatches_when_identity_still_matches() {
+        let mut app = routing_app();
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![crate::tui::types::WorktreeInfo {
+            path: PathBuf::from("/tmp/wt-a"),
+            head: "abc1234".to_string(),
+            branch: "change-b".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: false,
+            is_merging: false,
+        }];
+        app.modal = Some(ModalState::ConfirmWorktreeDelete {
+            path: PathBuf::from("/tmp/wt-a"),
+            branch: Some("change-b".to_string()),
+        });
+
+        let commands = route_key(&mut app, KeyCode::Char('y')).await;
+
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [TuiCommand::DeleteWorktreeByPath(path, branch, false)]
+                    if path == &PathBuf::from("/tmp/wt-a") && branch.as_deref() == Some("change-b")
+            ),
+            "expected a single worktree delete command, got {commands:?}"
+        );
+        assert!(app.modal.is_none());
+        assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/wt-a")));
+    }
+
+    #[tokio::test]
+    async fn worktree_delete_confirm_refuses_stale_identity_without_mutating_state() {
+        for (name, mutate) in [
+            (
+                "absent",
+                (|app: &mut AppState| app.worktrees.clear()) as fn(&mut AppState),
+            ),
+            ("rebranded", |app: &mut AppState| {
+                app.worktrees[0].branch = "change-z".to_string()
+            }),
+            ("main", |app: &mut AppState| app.worktrees[0].is_main = true),
+        ] {
+            for code in [KeyCode::Char('y'), KeyCode::Char('s')] {
+                let mut app = routing_app();
+                app.view_mode = ViewMode::Worktrees;
+                app.worktrees = vec![crate::tui::types::WorktreeInfo {
+                    path: PathBuf::from("/tmp/wt-a"),
+                    head: "abc1234".to_string(),
+                    branch: "change-b".to_string(),
+                    is_detached: false,
+                    is_main: false,
+                    merge_conflict: None,
+                    has_commits_ahead: false,
+                    is_merging: false,
+                }];
+                app.modal = Some(ModalState::ConfirmWorktreeDelete {
+                    path: PathBuf::from("/tmp/wt-a"),
+                    branch: Some("change-b".to_string()),
+                });
+                mutate(&mut app);
+
+                let commands = route_key(&mut app, code).await;
+
+                assert!(
+                    commands.is_empty(),
+                    "{name}: a stale worktree delete must not be dispatched for {code:?}"
+                );
+                assert!(
+                    app.modal.is_none(),
+                    "{name}: the stale modal must be cleared"
+                );
+                assert!(
+                    !app.is_worktree_deleting(&PathBuf::from("/tmp/wt-a")),
+                    "{name}: refusing must not mark the worktree as deleting"
+                );
+                assert!(app
+                    .warning_message
+                    .as_ref()
+                    .is_some_and(|msg| msg.contains("Worktree delete canceled")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn k_key_opens_force_kill_without_leaving_running_execution() {
+        let mut app = routing_app();
+
+        let commands = route_key(&mut app, KeyCode::Char('K')).await;
+
+        assert!(commands.is_empty());
+        assert_eq!(
+            app.modal,
+            Some(ModalState::ConfirmForceKill {
+                change_id: "change-a".to_string()
+            })
+        );
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Running,
+            "opening a confirmation must not move the execution axis"
+        );
+    }
+
+    #[tokio::test]
+    async fn w_key_opens_qr_over_the_current_execution_mode() {
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            let mut app = routing_app();
+            app.execution_mode = mode;
+
+            route_key(&mut app, KeyCode::Char('w')).await;
+
+            assert_eq!(app.modal, Some(ModalState::QrPopup));
+            assert_eq!(app.execution_mode, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn w_key_is_ignored_when_web_monitoring_is_disabled() {
+        let mut app = routing_app();
+        app.web_url = None;
+        let before = UnderlyingState::capture(&app);
+
+        route_key(&mut app, KeyCode::Char('w')).await;
+
+        assert!(app.modal.is_none());
+        assert_eq!(UnderlyingState::capture(&app), before);
+    }
+
+    #[tokio::test]
+    async fn bulk_mark_key_applies_across_the_admitted_execution_modes() {
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopped,
+        ] {
+            let mut app = routing_app();
+            app.execution_mode = mode;
+
+            route_key(&mut app, KeyCode::Char('x')).await;
+
+            assert!(
+                app.changes[1].selected,
+                "{mode:?} must admit bulk mark for eligible rows"
+            );
+        }
+
+        for mode in [AppExecutionMode::Stopping, AppExecutionMode::Error] {
+            let mut app = routing_app();
+            app.execution_mode = mode;
+
+            route_key(&mut app, KeyCode::Char('x')).await;
+
+            assert!(
+                !app.changes[1].selected,
+                "{mode:?} must refuse bulk mark through the shared matrix"
+            );
+        }
     }
 }

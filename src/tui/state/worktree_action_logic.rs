@@ -1,13 +1,20 @@
+use std::path::PathBuf;
+
 use crate::{tui::types::WorktreeInfo, vcs::GitWorkspaceManager};
 use tracing::debug;
 
-use super::{guards, worktree_logic, AppMode, AppState, ChangeState, TuiCommand, WorktreeAction};
+use super::{guards, modal_logic, worktree_logic, AppState, ChangeState, TuiCommand};
 
+/// Validate a delete request and return the identity the confirmation must carry.
+///
+/// The returned `(path, branch)` pair is the identity re-checked against a fresh
+/// observation before anything is deleted, so it is derived through the same
+/// helper the validity policy uses.
 pub(super) fn validate_delete_request(
     worktrees: &[WorktreeInfo],
     worktree_cursor_index: usize,
     changes: &[ChangeState],
-) -> Result<(String, Option<String>), String> {
+) -> Result<(PathBuf, Option<String>), String> {
     if worktrees.is_empty() || worktree_cursor_index >= worktrees.len() {
         return Err("No worktree selected".to_string());
     }
@@ -36,28 +43,10 @@ pub(super) fn validate_delete_request(
         }
     }
 
-    let path_str = worktree.path.display().to_string();
-    let branch_name = if !worktree.is_detached && !worktree.branch.is_empty() {
-        Some(worktree.branch.clone())
-    } else {
-        None
-    };
-
-    Ok((path_str, branch_name))
-}
-
-pub(super) fn apply_delete_confirmation_state(
-    pending_path: String,
-    pending_branch: Option<String>,
-    mode: &mut AppMode,
-    pending_worktree_action: &mut Option<(String, WorktreeAction)>,
-    pending_worktree_branch: &mut Option<String>,
-    previous_mode: &mut Option<AppMode>,
-) {
-    *pending_worktree_action = Some((pending_path, WorktreeAction::Delete));
-    *pending_worktree_branch = pending_branch;
-    *previous_mode = Some(mode.clone());
-    *mode = AppMode::ConfirmWorktreeDelete;
+    Ok((
+        worktree.path.clone(),
+        modal_logic::delete_branch_identity(worktree),
+    ))
 }
 
 pub(super) fn request_merge_worktree_branch(state: &mut AppState) -> Option<TuiCommand> {
