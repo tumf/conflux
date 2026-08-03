@@ -143,6 +143,13 @@ pub trait FinalCommitEnvironment: Send + Sync {
     /// Tree object recorded by `commit`.
     async fn commit_tree(&self, workspace_path: &Path, commit: &str) -> VcsResult<String>;
 
+    /// Tree the worktree's current content would produce once fully staged.
+    ///
+    /// This is the tree the add-and-commit path must record, so it is the only
+    /// thing that distinguishes this finalization's commit from another commit
+    /// that happens to share its subject and its parent.
+    async fn workspace_tree(&self, workspace_path: &Path) -> VcsResult<String>;
+
     /// Whether the worktree currently holds content that is not committed.
     ///
     /// This is the same predicate finalization uses to choose between the
@@ -182,6 +189,10 @@ impl FinalCommitEnvironment for GitFinalCommitEnvironment {
         .await
     }
 
+    async fn workspace_tree(&self, workspace_path: &Path) -> VcsResult<String> {
+        workspace_content_tree(workspace_path).await
+    }
+
     async fn has_uncommitted_changes(&self, workspace_path: &Path) -> VcsResult<bool> {
         has_changes_to_commit(workspace_path).await
     }
@@ -189,6 +200,81 @@ impl FinalCommitEnvironment for GitFinalCommitEnvironment {
     async fn sleep(&self, duration: Duration) {
         tokio::time::sleep(duration).await;
     }
+}
+
+/// Compute the tree `git add -A` followed by a commit would record right now.
+///
+/// The staging is replayed against a throwaway copy of the index, so this stays
+/// a pure observation: the managed worktree's real index is never written and
+/// its `index.lock` is never taken, which matters because this runs precisely
+/// when another process may be holding that lock. Copying the real index rather
+/// than reading `HEAD` keeps the replay faithful to whatever the finalization's
+/// own `git add -A` would start from.
+///
+/// The scratch index is driven with `GIT_INDEX_FILE`, spawned here rather than
+/// through the shared Git helpers on purpose: a general environment-injecting
+/// Git runner in the shared layer would let any caller redirect Git's index or
+/// object store, and only this policy needs it.
+async fn workspace_content_tree(workspace_path: &Path) -> VcsResult<String> {
+    let scratch = tempfile::TempDir::new().map_err(|error| {
+        VcsError::git_command(format!("could not create a scratch index directory: {error}"))
+    })?;
+    let scratch_index = scratch.path().join("index");
+
+    let index_path =
+        workspace_path.join(run_git(&["rev-parse", "--git-path", "index"], workspace_path).await?);
+    if index_path.exists() {
+        tokio::fs::copy(&index_path, &scratch_index)
+            .await
+            .map_err(|error| {
+                VcsError::git_command(format!(
+                    "could not copy {} to a scratch index: {error}",
+                    index_path.display()
+                ))
+            })?;
+    }
+
+    run_git_with_scratch_index(&["add", "-A"], workspace_path, &scratch_index).await?;
+    run_git_with_scratch_index(&["write-tree"], workspace_path, &scratch_index).await
+}
+
+/// Run one Git command whose index is redirected to `scratch_index`.
+async fn run_git_with_scratch_index(
+    args: &[&str],
+    workspace_path: &Path,
+    scratch_index: &Path,
+) -> VcsResult<String> {
+    let command = format!("git {}", args.join(" "));
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(workspace_path)
+        .env("GIT_INDEX_FILE", scratch_index)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|error| VcsError::Command {
+            backend: VcsBackend::Git,
+            message: format!("Failed to execute {command}: {error}"),
+            command: Some(command.clone()),
+            working_dir: Some(workspace_path.to_path_buf()),
+            stderr: None,
+            stdout: None,
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(VcsError::Command {
+            backend: VcsBackend::Git,
+            message: format!("{command} failed: {stderr}"),
+            command: Some(command),
+            working_dir: Some(workspace_path.to_path_buf()),
+            stderr: Some(stderr),
+            stdout: Some(stdout),
+        });
+    }
+
+    Ok(stdout.trim().to_string())
 }
 
 /// Repository state captured immediately before a finalization attempt.
@@ -206,6 +292,10 @@ struct FinalizationState {
     tree: Option<String>,
     /// Whether the worktree was dirty, which selects the finalization path.
     dirty: bool,
+    /// Tree the dirty worktree's content would produce, i.e. the exact tree the
+    /// add-and-commit path must record. `None` on the clean worktree, where the
+    /// amend inherits `tree` instead and there is nothing else to stage.
+    workspace_tree: Option<String>,
 }
 
 async fn capture_finalization_state(
@@ -221,12 +311,22 @@ async fn capture_finalization_state(
         None => (Vec::new(), None),
     };
     let dirty = environment.has_uncommitted_changes(workspace_path).await?;
+    // Captured only on the add-and-commit path, and captured before the
+    // attempt: afterwards the workspace is indistinguishable from one another
+    // actor rewrote, so it can no longer say what this attempt should record.
+    // An unreadable expected tree is an unreadable state, which is terminal
+    // rather than retried, for the same reason the rest of the capture is.
+    let workspace_tree = match dirty {
+        true => Some(environment.workspace_tree(workspace_path).await?),
+        false => None,
+    };
 
     Ok(FinalizationState {
         head,
         parents,
         tree,
         dirty,
+        workspace_tree,
     })
 }
 
@@ -239,11 +339,15 @@ async fn capture_finalization_state(
 /// - its lineage is the exact successor of the captured state for the
 ///   finalization path that state selected (a new child for add-and-commit,
 ///   the captured commit's own parents for amend),
-/// - the committed tree is the expected one, and
+/// - the committed tree is the expected one for that path (the workspace
+///   content captured before the attempt for add-and-commit, the captured
+///   commit's inherited tree for amend), and
 /// - no workspace content was left out of it.
 ///
 /// A same-subject commit already in history fails the first check because HEAD
-/// never moved, and an unrelated or partial commit fails the tree checks.
+/// never moved, and an unrelated or partial commit fails the tree checks - a
+/// foreign commit sharing this subject and this parent is still rejected,
+/// because it cannot also carry the captured workspace tree.
 async fn final_commit_recorded(
     environment: &dyn FinalCommitEnvironment,
     workspace_path: &Path,
@@ -270,9 +374,19 @@ async fn final_commit_recorded(
     };
 
     if before.dirty {
-        // Add-and-commit: the captured HEAD becomes the sole parent.
+        // Add-and-commit: the captured HEAD becomes the sole parent, and the
+        // recorded tree is exactly the workspace content captured before the
+        // attempt. Subject and parent alone are forgeable by any other actor
+        // committing on top of the same HEAD, so the tree is what makes this
+        // the *expected* commit rather than merely a plausible one.
         let expected_parents: Vec<&str> = before.head.as_deref().into_iter().collect();
         if parents_now.iter().map(String::as_str).collect::<Vec<_>>() != expected_parents {
+            return false;
+        }
+        let Ok(tree_now) = environment.commit_tree(workspace_path, &head_now).await else {
+            return false;
+        };
+        if Some(&tree_now) != before.workspace_tree.as_ref() {
             return false;
         }
     } else {
@@ -521,6 +635,10 @@ pub(crate) mod test_support {
             GitFinalCommitEnvironment
                 .commit_tree(workspace_path, commit)
                 .await
+        }
+
+        async fn workspace_tree(&self, workspace_path: &Path) -> VcsResult<String> {
+            GitFinalCommitEnvironment.workspace_tree(workspace_path).await
         }
 
         async fn has_uncommitted_changes(&self, workspace_path: &Path) -> VcsResult<bool> {
@@ -960,6 +1078,21 @@ mod tests {
 
         async fn commit_tree(&self, _workspace_path: &Path, commit: &str) -> VcsResult<String> {
             self.find(commit, |commit| commit.tree.clone())
+        }
+
+        async fn workspace_tree(&self, _workspace_path: &Path) -> VcsResult<String> {
+            if !*self.state_readable.lock().unwrap() {
+                return Err(VcsError::git_command("write-tree failed"));
+            }
+            // Staging everything records the pending content when there is any,
+            // and otherwise reproduces HEAD - exactly what `FakeRepo::finalize`
+            // commits.
+            let repo = self.repo.lock().unwrap();
+            Ok(repo.pending_tree.clone().unwrap_or_else(|| {
+                repo.head()
+                    .map(|commit| commit.tree.clone())
+                    .unwrap_or_else(|| "tree-empty".to_string())
+            }))
         }
 
         async fn has_uncommitted_changes(&self, _workspace_path: &Path) -> VcsResult<bool> {
@@ -1421,6 +1554,38 @@ mod tests {
         )
         .await
         .expect_err("a mismatched tree is not this finalization's commit");
+
+        assert_eq!(*attempts.lock().unwrap(), FINAL_COMMIT_MAX_ATTEMPTS);
+        assert!(error.to_string().contains("did not clear"));
+    }
+
+    #[tokio::test]
+    async fn final_apply_commit_lock_ambiguous_success_rejects_mismatched_tree_on_the_add_path() {
+        let environment = FakeEnvironment::dirty();
+        let attempts = Mutex::new(0_u32);
+
+        let error = run_final_commit_with_retry(
+            || async {
+                *attempts.lock().unwrap() += 1;
+                if *attempts.lock().unwrap() == 1 {
+                    // Another actor commits on top of the captured HEAD with
+                    // exactly this finalization's subject and leaves the
+                    // worktree clean, so subject, sole parent and cleanliness
+                    // all match - only the recorded content differs from the
+                    // workspace this attempt was supposed to commit.
+                    let mut repo = environment.repo.lock().unwrap();
+                    repo.pending_tree = None;
+                    repo.commit(COMMIT_MESSAGE, "tree-other");
+                }
+                Err(add_and_commit_lock_error())
+            },
+            &environment,
+            workspace(),
+            COMMIT_MESSAGE,
+            None,
+        )
+        .await
+        .expect_err("a same-subject, same-parent commit of other content is not this commit");
 
         assert_eq!(*attempts.lock().unwrap(), FINAL_COMMIT_MAX_ATTEMPTS);
         assert!(error.to_string().contains("did not clear"));

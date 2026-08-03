@@ -636,6 +636,116 @@ async fn final_apply_commit_lock_ambiguous_success_rejects_mismatched_tree() {
     assert!(error.to_string().contains("did not clear"));
 }
 
+#[cfg_attr(windows, ignore)]
+#[tokio::test]
+async fn final_apply_commit_lock_ambiguous_success_rejects_mismatched_tree_on_the_add_path() {
+    let repo = LockRepo::init().await;
+    repo.write_apply_output();
+    let message = expected_commit_message();
+    let mut attempts = 0_u32;
+
+    let error = run_final_commit_with_retry(
+        || {
+            attempts += 1;
+            let repo_path = repo.path.clone();
+            let message = message.clone();
+            async move {
+                if attempts == 1 {
+                    // A commit lands on top of the captured HEAD carrying
+                    // exactly this finalization's subject, and it leaves the
+                    // worktree clean - but it records content the attempt
+                    // never saw, so it is somebody else's commit.
+                    fs::write(repo_path.join("applied.txt"), "tampered output\n").unwrap();
+                    run_git(&["add", "-A"], &repo_path).await?;
+                    run_git(&["commit", "-q", "--no-verify", "-m", &message], &repo_path).await?;
+                }
+                Err(fabricated_lock_error(&repo_path, "git add -A").await)
+            }
+        },
+        &GitFinalCommitEnvironment,
+        &repo.path,
+        &message,
+        None,
+    )
+    .await
+    .expect_err("a same-subject, same-parent commit of other content is not this commit");
+
+    assert_eq!(attempts, FINAL_COMMIT_MAX_ATTEMPTS);
+    assert!(
+        error.to_string().contains("did not clear"),
+        "unexpected error: {}",
+        error
+    );
+    assert_eq!(
+        repo.commit_subjects().await,
+        vec![message, "base".to_string()],
+        "the foreign commit must be left exactly as it was found"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path.join("applied.txt")).unwrap(),
+        "tampered output\n",
+        "the policy must not have committed on top of the foreign commit"
+    );
+}
+
+/// The expected-tree proof must accept the real add-and-commit finalization it
+/// is derived from: a tree captured from the worktree before the attempt has to
+/// equal the tree `git add -A` plus `git commit` actually records.
+#[cfg_attr(windows, ignore)]
+#[tokio::test]
+async fn final_apply_commit_lock_environment_workspace_tree_matches_the_committed_tree() {
+    let repo = LockRepo::init().await;
+    repo.write_apply_output();
+    // Content Git treats specially still has to round-trip: a removal, a nested
+    // addition, and an ignored file that must stay out of the tree.
+    fs::remove_file(repo.path.join("base.txt")).unwrap();
+    fs::create_dir_all(repo.path.join("nested")).unwrap();
+    fs::write(repo.path.join("nested").join("deep.txt"), "deep\n").unwrap();
+    fs::write(repo.path.join(".gitignore"), "ignored.txt\n").unwrap();
+    fs::write(repo.path.join("ignored.txt"), "ignored\n").unwrap();
+
+    let expected = GitFinalCommitEnvironment
+        .workspace_tree(&repo.path)
+        .await
+        .expect("workspace tree");
+
+    // Capturing the expected tree must be a pure observation of the worktree.
+    assert!(
+        run_git(&["diff", "--cached", "--name-only"], &repo.path)
+            .await
+            .expect("git diff --cached")
+            .is_empty(),
+        "computing the expected tree must not stage anything in the real index"
+    );
+    assert!(
+        !repo.lock_path().exists(),
+        "computing the expected tree must not take the real index.lock"
+    );
+
+    git_ok(&repo.path, &["add", "-A"]).await;
+    git_ok(&repo.path, &["commit", "-q", "--no-verify", "-m", "staged"]).await;
+    let committed = GitFinalCommitEnvironment
+        .commit_tree(&repo.path, "HEAD")
+        .await
+        .expect("commit tree");
+
+    assert_eq!(
+        expected, committed,
+        "the captured workspace tree must be the tree finalization records"
+    );
+    let tracked = run_git(&["ls-tree", "-r", "--name-only", "HEAD"], &repo.path)
+        .await
+        .expect("git ls-tree");
+    assert!(
+        tracked.contains("nested/deep.txt") && !tracked.contains("base.txt"),
+        "the round-tripped tree must carry the addition and the removal: {tracked}"
+    );
+    assert!(
+        !tracked.contains("ignored.txt"),
+        "an ignored file must stay out of both trees: {tracked}"
+    );
+}
+
 // ---- managed lock identity ----------------------------------------------
 
 #[cfg_attr(windows, ignore)]
