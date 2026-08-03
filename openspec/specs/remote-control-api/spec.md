@@ -16,7 +16,7 @@ Single-instance web monitoring MUST expose `/api/v2` health, capabilities, insta
 
 ### Requirement: Closed shared command delegation
 
-`POST /api/v2/commands` MUST accept only `start`, `stop`, `cancel_stop`, `force_stop`, `set_execution_mark`, `set_queue_intent`, `retry_change`, `retry_errors`, `stop_and_dequeue`, and `resolve_merge` until a later spec delta extends the enum. Every command MUST include `expected_revision` and `idempotency_key`. Accepted lifecycle commands MUST execute through the same process-local application services used by the TUI; the API MUST NOT equate internal channel enqueue with successful command execution and MUST NOT maintain an independent workflow state machine.
+`POST /api/v2/commands` MUST accept only `start`, `stop`, `cancel_stop`, `force_stop`, `set_execution_mark`, `set_queue_intent`, `retry_change`, `retry_errors`, `stop_and_dequeue`, `resolve_merge`, `set_parallel_mode`, and `set_all_execution_marks` until a later spec delta extends the enum. Every command MUST include `expected_revision` and `idempotency_key`. Accepted lifecycle commands MUST execute through the same process-local application services used by the TUI; the API MUST NOT equate internal channel enqueue with successful command execution and MUST NOT maintain an independent workflow state machine.
 
 #### Scenario: Accepted command uses shared behavior
 
@@ -39,6 +39,22 @@ Single-instance web monitoring MUST expose `/api/v2` health, capabilities, insta
 **When**: Start is submitted
 **Then**: No scheduler is started
 **And**: The command settles as no-op or failed with actionable detail
+
+#### Scenario: Parallel toggle uses shared behavior
+
+**Given**: The application is in Select or Stopped mode and parallel execution is available
+**When**: `set_parallel_mode` is accepted
+**Then**: The shared service changes the mode
+**And**: It clears marks and queue presentation for changes that are ineligible in parallel mode
+**And**: The outcome identifies excluded changes and reasons
+
+#### Scenario: Bulk mark classifies one revision
+
+**Given**: Eligible and excluded changes exist at one state revision
+**When**: `set_all_execution_marks` is accepted
+**Then**: The service selects one target state from eligible rows only
+**And**: It updates eligible marks and Running queue intent atomically
+**And**: It returns changed IDs and stable exclusion reasons
 
 ### Requirement: Serialized optimistic revision control
 
@@ -134,35 +150,53 @@ The process MUST generate a new random 128-bit hexadecimal `instance_id` at star
 
 ### Requirement: Safe web authentication and binding
 
-The web server MUST refuse non-loopback binding unless a non-empty bearer token is configured. Direct token and token-environment options MUST be mutually exclusive. `/api/v2/health` MUST remain unauthenticated. When authentication is configured, every other v2 HTTP, SSE, and WebSocket resource MUST require `Authorization: Bearer` authentication.
+The process-scoped v2 server MUST bind a repository-scoped Unix domain socket by default in web-enabled local orchestration. The socket MUST be created with owner-only mode `0600`. Token-free UDS and loopback TCP binding are permitted; non-loopback TCP binding MUST be refused unless a non-empty bearer token is configured. Direct token and token-environment options MUST be mutually exclusive. One configured authentication policy MUST apply to every active listener: `/api/v2/health` remains unauthenticated and every other v2 HTTP, SSE, and WebSocket resource requires `Authorization: Bearer` authentication.
 
-Authenticated browser SSE clients and the embedded operator console MUST use `fetch()` response streaming with the Authorization header. Native `EventSource` MUST NOT be claimed as supported for authenticated v2. The v2 WebSocket MUST require the Authorization header during upgrade and is therefore a non-browser client contract. Tokens in URLs, query parameters, logs, correlation IDs, WebSocket subprotocols, or durable browser storage MUST be rejected or forbidden. The embedded browser console MUST use v2 SSE rather than a separate browser WebSocket contract.
+Before UDS bind, a non-socket entry or connectable live socket at the target path MUST be preserved and startup MUST fail. Only an unreachable stale socket entry may be removed. Shutdown MUST remove only the socket entry created by the current process. Tokens in URLs, query parameters, logs, correlation IDs, WebSocket subprotocols, durable browser storage, or Unix endpoint metadata MUST remain forbidden.
+
+#### Scenario: Default UDS is locally accessible without token
+
+**Given**: A web-enabled local orchestration process uses its default socket and no bearer token is configured
+**When**: A local client connects through that socket
+**Then**: `/api/v2/health` and other v2 resources follow the token-free local policy
+**And**: The socket file mode is `0600`
+
+#### Scenario: Configured token protects both transports
+
+**Given**: Bearer authentication and both UDS and TCP listeners are configured
+**When**: A client requests a protected v2 resource over either listener without the token
+**Then**: Both requests are rejected as unauthorized
+**And**: `/api/v2/health` remains available over both listeners
 
 #### Scenario: Unsafe non-loopback startup is rejected
 
-**Given**: Web monitoring is configured on a non-loopback address without a token
-**When**: The process starts the web server
-**Then**: Startup fails before socket binding
+**Given**: Web monitoring is configured on a non-loopback TCP address without a token
+**When**: The process starts its listeners
+**Then**: Startup fails before any requested listener is published or orchestration begins
 
-#### Scenario: Browser consumes authenticated SSE through fetch
+#### Scenario: Live socket is preserved
 
-**Given**: Bearer authentication is required
-**When**: Browser code requests `/api/v2/events` with `fetch()` and an Authorization header
-**Then**: The server authenticates and streams SSE events
+**Given**: The selected Unix path contains a socket accepting connections
+**When**: Conflux attempts startup
+**Then**: Startup fails without unlinking the socket
 
-#### Scenario: WebSocket query token is rejected
+#### Scenario: Non-socket target is preserved
 
-**Given**: Bearer authentication is required
-**When**: A client opens `/api/v2/ws` with a token only in its query or subprotocol
-**Then**: The handshake is rejected
-**And**: No event subscription is created
+**Given**: The selected Unix path contains a regular file or directory
+**When**: Conflux attempts startup
+**Then**: Startup fails without modifying that entry
 
-#### Scenario: Embedded console keeps token out of durable and observable channels
+#### Scenario: Unreachable stale socket is replaced
 
-**Given**: The embedded console accepts a bearer token
-**When**: It accesses protected resources
-**Then**: The token is sent only in the Authorization header
-**And**: It is absent from URLs, logs, correlation IDs, and localStorage
+**Given**: The selected Unix path contains a socket entry that cannot accept a connection
+**When**: Conflux starts the listener
+**Then**: It removes the stale socket entry and binds the new listener
+
+#### Scenario: Shutdown does not delete a replacement
+
+**Given**: The process-bound socket path was externally unlinked and replaced after startup
+**When**: Conflux shuts down
+**Then**: It does not remove the replacement entry
 
 ### Requirement: Exact-origin V2 CORS
 
@@ -251,3 +285,26 @@ Start, retry, stop, cancel stop, force stop, and resolve MUST use shared applica
 **When**: Another valid merge-wait change is submitted for resolve
 **Then**: It is reserved once in FIFO order
 **And**: Duplicate submission does not create another queue entry
+
+### Requirement: Remote parallel execution discovery
+
+Capabilities and state MUST expose parallel execution availability, active mode, maximum concurrency, VCS backend, and per-change eligibility with machine-readable blocked reasons.
+
+#### Scenario: Client discovers parallel execution state
+
+**Given**: A single cflx process has web monitoring enabled
+**When**: A client reads capabilities and state
+**Then**: It can distinguish sequential, available parallel, unavailable parallel, and active parallel modes
+**And**: It can explain why each non-final change is or is not parallel-eligible without inspecting Git itself
+
+### Requirement: Atomic parallel start eligibility
+
+Parallel start MUST validate the complete marked target set at the admitted revision. If any marked target is ineligible, start MUST reject the complete operation without spawning a scheduler or partially changing queue state.
+
+#### Scenario: One ineligible mark rejects start
+
+**Given**: Two changes are marked and one is not parallel-eligible
+**When**: Parallel start is submitted
+**Then**: Neither change starts
+**And**: The response identifies the ineligible target and reason
+**And**: Marks and queue intent remain coherent

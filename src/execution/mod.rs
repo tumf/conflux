@@ -28,7 +28,8 @@ pub mod wip_lock_retry;
 #[allow(unused_imports)]
 pub use apply::{
     check_task_progress, create_final_commit, create_progress_commit, is_progress_complete,
-    progress_increased, ApplyConfig, ApplyIterationResult, DEFAULT_MAX_ITERATIONS,
+    progress_increased, ApplyBudget, ApplyBudgetReservation, ApplyConfig, ApplyIterationResult,
+    DEFAULT_MAX_ITERATIONS,
 };
 
 // Re-export archive items for convenience.

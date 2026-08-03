@@ -331,6 +331,10 @@ impl ParallelExecutor {
         // Reanalysis reason is derived from scheduler events/state each iteration.
         let mut reanalysis_reason = ReanalysisReason::Initial;
         let mut cancelled = false;
+        // Set when the loop exits because nothing is dispatchable while blocked
+        // or waiting work remains. Such a run owes a truthful blocked report,
+        // never `AllCompleted`.
+        let mut blocked_exit = false;
         // Explicit scheduler outcome. Only `DrainedSuccessfully` may enter
         // upstream finalization (final checkpoint, verification, push,
         // confirmation); blocked/stalled and cancelled outcomes never push.
@@ -411,6 +415,12 @@ impl ParallelExecutor {
                 break;
             }
 
+            // Step 0: Consume accepted explicit-retry edges before reconciliation
+            // and classification, so a retried change's ephemeral failed
+            // classification is already gone when this pass classifies its
+            // dependents.
+            let explicit_retry_edge = self.consume_explicit_retry_edges().await;
+
             // Step 1: Check dynamic queue for newly added changes (TUI mode)
             let dynamic_queue_added = self
                 .check_dynamic_queue_and_add_changes(
@@ -430,7 +440,11 @@ impl ParallelExecutor {
             let reconciliation = self
                 .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
                 .await;
-            if reconciliation.has_queued_additions() {
+            if reconciliation.has_queued_additions() || explicit_retry_edge {
+                // A consumed explicit-retry edge arms exactly one reevaluation:
+                // it is a real operator state transition, so this pass bypasses
+                // debounce and unchanged-input suppression once, and the branch
+                // below returns the loop to the ordinary policy afterwards.
                 reanalysis_reason = ReanalysisReason::QueueNotification;
             } else if reconciliation.has_repair_additions() {
                 reanalysis_reason = ReanalysisReason::RepairCandidate;
@@ -498,6 +512,7 @@ impl ParallelExecutor {
                 ) {
                     SchedulerOutcome::DrainedSuccessfully
                 } else {
+                    blocked_exit = true;
                     SchedulerOutcome::BlockedOrStalled
                 };
                 break;
@@ -616,7 +631,28 @@ impl ParallelExecutor {
             }
         }
 
+        if blocked_exit {
+            return Ok(self.finish_blocked_run(&queued).await);
+        }
+
         Ok(self.finish_completed_run().await)
+    }
+
+    /// Emit the terminal output for a finite run that stopped with blocked work.
+    ///
+    /// No `AllCompleted`: nothing completed. The one operator-facing diagnostic
+    /// names the work that is still held, and the typed report tells the calling
+    /// boundary to withhold its success announcement.
+    async fn finish_blocked_run(&self, queued: &[crate::openspec::Change]) -> SchedulerRunReport {
+        let mut blocked: Vec<String> = queued.iter().map(|change| change.id.clone()).collect();
+        blocked.sort();
+        let message = format!(
+            "Processing stopped with blocked work remaining; no dispatchable candidate is available: {}",
+            blocked.join(", ")
+        );
+        warn!("{}", message);
+        send_event(&self.event_tx, ParallelEvent::Log(LogEntry::warn(&message))).await;
+        SchedulerRunReport::BlockedOrStalled
     }
 
     /// Emit the terminal completion output for a run that drained on its own.

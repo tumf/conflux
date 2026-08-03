@@ -36,6 +36,14 @@ pub struct DynamicQueue {
     stopped: Arc<Mutex<HashSet<String>>>,
     /// Per-change execution handles for immediate force-kill and termination waiting
     kill_tokens: Arc<Mutex<HashMap<String, ChangeExecutionHandle>>>,
+    /// Change IDs whose accepted, state-changing `RetryError` admission has not
+    /// been consumed by the scheduler yet.
+    ///
+    /// This is a target-ID-bearing one-shot edge, deliberately separate from the
+    /// ordinary queue and from the generic notification: only an explicit retry
+    /// may release a change's ephemeral failed classification, so a plain
+    /// `AddToQueue` or a generic wake must not be able to look like one.
+    explicit_retries: Arc<Mutex<HashSet<String>>>,
     /// Notification for queue changes (used to wake up re-analysis loop)
     notify: Arc<Notify>,
 }
@@ -48,8 +56,39 @@ impl DynamicQueue {
             removed: Arc::new(Mutex::new(HashSet::new())),
             stopped: Arc::new(Mutex::new(HashSet::new())),
             kill_tokens: Arc::new(Mutex::new(HashMap::new())),
+            explicit_retries: Arc::new(Mutex::new(HashSet::new())),
             notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Publish an accepted explicit-retry edge for `id` and wake the scheduler.
+    ///
+    /// Callers must only publish after a `ReducerCommand::RetryError` returned
+    /// `ReduceOutcome::Changed`: a refused or no-op retry proves nothing about
+    /// the change and must not release its failed classification.
+    ///
+    /// Returns true when this is a newly armed edge rather than a duplicate that
+    /// is still waiting to be consumed.
+    pub async fn publish_explicit_retry(&self, id: String) -> bool {
+        let armed = {
+            let mut retries = self.explicit_retries.lock().await;
+            retries.insert(id)
+        };
+        // Notify regardless: a duplicate publication still deserves a wake so an
+        // idle persistent scheduler re-evaluates promptly.
+        self.notify.notify_one();
+        armed
+    }
+
+    /// Take every pending explicit-retry target, leaving the set empty.
+    ///
+    /// One-shot by construction: an edge is consumed exactly once, so a later
+    /// timer wake cannot replay it.
+    pub async fn drain_explicit_retries(&self) -> Vec<String> {
+        let mut retries = self.explicit_retries.lock().await;
+        let mut drained: Vec<String> = retries.drain().collect();
+        drained.sort_unstable();
+        drained
     }
 
     /// Push a change ID to the queue and notify waiting listeners

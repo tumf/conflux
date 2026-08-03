@@ -16,6 +16,11 @@ pub mod operator_facts;
 pub mod remote_control_api;
 #[cfg(feature = "web-monitoring")]
 pub mod state;
+#[cfg(all(unix, feature = "web-monitoring"))]
+pub mod unix_socket;
+
+#[cfg(all(test, unix, feature = "web-monitoring"))]
+mod listener_tests;
 
 #[cfg(feature = "web-monitoring")]
 use axum::{
@@ -41,8 +46,11 @@ pub use url::build_access_url;
 /// Web server configuration
 #[derive(Debug, Clone)]
 pub struct WebConfig {
-    /// Whether web monitoring is enabled
-    #[allow(dead_code)]
+    /// Whether the browser-facing TCP listener participates.
+    ///
+    /// The Unix listener is configured separately, so this flag now means
+    /// exactly "`--web` was supplied" and is what makes the routable-bind
+    /// credential rule apply.
     pub enabled: bool,
     /// Port to bind the HTTP server
     pub port: u16,
@@ -88,6 +96,12 @@ impl WebConfig {
             bind,
             ..Self::default()
         }
+    }
+
+    /// Select whether the browser-facing TCP listener participates.
+    pub fn with_tcp_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
     }
 
     /// Set the refresh interval
@@ -157,7 +171,11 @@ impl WebConfig {
                 ));
             }
         }
-        if !self.is_loopback_bind()
+        // The routable-bind rule guards the TCP listener specifically. A
+        // UDS-only process never becomes reachable from the network, so a bind
+        // address it will not use cannot make it unsafe.
+        if self.enabled
+            && !self.is_loopback_bind()
             && self
                 .resolve_auth_token()
                 .as_deref()
@@ -263,112 +281,221 @@ pub(crate) fn build_app_for_test(config: &WebConfig, state: Arc<WebState>) -> Ro
     build_app(config, state).expect("test configuration must be valid")
 }
 
-/// Start the web monitoring server
-#[cfg(feature = "web-monitoring")]
-#[allow(dead_code)]
-pub async fn start_server(
-    config: WebConfig,
-    state: Arc<WebState>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    config.validate()?;
-    let addr: SocketAddr = format!("{}:{}", config.bind, config.port).parse()?;
-    let app = build_app(&config, state)?;
-
-    // Bind to the specified address (port 0 = OS auto-assign)
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    // Get the actual bound address (includes OS-assigned port if port was 0)
-    let actual_addr = listener.local_addr()?;
-    info!("Web monitoring server listening on http://{}", actual_addr);
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-
-    Ok(())
-}
-
-#[cfg(feature = "web-monitoring")]
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install Ctrl+C handler");
-    info!("Shutting down web server...");
-}
-
-/// Start the web server in a background task (non-blocking)
-#[cfg(feature = "web-monitoring")]
-#[allow(dead_code)]
-pub fn spawn_server(
-    config: WebConfig,
-    state: Arc<WebState>,
-) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-    tokio::spawn(async move { start_server(config, state).await })
-}
-
-/// Start the web server and return the accessible URL.
+/// Which listeners a local orchestration-owning process must start.
 ///
-/// This function binds to the specified address, determines the actual port
-/// (important when port 0 is used for auto-assignment), and constructs an
-/// accessible URL that can be used for QR code generation.
-///
-/// Returns a tuple of (JoinHandle, accessible_url).
+/// The Unix listener is the default local API surface; TCP is the browser-facing
+/// opt-in. Both are described up front so startup can be all-or-nothing: a
+/// process that advertised one endpoint and silently failed the other would be
+/// worse than one that refused to start.
 #[cfg(feature = "web-monitoring")]
-pub async fn spawn_server_with_url(
+#[derive(Debug, Clone, Default)]
+pub struct ListenerPlan {
+    /// Path for the Unix-domain listener, or `None` when it is opted out.
+    #[cfg(unix)]
+    pub unix_socket: Option<std::path::PathBuf>,
+    /// Whether `--web` asked for the retained TCP/Web UI listener.
+    pub tcp: bool,
+}
+
+#[cfg(feature = "web-monitoring")]
+impl ListenerPlan {
+    /// True when no listener was requested at all.
+    pub fn is_empty(&self) -> bool {
+        #[cfg(unix)]
+        let unix = self.unix_socket.is_none();
+        #[cfg(not(unix))]
+        let unix = true;
+        unix && !self.tcp
+    }
+}
+
+/// A running local API server: what it actually bound, and how to stop it.
+///
+/// Endpoints are recorded only after their listener bound, so nothing here ever
+/// describes an address a client cannot reach. Dropping the handle removes the
+/// owned socket even on an abrupt error path; [`ServerHandle::shutdown`] also
+/// waits for the listener tasks to finish.
+#[cfg(feature = "web-monitoring")]
+#[derive(Debug)]
+pub struct ServerHandle {
+    endpoints: Vec<String>,
+    tcp_url: Option<String>,
+    shutdown: tokio_util::sync::CancellationToken,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    #[cfg(unix)]
+    socket: Option<unix_socket::SocketGuard>,
+}
+
+#[cfg(feature = "web-monitoring")]
+impl ServerHandle {
+    /// Every endpoint whose listener completed startup, in publication order.
+    pub fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
+
+    /// The browser-facing TCP URL, when `--web` started one.
+    ///
+    /// A `unix://` endpoint is never returned here: it is discovery information
+    /// for local clients and reverse proxies, not something a browser or a QR
+    /// code can open.
+    pub fn tcp_url(&self) -> Option<&str> {
+        self.tcp_url.as_deref()
+    }
+
+    /// Stop every listener and refresh task, then remove the owned socket.
+    ///
+    /// Finite `run` completion and graceful TUI termination both call this, so
+    /// neither needs a second Ctrl+C to give the endpoint back.
+    pub async fn shutdown(mut self) {
+        self.shutdown.cancel();
+        for task in std::mem::take(&mut self.tasks) {
+            let _ = task.await;
+        }
+        #[cfg(unix)]
+        if let Some(socket) = &self.socket {
+            socket.release();
+        }
+    }
+}
+
+/// Stop every listener this failed startup transaction already started.
+///
+/// "Start none of them" has to mean the tasks too, not just the pathname: a
+/// leaked `axum::serve` task would keep answering the endpoint it bound while
+/// the caller believes nothing started. Cancelling and then awaiting is what
+/// makes the failure return only once no listener is serving any more.
+#[cfg(feature = "web-monitoring")]
+async fn abort_started_listeners(
+    shutdown: &tokio_util::sync::CancellationToken,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+) {
+    shutdown.cancel();
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+/// Start every requested listener before returning, or start none of them.
+///
+/// Ordering is the point: the caller runs this before lifecycle adapters, AI
+/// subprocesses, and orchestration, so a process that cannot serve its required
+/// API never reaches the work that assumes the API is there.
+#[cfg(feature = "web-monitoring")]
+pub async fn start_listeners(
     config: WebConfig,
+    plan: ListenerPlan,
     state: Arc<WebState>,
-) -> Result<
-    (
-        tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-        String,
-    ),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    // Reject an unsafe configuration before a socket exists, not after.
+) -> Result<ServerHandle, Box<dyn std::error::Error + Send + Sync>> {
+    // Reject an unsafe or contradictory configuration before a socket exists,
+    // not after.
     config.validate()?;
-    let addr: SocketAddr = format!("{}:{}", config.bind, config.port).parse()?;
+
+    // One router, one `WebState`: every listener reaches the same projection,
+    // command registry, executor binding, and authentication policy.
     let app = build_app(&config, state.clone())?;
+    let shutdown = tokio_util::sync::CancellationToken::new();
 
-    // Bind to the specified address (port 0 = OS auto-assign)
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    // Get the actual bound address (includes OS-assigned port if port was 0)
-    let actual_addr = listener.local_addr()?;
-    let actual_port = actual_addr.port();
+    let mut endpoints = Vec::new();
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // Build accessible URL using local IP for 0.0.0.0 bind
-    let url = build_access_url(&config.bind, actual_port);
-    info!("Web monitoring server listening on {}", url);
+    #[cfg(unix)]
+    let mut socket_guard = None;
+    #[cfg(unix)]
+    if let Some(path) = plan.unix_socket.as_deref() {
+        let (listener, guard) = unix_socket::bind_unix_listener(path).await?;
+        endpoints.push(unix_socket::unix_endpoint(path));
+        socket_guard = Some(guard);
+        info!(
+            "Local API listening on {}",
+            unix_socket::unix_endpoint(path)
+        );
 
-    // The listener is bound and its actual address (including an OS-assigned
-    // port) is known, so the repository lock owner can now advertise a URL that
-    // is genuinely reachable. A no-op when this process holds no lock.
-    crate::repo_lock::publish_api_url(&url);
+        let app = app.clone();
+        let token = shutdown.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app)
+                .with_graceful_shutdown(async move { token.cancelled().await })
+                .await
+            {
+                debug!("Unix API listener stopped: {}", e);
+            }
+        }));
+    }
 
-    // Spawn periodic refresh task if enabled
-    if config.refresh_interval_secs > 0 {
-        let state_clone = state;
-        let interval = config.refresh_interval_secs;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval));
+    let mut tcp_url = None;
+    if plan.tcp {
+        // A TCP failure after the socket bound must not leave a half-started
+        // process behind: the rollback stops the listener task already spawned,
+        // and returning then drops `socket_guard`, which removes the socket this
+        // transaction created.
+        // The actual address includes an OS-assigned port when 0 was requested,
+        // so what gets published is what a client can actually connect to.
+        let bound = async {
+            let addr: SocketAddr = format!("{}:{}", config.bind, config.port).parse()?;
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            let actual_port = listener.local_addr()?.port();
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((listener, actual_port))
+        }
+        .await;
+        let (listener, actual_port) = match bound {
+            Ok(bound) => bound,
+            Err(error) => {
+                abort_started_listeners(&shutdown, tasks).await;
+                return Err(error);
+            }
+        };
+        let url = build_access_url(&config.bind, actual_port);
+        info!("Web monitoring server listening on {}", url);
+        endpoints.push(url.clone());
+        tcp_url = Some(url);
+
+        let app = app.clone();
+        let token = shutdown.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app)
+                .with_graceful_shutdown(async move { token.cancelled().await })
+                .await
+            {
+                debug!("TCP API listener stopped: {}", e);
+            }
+        }));
+    }
+
+    // Every requested listener is bound, so the repository lock owner can now
+    // advertise endpoints that are genuinely reachable. A no-op when this
+    // process holds no lock.
+    crate::repo_lock::publish_endpoints(&endpoints);
+
+    if config.refresh_interval_secs > 0 && !endpoints.is_empty() {
+        let state = state.clone();
+        let interval_secs = config.refresh_interval_secs;
+        let token = shutdown.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                interval.tick().await;
-                if let Err(e) = state_clone.refresh_from_disk().await {
-                    debug!("Periodic refresh failed: {}", e);
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(e) = state.refresh_from_disk().await {
+                            debug!("Periodic refresh failed: {}", e);
+                        }
+                    }
                 }
             }
-        });
+        }));
     }
 
-    // Spawn the server in a background task
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
-        Ok(())
-    });
-
-    Ok((handle, url))
+    Ok(ServerHandle {
+        endpoints,
+        tcp_url,
+        shutdown,
+        tasks,
+        #[cfg(unix)]
+        socket: socket_guard,
+    })
 }
 
 // Stub implementations for when web-monitoring feature is disabled

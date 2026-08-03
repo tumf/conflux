@@ -100,12 +100,23 @@ pub enum SchedulerRunReport {
     CompletedWithErrors,
     /// Operator cancellation stopped the run.
     Stopped,
+    /// A finite run ended with queued work that is still blocked or stalled.
+    ///
+    /// Nothing drained: the remaining candidates are held by a failed
+    /// dependency, an unresolved blocker, or another wait lane. This is neither
+    /// a success nor an execution failure, and it must never be announced as
+    /// completion.
+    BlockedOrStalled,
 }
 
 impl SchedulerRunReport {
-    /// Whether this run finished with unresolved change-local failures.
-    pub fn has_change_failures(self) -> bool {
-        matches!(self, Self::CompletedWithErrors)
+    /// Whether this run ended without completing every eligible change.
+    ///
+    /// Boundaries use this to withhold a success announcement: both
+    /// change-local failures and blocked/stalled remainders leave work the
+    /// operator still owns.
+    pub fn is_incomplete(self) -> bool {
+        matches!(self, Self::CompletedWithErrors | Self::BlockedOrStalled)
     }
 }
 
@@ -222,6 +233,14 @@ pub struct ParallelExecutor {
     acceptance_history: Arc<Mutex<crate::history::AcceptanceHistory>>,
     /// Tracks which changes have had acceptance tail injected (to prevent re-injection)
     acceptance_tail_injected: Arc<Mutex<std::collections::HashMap<String, bool>>>,
+    /// The sole per-change `max_iterations` Apply-dispatch budget owner for this
+    /// parallel run.
+    ///
+    /// Shared by every dispatched workspace task, so a change that re-enters
+    /// Apply after an Acceptance FAIL keeps counting from where it left off.
+    /// Active-run memory only: a restart starts from zero and re-derives routing
+    /// from workspace and Git evidence.
+    apply_budget: crate::execution::apply::ApplyBudget,
     /// Counter for active manual resolve operations (TUI mode)
     manual_resolve_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Counter for active automatic resolve operations

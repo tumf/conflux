@@ -446,6 +446,14 @@ impl ParallelRunService {
             )
             .await;
 
+        // Close the event channel before joining the forwarder. The forwarder
+        // also breaks on a terminal event, but not every terminal path emits
+        // one: a scheduler failure and a blocked/stalled exit both return
+        // without `AllCompleted`, and a forwarder still holding a live sender
+        // would wait forever. The analyzer closure owned the only other clone
+        // and was consumed by the call above, so this closes the channel.
+        drop(executor);
+
         // Wait for event forwarding to complete
         let _ = forward_handle.await;
 

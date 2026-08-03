@@ -96,9 +96,16 @@ pub struct Orchestrator {
 }
 
 /// Control flow result indicating whether to continue or break the main loop
+#[derive(Debug)]
 enum LoopControl {
     Continue,
-    Break { finish_status: &'static str },
+    Break {
+        finish_status: &'static str,
+        /// Cumulative Apply dispatches owned by the shared budget when the run
+        /// stops on `iteration_limit`. `None` for every other stop reason, which
+        /// keeps `on_finish`'s existing `apply_count` of `0`.
+        apply_count: Option<u32>,
+    },
 }
 
 /// How explicit targets were resolved for a cumulative parallel run.
@@ -360,6 +367,7 @@ impl Orchestrator {
                 }
                 return LoopControl::Break {
                     finish_status: "graceful_stop",
+                    apply_count: None,
                 };
             }
         }
@@ -381,44 +389,26 @@ impl Orchestrator {
             }
             return LoopControl::Break {
                 finish_status: "cancelled",
+                apply_count: None,
             };
         }
         LoopControl::Continue
     }
 
-    /// Check max iterations limit and increment counter
-    /// Returns LoopControl indicating whether to continue or break
+    /// Advance the workflow-loop iteration counter used for shared-state
+    /// observability.
+    ///
+    /// This loop deliberately imposes no Apply ceiling of its own. `max_iterations`
+    /// has exactly one owner — the per-change [`ApplyBudget`] shared by serial CLI,
+    /// TUI, and parallel execution — which reserves before each configured Apply
+    /// dispatch, emits the single 80% warning, and returns a typed
+    /// `iteration_limit` outcome that reaches this loop as
+    /// [`ChangeProcessResult::IterationLimit`]. A second ceiling here would stop
+    /// runs early and duplicate the warning.
+    ///
+    /// [`ApplyBudget`]: crate::execution::apply::ApplyBudget
     async fn check_max_iterations(&mut self) -> LoopControl {
-        let mut state = self.shared_state.write().await;
-        state.increment_iteration();
-        let iteration = state.iteration();
-        let max_iterations = state.max_iterations();
-        drop(state);
-
-        if max_iterations > 0 {
-            // Log warning when approaching limit (80%)
-            let warning_threshold = (max_iterations as f32 * 0.8) as u32;
-            if iteration == warning_threshold {
-                warn!(
-                    "Approaching max iterations: {}/{}",
-                    iteration, max_iterations
-                );
-            }
-
-            // Stop if max iterations reached
-            if iteration > max_iterations {
-                info!(
-                    "Max iterations ({}) reached, stopping orchestration",
-                    max_iterations
-                );
-                if let Some(progress) = &mut self.progress {
-                    progress.complete_all();
-                }
-                return LoopControl::Break {
-                    finish_status: "iteration_limit",
-                };
-            }
-        }
+        self.shared_state.write().await.increment_iteration();
         LoopControl::Continue
     }
 
@@ -915,6 +905,7 @@ impl Orchestrator {
                 info!("Processing cancelled for {}", next.id);
                 Ok(LoopControl::Break {
                     finish_status: "cancelled",
+                    apply_count: None,
                 })
             }
             ChangeProcessResult::ChangeStopped => {
@@ -923,6 +914,7 @@ impl Orchestrator {
                 info!("Change {} stopped", next.id);
                 Ok(LoopControl::Break {
                     finish_status: "stopped",
+                    apply_count: None,
                 })
             }
             ChangeProcessResult::ApplySuccessIncomplete => Ok(self
@@ -932,6 +924,20 @@ impl Orchestrator {
                 self.handle_apply_failed(next, &error, serial_service)
                     .await?;
                 Ok(LoopControl::Continue)
+            }
+            // Budget exhaustion is its own typed stop, not an agent crash: the
+            // run ends with the canonical `iteration_limit` finish status and
+            // the exact cumulative per-change dispatch count.
+            ChangeProcessResult::IterationLimit { attempts, error } => {
+                info!("{}", error);
+                self.mark_change_stalled(&next.id, &error).await;
+                if let Some(progress) = &mut self.progress {
+                    progress.complete_all();
+                }
+                Ok(LoopControl::Break {
+                    finish_status: "iteration_limit",
+                    apply_count: Some(attempts),
+                })
             }
             ChangeProcessResult::AcceptancePassed
             | ChangeProcessResult::AcceptanceContinue
@@ -1006,6 +1012,9 @@ impl Orchestrator {
             .await?;
 
         let finish_status;
+        // Cumulative Apply dispatches reported to `on_finish` when the run stops
+        // on `iteration_limit`; every other stop keeps the existing `0`.
+        let mut finish_apply_count = 0u32;
 
         // Track previous graceful stop state to detect transitions (false -> true)
         let mut previous_graceful_stop = false;
@@ -1023,8 +1032,10 @@ impl Orchestrator {
                 LoopControl::Continue => {}
                 LoopControl::Break {
                     finish_status: status,
+                    apply_count,
                 } => {
                     finish_status = status;
+                    finish_apply_count = apply_count.unwrap_or(0);
                     break;
                 }
             }
@@ -1081,17 +1092,21 @@ impl Orchestrator {
                 LoopControl::Continue => {}
                 LoopControl::Break {
                     finish_status: status,
+                    apply_count,
                 } => {
                     finish_status = status;
+                    finish_apply_count = apply_count.unwrap_or(0);
                     break;
                 }
             }
         }
 
-        // Run on_finish hook
+        // Run on_finish hook exactly once for the run, carrying the typed finish
+        // status and — for `iteration_limit` — the exact cumulative count.
         let processed = self.shared_state.read().await.changes_processed();
-        let finish_context =
-            HookContext::new(processed, total_changes, 0, false).with_status(finish_status);
+        let finish_context = HookContext::new(processed, total_changes, 0, false)
+            .with_status(finish_status)
+            .with_apply_count(finish_apply_count);
         self.hooks
             .run_hook(HookType::OnFinish, &finish_context)
             .await?;
@@ -1438,6 +1453,38 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Run `on_finish` exactly once for a parallel run.
+    ///
+    /// A change stopped by the shared Apply-dispatch ceiling was recorded by its
+    /// workspace task as a typed observation, so the hook receives
+    /// `iteration_limit` together with that change's exact cumulative dispatch
+    /// count — the same contract serial reports through `LoopControl::Break` —
+    /// instead of a status the hook would have to infer from log text.
+    async fn run_parallel_finish_hook(&self) -> Result<()> {
+        let state = self.shared_state.read().await;
+        let iteration_limit = state.apply_iteration_limits().first().cloned();
+        let (finish_status, finish_apply_count) = state.parallel_finish_report();
+        let processed = state.changes_processed();
+        let total = state.total_changes();
+        drop(state);
+
+        if let Some(record) = &iteration_limit {
+            info!(
+                change_id = %record.change_id,
+                attempts = record.attempts,
+                max = record.max,
+                "Parallel run stopped on the Apply-dispatch ceiling"
+            );
+        }
+
+        let finish_context = HookContext::new(processed, total, 0, false)
+            .with_status(finish_status)
+            .with_apply_count(finish_apply_count);
+        self.hooks
+            .run_hook(HookType::OnFinish, &finish_context)
+            .await
+    }
+
     /// Run parallel execution mode
     async fn run_parallel(
         &mut self,
@@ -1716,6 +1763,8 @@ impl Orchestrator {
 
         result?;
 
+        self.run_parallel_finish_hook().await?;
+
         // Report clearly when all requested changes were rejected before any work started.
         let n_rejected = rejected_count.load(std::sync::atomic::Ordering::SeqCst);
         if n_rejected >= total_requested && total_requested > 0 {
@@ -1747,6 +1796,101 @@ mod tests {
             last_modified: "1m ago".to_string(),
             dependencies: Vec::new(),
             metadata: ProposalMetadata::default(),
+        }
+    }
+
+    /// Parallel runs have no `LoopControl` return path, so the finish hook is
+    /// driven from the typed observation the workspace task recorded.
+    mod parallel_finish_hook {
+        use super::*;
+        use crate::hooks::{HookConfig, HookConfigValue, HooksConfig};
+        use tempfile::TempDir;
+
+        fn orchestrator_with_on_finish(log: &std::path::Path) -> Orchestrator {
+            let config = OrchestratorConfig {
+                hooks: Some(HooksConfig {
+                    on_finish: Some(HookConfigValue::Full(HookConfig {
+                        command: format!(
+                            "sh -c 'echo \"$OPENSPEC_STATUS $OPENSPEC_APPLY_COUNT\" >> {}'",
+                            log.display()
+                        ),
+                        continue_on_failure: false,
+                        timeout: 30,
+                        git_commit_no_verify: false,
+                        max_retries: 0,
+                        retry_delay_secs: 0,
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            Orchestrator::with_config(None, config).expect("test orchestrator")
+        }
+
+        fn lines(log: &std::path::Path) -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_recorded_iteration_limit_reports_status_and_exact_count_once() {
+            let temp_dir = TempDir::new().unwrap();
+            let log = temp_dir.path().join("on-finish.log");
+            let orchestrator = orchestrator_with_on_finish(&log);
+
+            {
+                let mut state = orchestrator.shared_state.write().await;
+                *state = OrchestratorState::with_mode(
+                    vec!["change-a".to_string()],
+                    7,
+                    crate::orchestration::state::ExecutionMode::Parallel,
+                );
+                // The workspace task's typed observation: the ceiling refused
+                // dispatch 8 after 7 cumulative dispatches.
+                state.record_apply_iteration_limit("change-a", 7, 7);
+                // A repeated observation for the same change must not duplicate.
+                state.record_apply_iteration_limit("change-a", 7, 7);
+            }
+
+            orchestrator
+                .run_parallel_finish_hook()
+                .await
+                .expect("the finish hook must run");
+
+            assert_eq!(
+                lines(&log),
+                vec!["iteration_limit 7".to_string()],
+                "on_finish runs exactly once with the typed status and the exact count"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_run_without_an_iteration_limit_reports_completed() {
+            let temp_dir = TempDir::new().unwrap();
+            let log = temp_dir.path().join("on-finish.log");
+            let orchestrator = orchestrator_with_on_finish(&log);
+
+            {
+                let mut state = orchestrator.shared_state.write().await;
+                *state = OrchestratorState::with_mode(
+                    vec!["change-a".to_string()],
+                    7,
+                    crate::orchestration::state::ExecutionMode::Parallel,
+                );
+            }
+
+            orchestrator
+                .run_parallel_finish_hook()
+                .await
+                .expect("the finish hook must run");
+
+            assert_eq!(lines(&log), vec!["completed 0".to_string()]);
         }
     }
 
@@ -2353,6 +2497,78 @@ mod tests {
 
         let state = orchestrator.shared_state.read().await;
         assert_eq!(state.display_status(&blocked_change.id), "stalled");
+    }
+
+    /// The sole budget owner's typed exhaustion must survive the CLI run
+    /// boundary: the run stops with the canonical `iteration_limit` finish
+    /// status and the exact cumulative dispatch count, never as a generic crash.
+    #[tokio::test]
+    async fn test_iteration_limit_result_breaks_with_the_typed_finish_status() {
+        use crate::serial_run_service::ChangeProcessResult;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config = OrchestratorConfig::default();
+        let mut orchestrator = Orchestrator::with_config(None, config.clone()).unwrap();
+        let mut serial_service = SerialRunService::new(temp_dir.path().to_path_buf(), config);
+
+        let change = create_test_change("spent-change", 1, 5);
+        let result = ChangeProcessResult::IterationLimit {
+            attempts: 7,
+            error: "Max iterations (7) reached for change 'spent-change' after 7 Apply dispatch(es): latest Apply failure".to_string(),
+        };
+
+        let control = orchestrator
+            .handle_change_result(result, &change, &mut serial_service)
+            .await
+            .expect("budget exhaustion is a stop, not an orchestration error");
+
+        match control {
+            super::LoopControl::Break {
+                finish_status,
+                apply_count,
+            } => {
+                assert_eq!(finish_status, "iteration_limit");
+                assert_eq!(
+                    apply_count,
+                    Some(7),
+                    "on_finish must receive the exact cumulative dispatch count"
+                );
+            }
+            other => panic!("expected a typed iteration-limit stop, got {other:?}"),
+        }
+
+        let state = orchestrator.shared_state.read().await;
+        assert_eq!(state.display_status(&change.id), "stalled");
+    }
+
+    /// The workflow loop imposes no second Apply ceiling: `max_iterations` has
+    /// exactly one owner, so this counter is observability only.
+    #[tokio::test]
+    async fn test_workflow_loop_never_imposes_a_second_apply_ceiling() {
+        let config = OrchestratorConfig {
+            max_iterations: Some(2),
+            ..OrchestratorConfig::default()
+        };
+        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
+        {
+            let mut state = orchestrator.shared_state.write().await;
+            *state = crate::orchestration::state::OrchestratorState::new(
+                vec!["change-a".to_string()],
+                2,
+            );
+        }
+
+        for _ in 0..5 {
+            assert!(
+                matches!(
+                    orchestrator.check_max_iterations().await,
+                    super::LoopControl::Continue
+                ),
+                "only the shared ApplyBudget may stop a run on max_iterations"
+            );
+        }
+        assert_eq!(orchestrator.shared_state.read().await.iteration(), 5);
     }
 
     /// Regression: when ALL requested changes are rejected by start-time eligibility filtering,
