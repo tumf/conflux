@@ -16,6 +16,9 @@
 use crate::agent::{AgentRunner, OutputLine};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::execution::final_commit_lock_retry::{
+    run_final_commit_with_retry, FinalCommitEnvironment, GitFinalCommitEnvironment,
+};
 use crate::execution::wip_lock_retry::{
     run_wip_snapshot_with_retry, GitWipSnapshotEnvironment, WipSnapshotEnvironment,
 };
@@ -690,6 +693,9 @@ pub async fn create_progress_commit_with_environment<W: WorkspaceManager + ?Size
 ///   rejected the commit. This is repository-fixable apply feedback.
 /// - `Err(_)` - a terminal VCS failure that no apply agent can repair.
 ///
+/// Transient managed-worktree `index.lock` contention is recovered inside the
+/// finalization boundary; see [`create_final_commit_with_environment`].
+///
 /// # Arguments
 ///
 /// * `workspace_manager` - The workspace manager for VCS operations
@@ -700,21 +706,58 @@ pub async fn create_final_commit<W: WorkspaceManager + ?Sized>(
     workspace_path: &Path,
     change_id: &str,
 ) -> VcsResult<VerifiedCommitOutcome> {
+    create_final_commit_with_environment(
+        workspace_manager,
+        workspace_path,
+        change_id,
+        None,
+        &GitFinalCommitEnvironment,
+    )
+    .await
+}
+
+/// `create_final_commit` with cancellation and an injectable retry environment.
+///
+/// The complete finalization sequence is retried as a whole so that transient
+/// managed-worktree `index.lock` contention at either the staging or the commit
+/// step is covered by one policy, and so each attempt re-reads whether the
+/// worktree needs add-and-commit or amend. Only the orchestration boundary
+/// knows about cancellation; the `WorkspaceManager` contract is unchanged.
+///
+/// A repository hook rejection is not contention: it returns unchanged, keeps
+/// the existing bounded Apply repair route, and never consumes the lock budget.
+pub async fn create_final_commit_with_environment<W: WorkspaceManager + ?Sized>(
+    workspace_manager: &W,
+    workspace_path: &Path,
+    change_id: &str,
+    cancel_token: Option<&CancellationToken>,
+    environment: &dyn FinalCommitEnvironment,
+) -> VcsResult<VerifiedCommitOutcome> {
     let commit_message = format!("Apply: {}", change_id);
+    let commit_message_ref = commit_message.as_str();
 
     debug!(
         "Creating final commit for {}: {}",
         change_id, commit_message
     );
 
-    // Snapshot working copy changes first to capture workspace state.
-    workspace_manager
-        .snapshot_working_copy(workspace_path)
-        .await?;
+    let outcome = run_final_commit_with_retry(
+        move || async move {
+            // Snapshot working copy changes first to capture workspace state.
+            workspace_manager
+                .snapshot_working_copy(workspace_path)
+                .await?;
 
-    let outcome = workspace_manager
-        .create_verified_commit(workspace_path, &commit_message)
-        .await?;
+            workspace_manager
+                .create_verified_commit(workspace_path, commit_message_ref)
+                .await
+        },
+        environment,
+        workspace_path,
+        commit_message_ref,
+        cancel_token,
+    )
+    .await?;
 
     match &outcome {
         VerifiedCommitOutcome::Committed => info!(
@@ -770,13 +813,16 @@ enum FinalCommitAttempt {
 /// Attempt the verified final Apply commit for the current loop state.
 ///
 /// Terminal VCS failures propagate as `Err` and are never converted into agent
-/// feedback.
+/// feedback. That includes exhausted `index.lock` contention: the bounded
+/// retry lives inside the finalization boundary, so it never spends an
+/// Apply-agent hook-repair iteration.
 async fn attempt_final_commit(
     workspace_manager: Option<&dyn WorkspaceManager>,
     is_git: bool,
     workspace_path: &Path,
     change_id: &str,
     iteration: u32,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<FinalCommitAttempt> {
     if !is_git {
         return Ok(FinalCommitAttempt::Committed);
@@ -790,7 +836,15 @@ async fn attempt_final_commit(
         change_id, iteration
     );
 
-    match create_final_commit(ws_mgr, workspace_path, change_id).await? {
+    match create_final_commit_with_environment(
+        ws_mgr,
+        workspace_path,
+        change_id,
+        cancel_token,
+        &GitFinalCommitEnvironment,
+    )
+    .await?
+    {
         VerifiedCommitOutcome::Committed => Ok(FinalCommitAttempt::Committed),
         VerifiedCommitOutcome::RepositoryRejected(rejection) => {
             Ok(FinalCommitAttempt::Rejected(rejection))
@@ -1371,6 +1425,7 @@ where
                     workspace_path,
                     change_id,
                     attempts_so_far,
+                    cancel_token,
                 )
                 .await?
                 {
@@ -2145,6 +2200,7 @@ where
                 workspace_path,
                 change_id,
                 iteration,
+                cancel_token,
             )
             .await?
             {
@@ -4075,6 +4131,8 @@ mod tests {
 mod apply_commit_recovery {
     use super::tests::{count_acceptance_dispatch, init_git_repo, make_test_ai_runner};
     use super::*;
+    use crate::execution::final_commit_lock_retry::test_support::LockReleasingEnvironment;
+    use crate::execution::final_commit_lock_retry::FINAL_COMMIT_RETRY_DELAY;
     use crate::history::ApplyHistory;
     use crate::vcs::commands::VcsCommandOutput;
     use crate::vcs::git::commands::commit::{
@@ -4695,6 +4753,124 @@ mod apply_commit_recovery {
                 .completed
         );
         assert_eq!(parallel_repo.head_subject(), "Apply: caller-parallel");
+    }
+
+    // === Index-lock contention keeps the hook-repair contract (integration) ===
+
+    impl RecoveryRepo {
+        /// The managed worktree's own index lock path.
+        fn index_lock_path(&self) -> PathBuf {
+            self.workspace.join(".git").join("index.lock")
+        }
+
+        /// Hold that lock, as a competing Git process does.
+        fn hold_index_lock(&self) -> PathBuf {
+            let lock = self.index_lock_path();
+            std::fs::write(&lock, "held by another git process\n").unwrap();
+            lock
+        }
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn final_apply_commit_lock_preserves_hook_enabled_finalization_on_every_attempt() {
+        let repo = recovery_repo("lock-then-commit", COMPLETE_TASKS);
+        // The competing process releases its lock while the retry waits, so
+        // attempt one always hits contention and attempt two always clears it.
+        let environment = LockReleasingEnvironment::holding(repo.index_lock_path());
+        let config = OrchestratorConfig::default();
+        let ws_mgr = repo.workspace_manager(&config);
+
+        let outcome = create_final_commit_with_environment(
+            &ws_mgr,
+            &repo.workspace,
+            "lock-then-commit",
+            None,
+            &environment,
+        )
+        .await
+        .expect("transient contention must not fail finalization");
+
+        assert_eq!(outcome, VerifiedCommitOutcome::Committed);
+        assert_eq!(
+            environment.sleeps(),
+            vec![FINAL_COMMIT_RETRY_DELAY],
+            "the first attempt must have hit real contention and waited once"
+        );
+        assert!(
+            environment.lock_was_untouched(),
+            "Conflux must never delete or rewrite a lock it does not own"
+        );
+        assert_eq!(repo.head_subject(), "Apply: lock-then-commit");
+        assert!(
+            repo.hook_runs() >= 1,
+            "the retried final commit must still run repository verification"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn final_apply_commit_lock_rejection_still_routes_to_the_apply_repair_flow() {
+        // A hook rejection under the retry boundary must stay a typed
+        // `RepositoryRejected` and must not be re-attempted as contention:
+        // the existing bounded repair cycle owns it.
+        let repo = recovery_repo("lock-then-reject", COMPLETE_TASKS);
+        repo.block_commits();
+        let config = OrchestratorConfig::default();
+        let ws_mgr = repo.workspace_manager(&config);
+        let before = repo.head_subject();
+
+        let outcome = create_final_commit(&ws_mgr, &repo.workspace, "lock-then-reject")
+            .await
+            .expect("a hook rejection must not surface as a terminal VCS error");
+
+        let VerifiedCommitOutcome::RepositoryRejected(rejection) = outcome else {
+            panic!("the retry boundary must preserve the typed rejection");
+        };
+        assert_eq!(rejection.exit_code, Some(1));
+        assert!(rejection.stderr.contains("blocker.txt is present"));
+        assert_eq!(
+            repo.hook_runs(),
+            1,
+            "a rejection must cost exactly one commit attempt, not the lock retry budget"
+        );
+        assert_eq!(repo.head_subject(), before);
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn final_apply_commit_lock_exhaustion_is_terminal_without_a_repair_agent() {
+        let repo = recovery_repo("lock-forever", COMPLETE_TASKS);
+        let lock = repo.hold_index_lock();
+        let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh -c 'echo attempt >> {}'", apply_log.display())),
+            max_iterations: Some(5),
+            ..Default::default()
+        };
+
+        let result = run_recovery_loop(&repo, "lock-forever", &config).await;
+
+        assert_eq!(
+            count_acceptance_dispatch(&result),
+            0,
+            "exhausted contention must not hand off to acceptance"
+        );
+        let failure = caller_visible_failure(&result)
+            .expect("exhausted contention must surface as an apply failure");
+        assert!(failure.contains("did not clear"), "{failure}");
+        assert!(failure.contains("index.lock"), "{failure}");
+        assert!(
+            !apply_log.exists(),
+            "lock exhaustion must not consume the Apply-agent hook-repair budget"
+        );
+        assert_eq!(
+            repo.hook_runs(),
+            0,
+            "contention stops before repository verification runs"
+        );
+        assert!(lock.exists(), "Conflux must never delete a live lock");
+        assert_ne!(repo.head_subject(), "Apply: lock-forever");
     }
 }
 

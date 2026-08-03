@@ -9,10 +9,14 @@
 //! - `types` - Common type definitions (`ExecutionContext`, `ExecutionResult`, `ProgressInfo`)
 //! - `archive` - Common archive operation logic (path verification, task completion)
 //! - `apply` - Common apply operation logic (iteration control, progress commits)
+//! - `index_lock` - Shared managed-worktree `index.lock` evidence primitives
 //! - `wip_lock_retry` - Transient WIP snapshot `index.lock` retry policy
+//! - `final_commit_lock_retry` - Transient final Apply commit `index.lock` retry policy
 
 pub mod apply;
 pub mod archive;
+pub mod final_commit_lock_retry;
+pub(crate) mod index_lock;
 pub mod state;
 pub mod types;
 pub mod wip_lock_retry;
