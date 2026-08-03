@@ -15,15 +15,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::json;
 
 use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
 use crate::orchestration::operator_command::{
-    ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, ParallelRuntime,
+    ExecutionMarkStore, MarkExclusion, NoopQueueHooks, OperatorCommandService, OperatorMode,
+    OperatorOutcome, ParallelRuntime, QueuePort, TerminationWaiter,
 };
 use crate::orchestration::run_control::{
     testing::RecordingScheduler, ResolveReservations, RunControlService,
@@ -72,10 +75,17 @@ struct Wired {
     parallel: Arc<ParallelRuntime>,
     scheduler: Arc<RecordingScheduler>,
     executor: SharedServiceExecutor,
+    service: Arc<OperatorCommandService>,
 }
 
 impl Wired {
     async fn new(change_ids: &[&str]) -> Self {
+        Self::with_queue(change_ids, Arc::new(crate::tui::queue::DynamicQueue::new())).await
+    }
+
+    /// Same wiring, over a caller-supplied queue port so a test can suspend a
+    /// mutation inside the queue effect and drive a real interleaving.
+    async fn with_queue(change_ids: &[&str], queue: Arc<dyn QueuePort>) -> Self {
         let reducer = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
             change_ids.iter().map(|id| id.to_string()).collect(),
             10,
@@ -96,7 +106,7 @@ impl Wired {
         let service = Arc::new(
             OperatorCommandService::new(
                 reducer.clone(),
-                Arc::new(crate::tui::queue::DynamicQueue::new()),
+                queue,
                 Arc::new(NoopQueueHooks),
                 marks.clone(),
             )
@@ -112,7 +122,7 @@ impl Wired {
         ));
         let projection = web_state.remote_control().projection();
         let executor =
-            SharedServiceExecutor::new(service, run_control, web_state.clone(), projection);
+            SharedServiceExecutor::new(service.clone(), run_control, web_state.clone(), projection);
 
         Self {
             web_state,
@@ -121,6 +131,7 @@ impl Wired {
             parallel,
             scheduler,
             executor,
+            service,
         }
     }
 
@@ -610,6 +621,269 @@ async fn one_ineligible_marked_target_rejects_a_remote_parallel_start_entirely()
         vec!["committed".to_string(), "uncommitted".to_string()],
         "marks and queue intent stay coherent after the refusal"
     );
+}
+
+// ============================================================================
+// Concurrency: the toggle and a bulk mark are one mutation each
+// ============================================================================
+
+/// A queue port that parks the first queue mutation until the test releases it.
+///
+/// The pause is a real await *inside* a service mutation, which is what lets a
+/// test place a second command in the middle of the first one deterministically
+/// instead of starting two tasks and hoping for the damaging interleaving.
+struct PausingQueue {
+    inner: crate::tui::queue::DynamicQueue,
+    parked_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    parked_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    release_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl PausingQueue {
+    fn new() -> Arc<Self> {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        Arc::new(Self {
+            inner: crate::tui::queue::DynamicQueue::new(),
+            parked_tx: Mutex::new(Some(parked_tx)),
+            parked_rx: Mutex::new(Some(parked_rx)),
+            release_tx: Mutex::new(Some(release_tx)),
+            release_rx: Mutex::new(Some(release_rx)),
+        })
+    }
+
+    /// Resolve once a mutation is parked inside its queue effect.
+    async fn parked(&self) {
+        let rx = self
+            .parked_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("parked() is awaited once per queue");
+        rx.await.expect("a queue mutation must be reached");
+    }
+
+    /// Let the parked mutation run to completion.
+    fn release(&self) {
+        if let Some(tx) = self.release_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+    }
+
+    async fn pause_first_mutation(&self) {
+        let parked = self.parked_tx.lock().unwrap().take();
+        if let Some(tx) = parked {
+            let _ = tx.send(());
+            let release = self.release_rx.lock().unwrap().take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl QueuePort for PausingQueue {
+    async fn add(&self, change_id: &str) -> bool {
+        self.pause_first_mutation().await;
+        QueuePort::add(&self.inner, change_id).await
+    }
+
+    async fn remove(&self, change_id: &str) -> bool {
+        self.pause_first_mutation().await;
+        QueuePort::remove(&self.inner, change_id).await
+    }
+
+    async fn request_cancellation(
+        &self,
+        change_id: &str,
+    ) -> std::result::Result<Option<TerminationWaiter>, String> {
+        QueuePort::request_cancellation(&self.inner, change_id).await
+    }
+
+    async fn notify_scheduler(&self) {
+        QueuePort::notify_scheduler(&self.inner).await
+    }
+}
+
+/// The second mutation's outcome if it finished while the first one was parked,
+/// `None` if it was still waiting — which is what serialization looks like.
+///
+/// The result is *carried* rather than asserted on immediately so that an
+/// interleaving is judged by the state it leaves behind: the settled-state
+/// assertion runs first, and the ordering assertion only explains it.
+async fn settled_early(
+    handle: &mut tokio::task::JoinHandle<
+        crate::orchestration::operator_command::OperatorResult<OperatorOutcome>,
+    >,
+    accepted: &str,
+) -> Option<OperatorOutcome> {
+    tokio::time::timeout(Duration::from_millis(500), handle)
+        .await
+        .ok()
+        .map(|joined| {
+            joined
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{accepted}: {error}"))
+        })
+}
+
+/// Every ineligible row must end with neither a mark nor queue intent once
+/// parallel mode has settled on: that is the whole point of the toggle's
+/// cleanup, and it is exactly what an interleaved mutation can undo.
+async fn assert_parallel_settled_coherently(wired: &Wired) {
+    assert!(
+        wired.parallel.parallel_mode(),
+        "the toggle must have settled"
+    );
+    assert_eq!(
+        wired.marks.marked_ids(),
+        vec!["a_eligible".to_string()],
+        "parallel mode must not settle with an ineligible change marked"
+    );
+    assert_eq!(
+        wired.status("z_blocked").await,
+        "not queued",
+        "parallel mode must not settle with queue intent on an ineligible change"
+    );
+    assert_eq!(wired.status("a_eligible").await, "queued");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_toggle_arriving_inside_a_bulk_mark_cannot_leave_an_ineligible_row_marked() {
+    // The dangerous order from the other direction is covered by
+    // `a_bulk_mark_arriving_inside_a_toggle_classifies_against_the_settled_mode`.
+    let queue = PausingQueue::new();
+    let wired = Wired::with_queue(&["a_eligible", "z_blocked"], queue.clone()).await;
+    wired
+        .observe(
+            &["a_eligible", "z_blocked"],
+            &["a_eligible"],
+            &[],
+            "running",
+        )
+        .await;
+
+    // The bulk mark classifies while the mode is still sequential, so both rows
+    // are in its target set, and then parks inside its first queue mutation.
+    let bulk = tokio::spawn({
+        let service = wired.service.clone();
+        async move { service.set_all_execution_marks(OperatorMode::Running).await }
+    });
+    queue.parked().await;
+
+    // The toggle arrives mid-flight and must not observe, mutate, or clean up
+    // anything until the bulk mutation it would invalidate has finished. If it
+    // does slip in, its cleanup finds nothing to clear and the parked bulk
+    // mutation then marks and queues the ineligible row behind it.
+    let mut toggle = tokio::spawn({
+        let service = wired.service.clone();
+        async move { service.set_parallel_mode(OperatorMode::Stopped, true).await }
+    });
+    let raced = settled_early(&mut toggle, "Stopped mode accepts a toggle").await;
+    let interleaved = raced.is_some();
+
+    queue.release();
+    let bulk = bulk
+        .await
+        .unwrap()
+        .expect("Running mode accepts a bulk mark");
+    let toggle = match raced {
+        Some(outcome) => outcome,
+        None => toggle
+            .await
+            .unwrap()
+            .expect("Stopped mode accepts a toggle"),
+    };
+
+    assert_parallel_settled_coherently(&wired).await;
+    assert!(
+        !interleaved,
+        "the toggle must wait for the in-flight bulk mutation instead of interleaving with it"
+    );
+    match bulk {
+        OperatorOutcome::BulkMarks { marked, .. } => assert!(marked),
+        other => panic!("the bulk mutation must complete in full: {other:?}"),
+    }
+    match toggle {
+        OperatorOutcome::ParallelMode { enabled, cleared } => {
+            assert!(enabled);
+            assert_eq!(
+                cleared,
+                vec!["z_blocked".to_string()],
+                "the cleanup must see the marks the bulk mutation had just applied"
+            );
+        }
+        other => panic!("the toggle must apply after the bulk mutation: {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_bulk_mark_arriving_inside_a_toggle_classifies_against_the_settled_mode() {
+    let queue = PausingQueue::new();
+    let wired = Wired::with_queue(&["a_eligible", "z_blocked"], queue.clone()).await;
+    wired
+        .observe(
+            &["a_eligible", "z_blocked"],
+            &["a_eligible"],
+            &[],
+            "running",
+        )
+        .await;
+    wired.marks.replace(["z_blocked".to_string()]);
+    wired.reducer.write().await.apply_command(
+        crate::orchestration::state::ReducerCommand::AddToQueue("z_blocked".to_string()),
+    );
+
+    // The toggle parks inside the queue removal of its own cleanup.
+    let toggle = tokio::spawn({
+        let service = wired.service.clone();
+        async move { service.set_parallel_mode(OperatorMode::Stopped, true).await }
+    });
+    queue.parked().await;
+
+    let mut bulk = tokio::spawn({
+        let service = wired.service.clone();
+        async move { service.set_all_execution_marks(OperatorMode::Running).await }
+    });
+    let raced = settled_early(&mut bulk, "Running mode accepts a bulk mark").await;
+    let interleaved = raced.is_some();
+
+    queue.release();
+    toggle
+        .await
+        .unwrap()
+        .expect("Stopped mode accepts a toggle");
+    let bulk = match raced {
+        Some(outcome) => outcome,
+        None => bulk
+            .await
+            .unwrap()
+            .expect("Running mode accepts a bulk mark"),
+    };
+
+    assert_parallel_settled_coherently(&wired).await;
+    assert!(
+        !interleaved,
+        "a bulk mark must not classify against a toggle that is still applying"
+    );
+    match bulk {
+        OperatorOutcome::BulkMarks {
+            marked,
+            changed,
+            excluded,
+        } => {
+            assert!(marked);
+            assert_eq!(changed, vec!["a_eligible".to_string()]);
+            assert_eq!(
+                excluded,
+                vec![("z_blocked".to_string(), MarkExclusion::ParallelIneligible)],
+                "the plan must be derived from the mode the toggle settled on"
+            );
+        }
+        other => panic!("the bulk mutation must apply after the toggle: {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -398,6 +398,17 @@ pub struct ParallelCleanupRow<'a> {
 #[derive(Debug, Default)]
 pub struct ParallelRuntime {
     inner: Mutex<ParallelRuntimeInner>,
+    /// Serializes whole operator mutations, not individual field accesses.
+    ///
+    /// `inner` makes one read or one write atomic; it cannot make a *sequence*
+    /// atomic, and both mutations that span the toggle await in the middle of
+    /// theirs. Enabling parallel mode clears the intent of every change parallel
+    /// mode refuses, and a bulk mark classifies against the toggle and then
+    /// awaits the reducer and the queue. Interleaved, a bulk mark that
+    /// classified in sequential mode can resume after the cleanup has run and
+    /// re-mark exactly the row the cleanup cleared. Holding this guard for the
+    /// whole of either mutation is what makes that impossible.
+    mutations: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Default)]
@@ -493,6 +504,15 @@ impl ParallelRuntime {
             max_concurrent: guard.max_concurrent,
             vcs_backend: guard.vcs_backend.clone(),
         }
+    }
+
+    /// Take the shared guard for one indivisible operator mutation.
+    ///
+    /// Held for the entire mutation, across every await inside it. Nothing on
+    /// the read path takes it, so publishing facts and rendering a snapshot are
+    /// never blocked by a mutation in flight.
+    pub async fn lock_mutations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutations.lock().await
     }
 
     /// Targets that parallel mode refuses, in request order.
@@ -1116,6 +1136,10 @@ impl OperatorCommandService {
     /// mode clears the mark and queue intent of every change parallel mode
     /// refuses, so the target set a later start reads is coherent by
     /// construction rather than rejected at start time.
+    ///
+    /// The cleanup and the toggle are one mutation, taken under the shared
+    /// mutation guard: a bulk mark cannot run between them, and no reader can
+    /// observe parallel mode while intent parallel mode refuses is still live.
     pub async fn set_parallel_mode(
         &self,
         mode: OperatorMode,
@@ -1124,17 +1148,23 @@ impl OperatorCommandService {
         if !matches!(mode, OperatorMode::Select | OperatorMode::Stopped) {
             return Err(OperatorCommandError::ParallelModeNotAllowed { mode });
         }
+
+        let _mutation = self.parallel.lock_mutations().await;
+
         if enabled && !self.parallel.is_available() {
             return Err(OperatorCommandError::ParallelUnavailable);
         }
-        if !self.parallel.set_parallel_mode(enabled) {
+        if self.parallel.parallel_mode() == enabled {
             return Ok(OperatorOutcome::NoOp {
                 change_id: String::new(),
                 reason: NoOpReason::ParallelModeUnchanged,
             });
         }
 
-        // Only enabling can strand intent: serial mode refuses nothing.
+        // Only enabling can strand intent: serial mode refuses nothing. The
+        // cleanup runs *before* the toggle is published so the toggle becoming
+        // visible and the intent it invalidates disappearing are the same
+        // instant; the guard is what makes that ordering meaningful.
         let mut cleared = Vec::new();
         if enabled {
             for change_id in self.cleanup_targets_for_parallel().await {
@@ -1145,6 +1175,7 @@ impl OperatorCommandService {
                 }
             }
         }
+        self.parallel.set_parallel_mode(enabled);
 
         Ok(OperatorOutcome::ParallelMode { enabled, cleared })
     }
@@ -1175,6 +1206,10 @@ impl OperatorCommandService {
     /// receives the identical mark. Excluded rows keep whatever intent they
     /// already had and are reported with a stable reason instead of being
     /// silently skipped.
+    ///
+    /// Classification and application are one mutation under the shared guard,
+    /// so the toggle this reads cannot move — and its cleanup cannot run —
+    /// while the plan derived from it is still being applied.
     pub async fn set_all_execution_marks(
         &self,
         mode: OperatorMode,
@@ -1182,6 +1217,8 @@ impl OperatorCommandService {
         if !supports_bulk_marks(mode) {
             return Err(OperatorCommandError::BulkMarksNotAllowed { mode });
         }
+
+        let _mutation = self.parallel.lock_mutations().await;
 
         let parallel_mode = self.parallel.parallel_mode();
         // One read, one classification: re-reading per row could observe two
