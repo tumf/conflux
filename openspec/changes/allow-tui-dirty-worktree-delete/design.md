@@ -2,51 +2,77 @@
 
 ## Decision
 
-Represent dirty discard as a separate TUI intent and modal state, not as an interpretation of ordinary deletion or `skip_teardown`.
+Use the service's fresh `Dirty` refusal to escalate into a typed destructive modal. Do not add dirty state to `WorktreeInfo` or remote DTOs. Keep known-dirty discard and teardown skipping as independent permissions.
 
-The shared service receives two independent policy bits:
+## State machine
 
-- whether `.wt/teardown` may be skipped
-- whether known dirty content may be discarded
+```text
+D
+  -> ConfirmWorktreeDelete(path, expected identity/ref)
 
-Both default to false. Remote callers use the existing fail-closed constructor and cannot set either permission.
+Y
+  -> DeleteIntent(skip_teardown=false, allow_known_dirty=false)
 
-## Flow
+S
+  -> DeleteIntent(skip_teardown=true, allow_known_dirty=false)
 
-1. `D` opens the ordinary delete confirmation with path and branch identity.
-2. Confirmation evaluates a fresh worktree observation.
-3. A clean eligible target emits ordinary deletion with dirty discard disabled.
-4. A known dirty target opens a destructive confirmation instead of emitting deletion.
-5. The dedicated destructive input emits deletion with dirty discard enabled.
-6. `WorktreeService` takes the repository mutation guard, observes again, validates branch identity and every eligibility guard, then runs teardown and removal.
-7. Any drift refuses deletion and retains the resource.
+service result:
+  clean + eligible -> delete
+  Dirty -> ConfirmDirtyDiscard(path, identity, branch, head, skip_teardown)
+  anything else -> retain + actionable warning
 
-## Safety boundaries
+ConfirmDirtyDiscard:
+  uppercase X -> DeleteIntent(captured skip_teardown, allow_known_dirty=true)
+  N/Esc -> cancel
+  every other key -> no mutation
+```
 
-Known dirty state and unknown dirty state remain different. Explicit discard may waive only `DirtyState::Dirty`; it never converts `DirtyState::Unknown` into permission. It also does not waive main-worktree, base-merge, commits-ahead, active/deleting, or branch-identity checks.
+The existing ordinary modal must display both `Y` and `S` semantics. The destructive modal states permanent loss of tracked/index changes, reported non-ignored untracked entries, and possible generated/ignored directory content.
 
-Teardown and dirty discard remain orthogonal because they protect different data. Dirty discard authorizes loss of worktree files. Skip-teardown authorizes bypassing repository-defined cleanup. Combining them would make one confirmation grant more authority than its text describes.
+## Mutation boundary
 
-The option belongs in the shared service rather than directly calling the Git helper from the TUI. This preserves one mutation guard, one fresh-observation boundary, mandatory teardown ordering, branch cleanup, and events.
+```text
+shared repository-scoped guard
+  -> fresh observation
+  -> expected Git identity, branch and HEAD/ref validation
+  -> main/base-merge/ahead/dirty safety checks
+  -> teardown unless skipped
+  -> second observation
+  -> repeat identity/ref and non-dirty safety checks
+  -> require Dirty or Clean according to explicit policy; Unknown always refuses
+  -> structured dirty-discard warning
+  -> git worktree remove --force
+  -> delete branch only when ref/reachability still match validated facts
+  -> events/refresh
+```
+
+TUI and Web receive the same `Arc<WorktreeService>` or an equivalent shared repository-scoped guard. A per-command service-local mutex is insufficient.
+
+Active/deleting eligibility currently belongs to TUI state rather than `WorktreeFacts`. The TUI rechecks it before dispatch. If implementation cannot make activation and deletion share a reservation boundary, the guarantee is limited to latest TUI state at dispatch plus repository facts at service mutation; it must not claim atomic exclusion against later activation. A process-local delete reservation may be introduced only if needed to close that race and must be honored by run/queue admission.
+
+## Observation semantics
+
+Known dirty is based on explicit porcelain status with non-ignored untracked reporting. Ignored-only content can appear clean. Safety-critical failures for dirty, base resolution, commits ahead, base merge, identity, or ref state are explicit unknown/errors and refuse deletion.
+
+Known dirty-discard waives only known `Dirty`. It never waives an unknown fact, commits ahead, main status, or identity/ref mismatch.
+
+## Branch preservation
+
+Worktree removal and branch deletion are distinct outcomes. After forced worktree removal, branch cleanup remains best-effort but may use destructive deletion only when the branch ref equals the validated OID and reachability can be reconfirmed. A moved or unverifiable ref is retained with warning so commits do not become unreachable through a stale cleanup decision.
+
+## Threat boundary
+
+The shared guard serializes Conflux-owned mutations. Re-observation detects observable drift before removal. External Git processes can still race after the final check; no filesystem/Git atomic transaction is claimed.
 
 ## Alternatives rejected
 
-### Make the current `Y` confirmation delete dirty worktrees
-
-Rejected because the current dialog does not distinguish ordinary directory retirement from permanent loss of uncommitted and untracked files.
-
-### Reuse `S` as force delete
-
-Rejected because `S` already means skip teardown. Reinterpreting it would conflate independent permissions and make existing recovery behavior destructive in a new way.
-
-### Automatically stash or commit before deletion
-
-Rejected because it creates repository state the operator did not request, needs naming and recovery policy, and does not satisfy the goal of cheaply deleting disposable worktrees.
-
-### Expose force deletion remotely
-
-Rejected because the canonical remote contract intentionally excludes unsafe recovery controls and cannot provide a local interactive destructive boundary.
+- Current `Y` as force: insufficient data-loss distinction.
+- `S` as force: conflates teardown and dirty permissions.
+- TUI dirty projection: stale and unnecessarily widens DTO/state.
+- Auto stash/commit: creates unrequested repository state.
+- Remote force: violates the closed remote contract.
+- Dirty fingerprints or ignored-file scans: unnecessary for explicit disposable deletion.
 
 ## Verification strategy
 
-Pure eligibility tests cover the permission matrix. TUI state and key tests cover the two-stage interaction and cancellation. Service tests cover fresh observation, drift, teardown ordering, and events. Remote API tests prove the unsafe capability remains absent. These checks fail if implementation only changes dialog text or only bypasses the first dirty guard.
+Pure tests cover policy and unknown states. TUI tests cover the exact key matrix and captured teardown bit. Service tests cover shared serialization and both observations. Real-Git heavy tests mutate identity/ref and teardown state and prove branch retention. API/OpenAPI tests prove the remote capability remains absent. Each filtered suite first uses `--list` plus a non-empty assertion so absent new tests cannot pass silently.
