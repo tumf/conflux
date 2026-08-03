@@ -110,11 +110,6 @@ pub enum SchedulerRunReport {
 }
 
 impl SchedulerRunReport {
-    /// Whether this run finished with unresolved change-local failures.
-    pub fn has_change_failures(self) -> bool {
-        matches!(self, Self::CompletedWithErrors)
-    }
-
     /// Whether this run ended without completing every eligible change.
     ///
     /// Boundaries use this to withhold a success announcement: both
