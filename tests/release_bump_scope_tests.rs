@@ -572,6 +572,58 @@ fn staged_owned_path_change_blocks_release() {
 }
 
 #[test]
+fn deleted_tracked_openapi_blocks_release() {
+    let fx = Fixture::new(true);
+    let base_head = fx.head();
+    // A tracked release-owned artifact deleted from the worktree is still
+    // release-owned, so its deletion must be rejected before any mutation.
+    fs::remove_file(fx.repo.join("docs/openapi.yaml")).unwrap();
+
+    let out = fx.bump(&["patch"]);
+    assert_failure(&out);
+    assert!(
+        stderr_of(&out).contains("Release-owned paths must match HEAD"),
+        "{}",
+        describe(&out)
+    );
+    assert!(
+        stderr_of(&out).contains("docs/openapi.yaml"),
+        "the deleted owned path must be reported: {}",
+        describe(&out)
+    );
+
+    assert_eq!(fx.head(), base_head, "no release commit may be created");
+    assert_eq!(fx.commit_count(), 1);
+    assert!(fx.tags().is_empty(), "no release tag may be created");
+    let published = fx.origin_refs();
+    assert_eq!(published.get("refs/heads/main"), Some(&base_head));
+    assert!(!published.contains_key("refs/tags/v0.1.1"));
+    // Mutation never ran and the deletion was not silently restored.
+    assert_eq!(fx.manifest_version(), "0.1.0");
+    assert!(!fx.exists("docs/openapi.yaml"));
+    assert!(
+        fx.cargo_log().trim().is_empty(),
+        "cargo must not run once owned paths are dirty"
+    );
+}
+
+#[test]
+fn staged_deletion_of_tracked_openapi_blocks_release() {
+    let fx = Fixture::new(true);
+    let base_head = fx.head();
+    fx.git_ok(&["rm", "-q", "docs/openapi.yaml"]);
+
+    let out = fx.bump(&["patch"]);
+    assert_failure(&out);
+    assert!(stderr_of(&out).contains("Release-owned paths must match HEAD"));
+
+    assert_eq!(fx.head(), base_head);
+    assert!(fx.tags().is_empty());
+    assert_eq!(fx.origin_rev("refs/heads/main"), Some(base_head));
+    assert_eq!(fx.manifest_version(), "0.1.0");
+}
+
+#[test]
 fn untracked_owned_lockfile_blocks_release() {
     let fx = Fixture::new(false);
     // Simulate a lockfile that exists but was never committed.
@@ -630,6 +682,48 @@ fn generation_failure_blocks_tag_push_and_a_version_advancing_retry() {
     assert!(stderr_of(&retry).contains("Release-owned paths must match HEAD"));
     assert_eq!(fx.head(), base_head);
     assert!(fx.tags().is_empty(), "retry must not create any tag");
+    assert_eq!(
+        fx.manifest_version(),
+        "0.1.1",
+        "retry must not calculate a later version"
+    );
+}
+
+#[test]
+fn staging_failure_blocks_tag_push_and_a_version_advancing_retry() {
+    let fx = Fixture::new(true);
+    let base_head = fx.head();
+    // A held index lock is the real staging failure this scoping change was
+    // written for: `git add` cannot lock the index, so the release must stop
+    // before the commit, tag, and push.
+    let index_lock = fx.repo.join(".git").join("index.lock");
+    fs::write(&index_lock, "").unwrap();
+
+    let out = fx.bump(&["patch"]);
+    assert_failure(&out);
+    assert!(
+        stderr_of(&out).contains("index.lock"),
+        "expected a real git staging failure: {}",
+        describe(&out)
+    );
+    fs::remove_file(&index_lock).unwrap();
+
+    assert_eq!(fx.head(), base_head, "no release commit");
+    assert_eq!(fx.commit_count(), 1);
+    assert!(fx.tags().is_empty(), "no release tag");
+    let published = fx.origin_refs();
+    assert_eq!(published.get("refs/heads/main"), Some(&base_head));
+    assert!(!published.contains_key("refs/tags/v0.1.1"));
+    // Visible local state is left as-is rather than cleaned.
+    assert_eq!(fx.manifest_version(), "0.1.1", "mutation is left visible");
+
+    // A retry must refuse while owned paths are dirty, without advancing.
+    let retry = fx.bump(&["patch"]);
+    assert_failure(&retry);
+    assert!(stderr_of(&retry).contains("Release-owned paths must match HEAD"));
+    assert_eq!(fx.head(), base_head);
+    assert!(fx.tags().is_empty(), "retry must not create any tag");
+    assert_eq!(fx.origin_rev("refs/heads/main"), Some(base_head));
     assert_eq!(
         fx.manifest_version(),
         "0.1.1",
@@ -771,6 +865,98 @@ fn tagged_release_missing_its_push_resumes_the_same_version() {
             .map(|t| fx.git_ok(&["rev-list", "-n", "1", t])),
         Some(release_head)
     );
+}
+
+#[test]
+fn release_labelled_commit_with_unrelated_contents_is_not_resumed() {
+    let fx = Fixture::new(true);
+    // A commit carrying the release subject but also unrelated contents is not
+    // a valid scoped release commit, so it must never be tagged or published.
+    fx.write(
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.1.1\"\nedition = \"2021\"\n",
+    );
+    fx.write("unrelated.md", "swept in by an unscoped release\n");
+    fx.git_ok(&["add", "Cargo.toml", "unrelated.md"]);
+    fx.git_ok(&["commit", "-q", "-m", "chore(release): release v0.1.1"]);
+    let bad_head = fx.head();
+
+    let out = fx.bump(&["patch"]);
+    assert_failure(&out);
+    assert!(
+        stderr_of(&out).contains("not a valid scoped release commit"),
+        "{}",
+        describe(&out)
+    );
+
+    assert_eq!(fx.head(), bad_head, "no commit may be created");
+    assert_eq!(fx.commit_count(), 2);
+    assert!(
+        fx.tags().is_empty(),
+        "the invalid commit must not be tagged"
+    );
+    let published = fx.origin_refs();
+    assert_ne!(published.get("refs/heads/main"), Some(&bad_head));
+    assert!(!published.contains_key("refs/tags/v0.1.1"));
+    assert_eq!(
+        fx.manifest_version(),
+        "0.1.1",
+        "the version must not advance from an unresolved release state"
+    );
+
+    // Dry-run reports the same refusal without side effects.
+    let dry = fx.bump(&["patch", "--dry-run"]);
+    assert_failure(&dry);
+    assert!(stderr_of(&dry).contains("not a valid scoped release commit"));
+    assert!(fx.tags().is_empty());
+}
+
+#[test]
+fn lightweight_tag_at_head_is_rejected_instead_of_published() {
+    let fx = Fixture::new(true);
+    let release_head = release_commit_without_tag(&fx);
+    // The requirement is an annotated tag; a lightweight tag left at HEAD is
+    // not acceptable evidence of a completed release.
+    fx.git_ok(&["tag", "v0.1.1"]);
+    assert_eq!(fx.git_ok(&["cat-file", "-t", "v0.1.1"]), "commit");
+
+    let out = fx.bump(&["patch"]);
+    assert_failure(&out);
+    assert!(
+        stderr_of(&out).contains("not an annotated tag"),
+        "{}",
+        describe(&out)
+    );
+
+    assert_eq!(fx.head(), release_head, "no commit may be created");
+    assert_eq!(fx.commit_count(), 2);
+    assert_eq!(
+        fx.tags(),
+        vec!["v0.1.1".to_string()],
+        "no further version may be created"
+    );
+    assert_eq!(
+        fx.git_ok(&["cat-file", "-t", "v0.1.1"]),
+        "commit",
+        "the lightweight tag must be left for the operator to resolve"
+    );
+    let published = fx.origin_refs();
+    assert_ne!(published.get("refs/heads/main"), Some(&release_head));
+    assert!(
+        !published.contains_key("refs/tags/v0.1.1"),
+        "an unannotated release must not be published"
+    );
+    assert_eq!(fx.manifest_version(), "0.1.1");
+
+    // Recreating the tag as annotated lets the same release resume.
+    fx.git_ok(&["tag", "-a", "-f", "v0.1.1", "-m", "Release v0.1.1"]);
+    let resume = fx.bump(&["patch"]);
+    assert_success(&resume);
+    assert_eq!(fx.head(), release_head);
+    assert_eq!(fx.commit_count(), 2);
+    let published = fx.origin_refs();
+    assert_eq!(published.get("refs/heads/main"), Some(&release_head));
+    assert!(published.contains_key("refs/tags/v0.1.1"));
 }
 
 // --- Dry run ----------------------------------------------------------------
@@ -921,6 +1107,11 @@ fn release_guide_documents_the_owned_path_contract() {
         "chore(release): release vX.Y.Z",
         "--dry-run",
         "Resuming an interrupted release",
+        // Ownership survives deletion of a tracked artifact, and a resume needs
+        // commit/tag evidence rather than a matching subject.
+        "in the index, or in",
+        "Resuming only happens on evidence",
+        "is annotated",
     ] {
         assert!(
             guide.contains(needle),

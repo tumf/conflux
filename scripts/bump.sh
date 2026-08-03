@@ -73,9 +73,59 @@ next_core_version() {
 # so a release can never absorb unrelated concurrent work in the repository.
 set_release_owned_paths() {
 	RELEASE_OWNED_PATHS=(Cargo.toml Cargo.lock)
-	if [[ -f docs/openapi.yaml ]]; then
+	# Ownership of the optional artifact is decided from tracked/HEAD state as
+	# well as worktree presence. A file that is tracked but deleted from the
+	# worktree stays owned, so its deletion is rejected as a dirty release-owned
+	# path instead of silently dropping out of validation.
+	if [[ -f docs/openapi.yaml ]] ||
+		git ls-files --error-unmatch -- docs/openapi.yaml >/dev/null 2>&1 ||
+		git cat-file -e HEAD:docs/openapi.yaml 2>/dev/null; then
 		RELEASE_OWNED_PATHS+=(docs/openapi.yaml)
 	fi
+}
+
+path_is_release_owned() {
+	local candidate="$1" owned
+	for owned in "${RELEASE_OWNED_PATHS[@]}"; do
+		if [[ "$candidate" == "$owned" ]]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Repository-visible proof that HEAD really is the scoped release commit for
+# the given version: the release subject, a non-empty change set, the manifest
+# among the changed paths, and nothing outside the release-owned set.
+head_is_scoped_release_commit() {
+	local version="$1"
+	if [[ "$(git log -1 --pretty=%s)" != "chore(release): release v${version}" ]]; then
+		return 1
+	fi
+
+	local changed
+	changed=$(git diff-tree --no-commit-id --name-only -r HEAD)
+	if [[ -z "$changed" ]]; then
+		return 1
+	fi
+
+	local path
+	local saw_manifest=false
+	while IFS= read -r path; do
+		[[ -n "$path" ]] || continue
+		if ! path_is_release_owned "$path"; then
+			return 1
+		fi
+		if [[ "$path" == "Cargo.toml" ]]; then
+			saw_manifest=true
+		fi
+	done <<<"$changed"
+
+	$saw_manifest
+}
+
+tag_is_annotated() {
+	[[ "$(git cat-file -t "refs/tags/$1" 2>/dev/null)" == "tag" ]]
 }
 
 # True when every release-owned path matches HEAD in both index and worktree.
@@ -143,6 +193,16 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
 	# Recovery: the tag for the manifest version already points at HEAD, so the
 	# release commit and tag exist and only publication may be incomplete.
 	if [[ -n "$CURRENT_TAG_HEAD" && "$CURRENT_TAG_HEAD" == "$CURRENT_HEAD" ]]; then
+		if ! head_is_scoped_release_commit "$CURRENT_VERSION"; then
+			echo "Tag v${CURRENT_VERSION} points at HEAD, but HEAD is not a valid scoped release commit for v${CURRENT_VERSION}" >&2
+			echo "Resolve the release state manually before retrying" >&2
+			exit 1
+		fi
+		if ! tag_is_annotated "v${CURRENT_VERSION}"; then
+			echo "Tag v${CURRENT_VERSION} at HEAD is not an annotated tag" >&2
+			echo "Recreate it with 'git tag -a v${CURRENT_VERSION} -m \"Release v${CURRENT_VERSION}\" --force' before retrying" >&2
+			exit 1
+		fi
 		if $DRY_RUN; then
 			echo "[dry-run] Would push ${CURRENT_BRANCH} and existing tag v${CURRENT_VERSION}"
 			exit 0
@@ -156,6 +216,14 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
 	# is missing, so complete the same release instead of bumping again.
 	HEAD_SUBJECT=$(git log -1 --pretty=%s)
 	if [[ -z "$CURRENT_TAG_HEAD" && "$HEAD_SUBJECT" == "chore(release): release v${CURRENT_VERSION}" ]]; then
+		# The subject alone is not proof: only tag a HEAD whose contents are the
+		# scoped release commit for this version.
+		if ! head_is_scoped_release_commit "$CURRENT_VERSION"; then
+			echo "HEAD is labelled release v${CURRENT_VERSION} but is not a valid scoped release commit" >&2
+			echo "Expected a commit changing only: ${RELEASE_OWNED_PATHS[*]}" >&2
+			echo "Resolve the release state manually before retrying" >&2
+			exit 1
+		fi
 		if $DRY_RUN; then
 			echo "[dry-run] Would tag v${CURRENT_VERSION} at HEAD and push ${CURRENT_BRANCH}"
 			exit 0

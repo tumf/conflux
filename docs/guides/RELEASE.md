@@ -51,14 +51,15 @@ A `main`/`master` release owns exactly these paths:
 
 - `Cargo.toml`
 - `Cargo.lock`
-- `docs/openapi.yaml` (only when the file exists)
+- `docs/openapi.yaml` (only when it exists in the worktree, in the index, or in
+  `HEAD` — so deleting a tracked one does not remove it from the owned set)
 
 The whole worktree does **not** need to be clean. The bump only requires the
 release-owned paths to match `HEAD` in both the index and the worktree; if any
-of them has a staged, unstaged, or untracked change the bump exits non-zero
-before touching anything, prints the offending paths, and creates no commit,
-tag, or push. Restore or commit those paths yourself — the release never
-cleans, resets, or guesses ownership of them.
+of them has a staged, unstaged, untracked, or deleted change the bump exits
+non-zero before touching anything, prints the offending paths, and creates no
+commit, tag, or push. Restore or commit those paths yourself — the release
+never cleans, resets, or guesses ownership of them.
 
 Unrelated staged, unstaged, and untracked work is allowed and is preserved:
 the release stages only the owned paths and commits them with
@@ -89,6 +90,14 @@ failed run is safe to re-run once the cause is fixed:
   branch and tag again and only then reports the release complete.
 - **`--dry-run`** stays side-effect-free in all of the above states: it reports
   the action it would take and creates no commit, tag, or push.
+
+Resuming only happens on evidence, never on a label. `HEAD` counts as the
+release commit for the current version only when its subject is
+`chore(release): release vX.Y.Z` **and** it changes `Cargo.toml` and nothing
+outside the release-owned paths; a matching tag at `HEAD` counts only when it
+is annotated. Otherwise the bump exits non-zero without tagging, pushing, or
+advancing the version, and asks you to resolve the state — for example with
+`git tag -a vX.Y.Z -m "Release vX.Y.Z" --force` to replace a lightweight tag.
 
 To bypass a failing `pre-commit` hook for the release commit, set
 `OPENSPEC_GIT_COMMIT_NO_VERIFY=true` (this is what the Conflux hook
