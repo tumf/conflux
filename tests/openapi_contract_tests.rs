@@ -122,6 +122,88 @@ fn the_artifact_declares_itself_generated() {
     );
 }
 
+/// Everything else here proves the artifact is *currently* right. This proves
+/// the check would notice if it stopped being right — the one property a suite
+/// of positive assertions can never establish about itself.
+///
+/// A scratch copy of the artifact is drifted by dropping a required field, then
+/// run through the exact predicate `make check-openapi` uses (`diff -u tracked
+/// generated`, whose exit status is the target's pass/fail). The failure has to
+/// name the field that moved, because a diff that does not is not a useful
+/// error message. Regenerating over the fixture — the byte-for-byte effect of
+/// `make openapi` — then has to clear it.
+///
+/// The fixture is a private copy in a scratch directory: the check must be
+/// provable without the tracked artifact ever being written to.
+#[test]
+fn the_drift_check_fails_on_a_mutated_schema_and_passes_after_regeneration() {
+    let dir = scratch_dir("drift-fixture");
+    let tracked = dir.join("openapi.yaml");
+    let generated = dir.join("generated.yaml");
+    std::fs::write(&generated, document_yaml()).expect("scratch generated artifact");
+
+    // An omitted required field is the drift a reviewer is least likely to
+    // catch by eye and a generated client is most likely to trust.
+    let drifted = without_required_event_sequence(&artifact_text());
+    assert_ne!(drifted, document_yaml(), "the fixture must actually drift");
+    std::fs::write(&tracked, &drifted).expect("scratch drifted artifact");
+
+    let (matches, diff) = unified_diff(&tracked, &generated);
+    assert!(
+        !matches,
+        "the drift check accepted an artifact whose EventEnvelope no longer requires event_sequence"
+    );
+    assert!(
+        diff.contains("event_sequence"),
+        "the drift failure must name what moved, got:\n{diff}"
+    );
+
+    std::fs::write(&tracked, document_yaml()).expect("regenerate scratch artifact");
+    let (matches, diff) = unified_diff(&tracked, &generated);
+    assert!(matches, "regeneration must clear the drift, got:\n{diff}");
+
+    std::fs::remove_dir_all(&dir).expect("scratch dir is removable");
+}
+
+/// The comparison `check-openapi` performs, run the same way the target runs it.
+fn unified_diff(tracked: &Path, generated: &Path) -> (bool, String) {
+    let output = std::process::Command::new("diff")
+        .arg("-u")
+        .arg(tracked)
+        .arg(generated)
+        .output()
+        .expect("diff(1) is available; check-openapi depends on it too");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("cflx-openapi-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch directory is creatable");
+    dir
+}
+
+/// Drop `event_sequence` from `EventEnvelope`'s required list, touching no other
+/// byte so the resulting diff is exactly the one line that drifted.
+fn without_required_event_sequence(text: &str) -> String {
+    const SCHEMA: &str = "\n    EventEnvelope:\n";
+    const ENTRY: &str = "\n      - event_sequence\n";
+    let schema_at = text
+        .find(SCHEMA)
+        .expect("EventEnvelope is a published schema");
+    let entry_at = text[schema_at..]
+        .find(ENTRY)
+        .map(|offset| schema_at + offset)
+        .expect("EventEnvelope requires event_sequence");
+    let mut drifted = String::with_capacity(text.len());
+    drifted.push_str(&text[..=entry_at]);
+    drifted.push_str(&text[entry_at + ENTRY.len()..]);
+    drifted
+}
+
 #[test]
 fn the_repository_tracks_exactly_one_openapi_artifact() {
     // A second file cannot be kept honest, and a stale one is worse than none
@@ -160,7 +242,8 @@ fn collect_openapi_files(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
             if !SKIP.contains(&name.as_str()) {
                 collect_openapi_files(&path, depth + 1, found);
             }
-        } else if name.starts_with("openapi.") && (name.ends_with(".yaml") || name.ends_with(".json"))
+        } else if name.starts_with("openapi.")
+            && (name.ends_with(".yaml") || name.ends_with(".json"))
         {
             found.push(path);
         }
@@ -260,7 +343,10 @@ fn protected_router() -> axum::Router {
 
     #[async_trait::async_trait]
     impl RemoteControlExecutor for RefusingExecutor {
-        async fn execute(&self, _command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure> {
+        async fn execute(
+            &self,
+            _command: &CommandSpec,
+        ) -> Result<ExecutionSummary, CommandFailure> {
             unreachable!("the route-binding probe never presents credentials")
         }
     }
@@ -422,9 +508,18 @@ fn command_outcome_and_event_vocabularies_are_complete() {
         CommandState::Failed,
     ]
     .iter()
-    .map(|s| serde_json::to_value(s).unwrap().as_str().unwrap().to_string())
+    .map(|s| {
+        serde_json::to_value(s)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    })
     .collect();
-    assert_eq!(states, known_states, "command outcomes must all be published");
+    assert_eq!(
+        states, known_states,
+        "command outcomes must all be published"
+    );
 
     let categories: BTreeSet<String> = schemas(&doc)["EventCategory"]["enum"]
         .as_array()
@@ -436,7 +531,13 @@ fn command_outcome_and_event_vocabularies_are_complete() {
     let known_categories: BTreeSet<String> =
         [EventCategory::State, EventCategory::Log, EventCategory::Gap]
             .iter()
-            .map(|c| serde_json::to_value(c).unwrap().as_str().unwrap().to_string())
+            .map(|c| {
+                serde_json::to_value(c)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
     assert_eq!(
         categories, known_categories,
@@ -641,7 +742,8 @@ fn validate(value: &Value, schema: &Value, defs: &Value, path: &str, errors: &mu
         Value::Object(_) => "object",
     };
     // JSON Schema treats an integer as an acceptable `number`.
-    if !types.contains(&actual) && !(actual == "integer" && types.contains(&"number")) {
+    let accepted = types.contains(&actual) || (actual == "integer" && types.contains(&"number"));
+    if !accepted {
         errors.push(format!("{path}: serialized {actual}, published {types:?}"));
         return;
     }
@@ -666,7 +768,9 @@ fn validate(value: &Value, schema: &Value, defs: &Value, path: &str, errors: &mu
                         Some(property) => {
                             validate(member, property, defs, &format!("{path}.{name}"), errors)
                         }
-                        None => errors.push(format!("{path}: `{name}` is serialized but unpublished")),
+                        None => {
+                            errors.push(format!("{path}: `{name}` is serialized but unpublished"))
+                        }
                     }
                 }
             }
