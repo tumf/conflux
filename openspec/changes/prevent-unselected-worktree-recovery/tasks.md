@@ -53,8 +53,42 @@ The implementation must also pass `cargo test parallel::tests::executor && cargo
   `parallel_startup_queues_only_selected_targets_and_refresh_does_not_widen_it`,
   `tui_queue_commands_drive_the_scheduler_eligibility_boundary`.
 - evidence: `cargo fmt -- --check` and `cargo clippy --all-targets -- -D warnings` pass.
+- Acceptance repair (`dynamic-queue-intent-fail-open`): the reducer is now the sole authority on
+  ordinary queue intent, and every read of it fails closed. `admit_dynamic_queue_hint` validates each
+  wake-up hint before the catalog is consulted, refusing when no reducer is wired, when `try_read` is
+  contended, on a final terminal state, and when current intent does not admit the ID.
+  `is_ordinary_queue_eligible` no longer treats a reducer-unknown ID as admissible, because every
+  accepted path (start, `AddToQueue`, `RetryError`, `add_dynamic_change`) records reducer runtime
+  state before a hint is published. `classify_queued_work` also fails closed: an unreadable snapshot
+  used to look like "no change is waiting" and could classify a `MergeWait` or held candidate as
+  dispatchable.
+- Refusing on contention loses no intent: `reconcile_queued_candidates_from_shared_state` runs on the
+  same scheduler pass and re-adds every reducer-queued ID from `queued_change_ids()`, so a refused
+  hint costs at most one wake-up. This is asserted directly in
+  `dynamic_hint_and_classification_fail_closed_under_reducer_lock_contention`.
+- Related file outside the finding's declared set: `src/parallel/tests/manual_resolve.rs`. Its three
+  dynamic-queue ingestion tests drove the queue with no reducer at all, which the fail-closed gate in
+  the declared `src/parallel/queue_state.rs` now rejects. They were updated to record `AddToQueue`
+  intent before pushing the hint, which is the production order in
+  `OperatorCommandService::add_to_queue`; the shared helper is `shared_state_with_queue_intent`.
+  `test_idle_queue_addition_marks_reanalysis_and_enqueues_change` in the declared
+  `src/parallel/tests/executor.rs` was updated the same way.
+- evidence: `cargo test --lib` passes (2816 tests) after the repair, including the two new gate
+  regressions; `cargo fmt -- --check` and `cargo clippy --all-targets -- -D warnings` stay clean.
 
 ## Future Work
 
 - A separate operator workflow may expose interrupted unrequested worktrees as attention items, but observability must not grant execution intent.
 - Canonical duplicate requirement cleanup outside the exact promoted `Queue ingestion and analysis targeting` result may be handled as repository specification hygiene if archive promotion does not already collapse identical headings.
+
+## Current Acceptance Follow-up
+- attempt: 1
+- [x] [dynamic-queue-intent-fail-open] (major) Dynamic queue hints can bypass reducer-owned execution intent | evidence: src/parallel/queue_state.rs:1857-1895 skips eligibility validation when shared state try_read() is contended, then admits the dynamic ID from the catalog; src/orchestration/state.rs:1406-1413 treats IDs absent from reducer state as ordinarily eligible despite dynamic notifications being wake-up hints only; src/parallel/queue_state.rs:2296-2309 and 2322-2389 do not recheck reducer queue intent before classifying an already-added candidate as dispatchable | required_changes: src/parallel/queue_state.rs — Fail closed when reducer state cannot be read and require current reducer-owned ordinary eligibility before ingesting every dynamic queue hint; src/orchestration/state.rs — Do not treat reducer-unknown IDs as ordinary queue eligible; src/parallel/tests/executor.rs — Add regressions proving unknown hints and hints observed during reducer lock contention cannot enter analysis or dispatch | verification: src/parallel/tests/executor.rs — Hold or contend the shared reducer write lock while ingesting a revoked dynamic hint, and separately enqueue an ID absent from reducer state; assert neither changes the queued candidates or reaches analysis/dispatch
+  finding: {"evidence":["src/parallel/queue_state.rs:1857-1895 skips eligibility validation when shared state try_read() is contended, then admits the dynamic ID from the catalog","src/orchestration/state.rs:1406-1413 treats IDs absent from reducer state as ordinarily eligible despite dynamic notifications being wake-up hints only","src/parallel/queue_state.rs:2296-2309 and 2322-2389 do not recheck reducer queue intent before classifying an already-added candidate as dispatchable"],"id":"dynamic-queue-intent-fail-open","required_changes":[{"description":"Fail closed when reducer state cannot be read and require current reducer-owned ordinary eligibility before ingesting every dynamic queue hint","file":"src/parallel/queue_state.rs"},{"description":"Do not treat reducer-unknown IDs as ordinary queue eligible","file":"src/orchestration/state.rs"},{"description":"Add regressions proving unknown hints and hints observed during reducer lock contention cannot enter analysis or dispatch","file":"src/parallel/tests/executor.rs"}],"severity":"major","summary":"Dynamic queue hints can bypass reducer-owned execution intent","verification":[{"description":"Hold or contend the shared reducer write lock while ingesting a revoked dynamic hint, and separately enqueue an ID absent from reducer state; assert neither changes the queued candidates or reaches analysis/dispatch","file":"src/parallel/tests/executor.rs"}]}
+  evidence: src/parallel/queue_state.rs:1901-1958 `admit_dynamic_queue_hint` refuses every hint when the reducer is absent (`reducer_state_absent`) or `try_read` is contended (`reducer_state_unreadable`), before any catalog lookup
+  evidence: src/parallel/queue_state.rs:2028-2041 ingestion now runs that single validated admission gate for every hint, so no path reaches `list_changes_native_from` without current reducer-owned ordinary eligibility
+  evidence: src/parallel/queue_state.rs:2413-2450 `classify_queued_work` fails closed on an unreadable reducer snapshot and reports every candidate as `candidate_unavailable` instead of reading empty wait sets as dispatchable
+  evidence: src/orchestration/state.rs:1396-1424 `is_ordinary_queue_eligible` returns false for a reducer-unknown ID, so catalog membership alone can no longer authorize ordinary work
+  evidence: src/parallel/tests/executor.rs:12639-12760 `reducer_unknown_dynamic_hint_never_enters_analysis_or_dispatch` proves an ID absent from reducer state leaves queued candidates unchanged, is refused for missing intent rather than a catalog miss, and never reaches the recorded analyzer input or dispatch
+  evidence: src/parallel/tests/executor.rs:12762-12898 `dynamic_hint_and_classification_fail_closed_under_reducer_lock_contention` holds the shared write lock while ingesting a revoked hint, asserts nothing is queued and classification is `CandidateUnavailable`/blocked-only, then proves real intent still returns through reconciliation once readable
+  evidence: `cargo test --lib` passes (2816 tests), `cargo fmt -- --check` and `cargo clippy --all-targets -- -D warnings` clean

@@ -1401,11 +1401,19 @@ impl OrchestratorState {
     /// accepted addition cannot reacquire the change; an explicit `AddToQueue`
     /// or `RetryError` restores eligibility.
     ///
-    /// A change the reducer has never seen is unknown rather than revoked, so it
-    /// stays admissible and the caller's own catalog lookup decides.
+    /// A change the reducer has never seen carries no execution intent at all, so
+    /// it is not eligible either. Every accepted path into ordinary work —
+    /// start, `AddToQueue`, `RetryError`, and catalog registration through
+    /// `add_dynamic_change` — records reducer runtime state before any scheduler
+    /// wake-up hint is published, so "unknown to the reducer" cannot describe
+    /// work an operator asked for. Treating unknown as admissible would let any
+    /// ID that reaches the wake-up channel be resolved from the catalog and
+    /// executed without intent, which is the bypass this predicate exists to
+    /// close. Catalog membership alone still is not eligibility: a registered
+    /// change stays `QueueIntent::NotQueued` until an explicit command.
     pub fn is_ordinary_queue_eligible(&self, change_id: &str) -> bool {
         match self.change_runtime.get(change_id) {
-            None => true,
+            None => false,
             Some(rt) => {
                 !rt.is_terminal()
                     && !rt.dequeued

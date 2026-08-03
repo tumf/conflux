@@ -19,6 +19,28 @@ use tempfile::TempDir;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+/// Wire the reducer the way production does before a dynamic queue push.
+///
+/// `OperatorCommandService::add_to_queue` applies `AddToQueue` first and only
+/// then publishes the wake-up hint, and ingestion validates the hint against
+/// that reducer intent — never against the catalog alone — so a dynamic-queue
+/// test must record the same intent to exercise the accepted path.
+fn shared_state_with_queue_intent(
+    change_ids: &[&str],
+) -> Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>> {
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+
+    let mut state = OrchestratorState::with_mode(
+        change_ids.iter().map(|id| id.to_string()).collect(),
+        1,
+        ExecutionMode::Parallel,
+    );
+    for change_id in change_ids {
+        state.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+    }
+    Arc::new(tokio::sync::RwLock::new(state))
+}
+
 /// Helper function to create a test config with all required commands
 fn create_test_config() -> OrchestratorConfig {
     OrchestratorConfig {
@@ -443,6 +465,10 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
     executor.set_dynamic_queue(dynamic_queue.clone());
     executor.set_scheduler_lifetime(SchedulerLifetime::Persistent);
     executor.set_manual_resolve_counter(gated_resolve_counter.clone());
+    executor.set_shared_orchestrator_state(shared_state_with_queue_intent(&[
+        seed_change_id,
+        synthetic_change_id,
+    ]));
 
     let scheduler_queue = dynamic_queue.clone();
     let scheduler = tokio::spawn(async move {
@@ -532,6 +558,11 @@ async fn persistent_scheduler_dynamic_queue_push_after_initial_analysis_bypasses
     executor.set_cancel_token(cancel_token.clone());
     executor.set_dynamic_queue(dynamic_queue.clone());
     executor.set_scheduler_lifetime(SchedulerLifetime::Persistent);
+    // Only the seed carries queue intent at start. The dynamic change acquires
+    // it at push time, in the production order: reducer intent first, wake-up
+    // hint second.
+    let shared = shared_state_with_queue_intent(&[seed_change_id]);
+    executor.set_shared_orchestrator_state(shared.clone());
 
     let scheduler = tokio::spawn(async move {
         executor
@@ -555,6 +586,12 @@ async fn persistent_scheduler_dynamic_queue_push_after_initial_analysis_bypasses
     .await
     .expect("initial running scheduler analysis should start promptly");
 
+    shared
+        .write()
+        .await
+        .apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+            dynamic_change_id.to_string(),
+        ));
     assert!(dynamic_queue.push(dynamic_change_id.to_string()).await);
 
     let mut saw_dynamic_ingest = false;
@@ -615,6 +652,12 @@ async fn dynamic_queue_ingestion_validates_candidates_against_executor_repo_root
         Some(tx),
     );
     executor.set_dynamic_queue(dynamic_queue);
+    // Both IDs carry accepted reducer queue intent, so the repo-root catalog
+    // lookup is the only thing that can separate them here.
+    executor.set_shared_orchestrator_state(shared_state_with_queue_intent(&[
+        present_change_id,
+        absent_change_id,
+    ]));
 
     let mut queued = Vec::new();
     let in_flight = HashSet::new();

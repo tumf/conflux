@@ -61,6 +61,16 @@ impl QueueReconciliationOutcome {
     }
 }
 
+/// Outcome of validating one dynamic queue wake-up hint against reducer intent.
+///
+/// The refusal carries the diagnostic reason and operator-facing log line so the
+/// ingestion loop keeps a single skip path and every refusal is observable.
+#[derive(Debug)]
+enum DynamicQueueAdmission {
+    Admit,
+    Refuse { reason: &'static str, log: String },
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QueuedWorkClass {
@@ -1835,6 +1845,64 @@ impl ParallelExecutor {
         let _ = self.retry_deferred_rejection_review_for(change_id).await;
     }
 
+    /// Decide whether one dynamic queue hint may become scheduler-local work.
+    ///
+    /// A dynamic entry is a wake-up hint, never eligibility truth. Every accepted
+    /// path into ordinary work records reducer intent *before* the hint is
+    /// published (`add_to_queue` applies `AddToQueue`/`RetryError` first, start
+    /// queues its resolved targets first), so the reducer is the only authority
+    /// here and this check must fail closed:
+    ///
+    /// - no reducer wired, or a reducer snapshot that cannot be read right now,
+    ///   means eligibility is unproven, so the hint is refused rather than
+    ///   admitted from the catalog;
+    /// - a reducer-unknown ID carries no intent at all;
+    /// - `DequeueChange` does not drain the queue, so a stop-and-dequeue can
+    ///   leave a revoked ID sitting in it.
+    ///
+    /// Refusing costs at most one wake-up: `reconcile_queued_candidates_from_shared_state`
+    /// runs on the same scheduler pass and re-adds every genuinely reducer-queued
+    /// ID from `queued_change_ids()`, so intent that really exists is never lost.
+    fn admit_dynamic_queue_hint(&self, dynamic_id: &str) -> DynamicQueueAdmission {
+        let Some(shared) = &self.shared_orchestrator_state else {
+            return DynamicQueueAdmission::Refuse {
+                reason: "reducer_state_absent",
+                log: format!(
+                    "Ignoring queue entry with no reducer to authorize it: {}",
+                    dynamic_id
+                ),
+            };
+        };
+        let Ok(guard) = shared.try_read() else {
+            return DynamicQueueAdmission::Refuse {
+                reason: "reducer_state_unreadable",
+                log: format!(
+                    "Deferring queue entry until reducer queue intent is readable: {}",
+                    dynamic_id
+                ),
+            };
+        };
+        if guard.is_final_terminal_dispatch_stop(dynamic_id) {
+            return DynamicQueueAdmission::Refuse {
+                reason: "final_terminal",
+                log: format!(
+                    "Ignoring stale queue entry for final terminal change: {}",
+                    dynamic_id
+                ),
+            };
+        }
+        if !guard.is_ordinary_queue_eligible(dynamic_id) {
+            return DynamicQueueAdmission::Refuse {
+                reason: "no_current_queue_intent",
+                log: format!(
+                    "Ignoring stale queue entry without current queue intent: {}",
+                    dynamic_id
+                ),
+            };
+        }
+        DynamicQueueAdmission::Admit
+    }
+
     /// Check dynamic queue for newly added changes and update queued list.
     ///
     /// # Arguments
@@ -1854,45 +1922,18 @@ impl ParallelExecutor {
             let mut queue_changed = false;
             while let Some(dynamic_id) = queue.pop().await {
                 if !queued.iter().any(|c| c.id == dynamic_id) && !in_flight.contains(&dynamic_id) {
-                    if let Some(shared) = &self.shared_orchestrator_state {
-                        if let Ok(guard) = shared.try_read() {
-                            if guard.is_final_terminal_dispatch_stop(&dynamic_id) {
-                                info!(
-                                    change_id = %dynamic_id,
-                                    "Skipping dynamic queue ingestion because change is in a final terminal state"
-                                );
-                                drop(guard);
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::Log(LogEntry::info(format!(
-                                        "Ignoring stale queue entry for final terminal change: {}",
-                                        dynamic_id
-                                    ))),
-                                )
-                                .await;
-                                continue;
-                            }
-                            // A dynamic entry is a wake-up hint, not eligibility
-                            // truth. `DequeueChange` does not drain the queue, so
-                            // a stop-and-dequeue can leave the ID sitting here;
-                            // current reducer intent is what decides.
-                            if !guard.is_ordinary_queue_eligible(&dynamic_id) {
-                                info!(
-                                    change_id = %dynamic_id,
-                                    "Skipping dynamic queue ingestion because reducer queue intent was revoked"
-                                );
-                                drop(guard);
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::Log(LogEntry::info(format!(
-                                        "Ignoring stale queue entry without current queue intent: {}",
-                                        dynamic_id
-                                    ))),
-                                )
-                                .await;
-                                continue;
-                            }
-                        }
+                    // Reducer-owned intent is validated for every hint, before
+                    // the catalog is consulted at all.
+                    if let DynamicQueueAdmission::Refuse { reason, log } =
+                        self.admit_dynamic_queue_hint(&dynamic_id)
+                    {
+                        info!(
+                            change_id = %dynamic_id,
+                            reason,
+                            "Skipping dynamic queue ingestion because reducer-owned queue intent does not admit it"
+                        );
+                        send_event(&self.event_tx, ParallelEvent::Log(LogEntry::info(log))).await;
+                        continue;
                     }
 
                     match crate::openspec::list_changes_native_from(&self.repo_root) {
@@ -2285,6 +2326,10 @@ impl ParallelExecutor {
         // the reducer holds neither, the change is dispatched again, and
         // workspace evidence routes a complete unarchived apply revision back to
         // acceptance.
+        let reducer_snapshot = self
+            .shared_orchestrator_state
+            .as_ref()
+            .map(|state| state.try_read().ok());
         let (
             reducer_queued,
             merge_wait_ids,
@@ -2292,21 +2337,35 @@ impl ParallelExecutor {
             reject_wait_ids,
             acceptance_stalled,
             externally_blocked,
-        ) = self
-            .shared_orchestrator_state
-            .as_ref()
-            .and_then(|state| state.try_read().ok())
-            .map(|state| {
-                (
-                    state.queued_change_ids(),
-                    state.merge_wait_change_ids(),
-                    state.resolve_wait_change_ids(),
-                    state.reject_wait_change_ids(),
-                    state.acceptance_stalled_change_ids(),
-                    state.externally_blocked_change_ids(),
-                )
-            })
-            .unwrap_or_default();
+        ) = match reducer_snapshot {
+            Some(Some(state)) => (
+                state.queued_change_ids(),
+                state.merge_wait_change_ids(),
+                state.resolve_wait_change_ids(),
+                state.reject_wait_change_ids(),
+                state.acceptance_stalled_change_ids(),
+                state.externally_blocked_change_ids(),
+            ),
+            // A reducer that exists but cannot be read right now must fail
+            // closed. Falling through with empty wait sets would read as "no
+            // change is waiting" and could classify a `MergeWait`, lane-wait, or
+            // held candidate as dispatchable purely because of lock contention.
+            // Every candidate is instead reported as waiting-but-unavailable, so
+            // this pass dispatches nothing and the next pass reclassifies from a
+            // readable snapshot.
+            Some(None) => {
+                debug!(
+                    queued = queued.len(),
+                    "Deferring queue classification because reducer state is not readable"
+                );
+                classification.candidate_unavailable =
+                    queued.iter().map(|change| change.id.clone()).collect();
+                return classification;
+            }
+            // No reducer is wired at all: there is no reducer-owned wait state to
+            // consult, so scheduler-local candidates are classified on their own.
+            None => Default::default(),
+        };
         // An apply-origin external blocker suppresses dispatch exactly like an
         // acceptance-origin one; only the explanation differs.
         let held: HashSet<String> = acceptance_stalled

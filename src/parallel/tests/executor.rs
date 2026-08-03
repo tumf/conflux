@@ -5361,6 +5361,20 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
         .or_else(|| all_changes.first().map(|change| change.id.clone()))
         .or_fail("expected at least one change");
 
+    // Production order: an accepted queue addition records reducer intent
+    // before the wake-up hint is published, and ingestion validates against that
+    // intent rather than the catalog.
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.clone()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue(change_id.clone()));
+    executor.set_shared_orchestrator_state(shared);
+
     let dynamic_queue = Arc::new(DynamicQueue::new());
     dynamic_queue.push(change_id.to_string()).await;
     executor.set_dynamic_queue(dynamic_queue);
@@ -12606,6 +12620,289 @@ async fn queue_revocation_blocks_worktree_and_dynamic_reacquisition_until_explic
         "explicit requeue restores archived-dirty recovery"
     );
     assert_eq!(queued_after_requeue[0].id, "stale");
+}
+
+/// A dynamic queue entry is a wake-up hint, never intent. An ID the reducer has
+/// never seen carries no intent at all, so the catalog must not be allowed to
+/// turn it into work: it must not enter the queued candidates and must never
+/// reach the analyzer.
+#[tokio::test]
+async fn reducer_unknown_dynamic_hint_never_enters_analysis_or_dispatch() {
+    use crate::tui::queue::DynamicQueue;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    // Both changes are loadable from the catalog. Only reducer intent differs,
+    // so a refusal here can only come from the intent gate.
+    for change_id in ["selected", "unknown-to-reducer"] {
+        write_change_proposal(repo_dir.path(), change_id, &[]);
+        std::fs::write(
+            repo_dir
+                .path()
+                .join("openspec/changes")
+                .join(change_id)
+                .join("tasks.md"),
+            "## Implementation Tasks\n\n- [ ] Do the work\n",
+        )
+        .or_fail("write change tasks");
+    }
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(
+        repo_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["selected".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("selected".to_string()));
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    executor.set_dynamic_queue(dynamic_queue.clone());
+    assert!(dynamic_queue.push("unknown-to-reducer".to_string()).await);
+
+    assert!(
+        !shared
+            .read()
+            .await
+            .is_ordinary_queue_eligible("unknown-to-reducer"),
+        "an ID the reducer never saw carries no ordinary queue intent"
+    );
+
+    let mut queued = vec![make_test_change("selected")];
+    let mut in_flight = HashSet::new();
+    let mut reason = ReanalysisReason::Initial;
+    let ingested = executor
+        .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reason)
+        .await;
+
+    assert!(
+        !ingested,
+        "a reducer-unknown hint must not change the queued candidates"
+    );
+    assert_eq!(
+        queued
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["selected"],
+        "only the explicitly queued change may survive ingestion"
+    );
+    assert_eq!(reason, ReanalysisReason::Initial);
+
+    // Analysis runs on exactly what ingestion produced.
+    let analyzer_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let analyzer = recording_analyzer(analyzer_inputs.clone());
+    let mut join_set = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    executor
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            // Zero capacity keeps this at the analysis boundary: eligibility,
+            // not slots, is what must exclude the hint.
+            max_parallelism: 0,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::Initial,
+            analyzer: &analyzer,
+            semaphore: Arc::new(Semaphore::new(1)),
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
+        .await
+        .or_fail("analysis must succeed");
+
+    assert_eq!(
+        analyzer_inputs.lock().expect("analyzer input lock").clone(),
+        vec![vec!["selected".to_string()]],
+        "the analyzer must never be handed a reducer-unknown hint"
+    );
+    assert!(
+        in_flight.is_empty() && join_set.is_empty(),
+        "nothing may be dispatched for a reducer-unknown hint"
+    );
+
+    let mut refused_for_missing_intent = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(entry) = &event {
+            assert!(
+                !entry
+                    .message
+                    .contains("Dynamically added to parallel execution: unknown-to-reducer"),
+                "a reducer-unknown hint must never be admitted"
+            );
+            if entry.message.contains(
+                "Ignoring stale queue entry without current queue intent: unknown-to-reducer",
+            ) {
+                refused_for_missing_intent = true;
+            }
+        }
+    }
+    assert!(
+        refused_for_missing_intent,
+        "the refusal must be reported as missing queue intent, not as a catalog miss"
+    );
+}
+
+/// The reducer is the only authority on ordinary queue intent, so a snapshot it
+/// cannot hand out right now must fail closed. A hint observed while the shared
+/// write lock is held may not be admitted, and classification may not read the
+/// resulting empty wait sets as "nothing is waiting" and dispatch.
+#[tokio::test]
+async fn dynamic_hint_and_classification_fail_closed_under_reducer_lock_contention() {
+    use crate::tui::queue::DynamicQueue;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    for change_id in ["revoked", "queued-elsewhere", "merge-waiting"] {
+        write_change_proposal(repo_dir.path(), change_id, &[]);
+        std::fs::write(
+            repo_dir
+                .path()
+                .join("openspec/changes")
+                .join(change_id)
+                .join("tasks.md"),
+            "## Implementation Tasks\n\n- [ ] Do the work\n",
+        )
+        .or_fail("write change tasks");
+    }
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![
+            "revoked".to_string(),
+            "queued-elsewhere".to_string(),
+            "merge-waiting".to_string(),
+        ],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        // `revoked` was queued and then stopped-and-dequeued, which leaves the
+        // wake-up hint behind because `DequeueChange` does not drain the queue.
+        guard.apply_command(ReducerCommand::AddToQueue("revoked".to_string()));
+        guard.apply_command(ReducerCommand::DequeueChange("revoked".to_string()));
+        // `queued-elsewhere` carries real, current queue intent.
+        guard.apply_command(ReducerCommand::AddToQueue("queued-elsewhere".to_string()));
+        // A manual merge wait is reducer-owned waiting work that contention
+        // must not erase into "dispatchable".
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "merge-waiting".to_string(),
+            reason: "manual merge required".to_string(),
+            auto_resumable: false,
+        });
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    executor.set_dynamic_queue(dynamic_queue.clone());
+    assert!(dynamic_queue.push("revoked".to_string()).await);
+    assert!(dynamic_queue.push("queued-elsewhere".to_string()).await);
+
+    let mut queued: Vec<crate::openspec::Change> = Vec::new();
+    let in_flight = HashSet::new();
+    let mut reason = ReanalysisReason::Initial;
+
+    {
+        // Hold the shared write lock for the whole ingestion and classification
+        // pass, so every `try_read` inside them fails.
+        let _contended = shared.write().await;
+
+        let ingested = executor
+            .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reason)
+            .await;
+        assert!(
+            !ingested,
+            "no hint may be ingested while reducer intent is unreadable"
+        );
+        assert!(
+            queued.is_empty(),
+            "contention must not admit hints from the catalog"
+        );
+        assert_eq!(reason, ReanalysisReason::Initial);
+
+        // Reconciliation is the other candidate source and already fails closed.
+        assert_eq!(
+            executor
+                .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+                .await
+                .total_added(),
+            0,
+            "reconciliation must add nothing while the reducer is unreadable"
+        );
+
+        // Classification over an already-added candidate must not turn an
+        // unreadable snapshot into "no wait state, therefore dispatchable".
+        let contended_classification = executor
+            .classify_queued_work(
+                std::slice::from_ref(&make_test_change("merge-waiting")),
+                &in_flight,
+            )
+            .await;
+        assert!(
+            contended_classification.dispatchable.is_empty(),
+            "an unreadable reducer snapshot must not produce dispatchable work"
+        );
+        assert_eq!(
+            contended_classification.class_for("merge-waiting"),
+            Some(crate::parallel::queue_state::QueuedWorkClass::CandidateUnavailable),
+            "a candidate whose intent cannot be read is waiting, never dispatchable"
+        );
+        assert!(
+            contended_classification.is_blocked_only(),
+            "a contended pass must be blocked-only so analysis is skipped"
+        );
+    }
+
+    // Failing closed costs at most one wake-up: once the reducer is readable,
+    // real intent still arrives through reconciliation, and the revoked hint
+    // stays out.
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await
+            .queued_added,
+        1,
+        "genuine reducer intent is recovered on the next readable pass"
+    );
+    assert_eq!(
+        queued
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["queued-elsewhere"],
+        "only the change with current reducer queue intent comes back"
+    );
+
+    let readable_classification = executor
+        .classify_queued_work(
+            std::slice::from_ref(&make_test_change("merge-waiting")),
+            &in_flight,
+        )
+        .await;
+    assert!(
+        readable_classification.dispatchable.is_empty(),
+        "the reducer-owned merge wait is visible again and still blocks dispatch"
+    );
+    assert_eq!(
+        readable_classification.class_for("merge-waiting"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::ManualMergeWait),
+        "a readable snapshot reports the real wait lane instead of contention"
+    );
 }
 
 /// Reducer-owned lane intent is consumable on its own: an empty ordinary queue
