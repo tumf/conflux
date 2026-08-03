@@ -113,6 +113,107 @@ async fn query_credentials_are_refused_on_every_path_including_health() {
 }
 
 #[tokio::test]
+async fn query_credentials_are_refused_on_the_contract_discovery_routes() {
+    // These routes need no bearer token, which is exactly why they are the ones
+    // most likely to be mounted outside the gate. The published contract says
+    // credentials are rejected "on every path", so the token-free routes have to
+    // refuse them too rather than serve the document with a token in the URL.
+    let h = harness(Some(TOKEN), &[]);
+    for path in [
+        "/api/v2/openapi.yaml",
+        "/api/v2/openapi.json",
+        "/api/v2/docs",
+        "/api/v2/docs/",
+    ] {
+        let uri = format!("{path}?access_token={TOKEN}");
+        let (status, body) = status_and_json(send(&h.router, get(&uri, None)).await).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} must not teach clients to put tokens in URLs"
+        );
+        assert_eq!(body["error_code"], "unauthorized", "{path}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("query"),
+            "{path} must name the unsupported transport"
+        );
+    }
+}
+
+#[tokio::test]
+async fn subprotocol_credentials_are_refused_on_the_contract_discovery_routes() {
+    let h = harness(Some(TOKEN), &[]);
+    for path in [
+        "/api/v2/openapi.yaml",
+        "/api/v2/openapi.json",
+        "/api/v2/docs",
+        "/api/v2/docs/",
+    ] {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header("host", "127.0.0.1:8080")
+            .header("sec-websocket-protocol", format!("bearer.{TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = status_and_json(send(&h.router, request).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Sec-WebSocket-Protocol"),
+            "{path} must name the unsupported transport"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_origin_cannot_read_the_contract_documents() {
+    // Routing the contract routes through the gate means they inherit origin
+    // policy as well, so a browser page on an unlisted origin cannot read them.
+    let h = harness(Some(TOKEN), &[]);
+    for path in [
+        "/api/v2/openapi.yaml",
+        "/api/v2/openapi.json",
+        "/api/v2/docs",
+    ] {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let status = send(&h.router, request).await.status();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn the_contract_documents_stay_credential_free_behind_the_gate() {
+    // The other half of the property: gating must not start demanding a token
+    // for the routes that describe how to present one, nor for the Swagger UI's
+    // own assets, which would leave the page unable to render.
+    let h = harness(Some(TOKEN), &[]);
+    for path in [
+        "/api/v2/openapi.yaml",
+        "/api/v2/openapi.json",
+        "/api/v2/docs/",
+        "/api/v2/docs/swagger-ui.css",
+    ] {
+        let status = send(&h.router, get(path, None)).await.status();
+        assert_eq!(status, StatusCode::OK, "{path} must need no bearer token");
+    }
+
+    let status = send(&h.router, get("/api/v2/docs", None)).await.status();
+    assert!(
+        status.is_redirection(),
+        "/api/v2/docs must still redirect to the UI, got {status}"
+    );
+}
+
+#[tokio::test]
 async fn ordinary_query_parameters_are_still_accepted() {
     let h = harness(Some(TOKEN), &[]);
     let response = send(

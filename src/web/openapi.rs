@@ -54,6 +54,21 @@ pub const UNAUTHENTICATED_V2_PATHS: &[&str] = &[
     "/api/v2/docs",
 ];
 
+/// Whether a served path is exempt from bearer enforcement.
+///
+/// Exemption is *only* from the bearer check. Every other obligation the gate
+/// carries — origin policy, preflight handling, and the refusal of credentials
+/// smuggled through a query string or a WebSocket subprotocol — applies to these
+/// paths like any other, which is what lets the published contract say
+/// "on every path" and mean it.
+///
+/// [`UNAUTHENTICATED_V2_PATHS`] is the published list; the Swagger UI also serves
+/// its own static assets beneath `/api/v2/docs/`, which are part of the same
+/// contract-discovery page and must load without a token for it to render at all.
+pub fn is_unauthenticated_v2_path(path: &str) -> bool {
+    UNAUTHENTICATED_V2_PATHS.contains(&path) || path.starts_with("/api/v2/docs/")
+}
+
 /// Long-form contract semantics a generated consumer cannot infer from schemas.
 const API_DESCRIPTION: &str = "\
 Remote control of one running `cflx` process incarnation.

@@ -214,8 +214,14 @@ impl RemoteControlState {
 /// Mounted only by single-instance web monitoring. Server-mode project routing
 /// does not merge it: the two namespaces describe different things and sharing
 /// them would make `instance_id` meaningless.
+///
+/// Every route — including the contract-discovery routes, which need no bearer
+/// token — is registered before the gate layer, so origin policy, preflight
+/// handling, and the refusal of out-of-band credentials cover the whole
+/// namespace. Exempting a route from the *bearer* check is [`gate`]'s decision,
+/// not a reason to mount it outside the gate.
 pub fn router(state: RemoteControlState) -> Router {
-    let protected = Router::new()
+    Router::new()
         .route(HEALTH_PATH, get(reads::health))
         .route("/api/v2/capabilities", get(reads::capabilities))
         .route("/api/v2/instance", get(reads::instance))
@@ -229,15 +235,13 @@ pub fn router(state: RemoteControlState) -> Router {
         .route("/api/v2/commands/{command_id}", get(commands::get_command))
         .route("/api/v2/events", get(stream::events))
         .route("/api/v2/ws", get(stream::ws))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), gate))
-        .with_state(state);
-
-    protected
         .route("/api/v2/openapi.yaml", get(openapi_yaml))
         .merge(
             SwaggerUi::new("/api/v2/docs")
                 .url("/api/v2/openapi.json", crate::web::openapi::document()),
         )
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), gate))
+        .with_state(state)
 }
 
 /// Origin, credential-transport, and bearer enforcement for every v2 request.
@@ -273,7 +277,7 @@ async fn gate(State(state): State<RemoteControlState>, request: Request, next: N
 
     // The gate and the published contract read the same list, so a route cannot
     // be documented as authenticated while being served without credentials.
-    if !crate::web::openapi::UNAUTHENTICATED_V2_PATHS.contains(&request.uri().path()) {
+    if !crate::web::openapi::is_unauthenticated_v2_path(request.uri().path()) {
         if let Err(error) = state.auth.check_bearer(request.headers(), &correlation) {
             return error.into_response();
         }
