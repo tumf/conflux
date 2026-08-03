@@ -38,12 +38,73 @@ make bump-minor
 make bump-major
 ```
 
-This will:
-1. Validate you have a clean working tree
-2. Update version in Cargo.toml and Cargo.lock
-3. Create commit with message `chore(release): release vX.Y.Z`
+On `main`/`master` this will:
+1. Validate that the release-owned paths are clean (see below)
+2. Update version in `Cargo.toml`, `Cargo.lock`, and `docs/openapi.yaml` when present
+3. Create a commit with message `chore(release): release vX.Y.Z` containing only those paths
 4. Create annotated git tag `vX.Y.Z`
 5. Push commit and tag to origin
+
+### Release-owned paths
+
+A `main`/`master` release owns exactly these paths:
+
+- `Cargo.toml`
+- `Cargo.lock`
+- `docs/openapi.yaml` (only when it exists in the worktree, in the index, or in
+  `HEAD` — so deleting a tracked one does not remove it from the owned set)
+
+The whole worktree does **not** need to be clean. The bump only requires the
+release-owned paths to match `HEAD` in both the index and the worktree; if any
+of them has a staged, unstaged, untracked, or deleted change the bump exits
+non-zero before touching anything, prints the offending paths, and creates no
+commit, tag, or push. Restore or commit those paths yourself — the release
+never cleans, resets, or guesses ownership of them.
+
+Unrelated staged, unstaged, and untracked work is allowed and is preserved:
+the release stages only the owned paths and commits them with
+`git commit --only -- <owned paths>`, so files another session staged stay
+staged and stay out of the release commit. Unrelated dirt is also never
+counted as a release delta — if version generation produces no owned change,
+the bump exits non-zero without committing, tagging, or pushing.
+
+Because `on_merged` runs `make bump-patch` in the root repository while other
+sessions may be working there, this scoping is what keeps a release commit
+from absorbing someone else's files.
+
+### Resuming an interrupted release
+
+Retry behaviour is derived entirely from the repository's own Git state, so a
+failed run is safe to re-run once the cause is fixed:
+
+- **Failure before the commit lands** (version mutation, `cargo generate-lockfile`,
+  staging, or the commit itself, e.g. a rejecting `pre-commit` hook): no tag and
+  no push are created, and the partially mutated files are left in place. A
+  later bump then refuses to run because the owned paths are dirty, so it can
+  never silently advance to a further version. Restore or commit the owned
+  paths, then run the bump again.
+- **Commit created, tag missing**: re-running the bump recognises the release
+  commit for the current manifest version at `HEAD`, creates that same
+  annotated tag, and pushes. No second version is calculated.
+- **Commit and tag created, push failed**: re-running the bump pushes the same
+  branch and tag again and only then reports the release complete.
+- **`--dry-run`** stays side-effect-free in all of the above states: it reports
+  the action it would take and creates no commit, tag, or push.
+
+Resuming only happens on evidence, never on a label. `HEAD` counts as the
+release commit for the current version only when its subject is
+`chore(release): release vX.Y.Z` **and** it changes `Cargo.toml` and nothing
+outside the release-owned paths; a matching tag at `HEAD` counts only when it
+is annotated. Otherwise the bump exits non-zero without tagging, pushing, or
+advancing the version, and asks you to resolve the state — for example with
+`git tag -a vX.Y.Z -m "Release vX.Y.Z" --force` to replace a lightweight tag.
+
+To bypass a failing `pre-commit` hook for the release commit, set
+`OPENSPEC_GIT_COMMIT_NO_VERIFY=true` (this is what the Conflux hook
+configuration propagates).
+
+Non-`main` branches are unaffected by all of the above: they delegate to
+`cargo release` with a branch-derived pre-release version.
 
 On non-main branches, the bump targets create a pre-release version by appending a branch-derived suffix,
 e.g. `v1.0.0-develop`. This is useful for producing draft releases and Linux build artifacts.
@@ -131,7 +192,27 @@ Pre-release tags will create draft releases and skip Homebrew publishing.
 
 ### Release script fails validation
 
-**Problem**: "Working tree is not clean"
+**Problem**: "Release-owned paths must match HEAD before a release"
+
+The bump prints the offending paths. Only `Cargo.toml`, `Cargo.lock`, and
+`docs/openapi.yaml` matter here; unrelated dirty files are fine.
+
+```bash
+# Inspect only the release-owned paths
+git status --porcelain -- Cargo.toml Cargo.lock docs/openapi.yaml
+
+# Commit them, or restore them to HEAD
+git restore --staged --worktree -- Cargo.toml Cargo.lock docs/openapi.yaml
+```
+
+**Problem**: "No release changes produced for vX.Y.Z"
+
+Version generation left the release-owned paths identical to `HEAD`. Check
+that `Cargo.toml` has a `[package]` `version` field and that
+`cargo generate-lockfile` succeeded; unrelated dirty files are deliberately
+not treated as a release delta.
+
+**Problem**: "Working tree is not clean" (legacy `./scripts/release.sh`)
 ```bash
 # Check what's changed
 git status
