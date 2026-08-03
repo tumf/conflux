@@ -1,3 +1,6 @@
+use crate::orchestration::operator_command::{
+    plan_bulk_marks, supports_bulk_marks, BulkMarkPlan, MarkExclusion, MarkTargetRow, OperatorMode,
+};
 use crate::tui::events::{LogEntry, TuiCommand};
 use crate::tui::types::AppMode;
 
@@ -5,42 +8,18 @@ use super::{guards, AppState, ChangeState};
 
 /// Why a change is excluded from the bulk execution-mark toggle (`x`).
 ///
-/// Every variant is user-actionable: the TUI reports the grouped reasons so a
-/// partially applied bulk toggle never looks like it stopped halfway.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BulkToggleExclusion {
-    /// Running mode never converts an in-flight row into a stop request.
-    ActiveInRunning,
-    /// Parallel mode cannot queue a change that is not committed yet.
-    ParallelUncommitted,
-    /// Rejected proposals are read-only.
-    Rejected,
-}
-
-impl BulkToggleExclusion {
-    /// Ordering used when grouping exclusion reasons for display.
-    const ALL: [BulkToggleExclusion; 3] = [
-        BulkToggleExclusion::ActiveInRunning,
-        BulkToggleExclusion::ParallelUncommitted,
-        BulkToggleExclusion::Rejected,
-    ];
-
-    /// Short reason describing what the user can do about the exclusion.
-    pub(super) fn reason(self) -> &'static str {
-        match self {
-            BulkToggleExclusion::ActiveInRunning => "in progress (use K to stop)",
-            BulkToggleExclusion::ParallelUncommitted => {
-                "uncommitted in parallel mode (commit first)"
-            }
-            BulkToggleExclusion::Rejected => "rejected and read-only",
-        }
-    }
-}
+/// Re-exported from the shared operator vocabulary rather than defined here: a
+/// TUI-local exclusion enum would be free to disagree with the reason
+/// `/api/v2` reports for the identical row.
+pub(super) type BulkToggleExclusion = MarkExclusion;
 
 /// Snapshot of the bulk toggle target set, taken once per operation.
 ///
 /// Classification and target state come from the same snapshot so that every
-/// eligible row receives the identical mark state.
+/// eligible row receives the identical mark state. The classification itself is
+/// [`plan_bulk_marks`], the same function the `/api/v2`
+/// `set_all_execution_marks` command runs, so both frontends derive one target
+/// set and one set of exclusion reasons from the same rules.
 pub(super) struct BulkToggleSnapshot {
     /// Indices (into `changes`) of the rows the operation applies to.
     pub(super) eligible: Vec<usize>,
@@ -56,18 +35,23 @@ pub(super) struct BulkToggleSnapshot {
 impl BulkToggleSnapshot {
     /// Grouped exclusion reasons with counts, e.g. `2 rejected and read-only`.
     pub(super) fn exclusion_summary(&self) -> String {
-        BulkToggleExclusion::ALL
-            .iter()
-            .filter_map(|reason| {
-                let count = self
-                    .excluded
-                    .iter()
-                    .filter(|(_, actual)| actual == reason)
-                    .count();
-                (count > 0).then(|| format!("{} {}", count, reason.reason()))
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        BulkMarkPlan {
+            target_state: self.target_state,
+            eligible: Vec::new(),
+            excluded: self.excluded.clone(),
+        }
+        .exclusion_summary()
+    }
+}
+
+/// The operator-mode vocabulary the shared matrix is evaluated in.
+fn operator_mode(mode: &AppMode) -> OperatorMode {
+    match mode {
+        AppMode::Running => OperatorMode::Running,
+        AppMode::Stopping => OperatorMode::Stopping,
+        AppMode::Stopped => OperatorMode::Stopped,
+        AppMode::Error => OperatorMode::Error,
+        _ => OperatorMode::Select,
     }
 }
 
@@ -77,21 +61,12 @@ pub(super) fn classify_bulk_toggle_change(
     parallel_mode: bool,
     change: &ChangeState,
 ) -> Option<BulkToggleExclusion> {
-    if matches!(mode, AppMode::Running) && change.is_active_display_status() {
-        return Some(BulkToggleExclusion::ActiveInRunning);
-    }
-
-    match guards::classify_toggle_block(
-        change.is_parallel_eligible,
+    crate::orchestration::operator_command::classify_bulk_mark_row(
+        operator_mode(&mode),
         parallel_mode,
         &change.display_status_cache,
-    ) {
-        Some(guards::ToggleBlockReason::ParallelUncommitted) => {
-            Some(BulkToggleExclusion::ParallelUncommitted)
-        }
-        Some(guards::ToggleBlockReason::Rejected) => Some(BulkToggleExclusion::Rejected),
-        None => None,
-    }
+        change.is_parallel_eligible,
+    )
 }
 
 /// Classifies every change once and derives the shared target mark state.
@@ -100,23 +75,29 @@ pub(super) fn build_bulk_toggle_snapshot(
     parallel_mode: bool,
     changes: &[ChangeState],
 ) -> BulkToggleSnapshot {
-    let mut eligible = Vec::new();
-    let mut excluded = Vec::new();
+    let rows: Vec<MarkTargetRow<'_>> = changes
+        .iter()
+        .map(|change| MarkTargetRow {
+            change_id: &change.id,
+            display_status: &change.display_status_cache,
+            parallel_eligible: change.is_parallel_eligible,
+            marked: change.selected,
+        })
+        .collect();
+    let plan = plan_bulk_marks(operator_mode(&mode), parallel_mode, &rows);
 
-    for (index, change) in changes.iter().enumerate() {
-        match classify_bulk_toggle_change(mode.clone(), parallel_mode, change) {
-            Some(reason) => excluded.push((change.id.clone(), reason)),
-            None => eligible.push(index),
-        }
-    }
-
-    // If any eligible row is unmarked, mark them all; otherwise unmark them all.
-    let target_state = eligible.iter().any(|&index| !changes[index].selected);
+    // The plan names changes; the TUI mutates rows, so translate once here
+    // rather than letting the row list and the plan drift apart.
+    let eligible = plan
+        .eligible
+        .iter()
+        .filter_map(|id| changes.iter().position(|change| &change.id == id))
+        .collect();
 
     BulkToggleSnapshot {
         eligible,
-        excluded,
-        target_state,
+        excluded: plan.excluded,
+        target_state: plan.target_state,
     }
 }
 
@@ -130,7 +111,7 @@ pub(super) fn can_bulk_toggle_change(
 
 /// Modes where the bulk execution-mark toggle is meaningful.
 pub(super) fn is_bulk_toggle_mode(mode: &AppMode) -> bool {
-    matches!(mode, AppMode::Select | AppMode::Stopped | AppMode::Running)
+    supports_bulk_marks(operator_mode(mode))
 }
 
 /// Applies the bulk execution-mark toggle and reports the outcome.
@@ -349,15 +330,15 @@ mod tests {
 
         assert_eq!(
             classify_bulk_toggle_change(AppMode::Running, false, &active),
-            Some(BulkToggleExclusion::ActiveInRunning)
+            Some(BulkToggleExclusion::ChangeActive)
         );
         assert_eq!(
             classify_bulk_toggle_change(AppMode::Select, false, &rejected),
-            Some(BulkToggleExclusion::Rejected)
+            Some(BulkToggleExclusion::FinalStatus)
         );
         assert_eq!(
             classify_bulk_toggle_change(AppMode::Select, true, &uncommitted),
-            Some(BulkToggleExclusion::ParallelUncommitted)
+            Some(BulkToggleExclusion::ParallelIneligible)
         );
         assert_eq!(
             classify_bulk_toggle_change(AppMode::Select, false, &eligible),
@@ -367,6 +348,7 @@ mod tests {
         // Every reason must give the user something to act on.
         for reason in BulkToggleExclusion::ALL {
             assert!(!reason.reason().is_empty());
+            assert!(!reason.as_str().is_empty());
         }
     }
 
@@ -404,7 +386,7 @@ mod tests {
         assert_eq!(snapshot.eligible, vec![0]);
         assert_eq!(
             snapshot.excluded,
-            vec![("b".to_string(), BulkToggleExclusion::Rejected)]
+            vec![("b".to_string(), BulkToggleExclusion::FinalStatus)]
         );
         assert!(
             !snapshot.target_state,
@@ -429,8 +411,8 @@ mod tests {
             snapshot.exclusion_summary(),
             format!(
                 "2 {}, 1 {}",
-                BulkToggleExclusion::ActiveInRunning.reason(),
-                BulkToggleExclusion::Rejected.reason()
+                BulkToggleExclusion::ChangeActive.reason(),
+                BulkToggleExclusion::FinalStatus.reason()
             )
         );
     }

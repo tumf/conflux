@@ -11,8 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::orchestration::operator_command::{
-    MarkRoute, NoOpReason, OperatorCommandError, OperatorCommandService, OperatorMode,
-    OperatorOutcome,
+    MarkExclusion, MarkRoute, NoOpReason, OperatorCommandError, OperatorCommandService,
+    OperatorMode, OperatorOutcome,
 };
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
@@ -94,6 +94,16 @@ pub fn map_operator_error(error: &OperatorCommandError) -> CommandFailure {
         | OperatorCommandError::RetryUnsupported { .. } => {
             CommandFailure::new(ErrorCode::TargetIneligible, error.to_string())
         }
+        // A mode that has to move on, not a target that has to change: the same
+        // request succeeds once the run reaches Select or Stopped.
+        OperatorCommandError::ParallelModeNotAllowed { .. }
+        | OperatorCommandError::BulkMarksNotAllowed { .. } => {
+            CommandFailure::new(ErrorCode::LifecycleConflict, error.to_string())
+        }
+        // Parallel execution needs Git; no lifecycle transition makes it appear.
+        OperatorCommandError::ParallelUnavailable => {
+            CommandFailure::new(ErrorCode::TargetIneligible, error.to_string())
+        }
         // Termination did not confirm: the change is still occupying the root.
         OperatorCommandError::TerminationTimeout { .. } => {
             CommandFailure::new(ErrorCode::RootBusy, error.to_string())
@@ -133,10 +143,49 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
                 ExecutionSummary::changed(format!("retry accepted for {:?}", plan.change_ids))
             }
         }
+        OperatorOutcome::ParallelMode { enabled, cleared } => {
+            let mode = if *enabled { "parallel" } else { "sequential" };
+            if cleared.is_empty() {
+                ExecutionSummary::changed(format!("execution mode is now {mode}"))
+            } else {
+                // Naming the cleared rows is the whole point: an operator whose
+                // marks silently vanished cannot tell that from a lost command.
+                ExecutionSummary::changed(format!(
+                    "execution mode is now {mode}; cleared mark and queue intent for {cleared:?} \
+                     ({})",
+                    MarkExclusion::ParallelIneligible.reason()
+                ))
+            }
+        }
+        OperatorOutcome::BulkMarks {
+            marked,
+            changed,
+            excluded,
+        } => {
+            let action = if *marked { "marked" } else { "unmarked" };
+            let mut detail = format!("{} change(s) {action}: {changed:?}", changed.len());
+            if !excluded.is_empty() {
+                detail.push_str(&format!(
+                    ", {} excluded ({})",
+                    excluded.len(),
+                    summarize_exclusions(excluded)
+                ));
+            }
+            ExecutionSummary::changed(detail)
+        }
         OperatorOutcome::NoOp { change_id, reason } => {
             let why = match reason {
                 NoOpReason::MarkUnchanged => "execution mark already had the requested value",
                 NoOpReason::ReducerRejected => "the reducer produced no state change",
+                NoOpReason::ParallelModeUnchanged => {
+                    "execution mode already had the requested value"
+                }
+                NoOpReason::BulkMarksUnchanged => {
+                    "every eligible change already carried the derived mark"
+                }
+                NoOpReason::NoEligibleMarkTarget => {
+                    "no change is eligible for a bulk execution-mark mutation"
+                }
             };
             if change_id.is_empty() {
                 ExecutionSummary::no_op(why)
@@ -145,6 +194,24 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
             }
         }
     }
+}
+
+/// Group bulk-mark exclusions by reason with counts, e.g. `2 change_active`.
+///
+/// Stable tokens rather than prose: a client reading a command record's detail
+/// branches on the same vocabulary the change's `actions` block uses.
+fn summarize_exclusions(excluded: &[(String, MarkExclusion)]) -> String {
+    MarkExclusion::ALL
+        .iter()
+        .filter_map(|reason| {
+            let count = excluded
+                .iter()
+                .filter(|(_, actual)| actual == reason)
+                .count();
+            (count > 0).then(|| format!("{count} {}", reason.as_str()))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Map a run-lifecycle refusal onto a v2 error code.
@@ -363,6 +430,22 @@ impl SharedServiceExecutor {
             CommandSpec::ResolveMerge { change_id } => {
                 self.run(self.run_control.resolve_merge(change_id).await)
             }
+            // Both process-wide mutations route through the same per-change
+            // service the TUI uses, so the toggle guard, the ineligible-mark
+            // cleanup, and the bulk classification have exactly one
+            // implementation.
+            CommandSpec::SetParallelMode { enabled } => self
+                .service
+                .set_parallel_mode(mode, *enabled)
+                .await
+                .map(|outcome| summarize_outcome(&outcome))
+                .map_err(|error| map_operator_error(&error)),
+            CommandSpec::SetAllExecutionMarks => self
+                .service
+                .set_all_execution_marks(mode)
+                .await
+                .map(|outcome| summarize_outcome(&outcome))
+                .map_err(|error| map_operator_error(&error)),
             // Worktree commands carry no parameters, so there is nothing to
             // translate here: the closed target is passed straight to the shared
             // service, which owns every guard.

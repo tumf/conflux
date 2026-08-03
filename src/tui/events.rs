@@ -73,4 +73,10 @@ pub enum TuiCommand {
     },
     /// Force-stop and dequeue a single active change (during Running mode)
     DequeueChange(String),
+    /// Turn parallel execution on or off for the whole process.
+    ///
+    /// Carried as a command rather than applied in `AppState` so the `=` key
+    /// and the `/api/v2` `set_parallel_mode` command reach the same shared
+    /// service: the mode guard and the ineligible-intent cleanup exist once.
+    SetParallelMode(bool),
 }

@@ -4,7 +4,7 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
-use crate::orchestration::operator_command::QueueMutation;
+use crate::orchestration::operator_command::{OperatorOutcome, QueueMutation};
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
     SchedulerEffect,
@@ -329,6 +329,48 @@ pub async fn handle_tui_command(
                         path.display(),
                         e
                     )));
+                }
+            }
+        }
+        TuiCommand::SetParallelMode(enabled) => {
+            // Adapter only: the shared service owns the Select/Stopped guard,
+            // the availability guard, and the ineligible mark and queue-intent
+            // cleanup. The TUI adopts the resulting toggle and reports what the
+            // service actually did, so `=` and `/api/v2` cannot diverge.
+            let service = ctx.run_control.operator();
+            match service.set_parallel_mode(ctx.app.operator_mode(), enabled).await {
+                Ok(OperatorOutcome::ParallelMode { enabled, cleared }) => {
+                    ctx.app.sync_parallel_mode_from_runtime();
+                    ctx.app.apply_display_statuses_from_reducer(
+                        &shared_state.read().await.all_display_statuses(),
+                    );
+                    ctx.app.add_log(LogEntry::info(format!(
+                        "Parallel mode {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    )));
+                    if !cleared.is_empty() {
+                        let message = format!(
+                            "Removed uncommitted changes from queue in parallel mode: {}",
+                            cleared.join(", ")
+                        );
+                        ctx.app.warning_message = Some(message.clone());
+                        ctx.app.add_log(LogEntry::warn(message));
+                    }
+                }
+                Ok(OperatorOutcome::NoOp { .. }) => {
+                    // Never silent: a keypress that changed nothing has to say so.
+                    let message = format!(
+                        "Parallel mode already {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    );
+                    ctx.app.warning_message = Some(message.clone());
+                    ctx.app.add_log(LogEntry::info(message));
+                }
+                Ok(other) => debug!("Parallel toggle produced an unexpected outcome: {:?}", other),
+                Err(error) => {
+                    let message = format!("Parallel mode change rejected: {}", error);
+                    ctx.app.warning_message = Some(message.clone());
+                    ctx.app.add_log(LogEntry::warn(message));
                 }
             }
         }
@@ -673,6 +715,9 @@ mod tests {
         pub(super) scheduler: Arc<RecordingScheduler>,
         pub(super) run_control: Arc<RunControlService>,
         pub(super) marks: Arc<ExecutionMarkStore>,
+        /// The one parallel runtime store both adapters read and mutate.
+        pub(super) parallel:
+            Arc<crate::orchestration::operator_command::ParallelRuntime>,
         pub(super) resolves: Arc<ResolveReservations>,
         pub(super) config: OrchestratorConfig,
         pub(super) tx: mpsc::Sender<OrchestratorEvent>,
@@ -700,17 +745,22 @@ mod tests {
         ) -> Self {
             let (tx, rx) = mpsc::channel(256);
             let marks = Arc::new(ExecutionMarkStore::new());
+            let parallel = Arc::new(StartEligibility::new());
+            parallel.set_available(true);
             let hook_runner = crate::hooks::HookRunner::with_event_tx(
                 config.get_hooks(),
                 PathBuf::from("."),
                 tx.clone(),
             );
-            let operator = Arc::new(OperatorCommandService::new(
-                state.clone(),
-                Arc::new(queue.clone()),
-                Arc::new(HookRunnerQueueHooks::new(hook_runner)),
-                marks.clone(),
-            ));
+            let operator = Arc::new(
+                OperatorCommandService::new(
+                    state.clone(),
+                    Arc::new(queue.clone()),
+                    Arc::new(HookRunnerQueueHooks::new(hook_runner)),
+                    marks.clone(),
+                )
+                .with_parallel(parallel.clone()),
+            );
             let scheduler = Arc::new(RecordingScheduler::new());
             let resolves = Arc::new(ResolveReservations::new());
             let run_control = Arc::new(RunControlService::new(
@@ -718,7 +768,7 @@ mod tests {
                 operator,
                 scheduler.clone(),
                 resolves.clone(),
-                Arc::new(StartEligibility::new()),
+                parallel.clone(),
             ));
             Self {
                 state,
@@ -726,6 +776,7 @@ mod tests {
                 scheduler,
                 run_control,
                 marks,
+                parallel,
                 resolves,
                 config,
                 tx,
@@ -744,6 +795,9 @@ mod tests {
             app.set_shared_state(self.state.clone());
             app.set_resolve_reservations(self.resolves.clone());
             app.set_execution_marks(self.marks.clone());
+            app.parallel_available = true;
+            app.set_parallel_runtime(self.parallel.clone());
+            app.sync_parallel_mode_from_runtime();
             app
         }
 

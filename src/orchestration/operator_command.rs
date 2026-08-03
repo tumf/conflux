@@ -157,6 +157,361 @@ pub fn classify_mark_route(mode: OperatorMode, display_status: &str) -> MarkRout
     }
 }
 
+/// Why a change is excluded from a bulk execution-mark mutation.
+///
+/// Every variant is a stable token a frontend branches on rather than prose, so
+/// a remote client and the TUI describe the same exclusion the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MarkExclusion {
+    /// The change reached a final outcome and accepts no operator mutation.
+    FinalStatus,
+    /// Recovery in this mode is owned by the retry commands.
+    RetryRequired,
+    /// A graceful stop is in flight; intent changes wait for it.
+    StopPending,
+    /// The change is executing and must be stopped rather than marked.
+    ChangeActive,
+    /// The mode/status pair refuses this mutation.
+    StatusImmutable,
+    /// Parallel mode cannot queue a change that is not committed yet.
+    ParallelIneligible,
+}
+
+impl MarkExclusion {
+    /// Every exclusion, in the order used when grouping reasons for display.
+    pub const ALL: [MarkExclusion; 6] = [
+        MarkExclusion::ChangeActive,
+        MarkExclusion::ParallelIneligible,
+        MarkExclusion::FinalStatus,
+        MarkExclusion::RetryRequired,
+        MarkExclusion::StopPending,
+        MarkExclusion::StatusImmutable,
+    ];
+
+    /// Stable machine-readable token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FinalStatus => "final_status",
+            Self::RetryRequired => "retry_required",
+            Self::StopPending => "stop_pending",
+            Self::ChangeActive => "change_active",
+            Self::StatusImmutable => "status_immutable",
+            Self::ParallelIneligible => "parallel_ineligible",
+        }
+    }
+
+    /// Short operator-facing reason describing what can be done about it.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::FinalStatus => "final or rejected and read-only",
+            Self::RetryRequired => "in error mode (use retry)",
+            Self::StopPending => "waiting for the pending stop",
+            Self::ChangeActive => "in progress (use K to stop)",
+            Self::StatusImmutable => "not mutable in this mode",
+            Self::ParallelIneligible => "uncommitted in parallel mode (commit first)",
+        }
+    }
+}
+
+/// One candidate row for a bulk execution-mark mutation.
+///
+/// The caller supplies the three facts the decision needs — the reducer's
+/// display status, the server-observed parallel eligibility, and the current
+/// mark — so the classification itself stays a pure function every frontend can
+/// call with its own view of the same state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkTargetRow<'a> {
+    /// Target change.
+    pub change_id: &'a str,
+    /// Reducer-derived display status.
+    pub display_status: &'a str,
+    /// True when the change may take part in parallel execution.
+    pub parallel_eligible: bool,
+    /// Current execution mark.
+    pub marked: bool,
+}
+
+/// The classified target set of one bulk execution-mark mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkMarkPlan {
+    /// Mark state applied to every eligible row.
+    ///
+    /// `true` when at least one eligible row is unmarked (mark all), `false`
+    /// when every eligible row is already marked (unmark all). Excluded rows
+    /// never influence it.
+    pub target_state: bool,
+    /// Eligible change IDs, in input order.
+    pub eligible: Vec<String>,
+    /// Excluded change IDs paired with their stable reason, in input order.
+    pub excluded: Vec<(String, MarkExclusion)>,
+}
+
+impl BulkMarkPlan {
+    /// True when no row can be mutated.
+    pub fn is_empty(&self) -> bool {
+        self.eligible.is_empty()
+    }
+
+    /// Grouped exclusion reasons with counts, e.g. `2 rejected and read-only`.
+    pub fn exclusion_summary(&self) -> String {
+        MarkExclusion::ALL
+            .iter()
+            .filter_map(|reason| {
+                let count = self
+                    .excluded
+                    .iter()
+                    .filter(|(_, actual)| actual == reason)
+                    .count();
+                (count > 0).then(|| format!("{} {}", count, reason.reason()))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Modes where a bulk execution-mark mutation is meaningful.
+///
+/// `Error` and `Stopping` are excluded for the same reason the per-change matrix
+/// refuses them: recovery is owned by retry, and a pending stop is a transition.
+pub fn supports_bulk_marks(mode: OperatorMode) -> bool {
+    matches!(
+        mode,
+        OperatorMode::Select | OperatorMode::Running | OperatorMode::Stopped
+    )
+}
+
+/// Classify one bulk-mark candidate; `None` means it is part of the target set.
+///
+/// Eligibility is derived from the same [`classify_mark_route`] matrix a
+/// single-row mark request goes through, so a bulk mutation can never touch a
+/// row an individual command would refuse.
+pub fn classify_bulk_mark_row(
+    mode: OperatorMode,
+    parallel_mode: bool,
+    display_status: &str,
+    parallel_eligible: bool,
+) -> Option<MarkExclusion> {
+    if parallel_mode && !parallel_eligible && !is_final_status(display_status) {
+        return Some(MarkExclusion::ParallelIneligible);
+    }
+
+    match classify_mark_route(mode, display_status) {
+        MarkRoute::MarkOnly | MarkRoute::QueueIntent => None,
+        MarkRoute::RetryRequired => Some(MarkExclusion::RetryRequired),
+        MarkRoute::Immutable => Some(if is_final_status(display_status) {
+            MarkExclusion::FinalStatus
+        } else if matches!(mode, OperatorMode::Stopping) {
+            MarkExclusion::StopPending
+        } else if is_active_status(display_status) {
+            MarkExclusion::ChangeActive
+        } else {
+            MarkExclusion::StatusImmutable
+        }),
+    }
+}
+
+/// Classify every row once and derive the single shared target mark state.
+///
+/// One classification pass over one coherent set of rows is what makes a bulk
+/// mutation atomic in meaning: the target state cannot shift halfway through
+/// because a row was re-read at a different instant.
+pub fn plan_bulk_marks(
+    mode: OperatorMode,
+    parallel_mode: bool,
+    rows: &[MarkTargetRow<'_>],
+) -> BulkMarkPlan {
+    let mut eligible = Vec::new();
+    let mut excluded = Vec::new();
+    let mut any_unmarked = false;
+
+    if !supports_bulk_marks(mode) {
+        return BulkMarkPlan {
+            target_state: false,
+            eligible,
+            excluded,
+        };
+    }
+
+    for row in rows {
+        match classify_bulk_mark_row(
+            mode,
+            parallel_mode,
+            row.display_status,
+            row.parallel_eligible,
+        ) {
+            Some(reason) => excluded.push((row.change_id.to_string(), reason)),
+            None => {
+                any_unmarked |= !row.marked;
+                eligible.push(row.change_id.to_string());
+            }
+        }
+    }
+
+    BulkMarkPlan {
+        // If any eligible row is unmarked, mark them all; otherwise unmark them all.
+        target_state: any_unmarked,
+        eligible,
+        excluded,
+    }
+}
+
+/// Changes whose mark and queue presentation enabling parallel mode must clear.
+///
+/// Shared so the TUI toggle and the remote `set_parallel_mode` command clean up
+/// exactly the same rows: an ineligible change that carries operator intent —
+/// a mark, a queue intent, or both — cannot stay in a target set parallel mode
+/// would refuse to start.
+pub fn parallel_cleanup_targets(rows: &[ParallelCleanupRow<'_>]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| !row.parallel_eligible && (row.marked || row.queued))
+        .map(|row| row.change_id.to_string())
+        .collect()
+}
+
+/// One candidate row for the parallel-mode cleanup pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParallelCleanupRow<'a> {
+    /// Target change.
+    pub change_id: &'a str,
+    /// True when the change may take part in parallel execution.
+    pub parallel_eligible: bool,
+    /// Current execution mark.
+    pub marked: bool,
+    /// True when the change currently carries queue intent or presentation.
+    pub queued: bool,
+}
+
+// ============================================================================
+// Parallel runtime (process-local)
+// ============================================================================
+
+/// Sequential/parallel runtime facts for this process incarnation.
+///
+/// One store, shared by every frontend. Parallel eligibility is derived from
+/// workspace observation that only the frontend running the refresh loop
+/// performs, and the toggle itself is operator intent — publishing both here is
+/// what lets a keypress and a remote command read and mutate the *same* value
+/// instead of each keeping a copy that can drift.
+///
+/// Nothing here is durable: a restart re-observes the workspace and re-resolves
+/// the configured mode.
+#[derive(Debug, Default)]
+pub struct ParallelRuntime {
+    inner: Mutex<ParallelRuntimeInner>,
+}
+
+#[derive(Debug, Default)]
+struct ParallelRuntimeInner {
+    mode: bool,
+    available: bool,
+    max_concurrent: usize,
+    vcs_backend: String,
+    ineligible: HashSet<String>,
+}
+
+/// A coherent read of the parallel runtime facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelRuntimeFacts {
+    /// True when parallel execution is the active mode.
+    pub mode: bool,
+    /// True when parallel execution can be enabled at all (requires Git).
+    pub available: bool,
+    /// Maximum number of concurrently executing changes.
+    pub max_concurrent: usize,
+    /// VCS backend the run would use.
+    pub vcs_backend: String,
+}
+
+impl ParallelRuntime {
+    /// Create an empty projection (sequential mode, nothing excluded).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ParallelRuntimeInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Publish the current parallel toggle. Returns true when it changed.
+    pub fn set_parallel_mode(&self, parallel_mode: bool) -> bool {
+        let mut guard = self.lock();
+        let changed = guard.mode != parallel_mode;
+        guard.mode = parallel_mode;
+        changed
+    }
+
+    /// Publish whether parallel execution can be enabled at all.
+    pub fn set_available(&self, available: bool) {
+        self.lock().available = available;
+    }
+
+    /// Publish the configured maximum concurrency.
+    pub fn set_max_concurrent(&self, max_concurrent: usize) {
+        self.lock().max_concurrent = max_concurrent;
+    }
+
+    /// Publish the VCS backend a run would use.
+    pub fn set_vcs_backend(&self, backend: impl Into<String>) {
+        self.lock().vcs_backend = backend.into();
+    }
+
+    /// Publish the set of changes parallel mode refuses to start.
+    pub fn set_parallel_ineligible(&self, ids: impl IntoIterator<Item = String>) {
+        self.lock().ineligible = ids.into_iter().collect();
+    }
+
+    /// True when parallel execution is the active mode.
+    pub fn parallel_mode(&self) -> bool {
+        self.lock().mode
+    }
+
+    /// True when parallel execution can be enabled at all.
+    pub fn is_available(&self) -> bool {
+        self.lock().available
+    }
+
+    /// True when the change may take part in parallel execution.
+    pub fn is_eligible(&self, change_id: &str) -> bool {
+        !self.lock().ineligible.contains(change_id)
+    }
+
+    /// Every change parallel mode refuses, sorted for deterministic output.
+    pub fn ineligible_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.lock().ineligible.iter().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// One coherent read of every published runtime fact.
+    pub fn facts(&self) -> ParallelRuntimeFacts {
+        let guard = self.lock();
+        ParallelRuntimeFacts {
+            mode: guard.mode,
+            available: guard.available,
+            max_concurrent: guard.max_concurrent,
+            vcs_backend: guard.vcs_backend.clone(),
+        }
+    }
+
+    /// Targets that parallel mode refuses, in request order.
+    ///
+    /// Returns an empty vector in serial mode: parallel eligibility is not a
+    /// serial-mode constraint.
+    pub fn rejected(&self, targets: &[String]) -> Vec<String> {
+        let guard = self.lock();
+        if !guard.mode {
+            return Vec::new();
+        }
+        targets
+            .iter()
+            .filter(|id| guard.ineligible.contains(*id))
+            .cloned()
+            .collect()
+    }
+}
+
 /// Where a retry request must be routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryRoute {
@@ -222,6 +577,13 @@ pub enum OperatorCommand {
         /// Target change.
         change_id: String,
     },
+    /// Change the sequential/parallel toggle for the whole process.
+    SetParallelMode {
+        /// Requested toggle value.
+        enabled: bool,
+    },
+    /// Apply one derived execution-mark state to every eligible change.
+    SetAllExecutionMarks,
 }
 
 /// Which direction a dynamic queue mutation went.
@@ -257,6 +619,12 @@ pub enum NoOpReason {
     MarkUnchanged,
     /// The reducer rejected the intent in the current lifecycle state.
     ReducerRejected,
+    /// Parallel mode already had the requested value.
+    ParallelModeUnchanged,
+    /// Every eligible row already carried the derived target mark.
+    BulkMarksUnchanged,
+    /// No row was eligible for the bulk mutation.
+    NoEligibleMarkTarget,
 }
 
 /// What a successful command did.
@@ -278,6 +646,22 @@ pub enum OperatorOutcome {
     },
     /// A retry was accepted and routed.
     Retry(RetryPlan),
+    /// The parallel toggle changed.
+    ParallelMode {
+        /// The mode that is now active.
+        enabled: bool,
+        /// Changes whose mark and queue intent were cleared, sorted.
+        cleared: Vec<String>,
+    },
+    /// A bulk execution-mark mutation completed.
+    BulkMarks {
+        /// The single target state applied to every eligible row.
+        marked: bool,
+        /// Changes whose mark or queue intent actually changed, in plan order.
+        changed: Vec<String>,
+        /// Rows the plan excluded, with their stable reason, in plan order.
+        excluded: Vec<(String, MarkExclusion)>,
+    },
     /// Nothing changed.
     NoOp {
         /// Target change (empty for bulk commands).
@@ -350,6 +734,18 @@ pub enum OperatorCommandError {
         /// Display status that carries no retryable evidence.
         display_status: String,
     },
+    /// The parallel toggle cannot be changed in this mode.
+    ParallelModeNotAllowed {
+        /// Mode the request arrived in.
+        mode: OperatorMode,
+    },
+    /// Parallel execution is not available in this workspace.
+    ParallelUnavailable,
+    /// Bulk execution-mark mutation is not available in this mode.
+    BulkMarksNotAllowed {
+        /// Mode the request arrived in.
+        mode: OperatorMode,
+    },
 }
 
 impl std::fmt::Display for OperatorCommandError {
@@ -382,6 +778,18 @@ impl std::fmt::Display for OperatorCommandError {
             } => write!(
                 f,
                 "retry is not supported for '{change_id}' with status '{display_status}'"
+            ),
+            Self::ParallelModeNotAllowed { mode } => write!(
+                f,
+                "parallel mode cannot be changed in {mode:?} mode; stop the run first"
+            ),
+            Self::ParallelUnavailable => write!(
+                f,
+                "parallel execution is not available in this workspace (requires git)"
+            ),
+            Self::BulkMarksNotAllowed { mode } => write!(
+                f,
+                "bulk execution-mark mutation is not available in {mode:?} mode"
             ),
         }
     }
@@ -570,11 +978,16 @@ pub struct OperatorCommandService {
     queue: Arc<dyn QueuePort>,
     hooks: Arc<dyn QueueHookPort>,
     marks: Arc<ExecutionMarkStore>,
+    parallel: Arc<ParallelRuntime>,
     cancellation_timeout: Duration,
 }
 
 impl OperatorCommandService {
     /// Build a service over the shared reducer state and runtime ports.
+    ///
+    /// The parallel runtime defaults to an unshared empty projection; a process
+    /// that has one binds it with [`Self::with_parallel`] so the toggle the
+    /// start guard reads and the toggle this service mutates are one value.
     pub fn new(
         state: Arc<RwLock<OrchestratorState>>,
         queue: Arc<dyn QueuePort>,
@@ -586,8 +999,15 @@ impl OperatorCommandService {
             queue,
             hooks,
             marks,
+            parallel: Arc::new(ParallelRuntime::new()),
             cancellation_timeout: DEFAULT_CANCELLATION_TIMEOUT,
         }
+    }
+
+    /// Bind the shared parallel runtime store.
+    pub fn with_parallel(mut self, parallel: Arc<ParallelRuntime>) -> Self {
+        self.parallel = parallel;
+        self
     }
 
     /// Override the bound used when waiting for confirmed task termination.
@@ -599,6 +1019,11 @@ impl OperatorCommandService {
     /// Shared process-local execution marks.
     pub fn marks(&self) -> Arc<ExecutionMarkStore> {
         self.marks.clone()
+    }
+
+    /// Shared process-local parallel runtime facts.
+    pub fn parallel(&self) -> Arc<ParallelRuntime> {
+        self.parallel.clone()
     }
 
     /// Current display status for a change.
@@ -635,6 +1060,10 @@ impl OperatorCommandService {
                 .retry_change(&change_id)
                 .await
                 .map(OperatorOutcome::Retry),
+            OperatorCommand::SetParallelMode { enabled } => {
+                self.set_parallel_mode(mode, enabled).await
+            }
+            OperatorCommand::SetAllExecutionMarks => self.set_all_execution_marks(mode).await,
         }
     }
 
@@ -678,6 +1107,163 @@ impl OperatorCommandService {
                 })
             }
         }
+    }
+
+    /// Change the sequential/parallel toggle for the whole process.
+    ///
+    /// Only `Select` and `Stopped` accept it: a live or stopping run already
+    /// owns scheduling decisions the toggle would invalidate. Enabling parallel
+    /// mode clears the mark and queue intent of every change parallel mode
+    /// refuses, so the target set a later start reads is coherent by
+    /// construction rather than rejected at start time.
+    pub async fn set_parallel_mode(
+        &self,
+        mode: OperatorMode,
+        enabled: bool,
+    ) -> OperatorResult<OperatorOutcome> {
+        if !matches!(mode, OperatorMode::Select | OperatorMode::Stopped) {
+            return Err(OperatorCommandError::ParallelModeNotAllowed { mode });
+        }
+        if enabled && !self.parallel.is_available() {
+            return Err(OperatorCommandError::ParallelUnavailable);
+        }
+        if !self.parallel.set_parallel_mode(enabled) {
+            return Ok(OperatorOutcome::NoOp {
+                change_id: String::new(),
+                reason: NoOpReason::ParallelModeUnchanged,
+            });
+        }
+
+        // Only enabling can strand intent: serial mode refuses nothing.
+        let mut cleared = Vec::new();
+        if enabled {
+            for change_id in self.cleanup_targets_for_parallel().await {
+                let unmarked = self.marks.set(&change_id, false);
+                let removed = self.remove_from_queue(&change_id).await?;
+                if unmarked || removed.reducer_changed || removed.dynamic_queue_mutated {
+                    cleared.push(change_id);
+                }
+            }
+        }
+
+        Ok(OperatorOutcome::ParallelMode { enabled, cleared })
+    }
+
+    /// Ineligible changes that currently carry operator intent, sorted.
+    async fn cleanup_targets_for_parallel(&self) -> Vec<String> {
+        let ineligible = self.parallel.ineligible_ids();
+        let guard = self.state.read().await;
+        let rows: Vec<ParallelCleanupRow<'_>> = ineligible
+            .iter()
+            .map(|change_id| ParallelCleanupRow {
+                change_id,
+                parallel_eligible: false,
+                marked: self.marks.is_marked(change_id),
+                queued: matches!(
+                    guard.change_runtime(change_id).map(|rt| &rt.queue_intent),
+                    Some(crate::orchestration::state::QueueIntent::Queued)
+                ),
+            })
+            .collect();
+        parallel_cleanup_targets(&rows)
+    }
+
+    /// Apply one derived execution-mark state to every eligible change.
+    ///
+    /// The whole operation is classified from a single read of the reducer, so
+    /// the target state comes from one coherent view and every eligible row
+    /// receives the identical mark. Excluded rows keep whatever intent they
+    /// already had and are reported with a stable reason instead of being
+    /// silently skipped.
+    pub async fn set_all_execution_marks(
+        &self,
+        mode: OperatorMode,
+    ) -> OperatorResult<OperatorOutcome> {
+        if !supports_bulk_marks(mode) {
+            return Err(OperatorCommandError::BulkMarksNotAllowed { mode });
+        }
+
+        let parallel_mode = self.parallel.parallel_mode();
+        // One read, one classification: re-reading per row could observe two
+        // different instants and derive a target state from neither.
+        let observed: Vec<(String, String, bool, bool)> = {
+            let guard = self.state.read().await;
+            guard
+                .tracked_change_ids()
+                .into_iter()
+                .map(|change_id| {
+                    let display_status = guard.display_status(&change_id).to_string();
+                    let eligible = self.parallel.is_eligible(&change_id);
+                    let marked = self.marks.is_marked(&change_id);
+                    (change_id, display_status, eligible, marked)
+                })
+                .collect()
+        };
+
+        let rows: Vec<MarkTargetRow<'_>> = observed
+            .iter()
+            .map(
+                |(change_id, display_status, parallel_eligible, marked)| MarkTargetRow {
+                    change_id,
+                    display_status,
+                    parallel_eligible: *parallel_eligible,
+                    marked: *marked,
+                },
+            )
+            .collect();
+        let plan = plan_bulk_marks(mode, parallel_mode, &rows);
+
+        if plan.is_empty() {
+            return Ok(OperatorOutcome::NoOp {
+                change_id: String::new(),
+                reason: NoOpReason::NoEligibleMarkTarget,
+            });
+        }
+
+        let mut changed = Vec::new();
+        for change_id in &plan.eligible {
+            let display_status = observed
+                .iter()
+                .find(|(id, ..)| id == change_id)
+                .map(|(_, status, ..)| status.as_str())
+                .unwrap_or("not queued");
+            // The route comes from the classified snapshot, not from a second
+            // read, so a status that moved mid-operation cannot reroute a row
+            // the plan already accepted.
+            match classify_mark_route(mode, display_status) {
+                MarkRoute::MarkOnly => {
+                    if self.marks.set(change_id, plan.target_state) {
+                        changed.push(change_id.clone());
+                    }
+                }
+                MarkRoute::QueueIntent => {
+                    let outcome = if plan.target_state {
+                        self.add_to_queue(change_id).await?
+                    } else {
+                        self.remove_from_queue(change_id).await?
+                    };
+                    let mark_changed = self.marks.set(change_id, plan.target_state);
+                    if mark_changed || outcome.reducer_changed || outcome.dynamic_queue_mutated {
+                        changed.push(change_id.clone());
+                    }
+                }
+                // `plan_bulk_marks` only admits the two routes above.
+                MarkRoute::RetryRequired | MarkRoute::Immutable => {}
+            }
+        }
+
+        if changed.is_empty() {
+            return Ok(OperatorOutcome::NoOp {
+                change_id: String::new(),
+                reason: NoOpReason::BulkMarksUnchanged,
+            });
+        }
+
+        Ok(OperatorOutcome::BulkMarks {
+            marked: plan.target_state,
+            changed,
+            excluded: plan.excluded,
+        })
     }
 
     /// Add a change to the dynamic queue.

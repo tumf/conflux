@@ -939,6 +939,17 @@ impl OrchestratorState {
             .or_default()
     }
 
+    /// Every change the reducer currently tracks, sorted for determinism.
+    ///
+    /// This is the authoritative candidate set for an operation that addresses
+    /// "all changes": it is the same map `display_status` answers from, so a
+    /// bulk mutation can never classify a row the reducer does not know about.
+    pub fn tracked_change_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.change_runtime.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     /// Read-only access to the runtime state of a change.
     pub fn change_runtime(&self, change_id: &str) -> Option<&ChangeRuntimeState> {
         self.change_runtime.get(change_id)

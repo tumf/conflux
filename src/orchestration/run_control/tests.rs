@@ -243,6 +243,55 @@ async fn start_refuses_parallel_ineligible_targets() {
     assert!(harness.scheduler.calls().is_empty());
 }
 
+/// Parallel start is all-or-nothing over the *complete* marked set.
+///
+/// The eligible remainder is a target set the operator never asked for, so one
+/// ineligible mark must refuse the whole operation — and it must do so even
+/// when the ineligible row is not itself startable, which is the case a fence
+/// applied only to the startable subset would wave through.
+#[tokio::test]
+async fn one_ineligible_mark_refuses_the_whole_parallel_start() {
+    for arrange_ineligible_as_unstartable in [false, true] {
+        let harness = Harness::new(&["eligible", "ineligible"]);
+        harness.mark(&["eligible", "ineligible"]);
+        harness.eligibility.set_parallel_mode(true);
+        harness
+            .eligibility
+            .set_parallel_ineligible(["ineligible".to_string()]);
+        if arrange_ineligible_as_unstartable {
+            harness.to_merge_wait("ineligible").await;
+        }
+
+        let error = harness
+            .service
+            .start(OperatorMode::Select)
+            .await
+            .expect_err("one ineligible marked target refuses the whole start");
+
+        match &error {
+            RunControlError::NoEligibleTarget { detail, .. } => assert!(
+                detail.contains("ineligible") && !detail.contains("eligible,"),
+                "the refusal must name the ineligible target: {detail}"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            harness.scheduler.calls().is_empty(),
+            "no scheduler may be spawned for a partially eligible target set"
+        );
+        assert_eq!(
+            harness.status("eligible").await,
+            "not queued",
+            "the eligible target must not be left queued by a refused start"
+        );
+        assert_eq!(
+            harness.marks.marked_ids(),
+            vec!["eligible".to_string(), "ineligible".to_string()],
+            "a refused start leaves marks coherent"
+        );
+    }
+}
+
 #[tokio::test]
 async fn start_wakes_a_live_scheduler_instead_of_spawning_a_second_run() {
     let harness = Harness::new(&["a"]);

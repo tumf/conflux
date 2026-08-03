@@ -8,7 +8,8 @@ use crate::tui::types::WorktreeInfo;
 use crate::web::operator_facts::OperatorFactsStore;
 use crate::web::remote_control_api::dto::{
     AttentionState, BlockerKind as RemoteBlockerKind, ChangeActivity, ChangeBlocker, ChangeTiming,
-    ChangeWorktree, ParallelEligibility, QueueIntent as RemoteQueueIntent,
+    ChangeWorktree, ParallelEligibility, ParallelMode, ParallelRuntimeState,
+    QueueIntent as RemoteQueueIntent,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -135,6 +136,12 @@ pub struct OrchestratorStateSnapshot {
     /// error so "the run died" and "one change failed" stay separable.
     #[serde(default)]
     pub process_error: Option<String>,
+    /// Process-wide parallel execution runtime facts.
+    ///
+    /// Filled from the shared parallel runtime store, so the mode a remote
+    /// client reads is the same value the start guard and the TUI toggle use.
+    #[serde(default)]
+    pub parallel: ParallelRuntimeState,
 }
 
 impl OrchestratorStateSnapshot {
@@ -207,6 +214,7 @@ impl OrchestratorStateSnapshot {
             app_mode: "select".to_string(),
             is_resolving: false,
             process_error: None,
+            parallel: ParallelRuntimeState::default(),
         }
     }
 }
@@ -384,6 +392,13 @@ pub struct WebState {
     execution_marks: tokio::sync::RwLock<
         Option<Arc<crate::orchestration::operator_command::ExecutionMarkStore>>,
     >,
+    /// Process-wide parallel runtime facts, shared with the operator services.
+    ///
+    /// Late-bound like the marks: until an orchestration runtime exists the
+    /// snapshot reports sequential mode with parallel execution unavailable,
+    /// which is exactly what a process that cannot start a run should report.
+    parallel_runtime:
+        tokio::sync::RwLock<Option<Arc<crate::orchestration::operator_command::ParallelRuntime>>>,
     /// Timing, latest activity, attention, parallel eligibility, and worktree
     /// relation for this process incarnation.
     operator_facts: tokio::sync::RwLock<OperatorFactsStore>,
@@ -435,6 +450,7 @@ impl WebState {
             shared_orchestrator_state: tokio::sync::RwLock::new(None),
             remote_control: Arc::new(crate::web::remote_control_api::RemoteControlRuntime::new()),
             execution_marks: tokio::sync::RwLock::new(None),
+            parallel_runtime: tokio::sync::RwLock::new(None),
             operator_facts: tokio::sync::RwLock::new(OperatorFactsStore::new()),
             projected_dispatches: Mutex::new(RecentDispatchIds::default()),
         }
@@ -455,6 +471,19 @@ impl WebState {
         marks: Arc<crate::orchestration::operator_command::ExecutionMarkStore>,
     ) {
         *self.execution_marks.write().await = Some(marks);
+        self.sync_remote_control_projection().await;
+    }
+
+    /// Bind the shared process-wide parallel runtime store.
+    ///
+    /// The same `Arc` the operator command service mutates and the start guard
+    /// reads, so the mode a v2 client observes is never a copy that can drift
+    /// from the one a run would actually use.
+    pub async fn set_parallel_runtime(
+        &self,
+        parallel: Arc<crate::orchestration::operator_command::ParallelRuntime>,
+    ) {
+        *self.parallel_runtime.write().await = Some(parallel);
         self.sync_remote_control_projection().await;
     }
 
@@ -511,6 +540,18 @@ impl WebState {
         }
 
         let marks = self.execution_marks.read().await.clone();
+        snapshot.parallel = match self.parallel_runtime.read().await.as_ref() {
+            Some(runtime) => {
+                let facts = runtime.facts();
+                ParallelRuntimeState {
+                    mode: ParallelMode::from_enabled(facts.mode),
+                    available: facts.available,
+                    max_concurrent: facts.max_concurrent,
+                    vcs_backend: facts.vcs_backend,
+                }
+            }
+            None => ParallelRuntimeState::default(),
+        };
         let facts = self.operator_facts.read().await;
         snapshot.process_error = facts.process_error();
         for change in &mut snapshot.changes {

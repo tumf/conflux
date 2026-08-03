@@ -372,9 +372,15 @@ async fn run_tui_loop(
     }
     app.parallel_available = parallel_available;
     app.parallel_mode = parallel_mode;
+    app.max_concurrent = config.get_max_concurrent_workspaces();
+    app.vcs_backend = config.get_vcs_backend().to_string();
+    // The shared store is the toggle's home, so seed it before anything reads
+    // it: the start guard, the v2 snapshot, and the run supervisor all resolve
+    // the mode from here rather than from this frontend's field.
+    app.parallel_runtime().set_parallel_mode(parallel_mode);
+    app.publish_parallel_runtime();
     app.apply_parallel_eligibility(&committed_change_ids, &uncommitted_file_change_ids);
     app.apply_worktree_status(&worktree_change_ids);
-    app.max_concurrent = config.get_max_concurrent_workspaces();
     app.web_url = web_url;
 
     // Create shared stagger state for all AI commands (worktree, apply, archive, acceptance)
@@ -408,6 +414,7 @@ async fn run_tui_loop(
     if let Some(ref ws) = web_state {
         ws.set_shared_state(shared_state.clone()).await;
         ws.set_execution_marks(app.execution_marks()).await;
+        ws.set_parallel_runtime(app.parallel_runtime()).await;
         ws.set_repo_root(repo_root.clone()).await;
     }
 
@@ -473,21 +480,19 @@ async fn run_tui_loop(
             repo_root.clone(),
             tx.clone(),
         );
-        Arc::new(OperatorCommandService::new(
-            shared_state.clone(),
-            Arc::new(dynamic_queue.clone()),
-            Arc::new(HookRunnerQueueHooks::new(hook_runner)),
-            app.execution_marks(),
-        ))
+        Arc::new(
+            OperatorCommandService::new(
+                shared_state.clone(),
+                Arc::new(dynamic_queue.clone()),
+                Arc::new(HookRunnerQueueHooks::new(hook_runner)),
+                app.execution_marks(),
+            )
+            .with_parallel(app.parallel_runtime()),
+        )
     };
-    let start_eligibility = Arc::new(crate::orchestration::run_control::StartEligibility::new());
-    start_eligibility.set_parallel_mode(app.parallel_mode);
-    start_eligibility.set_parallel_ineligible(
-        app.changes
-            .iter()
-            .filter(|change| !change.is_parallel_eligible)
-            .map(|change| change.id.clone()),
-    );
+    // One store, three readers: the start guard, the operator service that
+    // mutates the toggle, and the TUI that observes it.
+    let start_eligibility = app.parallel_runtime();
     let run_control = Arc::new(crate::orchestration::run_control::RunControlService::new(
         shared_state.clone(),
         operator_service.clone(),
@@ -872,17 +877,22 @@ async fn run_tui_loop(
             }
         }
 
-        // The parallel toggle and its eligibility set are read by the shared
-        // start guard, so republish them once per frame instead of at every
-        // place the TUI can change them.
+        // The eligibility set is a TUI observation, so it is republished once
+        // per frame instead of at every place the TUI can change it. The toggle
+        // travels the other way: the shared store owns it, so a remote
+        // `set_parallel_mode` is adopted here rather than overwritten.
+        app.publish_parallel_runtime();
+        if app.sync_parallel_mode_from_runtime() {
+            app.add_log(LogEntry::info(format!(
+                "Parallel mode {} by a remote command",
+                if app.parallel_mode {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            )));
+        }
         parallel_mode_flag.store(app.parallel_mode, std::sync::atomic::Ordering::SeqCst);
-        start_eligibility.set_parallel_mode(app.parallel_mode);
-        start_eligibility.set_parallel_ineligible(
-            app.changes
-                .iter()
-                .filter(|change| !change.is_parallel_eligible)
-                .map(|change| change.id.clone()),
-        );
 
         publish_lifecycle_state(&app);
 

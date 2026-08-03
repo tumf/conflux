@@ -797,8 +797,10 @@ pub async fn handle_key_event(
             ctx.app.scroll_logs_to_bottom();
         }
         (KeyCode::Char('='), _) => {
-            // Toggle parallel mode (only if git is available)
-            ctx.app.toggle_parallel_mode();
+            // Toggle parallel mode. The request goes to the shared operator
+            // service as a command, so the mode guard and the ineligible-intent
+            // cleanup are the ones `/api/v2` also runs.
+            cmd_to_start = ctx.app.toggle_parallel_mode();
         }
         (KeyCode::Enter, _) => {
             handle_enter_key(ctx).await?;

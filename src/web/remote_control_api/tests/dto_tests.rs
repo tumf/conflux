@@ -12,8 +12,11 @@ fn closed_command_set_matches_the_advertised_list() {
     // trusts `capabilities` has to be able to submit every name it lists.
     for name in SUPPORTED_COMMANDS {
         let body = match name {
-            "start" | "stop" | "cancel_stop" | "force_stop" => {
+            "start" | "stop" | "cancel_stop" | "force_stop" | "set_all_execution_marks" => {
                 format!(r#"{{"type":"{name}"}}"#)
+            }
+            "set_parallel_mode" => {
+                r#"{"type":"set_parallel_mode","enabled":true}"#.to_string()
             }
             "set_execution_mark" => {
                 r#"{"type":"set_execution_mark","change_id":"a","marked":true}"#.to_string()

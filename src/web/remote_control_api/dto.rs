@@ -257,6 +257,21 @@ pub enum CommandSpec {
         /// Target change.
         change_id: String,
     },
+    /// Turn parallel execution on or off for the whole process.
+    ///
+    /// Accepted only in Select or Stopped mode. Enabling it also clears the mark
+    /// and queue intent of every change parallel mode refuses, and the outcome
+    /// names them.
+    SetParallelMode {
+        /// Requested toggle value.
+        enabled: bool,
+    },
+    /// Apply one derived execution-mark state to every eligible change.
+    ///
+    /// Deliberately parameterless: the target state is derived from the eligible
+    /// rows at the admitted revision, exactly as the TUI's bulk toggle does, so
+    /// a client cannot ask for a target set the server never classified.
+    SetAllExecutionMarks,
     /// Create the managed worktree for an eligible change.
     ///
     /// The change ID is the *only* input: branch, path, and base commit are all
@@ -332,6 +347,8 @@ impl CommandSpec {
             Self::RetryErrors { .. } => "retry_errors",
             Self::StopAndDequeue { .. } => "stop_and_dequeue",
             Self::ResolveMerge { .. } => "resolve_merge",
+            Self::SetParallelMode { .. } => "set_parallel_mode",
+            Self::SetAllExecutionMarks => "set_all_execution_marks",
             Self::CreateWorktree { .. } => "create_worktree",
             Self::DeleteWorktree { .. } => "delete_worktree",
             Self::MergeWorktree { .. } => "merge_worktree",
@@ -350,6 +367,9 @@ impl CommandSpec {
             Self::CreateWorktree { target, .. } => Some(&target.change_id),
             Self::Start | Self::Stop | Self::CancelStop | Self::ForceStop => None,
             Self::RetryErrors { .. } => None,
+            // Process-wide mutations: they address the whole target set, never
+            // one change.
+            Self::SetParallelMode { .. } | Self::SetAllExecutionMarks => None,
             // Worktree mutations are addressed by opaque ID, not by change.
             Self::DeleteWorktree { .. } | Self::MergeWorktree { .. } => None,
         }
@@ -357,7 +377,7 @@ impl CommandSpec {
 }
 
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 13] = [
+pub const SUPPORTED_COMMANDS: [&str; 15] = [
     "start",
     "stop",
     "cancel_stop",
@@ -368,6 +388,8 @@ pub const SUPPORTED_COMMANDS: [&str; 13] = [
     "retry_errors",
     "stop_and_dequeue",
     "resolve_merge",
+    "set_parallel_mode",
+    "set_all_execution_marks",
     "create_worktree",
     "delete_worktree",
     "merge_worktree",
@@ -538,6 +560,8 @@ pub struct CapabilitiesResponse {
     pub authentication_required: bool,
     /// The complete worktree surface, including its conflict-recovery boundary.
     pub worktrees: super::worktrees::WorktreeCapabilities,
+    /// The parallel execution surface, including its blocked-reason vocabulary.
+    pub parallel: ParallelCapabilities,
 }
 
 /// One supported event transport.
@@ -678,6 +702,44 @@ pub enum ActionBlockedReason {
     ChangeActive,
     /// The change is not waiting on a merge.
     NotMergeWaiting,
+    /// Parallel mode refuses a change that is not committed cleanly yet.
+    ParallelIneligible,
+}
+
+impl ActionBlockedReason {
+    /// Project a shared bulk-mark exclusion onto the wire vocabulary.
+    ///
+    /// One vocabulary, not two: the reason a bulk mutation skipped a row is the
+    /// same reason the row's own `actions` block reports.
+    pub fn from_mark_exclusion(
+        exclusion: crate::orchestration::operator_command::MarkExclusion,
+    ) -> Self {
+        use crate::orchestration::operator_command::MarkExclusion as E;
+        match exclusion {
+            E::FinalStatus => Self::FinalStatus,
+            E::RetryRequired => Self::RetryRequired,
+            E::StopPending => Self::StopPending,
+            E::ChangeActive => Self::ChangeActive,
+            E::StatusImmutable => Self::StatusImmutable,
+            E::ParallelIneligible => Self::ParallelIneligible,
+        }
+    }
+
+    /// Stable wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FinalStatus => "final_status",
+            Self::RetryRequired => "retry_required",
+            Self::StopPending => "stop_pending",
+            Self::StatusImmutable => "status_immutable",
+            Self::ModeHasNoQueue => "mode_has_no_queue",
+            Self::NoRetryableEvidence => "no_retryable_evidence",
+            Self::HoldNotResumable => "hold_not_resumable",
+            Self::ChangeActive => "change_active",
+            Self::NotMergeWaiting => "not_merge_waiting",
+            Self::ParallelIneligible => "parallel_ineligible",
+        }
+    }
 }
 
 /// Whether one operator action is currently permitted, and why not.
@@ -733,6 +795,70 @@ pub enum ParallelBlockedReason {
     NotCommitted,
     /// The change has uncommitted or untracked files under its directory.
     UncommittedChanges,
+}
+
+/// Every parallel-eligibility blocked reason, in capability-advertised order.
+pub const ALL_PARALLEL_BLOCKED_REASONS: [&str; 2] = ["not_committed", "uncommitted_changes"];
+
+/// The sequential/parallel execution mode a run would use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ParallelMode {
+    /// One change at a time, in the repository root.
+    #[default]
+    Sequential,
+    /// Multiple changes concurrently, each in its own worktree.
+    Parallel,
+}
+
+impl ParallelMode {
+    /// Resolve the mode from the shared runtime toggle.
+    pub fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Parallel
+        } else {
+            Self::Sequential
+        }
+    }
+
+    /// True when parallel execution is the active mode.
+    pub fn is_parallel(self) -> bool {
+        matches!(self, Self::Parallel)
+    }
+}
+
+/// Process-wide parallel execution runtime facts.
+///
+/// A client reads this instead of inferring the mode from how many changes
+/// happen to be running: `available` distinguishes "parallel is off" from
+/// "parallel cannot be turned on here", which are different operator problems.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ParallelRuntimeState {
+    /// Active execution mode.
+    pub mode: ParallelMode,
+    /// True when parallel execution can be enabled at all (requires Git).
+    pub available: bool,
+    /// Maximum number of concurrently executing changes.
+    pub max_concurrent: usize,
+    /// VCS backend a run would use.
+    pub vcs_backend: String,
+}
+
+/// Parallel execution surface advertised by `/api/v2/capabilities`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ParallelCapabilities {
+    /// True when parallel execution can be enabled at all.
+    pub available: bool,
+    /// Active execution mode at the moment capabilities were read.
+    pub mode: ParallelMode,
+    /// Maximum number of concurrently executing changes.
+    pub max_concurrent: usize,
+    /// VCS backend a run would use.
+    pub vcs_backend: String,
+    /// Every machine-readable per-change eligibility blocked reason.
+    pub blocked_reasons: Vec<String>,
+    /// Modes that accept `set_parallel_mode`.
+    pub toggle_modes: Vec<String>,
 }
 
 /// Server-observed parallel-execution eligibility.
@@ -870,6 +996,8 @@ pub struct InstanceSnapshot {
     /// Kept separate from a change's `error_detail` so "this run died" and "this
     /// one change failed" stay distinguishable without reading `app_mode` prose.
     pub process_error: Option<String>,
+    /// Process-wide parallel execution runtime facts.
+    pub parallel: ParallelRuntimeState,
     /// Projected changes.
     pub changes: Vec<ChangeResource>,
     /// Aggregate counts.
@@ -883,6 +1011,7 @@ impl InstanceSnapshot {
             app_mode: "select".to_string(),
             is_resolving: false,
             process_error: None,
+            parallel: ParallelRuntimeState::default(),
             changes: Vec::new(),
             totals: SnapshotTotals {
                 total: 0,

@@ -467,6 +467,7 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
         app_mode: source.app_mode.clone(),
         is_resolving: source.is_resolving,
         process_error: source.process_error.clone(),
+        parallel: source.parallel.clone(),
         totals: SnapshotTotals {
             total: changes.len(),
             completed: source.completed_changes,

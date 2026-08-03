@@ -214,6 +214,12 @@ pub struct AppState {
     /// frontend-independent copy other adapters read. It is never persisted, so a
     /// restarted process starts with every mark `false`.
     execution_marks: std::sync::Arc<crate::orchestration::operator_command::ExecutionMarkStore>,
+    /// Shared process-wide parallel runtime facts.
+    ///
+    /// The toggle itself lives here, not in `parallel_mode`: that field is a
+    /// render cache of this store, so a remote `set_parallel_mode` and an `=`
+    /// keypress mutate one value instead of two that can disagree.
+    parallel_runtime: std::sync::Arc<crate::orchestration::operator_command::ParallelRuntime>,
 }
 
 // ============================================================================
@@ -422,7 +428,101 @@ impl AppState {
             execution_marks: std::sync::Arc::new(
                 crate::orchestration::operator_command::ExecutionMarkStore::new(),
             ),
+            parallel_runtime: std::sync::Arc::new(
+                crate::orchestration::operator_command::ParallelRuntime::new(),
+            ),
         }
+    }
+
+    /// Shared handle to the process-wide parallel runtime facts.
+    pub fn parallel_runtime(
+        &self,
+    ) -> std::sync::Arc<crate::orchestration::operator_command::ParallelRuntime> {
+        self.parallel_runtime.clone()
+    }
+
+    /// Adopt an externally owned parallel runtime store.
+    ///
+    /// Same direction as [`AppState::set_execution_marks`]: a caller that built
+    /// the shared services first joins the store they already read, so the
+    /// toggle exists once rather than once per frontend.
+    pub fn set_parallel_runtime(
+        &mut self,
+        parallel: std::sync::Arc<crate::orchestration::operator_command::ParallelRuntime>,
+    ) {
+        self.parallel_runtime = parallel;
+        self.publish_parallel_runtime();
+    }
+
+    /// Publish the TUI's observations into the shared parallel runtime store.
+    ///
+    /// Availability, concurrency, backend, and per-change eligibility are all
+    /// observations only this frontend makes; publishing them is what lets the
+    /// shared start guard and a remote client use them without re-deriving
+    /// them. The toggle deliberately travels the other way: see
+    /// [`AppState::sync_parallel_mode_from_runtime`].
+    pub fn publish_parallel_runtime(&self) {
+        self.parallel_runtime.set_available(self.parallel_available);
+        self.parallel_runtime.set_max_concurrent(self.max_concurrent);
+        self.parallel_runtime
+            .set_vcs_backend(self.vcs_backend.clone());
+        self.parallel_runtime.set_parallel_ineligible(
+            self.changes
+                .iter()
+                .filter(|change| !change.is_parallel_eligible)
+                .map(|change| change.id.clone()),
+        );
+    }
+
+    /// Adopt a toggle another frontend changed, cleaning up ineligible intent.
+    ///
+    /// Returns true when the mode actually moved. The cleanup is the same one
+    /// the `=` key applies, so a remote toggle cannot leave the TUI painting a
+    /// marked row that parallel mode would refuse to start.
+    pub fn sync_parallel_mode_from_runtime(&mut self) -> bool {
+        let enabled = self.parallel_runtime.parallel_mode();
+        if enabled == self.parallel_mode {
+            return false;
+        }
+        self.parallel_mode = enabled;
+        if enabled {
+            self.clear_parallel_ineligible_intent();
+        }
+        true
+    }
+
+    /// Clear mark and queue presentation for every parallel-ineligible row.
+    ///
+    /// Returns the affected change IDs so the caller can report them; an
+    /// operator whose marks silently disappeared cannot tell that from a bug.
+    fn clear_parallel_ineligible_intent(&mut self) -> Vec<String> {
+        use crate::orchestration::operator_command::{parallel_cleanup_targets, ParallelCleanupRow};
+
+        let rows: Vec<ParallelCleanupRow<'_>> = self
+            .changes
+            .iter()
+            .map(|change| ParallelCleanupRow {
+                change_id: &change.id,
+                parallel_eligible: change.is_parallel_eligible,
+                marked: change.selected,
+                queued: change.display_status_cache == "queued",
+            })
+            .collect();
+        let cleared = parallel_cleanup_targets(&rows);
+
+        for change in &mut self.changes {
+            if !cleared.contains(&change.id) {
+                continue;
+            }
+            change.selected = false;
+            if change.display_status_cache == "queued" {
+                change.set_display_status_cache("not queued");
+            }
+        }
+        if !cleared.is_empty() {
+            self.publish_execution_marks();
+        }
+        cleared
     }
 
     /// Shared handle to the process-local execution marks.
@@ -906,18 +1006,15 @@ impl AppState {
             // Eligible if committed AND no uncommitted files
             change.is_parallel_eligible = committed_change_ids.contains(&change.id)
                 && !uncommitted_file_change_ids.contains(&change.id);
-            if self.parallel_mode
-                && matches!(self.mode, AppMode::Select | AppMode::Stopped)
-                && !change.is_parallel_eligible
-            {
-                if change.selected {
-                    change.selected = false;
-                }
-                if matches!(change.display_status_cache.as_str(), "queued") {
-                    change.set_display_status_cache("not queued");
-                }
-            }
         }
+
+        if self.parallel_mode && matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+            self.clear_parallel_ineligible_intent();
+        }
+
+        // A change that just became ineligible must reach the shared start
+        // guard at the same observation, not one refresh later.
+        self.publish_parallel_runtime();
     }
 
     /// Update worktree presence flags for changes.
@@ -1005,47 +1102,29 @@ impl AppState {
     ///
     /// Returns true if the mode was toggled, false if git is not available
     /// or if the mode cannot be changed in current state.
-    pub fn toggle_parallel_mode(&mut self) -> bool {
-        // Only allow toggling in Select or Stopped mode
+    /// Request the opposite parallel mode.
+    ///
+    /// Presentation only. Whether the toggle is accepted, which ineligible
+    /// changes lose their mark and queue intent, and what the operator is told
+    /// are all decided by the shared operator command service when the emitted
+    /// command is handled — the same service `/api/v2` `set_parallel_mode`
+    /// calls, so a keypress and a remote command cannot reach different
+    /// conclusions.
+    ///
+    /// The two local refusals below exist only so `=` is never silent; the
+    /// service re-validates both.
+    pub fn toggle_parallel_mode(&mut self) -> Option<TuiCommand> {
         if !matches!(self.mode, AppMode::Select | AppMode::Stopped) {
             self.warning_message = Some("Cannot toggle parallel mode while processing".to_string());
-            return false;
+            return None;
         }
 
-        // Check if parallel execution is available (git)
         if !self.parallel_available {
             self.warning_message = Some("Parallel mode not available (requires git)".to_string());
-            return false;
+            return None;
         }
 
-        self.parallel_mode = !self.parallel_mode;
-        let status = if self.parallel_mode {
-            "enabled"
-        } else {
-            "disabled"
-        };
-
-        if self.parallel_mode {
-            let mut removed = Vec::new();
-            for change in &mut self.changes {
-                if !change.is_parallel_eligible && change.selected {
-                    change.selected = false;
-                    if matches!(change.display_status_cache.as_str(), "queued") {
-                        change.set_display_status_cache("not queued");
-                    }
-                    removed.push(change.id.clone());
-                }
-            }
-            if !removed.is_empty() {
-                self.warning_message = Some(format!(
-                    "Removed uncommitted changes from queue in parallel mode: {}",
-                    removed.join(", ")
-                ));
-            }
-        }
-
-        self.add_log(LogEntry::info(format!("Parallel mode {}", status)));
-        true
+        Some(TuiCommand::SetParallelMode(!self.parallel_mode))
     }
 
     /// Reset stop/cancel state before a new run

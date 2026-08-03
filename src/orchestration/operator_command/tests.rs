@@ -1223,3 +1223,504 @@ async fn externally_blocked_change_does_not_block_unrelated_or_dependent_kinds()
         "unrelated ready work continues"
     );
 }
+
+// ============================================================================
+// Parallel control: classification (unit — pure functions, no boundaries)
+// ============================================================================
+
+/// Build a bulk-mark row without repeating the struct literal per case.
+fn row<'a>(
+    change_id: &'a str,
+    display_status: &'a str,
+    parallel_eligible: bool,
+    marked: bool,
+) -> MarkTargetRow<'a> {
+    MarkTargetRow {
+        change_id,
+        display_status,
+        parallel_eligible,
+        marked,
+    }
+}
+
+#[test]
+fn bulk_mark_target_state_is_derived_from_eligible_rows_only() {
+    // One unmarked eligible row means "mark all", even though the excluded row
+    // is unmarked too and the other eligible row is already marked.
+    let rows = [
+        row("marked", "not queued", true, true),
+        row("unmarked", "not queued", true, false),
+        row("rejected", "rejected", true, false),
+    ];
+    let plan = plan_bulk_marks(OperatorMode::Select, false, &rows);
+    assert!(plan.target_state, "a partially marked set marks all");
+    assert_eq!(plan.eligible, vec!["marked", "unmarked"]);
+    assert_eq!(
+        plan.excluded,
+        vec![("rejected".to_string(), MarkExclusion::FinalStatus)]
+    );
+
+    // Every eligible row marked means "unmark all"; the unmarked excluded row
+    // must not drag the target state back to `true`.
+    let rows = [
+        row("a", "not queued", true, true),
+        row("b", "not queued", true, true),
+        row("rejected", "rejected", true, false),
+    ];
+    let plan = plan_bulk_marks(OperatorMode::Select, false, &rows);
+    assert!(!plan.target_state, "a fully marked set unmarks all");
+    assert_eq!(plan.eligible, vec!["a", "b"]);
+}
+
+#[test]
+fn bulk_mark_classification_reports_one_stable_reason_per_mode_and_status() {
+    let cases: Vec<(OperatorMode, bool, &str, bool, Option<MarkExclusion>)> = vec![
+        // Select: everything non-final is pure operator intent.
+        (OperatorMode::Select, false, "not queued", true, None),
+        (
+            OperatorMode::Select,
+            false,
+            "archived",
+            true,
+            Some(MarkExclusion::FinalStatus),
+        ),
+        (
+            OperatorMode::Select,
+            false,
+            "rejected",
+            true,
+            Some(MarkExclusion::FinalStatus),
+        ),
+        // Parallel mode excludes an uncommitted row, and only in parallel mode.
+        (
+            OperatorMode::Select,
+            true,
+            "not queued",
+            false,
+            Some(MarkExclusion::ParallelIneligible),
+        ),
+        (OperatorMode::Select, false, "not queued", false, None),
+        // A final row stays "final": parallel eligibility is not why it is
+        // refused, and reporting "commit it first" would be a lie.
+        (
+            OperatorMode::Select,
+            true,
+            "archived",
+            false,
+            Some(MarkExclusion::FinalStatus),
+        ),
+        // Running: active rows are stopped, not marked; waits are mark-only.
+        (
+            OperatorMode::Running,
+            false,
+            "applying",
+            true,
+            Some(MarkExclusion::ChangeActive),
+        ),
+        (OperatorMode::Running, false, "merge wait", true, None),
+        (OperatorMode::Running, false, "queued", true, None),
+        // Stopped: only resumable rows.
+        (OperatorMode::Stopped, false, "error", true, None),
+        (
+            OperatorMode::Stopped,
+            false,
+            "queued",
+            true,
+            Some(MarkExclusion::StatusImmutable),
+        ),
+    ];
+
+    for (mode, parallel_mode, status, eligible, expected) in cases {
+        assert_eq!(
+            classify_bulk_mark_row(mode, parallel_mode, status, eligible),
+            expected,
+            "mode {mode:?}, parallel {parallel_mode}, status '{status}', eligible {eligible}"
+        );
+    }
+}
+
+#[test]
+fn bulk_mark_is_unavailable_in_error_and_stopping_modes() {
+    for mode in [OperatorMode::Error, OperatorMode::Stopping] {
+        assert!(!supports_bulk_marks(mode));
+        let plan = plan_bulk_marks(mode, false, &[row("a", "not queued", true, false)]);
+        assert!(
+            plan.is_empty() && plan.excluded.is_empty(),
+            "{mode:?} must produce no target set at all"
+        );
+    }
+}
+
+#[test]
+fn bulk_mark_plan_over_zero_rows_is_an_empty_unmark() {
+    let plan = plan_bulk_marks(OperatorMode::Select, false, &[]);
+    assert!(plan.is_empty());
+    assert!(plan.excluded.is_empty());
+    assert!(!plan.target_state);
+    assert_eq!(plan.exclusion_summary(), "");
+}
+
+#[test]
+fn bulk_mark_exclusion_summary_groups_reasons_with_counts() {
+    let rows = [
+        row("active-a", "applying", true, false),
+        row("active-b", "archiving", true, false),
+        row("rejected", "rejected", true, false),
+        row("eligible", "not queued", true, false),
+    ];
+    let plan = plan_bulk_marks(OperatorMode::Running, false, &rows);
+
+    assert_eq!(plan.eligible, vec!["eligible"]);
+    assert_eq!(
+        plan.exclusion_summary(),
+        format!(
+            "2 {}, 1 {}",
+            MarkExclusion::ChangeActive.reason(),
+            MarkExclusion::FinalStatus.reason()
+        )
+    );
+    // Machine-readable tokens are distinct so a client can branch on them.
+    let tokens: std::collections::HashSet<&str> =
+        MarkExclusion::ALL.iter().map(|r| r.as_str()).collect();
+    assert_eq!(tokens.len(), MarkExclusion::ALL.len());
+}
+
+#[test]
+fn parallel_cleanup_targets_only_names_ineligible_rows_carrying_intent() {
+    let rows = [
+        ParallelCleanupRow {
+            change_id: "eligible-marked",
+            parallel_eligible: true,
+            marked: true,
+            queued: true,
+        },
+        ParallelCleanupRow {
+            change_id: "ineligible-idle",
+            parallel_eligible: false,
+            marked: false,
+            queued: false,
+        },
+        ParallelCleanupRow {
+            change_id: "ineligible-marked",
+            parallel_eligible: false,
+            marked: true,
+            queued: false,
+        },
+        ParallelCleanupRow {
+            change_id: "ineligible-queued",
+            parallel_eligible: false,
+            marked: false,
+            queued: true,
+        },
+    ];
+
+    assert_eq!(
+        parallel_cleanup_targets(&rows),
+        vec!["ineligible-marked", "ineligible-queued"],
+        "only ineligible rows that actually carry intent need clearing"
+    );
+}
+
+// ============================================================================
+// Parallel control: service behavior (unit — in-memory queue and reducer)
+// ============================================================================
+
+/// A fixture whose parallel runtime is available and has the given exclusions.
+fn parallel_fixture(ids: &[&str], ineligible: &[&str]) -> Fixture {
+    let fixture = fixture(ids);
+    let parallel = fixture.service.parallel();
+    parallel.set_available(true);
+    parallel.set_max_concurrent(4);
+    parallel.set_vcs_backend("git");
+    parallel.set_parallel_ineligible(ineligible.iter().map(|id| id.to_string()));
+    fixture
+}
+
+#[tokio::test]
+async fn parallel_toggle_is_refused_outside_select_and_stopped() {
+    let fixture = parallel_fixture(&["a"], &[]);
+
+    for mode in [
+        OperatorMode::Running,
+        OperatorMode::Stopping,
+        OperatorMode::Error,
+    ] {
+        let error = fixture
+            .service
+            .set_parallel_mode(mode, true)
+            .await
+            .expect_err("a run owns scheduling decisions the toggle would invalidate");
+        assert!(matches!(
+            error,
+            OperatorCommandError::ParallelModeNotAllowed { .. }
+        ));
+        assert!(
+            !fixture.service.parallel().parallel_mode(),
+            "a refused toggle must not change the mode"
+        );
+    }
+}
+
+#[tokio::test]
+async fn parallel_toggle_is_refused_when_parallel_execution_is_unavailable() {
+    let fixture = fixture(&["a"]);
+    fixture.service.parallel().set_available(false);
+
+    let error = fixture
+        .service
+        .set_parallel_mode(OperatorMode::Select, true)
+        .await
+        .expect_err("parallel mode requires git");
+    assert!(matches!(error, OperatorCommandError::ParallelUnavailable));
+    assert!(!fixture.service.parallel().parallel_mode());
+
+    // Turning it *off* is always allowed: it removes a constraint.
+    assert!(fixture
+        .service
+        .set_parallel_mode(OperatorMode::Select, false)
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn enabling_parallel_mode_clears_ineligible_marks_and_queue_intent() {
+    let fixture = parallel_fixture(&["committed", "uncommitted", "idle-uncommitted"], &[
+        "uncommitted",
+        "idle-uncommitted",
+    ]);
+    fixture.marks.replace([
+        "committed".to_string(),
+        "uncommitted".to_string(),
+    ]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue("committed".to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue("uncommitted".to_string()));
+    }
+
+    let outcome = fixture
+        .service
+        .set_parallel_mode(OperatorMode::Select, true)
+        .await
+        .expect("Select mode accepts the toggle");
+
+    match outcome {
+        OperatorOutcome::ParallelMode { enabled, cleared } => {
+            assert!(enabled);
+            assert_eq!(
+                cleared,
+                vec!["uncommitted".to_string()],
+                "only an ineligible change carrying intent is cleared"
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+
+    assert_eq!(fixture.marks.marked_ids(), vec!["committed".to_string()]);
+    let guard = fixture.state.read().await;
+    assert_eq!(guard.display_status("committed"), "queued");
+    assert_eq!(guard.display_status("uncommitted"), "not queued");
+    assert!(fixture.service.parallel().parallel_mode());
+}
+
+#[tokio::test]
+async fn disabling_parallel_mode_clears_nothing_and_a_replay_is_a_no_op() {
+    let fixture = parallel_fixture(&["a", "b"], &["b"]);
+    fixture.marks.replace(["b".to_string()]);
+
+    // Serial mode refuses nothing, so an ineligible mark survives.
+    let outcome = fixture
+        .service
+        .set_parallel_mode(OperatorMode::Stopped, false)
+        .await
+        .expect("Stopped mode accepts the toggle");
+    assert!(matches!(
+        outcome,
+        OperatorOutcome::NoOp {
+            reason: NoOpReason::ParallelModeUnchanged,
+            ..
+        }
+    ));
+    assert_eq!(fixture.marks.marked_ids(), vec!["b".to_string()]);
+
+    // Enable, then submit the same intent again: the second one changes nothing.
+    fixture
+        .service
+        .set_parallel_mode(OperatorMode::Stopped, true)
+        .await
+        .expect("enabling is accepted");
+    let replay = fixture
+        .service
+        .set_parallel_mode(OperatorMode::Stopped, true)
+        .await
+        .expect("an idempotent replay is accepted");
+    assert!(matches!(
+        replay,
+        OperatorOutcome::NoOp {
+            reason: NoOpReason::ParallelModeUnchanged,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn bulk_mark_marks_every_eligible_change_and_reports_exclusions() {
+    let fixture = parallel_fixture(&["a", "b", "uncommitted"], &["uncommitted"]);
+    fixture.service.parallel().set_parallel_mode(true);
+    fixture.marks.replace(["a".to_string()]);
+
+    let outcome = fixture
+        .service
+        .set_all_execution_marks(OperatorMode::Select)
+        .await
+        .expect("Select mode accepts a bulk mutation");
+
+    match outcome {
+        OperatorOutcome::BulkMarks {
+            marked,
+            changed,
+            excluded,
+        } => {
+            assert!(marked, "one unmarked eligible row marks the whole set");
+            assert_eq!(changed, vec!["b".to_string()], "'a' was already marked");
+            assert_eq!(
+                excluded,
+                vec![(
+                    "uncommitted".to_string(),
+                    MarkExclusion::ParallelIneligible
+                )]
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    assert_eq!(
+        fixture.marks.marked_ids(),
+        vec!["a".to_string(), "b".to_string()],
+        "an excluded row keeps whatever intent it had"
+    );
+}
+
+#[tokio::test]
+async fn bulk_mark_unmarks_every_eligible_change_when_all_are_marked() {
+    let fixture = parallel_fixture(&["a", "b"], &[]);
+    fixture.marks.replace(["a".to_string(), "b".to_string()]);
+
+    let outcome = fixture
+        .service
+        .set_all_execution_marks(OperatorMode::Select)
+        .await
+        .expect("Select mode accepts a bulk mutation");
+
+    match outcome {
+        OperatorOutcome::BulkMarks {
+            marked, changed, ..
+        } => {
+            assert!(!marked);
+            assert_eq!(changed, vec!["a".to_string(), "b".to_string()]);
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    assert!(fixture.marks.marked_ids().is_empty());
+}
+
+#[tokio::test]
+async fn bulk_mark_in_running_mode_moves_queue_intent_with_the_mark() {
+    let fixture = parallel_fixture(&["idle", "active"], &[]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "active".to_string(),
+            command: "apply".to_string(),
+        });
+    }
+
+    let outcome = fixture
+        .service
+        .set_all_execution_marks(OperatorMode::Running)
+        .await
+        .expect("Running mode accepts a bulk mutation");
+
+    match outcome {
+        OperatorOutcome::BulkMarks {
+            marked,
+            changed,
+            excluded,
+        } => {
+            assert!(marked);
+            assert_eq!(changed, vec!["idle".to_string()]);
+            assert_eq!(
+                excluded,
+                vec![("active".to_string(), MarkExclusion::ChangeActive)],
+                "an in-flight change is stopped, never marked"
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+
+    assert_eq!(
+        fixture.state.read().await.display_status("idle"),
+        "queued",
+        "Running mode turns the mark into queue intent"
+    );
+    assert_eq!(fixture.queue.contents.lock().unwrap().clone(), vec!["idle"]);
+    assert_eq!(fixture.hooks.adds(), vec!["idle".to_string()]);
+
+    // Unmarking must take the queue intent back out with it.
+    fixture
+        .service
+        .set_all_execution_marks(OperatorMode::Running)
+        .await
+        .expect("Running mode accepts the reverse mutation");
+    assert_eq!(
+        fixture.state.read().await.display_status("idle"),
+        "not queued"
+    );
+    assert!(fixture.marks.marked_ids().is_empty());
+    assert_eq!(fixture.hooks.removes(), vec!["idle".to_string()]);
+}
+
+#[tokio::test]
+async fn bulk_mark_with_zero_eligible_rows_changes_nothing() {
+    let fixture = parallel_fixture(&["rejected"], &[]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ChangeRejected {
+            change_id: "rejected".to_string(),
+            reason: "acceptance refused the proposal".to_string(),
+        });
+    }
+
+    let outcome = fixture
+        .service
+        .set_all_execution_marks(OperatorMode::Select)
+        .await
+        .expect("a zero-eligible bulk mutation is valid, not an error");
+
+    assert!(matches!(
+        outcome,
+        OperatorOutcome::NoOp {
+            reason: NoOpReason::NoEligibleMarkTarget,
+            ..
+        }
+    ));
+    assert!(fixture.marks.marked_ids().is_empty());
+    assert!(fixture.queue.contents.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bulk_mark_is_refused_in_error_and_stopping_modes_without_side_effects() {
+    for mode in [OperatorMode::Error, OperatorMode::Stopping] {
+        let fixture = parallel_fixture(&["a"], &[]);
+        let error = fixture
+            .service
+            .set_all_execution_marks(mode)
+            .await
+            .expect_err("recovery and a pending stop own these modes");
+        assert!(matches!(
+            error,
+            OperatorCommandError::BulkMarksNotAllowed { .. }
+        ));
+        assert!(fixture.marks.marked_ids().is_empty());
+        assert!(fixture.queue.contents.lock().unwrap().is_empty());
+    }
+}
