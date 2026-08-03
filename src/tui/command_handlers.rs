@@ -15,7 +15,7 @@ use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
 #[cfg(test)]
 use crate::tui::queue::DynamicQueue;
 use crate::tui::state::AppState;
-use crate::tui::types::{AppExecutionMode, StopMode};
+use crate::tui::types::{AppExecutionMode, DeleteIntent, StopMode};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -34,9 +34,19 @@ enum DeleteWorktreeTestOutcome {
     Failure(String),
 }
 
+/// What the stub backend observes and does for one registered worktree.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct DeleteWorktreeTestState {
+    /// Dirty state `observe()` reports for this path.
+    dirty: crate::worktree_ops::service::DirtyState,
+    /// What `remove_worktree()` replays.
+    removal: DeleteWorktreeTestOutcome,
+}
+
 #[cfg(test)]
 static DELETE_WORKTREE_TEST_OUTCOMES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, DeleteWorktreeTestOutcome>>,
+    std::sync::Mutex<std::collections::HashMap<PathBuf, DeleteWorktreeTestState>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
@@ -44,13 +54,33 @@ fn set_delete_worktree_test_outcome(path: PathBuf, outcome: DeleteWorktreeTestOu
     DELETE_WORKTREE_TEST_OUTCOMES
         .lock()
         .expect("delete worktree test outcomes lock")
-        .insert(path, outcome);
+        .insert(
+            path,
+            DeleteWorktreeTestState {
+                dirty: crate::worktree_ops::service::DirtyState::Clean,
+                removal: outcome,
+            },
+        );
+}
+
+#[cfg(test)]
+fn set_delete_worktree_test_dirty(path: PathBuf, dirty: crate::worktree_ops::service::DirtyState) {
+    let mut outcomes = DELETE_WORKTREE_TEST_OUTCOMES
+        .lock()
+        .expect("delete worktree test outcomes lock");
+    let entry = outcomes
+        .entry(path)
+        .or_insert_with(|| DeleteWorktreeTestState {
+            dirty,
+            removal: DeleteWorktreeTestOutcome::Success,
+        });
+    entry.dirty = dirty;
 }
 
 use super::worktrees::load_worktrees_with_conflict_check;
 use crate::worktree_ops::service::{
-    ConflictPolicy, DeleteOptions, WorktreeBackend, WorktreeEventSink, WorktreeOperationEvent,
-    WorktreeService,
+    ConflictPolicy, DeleteOptions, ExpectedTarget, WorktreeBackend, WorktreeEventSink,
+    WorktreeOpError, WorktreeOperationEvent, WorktreeService,
 };
 
 /// Publish shared worktree operation events onto the TUI's orchestrator channel.
@@ -130,37 +160,46 @@ fn build_worktree_backend(
     Arc::new(tests::StubWorktreeBackend)
 }
 
-/// Build the shared worktree operation service for the current TUI context.
-fn build_worktree_service(
+/// Build *the* worktree operation service for one repository.
+///
+/// Called once per process, at startup, and shared from there: the service owns
+/// the repository mutation guard, so a second instance would be a second guard
+/// and two overlapping mutations could each believe they held it. The TUI and
+/// `/api/v2` are handed the same `Arc`.
+pub(crate) fn build_worktree_service(
     repo_root: &Path,
     config: &OrchestratorConfig,
     tx: &mpsc::Sender<OrchestratorEvent>,
-) -> WorktreeService {
+) -> Arc<WorktreeService> {
     let workspace_base_dir = config
         .get_workspace_base_dir()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| crate::config::defaults::default_workspace_base_dir(Some(repo_root)));
-    WorktreeService::new(
+    Arc::new(WorktreeService::new(
         build_worktree_backend(repo_root, config, tx),
         Arc::new(TuiWorktreeEvents {
             tx: tx.clone(),
             repo_root: repo_root.to_path_buf(),
         }),
         workspace_base_dir,
-    )
+    ))
 }
 
 /// Context for TuiCommand handling
 pub struct TuiCommandContext<'a> {
     pub app: &'a mut AppState,
-    pub repo_root: &'a Path,
-    pub config: &'a OrchestratorConfig,
     pub tx: &'a mpsc::Sender<OrchestratorEvent>,
     /// The single process-local run-lifecycle service shared with `/api/v2`.
     ///
     /// Every start, stop, retry, and resolve in this module goes through it, so a
     /// keypress and a remote command cannot resolve the same intent differently.
     pub run_control: &'a Arc<RunControlService>,
+    /// The single process-local worktree service shared with `/api/v2`.
+    ///
+    /// One instance means one repository mutation guard, which is what makes a
+    /// keypress and a remote command serialize against each other instead of
+    /// racing through two independent guards over the same repository.
+    pub worktree_service: &'a Arc<WorktreeService>,
     #[cfg(feature = "web-monitoring")]
     pub web_state: &'a Option<Arc<crate::web::WebState>>,
 }
@@ -233,6 +272,74 @@ fn report_run_no_op(app: &mut AppState, reason: &RunNoOpReason) {
     app.add_log(LogEntry::warn(message));
 }
 
+/// Handle a confirmed worktree deletion.
+///
+/// Adapter only: the shared service owns the delete guards, the teardown/removal
+/// split, the second observation, branch cleanup, and the refresh event. What
+/// this function owns is the *escalation* — the one refusal the TUI answers with
+/// a second confirmation instead of a warning.
+///
+/// The identity the modal confirmed travels with the command so the service can
+/// revalidate it under its own mutation guard: the pre-dispatch modal check is
+/// necessary but not sufficient, since the path can be re-occupied between
+/// confirmation and mutation.
+async fn handle_delete_worktree_command(intent: DeleteIntent, ctx: &mut TuiCommandContext<'_>) {
+    let mut expected = ExpectedTarget::on_branch(intent.branch.clone());
+    if let Some(identity) = intent.identity.clone() {
+        expected = expected.with_identity(identity);
+    }
+    if let Some(head) = intent.head.clone() {
+        expected = expected.with_head(head);
+    }
+
+    let options = if intent.allow_known_dirty {
+        DeleteOptions::local_discarding_dirty(intent.skip_teardown)
+    } else {
+        DeleteOptions::local(intent.skip_teardown)
+    };
+
+    let delete_result = ctx
+        .worktree_service
+        .delete_worktree(&intent.path, &expected, options)
+        .await;
+    ctx.app.clear_worktree_deleting(&intent.path);
+
+    match delete_result {
+        Ok(outcome) => {
+            info!("Worktree deleted successfully: {}", intent.path.display());
+            ctx.app.add_log(LogEntry::success(format!(
+                "Deleted worktree: {} ({})",
+                intent.path.display(),
+                outcome.detail
+            )));
+        }
+        // A known-dirty refusal is the escalation, not a failure: the operator
+        // asked to delete something that still holds uncommitted work, and the
+        // answer is a second confirmation naming exactly what the service just
+        // observed. `allow_known_dirty` was already granted here only if the
+        // refusal is about something else, so this never loops.
+        Err(WorktreeOpError::Dirty { target, .. }) if !intent.allow_known_dirty => {
+            ctx.app
+                .open_dirty_discard_confirmation(&target, intent.skip_teardown);
+        }
+        Err(e) => {
+            ctx.app.show_warning_popup(
+                "Worktree delete failed",
+                format!(
+                    "Failed to delete worktree '{}': {}",
+                    intent.path.display(),
+                    e
+                ),
+            );
+            ctx.app.add_log(LogEntry::error(format!(
+                "Worktree delete failed for '{}': {}",
+                intent.path.display(),
+                e
+            )));
+        }
+    }
+}
+
 /// Handle TuiCommand - main dispatcher
 pub async fn handle_tui_command(
     cmd: TuiCommand,
@@ -299,49 +406,8 @@ pub async fn handle_tui_command(
             )));
             debug_assert_eq!(outcome.mutation, QueueMutation::Removed);
         }
-        TuiCommand::DeleteWorktreeByPath(path, branch_name, skip_teardown) => {
-            // Adapter only: the shared service owns the delete guards, mandatory
-            // teardown ordering, branch cleanup, and the refresh event. The TUI
-            // keeps its local recovery `skip_teardown` escape hatch and its
-            // documented fail-open behavior for an unobservable dirty state;
-            // `/api/v2` passes the fail-closed policy instead.
-            //
-            // The branch the modal confirmed travels with the command so the
-            // service can revalidate it under its own mutation guard: the
-            // pre-dispatch modal check is necessary but not sufficient, since the
-            // path can be re-occupied between confirmation and mutation. The TUI
-            // never waives that check — a confirmation without a concrete branch
-            // identity is refused before it can become a command.
-            let service = build_worktree_service(ctx.repo_root, ctx.config, ctx.tx);
-            let delete_result = service
-                .delete_worktree(
-                    &path,
-                    Some(branch_name.as_str()),
-                    DeleteOptions::local(skip_teardown),
-                )
-                .await;
-            ctx.app.clear_worktree_deleting(&path);
-
-            match delete_result {
-                Ok(_) => {
-                    info!("Worktree deleted successfully: {}", path.display());
-                    ctx.app.add_log(LogEntry::success(format!(
-                        "Deleted worktree: {}",
-                        path.display()
-                    )));
-                }
-                Err(e) => {
-                    ctx.app.show_warning_popup(
-                        "Worktree delete failed",
-                        format!("Failed to delete worktree '{}': {}", path.display(), e),
-                    );
-                    ctx.app.add_log(LogEntry::error(format!(
-                        "Worktree delete failed for '{}': {}",
-                        path.display(),
-                        e
-                    )));
-                }
-            }
+        TuiCommand::DeleteWorktree(intent) => {
+            handle_delete_worktree_command(intent, ctx).await;
         }
         TuiCommand::Stop => {
             // Adapter only: the shared service owns the mode matrix and the
@@ -446,7 +512,7 @@ pub async fn handle_tui_command(
             // sequence. The TUI's policy difference is one value — a conflicting
             // merge is aborted here, and preserved for `/api/v2` clients that
             // have no way to resolve it remotely.
-            let service = build_worktree_service(ctx.repo_root, ctx.config, ctx.tx);
+            let service = ctx.worktree_service.clone();
             let merge_tx = ctx.tx.clone();
 
             tokio::spawn(async move {
@@ -571,13 +637,17 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::worktree_ops::service::{
-        DirtyState, MergeAttempt, WorktreeFacts, WorktreeOpError, WorktreeOpResult,
+        MergeAttempt, WorktreeFacts, WorktreeOpError, WorktreeOpResult,
     };
+
+    /// HEAD every stub-observed worktree reports.
+    pub(super) const STUB_HEAD: &str = "stubhead00000000";
 
     /// Backend the TUI command handlers are unit-tested against.
     ///
     /// Every worktree registered through [`set_delete_worktree_test_outcome`] is
-    /// observable and deletable; `remove` replays that registered outcome. No
+    /// observable; `remove_worktree` replays that registered outcome and
+    /// [`set_delete_worktree_test_dirty`] chooses what `observe` reports. No
     /// repository, process, or filesystem state is involved.
     pub(super) struct StubWorktreeBackend;
 
@@ -587,10 +657,12 @@ mod tests {
             Ok(DELETE_WORKTREE_TEST_OUTCOMES
                 .lock()
                 .expect("delete worktree test outcomes lock")
-                .keys()
-                .map(|path| {
+                .iter()
+                .map(|(path, state)| {
                     let mut facts = WorktreeFacts::new(path.clone(), "feature-a");
-                    facts.dirty = DirtyState::Clean;
+                    facts.identity = format!("gitdir: {}/.git", path.display());
+                    facts.head = STUB_HEAD.to_string();
+                    facts.dirty = state.dirty;
                     facts
                 })
                 .collect())
@@ -609,13 +681,18 @@ mod tests {
             Ok(())
         }
 
-        async fn remove(&self, path: &Path, _skip_teardown: bool) -> WorktreeOpResult<()> {
-            let outcome = DELETE_WORKTREE_TEST_OUTCOMES
+        async fn teardown(&self, _path: &Path) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+
+        async fn remove_worktree(&self, path: &Path) -> WorktreeOpResult<()> {
+            let removal = DELETE_WORKTREE_TEST_OUTCOMES
                 .lock()
                 .expect("delete worktree test outcomes lock")
                 .remove(path)
+                .map(|state| state.removal)
                 .unwrap_or(DeleteWorktreeTestOutcome::Success);
-            match outcome {
+            match removal {
                 DeleteWorktreeTestOutcome::Success => Ok(()),
                 DeleteWorktreeTestOutcome::Failure(message) => Err(WorktreeOpError::Internal(
                     format!("stubbed delete failure for {}: {}", path.display(), message),
@@ -623,7 +700,11 @@ mod tests {
             }
         }
 
-        async fn delete_branch(&self, _branch: &str) -> WorktreeOpResult<()> {
+        async fn branch_ref(&self, _branch: &str) -> WorktreeOpResult<Option<String>> {
+            Ok(Some(STUB_HEAD.to_string()))
+        }
+
+        async fn delete_branch_if_merged(&self, _branch: &str) -> WorktreeOpResult<()> {
             Ok(())
         }
 
@@ -691,6 +772,8 @@ mod tests {
         pub(super) config: OrchestratorConfig,
         pub(super) tx: mpsc::Sender<OrchestratorEvent>,
         pub(super) rx: mpsc::Receiver<OrchestratorEvent>,
+        /// The one shared worktree service, built the same way production does.
+        pub(super) worktree_service: Arc<WorktreeService>,
     }
 
     impl AdapterHarness {
@@ -734,6 +817,7 @@ mod tests {
                 resolves.clone(),
                 Arc::new(StartEligibility::new()),
             ));
+            let worktree_service = build_worktree_service(Path::new("."), &config, &tx);
             Self {
                 state,
                 queue,
@@ -744,6 +828,7 @@ mod tests {
                 config,
                 tx,
                 rx,
+                worktree_service,
             }
         }
 
@@ -764,10 +849,9 @@ mod tests {
         pub(super) fn context<'a>(&'a self, app: &'a mut AppState) -> TuiCommandContext<'a> {
             TuiCommandContext {
                 app,
-                repo_root: Path::new("."),
-                config: &self.config,
                 tx: &self.tx,
                 run_control: &self.run_control,
+                worktree_service: &self.worktree_service,
                 #[cfg(feature = "web-monitoring")]
                 web_state: &None,
             }
@@ -811,7 +895,11 @@ mod tests {
         harness
             .run(
                 &mut app,
-                TuiCommand::DeleteWorktreeByPath(path.clone(), "feature-a".to_string(), false),
+                TuiCommand::DeleteWorktree(DeleteIntent::ordinary(
+                    path.clone(),
+                    "feature-a".to_string(),
+                    false,
+                )),
             )
             .await;
 
@@ -837,7 +925,11 @@ mod tests {
         harness
             .run(
                 &mut app,
-                TuiCommand::DeleteWorktreeByPath(path.clone(), "feature-a".to_string(), false),
+                TuiCommand::DeleteWorktree(DeleteIntent::ordinary(
+                    path.clone(),
+                    "feature-a".to_string(),
+                    false,
+                )),
             )
             .await;
 
@@ -867,7 +959,11 @@ mod tests {
         harness
             .run(
                 &mut app,
-                TuiCommand::DeleteWorktreeByPath(path.clone(), "feature-stale".to_string(), false),
+                TuiCommand::DeleteWorktree(DeleteIntent::ordinary(
+                    path.clone(),
+                    "feature-stale".to_string(),
+                    false,
+                )),
             )
             .await;
 
@@ -887,6 +983,198 @@ mod tests {
                 .contains_key(&path),
             "a refused delete must never reach the backend remove"
         );
+    }
+
+    // ── Explicit dirty discard ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_escalates_the_services_refusal_into_a_confirmation() {
+        for skip_teardown in [false, true] {
+            let harness = AdapterHarness::new(&["change-a"]);
+            let mut app = harness.app(&["change-a"]);
+            let path = PathBuf::from("/tmp/worktree-dirty");
+            set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+            set_delete_worktree_test_dirty(
+                path.clone(),
+                crate::worktree_ops::service::DirtyState::Dirty,
+            );
+            app.worktrees = vec![create_test_worktree(path.to_str().unwrap())];
+            app.mark_worktree_deleting(path.clone());
+
+            harness
+                .run(
+                    &mut app,
+                    TuiCommand::DeleteWorktree(DeleteIntent::ordinary(
+                        path.clone(),
+                        "feature-a".to_string(),
+                        skip_teardown,
+                    )),
+                )
+                .await;
+
+            // The refusal is an escalation, not a failure: no warning popup, and
+            // the confirmation carries the *service's* observation.
+            assert!(
+                app.warning_popup.is_none(),
+                "a dirty refusal must not be reported as a delete failure"
+            );
+            assert_eq!(
+                app.modal,
+                Some(crate::tui::types::ModalState::ConfirmDirtyDiscard {
+                    path: path.clone(),
+                    identity: format!("gitdir: {}/.git", path.display()),
+                    branch: "feature-a".to_string(),
+                    head: STUB_HEAD.to_string(),
+                    skip_teardown,
+                })
+            );
+            assert!(
+                DELETE_WORKTREE_TEST_OUTCOMES
+                    .lock()
+                    .expect("delete worktree test outcomes lock")
+                    .contains_key(&path),
+                "a refused delete must never reach the backend removal"
+            );
+            assert!(!app.is_worktree_deleting(&path));
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_removes_the_worktree_once_discard_is_granted() {
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        let path = PathBuf::from("/tmp/worktree-dirty-confirmed");
+        set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+        set_delete_worktree_test_dirty(
+            path.clone(),
+            crate::worktree_ops::service::DirtyState::Dirty,
+        );
+        app.worktrees = vec![create_test_worktree(path.to_str().unwrap())];
+        app.mark_worktree_deleting(path.clone());
+
+        harness
+            .run(
+                &mut app,
+                TuiCommand::DeleteWorktree(DeleteIntent {
+                    path: path.clone(),
+                    branch: "feature-a".to_string(),
+                    identity: Some(format!("gitdir: {}/.git", path.display())),
+                    head: Some(STUB_HEAD.to_string()),
+                    skip_teardown: false,
+                    allow_known_dirty: true,
+                }),
+            )
+            .await;
+
+        assert!(
+            app.modal.is_none(),
+            "a granted discard must not re-escalate"
+        );
+        assert!(!app.is_worktree_deleting(&path));
+        assert!(
+            !DELETE_WORKTREE_TEST_OUTCOMES
+                .lock()
+                .expect("delete worktree test outcomes lock")
+                .contains_key(&path),
+            "the removal must actually have reached the backend"
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("Deleted worktree")));
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_reports_non_dirty_refusals_as_failures() {
+        // Only `Dirty` escalates. Everything else is a refusal the operator has
+        // to read, because no keypress can waive it.
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        let path = PathBuf::from("/tmp/worktree-unknown-dirty");
+        set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+        set_delete_worktree_test_dirty(
+            path.clone(),
+            crate::worktree_ops::service::DirtyState::Unknown,
+        );
+        app.worktrees = vec![create_test_worktree(path.to_str().unwrap())];
+        app.mark_worktree_deleting(path.clone());
+
+        harness
+            .run(
+                &mut app,
+                TuiCommand::DeleteWorktree(DeleteIntent::ordinary(
+                    path.clone(),
+                    "feature-a".to_string(),
+                    false,
+                )),
+            )
+            .await;
+
+        assert!(
+            app.modal.is_none(),
+            "an unobservable dirty state must never offer a discard confirmation"
+        );
+        assert!(app.warning_popup.is_some());
+        assert!(app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("Worktree delete failed")));
+        assert!(
+            DELETE_WORKTREE_TEST_OUTCOMES
+                .lock()
+                .expect("delete worktree test outcomes lock")
+                .contains_key(&path),
+            "a refused delete must never reach the backend removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_shares_one_mutation_guard_with_the_remote_port() {
+        // Both frontends are handed the same `Arc<WorktreeService>`, so an
+        // in-flight mutation is visible to the other one as `root_busy` instead
+        // of racing through a second guard over the same repository.
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        let path = PathBuf::from("/tmp/worktree-guarded");
+        set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+        app.worktrees = vec![create_test_worktree(path.to_str().unwrap())];
+        app.mark_worktree_deleting(path.clone());
+
+        let held = harness
+            .worktree_service
+            .observe()
+            .await
+            .expect("the stub observes");
+        assert!(!held.is_empty());
+
+        // Hold the shared guard exactly as a concurrent `/api/v2` delete would.
+        let guard = harness
+            .worktree_service
+            .acquire_root_for_test()
+            .expect("the first caller takes the shared guard");
+
+        harness
+            .run(
+                &mut app,
+                TuiCommand::DeleteWorktree(DeleteIntent::ordinary(
+                    path.clone(),
+                    "feature-a".to_string(),
+                    false,
+                )),
+            )
+            .await;
+        drop(guard);
+
+        assert!(
+            DELETE_WORKTREE_TEST_OUTCOMES
+                .lock()
+                .expect("delete worktree test outcomes lock")
+                .contains_key(&path),
+            "a keypress must not mutate the repository while another operation holds the guard"
+        );
+        assert!(app.logs.iter().any(|entry| entry
+            .message
+            .contains("another worktree operation is already mutating this repository")));
     }
 
     // ── Queue intent ────────────────────────────────────────────────────────
@@ -1903,14 +2191,14 @@ mod run_supervisor_tests {
         assert_eq!(app.changes[0].display_status_cache, "error");
         app.execution_mode = AppExecutionMode::Error;
         app.changes[0].selected = true;
+        let worktree_service = build_worktree_service(&root, &config, &tx);
 
         {
             let mut ctx = TuiCommandContext {
                 app: &mut app,
-                repo_root: &root,
-                config: &config,
                 tx: &tx,
                 run_control: &run_control,
+                worktree_service: &worktree_service,
                 #[cfg(feature = "web-monitoring")]
                 web_state: &None,
             };

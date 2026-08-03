@@ -236,6 +236,9 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
         Some(ModalState::ConfirmWorktreeDelete { .. }) => {
             worktree_view::render_delete_confirm(frame, app, area)
         }
+        Some(ModalState::ConfirmDirtyDiscard { .. }) => {
+            worktree_view::render_dirty_discard_confirm(frame, app, area)
+        }
         // Force-kill confirmation keeps its existing in-list presentation (the
         // `Y: confirm kill` / `N: cancel` hints and the header label); it has no
         // separate popup widget, and this change does not add one.
@@ -391,6 +394,10 @@ mod worktree_view {
     pub(super) fn render_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
         super::render_worktree_delete_confirm(frame, app, area);
     }
+
+    pub(super) fn render_dirty_discard_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
+        super::render_worktree_dirty_discard_confirm(frame, app, area);
+    }
 }
 
 mod popups {
@@ -430,6 +437,9 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         Some(modal @ ModalState::QrPopup) => (modal.title_label().to_string(), Color::Green, true),
         Some(modal @ ModalState::ConfirmWorktreeDelete { .. }) => {
             (modal.title_label().to_string(), Color::Yellow, true)
+        }
+        Some(modal @ ModalState::ConfirmDirtyDiscard { .. }) => {
+            (modal.title_label().to_string(), Color::Red, true)
         }
         Some(modal @ ModalState::ConfirmForceKill { .. }) => {
             (modal.title_label().to_string(), Color::Red, true)
@@ -1849,7 +1859,10 @@ fn render_worktree_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect)
     let path = path.display();
 
     let modal_width = (area.width * 60 / 100).clamp(40, 90);
-    let modal_height = (area.height * 30 / 100).clamp(7, 12);
+    // Tall enough for all seven body lines plus borders. The key hints are the
+    // last of them, and a confirmation that clips the keys it accepts is worse
+    // than one that takes more of a short terminal.
+    let modal_height = (area.height * 30 / 100).clamp(9, 12).min(area.height);
     let modal_x = (area.width.saturating_sub(modal_width)) / 2;
     let modal_y = (area.height.saturating_sub(modal_height)) / 2;
 
@@ -1871,12 +1884,99 @@ fn render_worktree_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect)
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "This will remove the worktree directory permanently.",
+            "This will remove the worktree directory permanently, including",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "generated and ignored contents inside it.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "Press Y to delete, N or Esc to cancel.",
+            "Y: run teardown and delete   S: skip teardown and delete",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "N or Esc: cancel",
+            Style::default().fg(Color::White),
+        )),
+    ];
+
+    let body = Paragraph::new(lines);
+    frame.render_widget(body, inner_area);
+}
+
+/// Render the second, explicitly destructive confirmation for a dirty worktree.
+///
+/// This modal exists because the first one is not enough: the operator has
+/// already asked for a deletion and been told the worktree still holds
+/// uncommitted work. What it must state, and what makes `X` a different decision
+/// from `Y`, is that the work is discarded rather than preserved anywhere.
+fn render_worktree_dirty_discard_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
+    let Some(ModalState::ConfirmDirtyDiscard {
+        path,
+        branch,
+        skip_teardown,
+        ..
+    }) = &app.modal
+    else {
+        return;
+    };
+
+    let modal_width = (area.width * 70 / 100).clamp(46, 100);
+    // Ten body lines plus borders: the `X` hint is the last line, and clipping
+    // it would leave the operator looking at a warning with no stated way out.
+    let modal_height = (area.height * 40 / 100).clamp(12, 16).min(area.height);
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(" Discard Uncommitted Changes ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+
+    let inner_area = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let teardown_line = if *skip_teardown {
+        "Teardown will be skipped (S was pressed)."
+    } else {
+        "Teardown will run before removal (Y was pressed)."
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("'{}' has uncommitted changes.", branch),
+            Style::default().fg(Color::Red),
+        )),
+        Line::from(Span::styled(
+            format!("{}", path.display()),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tracked and staged edits and reported untracked files will be",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "permanently lost. Generated and ignored contents of the",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "directory go with it. Nothing is stashed, committed, or backed up.",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            teardown_line,
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press uppercase X to discard and delete, N or Esc to keep it.",
             Style::default().fg(Color::White),
         )),
     ];
@@ -2272,7 +2372,63 @@ mod tests {
         assert!(content.contains("Tab: changes"));
         assert!(content.contains("D: delete"));
         assert!(content.contains("Delete Worktree"));
-        assert!(content.contains("Press Y to delete, N or Esc to cancel"));
+        // Both teardown choices are stated, because the operator picks between
+        // them here and the choice is carried into any later confirmation.
+        assert!(content.contains("Y: run teardown and delete"));
+        assert!(content.contains("S: skip teardown and delete"));
+        assert!(content.contains("N or Esc: cancel"));
+        assert!(
+            content.contains("generated and ignored contents"),
+            "the ordinary warning must still say the directory goes with it: {content}"
+        );
+    }
+
+    #[test]
+    fn tui_dirty_worktree_delete_destructive_modal_states_the_loss_and_the_key() {
+        let mut app = create_test_app(vec![]);
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a")];
+        app.modal = Some(ModalState::ConfirmDirtyDiscard {
+            path: std::path::PathBuf::from("/tmp/worktree-a"),
+            identity: "gitdir: /tmp/worktree-a/.git".to_string(),
+            branch: "feature-a".to_string(),
+            head: "abc1234".to_string(),
+            skip_teardown: false,
+        });
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("Discard Uncommitted Changes"));
+        assert!(content.contains("has uncommitted changes"));
+        assert!(content.contains("permanently lost"));
+        assert!(
+            content.contains("Nothing is stashed, committed, or backed up"),
+            "the modal must not imply the work is recoverable: {content}"
+        );
+        assert!(content.contains("Press uppercase X to discard and delete"));
+        assert!(content.contains("Teardown will run before removal"));
+    }
+
+    #[test]
+    fn tui_dirty_worktree_delete_destructive_modal_reports_the_captured_teardown_choice() {
+        let mut app = create_test_app(vec![]);
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a")];
+        app.modal = Some(ModalState::ConfirmDirtyDiscard {
+            path: std::path::PathBuf::from("/tmp/worktree-a"),
+            identity: "gitdir: /tmp/worktree-a/.git".to_string(),
+            branch: "feature-a".to_string(),
+            head: "abc1234".to_string(),
+            skip_teardown: true,
+        });
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let content = buffer_to_string(&buffer);
+
+        // The `S` the operator pressed is still in force here; `X` grants the
+        // other permission, not this one.
+        assert!(content.contains("Teardown will be skipped"));
     }
 
     #[test]

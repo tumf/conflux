@@ -18,7 +18,9 @@ use crate::openspec::Change;
 use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
 use crate::tui::config::TuiConfig;
 use crate::tui::events::{LogEntry, LogLevel, TuiCommand};
-use crate::tui::types::{AppExecutionMode, ModalState, StopMode, ViewMode, WorktreeInfo};
+use crate::tui::types::{
+    AppExecutionMode, DeleteIntent, ModalState, StopMode, ViewMode, WorktreeInfo,
+};
 use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet};
@@ -771,6 +773,11 @@ impl AppState {
     /// The confirmation is re-checked against a fresh worktree observation before
     /// anything is mutated: a stale identity refuses the command and leaves the
     /// worktree untouched rather than deleting whatever now occupies the path.
+    ///
+    /// Neither `Y` (`skip_teardown = false`) nor `S` (`skip_teardown = true`)
+    /// grants permission to discard uncommitted work. A known-dirty target
+    /// refuses in the shared service and comes back as an escalation into
+    /// [`Self::open_dirty_discard_confirmation`].
     pub fn confirm_worktree_action_delete_with_options(
         &mut self,
         skip_teardown: bool,
@@ -799,19 +806,98 @@ impl AppState {
             path.display()
         )));
 
-        Some(TuiCommand::DeleteWorktreeByPath(
+        Some(TuiCommand::DeleteWorktree(DeleteIntent::ordinary(
             path,
             branch,
             skip_teardown,
-        ))
+        )))
+    }
+
+    /// Escalate the shared service's fresh known-dirty refusal into a second,
+    /// explicitly destructive confirmation.
+    ///
+    /// The target comes from the service's own observation, taken under its
+    /// mutation guard. Nothing here is read from `worktrees`, which carries no
+    /// dirty state and would be a stale answer if it did.
+    pub fn open_dirty_discard_confirmation(
+        &mut self,
+        target: &crate::worktree_ops::service::DirtyTarget,
+        skip_teardown: bool,
+    ) {
+        self.modal = Some(ModalState::ConfirmDirtyDiscard {
+            path: target.path.clone(),
+            identity: target.identity.clone(),
+            branch: target.branch.clone(),
+            head: target.head.clone(),
+            skip_teardown,
+        });
+        self.add_log(LogEntry::warn(format!(
+            "Worktree has uncommitted changes: {} (press X to discard them and delete)",
+            target.path.display()
+        )));
+    }
+
+    /// Grant known-dirty discard for the pending destructive confirmation.
+    ///
+    /// This is reachable only from the uppercase `X` keypress. It re-checks the
+    /// confirmation against the latest observation first, so a target that became
+    /// active, was re-branded, moved its HEAD, or entered another delete between
+    /// the escalation and the keypress refuses instead of being discarded.
+    pub fn confirm_dirty_discard(&mut self) -> Option<TuiCommand> {
+        let Some(ModalState::ConfirmDirtyDiscard {
+            path,
+            identity,
+            branch,
+            head,
+            skip_teardown,
+        }) = self.modal.clone()
+        else {
+            return None;
+        };
+
+        if let Err(invalidation) = modal_logic::evaluate_dirty_discard(
+            &path,
+            &branch,
+            &head,
+            &self.modal_validity_context(),
+        ) {
+            self.invalidate_modal_with_report(invalidation, "Dirty worktree discard");
+            return None;
+        }
+
+        self.modal = None;
+        self.mark_worktree_deleting(path.clone());
+        let teardown_note = if skip_teardown {
+            " without teardown"
+        } else {
+            ""
+        };
+        self.add_log(LogEntry::warn(format!(
+            "Discarding uncommitted changes and deleting worktree{}: {}",
+            teardown_note,
+            path.display()
+        )));
+
+        Some(TuiCommand::DeleteWorktree(DeleteIntent {
+            path,
+            branch,
+            identity: Some(identity),
+            head: Some(head),
+            skip_teardown,
+            allow_known_dirty: true,
+        }))
     }
 
     /// Cancel pending worktree action.
     ///
     /// Only the overlay is dismissed; the execution mode underneath is whatever the
-    /// latest lifecycle event left it as.
+    /// latest lifecycle event left it as. Cancelling a dirty-discard confirmation
+    /// retains the worktree and everything uncommitted in it.
     pub fn cancel_worktree_action(&mut self) {
-        if matches!(self.modal, Some(ModalState::ConfirmWorktreeDelete { .. })) {
+        if matches!(
+            self.modal,
+            Some(ModalState::ConfirmWorktreeDelete { .. } | ModalState::ConfirmDirtyDiscard { .. })
+        ) {
             self.modal = None;
         }
     }
@@ -1946,9 +2032,12 @@ mod tests {
 
         assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")));
         assert!(matches!(
-            command,
-            Some(TuiCommand::DeleteWorktreeByPath(path, branch, false))
-                if path.as_path() == PathBuf::from("/tmp/worktree-a").as_path() && branch == "feature-a"
+            &command,
+            Some(TuiCommand::DeleteWorktree(intent))
+                if intent.path == *"/tmp/worktree-a"
+                    && intent.branch == "feature-a"
+                    && !intent.skip_teardown
+                    && !intent.allow_known_dirty
         ));
         assert!(app
             .logs
@@ -1966,9 +2055,12 @@ mod tests {
 
         assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")));
         assert!(matches!(
-            command,
-            Some(TuiCommand::DeleteWorktreeByPath(path, branch, true))
-                if path.as_path() == PathBuf::from("/tmp/worktree-a").as_path() && branch == "feature-a"
+            &command,
+            Some(TuiCommand::DeleteWorktree(intent))
+                if intent.path == *"/tmp/worktree-a"
+                    && intent.branch == "feature-a"
+                    && intent.skip_teardown
+                    && !intent.allow_known_dirty
         ));
         assert!(app.logs.iter().any(|entry| {
             entry
@@ -2044,10 +2136,175 @@ mod tests {
             })
         );
         assert!(matches!(
-            app.confirm_worktree_action_delete(),
-            Some(TuiCommand::DeleteWorktreeByPath(path, branch, false))
-                if path == std::path::Path::new("/tmp/worktree-b") && branch == "feature-b"
+            &app.confirm_worktree_action_delete(),
+            Some(TuiCommand::DeleteWorktree(intent))
+                if intent.path == std::path::Path::new("/tmp/worktree-b") && intent.branch == "feature-b"
         ));
+    }
+
+    /// A named way a dirty-discard target can drift before the confirmation.
+    type DirtyDriftCase = (&'static str, fn(&mut AppState));
+
+    fn dirty_target(path: &str, branch: &str) -> crate::worktree_ops::service::DirtyTarget {
+        crate::worktree_ops::service::DirtyTarget {
+            path: PathBuf::from(path),
+            identity: format!("gitdir: {path}/.git"),
+            branch: branch.to_string(),
+            head: "abc123".to_string(),
+        }
+    }
+
+    /// An app whose single worktree matches [`dirty_target`]'s observation.
+    fn dirty_discard_app() -> AppState {
+        let mut app = AppState::new(vec![create_test_change("feature-a", 0, 1)]);
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a", false)];
+        app
+    }
+
+    #[test]
+    fn tui_dirty_worktree_delete_escalation_captures_the_services_observation() {
+        for skip_teardown in [false, true] {
+            let mut app = dirty_discard_app();
+
+            app.open_dirty_discard_confirmation(
+                &dirty_target("/tmp/worktree-a", "feature-a"),
+                skip_teardown,
+            );
+
+            // Every field comes from the service's fresh look, including the
+            // identity and HEAD the projection in `worktrees` does not carry.
+            assert_eq!(
+                app.modal,
+                Some(ModalState::ConfirmDirtyDiscard {
+                    path: PathBuf::from("/tmp/worktree-a"),
+                    identity: "gitdir: /tmp/worktree-a/.git".to_string(),
+                    branch: "feature-a".to_string(),
+                    head: "abc123".to_string(),
+                    skip_teardown,
+                })
+            );
+            assert!(
+                !app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")),
+                "escalating is not deleting: the marker must not be taken yet"
+            );
+            assert!(app
+                .logs
+                .iter()
+                .any(|entry| entry.message.contains("press X to discard them")));
+        }
+    }
+
+    #[test]
+    fn tui_dirty_worktree_delete_confirmation_grants_discard_with_the_captured_teardown_bit() {
+        for skip_teardown in [false, true] {
+            let mut app = dirty_discard_app();
+            app.open_dirty_discard_confirmation(
+                &dirty_target("/tmp/worktree-a", "feature-a"),
+                skip_teardown,
+            );
+
+            let command = app.confirm_dirty_discard();
+
+            let Some(TuiCommand::DeleteWorktree(intent)) = command else {
+                panic!("expected a delete command, got {command:?}");
+            };
+            assert_eq!(intent.path, PathBuf::from("/tmp/worktree-a"));
+            assert_eq!(intent.branch, "feature-a");
+            assert_eq!(
+                intent.identity.as_deref(),
+                Some("gitdir: /tmp/worktree-a/.git")
+            );
+            assert_eq!(intent.head.as_deref(), Some("abc123"));
+            assert!(
+                intent.allow_known_dirty,
+                "uppercase X is what grants the discard permission"
+            );
+            assert_eq!(
+                intent.skip_teardown, skip_teardown,
+                "the teardown decision is the one taken in the ordinary confirmation"
+            );
+            assert!(app.modal.is_none());
+            assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")));
+        }
+    }
+
+    #[test]
+    fn tui_dirty_worktree_delete_ordinary_confirmations_never_grant_discard() {
+        for skip_teardown in [false, true] {
+            let mut app = dirty_discard_app();
+            app.request_worktree_delete_from_list();
+
+            let command = app.confirm_worktree_action_delete_with_options(skip_teardown);
+
+            let Some(TuiCommand::DeleteWorktree(intent)) = command else {
+                panic!("expected a delete command, got {command:?}");
+            };
+            assert!(
+                !intent.allow_known_dirty,
+                "neither Y nor S may grant permission to discard uncommitted work"
+            );
+            assert_eq!(intent.skip_teardown, skip_teardown);
+            assert_eq!(intent.identity, None);
+            assert_eq!(intent.head, None);
+        }
+    }
+
+    #[test]
+    fn tui_dirty_worktree_delete_cancellation_retains_the_worktree() {
+        let mut app = dirty_discard_app();
+        app.open_dirty_discard_confirmation(&dirty_target("/tmp/worktree-a", "feature-a"), false);
+
+        app.cancel_worktree_action();
+
+        assert!(app.modal.is_none());
+        assert!(
+            !app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")),
+            "cancelling must leave the worktree and its content alone"
+        );
+        assert!(
+            app.confirm_dirty_discard().is_none(),
+            "confirming without a modal must not emit a delete command"
+        );
+    }
+
+    #[test]
+    fn tui_dirty_worktree_delete_refuses_a_target_that_drifted_before_dispatch() {
+        let cases: [DirtyDriftCase; 5] = [
+            ("absent", |app: &mut AppState| app.worktrees.clear()),
+            ("main", |app: &mut AppState| app.worktrees[0].is_main = true),
+            ("rebranded", |app: &mut AppState| {
+                app.worktrees[0].branch = "feature-z".to_string()
+            }),
+            ("head-moved", |app: &mut AppState| {
+                app.worktrees[0].head = "def456".to_string()
+            }),
+            ("active", |app: &mut AppState| {
+                app.changes[0].set_display_status_cache("applying")
+            }),
+        ];
+
+        for (name, mutate) in cases {
+            let mut app = dirty_discard_app();
+            app.open_dirty_discard_confirmation(
+                &dirty_target("/tmp/worktree-a", "feature-a"),
+                false,
+            );
+            mutate(&mut app);
+
+            assert!(
+                app.confirm_dirty_discard().is_none(),
+                "{name}: a drifted target must not be discarded"
+            );
+            assert!(
+                app.modal.is_none(),
+                "{name}: the stale modal must be cleared"
+            );
+            assert!(
+                !app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")),
+                "{name}: a refused discard must not mark the worktree deleting"
+            );
+        }
     }
 
     #[test]
