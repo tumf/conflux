@@ -219,6 +219,37 @@ fn task_format_blocks_acceptance(workspace_path: &Path, change_id: &str) -> Vec<
     diagnostics
 }
 
+/// Evaluates the Apply repository-finalization barrier.
+///
+/// Conflux may only start owned index-mutating Git work (WIP snapshot, final
+/// Apply commit), cleanup review, a rejecting handoff, or an Acceptance
+/// dispatch once the owned Apply process group is proven to have no remaining
+/// members. Reaping the group leader is not that proof: a descendant can still
+/// hold the managed worktree `index.lock` after `sh` exits.
+///
+/// The verdict is derived purely from the passed-in ephemeral cleanup evidence,
+/// so it introduces no durable workflow state.
+pub(crate) fn evaluate_process_group_barrier(
+    report: &crate::process_manager::ProcessGroupCleanupReport,
+    change_id: &str,
+    workspace_path: &Path,
+    iteration: u32,
+) -> Result<()> {
+    if report.is_confirmed() {
+        return Ok(());
+    }
+
+    Err(OrchestratorError::AgentCommand(format!(
+        "Apply process-group cleanup could not be confirmed for '{}' in workspace '{}' \
+         (iteration {}); repository finalization was not started. {}. \
+         Resolve or terminate the surviving processes, then retry apply.",
+        change_id,
+        workspace_path.display(),
+        iteration,
+        report.diagnostics()
+    )))
+}
+
 fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<ApplyCompletionKind> {
     if detect_apply_blocked_handoff(workspace_path, change_id).is_some() {
         return Some(ApplyCompletionKind::BlockedHandoff);
@@ -1418,6 +1449,31 @@ where
 
             return Err(OrchestratorError::AgentCommand(error_msg));
         }
+
+        // Repository-finalization barrier. Everything below this point may
+        // mutate the managed worktree or hand the change to another stage, so
+        // it runs only once the owned Apply process group is proven quiescent.
+        // The evidence is ephemeral process-lifetime state; a restart re-derives
+        // routing from the workspace alone.
+        let cleanup_report = child.process_group_cleanup().await;
+        if let Err(barrier_error) =
+            evaluate_process_group_barrier(&cleanup_report, change_id, workspace_path, iteration)
+        {
+            warn!(
+                change_id = change_id,
+                iteration = iteration,
+                workspace = %workspace_path.display(),
+                quiescence = cleanup_report.quiescence().as_str(),
+                "Apply process-group cleanup unconfirmed; skipping WIP snapshot, final commit, and handoff"
+            );
+            return Err(barrier_error);
+        }
+        debug!(
+            change_id = change_id,
+            iteration = iteration,
+            force_killed = cleanup_report.force_killed(),
+            "Apply process-group quiescence confirmed; repository finalization may start"
+        );
 
         ensure_runtime_acceptance_follow_up(workspace_path, change_id, agent)?;
 
@@ -2638,6 +2694,364 @@ mod tests {
         assert_eq!(
             result.iterations, 1,
             "tasks-complete grace-terminated run should exit in a single iteration"
+        );
+    }
+
+    // === Apply process-group finalization barrier ===
+
+    fn cleanup_report_for_test(
+        quiescence: crate::process_manager::ProcessGroupQuiescence,
+        detail: &str,
+    ) -> crate::process_manager::ProcessGroupCleanupReport {
+        crate::process_manager::ProcessGroupCleanupReport::for_test(quiescence, Some(4242), detail)
+    }
+
+    #[test]
+    fn apply_process_group_barrier_allows_finalization_when_quiescence_confirmed() {
+        let report = cleanup_report_for_test(
+            crate::process_manager::ProcessGroupQuiescence::Confirmed,
+            "no members remained after graceful termination",
+        );
+
+        evaluate_process_group_barrier(&report, "change-a", Path::new("/tmp/ws"), 2)
+            .expect("confirmed quiescence must allow repository finalization");
+    }
+
+    #[test]
+    fn apply_process_group_barrier_allows_finalization_when_verification_not_applicable() {
+        let report = crate::process_manager::ProcessGroupCleanupReport::not_applicable(
+            "strict post-completion process-group cleanup is disabled",
+        );
+
+        evaluate_process_group_barrier(&report, "change-a", Path::new("/tmp/ws"), 1)
+            .expect("a platform/config without an owned group must not block finalization");
+    }
+
+    #[test]
+    fn apply_process_group_barrier_blocks_finalization_when_members_remain() {
+        let report = cleanup_report_for_test(
+            crate::process_manager::ProcessGroupQuiescence::MembersRemain,
+            "members were still alive after SIGKILL and the cleanup budget expired",
+        );
+
+        let err = evaluate_process_group_barrier(&report, "change-a", Path::new("/tmp/ws"), 3)
+            .expect_err("surviving process-group members must block repository finalization");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("repository finalization was not started"),
+            "error must state that no finalization ran: {message}"
+        );
+        assert!(
+            message.contains("pgid=4242") && message.contains("members_remain"),
+            "error must carry actionable cleanup diagnostics: {message}"
+        );
+        assert!(
+            message.contains("change-a") && message.contains("iteration 3"),
+            "error must identify the change and iteration: {message}"
+        );
+    }
+
+    #[test]
+    fn apply_process_group_barrier_blocks_finalization_when_membership_unverifiable() {
+        let report = cleanup_report_for_test(
+            crate::process_manager::ProcessGroupQuiescence::Unverifiable,
+            "group membership could not be checked after SIGKILL (EPERM)",
+        );
+
+        let err = evaluate_process_group_barrier(&report, "change-a", Path::new("/tmp/ws"), 1)
+            .expect_err("unverifiable membership must block repository finalization");
+        assert!(
+            err.to_string().contains("unverifiable"),
+            "error must name the unverifiable verdict: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_process_group_barrier_blocks_finalization_when_evidence_is_missing() {
+        // Absence of evidence must never be read as quiescence.
+        let report = crate::process_manager::ProcessGroupCleanupReport::missing(
+            "the command runner ended without publishing process-group cleanup evidence",
+        );
+
+        evaluate_process_group_barrier(&report, "change-a", Path::new("/tmp/ws"), 1)
+            .expect_err("missing cleanup evidence must block repository finalization");
+    }
+
+    /// Writes an executable-free shell script and returns its path.
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("script should be written");
+        path
+    }
+
+    #[cfg(unix)]
+    fn git_log_subjects(workspace: &Path) -> Vec<String> {
+        let output = std::process::Command::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(workspace)
+            .output()
+            .expect("git log should run");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    /// Unconfirmed process-group cleanup must fail Apply before any
+    /// Conflux-owned Git finalization, cleanup review, or Acceptance dispatch.
+    ///
+    /// Uses a real SIGTERM-immune descendant plus a zero cleanup budget so the
+    /// group provably cannot be shown quiescent.
+    #[cfg(unix)]
+    #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+    #[tokio::test]
+    async fn apply_process_group_barrier_blocks_git_finalization_for_unconfirmed_cleanup() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "unconfirmed-cleanup";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] one\n",
+        )
+        .unwrap();
+
+        let pgid_file = temp_dir.path().join("survivor.pgid");
+        let survivor = write_script(
+            temp_dir.path(),
+            "survivor.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 trap '' TERM\n\
+                 echo $$ > {pgid}\n\
+                 while :; do sleep 0.2; done\n",
+                pgid = pgid_file.display()
+            ),
+        );
+        let apply_script = write_script(
+            temp_dir.path(),
+            "apply.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 printf '## Implementation Tasks\\n- [x] one\\n' > {tasks}\n\
+                 sh {survivor} >/dev/null 2>&1 </dev/null &\n\
+                 sleep 120\n",
+                tasks = change_dir.join("tasks.md").display(),
+                survivor = survivor.display()
+            ),
+        );
+
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh {}", apply_script.display())),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let mut ai_runner = make_test_ai_runner();
+        // Zero budget: the surviving descendant can never be proven gone.
+        ai_runner.set_process_group_cleanup_timeout_ms(0);
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let commits_before = git_log_subjects(workspace);
+
+        let err = scoped_apply_completion_grace_secs_for_test(
+            1,
+            scoped_apply_completion_check_interval_ms_for_test(
+                200,
+                execute_apply_loop(
+                    change_id,
+                    workspace,
+                    &config,
+                    &mut agent,
+                    VcsBackend::Git,
+                    Some(&workspace_manager),
+                    None,
+                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &NoOpEventHandler,
+                    None,
+                    &ai_runner,
+                    |_line| async move {},
+                ),
+            ),
+        )
+        .await
+        .expect_err("unconfirmed process-group cleanup must fail apply");
+
+        // Terminate the survivor before asserting so a failure cannot leak it.
+        let survivor_pid: i32 = std::fs::read_to_string(&pgid_file)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .expect("survivor should have recorded its pid");
+        unsafe {
+            let pgid = libc::getpgid(survivor_pid);
+            if pgid > 0 {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+            libc::kill(survivor_pid, libc::SIGKILL);
+        }
+
+        let message = err.to_string();
+        assert!(
+            message.contains("process-group cleanup")
+                && message.contains("repository finalization was not started"),
+            "apply must fail with actionable cleanup diagnostics: {message}"
+        );
+
+        assert_eq!(
+            git_log_subjects(workspace),
+            commits_before,
+            "no WIP snapshot or final Apply commit may be created after unconfirmed cleanup"
+        );
+        // An Err result is the same signal callers use to skip cleanup review and
+        // Acceptance dispatch, so neither can start from this run.
+        assert_eq!(
+            std::fs::read_to_string(change_dir.join("tasks.md")).unwrap(),
+            "## Implementation Tasks\n- [x] one\n",
+            "workspace contents must be preserved for the retry"
+        );
+    }
+
+    /// A descendant that keeps the managed worktree `index.lock` past leader
+    /// exit must not race Git finalization: the barrier waits for it to release
+    /// the lock and exit, and only then does the final Apply commit run.
+    #[cfg(unix)]
+    #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+    #[tokio::test]
+    async fn apply_process_group_barrier_finalizes_after_descendant_releases_index_lock() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "lock-holder";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] one\n",
+        )
+        .unwrap();
+
+        let index_lock = workspace.join(".git").join("index.lock");
+        let released_marker = workspace.join("released-after-cleanup.txt");
+        // Holds the real index.lock, and starts releasing it only when the group
+        // sweep signals it. The handler first ignores further SIGTERMs, and an
+        // ignored disposition is inherited across exec, so its `sleep` cannot be
+        // cut short: the lock is deterministically held for one second *after*
+        // the leader exits, far longer than the WIP snapshot retry budget
+        // (3 x 200ms) and well inside the cleanup grace window. Because Git
+        // refuses to commit while index.lock exists, and because the marker only
+        // appears at release time, a final Apply commit containing the marker
+        // proves finalization started after the descendant was gone.
+        let holder = write_script(
+            temp_dir.path(),
+            "holder.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 release() {{\n\
+                 \x20 trap '' TERM\n\
+                 \x20 sleep 1\n\
+                 \x20 rm -f {lock}\n\
+                 \x20 echo released > {marker}\n\
+                 \x20 exit 0\n\
+                 }}\n\
+                 trap release TERM\n\
+                 : > {lock}\n\
+                 while :; do sleep 60; done\n",
+                lock = index_lock.display(),
+                marker = released_marker.display()
+            ),
+        );
+        let apply_script = write_script(
+            temp_dir.path(),
+            "apply.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 printf '## Implementation Tasks\\n- [x] one\\n' > {tasks}\n\
+                 sh {holder} >/dev/null 2>&1 </dev/null &\n\
+                 sleep 120\n",
+                tasks = change_dir.join("tasks.md").display(),
+                holder = holder.display()
+            ),
+        );
+
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh {}", apply_script.display())),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let result = scoped_apply_completion_grace_secs_for_test(
+            1,
+            scoped_apply_completion_check_interval_ms_for_test(
+                200,
+                execute_apply_loop(
+                    change_id,
+                    workspace,
+                    &config,
+                    &mut agent,
+                    VcsBackend::Git,
+                    Some(&workspace_manager),
+                    None,
+                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &NoOpEventHandler,
+                    None,
+                    &ai_runner,
+                    |_line| async move {},
+                ),
+            ),
+        )
+        .await
+        .expect("apply must succeed once the lock-holding descendant is gone");
+
+        assert!(
+            released_marker.exists(),
+            "the descendant must have released index.lock itself; Conflux never deletes lock files"
+        );
+        assert!(
+            !index_lock.exists(),
+            "index.lock must be gone once cleanup confirmed quiescence"
+        );
+        assert!(
+            result.completed,
+            "apply must complete after confirmed cleanup"
+        );
+
+        // Git refuses to commit while index.lock exists, so the presence of the
+        // final Apply commit proves finalization ran only after the release.
+        let subjects = git_log_subjects(workspace);
+        assert!(
+            subjects.iter().any(|s| s == &format!("Apply: {change_id}")),
+            "final Apply commit must exist after confirmed cleanup, got: {subjects:?}"
+        );
+
+        // The release marker is written only when the descendant exits, so a
+        // commit that contains it cannot have been snapshotted any earlier.
+        let tracked = std::process::Command::new("git")
+            .args(["ls-tree", "-r", "HEAD", "--name-only"])
+            .current_dir(workspace)
+            .output()
+            .expect("git ls-tree should run");
+        let tracked = String::from_utf8_lossy(&tracked.stdout).to_string();
+        assert!(
+            tracked.contains("released-after-cleanup.txt"),
+            "final commit must have snapshotted the workspace after the descendant exited: {tracked}"
         );
     }
 
