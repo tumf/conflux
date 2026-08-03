@@ -12,6 +12,45 @@ use super::events::{send_event, ParallelEvent};
 use super::resolve_state::{
     self, BatchState, GitResolveEvidence, ResolveEvidence, SequentialMergeItem,
 };
+use super::types::{resolve_failure_detail, ResolveFailureClassification};
+
+/// Terminal failure of one bounded resolve sequence.
+///
+/// The distinction is the whole point of the type: `Exhausted` means the
+/// conflict layer already emitted the single authoritative `ResolveFailed` for
+/// every affected change and the workspace evidence survives for explicit
+/// retry, so no caller may promote it to a process-scoped error. Anything else
+/// happened before a change-scoped transition could be established and must
+/// fail closed.
+#[derive(Debug)]
+pub enum ResolveFailure {
+    /// Bounded exhaustion; one `ResolveFailed` per change was already emitted.
+    Exhausted {
+        /// Attempts that were exhausted.
+        attempts: u32,
+        /// Bounded final failure classification.
+        classification: ResolveFailureClassification,
+        /// Sanitized bounded operator detail, as carried on `ResolveFailed`.
+        detail: String,
+    },
+    /// No change-scoped transition was established for this failure.
+    Unclassified(OrchestratorError),
+}
+
+impl std::fmt::Display for ResolveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exhausted { detail, .. } => write!(f, "{}", detail),
+            Self::Unclassified(error) => write!(f, "{}", error),
+        }
+    }
+}
+
+impl From<OrchestratorError> for ResolveFailure {
+    fn from(error: OrchestratorError) -> Self {
+        Self::Unclassified(error)
+    }
+}
 
 /// RAII guard that decrements auto_resolve_count on drop.
 /// This ensures the counter is decremented on all exit paths (success, error, early return).
@@ -33,16 +72,27 @@ impl Drop for AutoResolveGuard {
     }
 }
 
-/// Emit resolve failure events for the batch and return the terminal error.
-async fn fail_resolve(
+/// Emit the authoritative change-scoped resolve failure for the batch.
+///
+/// `ResolveFailed` is the one workflow-state owner: exactly one is emitted per
+/// affected change, carrying the change ID, attempts exhausted, the bounded
+/// classification token, and a sanitized summary. `ConflictResolutionFailed`
+/// rides along as ordered presentation telemetry only — no caller may treat it
+/// as state, and no caller may follow this with a global Error for the same
+/// failure.
+pub(super) async fn fail_resolve(
     event_tx: &Option<mpsc::Sender<ParallelEvent>>,
     change_ids: &[String],
-    error_msg: String,
-) -> Result<()> {
+    attempts: u32,
+    classification: ResolveFailureClassification,
+    summary: String,
+) -> ResolveFailure {
+    let detail = resolve_failure_detail(attempts, classification, &summary);
+
     send_event(
         event_tx,
         ParallelEvent::ConflictResolutionFailed {
-            error: error_msg.clone(),
+            error: detail.clone(),
         },
     )
     .await;
@@ -52,13 +102,17 @@ async fn fail_resolve(
             event_tx,
             ParallelEvent::ResolveFailed {
                 change_id: change_id.to_string(),
-                error: error_msg.clone(),
+                error: detail.clone(),
             },
         )
         .await;
     }
 
-    Err(OrchestratorError::GitConflict(error_msg))
+    ResolveFailure::Exhausted {
+        attempts,
+        classification,
+        detail,
+    }
 }
 
 /// Detect conflicted files using the workspace manager.
@@ -100,7 +154,7 @@ pub async fn resolve_conflicts_with_retry(
     max_retries: u32,
     shared_stagger_state: crate::ai_command_runner::SharedStaggerState,
     auto_resolve_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) -> Result<()> {
+) -> std::result::Result<(), ResolveFailure> {
     // Create RAII guard to ensure counter is decremented on all exit paths
     let _guard = AutoResolveGuard::new(auto_resolve_count);
 
@@ -162,6 +216,12 @@ pub async fn resolve_conflicts_with_retry(
         )
         .await;
     }
+
+    // Bounded final classification of the last observed failure. It starts at
+    // the budget-exhaustion default so an attempt loop that records nothing more
+    // specific still reports a real class instead of an inferred one.
+    let mut final_classification = ResolveFailureClassification::RetriesExhausted;
+    let mut final_summary = format!("Failed to resolve conflicts after {} attempts", max_retries);
 
     for attempt in 1..=max_retries {
         let start = Instant::now();
@@ -269,13 +329,16 @@ pub async fn resolve_conflicts_with_retry(
         }
 
         // Record failed attempt with continuation reason
-        let continuation_reason = if status_success {
+        let (continuation_reason, classification) = if status_success {
             let reason = format!(
                 "Conflicts still present after resolution attempt: {}",
                 remaining_conflicts.join(", ")
             );
             warn!("{}", reason);
-            Some(reason)
+            (
+                Some(reason),
+                ResolveFailureClassification::UnresolvedConflict,
+            )
         } else {
             let reason = format!(
                 "Resolution command failed with exit code: {:?}",
@@ -286,8 +349,13 @@ pub async fn resolve_conflicts_with_retry(
                 attempt,
                 status.code()
             );
-            Some(reason)
+            (
+                Some(reason),
+                ResolveFailureClassification::ResolveAgentFailed,
+            )
         };
+        final_classification = classification;
+        final_summary = continuation_reason.clone().unwrap_or_default();
 
         resolve_context.record(ResolveAttempt {
             attempt,
@@ -301,21 +369,19 @@ pub async fn resolve_conflicts_with_retry(
         });
     }
 
-    let error_msg = format!("Failed to resolve conflicts after {} attempts", max_retries);
-    send_event(
+    // Guard will decrement auto resolve counter on drop.
+    //
+    // Bounded exhaustion is change-local: the batch keeps its worktree and
+    // repository evidence, so it leaves through the one authoritative
+    // change-scoped owner rather than a process-scoped error.
+    Err(fail_resolve(
         event_tx,
-        ParallelEvent::ConflictResolutionFailed {
-            error: error_msg.clone(),
-        },
+        change_ids,
+        max_retries,
+        final_classification,
+        final_summary,
     )
-    .await;
-
-    // Guard will decrement auto resolve counter on drop
-
-    // Return VCS-specific error
-    match workspace_manager.backend_type() {
-        VcsBackend::Git | VcsBackend::Auto => Err(OrchestratorError::GitConflict(error_msg)),
-    }
+    .await)
 }
 
 #[derive(Clone)]
@@ -405,7 +471,9 @@ pub(crate) async fn render_worktree_locations(
 }
 
 /// Attempt to resolve merges with retries using the configured resolve command.
-pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> Result<()> {
+pub async fn resolve_merges_with_retry(
+    args: ResolveMergesWithRetryArgs<'_>,
+) -> std::result::Result<(), ResolveFailure> {
     let ResolveMergesWithRetryArgs {
         workspace_manager,
         config,
@@ -467,7 +535,17 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             "Sequential merge batch state withholds agent action: {}",
             reason.replace('\n', " | ")
         );
-        return fail_resolve(event_tx, change_ids, reason).await;
+        // Withheld agent action is terminal for this batch but still
+        // change-local: nothing was mutated blindly, so the worktrees stay
+        // retryable. Zero attempts were spent.
+        return Err(fail_resolve(
+            event_tx,
+            change_ids,
+            0,
+            ResolveFailureClassification::EvidenceWithheld,
+            reason,
+        )
+        .await);
     }
 
     let conflict_files = detect_conflicts(workspace_manager).await?;
@@ -552,6 +630,11 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         )
         .await;
     }
+
+    // Bounded final classification of the last observed failure, defaulted to
+    // budget exhaustion so the terminal report is never inferred from prose.
+    let mut final_classification = ResolveFailureClassification::RetriesExhausted;
+    let mut final_summary = format!("Failed to resolve merges after {} attempts", max_retries);
 
     for attempt in 1..=max_retries {
         let start = Instant::now();
@@ -661,7 +744,14 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         max_retries,
                         reason.replace('\n', " | ")
                     );
-                    return fail_resolve(event_tx, change_ids, reason).await;
+                    return Err(fail_resolve(
+                        event_tx,
+                        change_ids,
+                        attempt,
+                        ResolveFailureClassification::EvidenceWithheld,
+                        reason,
+                    )
+                    .await);
                 }
 
                 if !complete {
@@ -721,13 +811,16 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         }
 
         // Record failed attempt with continuation reason
-        let continuation_reason = if status_success {
+        let (continuation_reason, classification) = if status_success {
             let reason = format!(
                 "Conflicts still present after merge resolution attempt: {}",
                 remaining_conflicts.join(", ")
             );
             warn!("{}", reason);
-            Some(reason)
+            (
+                Some(reason),
+                ResolveFailureClassification::UnresolvedConflict,
+            )
         } else {
             let reason = format!(
                 "Merge resolution command failed with exit code: {:?}",
@@ -738,8 +831,13 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                 attempt,
                 status.code()
             );
-            Some(reason)
+            (
+                Some(reason),
+                ResolveFailureClassification::ResolveAgentFailed,
+            )
         };
+        final_classification = classification;
+        final_summary = continuation_reason.clone().unwrap_or_default();
 
         resolve_context.record(ResolveAttempt {
             attempt,
@@ -753,10 +851,19 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         });
     }
 
-    let error_msg = format!("Failed to resolve merges after {} attempts", max_retries);
-
-    // Guard will decrement auto resolve counter on drop
-    fail_resolve(event_tx, change_ids, error_msg).await
+    // Guard will decrement auto resolve counter on drop.
+    //
+    // The batch exhausted its bounded budget with its worktrees intact, so this
+    // is a change-local failure with an authoritative per-change owner, not a
+    // process-scoped error.
+    Err(fail_resolve(
+        event_tx,
+        change_ids,
+        max_retries,
+        final_classification,
+        final_summary,
+    )
+    .await)
 }
 
 /// Build prompt for conflict resolution (variable context only; fixed guidance lives in cflx-resolve).

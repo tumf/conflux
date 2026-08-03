@@ -11,13 +11,105 @@ use crate::vcs::{VcsBackend, VcsError};
 use std::path::Path;
 use std::path::PathBuf;
 
-use super::conflict;
+use super::conflict::{self, ResolveFailure};
 use super::events::send_event;
 use super::resolve_state::{self, GitResolveEvidence};
+use super::AlreadyReportedFailureKind;
 use super::MergeTaskOutcome;
 use super::ParallelEvent;
 use super::ParallelExecutor;
 use super::PostArchiveAction;
+use super::ResolveFailureClassification;
+
+/// Typed failure of one background base-lane attempt.
+///
+/// Each variant states who already owns the change-scoped lifecycle event, so
+/// the queue boundary never re-derives scope from message text or from
+/// [`super::MergeResultOrigin`]. Anything that cannot prove change-local scope
+/// converts into [`BaseLaneFailure::RunFatal`], including every
+/// [`OrchestratorError`] that reaches this boundary through `?`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BaseLaneFailure {
+    /// Bounded conflict resolution exhausted; `ResolveFailed` already emitted.
+    ResolveExhausted {
+        attempts: u32,
+        classification: ResolveFailureClassification,
+        detail: String,
+    },
+    /// A typed change-scoped owner already reported this failure.
+    AlreadyReported {
+        kind: AlreadyReportedFailureKind,
+        detail: String,
+    },
+    /// Base/repository truth is unsafe or unknown; the run has no safe continuation.
+    RunFatal { detail: String },
+}
+
+impl BaseLaneFailure {
+    /// Fail closed: an unproven failure is run-fatal, never change-local.
+    pub(super) fn fatal(detail: impl Into<String>) -> Self {
+        Self::RunFatal {
+            detail: detail.into(),
+        }
+    }
+
+    /// Attach change identity and produce the scheduler-visible outcome.
+    pub(super) fn into_outcome(self, change_id: &str) -> MergeTaskOutcome {
+        match self {
+            Self::ResolveExhausted {
+                attempts,
+                classification,
+                detail,
+            } => MergeTaskOutcome::resolve_exhausted(change_id, attempts, classification, detail),
+            Self::AlreadyReported { kind, detail } => {
+                MergeTaskOutcome::already_reported(change_id, kind, detail)
+            }
+            Self::RunFatal { detail } => MergeTaskOutcome::run_fatal(detail),
+        }
+    }
+}
+
+impl std::fmt::Display for BaseLaneFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResolveExhausted { detail, .. }
+            | Self::AlreadyReported { detail, .. }
+            | Self::RunFatal { detail } => write!(f, "{}", detail),
+        }
+    }
+}
+
+impl From<OrchestratorError> for BaseLaneFailure {
+    fn from(error: OrchestratorError) -> Self {
+        Self::fatal(error.to_string())
+    }
+}
+
+impl From<VcsError> for BaseLaneFailure {
+    fn from(error: VcsError) -> Self {
+        Self::fatal(error.to_string())
+    }
+}
+
+impl From<ResolveFailure> for BaseLaneFailure {
+    fn from(failure: ResolveFailure) -> Self {
+        match failure {
+            ResolveFailure::Exhausted {
+                attempts,
+                classification,
+                detail,
+            } => Self::ResolveExhausted {
+                attempts,
+                classification,
+                detail,
+            },
+            ResolveFailure::Unclassified(error) => Self::fatal(error.to_string()),
+        }
+    }
+}
+
+/// Result alias for base-lane operations that classify their own failures.
+pub(super) type BaseLaneResult<T> = std::result::Result<T, BaseLaneFailure>;
 
 /// One admitted change carried through the merge/resolve chain in declared order.
 ///
@@ -358,10 +450,14 @@ impl ParallelExecutor {
     ///
     /// # Arguments
     /// * `workspace_result` - Result from archived workspace
+    ///
+    /// The returned [`MergeTaskOutcome`] is exhaustive by design: this is the
+    /// classification boundary, so every failure leaves here already knowing
+    /// whether its lifecycle event was owned elsewhere or the run is unsafe.
     pub(super) async fn handle_merge_and_cleanup(
         &mut self,
         workspace_result: super::types::WorkspaceResult,
-    ) -> Result<MergeTaskOutcome> {
+    ) -> MergeTaskOutcome {
         let revisions = vec![workspace_result.workspace_name.clone()];
         let change_ids = vec![workspace_result.change_id.clone()];
 
@@ -493,7 +589,13 @@ impl ParallelExecutor {
                                 },
                             )
                             .await;
-                            return Err(OrchestratorError::GitCommand(message));
+                            // `HookFailed` is the typed owner of this failure;
+                            // the queue boundary must not promote it again.
+                            return MergeTaskOutcome::already_reported(
+                                &workspace_result.change_id,
+                                AlreadyReportedFailureKind::Hook,
+                                message,
+                            );
                         }
                     }
 
@@ -537,7 +639,7 @@ impl ParallelExecutor {
                         )
                         .await;
                     }
-                    Ok(MergeTaskOutcome::Merged)
+                    MergeTaskOutcome::Merged
                 }
                 Ok(MergeAttempt::Deferred(deferred)) => {
                     let reason = deferred.reason.clone();
@@ -592,22 +694,21 @@ impl ParallelExecutor {
                         },
                     )
                     .await;
-                    Ok(MergeTaskOutcome::deferred(reason, auto_resumable))
+                    MergeTaskOutcome::deferred(reason, auto_resumable)
                 }
-                Err(e) => {
-                    let error_msg = format!(
-                        "Failed to merge archived {} (workspace: {}): {}",
-                        workspace_result.change_id, workspace_result.workspace_name, e
+                Err(failure) => {
+                    // No generic global Error here. The failure already carries
+                    // its own scope: an exhausted resolve and an already-reported
+                    // publication/hook failure each have a change-scoped owner,
+                    // and only a run-fatal outcome may reach the single global
+                    // Error owner at the queue/orchestration boundary.
+                    tracing::error!(
+                        change_id = %workspace_result.change_id,
+                        workspace = %workspace_result.workspace_name,
+                        outcome = ?failure,
+                        "Background base-lane attempt failed"
                     );
-                    tracing::error!("{}", error_msg);
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::Error {
-                            message: error_msg.clone(),
-                        },
-                    )
-                    .await;
-                    Err(OrchestratorError::GitCommand(error_msg))
+                    failure.into_outcome(&workspace_result.change_id)
                 }
             }
         } else {
@@ -616,7 +717,7 @@ impl ParallelExecutor {
                 workspace_result.workspace_name
             );
             tracing::warn!("{}", reason);
-            Ok(MergeTaskOutcome::deferred(reason, false))
+            MergeTaskOutcome::deferred(reason, false)
         }
     }
 
@@ -625,7 +726,7 @@ impl ParallelExecutor {
         workspace_result: &super::types::WorkspaceResult,
         remote: String,
         archive_path: &Path,
-    ) -> Result<MergeTaskOutcome> {
+    ) -> MergeTaskOutcome {
         use crate::execution::archive::is_archive_commit_complete;
 
         let branch = workspace_result.workspace_name.clone();
@@ -639,7 +740,7 @@ impl ParallelExecutor {
                     workspace_result.change_id
                 );
                 tracing::warn!(%reason);
-                return Ok(MergeTaskOutcome::deferred(reason, false));
+                return MergeTaskOutcome::deferred(reason, false);
             }
             Err(error) => {
                 let reason = format!(
@@ -647,7 +748,7 @@ impl ParallelExecutor {
                     workspace_result.change_id, error
                 );
                 tracing::warn!(%reason);
-                return Ok(MergeTaskOutcome::deferred(reason, false));
+                return MergeTaskOutcome::deferred(reason, false);
             }
         }
 
@@ -686,7 +787,13 @@ impl ParallelExecutor {
                 },
             )
             .await;
-            return Err(OrchestratorError::GitCommand(message));
+            // `PushFailed` owns this change transition and its explicit retry;
+            // crossing the shared boundary must not promote it to run-fatal.
+            return MergeTaskOutcome::already_reported(
+                &workspace_result.change_id,
+                AlreadyReportedFailureKind::Push,
+                message,
+            );
         }
 
         send_event(
@@ -725,15 +832,22 @@ impl ParallelExecutor {
             )
             .await;
         }
-        Ok(MergeTaskOutcome::Merged)
+        MergeTaskOutcome::Merged
     }
 
+    /// Attempt one base-lane integration for the admitted batch.
+    ///
+    /// Failures are classified here, at the boundary that still knows what was
+    /// mutated and which lifecycle event was already emitted. `?` converts an
+    /// unclassified [`OrchestratorError`] into [`BaseLaneFailure::RunFatal`], so
+    /// a repository or base query that fails before a change-scoped transition
+    /// fails closed rather than being guessed as change-local.
     pub(super) async fn attempt_merge(
         &self,
         revisions: &[String],
         change_ids: &[String],
         archive_paths: &[PathBuf],
-    ) -> Result<MergeAttempt> {
+    ) -> BaseLaneResult<MergeAttempt> {
         use crate::execution::archive::is_archive_commit_complete;
 
         let auto_resolve_count = self
@@ -909,16 +1023,25 @@ impl ParallelExecutor {
     /// and its `on_merged` hook already happened. Resumption therefore re-runs
     /// only the unproven part — verification, publication, and confirmation —
     /// and never fires `on_merged` a second time for the same integration.
+    ///
+    /// Every failure path here reports through an existing typed change-scoped
+    /// owner — `PushFailed`, or `HookFailed` for the `on_merged` step — so the
+    /// shared base-lane boundary sees `AlreadyReported` and never promotes an
+    /// unpublished-but-resumable change to a run-fatal outcome.
     pub(super) async fn publish_base_integration(
         &self,
         change_id: &str,
         workspace_name: Option<&str>,
         resuming: bool,
-    ) -> Result<()> {
+    ) -> BaseLaneResult<()> {
         let (remote, branch) = self
             .upstream_identity()
             .await
             .unwrap_or_else(|| ("origin".to_string(), "HEAD".to_string()));
+
+        let already_reported = |kind: AlreadyReportedFailureKind, detail: String| {
+            BaseLaneFailure::AlreadyReported { kind, detail }
+        };
 
         // Durable identity first: after this commit exists, process loss cannot
         // make the change look like ordinary terminal `merged` history.
@@ -926,7 +1049,10 @@ impl ParallelExecutor {
             if let Err(err) = self.record_publication_intent(change_id).await {
                 self.report_publication_failure(change_id, &remote, &branch, &err.to_string())
                     .await;
-                return Err(err);
+                return Err(already_reported(
+                    AlreadyReportedFailureKind::Push,
+                    err.to_string(),
+                ));
             }
         }
 
@@ -949,14 +1075,22 @@ impl ParallelExecutor {
             {
                 self.report_publication_failure(change_id, &remote, &branch, &err.to_string())
                     .await;
-                return Err(err);
+                // `HookFailed` is emitted by `run_on_merged_for_publication`
+                // itself, so the hook owner keeps this failure.
+                return Err(already_reported(
+                    AlreadyReportedFailureKind::Hook,
+                    err.to_string(),
+                ));
             }
         }
 
         if let Err(err) = self.run_upstream_base_result_verification(change_id).await {
             self.report_publication_failure(change_id, &remote, &branch, &err.to_string())
                 .await;
-            return Err(err);
+            return Err(already_reported(
+                AlreadyReportedFailureKind::Push,
+                err.to_string(),
+            ));
         }
 
         match self.publish_completed_change(change_id).await {
@@ -982,12 +1116,15 @@ impl ParallelExecutor {
             Ok(super::upstream_lane::PublicationLaneOutcome::Unpublished { reason }) => {
                 self.report_publication_failure(change_id, &remote, &branch, &reason)
                     .await;
-                Err(OrchestratorError::GitCommand(reason))
+                Err(already_reported(AlreadyReportedFailureKind::Push, reason))
             }
             Err(err) => {
                 self.report_publication_failure(change_id, &remote, &branch, &err.to_string())
                     .await;
-                Err(err)
+                Err(already_reported(
+                    AlreadyReportedFailureKind::Push,
+                    err.to_string(),
+                ))
             }
         }
     }
@@ -1106,7 +1243,8 @@ impl ParallelExecutor {
         let archive_paths = vec![workspace.path.clone()];
         match self
             .attempt_merge(&revisions, &change_ids, &archive_paths)
-            .await?
+            .await
+            .map_err(|failure| OrchestratorError::GitCommand(failure.to_string()))?
         {
             MergeAttempt::Merged { revision } => {
                 // Run on_merged hook before merged status transition (MergeCompleted event)
@@ -1250,7 +1388,10 @@ impl ParallelExecutor {
     }
 
     /// Merge the ordered batch and resolve any conflicts.
-    pub(super) async fn merge_and_resolve(&self, items: &[SequentialMergeItem]) -> Result<String> {
+    pub(super) async fn merge_and_resolve(
+        &self,
+        items: &[SequentialMergeItem],
+    ) -> BaseLaneResult<String> {
         let change_ids_vec = SequentialMergeItem::change_ids(items);
         let shared_stagger_state = self.shared_stagger_state.clone();
         let auto_resolve_count = self.auto_resolve_count.clone();
@@ -1280,10 +1421,10 @@ impl ParallelExecutor {
         &'a self,
         items: &'a [SequentialMergeItem],
         mut resolve_conflicts: F,
-    ) -> Result<String>
+    ) -> BaseLaneResult<String>
     where
         F: FnMut(Vec<String>, String) -> Fut,
-        Fut: std::future::Future<Output = Result<()>> + Send + 'a,
+        Fut: std::future::Future<Output = std::result::Result<(), ResolveFailure>> + Send + 'a,
     {
         let max_attempts = self.max_conflict_retries.max(1);
         let revisions = SequentialMergeItem::revisions(items);
@@ -1328,7 +1469,17 @@ impl ParallelExecutor {
             })
             .await?;
 
-            self.verify_merge_commits(&base_revision, items).await?;
+            // Verification decides whether the base actually integrated the
+            // batch. A failure here leaves base truth unknown, which is exactly
+            // the case the outcome contract requires to fail closed.
+            self.verify_merge_commits(&base_revision, items)
+                .await
+                .map_err(|error| {
+                    BaseLaneFailure::fatal(format!(
+                        "Post-merge verification left base integration truth unknown: {}",
+                        error
+                    ))
+                })?;
 
             let merge_revision = self.workspace_manager.get_current_revision().await?;
 
@@ -1374,34 +1525,21 @@ impl ParallelExecutor {
                     .await;
 
                     if attempt >= max_attempts {
-                        let error_msg = format!(
-                            "Merge conflict unresolved after {} attempts: {}",
-                            max_attempts, details
-                        );
-                        send_event(
+                        // One authoritative change-scoped owner for the bounded
+                        // exhaustion, emitted through the same helper the Git
+                        // path uses so the two cannot drift.
+                        return Err(conflict::fail_resolve(
                             &self.event_tx,
-                            ParallelEvent::ConflictResolutionFailed {
-                                error: error_msg.clone(),
-                            },
+                            change_ids,
+                            max_attempts,
+                            ResolveFailureClassification::UnresolvedConflict,
+                            format!(
+                                "Merge conflict unresolved after {} attempts: {}",
+                                max_attempts, details
+                            ),
                         )
-                        .await;
-
-                        // Send ResolveFailed for each change_id to update TUI status
-                        for change_id in change_ids {
-                            send_event(
-                                &self.event_tx,
-                                ParallelEvent::ResolveFailed {
-                                    change_id: change_id.to_string(),
-                                    error: error_msg.clone(),
-                                },
-                            )
-                            .await;
-                        }
-
-                        return Err(OrchestratorError::from_vcs_error(VcsError::Conflict {
-                            backend: self.workspace_manager.backend_type(),
-                            details: error_msg,
-                        }));
+                        .await
+                        .into());
                     }
 
                     tracing::info!(
@@ -1420,30 +1558,23 @@ impl ParallelExecutor {
                             err
                         );
 
-                        // Send ResolveFailed for each change_id to update TUI status
-                        for change_id in change_ids {
-                            send_event(
-                                &self.event_tx,
-                                ParallelEvent::ResolveFailed {
-                                    change_id: change_id.to_string(),
-                                    error: err.to_string(),
-                                },
-                            )
-                            .await;
-                        }
-
-                        return Err(err);
+                        // No second `ResolveFailed` here: a bounded exhaustion
+                        // already emitted its authoritative per-change event, and
+                        // an unclassified failure established no change-scoped
+                        // transition to duplicate.
+                        return Err(err.into());
                     }
                     tracing::info!("Conflict resolution completed, retrying merge");
 
                     // Note: ResolveCompleted will be sent when the merge succeeds
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(OrchestratorError::from(e).into()),
             }
         }
 
-        // Fallback: should not normally reach here
-        Err(OrchestratorError::GitCommand(
+        // Fallback: should not normally reach here. An unexplained exit leaves
+        // base truth unproven, so it fails closed.
+        Err(BaseLaneFailure::fatal(
             "Merge failed: exhausted all attempts without success or error".to_string(),
         ))
     }

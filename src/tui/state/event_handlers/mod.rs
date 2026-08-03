@@ -3,6 +3,8 @@ use crate::tui::events::OrchestratorEvent;
 
 mod completion;
 mod errors;
+#[cfg(test)]
+mod modal_tests;
 mod output;
 mod processing;
 mod refresh;
@@ -19,6 +21,18 @@ impl AppState {
     /// refused as no longer eligible, and would reach the operator as a warning
     /// for work that is in fact proceeding.
     pub fn handle_orchestrator_event(&mut self, event: OrchestratorEvent) {
+        self.dispatch_orchestrator_event(event);
+
+        // A background event may move execution or the observed target set while a
+        // modal is visible. Handlers own execution state; the modal axis changes
+        // only here, through the explicit validity policy, and only ever by being
+        // cleared together with its payload.
+        if let Some(invalidation) = self.revalidate_modal() {
+            tracing::debug!("Cleared stale TUI modal: {}", invalidation.reason());
+        }
+    }
+
+    fn dispatch_orchestrator_event(&mut self, event: OrchestratorEvent) {
         match event {
             OrchestratorEvent::ProcessingStarted(id) => self.handle_processing_started(id),
             OrchestratorEvent::ProcessingCompleted(id) => self.handle_processing_completed(id),

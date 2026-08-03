@@ -1,6 +1,6 @@
 //! Truthful classification of an immediate (second-Esc / `ForceStop`) stop.
 //!
-//! `AppMode::Stopping` describes TUI lifecycle only. It says nothing about
+//! `AppExecutionMode::Stopping` describes TUI lifecycle only. It says nothing about
 //! whether an agent process is running, so it must never be used on its own to
 //! claim that a process was force-terminated.
 //!

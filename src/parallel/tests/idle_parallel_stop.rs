@@ -329,7 +329,7 @@ async fn idle_parallel_stop_cancelled_scheduler_handles_pending_merge_before_sto
             change_id: "merging-change".to_string(),
             workspace_name: "merging-change".to_string(),
             origin: MergeResultOrigin::PostArchiveMerge,
-            outcome: Ok(MergeTaskOutcome::deferred("base lane busy", false)),
+            outcome: MergeTaskOutcome::deferred("base lane busy", false),
         })
         .await
         .expect("scheduler must still hold the merge-result receiver");
