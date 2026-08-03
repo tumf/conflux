@@ -104,7 +104,11 @@ pub enum ModalState {
         /// Path of the worktree the confirmation was opened for.
         path: PathBuf,
         /// Branch bound to that worktree when the confirmation was opened.
-        branch: Option<String>,
+        ///
+        /// Mandatory: a deletion is confirmed against a concrete branch identity
+        /// that can be re-checked before the mutation, so a worktree with no
+        /// branch to name (detached HEAD) cannot reach this confirmation at all.
+        branch: String,
     },
     /// Force-kill confirmation for a single active change.
     ConfirmForceKill {
@@ -209,7 +213,7 @@ mod tests {
     fn destructive_modals_carry_their_own_identity_payload() {
         let worktree = ModalState::ConfirmWorktreeDelete {
             path: PathBuf::from("/tmp/worktree-a"),
-            branch: Some("feature/a".to_string()),
+            branch: "feature/a".to_string(),
         };
         let kill = ModalState::ConfirmForceKill {
             change_id: "change-a".to_string(),
@@ -221,14 +225,14 @@ mod tests {
             worktree,
             ModalState::ConfirmWorktreeDelete {
                 path: PathBuf::from("/tmp/worktree-b"),
-                branch: Some("feature/a".to_string()),
+                branch: "feature/a".to_string(),
             }
         );
         assert_ne!(
             worktree,
             ModalState::ConfirmWorktreeDelete {
                 path: PathBuf::from("/tmp/worktree-a"),
-                branch: None,
+                branch: "feature/b".to_string(),
             }
         );
         assert_ne!(
@@ -244,7 +248,7 @@ mod tests {
         assert!(!ModalState::QrPopup.is_user_decision());
         assert!(ModalState::ConfirmWorktreeDelete {
             path: PathBuf::from("/tmp/worktree-a"),
-            branch: None,
+            branch: "feature/a".to_string(),
         }
         .is_user_decision());
         assert!(ModalState::ConfirmForceKill {
@@ -259,7 +263,7 @@ mod tests {
         assert_eq!(
             ModalState::ConfirmWorktreeDelete {
                 path: PathBuf::from("/tmp/worktree-a"),
-                branch: None,
+                branch: "feature/a".to_string(),
             }
             .title_label(),
             "Confirm Delete"

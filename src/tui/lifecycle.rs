@@ -110,7 +110,7 @@ mod tests {
     fn worktree_confirmation() -> ModalState {
         ModalState::ConfirmWorktreeDelete {
             path: std::path::PathBuf::from("/tmp/wt-a"),
-            branch: Some("change-a".to_string()),
+            branch: "change-a".to_string(),
         }
     }
 

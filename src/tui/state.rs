@@ -779,11 +779,9 @@ impl AppState {
             return None;
         };
 
-        if let Err(invalidation) = modal_logic::evaluate_worktree_delete(
-            &path,
-            branch.as_deref(),
-            &self.modal_validity_context(),
-        ) {
+        if let Err(invalidation) =
+            modal_logic::evaluate_worktree_delete(&path, &branch, &self.modal_validity_context())
+        {
             self.invalidate_modal_with_report(invalidation, "Worktree delete");
             return None;
         }
@@ -1949,7 +1947,7 @@ mod tests {
         assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")));
         assert!(matches!(
             command,
-            Some(TuiCommand::DeleteWorktreeByPath(path, Some(branch), false))
+            Some(TuiCommand::DeleteWorktreeByPath(path, branch, false))
                 if path.as_path() == PathBuf::from("/tmp/worktree-a").as_path() && branch == "feature-a"
         ));
         assert!(app
@@ -1969,7 +1967,7 @@ mod tests {
         assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")));
         assert!(matches!(
             command,
-            Some(TuiCommand::DeleteWorktreeByPath(path, Some(branch), true))
+            Some(TuiCommand::DeleteWorktreeByPath(path, branch, true))
                 if path.as_path() == PathBuf::from("/tmp/worktree-a").as_path() && branch == "feature-a"
         ));
         assert!(app.logs.iter().any(|entry| {
@@ -1977,6 +1975,79 @@ mod tests {
                 .message
                 .contains("Deleting worktree with skip-teardown: /tmp/worktree-a")
         }));
+    }
+
+    #[test]
+    fn a_worktree_without_a_branch_identity_can_never_produce_a_delete_command() {
+        // Both ways an observation loses its identity, driven through the whole
+        // request → confirm path: no modal opens, so no confirmation exists to
+        // dispatch, and the delete marker is never taken either.
+        let mut detached = create_test_worktree("/tmp/worktree-a", "feature-a", false);
+        detached.is_detached = true;
+        let nameless = create_test_worktree("/tmp/worktree-a", "", false);
+
+        for (name, worktree) in [("detached", detached), ("empty-branch", nameless)] {
+            let mut app = AppState::new(vec![]);
+            app.view_mode = ViewMode::Worktrees;
+            app.worktrees = vec![worktree];
+
+            assert!(app.request_worktree_delete_from_list().is_none());
+
+            assert!(
+                app.modal.is_none(),
+                "{name}: no confirmation may open without a revalidatable identity"
+            );
+            assert!(
+                app.warning_message
+                    .as_deref()
+                    .is_some_and(|msg| msg.contains("no branch to confirm against")),
+                "{name}: the operator must be told why: {:?}",
+                app.warning_message
+            );
+            assert!(
+                app.confirm_worktree_action_delete().is_none(),
+                "{name}: confirming without a modal must not emit a delete command"
+            );
+            assert!(
+                app.confirm_worktree_action_delete_with_options(true)
+                    .is_none(),
+                "{name}: skip-teardown confirm must not emit a delete command either"
+            );
+            assert!(
+                !app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")),
+                "{name}: a refused request must not mark the worktree deleting"
+            );
+        }
+    }
+
+    #[test]
+    fn a_branch_bearing_worktree_beside_a_detached_one_stays_deletable() {
+        // The identity guard refuses the target it cannot revalidate without
+        // narrowing deletion for ordinary branch-bearing worktrees.
+        let mut detached = create_test_worktree("/tmp/worktree-detached", "feature-a", false);
+        detached.is_detached = true;
+        let mut app = AppState::new(vec![]);
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![
+            detached,
+            create_test_worktree("/tmp/worktree-b", "feature-b", false),
+        ];
+        app.worktree_cursor_index = 1;
+
+        app.request_worktree_delete_from_list();
+
+        assert_eq!(
+            app.modal,
+            Some(ModalState::ConfirmWorktreeDelete {
+                path: PathBuf::from("/tmp/worktree-b"),
+                branch: "feature-b".to_string(),
+            })
+        );
+        assert!(matches!(
+            app.confirm_worktree_action_delete(),
+            Some(TuiCommand::DeleteWorktreeByPath(path, branch, false))
+                if path == std::path::Path::new("/tmp/worktree-b") && branch == "feature-b"
+        ));
     }
 
     #[test]
@@ -4287,7 +4358,7 @@ mod tests {
             app.modal,
             Some(ModalState::ConfirmWorktreeDelete {
                 path: PathBuf::from("/tmp/wt-a"),
-                branch: Some("change-a".to_string()),
+                branch: "change-a".to_string(),
             })
         );
         assert_eq!(

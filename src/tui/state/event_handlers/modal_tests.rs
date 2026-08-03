@@ -56,7 +56,7 @@ fn force_kill_modal() -> ModalState {
 fn delete_modal() -> ModalState {
     ModalState::ConfirmWorktreeDelete {
         path: PathBuf::from("/tmp/wt-b"),
-        branch: Some("change-b".to_string()),
+        branch: "change-b".to_string(),
     }
 }
 

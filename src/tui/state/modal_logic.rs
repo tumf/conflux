@@ -84,6 +84,10 @@ impl ModalInvalidation {
 /// The confirmation payload and a fresh observation must agree on this value, so
 /// deriving it in one place is what makes "same worktree" mean the same thing at
 /// open time, at invalidation time, and at confirmation time.
+///
+/// `None` means this observation has no branch to name — a detached HEAD. Such a
+/// worktree carries nothing that can be revalidated later, so it never becomes a
+/// confirmation payload and never matches one.
 pub(crate) fn delete_branch_identity(worktree: &WorktreeInfo) -> Option<String> {
     (!worktree.is_detached && !worktree.branch.is_empty()).then(|| worktree.branch.clone())
 }
@@ -99,7 +103,7 @@ pub(crate) fn find_worktree<'a>(
 /// Whether a worktree-delete confirmation still targets the same eligible worktree.
 pub(crate) fn evaluate_worktree_delete(
     path: &Path,
-    branch: Option<&str>,
+    branch: &str,
     ctx: &ModalValidityContext<'_>,
 ) -> Result<(), ModalInvalidation> {
     let Some(worktree) = find_worktree(ctx.worktrees, path) else {
@@ -114,7 +118,9 @@ pub(crate) fn evaluate_worktree_delete(
         return Err(ModalInvalidation::WorktreeTargetDeleting);
     }
 
-    if delete_branch_identity(worktree).as_deref() != branch {
+    // A detached observation yields `None` here, so it can never equal the
+    // confirmed branch: re-detaching the path invalidates the confirmation.
+    if delete_branch_identity(worktree).as_deref() != Some(branch) {
         return Err(ModalInvalidation::WorktreeIdentityChanged);
     }
 
@@ -168,7 +174,7 @@ pub(crate) fn evaluate(
             }
         }
         ModalState::ConfirmWorktreeDelete { path, branch } => {
-            evaluate_worktree_delete(path, branch.as_deref(), ctx)
+            evaluate_worktree_delete(path, branch, ctx)
         }
         ModalState::ConfirmForceKill { change_id } => evaluate_force_kill(change_id, ctx),
     }
@@ -263,7 +269,7 @@ mod tests {
     fn delete_modal() -> ModalState {
         ModalState::ConfirmWorktreeDelete {
             path: PathBuf::from("/tmp/wt-a"),
-            branch: Some("change-a".to_string()),
+            branch: "change-a".to_string(),
         }
     }
 
@@ -353,6 +359,14 @@ mod tests {
         detached.worktrees[0].is_detached = true;
         assert_eq!(
             evaluate(&delete_modal(), &detached.ctx()),
+            Err(ModalInvalidation::WorktreeIdentityChanged)
+        );
+
+        // Same path, branch name no longer observable at all.
+        let mut nameless = Fixture::new();
+        nameless.worktrees[0].branch = String::new();
+        assert_eq!(
+            evaluate(&delete_modal(), &nameless.ctx()),
             Err(ModalInvalidation::WorktreeIdentityChanged)
         );
 

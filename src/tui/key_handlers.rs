@@ -1883,7 +1883,7 @@ mod tests {
             ("worktree-delete", |app: &mut AppState| {
                 app.modal = Some(ModalState::ConfirmWorktreeDelete {
                     path: PathBuf::from("/tmp/wt-a"),
-                    branch: Some("change-b".to_string()),
+                    branch: "change-b".to_string(),
                 });
             }),
             ("force-kill", |app: &mut AppState| {
@@ -1923,7 +1923,7 @@ mod tests {
             ModalState::QrPopup,
             ModalState::ConfirmWorktreeDelete {
                 path: PathBuf::from("/tmp/wt-a"),
-                branch: Some("change-b".to_string()),
+                branch: "change-b".to_string(),
             },
             ModalState::ConfirmForceKill {
                 change_id: "change-a".to_string(),
@@ -2054,7 +2054,7 @@ mod tests {
         }];
         app.modal = Some(ModalState::ConfirmWorktreeDelete {
             path: PathBuf::from("/tmp/wt-a"),
-            branch: Some("change-b".to_string()),
+            branch: "change-b".to_string(),
         });
 
         let commands = route_key(&mut app, KeyCode::Char('y')).await;
@@ -2063,7 +2063,7 @@ mod tests {
             matches!(
                 commands.as_slice(),
                 [TuiCommand::DeleteWorktreeByPath(path, branch, false)]
-                    if path == &PathBuf::from("/tmp/wt-a") && branch.as_deref() == Some("change-b")
+                    if path == &PathBuf::from("/tmp/wt-a") && branch == "change-b"
             ),
             "expected a single worktree delete command, got {commands:?}"
         );
@@ -2098,7 +2098,7 @@ mod tests {
                 }];
                 app.modal = Some(ModalState::ConfirmWorktreeDelete {
                     path: PathBuf::from("/tmp/wt-a"),
-                    branch: Some("change-b".to_string()),
+                    branch: "change-b".to_string(),
                 });
                 mutate(&mut app);
 

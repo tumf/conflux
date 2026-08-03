@@ -2261,7 +2261,7 @@ mod tests {
         app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a")];
         app.modal = Some(ModalState::ConfirmWorktreeDelete {
             path: std::path::PathBuf::from("/tmp/worktree-a"),
-            branch: Some("feature-a".to_string()),
+            branch: "feature-a".to_string(),
         });
 
         let buffer = render_buffer(&mut app, 120, 30);
@@ -2609,7 +2609,7 @@ mod tests {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.modal = Some(ModalState::ConfirmWorktreeDelete {
             path: std::path::PathBuf::from("/path/to/worktree"),
-            branch: None,
+            branch: "feature-a".to_string(),
         });
 
         let buffer = render_buffer(&mut app, 80, 20);
@@ -4142,7 +4142,7 @@ mod tests {
     fn delete_overlay() -> ModalState {
         ModalState::ConfirmWorktreeDelete {
             path: std::path::PathBuf::from("/tmp/worktree-a"),
-            branch: Some("change-a".to_string()),
+            branch: "change-a".to_string(),
         }
     }
 

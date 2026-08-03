@@ -309,12 +309,14 @@ pub async fn handle_tui_command(
             // The branch the modal confirmed travels with the command so the
             // service can revalidate it under its own mutation guard: the
             // pre-dispatch modal check is necessary but not sufficient, since the
-            // path can be re-occupied between confirmation and mutation.
+            // path can be re-occupied between confirmation and mutation. The TUI
+            // never waives that check — a confirmation without a concrete branch
+            // identity is refused before it can become a command.
             let service = build_worktree_service(ctx.repo_root, ctx.config, ctx.tx);
             let delete_result = service
                 .delete_worktree(
                     &path,
-                    branch_name.as_deref(),
+                    Some(branch_name.as_str()),
                     DeleteOptions::local(skip_teardown),
                 )
                 .await;
@@ -809,11 +811,7 @@ mod tests {
         harness
             .run(
                 &mut app,
-                TuiCommand::DeleteWorktreeByPath(
-                    path.clone(),
-                    Some("feature-a".to_string()),
-                    false,
-                ),
+                TuiCommand::DeleteWorktreeByPath(path.clone(), "feature-a".to_string(), false),
             )
             .await;
 
@@ -839,11 +837,7 @@ mod tests {
         harness
             .run(
                 &mut app,
-                TuiCommand::DeleteWorktreeByPath(
-                    path.clone(),
-                    Some("feature-a".to_string()),
-                    false,
-                ),
+                TuiCommand::DeleteWorktreeByPath(path.clone(), "feature-a".to_string(), false),
             )
             .await;
 
@@ -873,11 +867,7 @@ mod tests {
         harness
             .run(
                 &mut app,
-                TuiCommand::DeleteWorktreeByPath(
-                    path.clone(),
-                    Some("feature-stale".to_string()),
-                    false,
-                ),
+                TuiCommand::DeleteWorktreeByPath(path.clone(), "feature-stale".to_string(), false),
             )
             .await;
 
