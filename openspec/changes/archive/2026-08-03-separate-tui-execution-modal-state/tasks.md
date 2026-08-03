@@ -35,14 +35,3 @@ Archive validation is the authoritative final OpenSpec gate. Expected archive ga
 
 - Reclassify specific background merge failures as recoverable warnings only through a separate proposal with event-ownership and scheduler-safety evidence.
 - Expose modal presentation state through remote monitoring only if a future frontend requirement needs it; execution `app_mode` remains unchanged here.
-
-## Current Acceptance Follow-up
-- attempt: 3
-- [x] [tui-worktree-delete-identity-revalidation] src/tui/state/worktree_action_logic.rs:22-49 accepts detached or empty-branch worktrees and returns a None identity; src/tui/command_handlers.rs:302-320 forwards it, while src/worktree_ops/service.rs:257-265,532-548 treats None as waiving identity validation and removes the freshly observed occupant. Reject detached/empty-branch targets before confirmation unless a concrete revalidatable identity is carried, and add tests proving they cannot produce a deletion command while branch-bearing worktrees remain deletable.
-  evidence: `src/tui/state/worktree_action_logic.rs:26-33` refuses a target whose `delete_branch_identity` is `None` ("no branch to confirm against (detached HEAD)") and now returns `(PathBuf, String)`, so detached/empty-branch worktrees never reach a confirmation.
-  evidence: `src/tui/types.rs:103-110` makes `ModalState::ConfirmWorktreeDelete.branch` a mandatory `String` and `src/tui/events.rs:63-67` makes `TuiCommand::DeleteWorktreeByPath` carry a `String`, so no identity-free delete confirmation or command is constructible in the TUI.
-  evidence: `src/tui/command_handlers.rs:302-325` now passes `Some(branch_name.as_str())` to `WorktreeService::delete_worktree`, so the TUI path never takes the service's `None` identity waiver.
-  evidence: `src/tui/state/modal_logic.rs:104-126` compares the fresh observation against `Some(branch)`, so an observation that detaches or loses its branch name invalidates the confirmation (`worktree_delete_invalidation_boundaries` covers detached and empty-branch).
-  evidence: new `tui::state::worktree_action_logic::tests::a_worktree_without_a_revalidatable_identity_is_refused` and `tui::state::tests::a_worktree_without_a_branch_identity_can_never_produce_a_delete_command` prove no modal, no command, and no delete marker for detached/empty-branch targets.
-  evidence: new `tui::state::worktree_action_logic::tests::a_branch_bearing_worktree_yields_the_identity_to_revalidate` and `tui::state::tests::a_branch_bearing_worktree_beside_a_detached_one_stays_deletable` prove branch-bearing worktrees still confirm and dispatch `DeleteWorktreeByPath`.
-  evidence: `cargo test --lib tui::` — 523 passed, 0 failed, 1 ignored; `cargo test --lib` — 2918 passed, 0 failed, 9 ignored; `cargo test --features web-monitoring --lib web::remote_control_api::tests::operator_snapshot_tests` — 20 passed; `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean.
