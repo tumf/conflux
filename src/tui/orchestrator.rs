@@ -1825,4 +1825,73 @@ mod tests {
             ParallelTerminalReport::Stopped
         );
     }
+
+    // ------------------------------------------------------------------
+    // Explicit-intent boundary at TUI/remote parallel startup
+    // ------------------------------------------------------------------
+
+    /// TUI and remote Start both come through this initialisation. Only the
+    /// resolved targets may gain queue intent, and the initial all-change
+    /// refresh that immediately follows must not widen it.
+    #[tokio::test]
+    async fn parallel_startup_queues_only_selected_targets_and_refresh_does_not_widen_it() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState, QueueIntent};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+            vec!["fresh".to_string(), "stale".to_string()],
+            1,
+            ExecutionMode::Parallel,
+        )));
+
+        let preserved = super::initialize_parallel_shared_state(
+            &shared,
+            std::slice::from_ref(&"fresh".to_string()),
+            10,
+        )
+        .await;
+        assert!(
+            !preserved,
+            "a non-empty target set replaces reducer state instead of preserving resolve startup"
+        );
+
+        let change = |id: &str| crate::openspec::Change {
+            id: id.to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: crate::openspec::ProposalMetadata::default(),
+        };
+
+        shared
+            .write()
+            .await
+            .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+                changes: vec![change("fresh"), change("stale")],
+                rejected_changes: Vec::new(),
+                committed_change_ids: HashSet::from(["fresh".to_string(), "stale".to_string()]),
+                uncommitted_file_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::from(["stale".to_string()]),
+                worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
+                merge_wait_ids: HashSet::new(),
+            });
+
+        let guard = shared.read().await;
+        assert_eq!(guard.queued_change_ids(), vec!["fresh".to_string()]);
+        assert_eq!(
+            guard
+                .change_runtime("stale")
+                .expect("refresh registers the unselected change")
+                .queue_intent,
+            QueueIntent::NotQueued
+        );
+        assert!(!guard.is_ordinary_queue_eligible("stale"));
+        assert!(guard.merge_wait_change_ids().is_empty());
+        assert!(guard.resolve_wait_change_ids().is_empty());
+        assert!(guard.reject_wait_change_ids().is_empty());
+    }
 }

@@ -742,3 +742,128 @@ async fn start_targets_only_returns_marked_rows_the_reducer_calls_not_queued() {
     assert_eq!(harness.status("c").await, "queued");
     assert_eq!(harness.service.start_targets().await, vec!["a".to_string()]);
 }
+
+// ============================================================================
+// Explicit-intent boundary
+// ============================================================================
+
+#[tokio::test]
+async fn tui_and_remote_start_produce_identical_explicit_target_eligibility() {
+    // Two frontends, one boundary. Each harness stands for one frontend's call
+    // into the same shared service with the same observed marks.
+    let tui = Harness::new(&["marked-a", "marked-b", "unmarked-residue"]);
+    let remote = Harness::new(&["marked-a", "marked-b", "unmarked-residue"]);
+    tui.mark(&["marked-a", "marked-b"]);
+    remote.mark(&["marked-a", "marked-b"]);
+
+    let tui_outcome = tui
+        .service
+        .start(OperatorMode::Select)
+        .await
+        .expect("TUI start");
+    let remote_outcome = remote
+        .service
+        .start(OperatorMode::Select)
+        .await
+        .expect("remote start");
+
+    assert_eq!(tui_outcome, remote_outcome);
+    assert_eq!(
+        tui.scheduler.started_targets(),
+        remote.scheduler.started_targets()
+    );
+
+    let mut tui_queued = tui.state.read().await.queued_change_ids();
+    let mut remote_queued = remote.state.read().await.queued_change_ids();
+    tui_queued.sort();
+    remote_queued.sort();
+    assert_eq!(
+        tui_queued,
+        vec!["marked-a".to_string(), "marked-b".to_string()]
+    );
+    assert_eq!(
+        tui_queued, remote_queued,
+        "equivalent accepted intent must produce identical scheduler eligibility"
+    );
+
+    for harness in [&tui, &remote] {
+        assert!(
+            !harness
+                .state
+                .read()
+                .await
+                .is_ordinary_queue_eligible("unmarked-residue"),
+            "an unmarked catalog or worktree entry must stay ineligible"
+        );
+    }
+}
+
+#[tokio::test]
+async fn queue_removal_and_dequeue_revoke_eligibility_until_explicit_requeue() {
+    let harness = Harness::new(&["alpha"]);
+    harness.mark(&["alpha"]);
+    harness
+        .service
+        .start(OperatorMode::Select)
+        .await
+        .expect("start");
+
+    assert!(harness
+        .state
+        .read()
+        .await
+        .is_ordinary_queue_eligible("alpha"));
+
+    harness
+        .service
+        .operator()
+        .remove_from_queue("alpha")
+        .await
+        .expect("queue removal");
+    assert!(
+        !harness
+            .state
+            .read()
+            .await
+            .is_ordinary_queue_eligible("alpha"),
+        "queue removal revokes ordinary execution eligibility immediately"
+    );
+
+    // Stop-and-dequeue is the other revocation path, and it is stickier: the
+    // `dequeued` flag survives until an explicit requeue clears it.
+    harness
+        .service
+        .operator()
+        .add_to_queue("alpha")
+        .await
+        .expect("requeue");
+    harness
+        .service
+        .operator()
+        .stop_and_dequeue("alpha")
+        .await
+        .expect("stop and dequeue");
+    assert!(
+        !harness
+            .state
+            .read()
+            .await
+            .is_ordinary_queue_eligible("alpha"),
+        "a dequeued change must not be reacquired"
+    );
+
+    harness
+        .service
+        .operator()
+        .add_to_queue("alpha")
+        .await
+        .expect("explicit requeue");
+    assert!(
+        harness
+            .state
+            .read()
+            .await
+            .is_ordinary_queue_eligible("alpha"),
+        "explicit requeue is the ordinary way back"
+    );
+}
