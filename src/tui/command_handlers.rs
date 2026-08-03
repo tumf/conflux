@@ -15,7 +15,7 @@ use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
 #[cfg(test)]
 use crate::tui::queue::DynamicQueue;
 use crate::tui::state::AppState;
-use crate::tui::types::{AppMode, StopMode};
+use crate::tui::types::{AppExecutionMode, StopMode};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -299,15 +299,26 @@ pub async fn handle_tui_command(
             )));
             debug_assert_eq!(outcome.mutation, QueueMutation::Removed);
         }
-        TuiCommand::DeleteWorktreeByPath(path, _branch_name, skip_teardown) => {
+        TuiCommand::DeleteWorktreeByPath(path, branch_name, skip_teardown) => {
             // Adapter only: the shared service owns the delete guards, mandatory
             // teardown ordering, branch cleanup, and the refresh event. The TUI
             // keeps its local recovery `skip_teardown` escape hatch and its
             // documented fail-open behavior for an unobservable dirty state;
             // `/api/v2` passes the fail-closed policy instead.
+            //
+            // The branch the modal confirmed travels with the command so the
+            // service can revalidate it under its own mutation guard: the
+            // pre-dispatch modal check is necessary but not sufficient, since the
+            // path can be re-occupied between confirmation and mutation. The TUI
+            // never waives that check — a confirmation without a concrete branch
+            // identity is refused before it can become a command.
             let service = build_worktree_service(ctx.repo_root, ctx.config, ctx.tx);
             let delete_result = service
-                .delete_worktree(&path, DeleteOptions::local(skip_teardown))
+                .delete_worktree(
+                    &path,
+                    Some(branch_name.as_str()),
+                    DeleteOptions::local(skip_teardown),
+                )
                 .await;
             ctx.app.clear_worktree_deleting(&path);
 
@@ -339,7 +350,7 @@ pub async fn handle_tui_command(
             match ctx.run_control.stop(ctx.app.operator_mode()).await {
                 Ok(RunControlOutcome::StopRequested) => {
                     ctx.app.stop_mode = StopMode::GracefulPending;
-                    ctx.app.mode = AppMode::Stopping;
+                    ctx.app.execution_mode = AppExecutionMode::Stopping;
                     ctx.app
                         .add_log(LogEntry::warn("Stopping after current change completes..."));
                     // Emit Stopping event for web clients
@@ -361,7 +372,7 @@ pub async fn handle_tui_command(
             match ctx.run_control.cancel_stop(ctx.app.operator_mode()).await {
                 Ok(RunControlOutcome::StopCancelled) => {
                     ctx.app.stop_mode = StopMode::None;
-                    ctx.app.mode = AppMode::Running;
+                    ctx.app.execution_mode = AppExecutionMode::Running;
                     ctx.app
                         .add_log(LogEntry::info("Stop canceled, continuing..."));
                     // Forward to web state immediately for web control API
@@ -380,7 +391,7 @@ pub async fn handle_tui_command(
             }
         }
         TuiCommand::ForceStop => {
-            // Immediate stop. `AppMode::Stopping` describes TUI lifecycle only, so
+            // Immediate stop. `AppExecutionMode::Stopping` describes TUI lifecycle only, so
             // the force-vs-ordinary decision comes from the one runtime activity
             // snapshot the shared service takes, and cancellation is issued there
             // for both reporting classes.
@@ -499,8 +510,11 @@ pub async fn handle_tui_command(
                     }
                     match reservation {
                         ResolveReservation::Active => {
-                            if matches!(ctx.app.mode, AppMode::Select | AppMode::Stopped) {
-                                ctx.app.mode = AppMode::Running;
+                            if matches!(
+                                ctx.app.execution_mode,
+                                AppExecutionMode::Select | AppExecutionMode::Stopped
+                            ) {
+                                ctx.app.execution_mode = AppExecutionMode::Running;
                             }
                             let how = match scheduler {
                                 SchedulerEffect::Started => "started scheduler for manual resolve",
@@ -797,11 +811,7 @@ mod tests {
         harness
             .run(
                 &mut app,
-                TuiCommand::DeleteWorktreeByPath(
-                    path.clone(),
-                    Some("feature-a".to_string()),
-                    false,
-                ),
+                TuiCommand::DeleteWorktreeByPath(path.clone(), "feature-a".to_string(), false),
             )
             .await;
 
@@ -827,11 +837,7 @@ mod tests {
         harness
             .run(
                 &mut app,
-                TuiCommand::DeleteWorktreeByPath(
-                    path.clone(),
-                    Some("feature-a".to_string()),
-                    false,
-                ),
+                TuiCommand::DeleteWorktreeByPath(path.clone(), "feature-a".to_string(), false),
             )
             .await;
 
@@ -843,6 +849,44 @@ mod tests {
             .logs
             .iter()
             .any(|entry| entry.message.contains("Worktree delete failed")));
+    }
+
+    #[tokio::test]
+    async fn test_delete_worktree_command_refuses_a_stale_confirmed_branch() {
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        let path = PathBuf::from("/tmp/worktree-replaced");
+        // The stub observes every registered path on `feature-a`, so confirming a
+        // different branch is exactly the "path was re-occupied since the modal"
+        // case: the adapter must forward the confirmed identity and the service
+        // must refuse before the backend is asked to remove anything.
+        set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+        app.worktrees = vec![create_test_worktree(path.to_str().unwrap())];
+        app.mark_worktree_deleting(path.clone());
+
+        harness
+            .run(
+                &mut app,
+                TuiCommand::DeleteWorktreeByPath(path.clone(), "feature-stale".to_string(), false),
+            )
+            .await;
+
+        assert!(!app.is_worktree_deleting(&path));
+        assert!(
+            app.logs
+                .iter()
+                .any(|entry| entry.message.contains("Worktree delete failed")
+                    && entry.message.contains("feature-stale")),
+            "the identity refusal must be reported verbatim: {:?}",
+            app.logs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(
+            DELETE_WORKTREE_TEST_OUTCOMES
+                .lock()
+                .expect("delete worktree test outcomes lock")
+                .contains_key(&path),
+            "a refused delete must never reach the backend remove"
+        );
     }
 
     // ── Queue intent ────────────────────────────────────────────────────────
@@ -1085,6 +1129,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn force_kill_confirmation_reaches_the_shared_service_and_terminates_the_target() {
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        app.execution_mode = AppExecutionMode::Running;
+        app.changes[0].set_display_status_cache("applying");
+        harness.state.write().await.apply_execution_event(
+            &crate::events::ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply".to_string(),
+            },
+        );
+
+        let token = CancellationToken::new();
+        harness
+            .queue
+            .register_kill_token("change-a".to_string(), token.clone())
+            .await;
+        let worker_queue = harness.queue.clone();
+        let worker = tokio::spawn(async move {
+            token.cancelled().await;
+            worker_queue.unregister_kill_token("change-a").await;
+        });
+
+        // The confirmation is advisory; the command it emits is what carries the
+        // intent into the shared service.
+        assert!(app.request_force_kill_confirmation());
+        let command = app.confirm_force_kill().expect("confirmation dispatches");
+        assert!(app.modal.is_none());
+        harness.run(&mut app, command).await;
+
+        wait_for_status(&harness.state, "change-a", "not queued").await;
+        worker.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn force_kill_confirmation_missing_termination_evidence_leaves_the_target_active() {
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        app.execution_mode = AppExecutionMode::Running;
+        app.changes[0].set_display_status_cache("applying");
+        harness.state.write().await.apply_execution_event(
+            &crate::events::ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply".to_string(),
+            },
+        );
+
+        assert!(app.request_force_kill_confirmation());
+        let command = app.confirm_force_kill().expect("confirmation dispatches");
+        harness.run(&mut app, command).await;
+
+        // No cancellation handle exists, so termination cannot be proven and the
+        // shared service refuses to dequeue.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            harness.status("change-a").await,
+            "applying",
+            "an unprovable termination must not mutate authoritative state"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_kill_confirmation_refuses_a_stale_target_before_reaching_the_service() {
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        app.execution_mode = AppExecutionMode::Running;
+        app.changes[0].set_display_status_cache("applying");
+        assert!(app.request_force_kill_confirmation());
+
+        // The target settles between display and confirmation input.
+        app.changes[0].set_display_status_cache("archived");
+
+        assert!(
+            app.confirm_force_kill().is_none(),
+            "a stale confirmation must not emit a stop-and-dequeue command"
+        );
+        assert!(app.modal.is_none());
+        assert_eq!(harness.status("change-a").await, "not queued");
+    }
+
     // ── Start / retry ───────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1103,7 +1228,7 @@ mod tests {
             harness.scheduler.started_targets(),
             vec![vec!["change-a".to_string()]]
         );
-        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
         assert_eq!(app.changes[0].display_status_cache, "queued");
         assert_eq!(app.changes[1].display_status_cache, "not queued");
     }
@@ -1122,7 +1247,7 @@ mod tests {
             harness.scheduler.calls().is_empty(),
             "an empty target set must not start a scheduler"
         );
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
         let warning = app.warning_message.clone().unwrap_or_default();
         assert!(
             warning.contains("no eligible target"),
@@ -1164,7 +1289,7 @@ mod tests {
             },
         );
         app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
-        app.mode = AppMode::Error;
+        app.execution_mode = AppExecutionMode::Error;
         app.changes[0].selected = true;
         app.publish_execution_marks();
 
@@ -1213,7 +1338,7 @@ mod tests {
         );
         app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
         assert_eq!(app.changes[0].display_status_cache, "stalled");
-        app.mode = AppMode::Error;
+        app.execution_mode = AppExecutionMode::Error;
         app.changes[0].selected = true;
         app.publish_execution_marks();
 
@@ -1343,7 +1468,7 @@ mod tests {
             harness.state.read().await.resolve_wait_change_ids(),
             vec!["change-a".to_string()]
         );
-        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
     }
 
     #[tokio::test]
@@ -1422,11 +1547,11 @@ mod tests {
     async fn stop_requests_graceful_stop_only_while_running() {
         let harness = AdapterHarness::new(&["change-a"]);
         let mut app = harness.app(&["change-a"]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         harness.run(&mut app, TuiCommand::Stop).await;
 
-        assert_eq!(app.mode, AppMode::Stopping);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopping);
         assert_eq!(app.stop_mode, StopMode::GracefulPending);
         assert_eq!(
             harness.scheduler.calls(),
@@ -1449,12 +1574,12 @@ mod tests {
     async fn cancel_stop_returns_to_running_only_from_stopping() {
         let harness = AdapterHarness::new(&["change-a"]);
         let mut app = harness.app(&["change-a"]);
-        app.mode = AppMode::Stopping;
+        app.execution_mode = AppExecutionMode::Stopping;
         app.stop_mode = StopMode::GracefulPending;
 
         harness.run(&mut app, TuiCommand::CancelStop).await;
 
-        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
         assert_eq!(app.stop_mode, StopMode::None);
         assert_eq!(
             harness.scheduler.calls(),
@@ -1478,7 +1603,7 @@ mod tests {
         harness.scheduler.set_activity(activity);
         harness.scheduler.set_running(scheduler_running);
         let mut app = harness.app(&["change-a"]);
-        app.mode = AppMode::Stopping;
+        app.execution_mode = AppExecutionMode::Stopping;
         app.stop_mode = StopMode::ImmediatePending;
         app.changes[0].selected = true;
         app.changes[0].set_display_status_cache("applying");
@@ -1519,8 +1644,8 @@ mod tests {
         assert_eq!(log_count(&app, "Force stopped"), 1);
         assert_eq!(app.stop_mode, StopMode::ForceStopped);
         assert_eq!(
-            app.mode,
-            AppMode::Stopping,
+            app.execution_mode,
+            AppExecutionMode::Stopping,
             "the scheduler owns terminal stop while in-flight cleanup is pending"
         );
         assert_eq!(log_count(&app, "Processing stopped"), 0);
@@ -1541,7 +1666,7 @@ mod tests {
             "an idle wait must not claim forceful process termination"
         );
         assert_eq!(log_count(&app, "Processing stopped"), 1);
-        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
     }
 
     #[tokio::test]
@@ -1559,8 +1684,8 @@ mod tests {
             "a background merge is shutdown work, not a force-stopped agent process"
         );
         assert_eq!(
-            app.mode,
-            AppMode::Stopping,
+            app.execution_mode,
+            AppExecutionMode::Stopping,
             "terminal stop waits for the base-lane operation to reach its boundary"
         );
         assert_eq!(log_count(&app, "Processing stopped"), 0);
@@ -1572,8 +1697,8 @@ mod tests {
         let app = run_force_stop(&harness, activity(0, true), false).await;
 
         assert_eq!(
-            app.mode,
-            AppMode::Stopped,
+            app.execution_mode,
+            AppExecutionMode::Stopped,
             "with no live scheduler there is nothing left to drain"
         );
         assert_eq!(log_count(&app, "Processing stopped"), 1);
@@ -1602,7 +1727,7 @@ mod tests {
     async fn force_stop_outside_running_or_stopping_cancels_nothing() {
         let harness = AdapterHarness::new(&["change-a"]);
         let mut app = harness.app(&["change-a"]);
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
 
         harness.run(&mut app, TuiCommand::ForceStop).await;
 
@@ -1776,7 +1901,7 @@ mod run_supervisor_tests {
         app.set_shared_state(shared_state.clone());
         app.apply_display_statuses_from_reducer(&shared_state.read().await.all_display_statuses());
         assert_eq!(app.changes[0].display_status_cache, "error");
-        app.mode = AppMode::Error;
+        app.execution_mode = AppExecutionMode::Error;
         app.changes[0].selected = true;
 
         {
