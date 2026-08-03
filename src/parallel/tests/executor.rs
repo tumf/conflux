@@ -1040,6 +1040,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1189,6 +1190,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1355,6 +1357,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1576,6 +1579,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1789,6 +1793,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2008,6 +2013,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -11716,6 +11722,231 @@ async fn dispatch_scripted_repair_cycle(
     }
 
     observed
+}
+
+/// Dispatch one change whose acceptance command *fails at command level* on the
+/// invocations listed in `failing_attempts`, and otherwise prints the recorded
+/// verdict for that invocation.
+///
+/// This is the production shape of Acceptance command recovery: the command
+/// queue already exhausted its transport retries, but the applied workspace is
+/// unchanged and clean.
+async fn dispatch_scripted_command_failure_cycle(
+    change_id: &str,
+    failing_attempts: &[u32],
+    verdicts: &[String],
+) -> ScriptedRepairDispatch {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let state_dir = TempDir::new().or_fail("create scripted verdict state dir");
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    let verdict_dir = state_dir.path().join("verdicts");
+    std::fs::create_dir_all(&verdict_dir).or_fail("create verdict dir");
+    for (index, verdict) in verdicts.iter().enumerate() {
+        std::fs::write(
+            verdict_dir.join(format!("verdict-{}.json", index + 1)),
+            verdict,
+        )
+        .or_fail("write scripted verdict");
+    }
+    std::fs::write(
+        verdict_dir.join("verdict-last.json"),
+        verdicts.last().or_fail("at least one verdict"),
+    )
+    .or_fail("write trailing verdict");
+
+    let counter = state_dir.path().join("attempts").display().to_string();
+    let verdict_dir = verdict_dir.display().to_string();
+    let failing = failing_attempts
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some(format!(
+            "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
+             > openspec/changes/{change_id}/tasks.next \
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md\""
+        )),
+        acceptance_command: Some(format!(
+            "sh -c 'n=$(cat \"{counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+             echo $n > \"{counter}\"; \
+             for f in {failing}; do \
+             if [ \"$f\" = \"$n\" ]; then \
+             echo \"acceptance transport crashed on attempt $n\" >&2; exit 1; fi; done; \
+             verdict=\"{verdict_dir}/verdict-$n.json\"; \
+             [ -f \"$verdict\" ] || verdict=\"{verdict_dir}/verdict-last.json\"; cat \"$verdict\"'"
+        )),
+        archive_command: Some(format!(
+            "sh -c 'mkdir -p openspec/changes/archive \
+             && mv openspec/changes/{change_id} openspec/changes/archive/{change_id}'"
+        )),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
+        ..Default::default()
+    });
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch scripted command-failure cycle");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    let workspace_path = workspace_base.path().join(format!("cflx-{change_id}"));
+    let mut observed = ScriptedRepairDispatch {
+        result,
+        workspace_path,
+        acceptance_invocations: 0,
+        apply_invocations: 0,
+        acceptance_error_logs: Vec::new(),
+        execution_hold: None,
+    };
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
+                observed.acceptance_invocations += 1;
+            }
+            ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
+                observed.apply_invocations += 1;
+            }
+            ExecutionEvent::Log(log)
+                if matches!(log.level, crate::events::LogLevel::Error)
+                    && log.operation.as_deref() == Some("acceptance") =>
+            {
+                observed.acceptance_error_logs.push(log.message.clone());
+            }
+            _ => {}
+        }
+    }
+
+    observed
+}
+
+/// A recoverable Acceptance command failure re-runs only Acceptance against the
+/// same applied, clean workspace.
+#[tokio::test]
+async fn parallel_acceptance_command_failure_reruns_only_acceptance() {
+    let change_id = "parallel-cmd-recover";
+    let observed = dispatch_scripted_command_failure_cycle(
+        change_id,
+        &[1],
+        &["{\"acceptance\":\"pass\"}".to_string()],
+    )
+    .await;
+
+    assert_eq!(
+        observed.result.error, None,
+        "a recovered command failure must not fail the workspace"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 2,
+        "exactly one Acceptance-only retry follows the command failure"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "command recovery must never rerun Apply"
+    );
+    assert!(
+        observed.result.final_revision.is_some(),
+        "the recovered cycle proceeds to archive handoff"
+    );
+}
+
+/// Three consecutive command failures are terminal, and no fourth attempt runs.
+#[tokio::test]
+async fn parallel_acceptance_command_failure_exhausts_after_three_attempts() {
+    let change_id = "parallel-cmd-exhaust";
+    let observed = dispatch_scripted_command_failure_cycle(
+        change_id,
+        &[1, 2, 3, 4],
+        &["{\"acceptance\":\"pass\"}".to_string()],
+    )
+    .await;
+
+    let error = observed
+        .result
+        .error
+        .as_deref()
+        .or_fail("exhausted command recovery is terminal");
+    assert!(
+        error.contains("3 consecutive attempts after 2 command-failure retries"),
+        "{error}"
+    );
+    assert!(
+        error.contains("acceptance transport crashed on attempt 3"),
+        "the terminal error carries the latest bounded diagnostics: {error}"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 3,
+        "no fourth command-failure attempt may start"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "the outer apply+acceptance cycle budget is untouched by command failures"
+    );
+}
+
+/// A completed non-command-failure invocation ends the consecutive sequence, so
+/// later failures form a fresh one with its own full budget.
+#[tokio::test]
+async fn parallel_completed_protocol_result_resets_acceptance_command_recovery() {
+    let change_id = "parallel-cmd-reset";
+    // CommandFailed, then a completed missing-verdict invocation, then three
+    // fresh command failures.
+    let observed = dispatch_scripted_command_failure_cycle(
+        change_id,
+        &[1, 3, 4, 5, 6],
+        &["status: still waiting for verification".to_string()],
+    )
+    .await;
+
+    let error = observed
+        .result
+        .error
+        .as_deref()
+        .or_fail("the fresh sequence exhausts on its own third failure");
+    assert!(
+        error.contains("3 consecutive attempts after 2 command-failure retries"),
+        "{error}"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 5,
+        "one failure, one completed protocol result, then three fresh failures"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "neither command recovery nor protocol retry reruns Apply"
+    );
 }
 
 /// A repair that only nudges an unrelated calibration constant must not buy

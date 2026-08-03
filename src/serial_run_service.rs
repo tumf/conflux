@@ -21,10 +21,12 @@ use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::acceptance::{
-    decide_acceptance_blocker, decide_acceptance_retry, missing_verdict_exhausted_error,
-    normalize_findings, repository_findings, semantic_progress_fingerprint,
-    AcceptanceBlockerDecision, AcceptanceProtocolDriver, AcceptanceRetryDecision,
-    MissingVerdictRetryStep, MAX_MISSING_VERDICT_RETRIES,
+    decide_acceptance_blocker, decide_acceptance_command_failure, decide_acceptance_retry,
+    missing_verdict_exhausted_error, normalize_findings, observe_completed_acceptance_invocation,
+    repository_findings, semantic_progress_fingerprint, AcceptanceBlockerDecision,
+    AcceptanceCommandRecovery, AcceptanceCommandRetryCounter, AcceptanceProtocolDriver,
+    AcceptanceProtocolRetry, AcceptanceRetryDecision, MissingVerdictRetryStep,
+    MAX_MISSING_VERDICT_RETRIES,
 };
 use crate::orchestration::{
     acceptance_test_streaming, archive_change, AcceptanceResult, ArchiveContext, ArchiveResult,
@@ -117,6 +119,14 @@ pub struct SerialRunService {
     /// operator retry releases the automatic repair budget. Parallel reaches the
     /// same suppression through its failed-change tracker.
     acceptance_repair_holds: HashSet<String>,
+    /// The sole per-change `max_iterations` owner for serial execution.
+    ///
+    /// CLI serial and TUI serial both drive this service, so one instance covers
+    /// both frontends. Every Apply entry for a change — first implementation,
+    /// command-failure recovery, Acceptance FAIL-to-Apply repair, task-format
+    /// repair, escalation, and final-commit repair — reserves from the same
+    /// per-change total. It is active-run memory only.
+    apply_budget: crate::execution::apply::ApplyBudget,
 }
 
 impl SerialRunService {
@@ -138,6 +148,7 @@ impl SerialRunService {
             acceptance_resume: HashSet::new(),
             accepted_change_ids: HashSet::new(),
             acceptance_repair_holds: HashSet::new(),
+            apply_budget: crate::execution::apply::ApplyBudget::new(),
         }
     }
 
@@ -741,6 +752,7 @@ impl SerialRunService {
             &event_handler,
             Some(&cancel_token), // Pass cancel_token to enable apply loop cancellation
             ai_runner,
+            &self.apply_budget,
             |line| async move {
                 match &line {
                     OutputLine::Stdout(s) => output.on_stdout(s),
@@ -751,6 +763,24 @@ impl SerialRunService {
         .await
         {
             Ok(result) => result,
+            Err(error @ crate::error::OrchestratorError::IterationLimit { .. }) => {
+                // The budget owner already emitted the threshold warning and the
+                // typed exhaustion. Preserve `iteration_limit` ownership across
+                // this boundary rather than degrading it to a command crash.
+                cancel_task.abort();
+                let crate::error::OrchestratorError::IterationLimit { attempts, .. } = &error
+                else {
+                    unreachable!("matched IterationLimit above")
+                };
+                let attempts = *attempts;
+                let error_message = error.to_string();
+                warn!("{}", error_message);
+                self.mark_stalled(&change.id, &error_message);
+                return Ok(ChangeProcessResult::IterationLimit {
+                    attempts,
+                    error: error_message,
+                });
+            }
             Err(crate::error::OrchestratorError::PermissionBlocked {
                 denied_path,
                 guidance,
@@ -898,18 +928,76 @@ impl SerialRunService {
         }
 
         let mut protocol = AcceptanceProtocolDriver::default();
+        // Consecutive Acceptance command-failure accounting for this run only.
+        // It is independent from the protocol, explicit-CONTINUE, and
+        // FAIL-to-Apply budgets, and its retries re-run only the configured
+        // Acceptance command against the same applied, clean workspace.
+        let mut command_recovery = AcceptanceCommandRetryCounter::default();
+        // A command that never completed left any pending protocol continuation
+        // unanswered, so the same continuation context is carried into the
+        // command retry instead of being silently consumed.
+        let mut pending_protocol_retry: Option<AcceptanceProtocolRetry> = None;
         loop {
-            match acceptance_test_streaming(
+            let protocol_retry = pending_protocol_retry
+                .take()
+                .or_else(|| protocol.take_protocol_retry());
+            let outcome = acceptance_test_streaming(
                 change,
                 agent,
                 ai_runner,
                 &self.config,
                 output,
                 cancel_check,
-                protocol.take_protocol_retry(),
+                protocol_retry,
             )
-            .await
-            {
+            .await;
+
+            // Any invocation that completes as a non-command-failure result ends
+            // the consecutive command-failure sequence and clears its latest-only
+            // prompt context before that result follows its own existing routing.
+            // Cancellation is not a completed result and is never a command
+            // failure, so it neither resets nor consumes this budget.
+            if let Ok((result, _, _)) = &outcome {
+                if !matches!(
+                    result,
+                    AcceptanceResult::CommandFailed { .. } | AcceptanceResult::Cancelled
+                ) {
+                    observe_completed_acceptance_invocation(
+                        &mut command_recovery,
+                        agent,
+                        &change.id,
+                    );
+                }
+            }
+
+            match outcome {
+                Ok((
+                    AcceptanceResult::CommandFailed { diagnostic, .. },
+                    _attempt_number,
+                    _command,
+                )) => {
+                    // The command queue already exhausted its transport retries.
+                    // Recovery re-runs only Acceptance against the same applied,
+                    // clean workspace: no Apply, no cleanup-review, no FAIL task
+                    // append, and no other counter is consumed.
+                    match decide_acceptance_command_failure(
+                        &mut command_recovery,
+                        agent,
+                        &change.id,
+                        diagnostic,
+                    ) {
+                        AcceptanceCommandRecovery::Retry { progress, .. } => {
+                            warn!("{} for {}", progress, change.id);
+                            output.on_warn(&progress);
+                            pending_protocol_retry = protocol_retry;
+                            continue;
+                        }
+                        AcceptanceCommandRecovery::Exhausted { error, .. } => {
+                            error!("{} for {}", error, change.id);
+                            break Ok(ChangeProcessResult::AcceptanceCommandFailed { error });
+                        }
+                    }
+                }
                 Ok((AcceptanceResult::MissingVerdict { findings }, _attempt_number, _command)) => {
                     match protocol.observe_missing_verdict(&findings) {
                         MissingVerdictRetryStep::Retry { progress, .. } => {
@@ -1340,7 +1428,11 @@ impl SerialRunService {
             AcceptanceResult::CommandFailed {
                 error,
                 findings: _findings,
+                diagnostic: _diagnostic,
             } => {
+                // The acceptance loop owns the bounded command-failure budget and
+                // only reaches terminal routing after exhaustion, so this arm is
+                // reached only by a caller that bypassed that loop.
                 error!("Acceptance command failed for {}: {}", change_id, error);
                 // Canonical owner note: runtime appends follow-up tasks for FAIL verdicts,
                 // while command-level failures are surfaced without forcing local tasks.md updates.
@@ -1433,6 +1525,14 @@ pub enum ChangeProcessResult {
     },
     /// Acceptance test command failed
     AcceptanceCommandFailed { error: String },
+    /// The change exhausted its per-change active-run `max_iterations` Apply
+    /// budget.
+    ///
+    /// Carried as its own variant so serial CLI and TUI run boundaries can
+    /// invoke `on_finish` with `status = iteration_limit` and the exact
+    /// cumulative dispatch count instead of reclassifying budget exhaustion as
+    /// an ordinary agent-command failure.
+    IterationLimit { attempts: u32, error: String },
     /// Acceptance test requires continuation
     AcceptanceContinue,
     /// Acceptance CONTINUE limit exceeded
@@ -3928,6 +4028,42 @@ mod tests {
         }
     }
 
+    /// Scripted serial cycle whose acceptance command *fails at command level*
+    /// on the attempts listed in `failing_attempts`, and otherwise prints the
+    /// scripted verdict for that attempt number.
+    ///
+    /// This is the exact shape operation-level Acceptance recovery must handle:
+    /// the command queue has already exhausted its transport retries, but the
+    /// applied workspace is unchanged and still clean.
+    fn serial_command_failure_cycle_config(
+        change_id: &str,
+        state_dir: &std::path::Path,
+        failing_attempts: &[u32],
+        verdicts: &[String],
+    ) -> OrchestratorConfig {
+        let mut config = serial_scripted_cycle_config(change_id, state_dir, verdicts, "true");
+
+        let acceptance_counter = state_dir.join("acceptance-attempts").display().to_string();
+        let verdict_dir = state_dir.join("verdicts").display().to_string();
+        let failing = failing_attempts
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        config.acceptance_command = Some(format!(
+            "sh -c 'n=$(cat \"{acceptance_counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+             echo $n > \"{acceptance_counter}\"; \
+             for f in {failing}; do \
+             if [ \"$f\" = \"$n\" ]; then \
+             echo \"acceptance transport crashed on attempt $n\" >&2; exit 1; fi; done; \
+             verdict=\"{verdict_dir}/verdict-$n.json\"; \
+             [ -f \"$verdict\" ] || verdict=\"{verdict_dir}/verdict-last.json\"; \
+             cat \"$verdict\"'"
+        ));
+        config
+    }
+
     fn serial_invocations(state_dir: &std::path::Path, counter: &str) -> u32 {
         std::fs::read_to_string(state_dir.join(counter))
             .map(|text| text.trim().parse().unwrap_or(0))
@@ -4361,6 +4497,196 @@ mod tests {
         );
         assert_eq!(serial_invocations(state_dir.path(), "apply-attempts"), 1);
         assert_acceptance_added_no_worktree_artifact(temp_dir.path(), change_id);
+    }
+
+    // === Acceptance command-failure recovery (integration) ===
+
+    #[tokio::test]
+    async fn serial_acceptance_command_failure_reruns_only_acceptance() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-cmd-recover";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        // Attempt 1 crashes at command level; attempt 2 completes with PASS.
+        let config = serial_command_failure_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[1],
+            &["{\"acceptance\":\"pass\"}".to_string()],
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let result = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+
+        assert!(
+            matches!(result, ChangeProcessResult::AcceptancePassed),
+            "a recovered command failure must reach the fresh verdict, got {result:?}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            2,
+            "exactly one Acceptance-only retry follows the command failure"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "apply-attempts"),
+            1,
+            "command recovery must never rerun Apply"
+        );
+        assert_acceptance_added_no_worktree_artifact(temp_dir.path(), change_id);
+    }
+
+    #[tokio::test]
+    async fn serial_acceptance_command_failure_exhausts_after_three_attempts() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-cmd-exhaust";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let config = serial_command_failure_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[1, 2, 3, 4],
+            &["{\"acceptance\":\"pass\"}".to_string()],
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let result = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+
+        let ChangeProcessResult::AcceptanceCommandFailed { error } = &result else {
+            panic!("three consecutive command failures must be terminal, got {result:?}");
+        };
+        assert!(
+            error.contains("3 consecutive attempts after 2 command-failure retries"),
+            "{error}"
+        );
+        assert!(
+            error.contains("acceptance transport crashed on attempt 3"),
+            "the terminal error must carry the latest bounded diagnostics: {error}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            3,
+            "no fourth command-failure attempt may start"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "apply-attempts"),
+            1,
+            "exhaustion must not dispatch repair work"
+        );
+        assert_acceptance_added_no_worktree_artifact(temp_dir.path(), change_id);
+    }
+
+    #[tokio::test]
+    async fn serial_completed_protocol_result_resets_acceptance_command_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-cmd-reset";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        // CommandFailed -> MissingVerdict -> CommandFailed x3. The completed
+        // missing-verdict invocation ends the first sequence, so the later
+        // failures form a fresh one that only exhausts on its own third attempt.
+        let missing_verdict = "status: still waiting for verification".to_string();
+        let config = serial_command_failure_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[1, 3, 4, 5, 6],
+            &[missing_verdict],
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let result = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+
+        let ChangeProcessResult::AcceptanceCommandFailed { error } = &result else {
+            panic!("expected a terminal acceptance command failure, got {result:?}");
+        };
+        assert!(
+            error.contains("3 consecutive attempts after 2 command-failure retries"),
+            "the reset must restart the command-failure sequence: {error}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            5,
+            "one failure, one completed protocol result, then three fresh failures"
+        );
+        assert_eq!(serial_invocations(state_dir.path(), "apply-attempts"), 1);
+    }
+
+    // === Typed iteration-limit routing (integration) ===
+
+    #[tokio::test]
+    async fn serial_budget_exhaustion_returns_the_typed_iteration_limit_result() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-iteration-limit";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let apply_counter = state_dir
+            .path()
+            .join("apply-attempts")
+            .display()
+            .to_string();
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'n=$(cat \"{apply_counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo $n > \"{apply_counter}\"; echo apply-boom >&2; exit 4'"
+            )),
+            acceptance_command: Some("sh -c 'echo should-not-run; exit 1'".to_string()),
+            max_iterations: Some(2),
+            ..Default::default()
+        };
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let result = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+
+        let ChangeProcessResult::IterationLimit { attempts, error } = &result else {
+            panic!("budget exhaustion must stay typed at the serial boundary, got {result:?}");
+        };
+        assert_eq!(*attempts, 2);
+        assert!(error.contains(change_id), "{error}");
+        assert!(error.contains("apply-boom"), "{error}");
+        assert_eq!(
+            serial_invocations(state_dir.path(), "apply-attempts"),
+            2,
+            "no dispatch may start beyond the exact ceiling"
+        );
     }
 
     #[tokio::test]

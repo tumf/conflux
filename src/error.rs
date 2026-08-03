@@ -74,6 +74,21 @@ pub enum OrchestratorError {
         denied_path: String,
         guidance: String,
     },
+
+    /// The sole per-change Apply-dispatch budget owner refused to reserve
+    /// another dispatch because the positive `max_iterations` ceiling is spent.
+    ///
+    /// This is deliberately a distinct variant rather than an untyped
+    /// [`OrchestratorError::AgentCommand`]: serial CLI, TUI, and parallel run
+    /// boundaries must preserve `iteration_limit` finish-status ownership rather
+    /// than reclassify budget exhaustion as an ordinary agent-command crash.
+    #[error("Max iterations ({max}) reached for change '{change_id}' after {attempts} Apply dispatch(es): {diagnostic}")]
+    IterationLimit {
+        change_id: String,
+        attempts: u32,
+        max: u32,
+        diagnostic: String,
+    },
 }
 
 #[allow(dead_code)] // Legacy API helpers, kept for backward compatibility

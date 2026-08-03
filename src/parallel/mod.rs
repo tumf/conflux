@@ -193,6 +193,14 @@ pub struct ParallelExecutor {
     acceptance_history: Arc<Mutex<crate::history::AcceptanceHistory>>,
     /// Tracks which changes have had acceptance tail injected (to prevent re-injection)
     acceptance_tail_injected: Arc<Mutex<std::collections::HashMap<String, bool>>>,
+    /// The sole per-change `max_iterations` Apply-dispatch budget owner for this
+    /// parallel run.
+    ///
+    /// Shared by every dispatched workspace task, so a change that re-enters
+    /// Apply after an Acceptance FAIL keeps counting from where it left off.
+    /// Active-run memory only: a restart starts from zero and re-derives routing
+    /// from workspace and Git evidence.
+    apply_budget: crate::execution::apply::ApplyBudget,
     /// Counter for active manual resolve operations (TUI mode)
     manual_resolve_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Counter for active automatic resolve operations

@@ -1381,6 +1381,9 @@ impl ParallelExecutor {
         let cancel_token = self.cancel_token.clone();
         let shared_stagger_state = self.shared_stagger_state.clone();
         let dynamic_queue = self.dynamic_queue.clone();
+        // Handle to the run-wide Apply budget owner. Cloning shares the same
+        // per-change accounting with every other in-flight workspace task.
+        let apply_budget = self.apply_budget.clone();
         let workspace = workspace_val;
 
         // Spawn apply + acceptance + archive task
@@ -1624,8 +1627,13 @@ impl ParallelExecutor {
             // restart re-runs acceptance from workspace state instead of
             // resuming a protocol-retry sequence.
             let mut protocol = AcceptanceProtocolDriver::default();
+            // Consecutive Acceptance command-failure accounting for this dispatch
+            // only, shared with serial orchestration through the same policy API.
+            // It is independent from the protocol, explicit-CONTINUE, and
+            // FAIL-to-Apply cycle budgets and is never persisted.
+            let mut acceptance_command_recovery =
+                crate::orchestration::acceptance::AcceptanceCommandRetryCounter::default();
             let mut cycle_count = 0u32;
-            let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
 
             // Create a per-change cancel token that monitors both global cancel and single-change stop
             let per_change_cancel = CancellationToken::new();
@@ -1926,7 +1934,7 @@ impl ParallelExecutor {
                 // Skip apply only for the first cycle when resuming from an already-applied state.
                 // Even when apply is skipped, this cycle must still execute acceptance unless
                 // resume_action explicitly allows archive continuation.
-                let (revision, final_iteration, blocked_handoff, rejected_handoff) = if !should_run_apply(&mut skip_apply_once) {
+                let (revision, _final_iteration, blocked_handoff, rejected_handoff) = if !should_run_apply(&mut skip_apply_once) {
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::Log(
@@ -1940,7 +1948,7 @@ impl ParallelExecutor {
                     }
 
                     match crate::vcs::git::commands::get_current_commit(&workspace.path).await {
-                        Ok(revision) => (revision, cumulative_iteration, None, None),
+                        Ok(revision) => (revision, apply_budget.attempts(&change_id), None, None),
                         Err(e) => {
                             cancel_monitor.abort();
                             return WorkspaceResult {
@@ -2006,7 +2014,7 @@ impl ParallelExecutor {
                     &apply_history,
                     &acceptance_history,
                     &acceptance_tail_injected,
-                    cumulative_iteration, // Pass current iteration count
+                    &apply_budget, // Sole per-change max_iterations owner
                 )
                 .await;
 
@@ -2069,6 +2077,35 @@ impl ParallelExecutor {
                             };
                         }
 
+                        // The sole per-change budget owner refused another
+                        // dispatch. Preserve the typed `iteration_limit`
+                        // diagnosis with its exact cumulative attempt count
+                        // instead of reclassifying it as an ordinary agent
+                        // command crash, and stop this change without a
+                        // further cycle.
+                        if let OrchestratorError::IterationLimit { attempts, .. } = &e {
+                            let attempts = *attempts;
+                            let error = e.to_string();
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::error(error.clone())
+                                            .with_change_id(&change_id)
+                                            .with_operation("apply")
+                                            .with_iteration(attempts),
+                                    ))
+                                    .await;
+                            }
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(error),
+                                rejected: None,
+                            };
+                        }
+
                         // Apply failed - return error immediately
                         cancel_monitor.abort();
                         return WorkspaceResult {
@@ -2081,9 +2118,6 @@ impl ParallelExecutor {
                     }
                 }
                 };
-
-                // Update cumulative iteration count
-                cumulative_iteration = final_iteration;
 
                 if let Some(handoff) = &rejected_handoff {
                     info!(
@@ -2416,21 +2450,116 @@ impl ParallelExecutor {
                             .await;
                         }
                     }
-                    agent.seed_acceptance_history(acceptance_history.lock().await.clone());
-                    execute_acceptance_in_workspace(
-                        &change_id,
-                        &workspace.path,
-                        &mut agent,
-                        event_tx.clone(),
-                        Some(&per_change_cancel),
-                        &ai_runner,
-                        &config,
-                        &acceptance_tail_injected,
-                        &acceptance_history,
-                        Some(base_branch.as_str()),
-                        protocol.take_protocol_retry(),
-                    )
-                    .await
+                    // Acceptance-only command-failure recovery. It lives inside
+                    // one applied-workspace cycle on purpose: it re-runs only the
+                    // configured Acceptance command against the same applied,
+                    // clean workspace, never re-enters Apply or cleanup-review,
+                    // never increments `cycle_count`, and never uses
+                    // `skip_apply_once` as an indirect retry mechanism. That keeps
+                    // `MAX_ACCEPTANCE_RETRY_CYCLES` reserved for FAIL-to-Apply
+                    // repair cycles.
+                    let mut pending_protocol_retry: Option<
+                        crate::orchestration::acceptance::AcceptanceProtocolRetry,
+                    > = None;
+                    loop {
+                        // A command that never completed left any pending protocol
+                        // continuation unanswered, so the same context is carried
+                        // into the command retry instead of being consumed.
+                        let protocol_retry = pending_protocol_retry
+                            .take()
+                            .or_else(|| protocol.take_protocol_retry());
+                        agent.seed_acceptance_history(acceptance_history.lock().await.clone());
+                        let outcome = execute_acceptance_in_workspace(
+                            &change_id,
+                            &workspace.path,
+                            &mut agent,
+                            event_tx.clone(),
+                            Some(&per_change_cancel),
+                            &ai_runner,
+                            &config,
+                            &acceptance_tail_injected,
+                            &acceptance_history,
+                            Some(base_branch.as_str()),
+                            protocol_retry,
+                        )
+                        .await;
+
+                        match outcome {
+                            Ok((
+                                crate::orchestration::AcceptanceResult::CommandFailed {
+                                    findings,
+                                    diagnostic,
+                                    ..
+                                },
+                                acceptance_iteration,
+                            )) => {
+                                match crate::orchestration::acceptance::decide_acceptance_command_failure(
+                                    &mut acceptance_command_recovery,
+                                    &mut agent,
+                                    &change_id,
+                                    diagnostic.clone(),
+                                ) {
+                                    crate::orchestration::acceptance::AcceptanceCommandRecovery::Retry {
+                                        progress,
+                                        ..
+                                    } => {
+                                        warn!(
+                                            "Acceptance command recovery for {} (cycle {}): {}",
+                                            change_id, cycle_count, progress
+                                        );
+                                        if let Some(ref tx) = event_tx {
+                                            let _ = tx
+                                                .send(ParallelEvent::Log(
+                                                    LogEntry::info(format!(
+                                                        "{} (cycle {})",
+                                                        progress, cycle_count
+                                                    ))
+                                                    .with_change_id(&change_id)
+                                                    .with_operation("acceptance")
+                                                    .with_iteration(acceptance_iteration),
+                                                ))
+                                                .await;
+                                        }
+                                        pending_protocol_retry = protocol_retry;
+                                        continue;
+                                    }
+                                    crate::orchestration::acceptance::AcceptanceCommandRecovery::Exhausted {
+                                        error,
+                                        ..
+                                    } => {
+                                        break Ok((
+                                            crate::orchestration::AcceptanceResult::CommandFailed {
+                                                error,
+                                                findings,
+                                                diagnostic,
+                                            },
+                                            acceptance_iteration,
+                                        ));
+                                    }
+                                }
+                            }
+                            // Any invocation that completes as a non-command-failure
+                            // result ends the consecutive command-failure sequence
+                            // and clears its latest-only prompt context before that
+                            // result follows its own existing routing. Cancellation
+                            // never completes, so it neither resets nor consumes
+                            // this budget.
+                            Ok((result, acceptance_iteration)) => {
+                                if !matches!(
+                                    result,
+                                    crate::orchestration::AcceptanceResult::Cancelled
+                                ) {
+                                    crate::orchestration::acceptance::observe_completed_acceptance_invocation(
+                                        &mut acceptance_command_recovery,
+                                        &mut agent,
+                                        &change_id,
+                                    );
+                                }
+                                break Ok((result, acceptance_iteration));
+                            }
+                            Err(e) => break Err(e),
+                        }
+                    }
                 };
 
                 // Any canonical verdict ends the consecutive missing-verdict
@@ -2878,6 +3007,7 @@ impl ParallelExecutor {
                         crate::orchestration::AcceptanceResult::CommandFailed {
                             error,
                             findings: _,
+                            diagnostic: _,
                         },
                         acceptance_iteration,
                     )) => {

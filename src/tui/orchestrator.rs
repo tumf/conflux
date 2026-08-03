@@ -289,6 +289,11 @@ pub async fn run_orchestrator(
             .await;
     }
 
+    // Finish status reported to `on_finish` exactly once at the end of this run,
+    // plus the cumulative Apply-dispatch count that accompanies `iteration_limit`.
+    let mut finish_status = "completed";
+    let mut finish_apply_count = 0u32;
+
     // Main two-phase loop
     loop {
         // Check for cancellation before each iteration
@@ -312,32 +317,11 @@ pub async fn run_orchestrator(
             break;
         }
 
-        // Check max iterations limit (0 = no limit)
-        let current_iteration = serial_service.iteration();
-        if max_iterations > 0 && current_iteration >= max_iterations {
-            dispatcher
-                .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
-                    "Max iterations ({}) reached, stopping orchestration",
-                    max_iterations
-                ))))
-                .await;
-            // Send completion event
-            dispatcher.dispatch(OrchestratorEvent::AllCompleted).await;
-            break;
-        }
-
-        // Log warning when approaching limit (80%)
-        if max_iterations > 0 {
-            let warning_threshold = (max_iterations as f32 * 0.8) as u32;
-            if current_iteration == warning_threshold {
-                dispatcher
-                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
-                        "Approaching max iterations: {}/{}",
-                        current_iteration, max_iterations
-                    ))))
-                    .await;
-            }
-        }
+        // `max_iterations` has exactly one owner: the per-change `ApplyBudget`
+        // inside `SerialRunService`, which reserves before each configured Apply
+        // dispatch, emits the single 80% warning, and returns the typed
+        // `iteration_limit` outcome handled below. This loop imposes no second
+        // ceiling and duplicates no warning.
 
         // Check dynamic queue for new changes before checking if we're done
         while let Some(dynamic_id) = dynamic_queue.pop().await {
@@ -796,6 +780,25 @@ pub async fn run_orchestrator(
                 };
                 dispatcher.dispatch(processing_error_event).await;
             }
+            // The sole per-change budget owner refused another dispatch. Stop the
+            // run with the canonical `iteration_limit` finish status and the exact
+            // cumulative count instead of reclassifying it as a command crash.
+            Ok(ChangeProcessResult::IterationLimit { attempts, error }) => {
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(error.clone())))
+                    .await;
+                dispatcher
+                    .dispatch(OrchestratorEvent::ProcessingError {
+                        id: change_id.clone(),
+                        error,
+                    })
+                    .await;
+                shared_state.write().await.remove_from_pending(&change_id);
+                finish_status = "iteration_limit";
+                finish_apply_count = attempts;
+                dispatcher.dispatch(OrchestratorEvent::AllCompleted).await;
+                break;
+            }
             Ok(ChangeProcessResult::Archived) => {
                 // Change was complete and successfully archived
                 dispatcher
@@ -884,7 +887,9 @@ pub async fn run_orchestrator(
     // Run on_finish hook after all changes processed or stopped
     let state = shared_state.read().await;
     let complete_context =
-        HookContext::new(state.changes_processed(), state.total_changes(), 0, false);
+        HookContext::new(state.changes_processed(), state.total_changes(), 0, false)
+            .with_status(finish_status)
+            .with_apply_count(finish_apply_count);
     if let Err(e) = hooks.run_hook(HookType::OnFinish, &complete_context).await {
         dispatcher
             .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(

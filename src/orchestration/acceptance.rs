@@ -229,6 +229,230 @@ pub fn protocol_exhausted_error(
     )
 }
 
+/// Maximum Acceptance-only retries permitted after the initial command failure.
+///
+/// Fixed protocol safety bound rather than configuration: the initial invocation
+/// plus these retries gives three consecutive opportunities for the configured
+/// Acceptance command to run to completion. It is deliberately independent from
+/// [`MAX_ACCEPTANCE_PROTOCOL_RETRIES`], the configured explicit-`CONTINUE`
+/// budget, and [`MAX_ACCEPTANCE_RETRY_CYCLES`]: a command that could not run at
+/// all produced no verdict to consume any of those.
+pub const MAX_ACCEPTANCE_COMMAND_RETRIES: u32 = 2;
+
+/// Bounded Conflux-managed diagnosis of one Acceptance command that failed to
+/// complete.
+///
+/// This is transport evidence, never an Acceptance verdict: it can never be
+/// parsed as a canonical outcome, appended as a FAIL finding, or merged into
+/// canonical [`crate::history::AcceptanceHistory`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptanceCommandDiagnostic {
+    /// Human-facing error summary for the failed invocation.
+    pub error: String,
+    /// Child exit code when the process actually reported one.
+    pub exit_code: Option<i32>,
+    /// Bounded stdout tail captured by the existing output collector.
+    pub stdout_tail: Option<String>,
+    /// Bounded stderr tail captured by the existing output collector.
+    pub stderr_tail: Option<String>,
+}
+
+impl AcceptanceCommandDiagnostic {
+    /// One-line bounded summary used in operator-facing progress and terminal
+    /// messages.
+    pub fn summary(&self) -> String {
+        const MAX_TAIL_CHARS: usize = 400;
+
+        fn condense(tail: &str) -> String {
+            let single_line = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+            match single_line.char_indices().nth(MAX_TAIL_CHARS) {
+                Some((idx, _)) => format!("{}...", &single_line[..idx]),
+                None => single_line,
+            }
+        }
+
+        let mut parts = vec![self.error.clone()];
+        if let Some(code) = self.exit_code {
+            parts.push(format!("exit_code: {}", code));
+        }
+        if let Some(stderr) = self.stderr_tail.as_deref().filter(|t| !t.trim().is_empty()) {
+            parts.push(format!("stderr: {}", condense(stderr)));
+        } else if let Some(stdout) = self.stdout_tail.as_deref().filter(|t| !t.trim().is_empty()) {
+            parts.push(format!("stdout: {}", condense(stdout)));
+        }
+        parts.join(" | ")
+    }
+}
+
+/// Routing decision for one Acceptance command that failed to complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptanceCommandRetryDecision {
+    /// Budget remains: re-invoke only the configured Acceptance command against
+    /// the same applied, clean workspace.
+    Retry {
+        /// 1-based retry index; the first retry after the initial failure is 1.
+        attempt: u32,
+        max_retries: u32,
+        diagnostic: AcceptanceCommandDiagnostic,
+    },
+    /// Third consecutive failure: route to the terminal Acceptance command error.
+    Exhausted {
+        attempts: u32,
+        max_retries: u32,
+        diagnostic: AcceptanceCommandDiagnostic,
+    },
+}
+
+/// Consecutive Acceptance command-failure accounting for one change during a
+/// single active run.
+///
+/// Per `openspec/CONSTITUTION.md` this is active-run memory only. It is never
+/// persisted, so a restart simply re-runs Acceptance against the applied, clean,
+/// unarchived workspace with a fresh budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcceptanceCommandRetryCounter {
+    consecutive_failures: u32,
+}
+
+impl AcceptanceCommandRetryCounter {
+    /// Consecutive command failures observed since the last completed
+    /// non-command-failure invocation.
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// End the consecutive sequence.
+    ///
+    /// Called for every invocation that completes as any non-command-failure
+    /// result — canonical PASS/FAIL/CONTINUE, validated stalled or
+    /// permission-stalled, missing verdict, malformed finding, and bare blocker —
+    /// before that result follows its own existing routing.
+    pub fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    /// Record one command failure and return the routing decision.
+    pub fn record_command_failure(
+        &mut self,
+        diagnostic: AcceptanceCommandDiagnostic,
+    ) -> AcceptanceCommandRetryDecision {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures <= MAX_ACCEPTANCE_COMMAND_RETRIES {
+            AcceptanceCommandRetryDecision::Retry {
+                attempt: self.consecutive_failures,
+                max_retries: MAX_ACCEPTANCE_COMMAND_RETRIES,
+                diagnostic,
+            }
+        } else {
+            AcceptanceCommandRetryDecision::Exhausted {
+                attempts: self.consecutive_failures,
+                max_retries: MAX_ACCEPTANCE_COMMAND_RETRIES,
+                diagnostic,
+            }
+        }
+    }
+}
+
+/// Non-terminal progress message for an Acceptance command retry.
+///
+/// Deliberately worded as progress, not error: the change is still Acceptance
+/// work in progress while command-recovery budget remains.
+pub fn acceptance_command_retry_progress(
+    attempt: u32,
+    max_retries: u32,
+    diagnostic: &AcceptanceCommandDiagnostic,
+) -> String {
+    format!(
+        "Acceptance command did not complete (command-failure recovery {attempt}/{max_retries}); \
+         re-running only the configured acceptance command against the same applied workspace. \
+         Evidence: {}",
+        diagnostic.summary()
+    )
+}
+
+/// Terminal diagnostic emitted after the third consecutive command failure.
+pub fn acceptance_command_exhausted_error(
+    attempts: u32,
+    max_retries: u32,
+    diagnostic: &AcceptanceCommandDiagnostic,
+) -> String {
+    format!(
+        "Acceptance command failed to complete on {attempts} consecutive attempts after \
+         {max_retries} command-failure retries. Evidence: {}",
+        diagnostic.summary()
+    )
+}
+
+/// What serial and parallel execution must do next after an Acceptance command
+/// failure.
+///
+/// One shared decision so both frontends apply the same bound, the same
+/// latest-only prompt context, and the same terminal shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptanceCommandRecovery {
+    /// Re-invoke only the configured Acceptance command. The message is
+    /// operator-facing progress, not an error.
+    Retry { attempt: u32, progress: String },
+    /// Budget spent: return the existing terminal Acceptance command failure.
+    Exhausted { attempts: u32, error: String },
+}
+
+/// Shared Acceptance command-failure policy used by serial and parallel
+/// execution.
+///
+/// Records the failure against `counter`, stores the latest-only bounded
+/// diagnosis on `agent` so the next normal Acceptance prompt can render it as
+/// untrusted evidence, and returns the routing decision. Exhaustion clears the
+/// prompt context because no further command retry follows it.
+///
+/// This never reruns Apply or cleanup-review and never touches the
+/// missing-verdict/protocol, explicit-`CONTINUE`, or FAIL-to-Apply budgets.
+pub fn decide_acceptance_command_failure(
+    counter: &mut AcceptanceCommandRetryCounter,
+    agent: &mut AgentRunner,
+    change_id: &str,
+    diagnostic: AcceptanceCommandDiagnostic,
+) -> AcceptanceCommandRecovery {
+    match counter.record_command_failure(diagnostic) {
+        AcceptanceCommandRetryDecision::Retry {
+            attempt,
+            max_retries,
+            diagnostic,
+        } => {
+            let progress = acceptance_command_retry_progress(attempt, max_retries, &diagnostic);
+            agent.set_acceptance_command_recovery(change_id, diagnostic);
+            AcceptanceCommandRecovery::Retry { attempt, progress }
+        }
+        AcceptanceCommandRetryDecision::Exhausted {
+            attempts,
+            max_retries,
+            diagnostic,
+        } => {
+            agent.clear_acceptance_command_recovery(change_id);
+            AcceptanceCommandRecovery::Exhausted {
+                attempts,
+                error: acceptance_command_exhausted_error(attempts, max_retries, &diagnostic),
+            }
+        }
+    }
+}
+
+/// Shared reset boundary for Acceptance command recovery.
+///
+/// Any invocation that completes as a non-command-failure result ends the
+/// consecutive sequence and clears the latest-only prompt context *before* that
+/// result follows its existing canonical, missing/malformed protocol, stalled,
+/// permission-stalled, or blocker routing. A later command failure therefore
+/// starts a fresh sequence with fresh latest-only context.
+pub fn observe_completed_acceptance_invocation(
+    counter: &mut AcceptanceCommandRetryCounter,
+    agent: &mut AgentRunner,
+    change_id: &str,
+) {
+    counter.reset();
+    agent.clear_acceptance_command_recovery(change_id);
+}
+
 /// Next step after an acceptance command violated a verdict protocol contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissingVerdictRetryStep {
@@ -1220,9 +1444,14 @@ pub enum AcceptanceResult {
         blocker: crate::acceptance::AcceptanceBlocker,
     },
     /// Acceptance command execution failed (non-zero exit).
+    ///
+    /// `diagnostic` carries the bounded, latest-only Conflux-managed transport
+    /// evidence used by the shared command-failure recovery policy. It is never
+    /// a verdict and never becomes a FAIL finding payload.
     CommandFailed {
         error: String,
         findings: Vec<String>,
+        diagnostic: AcceptanceCommandDiagnostic,
     },
     /// Acceptance detected a repeated unresolved permission/policy blocker.
     PermissionStalled {
@@ -1468,6 +1697,10 @@ where
             "Acceptance command failed with exit code: {:?}",
             status.code()
         );
+        // Cloned before the attempt record consumes the tails; the recovery
+        // diagnostic is stored separately from canonical acceptance history.
+        let stdout_tail_for_diagnostic = stdout_tail.clone();
+        let stderr_tail_for_diagnostic = stderr_tail.clone();
         let attempt_number = agent.next_acceptance_attempt_number(&change.id);
         let attempt = AcceptanceAttempt {
             attempt: attempt_number,
@@ -1481,10 +1714,17 @@ where
         };
         agent.record_acceptance_attempt(&change.id, attempt);
         output.on_error(&error_msg);
+        let diagnostic = AcceptanceCommandDiagnostic {
+            error: error_msg.clone(),
+            exit_code: status.code(),
+            stdout_tail: stdout_tail_for_diagnostic,
+            stderr_tail: stderr_tail_for_diagnostic,
+        };
         return Ok((
             AcceptanceResult::CommandFailed {
                 error: error_msg,
                 findings: tail_findings,
+                diagnostic,
             },
             attempt_number,
             command,
@@ -1631,6 +1871,264 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // === Acceptance command-failure recovery ===
+
+    mod command_recovery {
+        use super::super::*;
+
+        fn diagnostic(marker: &str) -> AcceptanceCommandDiagnostic {
+            AcceptanceCommandDiagnostic {
+                error: format!("Acceptance command failed with exit code: Some(1) [{marker}]"),
+                exit_code: Some(1),
+                stdout_tail: Some(format!("stdout {marker}")),
+                stderr_tail: Some(format!("stderr {marker}")),
+            }
+        }
+
+        fn agent() -> AgentRunner {
+            AgentRunner::new(crate::config::OrchestratorConfig::default())
+        }
+
+        #[test]
+        fn two_retries_follow_the_initial_failure_and_the_third_exhausts() {
+            let mut counter = AcceptanceCommandRetryCounter::default();
+
+            assert!(matches!(
+                counter.record_command_failure(diagnostic("a")),
+                AcceptanceCommandRetryDecision::Retry {
+                    attempt: 1,
+                    max_retries: 2,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                counter.record_command_failure(diagnostic("b")),
+                AcceptanceCommandRetryDecision::Retry {
+                    attempt: 2,
+                    max_retries: 2,
+                    ..
+                }
+            ));
+
+            let third = counter.record_command_failure(diagnostic("c"));
+            let AcceptanceCommandRetryDecision::Exhausted {
+                attempts,
+                max_retries,
+                diagnostic,
+            } = third
+            else {
+                panic!("the third consecutive command failure must exhaust the budget");
+            };
+            assert_eq!((attempts, max_retries), (3, MAX_ACCEPTANCE_COMMAND_RETRIES));
+            assert!(
+                diagnostic.error.contains("[c]"),
+                "exhaustion reports the latest evidence, not the first: {diagnostic:?}"
+            );
+        }
+
+        #[test]
+        fn the_terminal_error_carries_attempt_count_and_latest_bounded_evidence() {
+            let mut counter = AcceptanceCommandRetryCounter::default();
+            counter.record_command_failure(diagnostic("a"));
+            counter.record_command_failure(diagnostic("b"));
+            let AcceptanceCommandRetryDecision::Exhausted {
+                attempts,
+                max_retries,
+                diagnostic,
+            } = counter.record_command_failure(diagnostic("c"))
+            else {
+                panic!("expected exhaustion");
+            };
+
+            let error = acceptance_command_exhausted_error(attempts, max_retries, &diagnostic);
+            assert!(error.contains("3 consecutive attempts"), "{error}");
+            assert!(error.contains("2 command-failure retries"), "{error}");
+            assert!(error.contains("exit_code: 1"), "{error}");
+            assert!(error.contains("stderr c"), "{error}");
+            assert!(
+                !error.contains("stderr a"),
+                "only the latest evidence is reported: {error}"
+            );
+        }
+
+        #[test]
+        fn any_completed_non_command_failure_result_resets_the_sequence() {
+            let mut counter = AcceptanceCommandRetryCounter::default();
+            let mut agent = agent();
+
+            // Every completed result kind ends consecutiveness, including the
+            // protocol failures that keep their own independent budgets.
+            for _ in 0..3 {
+                counter.record_command_failure(diagnostic("a"));
+                counter.record_command_failure(diagnostic("b"));
+                assert_eq!(counter.consecutive_failures(), 2);
+
+                observe_completed_acceptance_invocation(&mut counter, &mut agent, "change-a");
+                assert_eq!(counter.consecutive_failures(), 0);
+                assert!(agent.acceptance_command_recovery("change-a").is_none());
+            }
+        }
+
+        #[test]
+        fn protocol_completion_breaks_command_failure_consecutiveness() {
+            let mut counter = AcceptanceCommandRetryCounter::default();
+            let mut protocol = AcceptanceProtocolDriver::default();
+            let mut agent = agent();
+
+            // CommandFailed -> MissingVerdict -> CommandFailed.
+            assert!(matches!(
+                counter.record_command_failure(diagnostic("first")),
+                AcceptanceCommandRetryDecision::Retry { attempt: 1, .. }
+            ));
+
+            // The completed missing-verdict invocation resets command recovery
+            // first, then follows its own existing protocol accounting.
+            observe_completed_acceptance_invocation(&mut counter, &mut agent, "change-a");
+            let missing = protocol.observe_missing_verdict(&["waiting".to_string()]);
+            assert!(matches!(missing, MissingVerdictRetryStep::Retry { .. }));
+
+            assert!(
+                matches!(
+                    counter.record_command_failure(diagnostic("second")),
+                    AcceptanceCommandRetryDecision::Retry { attempt: 1, .. }
+                ),
+                "the final command failure starts a new sequence"
+            );
+            assert_eq!(
+                protocol.consecutive_missing_verdicts(),
+                1,
+                "the missing-verdict budget keeps its own independent accounting"
+            );
+        }
+
+        #[test]
+        fn budgets_stay_independent_when_one_is_exhausted() {
+            let mut counter = AcceptanceCommandRetryCounter::default();
+            let mut protocol = AcceptanceProtocolDriver::default();
+
+            for _ in 0..3 {
+                counter.record_command_failure(diagnostic("boom"));
+            }
+
+            assert_eq!(counter.consecutive_failures(), 3);
+            assert_eq!(
+                protocol.consecutive_missing_verdicts(),
+                0,
+                "command failures never consume the protocol budget"
+            );
+            assert_eq!(protocol.consecutive_bare_blockers(), 0);
+            assert_eq!(protocol.consecutive_malformed_findings(), 0);
+            assert!(
+                protocol.take_protocol_retry().is_none(),
+                "command failures never schedule a protocol continuation"
+            );
+        }
+
+        #[test]
+        fn the_shared_policy_stores_latest_only_prompt_context_and_clears_on_exhaustion() {
+            let mut counter = AcceptanceCommandRetryCounter::default();
+            let mut agent = agent();
+
+            let first = decide_acceptance_command_failure(
+                &mut counter,
+                &mut agent,
+                "change-a",
+                diagnostic("a"),
+            );
+            assert!(matches!(
+                first,
+                AcceptanceCommandRecovery::Retry { attempt: 1, .. }
+            ));
+            assert!(agent
+                .acceptance_command_recovery("change-a")
+                .expect("a retry stores the latest diagnosis")
+                .error
+                .contains("[a]"));
+
+            decide_acceptance_command_failure(
+                &mut counter,
+                &mut agent,
+                "change-a",
+                diagnostic("b"),
+            );
+            let stored = agent
+                .acceptance_command_recovery("change-a")
+                .expect("still recovering");
+            assert!(stored.error.contains("[b]"), "{stored:?}");
+            assert!(
+                !stored.error.contains("[a]"),
+                "prior command failures are never replayed: {stored:?}"
+            );
+
+            let third = decide_acceptance_command_failure(
+                &mut counter,
+                &mut agent,
+                "change-a",
+                diagnostic("c"),
+            );
+            let AcceptanceCommandRecovery::Exhausted { attempts, error } = third else {
+                panic!("the third consecutive failure must exhaust");
+            };
+            assert_eq!(attempts, 3);
+            assert!(error.contains("[c]"), "{error}");
+            assert!(
+                agent.acceptance_command_recovery("change-a").is_none(),
+                "no further command retry follows exhaustion, so the context is cleared"
+            );
+        }
+
+        #[test]
+        fn command_recovery_context_is_tracked_per_change() {
+            let mut counter_a = AcceptanceCommandRetryCounter::default();
+            let mut counter_b = AcceptanceCommandRetryCounter::default();
+            let mut agent = agent();
+
+            decide_acceptance_command_failure(
+                &mut counter_a,
+                &mut agent,
+                "change-a",
+                diagnostic("a"),
+            );
+            decide_acceptance_command_failure(
+                &mut counter_b,
+                &mut agent,
+                "change-b",
+                diagnostic("b"),
+            );
+
+            observe_completed_acceptance_invocation(&mut counter_a, &mut agent, "change-a");
+
+            assert!(agent.acceptance_command_recovery("change-a").is_none());
+            assert!(
+                agent.acceptance_command_recovery("change-b").is_some(),
+                "one change's reset must not clear another change's context"
+            );
+        }
+
+        #[test]
+        fn the_progress_message_is_worded_as_recovery_not_failure() {
+            let mut counter = AcceptanceCommandRetryCounter::default();
+            let AcceptanceCommandRetryDecision::Retry {
+                attempt,
+                max_retries,
+                diagnostic,
+            } = counter.record_command_failure(diagnostic("a"))
+            else {
+                panic!("expected a retry");
+            };
+
+            let progress = acceptance_command_retry_progress(attempt, max_retries, &diagnostic);
+            assert!(
+                progress.contains("command-failure recovery 1/2"),
+                "{progress}"
+            );
+            assert!(
+                progress.contains("re-running only the configured acceptance command"),
+                "{progress}"
+            );
+        }
+    }
 
     /// A minimal validated external blocker, used wherever a canonical stalled
     /// verdict is needed.
@@ -2157,6 +2655,7 @@ mod tests {
             AcceptanceResult::CommandFailed {
                 error: "exit 1".to_string(),
                 findings: Vec::new(),
+                diagnostic: AcceptanceCommandDiagnostic::default(),
             },
             AcceptanceResult::Cancelled,
         ] {
@@ -2230,6 +2729,7 @@ mod tests {
                 AcceptanceResult::CommandFailed {
                     error: "exit code 1".to_string(),
                     findings: vec!["boom".to_string()],
+                    diagnostic: AcceptanceCommandDiagnostic::default(),
                 },
                 false,
                 false,
@@ -2261,6 +2761,7 @@ mod tests {
             AcceptanceResult::CommandFailed {
                 error: "exit code 1".to_string(),
                 findings: Vec::new(),
+                diagnostic: AcceptanceCommandDiagnostic::default(),
             },
             AcceptanceResult::Cancelled,
         ] {
@@ -2547,6 +3048,7 @@ mod tests {
         assert!(!AcceptanceResult::CommandFailed {
             error: "test".to_string(),
             findings: vec!["failure".to_string()],
+            diagnostic: AcceptanceCommandDiagnostic::default(),
         }
         .is_pass());
         assert!(!AcceptanceResult::PermissionStalled {
