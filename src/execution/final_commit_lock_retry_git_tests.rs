@@ -229,7 +229,10 @@ async fn final_apply_commit_lock_recovers_add_and_commit_when_contention_clears(
         repo.head_file_names().await.contains("applied.txt"),
         "the apply output must land in the final commit"
     );
-    assert!(repo.is_clean().await, "no workspace content may be left out");
+    assert!(
+        repo.is_clean().await,
+        "no workspace content may be left out"
+    );
     assert!(
         repo.hook_runs() >= 1,
         "the recovered final commit must run repository verification"

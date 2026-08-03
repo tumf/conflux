@@ -127,7 +127,9 @@ mod tests {
             "fatal: Unable to create '/repo/.git/index.lock': Permission denied\n"
         )
         .is_none());
-        assert!(parse_existing_index_lock(&lock_stderr("/repo/.git/refs/heads/main.lock")).is_none());
+        assert!(
+            parse_existing_index_lock(&lock_stderr("/repo/.git/refs/heads/main.lock")).is_none()
+        );
         assert!(parse_existing_index_lock("fatal: not a git repository\n").is_none());
     }
 

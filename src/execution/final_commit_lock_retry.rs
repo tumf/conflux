@@ -74,7 +74,10 @@ pub struct FinalCommitIdentity {
 /// Render a verified commit command the way `run_vcs_command_captured` records
 /// it, so classification compares structured argv rather than prose.
 fn rendered_verified_commit(mode: VerifiedCommitMode, commit_message: &str) -> String {
-    format!("git {}", verified_commit_args(mode, commit_message).join(" "))
+    format!(
+        "git {}",
+        verified_commit_args(mode, commit_message).join(" ")
+    )
 }
 
 /// Whether `command` is one of the finalization commands for this change.
