@@ -724,12 +724,16 @@ fn archived(change_id: &str) -> String {
 /// `base -> t` on the target, with branch `ws-a` pre-synced onto `t`.
 ///
 /// `a_tip` is the branch tip; `merge` (when integrated) is the final merge.
+/// The branch tip carries the archived change, which is what a resolve batch
+/// item always looks like: the change is archived on its own branch before the
+/// final merge integrates it.
 fn presynced_repo() -> FakeRepo {
     let mut repo = FakeRepo::default();
     repo.commit("base", "Base", &[])
         .commit("t", "Target advance", &["base"])
         .commit("a1", "Work on change-a", &["base"])
         .commit("a_tip", "Pre-sync base into change-a", &["a1", "t"])
+        .tree("a_tip", &[&archived("change-a")])
         .tree("t", &[])
         .tree("base", &[]);
     repo
@@ -827,6 +831,7 @@ async fn target_state_on_first_parent_lineage_needs_no_presync() {
     let mut repo = FakeRepo::default();
     repo.commit("base", "Base", &[])
         .commit("a_tip", "Work on change-a", &["base"])
+        .tree("a_tip", &[&archived("change-a")])
         .tree("base", &[]);
     let evidence = FakeEvidence::new(repo, "base").worktree("ws-a", "/wt/a", "a_tip");
     let items = vec![item("ws-a", "change-a", "/wt/a")];
@@ -1314,9 +1319,221 @@ async fn invalid_cleanup_commits_fail_closed() {
 }
 
 #[tokio::test]
+async fn cleanup_must_be_a_forward_commit_on_the_target_lineage() {
+    let items = vec![item("ws-a", "change-a", "/wt/a")];
+
+    // Reachable but not on the target's own forward history: the cleanup was
+    // authored on a side branch and merged back, so the target never moved
+    // forward past the resurrection.
+    let mut side_branch = presynced_repo();
+    side_branch
+        .commit("merge", "Merge change: change-a", &["t", "a_tip"])
+        .commit(
+            "cleanup",
+            "Cleanup resurrected change: change-a",
+            &["merge"],
+        )
+        .commit("head", "Merge side cleanup", &["merge", "cleanup"])
+        .diff("cleanup", &[('D', &live("change-a"))])
+        .tree("merge", &[&live("change-a"), &archived("change-a")])
+        .tree("cleanup", &[&archived("change-a")])
+        .tree("head", &[&archived("change-a")]);
+    let evidence = FakeEvidence::new(side_branch, "head").worktree("ws-a", "/wt/a", "a_tip");
+    match resolve_state::classify_batch(&evidence, &items, "base").await {
+        BatchState::UnsafeEvidence { reason } => {
+            assert!(reason.contains("first-parent lineage"), "{}", reason)
+        }
+        other => panic!("expected unsafe evidence, got {:?}", other),
+    }
+
+    // Wrong predecessor: the cleanup is on the target lineage but its parent
+    // predates the commit that integrated the change, so it cannot be the
+    // cleanup of that integration.
+    let mut before_integration = FakeRepo::default();
+    before_integration
+        .commit("base", "Base", &[])
+        .commit("t", "Target advance", &["base"])
+        .commit("a_tip", "Work on change-a", &["base"])
+        .commit("cleanup", "Cleanup resurrected change: change-a", &["t"])
+        .commit("head", "Merge branch ws-a", &["cleanup", "a_tip"])
+        .diff("cleanup", &[('D', &live("change-a"))])
+        .tree("a_tip", &[&archived("change-a")])
+        .tree("cleanup", &[&archived("change-a")])
+        .tree("head", &[&archived("change-a")]);
+    let evidence = FakeEvidence::new(before_integration, "head").worktree("ws-a", "/wt/a", "a_tip");
+    match resolve_state::classify_batch(&evidence, &items, "base").await {
+        BatchState::UnsafeEvidence { reason } => assert!(
+            reason.contains("does not contain its committed integration"),
+            "{}",
+            reason
+        ),
+        other => panic!("expected unsafe evidence, got {:?}", other),
+    }
+
+    // Wrong predecessor: on the lineage and after integration, but the parent
+    // state never held the live/archive coexistence the commit claims to remove.
+    let mut wrong_predecessor = presynced_repo();
+    wrong_predecessor
+        .commit("merge", "Merge change: change-a", &["t", "a_tip"])
+        .commit("filler", "Unrelated follow-up", &["merge"])
+        .commit(
+            "cleanup",
+            "Cleanup resurrected change: change-a",
+            &["filler"],
+        )
+        .diff("cleanup", &[('D', &live("change-a"))])
+        .tree("merge", &[&live("change-a"), &archived("change-a")])
+        .tree("filler", &[&archived("change-a")])
+        .tree("cleanup", &[&archived("change-a")]);
+    let evidence =
+        FakeEvidence::new(wrong_predecessor, "cleanup").worktree("ws-a", "/wt/a", "a_tip");
+    match resolve_state::classify_batch(&evidence, &items, "base").await {
+        BatchState::UnsafeEvidence { reason } => assert!(
+            reason.contains("does not hold the live/archive coexistence"),
+            "{}",
+            reason
+        ),
+        other => panic!("expected unsafe evidence, got {:?}", other),
+    }
+
+    // The same shape, cleaned up directly on top of the integration it repairs.
+    let mut forward = presynced_repo();
+    forward
+        .commit("merge", "Merge change: change-a", &["t", "a_tip"])
+        .commit(
+            "cleanup",
+            "Cleanup resurrected change: change-a",
+            &["merge"],
+        )
+        .diff("cleanup", &[('D', &live("change-a"))])
+        .tree("merge", &[&live("change-a"), &archived("change-a")])
+        .tree("cleanup", &[&archived("change-a")]);
+    let evidence = FakeEvidence::new(forward, "cleanup").worktree("ws-a", "/wt/a", "a_tip");
+    assert_eq!(
+        resolve_state::classify_batch(&evidence, &items, "base").await,
+        BatchState::Complete,
+        "a direct forward cleanup on the target lineage is the accepted shape"
+    );
+}
+
+#[tokio::test]
+async fn declared_order_is_verified_when_every_item_is_integrated() {
+    let items = vec![
+        item("ws-a", "change-a", "/wt/a"),
+        item("ws-b", "change-b", "/wt/b"),
+    ];
+
+    // Both items have an exact integration commit, so no `NotIntegrated` hole
+    // exists — but the target history integrated B before A.
+    let mut reversed = FakeRepo::default();
+    reversed
+        .commit("base", "Base", &[])
+        .commit("a1", "Work a", &["base"])
+        .commit("b1", "Work b", &["base"])
+        .commit("merge_b", "Merge change: change-b", &["base", "b1"])
+        .commit("merge_a", "Merge change: change-a", &["merge_b", "a1"])
+        .tree("merge_a", &[&archived("change-a"), &archived("change-b")]);
+    let evidence = FakeEvidence::new(reversed, "merge_a")
+        .worktree("ws-a", "/wt/a", "a1")
+        .worktree("ws-b", "/wt/b", "b1");
+    match resolve_state::classify_batch(&evidence, &items, "base").await {
+        BatchState::UnsafeEvidence { reason } => {
+            assert!(reason.contains("declared order"), "{}", reason)
+        }
+        other => panic!("expected unsafe evidence, got {:?}", other),
+    }
+
+    // The same two integrations in declared order are complete.
+    let mut ordered = FakeRepo::default();
+    ordered
+        .commit("base", "Base", &[])
+        .commit("a1", "Work a", &["base"])
+        .commit("b1", "Work b", &["base"])
+        .commit("merge_a", "Merge change: change-a", &["base", "a1"])
+        .commit("b_tip", "Pre-sync base into change-b", &["b1", "merge_a"])
+        .commit("merge_b", "Merge change: change-b", &["merge_a", "b_tip"])
+        .tree("merge_b", &[&archived("change-a"), &archived("change-b")]);
+    let evidence = FakeEvidence::new(ordered, "merge_b")
+        .worktree("ws-a", "/wt/a", "a1")
+        .worktree("ws-b", "/wt/b", "b_tip");
+    assert_eq!(
+        resolve_state::classify_batch(&evidence, &items, "base").await,
+        BatchState::Complete
+    );
+}
+
+#[tokio::test]
+async fn prefinal_archive_evidence_comes_from_the_validated_worktree_head() {
+    let items = vec![item("ws-a", "change-a", "/wt/a")];
+
+    // Worktree-only archive evidence: the target has never seen the archive, so
+    // only the validated branch tip can prove it. The final merge is authorized.
+    let mut worktree_only = presynced_repo();
+    worktree_only
+        .tree("t", &[&live("change-a")])
+        .tree("a_tip", &[&archived("change-a")]);
+    let evidence = FakeEvidence::new(worktree_only, "t").worktree("ws-a", "/wt/a", "a_tip");
+    assert!(
+        matches!(
+            resolve_state::classify_batch(&evidence, &items, "base").await,
+            BatchState::FinalMergeMissing { .. }
+        ),
+        "an archive committed only on the branch tip must still authorize the final merge"
+    );
+
+    // Missing archive identity: the branch tip never archived the change.
+    let mut unarchived = presynced_repo();
+    unarchived.tree("a_tip", &[&live("change-a")]);
+    let evidence = FakeEvidence::new(unarchived, "t").worktree("ws-a", "/wt/a", "a_tip");
+    match resolve_state::classify_batch(&evidence, &items, "base").await {
+        BatchState::UnsafeEvidence { reason } => {
+            assert!(reason.contains("no valid archive proposal"), "{}", reason)
+        }
+        other => panic!("expected unsafe evidence, got {:?}", other),
+    }
+
+    // Nested layout: reported distinctly because it is repairable.
+    let mut nested = presynced_repo();
+    nested.tree(
+        "a_tip",
+        &["openspec/changes/archive/2026-08-03/change-a/proposal.md"],
+    );
+    let evidence = FakeEvidence::new(nested, "t").worktree("ws-a", "/wt/a", "a_tip");
+    match resolve_state::classify_batch(&evidence, &items, "base").await {
+        BatchState::UnsafeEvidence { reason } => {
+            assert!(reason.contains("invalid nested layout"), "{}", reason)
+        }
+        other => panic!("expected unsafe evidence, got {:?}", other),
+    }
+
+    // Suffix collision and a non-proposal entry are not archive identities.
+    for archive_like in [
+        "openspec/changes/archive/prefix-change-a/proposal.md",
+        "openspec/changes/archive/change-a/design.md",
+    ] {
+        let mut repo = presynced_repo();
+        repo.tree("a_tip", &[archive_like]);
+        let evidence = FakeEvidence::new(repo, "t").worktree("ws-a", "/wt/a", "a_tip");
+        match resolve_state::classify_batch(&evidence, &items, "base").await {
+            BatchState::UnsafeEvidence { reason } => assert!(
+                reason.contains("no valid archive proposal"),
+                "'{}' must not authorize the final merge: {}",
+                archive_like,
+                reason
+            ),
+            other => panic!(
+                "'{}' must not authorize the final merge, got {:?}",
+                archive_like, other
+            ),
+        }
+    }
+}
+
+#[tokio::test]
 async fn invalid_archive_shapes_never_authorize_deletion() {
-    // Nested date layout and a suffix-similar entry are both invalid archive
-    // identities, so live/archive coexistence is not claimed.
+    // Post-final: nested date layout, a suffix-similar entry, and a non-proposal
+    // entry are all invalid archive identities, so committed live/archive
+    // coexistence is never claimed and deletion is never authorized.
     for archive_like in [
         "openspec/changes/archive/2026-08-03/change-a/proposal.md",
         "openspec/changes/archive/prefix-change-a/proposal.md",
@@ -1328,11 +1545,12 @@ async fn invalid_archive_shapes_never_authorize_deletion() {
         let evidence = FakeEvidence::new(repo, "merge").worktree("ws-a", "/wt/a", "a_tip");
         let items = vec![item("ws-a", "change-a", "/wt/a")];
 
-        assert_eq!(
-            resolve_state::classify_batch(&evidence, &items, "base").await,
-            BatchState::Complete,
-            "'{}' must not be treated as a valid archive identity",
-            archive_like
+        let state = resolve_state::classify_batch(&evidence, &items, "base").await;
+        assert!(
+            !matches!(state, BatchState::ResurrectionCleanupRequired { .. }),
+            "'{}' must not be treated as a valid archive identity, got {:?}",
+            archive_like,
+            state
         );
     }
 }

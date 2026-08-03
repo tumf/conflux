@@ -138,6 +138,20 @@ pub(crate) fn paths_contain_valid_archive<S: AsRef<str>>(paths: &[S], change_id:
         .any(|path| is_valid_archive_proposal_path(path.as_ref(), change_id))
 }
 
+/// Whether the supplied committed/indexed paths carry the invalid nested archive
+/// layout for `change_id`.
+///
+/// Used to separate "not archived at all" from "archived under a layout that can
+/// never be recognised", so Git-view callers can report the actionable one.
+pub(crate) fn paths_contain_invalid_nested_archive<S: AsRef<str>>(
+    paths: &[S],
+    change_id: &str,
+) -> bool {
+    paths
+        .iter()
+        .any(|path| is_invalid_nested_archive_path(path.as_ref(), change_id))
+}
+
 pub(crate) fn is_valid_archive_entry_name(name: &str, change_id: &str) -> bool {
     name == change_id || is_valid_dated_archive_name(name, change_id)
 }

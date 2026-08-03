@@ -33,6 +33,34 @@ impl Drop for AutoResolveGuard {
     }
 }
 
+/// Emit resolve failure events for the batch and return the terminal error.
+async fn fail_resolve(
+    event_tx: &Option<mpsc::Sender<ParallelEvent>>,
+    change_ids: &[String],
+    error_msg: String,
+) -> Result<()> {
+    send_event(
+        event_tx,
+        ParallelEvent::ConflictResolutionFailed {
+            error: error_msg.clone(),
+        },
+    )
+    .await;
+
+    for change_id in change_ids {
+        send_event(
+            event_tx,
+            ParallelEvent::ResolveFailed {
+                change_id: change_id.to_string(),
+                error: error_msg.clone(),
+            },
+        )
+        .await;
+    }
+
+    Err(OrchestratorError::GitConflict(error_msg))
+}
+
 /// Detect conflicted files using the workspace manager.
 pub async fn detect_conflicts(workspace_manager: &dyn WorkspaceManager) -> Result<Vec<String>> {
     workspace_manager
@@ -427,6 +455,21 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         return Ok(());
     }
 
+    // Classification that withholds agent action is terminal, not retryable:
+    // identity is unproven, so invoking the agent would invite exactly the blind
+    // mutation this classifier exists to prevent.
+    if let Some(state) = batch_state
+        .as_ref()
+        .filter(|state| !state.allows_agent_action())
+    {
+        let reason = state.diagnosis();
+        warn!(
+            "Sequential merge batch state withholds agent action: {}",
+            reason.replace('\n', " | ")
+        );
+        return fail_resolve(event_tx, change_ids, reason).await;
+    }
+
     let conflict_files = detect_conflicts(workspace_manager).await?;
     let conflict_files_str = conflict_files.join(", ");
 
@@ -607,8 +650,19 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                 // generic "missing merge commits" fallback.
                 let state = resolve_state::classify_batch(&evidence, items, base_revision).await;
                 let complete = state.is_complete();
+                let retryable = state.allows_agent_action();
                 let reason = state.diagnosis();
                 batch_state = Some(state);
+
+                if !complete && !retryable {
+                    warn!(
+                        "Sequential merge batch state withholds agent action after resolve attempt {}/{}: {}",
+                        attempt,
+                        max_retries,
+                        reason.replace('\n', " | ")
+                    );
+                    return fail_resolve(event_tx, change_ids, reason).await;
+                }
 
                 if !complete {
                     warn!(
@@ -700,31 +754,9 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
     }
 
     let error_msg = format!("Failed to resolve merges after {} attempts", max_retries);
-    send_event(
-        event_tx,
-        ParallelEvent::ConflictResolutionFailed {
-            error: error_msg.clone(),
-        },
-    )
-    .await;
-
-    // Send ResolveFailed for each change_id to update TUI status
-    for change_id in change_ids {
-        send_event(
-            event_tx,
-            ParallelEvent::ResolveFailed {
-                change_id: change_id.to_string(),
-                error: error_msg.clone(),
-            },
-        )
-        .await;
-    }
 
     // Guard will decrement auto resolve counter on drop
-
-    match workspace_manager.backend_type() {
-        VcsBackend::Git | VcsBackend::Auto => Err(OrchestratorError::GitConflict(error_msg)),
-    }
+    fail_resolve(event_tx, change_ids, error_msg).await
 }
 
 /// Build prompt for conflict resolution (variable context only; fixed guidance lives in cflx-resolve).

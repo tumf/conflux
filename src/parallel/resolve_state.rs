@@ -526,12 +526,22 @@ async fn validate_presync(
 }
 
 /// Validate any existing forward cleanup commit for the change.
+///
+/// Reachability from target `HEAD` is not enough: a cleanup commit authored on a
+/// side branch and merged in later is reachable while the target's own history
+/// never moved forward past the resurrection. The commit must therefore sit on
+/// the target first-parent lineage and its single parent must be the target
+/// state that actually held the live/archive coexistence, at or after this
+/// item's committed integration.
 async fn validate_cleanup_commits(
     evidence: &dyn ResolveEvidence,
-    change_id: &str,
+    item: &ValidatedItem,
+    integration: &ItemIntegration,
     base_revision: &str,
     target_head: &str,
+    target_lineage: &[String],
 ) -> std::result::Result<(), BatchState> {
+    let change_id = item.change_id.as_str();
     let subject = cleanup_subject(change_id);
     let candidates = evidence
         .commits_with_exact_subject(Some(base_revision), target_head, &subject)
@@ -552,6 +562,15 @@ async fn validate_cleanup_commits(
         }
     };
 
+    if !target_lineage.iter().any(|candidate| candidate == &commit) {
+        return Err(BatchState::UnsafeEvidence {
+            reason: format!(
+                "Cleanup commit {} for '{}' is not on target HEAD {} first-parent lineage; only forward cleanup on the target is accepted",
+                commit, change_id, target_head
+            ),
+        });
+    }
+
     let parents = evidence
         .parents_of(&commit)
         .await
@@ -565,6 +584,7 @@ async fn validate_cleanup_commits(
             ),
         });
     }
+    let predecessor = parents[0].clone();
 
     let entries = evidence
         .commit_diff_entries(&commit)
@@ -584,6 +604,47 @@ async fn validate_cleanup_commits(
                 ),
             });
         }
+    }
+
+    // Bind the predecessor to this item's committed integration state.
+    let integrated_at = match integration {
+        ItemIntegration::Exact { commit, .. } => commit.clone(),
+        ItemIntegration::Historical => item.tip.clone(),
+        ItemIntegration::NotIntegrated => {
+            return Err(BatchState::UnsafeEvidence {
+                reason: format!(
+                    "Cleanup commit {} exists for '{}' but the change has no committed integration",
+                    commit, change_id
+                ),
+            })
+        }
+    };
+    let after_integration = evidence
+        .is_ancestor(&integrated_at, &predecessor)
+        .await
+        .map_err(|error| unsafe_evidence("Failed to order cleanup against integration", error))?;
+    if !after_integration {
+        return Err(BatchState::UnsafeEvidence {
+            reason: format!(
+                "Cleanup commit {} for '{}' has predecessor {} which does not contain its committed integration {}",
+                commit, change_id, predecessor, integrated_at
+            ),
+        });
+    }
+
+    let predecessor_paths = evidence
+        .committed_tree_paths(&predecessor, archive_layout::ACTIVE_CHANGES_PREFIX)
+        .await
+        .map_err(|error| unsafe_evidence("Failed to read cleanup predecessor tree", error))?;
+    if !archive_layout::paths_contain_active_change(&predecessor_paths, change_id)
+        || !archive_layout::paths_contain_valid_archive(&predecessor_paths, change_id)
+    {
+        return Err(BatchState::UnsafeEvidence {
+            reason: format!(
+                "Cleanup commit {} for '{}' has predecessor {} which does not hold the live/archive coexistence it claims to remove",
+                commit, change_id, predecessor
+            ),
+        });
     }
 
     Ok(())
@@ -693,6 +754,67 @@ async fn classify_batch_inner(
         }
     }
 
+    // Declared order must be provable from the target's own forward history, not
+    // only from the presence of a hole. When every item already has an exact
+    // integration commit there is no `NotIntegrated` marker left, so a history
+    // that integrated B before A has to be rejected by chaining the exact
+    // commits along the target first-parent lineage.
+    let target_lineage = evidence
+        .first_parent_lineage(&target_head)
+        .await
+        .map_err(|error| unsafe_evidence("Failed to read target first-parent lineage", error))?;
+
+    let mut previous: Option<(&str, String, usize)> = None;
+    for (item, integration) in validated.iter().zip(integrations.iter()) {
+        // Historical ancestry-only evidence has no exact commit to place on the
+        // lineage, and is exempt from the ordering proof by design.
+        let ItemIntegration::Exact {
+            commit,
+            target_state,
+        } = integration
+        else {
+            continue;
+        };
+        let Some(position) = target_lineage
+            .iter()
+            .position(|candidate| candidate == commit)
+        else {
+            return Err(BatchState::UnsafeEvidence {
+                reason: format!(
+                    "Final merge commit {} for '{}' is not on target HEAD {} first-parent lineage",
+                    commit, item.change_id, target_head
+                ),
+            });
+        };
+        if let Some((previous_id, previous_commit, previous_position)) = &previous {
+            // The lineage is newest first, so each later declared item must sit
+            // strictly closer to target HEAD than the item before it.
+            if position >= *previous_position {
+                return Err(BatchState::UnsafeEvidence {
+                    reason: format!(
+                        "Item '{}' was integrated before earlier item '{}' on the target first-parent history; declared order was violated",
+                        item.change_id, previous_id
+                    ),
+                });
+            }
+            let chained = evidence
+                .is_ancestor(previous_commit, target_state)
+                .await
+                .map_err(|error| {
+                    unsafe_evidence("Failed to chain declared-order integrations", error)
+                })?;
+            if !chained {
+                return Err(BatchState::UnsafeEvidence {
+                    reason: format!(
+                        "Final merge commit {} for '{}' does not build on the committed integration {} of earlier item '{}'; declared order was violated",
+                        commit, item.change_id, previous_commit, previous_id
+                    ),
+                });
+            }
+        }
+        previous = Some((item.change_id.as_str(), commit.clone(), position));
+    }
+
     // Committed items: prove the pre-sync topology their merge claims.
     for (item, integration) in validated.iter().zip(integrations.iter()) {
         match integration {
@@ -795,6 +917,41 @@ async fn classify_batch_inner(
             });
         }
 
+        // Archive evidence before the final merge starts comes from the
+        // validated worktree tip's committed tree — not the filesystem, and not
+        // the target index, which has not seen this branch yet. The final merge
+        // integrates exactly this commit, so an unarchived or invalidly archived
+        // tip must never be allowed to start it.
+        let worktree_tree_paths = evidence
+            .committed_tree_paths(&item.tip, archive_layout::ACTIVE_CHANGES_PREFIX)
+            .await
+            .map_err(|error| {
+                unsafe_evidence("Failed to read validated worktree committed tree", error)
+            })?;
+        if !archive_layout::paths_contain_valid_archive(&worktree_tree_paths, &item.change_id) {
+            let nested = archive_layout::paths_contain_invalid_nested_archive(
+                &worktree_tree_paths,
+                &item.change_id,
+            );
+            return Err(BatchState::UnsafeEvidence {
+                reason: if nested {
+                    format!(
+                        "Branch '{}' tip {} archives '{}' under an invalid nested layout; expected {}/YYYY-MM-DD-{}/proposal.md",
+                        item.revision,
+                        item.tip,
+                        item.change_id,
+                        archive_layout::ARCHIVE_PREFIX,
+                        item.change_id
+                    )
+                } else {
+                    format!(
+                        "Branch '{}' tip {} has no valid archive proposal for '{}'; the final merge would integrate an unarchived change",
+                        item.revision, item.tip, item.change_id
+                    )
+                },
+            });
+        }
+
         return Ok(BatchState::FinalMergeMissing {
             change_id: item.change_id.clone(),
             worktree: item.worktree.clone(),
@@ -808,8 +965,16 @@ async fn classify_batch_inner(
         .await
         .map_err(|error| unsafe_evidence("Failed to read committed target tree", error))?;
 
-    for item in &validated {
-        validate_cleanup_commits(evidence, &item.change_id, base_revision, &target_head).await?;
+    for (item, integration) in validated.iter().zip(integrations.iter()) {
+        validate_cleanup_commits(
+            evidence,
+            item,
+            integration,
+            base_revision,
+            &target_head,
+            &target_lineage,
+        )
+        .await?;
 
         let live = archive_layout::paths_contain_active_change(&tree_paths, &item.change_id);
         let archived = archive_layout::paths_contain_valid_archive(&tree_paths, &item.change_id);
