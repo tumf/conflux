@@ -407,37 +407,35 @@ async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action()
     executor
         .pending_merge_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        !executor
-            .handle_merge_result_with_tx(
-                MergeResult {
-                    change_id: "change-a".to_string(),
-                    workspace_name: "ws-change-a".to_string(),
-                    origin: MergeResultOrigin::ResolveWaitRetry,
-                    outcome: Ok(MergeTaskOutcome::deferred("Merge lane busy", true)),
-                },
-                &merge_result_tx,
-            )
-            .await
-    );
+    assert!(!executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: "change-a".to_string(),
+                workspace_name: "ws-change-a".to_string(),
+                origin: MergeResultOrigin::ResolveWaitRetry,
+                outcome: MergeTaskOutcome::deferred("Merge lane busy", true),
+            },
+            &merge_result_tx,
+        )
+        .await
+        .is_merged());
     assert!(!shared.read().await.is_base_mutating_lane_occupied());
 
     executor
         .pending_merge_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        executor
-            .handle_merge_result_with_tx(
-                MergeResult {
-                    change_id: "blocking-merge".to_string(),
-                    workspace_name: "ws-blocking-merge".to_string(),
-                    origin: MergeResultOrigin::PostArchiveMerge,
-                    outcome: Ok(MergeTaskOutcome::Merged),
-                },
-                &merge_result_tx,
-            )
-            .await
-    );
+    assert!(executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: "blocking-merge".to_string(),
+                workspace_name: "ws-blocking-merge".to_string(),
+                origin: MergeResultOrigin::PostArchiveMerge,
+                outcome: MergeTaskOutcome::Merged,
+            },
+            &merge_result_tx,
+        )
+        .await
+        .is_merged());
 
     let retry_result = tokio::time::timeout(
         std::time::Duration::from_millis(500),
@@ -449,7 +447,7 @@ async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action()
     assert_eq!(retry_result.change_id, "change-a");
     assert_eq!(retry_result.origin, MergeResultOrigin::ResolveWaitRetry);
     assert!(
-        matches!(retry_result.outcome, Ok(MergeTaskOutcome::Merged)),
+        matches!(retry_result.outcome, MergeTaskOutcome::Merged),
         "spawned retry itself must reach a merged outcome without a synthetic replacement: {:?}",
         retry_result.outcome
     );
@@ -457,7 +455,8 @@ async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action()
     assert!(
         executor
             .handle_merge_result_with_tx(retry_result, &merge_result_tx)
-            .await,
+            .await
+            .is_merged(),
         "scheduler must accept the spawned retry's merged outcome without user action"
     );
     assert_eq!(

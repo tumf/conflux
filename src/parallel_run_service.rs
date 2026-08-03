@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::hooks::HookRunner;
 use crate::openspec::Change;
 use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
-use crate::parallel::{ParallelEvent, ParallelExecutor, PostArchiveAction};
+use crate::parallel::{ParallelEvent, ParallelExecutor, PostArchiveAction, SchedulerRunReport};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -432,7 +432,9 @@ impl ParallelRunService {
         // Wait for event forwarding to complete
         let _ = forward_handle.await;
 
-        result
+        // The callback API reports through events; the typed terminal report is
+        // consumed by boundaries that publish their own completion transition.
+        result.map(|_report| ())
     }
 
     /// Run parallel execution with an mpsc sender for events and optional shared queue change state.
@@ -458,7 +460,7 @@ impl ParallelRunService {
             std::sync::Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
         >,
         explicit_retry: bool,
-    ) -> Result<()> {
+    ) -> Result<SchedulerRunReport> {
         let mut executor = self.create_executor_with_queue_state(
             Some(event_tx.clone()),
             cancel_token,
@@ -482,7 +484,7 @@ impl ParallelRunService {
         mut executor: ParallelExecutor,
         changes: Vec<Change>,
         event_tx: mpsc::Sender<ParallelEvent>,
-    ) -> Result<()> {
+    ) -> Result<SchedulerRunReport> {
         // Prepare changes using the common helper (sends warning event if needed).
         // Preserve caller-provided reducer state: manual TUI retry startup records
         // ResolveWait/RejectWait in the reducer before constructing the executor, and
@@ -500,7 +502,7 @@ impl ParallelRunService {
             .await?
         {
             Some(changes) => changes,
-            None => return Ok(()),
+            None => return Ok(SchedulerRunReport::Completed),
         };
 
         info!(

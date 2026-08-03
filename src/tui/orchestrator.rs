@@ -102,6 +102,10 @@ where
 pub(crate) enum ParallelTerminalReport {
     /// Normal completion: success log and `AllCompleted`.
     Completed,
+    /// The run drained, but one or more changes ended in a change-local failure
+    /// whose evidence is preserved for explicit retry: warning and
+    /// `AllCompleted`, no success message and no Error.
+    CompletedWithErrors,
     /// Genuine execution error: failure log, completion-with-errors, `AllCompleted`.
     Failed,
     /// Operator stop or scheduler-reported stop: one stop diagnostic only, with
@@ -114,11 +118,17 @@ pub(crate) enum ParallelTerminalReport {
 /// Operator cancellation is a stopped outcome, never an agent-command failure,
 /// even when the bounded cleanup barrier had to escalate. Only a scheduler that
 /// returned on its own may report a genuine execution error.
+///
+/// `scheduler_completed_with_errors` is the scheduler's own typed report, not an
+/// inference from diagnostics: a run that drained while changes remain in manual
+/// `MergeWait` is neither a success nor a failure, and reporting it as either
+/// would be untruthful about work the operator still owns.
 pub(crate) fn classify_parallel_terminal_report(
     termination: ParallelTermination,
     scheduler_failed: bool,
     scheduler_reported_stop: bool,
     reducer_owned_lane_wait_or_active: bool,
+    scheduler_completed_with_errors: bool,
 ) -> ParallelTerminalReport {
     if termination.is_operator_cancellation() || scheduler_reported_stop {
         return ParallelTerminalReport::Stopped;
@@ -128,6 +138,9 @@ pub(crate) fn classify_parallel_terminal_report(
     }
     if reducer_owned_lane_wait_or_active {
         return ParallelTerminalReport::Stopped;
+    }
+    if scheduler_completed_with_errors {
+        return ParallelTerminalReport::CompletedWithErrors;
     }
     ParallelTerminalReport::Completed
 }
@@ -1113,6 +1126,10 @@ pub async fn run_orchestrator_parallel(
 
     let scheduler_reported_stop = merge_deferred_stop.load(Ordering::SeqCst);
     let scheduler_failed = matches!(result, Some(Err(_)));
+    let scheduler_completed_with_errors = matches!(
+        &result,
+        Some(Ok(report)) if report.has_change_failures()
+    );
 
     let has_reducer_owned_lane_wait_or_active = {
         let state = shared_state.read().await;
@@ -1126,6 +1143,7 @@ pub async fn run_orchestrator_parallel(
         scheduler_failed,
         scheduler_reported_stop,
         has_reducer_owned_lane_wait_or_active,
+        scheduler_completed_with_errors,
     );
 
     match report {
@@ -1160,6 +1178,9 @@ pub async fn run_orchestrator_parallel(
                     .await;
             }
         }
+        // Deliberately no success log: changes are still waiting for an
+        // explicit retry, so claiming completion here would be untruthful.
+        ParallelTerminalReport::CompletedWithErrors => {}
         ParallelTerminalReport::Completed => {
             dispatcher
                 .dispatch(OrchestratorEvent::Log(LogEntry::success(format!(
@@ -1173,7 +1194,7 @@ pub async fn run_orchestrator_parallel(
     // Only send completion message and AllCompleted event if not stopped/cancelled
     match report {
         ParallelTerminalReport::Stopped => {}
-        ParallelTerminalReport::Failed => {
+        ParallelTerminalReport::Failed | ParallelTerminalReport::CompletedWithErrors => {
             dispatcher
                 .dispatch(OrchestratorEvent::Log(LogEntry::warn(
                     "Processing completed with errors".to_string(),
@@ -1734,7 +1755,7 @@ mod tests {
             "pending base-lane results must be handled before terminal stop"
         );
         assert_eq!(
-            classify_parallel_terminal_report(termination, false, true, false),
+            classify_parallel_terminal_report(termination, false, true, false, false),
             ParallelTerminalReport::Stopped,
             "a drained pending merge is never a force-stopped agent process failure"
         );
@@ -1754,7 +1775,7 @@ mod tests {
         assert!(result.is_none());
         assert!(termination.is_operator_cancellation());
         assert_eq!(
-            classify_parallel_terminal_report(termination, false, false, false),
+            classify_parallel_terminal_report(termination, false, false, false, false),
             ParallelTerminalReport::Stopped,
             "a bounded cleanup escalation stays operator cancellation"
         );
@@ -1767,7 +1788,7 @@ mod tests {
             ParallelTermination::CancelledAfterCleanupTimeout,
         ] {
             assert_eq!(
-                classify_parallel_terminal_report(termination, true, false, false),
+                classify_parallel_terminal_report(termination, true, false, false, false),
                 ParallelTerminalReport::Stopped,
                 "cancellation must never be reported as an agent-command failure"
             );
@@ -1781,6 +1802,7 @@ mod tests {
                 ParallelTermination::SchedulerReturned,
                 true,
                 false,
+                false,
                 false
             ),
             ParallelTerminalReport::Failed
@@ -1792,6 +1814,7 @@ mod tests {
         assert_eq!(
             classify_parallel_terminal_report(
                 ParallelTermination::SchedulerReturned,
+                false,
                 false,
                 false,
                 false
@@ -1807,6 +1830,7 @@ mod tests {
                 ParallelTermination::SchedulerReturned,
                 false,
                 true,
+                false,
                 false
             ),
             ParallelTerminalReport::Stopped
@@ -1820,9 +1844,64 @@ mod tests {
                 ParallelTermination::SchedulerReturned,
                 false,
                 false,
-                true
+                true,
+                false
             ),
             ParallelTerminalReport::Stopped
         );
+    }
+
+    #[test]
+    fn finite_change_local_failure_completes_with_errors_not_success() {
+        assert_eq!(
+            classify_parallel_terminal_report(
+                ParallelTermination::SchedulerReturned,
+                false,
+                false,
+                false,
+                true
+            ),
+            ParallelTerminalReport::CompletedWithErrors,
+            "a drained run holding a change in merge wait is neither success nor failure"
+        );
+    }
+
+    #[test]
+    fn run_fatal_scheduler_failure_outranks_change_local_failures() {
+        assert_eq!(
+            classify_parallel_terminal_report(
+                ParallelTermination::SchedulerReturned,
+                true,
+                false,
+                false,
+                true
+            ),
+            ParallelTerminalReport::Failed,
+            "an aborted run stays Failed; change-local suppression must not downgrade it"
+        );
+    }
+
+    #[test]
+    fn operator_cancellation_outranks_change_local_failures() {
+        assert_eq!(
+            classify_parallel_terminal_report(
+                ParallelTermination::CancelledAfterCleanup,
+                false,
+                false,
+                false,
+                true
+            ),
+            ParallelTerminalReport::Stopped,
+            "operator cancellation owns the terminal transition"
+        );
+    }
+
+    #[test]
+    fn scheduler_run_report_only_flags_completed_with_errors() {
+        use crate::parallel::SchedulerRunReport;
+
+        assert!(SchedulerRunReport::CompletedWithErrors.has_change_failures());
+        assert!(!SchedulerRunReport::Completed.has_change_failures());
+        assert!(!SchedulerRunReport::Stopped.has_change_failures());
     }
 }

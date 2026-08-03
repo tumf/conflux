@@ -41,7 +41,9 @@ pub use crate::events::ExecutionEvent as ParallelEvent;
 #[allow(unused_imports)]
 pub use merge::{base_dirty_reason, resolve_deferred_merge};
 pub use types::{
-    FailedChangeTracker, MergeResult, MergeResultOrigin, MergeTaskOutcome, WorkspaceResult,
+    resolve_failure_detail, AlreadyReportedFailureKind, FailedChangeTracker, MergeResult,
+    MergeResultDisposition, MergeResultOrigin, MergeTaskOutcome, ResolveFailureClassification,
+    WorkspaceResult,
 };
 
 // Re-exports used in tests via `use super::super::*`.
@@ -78,6 +80,30 @@ pub enum SchedulerLifetime {
     Finite,
     /// Persistent execution (loop-based/TUI): keep waiting for queue notifications until stopped.
     Persistent,
+}
+
+/// Terminal report of one scheduler invocation that returned on its own.
+///
+/// A scheduler failure is the `Err` half of the run result, so this enum only
+/// describes returns that were *not* failures. `CompletedWithErrors` exists so a
+/// finite run that drained while change-local failures remain unresolved can
+/// never be reported as plain success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerRunReport {
+    /// Every eligible change reached its terminal state without failure.
+    Completed,
+    /// Eligible work drained, but one or more changes ended in a change-local
+    /// failure whose evidence is preserved for explicit retry.
+    CompletedWithErrors,
+    /// Operator cancellation stopped the run.
+    Stopped,
+}
+
+impl SchedulerRunReport {
+    /// Whether this run finished with unresolved change-local failures.
+    pub fn has_change_failures(self) -> bool {
+        matches!(self, Self::CompletedWithErrors)
+    }
 }
 
 /// Terminal action after a change has been archived in parallel mode.
@@ -271,6 +297,19 @@ pub struct ParallelExecutor {
     /// real `-u` run installs a plan so classification reads the cumulative base
     /// produced by the mandatory initial upstream checkpoint instead.
     explicit_target_plan: Option<crate::orchestration::target_resolution::ExplicitTargetPlan>,
+    /// Changes that ended this invocation in a change-local base-lane failure.
+    ///
+    /// Invocation-scoped in-memory bookkeeping only: it decides the terminal
+    /// report of *this* scheduler run and nothing else. It is never persisted,
+    /// so a restart recomputes the next action from workspace and Git evidence
+    /// alone, as `openspec/CONSTITUTION.md` requires.
+    change_failures_this_run: HashSet<String>,
+    /// Detail of the run-fatal outcome that requested a scheduler abort.
+    ///
+    /// `Some` means the single global Error was already emitted by the
+    /// queue/orchestration owner and the loop owes a bounded drain followed by
+    /// scheduler failure. Also invocation-scoped and never persisted.
+    run_fatal_abort: Option<String>,
 }
 
 #[cfg(test)]

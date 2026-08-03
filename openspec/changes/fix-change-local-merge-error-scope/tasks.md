@@ -20,9 +20,38 @@
 
 - [ ] Run the complete repository-local gate and resolve formatting, lint, compile, and test failures introduced by the typed event and terminal-report migration without broadening unrelated semantics. Completion requires every command to exit successfully. (verification: integration - `cargo test --lib parallel::tests:: && cargo test --lib tui:: && cargo test --lib lifecycle_integration && cargo test --features web-monitoring --lib web::remote_control_api::tests::operator_snapshot_tests && cargo fmt --check && cargo clippy -- -D warnings`; verification-id: change-local-merge-error-tests)
 
+## Implementation Blocker #1
+
+- category: infrastructure
+- summary: macOS code-signature validation (`amfid`) is wedged on this host, so `rustc` cannot load any freshly built proc-macro dylib and no test binary can be compiled.
+- evidence:
+   - `dlopen("/tmp/cflx-iso/debug/deps/libzerofrom_derive-c949a57ee85cf33a.dylib")` returns `code signature in <38DCC633-0097-3345-9105-11096323EF7B> ... not valid for use in process: library load mig callout failed`
+   - `cargo test --lib parallel::tests::change_local_merge_error_scope` fails with `error[E0463]: can't find crate for 'zerofrom_derive'` / `'thiserror_impl'` / `'tokio_macros'` / `'rustversion'`, and with 579 such errors against the shared target dir (`error[E0463]: can't find crate for 'async_trait'`, `'tokio'`, `'serde'`, ...)
+   - 8 sequential retries and two independent target directories (shared `/Volumes/OWCUS4EXP1M2/mini-data/work-cache/rust-target/default` and a clean local `/tmp/cflx-iso`) all failed; a different proc-macro fails each run
+   - the same host-level symptom appears outside Rust: `eza --version` fails with `dyld[...]: Library not loaded: /opt/homebrew/opt/libgit2/lib/libgit2.1.9.dylib ... library load mig callout failed`
+   - not disk or volume related: `df -h` shows 49Gi free on `/` and 868Gi free on the external volume, and the dependency artifacts are present and readable
+- impact: no `cargo test`, `cargo clippy`, or compiled-binary verification can run, so the repository-local gate for this change cannot be executed. Implementation and tests are written; only their execution is blocked.
+- prerequisite_owner: host_operator
+- unblock_condition: `dlopen` of a freshly built unsigned dylib succeeds on this host — observable as `cargo test --lib parallel::tests::change_local_merge_error_scope` compiling without `error[E0463]: can't find crate`.
+- unblock_actions:
+   - restart the wedged code-signature daemon on the host (`sudo killall -9 amfid`, which respawns automatically) or reboot the machine
+   - re-run `cargo test --lib parallel::tests:: && cargo test --lib tui:: && cargo test --lib lifecycle_integration && cargo test --features web-monitoring --lib web::remote_control_api::tests::operator_snapshot_tests && cargo fmt --check && cargo clippy -- -D warnings`
+- resumable: true
+- owner: host_operator
+- decision_due: 2026-08-04
+
+## Notes
+
+- `MergeResultDisposition` carries a fourth variant, `Deferred`, alongside `Merged`, `ContinueWithErrors`, and `AbortRun`. `design.md` lists deferral as its own "existing non-terminal continuation ... without marking an error when no failure occurred"; folding it into `ContinueWithErrors` would record a change failure where none happened and turn every deferral into a `CompletedWithErrors` run.
+- `AlreadyReportedFailureKind` carries `RejectionReview` in addition to `Push` and `Hook`. `RejectionReviewFailed` is an existing typed change-scoped owner on the same shared base-lane boundary, and without it the spawned RejectWait retry path would fail closed to `RunFatal` and abort runs that today continue.
+- Two former direct `ParallelEvent::Error` emissions in the base-lane retry bodies were retyped rather than kept: a missing workspace is stale-intent cleanup and now emits a change-scoped warning log, and a repository workspace-lookup failure now returns `RunFatal` so the single queue/orchestration owner emits the one global Error. Keeping either as a bare global Error would have reintroduced a frontend Error with no corresponding run invalidation.
+- `fix-resolve-merge-continuation` is already archived as `openspec/changes/archive/2026-08-03-fix-resolve-merge-continuation`, so integration order is settled: its continuation regressions live in `parallel::tests::conflict` and run inside this change's `cargo test --lib parallel::tests::` gate.
+
 ## Final Validation
 
 Archive validation is the authoritative final OpenSpec gate. Expected archive gate: `cflx openspec validate fix-change-local-merge-error-scope --archive-gate`.
+
+Verification status while Implementation Blocker #1 stands: `cargo check --lib --tests` and `cargo check --lib --tests --features heavy-tests` both completed successfully before the host's code-signature daemon wedged, so every production and test source file in this change compiles. `cargo fmt` was applied. No `cargo test`, `cargo clippy`, or `cargo fmt --check` result exists yet, so no task whose completion depends on executing tests is marked complete.
 
 ## Future Work
 

@@ -156,6 +156,9 @@ impl ParallelExecutor {
             upstream: None,
             // Default: explicit targets are resolved before construction.
             explicit_target_plan: None,
+            // Invocation-scoped terminal-report bookkeeping starts clean.
+            change_failures_this_run: HashSet::new(),
+            run_fatal_abort: None,
             // Default: the scheduler loop owns its merge-result channel.
             #[cfg(test)]
             merge_result_channel_override: None,

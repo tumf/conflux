@@ -1057,6 +1057,8 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -1207,6 +1209,8 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -1373,6 +1377,8 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -1594,6 +1600,8 @@ async fn test_merge_retries_when_merge_commit_missing() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -1807,6 +1815,8 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -2026,6 +2036,8 @@ async fn test_merge_retries_after_pre_commit_changes() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -3326,9 +3338,10 @@ async fn test_resolve_wait_completion_unblocks_dependents() {
                 change_id: "alpha".to_string(),
                 workspace_name: "ws-alpha".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(MergeTaskOutcome::Merged),
+                outcome: MergeTaskOutcome::Merged,
             })
-            .await,
+            .await
+            .is_merged(),
         "merged resolve_wait result should be treated as a successful base-lane completion"
     );
     assert!(
@@ -5021,27 +5034,29 @@ async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
 
     executor.pending_merge_count.store(2, Ordering::Relaxed);
-    assert!(
+    assert_eq!(
         executor
             .handle_merge_result(MergeResult {
                 change_id: "change-ok".to_string(),
                 workspace_name: "ws-change-ok".to_string(),
                 origin: MergeResultOrigin::PostArchiveMerge,
-                outcome: Ok(MergeTaskOutcome::Merged),
+                outcome: MergeTaskOutcome::Merged,
             })
-            .await
+            .await,
+        MergeResultDisposition::Merged
     );
     assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 1);
 
-    assert!(
-        !executor
+    assert_eq!(
+        executor
             .handle_merge_result(MergeResult {
                 change_id: "change-err".to_string(),
                 workspace_name: "ws-change-err".to_string(),
                 origin: MergeResultOrigin::PostArchiveMerge,
-                outcome: Err("merge failed".to_string()),
+                outcome: MergeTaskOutcome::run_fatal("merge failed"),
             })
-            .await
+            .await,
+        MergeResultDisposition::AbortRun
     );
     assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
 }
@@ -5061,17 +5076,17 @@ async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_
 
     executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result(MergeResult {
             change_id: "change-ok".to_string(),
             workspace_name: "ws-change-ok".to_string(),
             origin: MergeResultOrigin::PostArchiveMerge,
-            outcome: Ok(MergeTaskOutcome::Merged),
+            outcome: MergeTaskOutcome::Merged,
         })
         .await;
 
     assert!(
-        merged,
+        disposition.is_merged(),
         "actual merged background outcomes must trigger success-only scheduler follow-up"
     );
     assert_eq!(
@@ -5097,21 +5112,23 @@ async fn test_handle_merge_result_deferred_is_not_successful_completion() {
     executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
     executor.resolve_wait_changes.insert("beta".to_string());
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result(MergeResult {
             change_id: "alpha".to_string(),
             workspace_name: "ws-alpha".to_string(),
             origin: MergeResultOrigin::PostArchiveMerge,
-            outcome: Ok(MergeTaskOutcome::deferred(
-                "archive verification incomplete",
-                false,
-            )),
+            outcome: MergeTaskOutcome::deferred("archive verification incomplete", false),
         })
         .await;
 
-    assert!(
-        !merged,
+    assert_eq!(
+        disposition,
+        MergeResultDisposition::Deferred,
         "deferred background merge outcomes must not be reported as completed merges"
+    );
+    assert!(
+        !executor.had_change_failures(),
+        "a deferral is pending work, not a change failure"
     );
     assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
     assert!(
@@ -5120,9 +5137,11 @@ async fn test_handle_merge_result_deferred_is_not_successful_completion() {
     );
 }
 
+/// Only a run-fatal outcome may reach the single global-Error owner, and when it
+/// does it must ask for an abort rather than a decorated continuation.
 #[tokio::test]
-async fn test_handle_merge_result_failed_emits_error_event_with_context() {
-    use crate::parallel::{MergeResult, MergeResultOrigin};
+async fn run_fatal_merge_result_emits_one_global_error_and_requests_abort() {
+    use crate::parallel::{MergeResult, MergeResultOrigin, MergeTaskOutcome};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
@@ -5135,16 +5154,16 @@ async fn test_handle_merge_result_failed_emits_error_event_with_context() {
 
     executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result(MergeResult {
             change_id: "alpha".to_string(),
             workspace_name: "ws-alpha".to_string(),
             origin: MergeResultOrigin::PostArchiveMerge,
-            outcome: Err("merge failed hard".to_string()),
+            outcome: MergeTaskOutcome::run_fatal("merge failed hard"),
         })
         .await;
 
-    assert!(!merged, "failed merge outcomes are not successful merges");
+    assert_eq!(disposition, MergeResultDisposition::AbortRun);
     let event = rx.try_recv().or_fail("expected merge failure event");
     match event {
         ExecutionEvent::Error { message } => {
@@ -5159,6 +5178,192 @@ async fn test_handle_merge_result_failed_emits_error_event_with_context() {
             );
         }
         other => panic!("expected error event, got {other:?}"),
+    }
+
+    // A second fatal result arriving during the bounded drain must not add a
+    // second global Error: the run is already aborting.
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        executor
+            .handle_merge_result(MergeResult {
+                change_id: "beta".to_string(),
+                workspace_name: "ws-beta".to_string(),
+                origin: MergeResultOrigin::PostArchiveMerge,
+                outcome: MergeTaskOutcome::run_fatal("second fatal outcome"),
+            })
+            .await,
+        MergeResultDisposition::AbortRun
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "an aborting run emits exactly one global Error"
+    );
+}
+
+/// The regression this change exists for: bounded post-archive resolve
+/// exhaustion is change-local, so the queue wrapper must not wrap it in a global
+/// Error, and the run must keep going.
+#[tokio::test]
+async fn resolve_exhausted_merge_result_continues_without_a_global_error() {
+    use crate::parallel::{
+        MergeResult, MergeResultOrigin, MergeTaskOutcome, ResolveFailureClassification,
+    };
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+
+    let disposition = executor
+        .handle_merge_result(MergeResult {
+            change_id: "alpha".to_string(),
+            workspace_name: "ws-alpha".to_string(),
+            origin: MergeResultOrigin::PostArchiveMerge,
+            outcome: MergeTaskOutcome::resolve_exhausted(
+                "alpha",
+                3,
+                ResolveFailureClassification::UnresolvedConflict,
+                "conflicts remain",
+            ),
+        })
+        .await;
+
+    assert_eq!(disposition, MergeResultDisposition::ContinueWithErrors);
+    assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
+    assert!(
+        executor.had_change_failures(),
+        "a change-local failure must be remembered for truthful terminal reporting"
+    );
+    assert!(
+        executor.run_fatal_abort.is_none(),
+        "an exhausted resolve must never request a run abort"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the queue wrapper must not emit a global Error for an already-classified change failure"
+    );
+}
+
+/// Publication and hook failures keep their own typed owners across the shared
+/// boundary; the queue must neither duplicate nor escalate them.
+#[tokio::test]
+async fn already_reported_merge_results_are_never_promoted_to_global_errors() {
+    use crate::parallel::{
+        AlreadyReportedFailureKind, MergeResult, MergeResultOrigin, MergeTaskOutcome,
+    };
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    for kind in [
+        AlreadyReportedFailureKind::Push,
+        AlreadyReportedFailureKind::Hook,
+        AlreadyReportedFailureKind::RejectionReview,
+    ] {
+        let config = create_test_config();
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+        executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+
+        let disposition = executor
+            .handle_merge_result(MergeResult {
+                change_id: "alpha".to_string(),
+                workspace_name: "ws-alpha".to_string(),
+                origin: MergeResultOrigin::PostArchiveMerge,
+                outcome: MergeTaskOutcome::already_reported(
+                    "alpha",
+                    kind,
+                    "already reported by its typed owner",
+                ),
+            })
+            .await;
+
+        assert_eq!(
+            disposition,
+            MergeResultDisposition::ContinueWithErrors,
+            "{:?} must continue the run",
+            kind
+        );
+        assert!(
+            executor.run_fatal_abort.is_none(),
+            "{:?} must not fall through to a run-fatal abort",
+            kind
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "{:?} already emitted its lifecycle event; a duplicate global Error is forbidden",
+            kind
+        );
+    }
+}
+
+/// Ownership release is independent of severity: every outcome returns the
+/// pending counter, and every non-merged spawned-retry outcome returns the lane.
+#[tokio::test]
+async fn every_outcome_releases_pending_accounting_regardless_of_severity() {
+    use crate::parallel::{
+        AlreadyReportedFailureKind, MergeResult, MergeResultOrigin, MergeTaskOutcome,
+        ResolveFailureClassification,
+    };
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let outcomes = [
+        MergeTaskOutcome::Merged,
+        MergeTaskOutcome::deferred("base lane busy", true),
+        MergeTaskOutcome::deferred("needs operator action", false),
+        MergeTaskOutcome::resolve_exhausted(
+            "alpha",
+            3,
+            ResolveFailureClassification::RetriesExhausted,
+            "budget exhausted",
+        ),
+        MergeTaskOutcome::already_reported(
+            "alpha",
+            AlreadyReportedFailureKind::Push,
+            "push already reported",
+        ),
+        MergeTaskOutcome::run_fatal("base identity lost"),
+    ];
+
+    for outcome in outcomes {
+        let config = create_test_config();
+        let (tx, _rx) = mpsc::channel(32);
+        let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+        executor.pending_merge_count.store(1, Ordering::Relaxed);
+
+        let expected = outcome.disposition();
+        let disposition = executor
+            .handle_merge_result(MergeResult {
+                change_id: "alpha".to_string(),
+                workspace_name: "ws-alpha".to_string(),
+                origin: MergeResultOrigin::PostArchiveMerge,
+                outcome: outcome.clone(),
+            })
+            .await;
+
+        assert_eq!(
+            disposition, expected,
+            "disposition drifted for {:?}",
+            outcome
+        );
+        assert_eq!(
+            executor.pending_merge_count.load(Ordering::Relaxed),
+            0,
+            "pending accounting must be released for {:?}",
+            outcome
+        );
     }
 }
 
@@ -5739,19 +5944,19 @@ async fn handle_merge_result_releases_resolve_wait_retry_lane_on_auto_deferred()
     }
     executor.set_shared_orchestrator_state(shared.clone());
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "change-a".to_string(),
                 workspace_name: "ws-change-a".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(MergeTaskOutcome::deferred("Merge lane busy", true)),
+                outcome: MergeTaskOutcome::deferred("Merge lane busy", true),
             },
             &merge_result_tx,
         )
         .await;
 
-    assert!(!merged);
+    assert_eq!(disposition, MergeResultDisposition::Deferred);
     let guard = shared.read().await;
     assert!(!guard.is_base_mutating_lane_occupied());
     assert_eq!(
@@ -5789,19 +5994,23 @@ async fn handle_merge_result_releases_reject_wait_retry_lane_and_suppresses_dupl
     }
     executor.set_shared_orchestrator_state(shared.clone());
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "reject-a".to_string(),
                 workspace_name: "ws-reject-a".to_string(),
                 origin: MergeResultOrigin::RejectWaitRetry,
-                outcome: Err("specific rejection review failure already emitted".to_string()),
+                outcome: MergeTaskOutcome::already_reported(
+                    "reject-a",
+                    crate::parallel::AlreadyReportedFailureKind::RejectionReview,
+                    "specific rejection review failure already emitted",
+                ),
             },
             &merge_result_tx,
         )
         .await;
 
-    assert!(!merged);
+    assert_eq!(disposition, MergeResultDisposition::ContinueWithErrors);
     let guard = shared.read().await;
     assert!(!guard.is_base_mutating_lane_occupied());
     assert_eq!(guard.reject_wait_change_ids(), vec!["reject-a".to_string()]);
@@ -5821,19 +6030,24 @@ async fn handle_merge_result_suppresses_resolve_retry_generic_error() {
     let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
 
     executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
-    let merged = executor
+    let disposition = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "resolve-a".to_string(),
                 workspace_name: "ws-resolve-a".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Err("ResolveFailed already emitted by retry body".to_string()),
+                outcome: MergeTaskOutcome::resolve_exhausted(
+                    "resolve-a",
+                    3,
+                    crate::parallel::ResolveFailureClassification::UnresolvedConflict,
+                    "ResolveFailed already emitted by retry body",
+                ),
             },
             &merge_result_tx,
         )
         .await;
 
-    assert!(!merged);
+    assert_eq!(disposition, MergeResultDisposition::ContinueWithErrors);
     assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
     assert!(
         event_rx.try_recv().is_err(),
@@ -5880,20 +6094,29 @@ async fn resolve_retry_workspace_lookup_failure_is_operator_visible() {
 
     let outcome = executor
         .retry_deferred_merges_for(vec!["missing-ws".to_string()])
-        .await
-        .or_fail("missing workspace is treated as stale intent cleanup");
+        .await;
 
     assert_eq!(outcome, MergeTaskOutcome::Merged);
-    let mut saw_workspace_error = false;
+    let mut saw_workspace_warning = false;
     while let Ok(event) = event_rx.try_recv() {
-        if let ExecutionEvent::Error { message } = event {
-            saw_workspace_error =
-                message.contains("No workspace found for ResolveWait retry 'missing-ws'");
+        match event {
+            ExecutionEvent::Log(entry) => {
+                if entry
+                    .message
+                    .contains("No workspace found for ResolveWait retry 'missing-ws'")
+                {
+                    saw_workspace_warning = true;
+                }
+            }
+            ExecutionEvent::Error { message } => panic!(
+                "clearing stale retry intent is not a run-fatal outcome, got global Error: {message}"
+            ),
+            _ => {}
         }
     }
     assert!(
-        saw_workspace_error,
-        "missing-workspace retry path must emit an operator-visible Error event"
+        saw_workspace_warning,
+        "missing-workspace retry path must stay operator-visible as a warning"
     );
     {
         let guard = shared.read().await;
@@ -5954,20 +6177,29 @@ async fn reject_retry_workspace_lookup_failure_is_operator_visible() {
 
     let outcome = executor
         .retry_deferred_rejection_review_for("missing-reject-ws".to_string())
-        .await
-        .or_fail("missing rejection workspace is treated as stale intent cleanup");
+        .await;
 
     assert_eq!(outcome, MergeTaskOutcome::Merged);
-    let mut saw_workspace_error = false;
+    let mut saw_workspace_warning = false;
     while let Ok(event) = event_rx.try_recv() {
-        if let ExecutionEvent::Error { message } = event {
-            saw_workspace_error =
-                message.contains("No workspace found for RejectWait retry 'missing-reject-ws'");
+        match event {
+            ExecutionEvent::Log(entry) => {
+                if entry
+                    .message
+                    .contains("No workspace found for RejectWait retry 'missing-reject-ws'")
+                {
+                    saw_workspace_warning = true;
+                }
+            }
+            ExecutionEvent::Error { message } => panic!(
+                "clearing stale reject-wait intent is not a run-fatal outcome, got global Error: {message}"
+            ),
+            _ => {}
         }
     }
     assert!(
-        saw_workspace_error,
-        "missing RejectWait workspace path must emit an operator-visible Error event"
+        saw_workspace_warning,
+        "missing RejectWait workspace path must stay operator-visible as a warning"
     );
     {
         let guard = shared.read().await;
@@ -6024,22 +6256,21 @@ async fn resolve_give_up_promotes_next_waiter_without_user_action() {
 
     let outcome = executor
         .retry_deferred_merges_for(vec!["first".to_string()])
-        .await
-        .or_fail("missing first workspace gives up as merged trigger");
+        .await;
     assert_eq!(outcome, MergeTaskOutcome::Merged);
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "first".to_string(),
                 workspace_name: "ws-first".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(MergeTaskOutcome::Merged),
+                outcome: MergeTaskOutcome::Merged,
             },
             &merge_result_tx,
         )
         .await;
-    assert!(merged);
+    assert!(disposition.is_merged());
 
     {
         let guard = shared.read().await;
@@ -6120,19 +6351,19 @@ async fn retry_lane_busy_release_allows_subsequent_repromotion() {
     };
     drop(merge_guard);
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "change-a".to_string(),
                 workspace_name: "ws-change-a".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(outcome),
+                outcome,
             },
             &merge_result_tx,
         )
         .await;
 
-    assert!(!merged);
+    assert_eq!(disposition, MergeResultDisposition::Deferred);
     {
         let guard = shared.read().await;
         assert!(!guard.is_base_mutating_lane_occupied());
@@ -6185,7 +6416,7 @@ async fn deferred_retry_lane_repromotes_after_merge_completion_trigger() {
                 change_id: "change-a".to_string(),
                 workspace_name: "ws-change-a".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(MergeTaskOutcome::deferred("Merge lane busy", true)),
+                outcome: MergeTaskOutcome::deferred("Merge lane busy", true),
             },
             &merge_result_tx,
         )
@@ -6198,7 +6429,7 @@ async fn deferred_retry_lane_repromotes_after_merge_completion_trigger() {
                 change_id: "blocking-merge".to_string(),
                 workspace_name: "ws-blocking-merge".to_string(),
                 origin: MergeResultOrigin::PostArchiveMerge,
-                outcome: Ok(MergeTaskOutcome::Merged),
+                outcome: MergeTaskOutcome::Merged,
             },
             &merge_result_tx,
         )
@@ -6253,7 +6484,7 @@ async fn finite_scheduler_does_not_drain_while_spawned_retry_is_pending() {
                 change_id: "blocking-merge".to_string(),
                 workspace_name: "ws-blocking-merge".to_string(),
                 origin: MergeResultOrigin::PostArchiveMerge,
-                outcome: Ok(MergeTaskOutcome::Merged),
+                outcome: MergeTaskOutcome::Merged,
             },
             &merge_result_tx,
         )
@@ -6286,19 +6517,18 @@ async fn finite_scheduler_does_not_drain_while_spawned_retry_is_pending() {
         "receiving a spawned result is not enough; the scheduler must handle it first"
     );
 
-    assert!(
-        executor
-            .handle_merge_result_with_tx(
-                MergeResult {
-                    change_id: "retry-a".to_string(),
-                    workspace_name: "ws-retry-a".to_string(),
-                    origin: MergeResultOrigin::ResolveWaitRetry,
-                    outcome: Ok(MergeTaskOutcome::Merged),
-                },
-                &merge_result_tx,
-            )
-            .await
-    );
+    assert!(executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: "retry-a".to_string(),
+                workspace_name: "ws-retry-a".to_string(),
+                origin: MergeResultOrigin::ResolveWaitRetry,
+                outcome: MergeTaskOutcome::Merged,
+            },
+            &merge_result_tx,
+        )
+        .await
+        .is_merged());
 
     assert!(
         !shared
@@ -9339,8 +9569,7 @@ async fn push_post_archive_success_cleans_workspace_and_does_not_merge_base() {
             error: None,
             rejected: None,
         })
-        .await
-        .or_fail("push post-archive should succeed");
+        .await;
     assert_eq!(outcome, MergeTaskOutcome::Merged);
     assert_eq!(
         get_current_commit(repo.path())
@@ -9447,7 +9676,7 @@ async fn push_post_archive_failure_preserves_workspace_and_skips_on_merged_hook(
         remote: "missing-remote".to_string(),
     };
 
-    let error = executor
+    let outcome = executor
         .handle_merge_and_cleanup(WorkspaceResult {
             change_id: "alpha".to_string(),
             workspace_name: workspace.name.clone(),
@@ -9455,9 +9684,25 @@ async fn push_post_archive_failure_preserves_workspace_and_skips_on_merged_hook(
             error: None,
             rejected: None,
         })
-        .await
-        .expect_err("push to missing remote should fail");
-    assert!(error.to_string().contains("Failed to push archived alpha"));
+        .await;
+    // `PushFailed` already owns this change transition, so the shared boundary
+    // reports it as already reported rather than promoting it to run-fatal.
+    match &outcome {
+        MergeTaskOutcome::RecoverableAlreadyReported {
+            change_id,
+            kind,
+            detail,
+        } => {
+            assert_eq!(change_id, "alpha");
+            assert_eq!(*kind, crate::parallel::AlreadyReportedFailureKind::Push);
+            assert!(detail.contains("Failed to push archived alpha"), "{detail}");
+        }
+        other => panic!("a reported push failure must not become run-fatal, got {other:?}"),
+    }
+    assert_eq!(
+        outcome.disposition(),
+        MergeResultDisposition::ContinueWithErrors
+    );
     assert!(
         workspace.path.exists(),
         "failed push must preserve worktree for inspection/retry"

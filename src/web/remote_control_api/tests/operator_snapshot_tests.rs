@@ -659,6 +659,124 @@ async fn a_change_local_error_is_distinct_from_a_fatal_process_error() {
     );
 }
 
+/// Bounded post-archive resolve exhaustion is change-local across the remote
+/// surface: one ordered `resolve_failed` carrying the change ID, presentation
+/// telemetry that owns no state, and `process_error` left unset.
+///
+/// The regression it guards is the run where the same failure was also emitted
+/// as a global Error, which made every frontend report a dead run while the
+/// scheduler was still alive.
+#[tokio::test]
+async fn an_exhausted_post_archive_resolve_stays_change_scoped_on_the_remote_surface() {
+    let (web_state, reducer, _) = wired_web_state(&["alpha"]).await;
+    web_state.update(&[change("alpha")]).await;
+    let projection = web_state.remote_control().projection();
+    let before = projection.revision();
+
+    let detail = crate::parallel::resolve_failure_detail(
+        3,
+        crate::parallel::ResolveFailureClassification::UnresolvedConflict,
+        "conflicts still present after merge resolution attempt: a.rs",
+    );
+
+    observe(
+        &web_state,
+        &reducer,
+        ExecutionEvent::ConflictResolutionFailed {
+            error: detail.clone(),
+        },
+    )
+    .await;
+    observe(
+        &web_state,
+        &reducer,
+        ExecutionEvent::ResolveFailed {
+            change_id: "alpha".to_string(),
+            error: detail,
+        },
+    )
+    .await;
+
+    let published = match projection.events_after(before) {
+        EventsSince::Replay(events) => events,
+        EventsSince::Gap => {
+            panic!("the cursor was just taken; the stream must be replayable")
+        }
+    };
+    let resolve_failed: Vec<_> = published
+        .iter()
+        .filter(|event| event.event_type == "resolve_failed")
+        .collect();
+    assert_eq!(
+        resolve_failed.len(),
+        1,
+        "exactly one change-scoped projection for the failure"
+    );
+    assert_eq!(
+        resolve_failed[0].change_id.as_deref(),
+        Some("alpha"),
+        "the ordered event must keep the structured change ID"
+    );
+    assert!(
+        published
+            .iter()
+            .any(|event| event.event_type == "conflict_resolution_failed"),
+        "presentation telemetry is still ordered on the stream"
+    );
+    assert!(
+        published
+            .iter()
+            .all(|event| event.event_type != "process_error"),
+        "a change-local failure must not project as a process error"
+    );
+
+    let (snapshot, _, _) = projection.snapshot();
+    assert_eq!(
+        snapshot.process_error, None,
+        "the run is not dead; only one change is waiting for explicit retry"
+    );
+}
+
+/// A run-fatal outcome keeps its existing process-fatal projection. Change-local
+/// suppression must not downgrade the one event that means the run stopped.
+#[tokio::test]
+async fn a_run_fatal_outcome_remains_process_fatal_on_the_remote_surface() {
+    let (web_state, reducer, _) = wired_web_state(&["alpha"]).await;
+    web_state.update(&[change("alpha")]).await;
+    let projection = web_state.remote_control().projection();
+    let before = projection.revision();
+
+    observe(
+        &web_state,
+        &reducer,
+        ExecutionEvent::Error {
+            message: "Background merge failed for 'alpha' (workspace 'ws-alpha'): base branch could not be identified".to_string(),
+        },
+    )
+    .await;
+
+    let published = match projection.events_after(before) {
+        EventsSince::Replay(events) => events,
+        EventsSince::Gap => {
+            panic!("the cursor was just taken; the stream must be replayable")
+        }
+    };
+    assert!(
+        published
+            .iter()
+            .any(|event| event.event_type == "process_error"),
+        "a run-fatal global Error still projects as process-scoped"
+    );
+    let (snapshot, _, _) = projection.snapshot();
+    assert!(
+        snapshot
+            .process_error
+            .as_deref()
+            .is_some_and(|detail| detail.contains("base branch could not be identified")),
+        "the fatal detail must reach the operator"
+    );
+}
+
 #[tokio::test]
 async fn parallel_eligibility_and_worktree_relation_come_from_the_workspace_observation() {
     let (web_state, _, _) = wired_web_state(&["ready", "dirty", "uncommitted"]).await;

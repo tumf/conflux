@@ -148,8 +148,8 @@ use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
 use super::merge::base_dirty_reason;
 use super::{
-    MergeResult, MergeResultOrigin, MergeTaskOutcome, ParallelEvent, ParallelExecutor,
-    WorkspaceResult,
+    AlreadyReportedFailureKind, MergeResult, MergeResultDisposition, MergeResultOrigin,
+    MergeTaskOutcome, ParallelEvent, ParallelExecutor, WorkspaceResult,
 };
 
 pub(crate) struct ReanalysisDispatchContext<'a, F> {
@@ -999,10 +999,10 @@ impl ParallelExecutor {
                         change_id,
                         workspace_name,
                         origin: MergeResultOrigin::PostArchiveMerge,
-                        outcome: Ok(MergeTaskOutcome::deferred(
+                        outcome: MergeTaskOutcome::deferred(
                             "duplicate post-archive merge task suppressed because the same change is already active",
                             true,
-                        )),
+                        ),
                     })
                     .await
                 {
@@ -1015,8 +1015,7 @@ impl ParallelExecutor {
             };
             let outcome = merge_executor
                 .handle_merge_and_cleanup(workspace_result)
-                .await
-                .map_err(|error| error.to_string());
+                .await;
 
             if let Err(send_error) = merge_result_tx
                 .send(MergeResult {
@@ -1069,21 +1068,55 @@ impl ParallelExecutor {
     }
 
     #[allow(dead_code)]
-    pub(super) async fn handle_merge_result(&mut self, merge_result: MergeResult) -> bool {
+    pub(super) async fn handle_merge_result(
+        &mut self,
+        merge_result: MergeResult,
+    ) -> MergeResultDisposition {
         let (merge_result_tx, _merge_result_rx) = mpsc::channel(1);
         self.handle_merge_result_with_tx(merge_result, &merge_result_tx)
             .await
     }
 
+    /// Apply one typed background base-lane result and return its scheduler disposition.
+    ///
+    /// Ownership release comes first and is independent of severity: the pending
+    /// counter and, for a spawned retry, the base-mutating lane are returned to
+    /// the scheduler before the disposition is decided, so a failure can never
+    /// strand the lane it borrowed.
+    ///
+    /// This is also the single global-Error owner for the background base-lane
+    /// boundary. Only [`MergeTaskOutcome::RunFatal`] emits one, exactly once,
+    /// and it always comes with `AbortRun`; every change-local outcome already
+    /// has an authoritative change-scoped owner upstream and must not be
+    /// promoted here.
     pub(super) async fn handle_merge_result_with_tx(
         &mut self,
         merge_result: MergeResult,
         merge_result_tx: &mpsc::Sender<MergeResult>,
-    ) -> bool {
+    ) -> MergeResultDisposition {
         self.pending_merge_count.fetch_sub(1, Ordering::Relaxed);
 
-        match merge_result.outcome {
-            Ok(MergeTaskOutcome::Merged) => {
+        let disposition = merge_result.outcome.disposition();
+
+        // Lane release for spawned retries happens for every non-merged outcome,
+        // ahead of the disposition-specific handling below. The merged path
+        // instead promotes the next waiter, which is its own release path.
+        if !disposition.is_merged() {
+            let releases_retry_lane = match &merge_result.outcome {
+                MergeTaskOutcome::Deferred { auto_resumable, .. } => *auto_resumable,
+                _ => true,
+            };
+            if releases_retry_lane {
+                self.release_retry_lane_after_non_terminal_outcome(
+                    &merge_result.change_id,
+                    merge_result.origin,
+                )
+                .await;
+            }
+        }
+
+        match &merge_result.outcome {
+            MergeTaskOutcome::Merged => {
                 info!(
                     origin = ?merge_result.origin,
                     "Background base-lane task completed successfully for '{}'",
@@ -1091,54 +1124,84 @@ impl ParallelExecutor {
                 );
                 self.dispatch_deferred_base_lane_waiter(merge_result_tx.clone())
                     .await;
-                true
             }
 
-            Ok(MergeTaskOutcome::Deferred {
+            MergeTaskOutcome::Deferred {
                 reason,
                 auto_resumable,
-            }) => {
+            } => {
                 info!(
                     "Background merge task deferred for '{}' (workspace '{}', auto_resumable={}): {}",
                     merge_result.change_id, merge_result.workspace_name, auto_resumable, reason
                 );
-                if auto_resumable {
-                    self.release_retry_lane_after_non_terminal_outcome(
-                        &merge_result.change_id,
-                        merge_result.origin,
-                    )
-                    .await;
-                }
-                false
             }
-            Err(error) => {
-                error!(
-                    "Background merge task failed for '{}' (workspace '{}', origin {:?}): {}",
-                    merge_result.change_id, merge_result.workspace_name, merge_result.origin, error
+
+            MergeTaskOutcome::ResolveExhausted {
+                change_id,
+                attempts,
+                classification,
+                detail,
+            } => {
+                // `ResolveFailed` already carried this to the reducer with the
+                // change ID attached, and the worktree is preserved for explicit
+                // retry. Wrapping it in a global Error would erase both facts.
+                warn!(
+                    change_id = %change_id,
+                    workspace = %merge_result.workspace_name,
+                    origin = ?merge_result.origin,
+                    attempts = attempts,
+                    classification = classification.token(),
+                    "Bounded post-archive resolve exhausted; change remains in merge wait for explicit retry: {}",
+                    detail
                 );
-                self.release_retry_lane_after_non_terminal_outcome(
-                    &merge_result.change_id,
-                    merge_result.origin,
-                )
-                .await;
-                if !matches!(
-                    merge_result.origin,
-                    MergeResultOrigin::ResolveWaitRetry | MergeResultOrigin::RejectWaitRetry
-                ) {
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::Error {
-                            message: format!(
-                                "Background merge failed for '{}' (workspace '{}'): {}",
-                                merge_result.change_id, merge_result.workspace_name, error
-                            ),
-                        },
-                    )
-                    .await;
+            }
+
+            MergeTaskOutcome::RecoverableAlreadyReported {
+                change_id,
+                kind,
+                detail,
+            } => {
+                warn!(
+                    change_id = %change_id,
+                    workspace = %merge_result.workspace_name,
+                    origin = ?merge_result.origin,
+                    owner = kind.token(),
+                    "Background base-lane failure already reported by its typed owner: {}",
+                    detail
+                );
+            }
+
+            MergeTaskOutcome::RunFatal { detail } => {
+                error!(
+                    change_id = %merge_result.change_id,
+                    workspace = %merge_result.workspace_name,
+                    origin = ?merge_result.origin,
+                    "Background base-lane task failed fatally: {}",
+                    detail
+                );
+                let message = format!(
+                    "Background merge failed for '{}' (workspace '{}'): {}",
+                    merge_result.change_id, merge_result.workspace_name, detail
+                );
+                // One global Error per aborting run: a later fatal result that
+                // arrives during the bounded drain must not add a second.
+                if self.run_fatal_abort.is_none() {
+                    self.run_fatal_abort = Some(message.clone());
+                    send_event(&self.event_tx, ParallelEvent::Error { message }).await;
                 }
-                false
             }
         }
+
+        if disposition == MergeResultDisposition::ContinueWithErrors {
+            let failed_change = merge_result
+                .outcome
+                .scoped_change_id()
+                .unwrap_or(merge_result.change_id.as_str())
+                .to_string();
+            self.change_failures_this_run.insert(failed_change);
+        }
+
+        disposition
     }
 
     async fn dispatch_deferred_base_lane_waiter(
@@ -1347,8 +1410,8 @@ impl ParallelExecutor {
     pub(super) async fn retry_deferred_merges_for(
         &mut self,
         deferred: Vec<String>,
-    ) -> std::result::Result<MergeTaskOutcome, String> {
-        let mut outcome = Ok(MergeTaskOutcome::Merged);
+    ) -> MergeTaskOutcome {
+        let mut outcome = MergeTaskOutcome::Merged;
         for change_id in deferred.into_iter().take(1) {
             // A change with durable publication-required evidence is already in
             // cumulative base but is *not* done: retry must resume publication
@@ -1382,33 +1445,37 @@ impl ParallelExecutor {
             {
                 Ok(Some(ws)) => ws,
                 Ok(None) => {
+                    // Stale bookkeeping, not a failure: there is no workspace
+                    // left to retry, so the intent is cleared and the run
+                    // continues. A global Error here would claim the run is
+                    // invalid when nothing is.
                     let message = format!(
                         "No workspace found for ResolveWait retry '{}', clearing stale retry intent",
                         change_id
                     );
                     warn!("{}", message);
-                    send_event(&self.event_tx, ParallelEvent::Error { message }).await;
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Log(LogEntry::warn(&message).with_change_id(&change_id)),
+                    )
+                    .await;
                     // Remove from deferred set; the workspace is gone, nothing to retry.
                     self.clear_resolve_wait_intent_for_outcome(&change_id).await;
                     self.abandon_base_mutating_lane_occupant_for_give_up(&change_id)
                         .await;
-                    outcome = Ok(MergeTaskOutcome::Merged);
+                    outcome = MergeTaskOutcome::Merged;
                     continue;
                 }
                 Err(e) => {
+                    // A repository query failed before any change-scoped
+                    // transition could be established, so scope is unknown and
+                    // the outcome fails closed to the single global owner.
                     let message = format!(
                         "Failed to find workspace for ResolveWait retry '{}': {}",
                         change_id, e
                     );
                     warn!("{}", message);
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::Error {
-                            message: message.clone(),
-                        },
-                    )
-                    .await;
-                    outcome = Err(message);
+                    outcome = MergeTaskOutcome::run_fatal(message);
                     continue;
                 }
             };
@@ -1424,7 +1491,7 @@ impl ParallelExecutor {
                 self.clear_resolve_wait_intent_for_outcome(&change_id).await;
                 self.abandon_base_mutating_lane_occupant_for_give_up(&change_id)
                     .await;
-                outcome = Ok(MergeTaskOutcome::Merged);
+                outcome = MergeTaskOutcome::Merged;
                 continue;
             }
 
@@ -1499,7 +1566,13 @@ impl ParallelExecutor {
                                 },
                             )
                             .await;
-                            outcome = Err(message);
+                            // `HookFailed` owns this transition; the queue must
+                            // not promote it into a run-fatal outcome.
+                            outcome = MergeTaskOutcome::already_reported(
+                                &change_id,
+                                AlreadyReportedFailureKind::Hook,
+                                message,
+                            );
                             continue;
                         }
                     }
@@ -1546,7 +1619,7 @@ impl ParallelExecutor {
                         )
                         .await;
                     }
-                    outcome = Ok(MergeTaskOutcome::Merged);
+                    outcome = MergeTaskOutcome::Merged;
                 }
                 Ok(super::merge::MergeAttempt::Deferred(deferred)) => {
                     info!(
@@ -1570,12 +1643,17 @@ impl ParallelExecutor {
                         },
                     )
                     .await;
-                    outcome = Ok(MergeTaskOutcome::deferred(reason, auto_resumable));
+                    outcome = MergeTaskOutcome::deferred(reason, auto_resumable);
                 }
-                Err(e) => {
-                    error!("Deferred merge retry error for '{}': {}", change_id, e);
-                    // Keep in deferred set; another merge/resolve completion will trigger again.
-                    outcome = Err(e.to_string());
+                Err(failure) => {
+                    error!(
+                        change_id = %change_id,
+                        outcome = ?failure,
+                        "Deferred merge retry failed"
+                    );
+                    // Keep in deferred set; another merge/resolve completion will
+                    // trigger again. The typed failure already knows its scope.
+                    outcome = failure.into_outcome(&change_id);
                 }
             }
         }
@@ -1585,8 +1663,8 @@ impl ParallelExecutor {
     pub(super) async fn retry_deferred_rejection_review_for(
         &mut self,
         change_id: String,
-    ) -> std::result::Result<MergeTaskOutcome, String> {
-        let mut outcome = Ok(MergeTaskOutcome::Merged);
+    ) -> MergeTaskOutcome {
+        let mut outcome = MergeTaskOutcome::Merged;
         send_event(
             &self.event_tx,
             ParallelEvent::Log(LogEntry::info(format!(
@@ -1603,31 +1681,31 @@ impl ParallelExecutor {
         {
             Ok(Some(ws)) => ws,
             Ok(None) => {
+                // Stale bookkeeping, not a failure: nothing is left to review.
                 let message = format!(
                     "No workspace found for RejectWait retry '{}', clearing reject wait",
                     change_id
                 );
                 warn!("{}", message);
-                send_event(&self.event_tx, ParallelEvent::Error { message }).await;
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::warn(&message).with_change_id(&change_id)),
+                )
+                .await;
                 self.clear_reject_wait_intent_for_success(&change_id).await;
                 self.abandon_base_mutating_lane_occupant_for_give_up(&change_id)
                     .await;
-                return Ok(MergeTaskOutcome::Merged);
+                return MergeTaskOutcome::Merged;
             }
             Err(e) => {
+                // Repository query failure before any change-scoped transition:
+                // scope is unknown, so it fails closed.
                 let message = format!(
                     "Failed to find workspace for RejectWait retry '{}': {}",
                     change_id, e
                 );
                 warn!("{}", message);
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::Error {
-                        message: message.clone(),
-                    },
-                )
-                .await;
-                return Err(message);
+                return MergeTaskOutcome::run_fatal(message);
             }
         };
 
@@ -1753,7 +1831,11 @@ impl ParallelExecutor {
                         };
                         self.apply_rejection_review_event_in_shared_state(&failed_event)
                             .await;
-                        outcome = Err(error.to_string());
+                        outcome = MergeTaskOutcome::already_reported(
+                            &change_id,
+                            AlreadyReportedFailureKind::RejectionReview,
+                            error.to_string(),
+                        );
                         send_event(&self.event_tx, failed_event).await;
                     }
                 }
@@ -1785,7 +1867,11 @@ impl ParallelExecutor {
                         };
                         self.apply_rejection_review_event_in_shared_state(&failed_event)
                             .await;
-                        outcome = Err(error.to_string());
+                        outcome = MergeTaskOutcome::already_reported(
+                            &change_id,
+                            AlreadyReportedFailureKind::RejectionReview,
+                            error.to_string(),
+                        );
                         send_event(&self.event_tx, failed_event).await;
                     }
                 }
@@ -1801,7 +1887,11 @@ impl ParallelExecutor {
                 };
                 self.apply_rejection_review_event_in_shared_state(&failed_event)
                     .await;
-                outcome = Err(error.to_string());
+                outcome = MergeTaskOutcome::already_reported(
+                    &change_id,
+                    AlreadyReportedFailureKind::RejectionReview,
+                    error.to_string(),
+                );
                 send_event(&self.event_tx, failed_event).await;
             }
         }
