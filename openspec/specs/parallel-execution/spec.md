@@ -1327,50 +1327,81 @@ re-analysis の `order` は依存関係の制約として扱い、依存解決�
 
 ### Requirement: Queue ingestion and analysis targeting
 
-並列実行の analysis は queued の change のみを対象にしなければならない（MUST）。
+Parallel analysis MUST target only changes made eligible by explicit invocation targets or current reducer-owned intent. Initial explicit targets from TUI, CLI, or remote Start are eligible scheduler inputs. After startup, ordinary queue reconciliation MUST derive eligibility from current reducer `QueueIntent::Queued`; dynamic queue notifications are wake-up hints only.
 
-キューに追加された change は analysis 実行前に queued 集合へ反映されなければならない（MUST）。
+Repository-wide worktree discovery, active-change catalog refresh, `ChangesRefreshed`, and workspace observation MUST NOT create ordinary queue intent or append unrelated IDs to scheduler-local queued work or dependency analysis. For an already eligible ID that is absent from the active catalog, the scheduler MAY inspect that ID's preserved workspace and reconstruct an archived-dirty repair candidate. Repository evidence determines the resume phase but MUST NOT create execution intent.
 
-scheduler-local queued 集合は reducer-visible queued intent と reconcile されなければならない（MUST）。reconcile は dynamic queue notification の欠落、dynamic queue pop 後の一時的な candidate load failure、または stale local queue state によって reducer-visible queued change が永続的に analysis 対象外になることを防がなければならない（MUST）。
+`RemoveFromQueue` and `DequeueChange` revoke ordinary eligibility. A preserved worktree or stale local/dynamic entry MUST NOT reacquire the change until accepted explicit requeue or retry restores reducer queued intent. Presence on the scheduler-local candidate list MUST NOT by itself keep a change eligible: ordinary classification, dependency analysis, and dispatch selection MUST require current reducer-owned ordinary intent, and a revoked candidate MUST leave the scheduler-local candidate list. Reducer-owned `ResolveWait` and `RejectWait` remain independently scheduler-consumable lane intent. Final terminal and terminal-error stop gates remain independently enforced after eligibility evaluation.
 
-実行中の change が存在せず、queued の change も空の場合、オーケストレーションは完了状態にならなければならない（MUST）。ただし reducer-visible queued intent が存在する場合、その intent が terminal / active / missing などの理由で analysis 対象外であることが確認されるまで完了状態として扱ってはならない（MUST NOT）。
+#### Scenario: Revocation stops an already admitted candidate
 
-queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
+**Given**: Changes `keeper` and `revoked` both carry accepted queue intent
+**And**: Both are already scheduler-local ordinary candidates
+**When**: `RemoveFromQueue` or `DequeueChange` revokes ordinary intent for `revoked`
+**Then**: `revoked` is not classified as dispatchable and is not selected for dispatch
+**And**: `revoked` leaves the scheduler-local candidate list and is not analyzed
+**And**: `keeper` remains dispatchable
+**And**: A later accepted `AddToQueue` restores `revoked` to dispatchable work
 
-Archived-dirty repair candidate は workspace-derived repair trigger として扱われなければならない（MUST）。scheduler は同じ unchanged archived-dirty repair candidate の再発見を通常の user/reducer queue addition と同じ debounce 更新として扱ってはならない（MUST NOT）。
+#### Scenario: Catalog refresh does not admit unselected archived-dirty work
 
-Reducer-terminal final states such as `merged`, `archived`, and `rejected` MUST be dispatch stop gates for ordinary apply/acceptance/archive work. A stale dynamic queue entry, stale scheduler-local candidate, or reducer reconciliation pass MUST NOT add a final terminal change to scheduler-local queued work or analysis candidates.
+**Given**: A parallel run has initial explicit target `fresh`
+**And**: Preserved worktree `stale` is archived-dirty and not merged
+**And**: `stale` has no queue or lane-wait intent
+**When**: `ChangesRefreshed` registers both `fresh` and `stale`
+**And**: Queue reconciliation scans catalog and worktree state
+**Then**: `stale` is not added to scheduler-local queued work or dependency analysis
+**And**: Apply, acceptance, archive finalization, resolve, reject, and merge do not start for `stale`
+**And**: `stale` repository and worktree evidence remains unchanged
 
-Recoverable terminal `error` remains distinct: it MUST NOT be dispatched through ordinary apply/acceptance/archive work unless explicit retry intent clears the terminal error according to reducer rules.
+#### Scenario: Explicit target recovers archived-dirty workspace
 
-<!-- Expected canonical result after archive: `parallel-execution` will require scheduler queue ingestion, reconciliation, and dispatch selection to treat reducer-terminal final states as ordinary dispatch stop gates while preserving explicit retry semantics for terminal errors. -->
+**Given**: Archived-dirty `stale` is an initial explicit TUI, CLI, or remote target
+**And**: It is absent from the active change catalog because its change directory was moved into the workspace archive
+**When**: The scheduler resolves initial candidates
+**Then**: It may inspect only `stale`'s preserved workspace and reconstruct repair work
+**And**: It resumes the repository-derived archive-finalization or archive-complete phase
+**And**: It does not rerun completed apply work
 
-#### Scenario: terminal merged dynamic queue entry is ignored
+#### Scenario: Reducer queued intent recovers archived-dirty workspace
 
-- **GIVEN** change `alpha` is reducer-terminal `merged`
-- **AND** a stale dynamic queue entry for `alpha` is popped
-- **WHEN** scheduler dynamic queue ingestion evaluates `alpha`
-- **THEN** `alpha` is not added to scheduler-local `queued`
-- **AND** `alpha` is not included in dependency analysis candidates
-- **AND** apply, acceptance, and archive are not started for `alpha`
+**Given**: Archived-dirty `stale` was not an initial target
+**And**: An accepted queue addition or terminal-error retry sets `QueueIntent::Queued` for `stale`
+**When**: Queue reconciliation cannot load `stale` from the active catalog
+**Then**: It may inspect `stale`'s preserved workspace and reconstruct repair work
+**And**: Recovery uses current workspace, Git, and base-tree evidence
 
-#### Scenario: terminal merged dispatch preflight stops archive path
+#### Scenario: Queue revocation prevents worktree reacquisition
 
-- **GIVEN** change `alpha` is reducer-terminal `merged`
-- **AND** stale scheduler-local state attempts to dispatch `alpha`
-- **WHEN** `dispatch_change_to_workspace` evaluates preflight guards
-- **THEN** dispatch is skipped before workspace acquisition or reuse
-- **AND** `execute_archive_in_workspace` is not called for `alpha`
-- **AND** no `ArchiveStarted` event is emitted for `alpha`
+**Given**: `stale` was previously eligible and has a preserved archived-dirty worktree
+**When**: `RemoveFromQueue` or `DequeueChange` revokes its ordinary queue eligibility
+**And**: Later reconciliation observes stale local entries or the preserved worktree
+**Then**: `stale` is not re-added to ordinary queued work
+**And**: A later accepted explicit requeue is required before ordinary recovery can resume
 
-#### Scenario: terminal error remains explicit retry only
+#### Scenario: Lane waits remain distinct from ordinary recovery
 
-- **GIVEN** change `beta` is reducer-terminal `error`
-- **WHEN** ordinary scheduler dispatch evaluates `beta` without explicit retry intent
-- **THEN** `beta` is skipped as retry-required
-- **AND** apply, acceptance, and archive are not started for `beta`
-- **WHEN** explicit retry intent clears the terminal error
-- **THEN** `beta` can become eligible for ordinary queued dispatch again
+**Given**: The ordinary queued set is empty
+**And**: The reducer owns `ResolveWait` for one change or `RejectWait` for another
+**When**: The base-mutating lane becomes available
+**Then**: The scheduler consumes the matching lane intent
+**And**: It does not require or synthesize ordinary queued intent
+
+#### Scenario: Unrequested residue does not prevent drain
+
+**Given**: No ordinary queued, active, resolve-wait, or reject-wait intent remains
+**And**: An unrequested archived-dirty worktree exists
+**When**: The scheduler evaluates completion
+**Then**: The unrequested worktree is not treated as current-run work
+**And**: The run may drain or complete
+
+#### Scenario: Eligible merged and terminal-error changes retain independent stop gates
+
+**Given**: Explicit intent makes change `alpha` visible to candidate evaluation
+**And**: Repository or reducer evidence classifies `alpha` as merged or terminal error
+**When**: Dispatch eligibility is evaluated
+**Then**: Merged evidence prevents ordinary dispatch permanently
+**And**: Terminal error prevents ordinary dispatch until accepted `RetryError`
 
 ### Requirement: Dispatch sequencing for queued changes
 キューに追加された change は analysis を経由せずに dispatch されてはならない（MUST NOT）。
@@ -1994,50 +2025,81 @@ When a reused worktree is not archive-complete:
 
 ### Requirement: Queue ingestion and analysis targeting
 
-並列実行の analysis は queued の change のみを対象にしなければならない（MUST）。
+Parallel analysis MUST target only changes made eligible by explicit invocation targets or current reducer-owned intent. Initial explicit targets from TUI, CLI, or remote Start are eligible scheduler inputs. After startup, ordinary queue reconciliation MUST derive eligibility from current reducer `QueueIntent::Queued`; dynamic queue notifications are wake-up hints only.
 
-キューに追加された change は analysis 実行前に queued 集合へ反映されなければならない（MUST）。
+Repository-wide worktree discovery, active-change catalog refresh, `ChangesRefreshed`, and workspace observation MUST NOT create ordinary queue intent or append unrelated IDs to scheduler-local queued work or dependency analysis. For an already eligible ID that is absent from the active catalog, the scheduler MAY inspect that ID's preserved workspace and reconstruct an archived-dirty repair candidate. Repository evidence determines the resume phase but MUST NOT create execution intent.
 
-scheduler-local queued 集合は reducer-visible queued intent と reconcile されなければならない（MUST）。reconcile は dynamic queue notification の欠落、dynamic queue pop 後の一時的な candidate load failure、または stale local queue state によって reducer-visible queued change が永続的に analysis 対象外になることを防がなければならない（MUST）。
+`RemoveFromQueue` and `DequeueChange` revoke ordinary eligibility. A preserved worktree or stale local/dynamic entry MUST NOT reacquire the change until accepted explicit requeue or retry restores reducer queued intent. Presence on the scheduler-local candidate list MUST NOT by itself keep a change eligible: ordinary classification, dependency analysis, and dispatch selection MUST require current reducer-owned ordinary intent, and a revoked candidate MUST leave the scheduler-local candidate list. Reducer-owned `ResolveWait` and `RejectWait` remain independently scheduler-consumable lane intent. Final terminal and terminal-error stop gates remain independently enforced after eligibility evaluation.
 
-実行中の change が存在せず、queued の change も空の場合、オーケストレーションは完了状態にならなければならない（MUST）。ただし reducer-visible queued intent が存在する場合、その intent が terminal / active / missing などの理由で analysis 対象外であることが確認されるまで完了状態として扱ってはならない（MUST NOT）。
+#### Scenario: Revocation stops an already admitted candidate
 
-queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
+**Given**: Changes `keeper` and `revoked` both carry accepted queue intent
+**And**: Both are already scheduler-local ordinary candidates
+**When**: `RemoveFromQueue` or `DequeueChange` revokes ordinary intent for `revoked`
+**Then**: `revoked` is not classified as dispatchable and is not selected for dispatch
+**And**: `revoked` leaves the scheduler-local candidate list and is not analyzed
+**And**: `keeper` remains dispatchable
+**And**: A later accepted `AddToQueue` restores `revoked` to dispatchable work
 
-Archived-dirty repair candidate は workspace-derived repair trigger として扱われなければならない（MUST）。scheduler は同じ unchanged archived-dirty repair candidate の再発見を通常の user/reducer queue addition と同じ debounce 更新として扱ってはならない（MUST NOT）。
+#### Scenario: Catalog refresh does not admit unselected archived-dirty work
 
-Reducer-terminal final states such as `merged`, `archived`, and `rejected` MUST be dispatch stop gates for ordinary apply/acceptance/archive work. A stale dynamic queue entry, stale scheduler-local candidate, or reducer reconciliation pass MUST NOT add a final terminal change to scheduler-local queued work or analysis candidates.
+**Given**: A parallel run has initial explicit target `fresh`
+**And**: Preserved worktree `stale` is archived-dirty and not merged
+**And**: `stale` has no queue or lane-wait intent
+**When**: `ChangesRefreshed` registers both `fresh` and `stale`
+**And**: Queue reconciliation scans catalog and worktree state
+**Then**: `stale` is not added to scheduler-local queued work or dependency analysis
+**And**: Apply, acceptance, archive finalization, resolve, reject, and merge do not start for `stale`
+**And**: `stale` repository and worktree evidence remains unchanged
 
-Recoverable terminal `error` remains distinct: it MUST NOT be dispatched through ordinary apply/acceptance/archive work unless explicit retry intent clears the terminal error according to reducer rules.
+#### Scenario: Explicit target recovers archived-dirty workspace
 
-<!-- Expected canonical result after archive: `parallel-execution` will require scheduler queue ingestion, reconciliation, and dispatch selection to treat reducer-terminal final states as ordinary dispatch stop gates while preserving explicit retry semantics for terminal errors. -->
+**Given**: Archived-dirty `stale` is an initial explicit TUI, CLI, or remote target
+**And**: It is absent from the active change catalog because its change directory was moved into the workspace archive
+**When**: The scheduler resolves initial candidates
+**Then**: It may inspect only `stale`'s preserved workspace and reconstruct repair work
+**And**: It resumes the repository-derived archive-finalization or archive-complete phase
+**And**: It does not rerun completed apply work
 
-#### Scenario: terminal merged dynamic queue entry is ignored
+#### Scenario: Reducer queued intent recovers archived-dirty workspace
 
-- **GIVEN** change `alpha` is reducer-terminal `merged`
-- **AND** a stale dynamic queue entry for `alpha` is popped
-- **WHEN** scheduler dynamic queue ingestion evaluates `alpha`
-- **THEN** `alpha` is not added to scheduler-local `queued`
-- **AND** `alpha` is not included in dependency analysis candidates
-- **AND** apply, acceptance, and archive are not started for `alpha`
+**Given**: Archived-dirty `stale` was not an initial target
+**And**: An accepted queue addition or terminal-error retry sets `QueueIntent::Queued` for `stale`
+**When**: Queue reconciliation cannot load `stale` from the active catalog
+**Then**: It may inspect `stale`'s preserved workspace and reconstruct repair work
+**And**: Recovery uses current workspace, Git, and base-tree evidence
 
-#### Scenario: terminal merged dispatch preflight stops archive path
+#### Scenario: Queue revocation prevents worktree reacquisition
 
-- **GIVEN** change `alpha` is reducer-terminal `merged`
-- **AND** stale scheduler-local state attempts to dispatch `alpha`
-- **WHEN** `dispatch_change_to_workspace` evaluates preflight guards
-- **THEN** dispatch is skipped before workspace acquisition or reuse
-- **AND** `execute_archive_in_workspace` is not called for `alpha`
-- **AND** no `ArchiveStarted` event is emitted for `alpha`
+**Given**: `stale` was previously eligible and has a preserved archived-dirty worktree
+**When**: `RemoveFromQueue` or `DequeueChange` revokes its ordinary queue eligibility
+**And**: Later reconciliation observes stale local entries or the preserved worktree
+**Then**: `stale` is not re-added to ordinary queued work
+**And**: A later accepted explicit requeue is required before ordinary recovery can resume
 
-#### Scenario: terminal error remains explicit retry only
+#### Scenario: Lane waits remain distinct from ordinary recovery
 
-- **GIVEN** change `beta` is reducer-terminal `error`
-- **WHEN** ordinary scheduler dispatch evaluates `beta` without explicit retry intent
-- **THEN** `beta` is skipped as retry-required
-- **AND** apply, acceptance, and archive are not started for `beta`
-- **WHEN** explicit retry intent clears the terminal error
-- **THEN** `beta` can become eligible for ordinary queued dispatch again
+**Given**: The ordinary queued set is empty
+**And**: The reducer owns `ResolveWait` for one change or `RejectWait` for another
+**When**: The base-mutating lane becomes available
+**Then**: The scheduler consumes the matching lane intent
+**And**: It does not require or synthesize ordinary queued intent
+
+#### Scenario: Unrequested residue does not prevent drain
+
+**Given**: No ordinary queued, active, resolve-wait, or reject-wait intent remains
+**And**: An unrequested archived-dirty worktree exists
+**When**: The scheduler evaluates completion
+**Then**: The unrequested worktree is not treated as current-run work
+**And**: The run may drain or complete
+
+#### Scenario: Eligible merged and terminal-error changes retain independent stop gates
+
+**Given**: Explicit intent makes change `alpha` visible to candidate evaluation
+**And**: Repository or reducer evidence classifies `alpha` as merged or terminal error
+**When**: Dispatch eligibility is evaluated
+**Then**: Merged evidence prevents ordinary dispatch permanently
+**And**: Terminal error prevents ordinary dispatch until accepted `RetryError`
 
 ### Requirement: Acceptance failure returns to apply loop
 
