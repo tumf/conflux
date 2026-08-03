@@ -34,6 +34,7 @@ fn no_store<T: serde::Serialize>(body: T) -> Response {
     get,
     path = "/api/v2/health",
     tag = "remote-control",
+    security(),
     responses((status = 200, description = "Process is serving requests", body = HealthResponse))
 )]
 pub async fn health() -> Response {

@@ -114,7 +114,14 @@ fn event_stream(
         ("instance_id" = Option<String>, Query, description = "Incarnation the cursor belongs to")
     ),
     responses(
-        (status = 200, description = "Ordered SSE event stream (fetch() response streaming)"),
+        (
+            status = 200,
+            description = "Ordered SSE stream read with fetch() response streaming. Each `data:` \
+                           frame is one EventEnvelope; a `gap` category means the requested cursor \
+                           is no longer replayable and the client must re-read GET /api/v2/state.",
+            body = super::dto::EventEnvelope,
+            content_type = "text/event-stream"
+        ),
         (status = 401, description = "Missing or invalid bearer credentials", body = super::dto::ApiError)
     )
 )]
@@ -148,7 +155,11 @@ pub async fn events(
         ("instance_id" = Option<String>, Query, description = "Incarnation the cursor belongs to")
     ),
     responses(
-        (status = 101, description = "Switching protocols"),
+        (
+            status = 101,
+            description = "Switching protocols. Every subsequent text frame is one EventEnvelope, \
+                           in the same order and with the same `gap` semantics as the SSE stream."
+        ),
         (status = 401, description = "Missing bearer header, or credentials in query/subprotocol", body = super::dto::ApiError)
     )
 )]

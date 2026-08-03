@@ -128,13 +128,19 @@ bump-major:
 	./scripts/bump.sh major
 	@echo "Major version bumped and tagged successfully"
 
-# Generate OpenAPI specification
+# The one canonical /api/v2 contract in this repository. Generated from
+# src/web/openapi.rs; never hand-edited. There is no second OpenAPI file.
+OPENAPI_ARTIFACT := docs/openapi.yaml
+
+# Regenerate the canonical OpenAPI artifact.
 openapi:
-	@echo "Generating OpenAPI specification..."
-	@mkdir -p docs
-	cargo run --bin openapi-gen --features web-monitoring > /tmp/openapi-gen.yaml
-	@mv /tmp/openapi-gen.yaml docs/openapi.yaml
-	@echo "OpenAPI specification generated at docs/openapi.yaml"
+	@echo "Generating $(OPENAPI_ARTIFACT)..."
+	@mkdir -p $(dir $(OPENAPI_ARTIFACT))
+	@tmp="$$(mktemp "$${TMPDIR:-/tmp}/cflx-openapi.XXXXXX")"; \
+	trap 'rm -f "$$tmp"' EXIT INT TERM; \
+	cargo run --quiet --bin openapi-gen --features web-monitoring > "$$tmp" || exit 1; \
+	mv "$$tmp" $(OPENAPI_ARTIFACT)
+	@echo "OpenAPI specification generated at $(OPENAPI_ARTIFACT)"
 
 # Publish to crates.io (requires `cargo login` beforehand)
 publish: check
@@ -146,17 +152,23 @@ publish-dry-run: check
 	@echo "Running crates.io dry-run..."
 	cargo publish --dry-run --allow-dirty
 
-# Check if OpenAPI specification is up to date
+# Fail on any drift between the code and the canonical OpenAPI artifact.
+#
+# Read-only by construction: generation goes to a private temporary file and the
+# check never writes to the working tree, so running it can neither hide drift
+# nor disturb unrelated edits. The diff is the error message — it names the route,
+# field, enum member, or security declaration that moved.
 check-openapi:
-	@echo "Checking OpenAPI specification..."
-	@mkdir -p docs
-	@cargo run --bin openapi-gen --features web-monitoring > /tmp/openapi-check.yaml
-	@if ! diff -q docs/openapi.yaml /tmp/openapi-check.yaml > /dev/null 2>&1; then \
-		echo "ERROR: OpenAPI specification is out of date. Run 'make openapi' to update."; \
-		diff docs/openapi.yaml /tmp/openapi-check.yaml || true; \
-		rm /tmp/openapi-check.yaml; \
+	@echo "Checking $(OPENAPI_ARTIFACT) against the generated contract..."
+	@tmp="$$(mktemp "$${TMPDIR:-/tmp}/cflx-openapi-check.XXXXXX")"; \
+	trap 'rm -f "$$tmp"' EXIT INT TERM; \
+	cargo run --quiet --bin openapi-gen --features web-monitoring > "$$tmp" || exit 1; \
+	if ! diff -u $(OPENAPI_ARTIFACT) "$$tmp"; then \
+		echo ""; \
+		echo "ERROR: $(OPENAPI_ARTIFACT) does not match the generated contract."; \
+		echo "       Run 'make openapi' and commit the result."; \
 		exit 1; \
-	else \
-		echo "OpenAPI specification is up to date."; \
-		rm /tmp/openapi-check.yaml; \
-	fi
+	fi; \
+	echo "$(OPENAPI_ARTIFACT) matches the generated contract."
+	@echo "Running canonical-artifact contract assertions..."
+	@cargo test --quiet --features web-monitoring --test openapi_contract_tests
