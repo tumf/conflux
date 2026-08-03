@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::task_parser;
 use crate::tui::events::LogEntry;
-use crate::tui::types::{AppMode, StopMode};
+use crate::tui::types::{AppExecutionMode, StopMode};
 
 use super::AppState;
 
@@ -24,9 +24,9 @@ impl AppState {
     /// Only the retained terminal modes need to be named exactly; every other
     /// mode is non-terminal as far as completion handling is concerned.
     fn terminal_mode_name(&self) -> &'static str {
-        match self.mode {
-            AppMode::Stopped => "stopped",
-            AppMode::Error => "error",
+        match self.execution_mode {
+            AppExecutionMode::Stopped => "stopped",
+            AppExecutionMode::Error => "error",
             _ => "running",
         }
     }
@@ -49,7 +49,7 @@ impl AppState {
             }
         }
 
-        self.mode = AppMode::Select;
+        self.execution_mode = AppExecutionMode::Select;
         self.current_change = None;
         self.stop_mode = StopMode::None;
         if let Some(started) = self.orchestration_started_at {
@@ -272,9 +272,12 @@ mod tests {
     /// projection would describe the same run differently.
     #[test]
     fn late_all_completed_preserves_retained_terminal_modes() {
-        for (mode, expected_name) in [(AppMode::Stopped, "stopped"), (AppMode::Error, "error")] {
+        for (mode, expected_name) in [
+            (AppExecutionMode::Stopped, "stopped"),
+            (AppExecutionMode::Error, "error"),
+        ] {
             let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-            app.mode = mode.clone();
+            app.execution_mode = mode;
             assert_eq!(app.terminal_mode_name(), expected_name);
             assert!(!crate::events::all_completed_may_overwrite_mode(
                 expected_name
@@ -283,7 +286,7 @@ mod tests {
             app.handle_all_completed();
 
             assert_eq!(
-                app.mode, mode,
+                app.execution_mode, mode,
                 "a late completion overwrote the authoritative terminal mode"
             );
         }
@@ -293,14 +296,14 @@ mod tests {
     #[test]
     fn all_completed_still_completes_a_running_frontend() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         assert!(crate::events::all_completed_may_overwrite_mode(
             app.terminal_mode_name()
         ));
 
         app.handle_all_completed();
 
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
     }
 
     #[test]
@@ -354,7 +357,7 @@ mod tests {
     #[test]
     fn global_completion_log_remains_unscoped() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         app.handle_all_completed();
 
@@ -397,10 +400,10 @@ mod tests {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.handle_all_completed();
 
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
         assert_eq!(app.current_change, None);
     }
 
@@ -409,21 +412,21 @@ mod tests {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.mode = AppMode::Error;
+        app.execution_mode = AppExecutionMode::Error;
         app.handle_all_completed();
 
-        assert_eq!(app.mode, AppMode::Error);
+        assert_eq!(app.execution_mode, AppExecutionMode::Error);
     }
 
     #[test]
     fn all_completed_keeps_stopped_mode() {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Stopped;
+        app.execution_mode = AppExecutionMode::Stopped;
 
         app.handle_all_completed();
 
-        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
     }
 
     #[test]
@@ -452,7 +455,7 @@ mod tests {
     fn all_completed_resets_blocked_and_queued_to_not_queued() {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "queued".to_string();
         app.changes[0].selected = true;
         app.changes[1].display_status_cache = "blocked".to_string();
@@ -462,7 +465,7 @@ mod tests {
 
         assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert_eq!(app.changes[1].display_status_cache, "not queued");
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
     }
 
     #[test]
@@ -488,7 +491,7 @@ mod tests {
     fn merge_completed_closes_active_resolve_lifecycle() {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.set_resolving("__active__");
         app.changes[0].set_display_status_cache("resolving");
 
@@ -509,7 +512,7 @@ mod tests {
             create_test_change("change-b", 0, 1),
         ];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.set_resolving("__active__");
         app.changes[0].set_display_status_cache("resolving");
         app.changes[1].set_display_status_cache("resolve pending");
@@ -598,7 +601,7 @@ mod tests {
             create_test_change("change-a", 0, 1),
             create_test_change("change-b", 0, 1),
         ]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.set_resolve_reservations(resolves.clone());
         app.set_shared_state(state.clone());
         app.apply_display_statuses_from_reducer(&state.read().await.all_display_statuses());

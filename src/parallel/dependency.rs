@@ -50,6 +50,15 @@ pub(super) struct DependencyContext {
     terminal_error_ids: HashSet<String>,
     resolving_ids: HashSet<String>,
     resolve_wait_ids: HashSet<String>,
+    /// Candidate IDs the reducer does not currently admit as ordinary queued work.
+    ///
+    /// `None` means no reducer is wired at all, so there is no reducer-owned
+    /// intent to consult and the scheduler-local candidate list stands on its
+    /// own. `Some(set)` is authoritative: it is computed from the same snapshot
+    /// as the other reducer-owned sets, and a reducer that cannot be read right
+    /// now yields every candidate, so an unreadable snapshot withholds work
+    /// instead of silently granting it.
+    ordinary_ineligible_ids: Option<HashSet<String>>,
     lifecycle_evidence_available: bool,
     effective_dependency_base: Option<String>,
 }
@@ -74,36 +83,56 @@ impl DependencyContext {
         in_flight: &HashSet<String>,
         shared_orchestrator_state: Option<&std::sync::Arc<RwLock<OrchestratorState>>>,
     ) -> Self {
-        let (terminal_error_ids, resolving_ids, resolve_wait_ids, lifecycle_evidence_available) =
-            match shared_orchestrator_state {
-                Some(state) => match state.try_read() {
-                    Ok(state) => (
-                        state
-                            .initial_change_ids()
-                            .iter()
-                            .filter(|id| state.is_terminal_error_change(id))
-                            .cloned()
-                            .collect::<HashSet<_>>(),
-                        state
-                            .active_change_ids()
-                            .into_iter()
-                            .filter(|id| state.display_status(id) == "resolving")
-                            .collect::<HashSet<_>>(),
-                        state
-                            .resolve_wait_change_ids()
-                            .into_iter()
-                            .collect::<HashSet<_>>(),
-                        true,
-                    ),
-                    Err(_) => (HashSet::new(), HashSet::new(), HashSet::new(), false),
-                },
-                None => (HashSet::new(), HashSet::new(), HashSet::new(), true),
-            };
-
         let queued_ids = queued_ids
             .into_iter()
             .map(|id| id.as_ref().to_string())
             .collect::<HashSet<_>>();
+
+        let (
+            terminal_error_ids,
+            resolving_ids,
+            resolve_wait_ids,
+            ordinary_ineligible_ids,
+            lifecycle_evidence_available,
+        ) = match shared_orchestrator_state {
+            Some(state) => match state.try_read() {
+                Ok(state) => (
+                    state
+                        .initial_change_ids()
+                        .iter()
+                        .filter(|id| state.is_terminal_error_change(id))
+                        .cloned()
+                        .collect::<HashSet<_>>(),
+                    state
+                        .active_change_ids()
+                        .into_iter()
+                        .filter(|id| state.display_status(id) == "resolving")
+                        .collect::<HashSet<_>>(),
+                    state
+                        .resolve_wait_change_ids()
+                        .into_iter()
+                        .collect::<HashSet<_>>(),
+                    Some(
+                        queued_ids
+                            .iter()
+                            .filter(|id| !state.is_ordinary_queue_eligible(id))
+                            .cloned()
+                            .collect::<HashSet<_>>(),
+                    ),
+                    true,
+                ),
+                // A reducer that exists but cannot be read right now proves
+                // nothing, so every candidate is withheld until it can.
+                Err(_) => (
+                    HashSet::new(),
+                    HashSet::new(),
+                    HashSet::new(),
+                    Some(queued_ids.clone()),
+                    false,
+                ),
+            },
+            None => (HashSet::new(), HashSet::new(), HashSet::new(), None, true),
+        };
         let in_flight_ids = in_flight.iter().cloned().collect::<HashSet<_>>();
         let active_ids = collect_active_change_ids(&repo_root);
         let archived_ids = collect_archived_change_ids(&repo_root);
@@ -132,9 +161,26 @@ impl DependencyContext {
             terminal_error_ids,
             resolving_ids,
             resolve_wait_ids,
+            ordinary_ineligible_ids,
             lifecycle_evidence_available,
             effective_dependency_base: None,
         }
+    }
+
+    /// True when current reducer intent withholds `change_id` from ordinary work.
+    ///
+    /// Being on the scheduler's local candidate list is *history*: it proves the
+    /// change was admitted on some earlier pass, not that an operator still wants
+    /// it. `RemoveFromQueue` and `DequeueChange` revoke intent without touching
+    /// that list, so ordinary classification and dispatch consult this predicate
+    /// instead of trusting local membership. Reducer-owned lane waits
+    /// (`MergeWait`, `ResolveWait`, `RejectWait`) are decided before this gate by
+    /// their own sets, so revocation only removes *ordinary* eligibility.
+    pub(super) fn withholds_ordinary_queue_intent(&self, change_id: &str) -> bool {
+        self.ordinary_ineligible_ids
+            .as_ref()
+            .map(|ineligible| ineligible.contains(change_id))
+            .unwrap_or(false)
     }
 
     pub(super) fn classify(&self, dep_id: &str) -> DependencyTargetClass {

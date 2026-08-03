@@ -1,7 +1,65 @@
+use crate::orchestration::operator_command::{classify_mark_route, MarkRoute};
 use crate::tui::events::{LogEntry, TuiCommand};
-use crate::tui::types::AppMode;
+use crate::tui::types::AppExecutionMode;
 
 use super::{guards, AppState, ChangeState};
+
+/// Why the shared lifecycle matrix refuses bulk execution-mark mutation.
+///
+/// The distinction matters operationally: `Stopping` is a transition that will
+/// end on its own, while `Error` is owned by explicit retry commands. Reporting
+/// them with one generic message is what made the original incident unreadable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BulkToggleRejection {
+    /// The mode makes marks immutable (a pending graceful stop).
+    Immutable(AppExecutionMode),
+    /// Recovery in this mode is owned by retry, not by mark mutation.
+    RetryRequired(AppExecutionMode),
+}
+
+impl BulkToggleRejection {
+    /// Operator-facing message naming the actual execution condition.
+    ///
+    /// The message always names an execution mode. It can never name a modal,
+    /// because modals are not on this axis any more.
+    pub(super) fn message(self) -> String {
+        match self {
+            BulkToggleRejection::Immutable(mode) => format!(
+                "Bulk mark (x) is unavailable in {} mode: execution marks are immutable until the stop settles",
+                execution_mode_label(mode)
+            ),
+            BulkToggleRejection::RetryRequired(mode) => format!(
+                "Bulk mark (x) is unavailable in {} mode: recovery is owned by retry",
+                execution_mode_label(mode)
+            ),
+        }
+    }
+}
+
+/// Operator-facing name of an execution mode.
+pub(super) fn execution_mode_label(mode: AppExecutionMode) -> &'static str {
+    match mode {
+        AppExecutionMode::Select => "Select",
+        AppExecutionMode::Running => "Running",
+        AppExecutionMode::Stopping => "Stopping",
+        AppExecutionMode::Stopped => "Stopped",
+        AppExecutionMode::Error => "Error",
+    }
+}
+
+/// Whether the execution mode admits bulk execution-mark mutation.
+///
+/// Admission is derived from the shared `OperatorMode` matrix rather than a
+/// TUI-local table, so the TUI and `/api/v2` cannot drift apart on which modes
+/// accept mark intent. `"not queued"` is the neutral probe status: it is the one
+/// row state whose route reflects the mode alone.
+pub(super) fn classify_bulk_toggle_mode(mode: AppExecutionMode) -> Result<(), BulkToggleRejection> {
+    match classify_mark_route(mode.operator_mode(), "not queued") {
+        MarkRoute::MarkOnly | MarkRoute::QueueIntent => Ok(()),
+        MarkRoute::RetryRequired => Err(BulkToggleRejection::RetryRequired(mode)),
+        MarkRoute::Immutable => Err(BulkToggleRejection::Immutable(mode)),
+    }
+}
 
 /// Why a change is excluded from the bulk execution-mark toggle (`x`).
 ///
@@ -73,11 +131,11 @@ impl BulkToggleSnapshot {
 
 /// Classifies a single change for bulk toggle; `None` means eligible.
 pub(super) fn classify_bulk_toggle_change(
-    mode: AppMode,
+    mode: AppExecutionMode,
     parallel_mode: bool,
     change: &ChangeState,
 ) -> Option<BulkToggleExclusion> {
-    if matches!(mode, AppMode::Running) && change.is_active_display_status() {
+    if matches!(mode, AppExecutionMode::Running) && change.is_active_display_status() {
         return Some(BulkToggleExclusion::ActiveInRunning);
     }
 
@@ -96,7 +154,7 @@ pub(super) fn classify_bulk_toggle_change(
 
 /// Classifies every change once and derives the shared target mark state.
 pub(super) fn build_bulk_toggle_snapshot(
-    mode: AppMode,
+    mode: AppExecutionMode,
     parallel_mode: bool,
     changes: &[ChangeState],
 ) -> BulkToggleSnapshot {
@@ -104,7 +162,7 @@ pub(super) fn build_bulk_toggle_snapshot(
     let mut excluded = Vec::new();
 
     for (index, change) in changes.iter().enumerate() {
-        match classify_bulk_toggle_change(mode.clone(), parallel_mode, change) {
+        match classify_bulk_toggle_change(mode, parallel_mode, change) {
             Some(reason) => excluded.push((change.id.clone(), reason)),
             None => eligible.push(index),
         }
@@ -121,7 +179,7 @@ pub(super) fn build_bulk_toggle_snapshot(
 }
 
 pub(super) fn can_bulk_toggle_change(
-    mode: AppMode,
+    mode: AppExecutionMode,
     parallel_mode: bool,
     change: &ChangeState,
 ) -> bool {
@@ -129,8 +187,8 @@ pub(super) fn can_bulk_toggle_change(
 }
 
 /// Modes where the bulk execution-mark toggle is meaningful.
-pub(super) fn is_bulk_toggle_mode(mode: &AppMode) -> bool {
-    matches!(mode, AppMode::Select | AppMode::Stopped | AppMode::Running)
+pub(super) fn is_bulk_toggle_mode(mode: &AppExecutionMode) -> bool {
+    classify_bulk_toggle_mode(*mode).is_ok()
 }
 
 /// Applies the bulk execution-mark toggle and reports the outcome.
@@ -139,16 +197,21 @@ pub(super) fn is_bulk_toggle_mode(mode: &AppMode) -> bool {
 /// to every eligible row, and excluded rows are reported with their reason so a
 /// partial-looking result is always explained.
 pub(super) fn toggle_all_marks(state: &mut AppState) -> Vec<TuiCommand> {
-    if !is_bulk_toggle_mode(&state.mode) {
-        report_bulk_toggle_block(
-            state,
-            "Bulk mark (x) is only available in Select, Running, or Stopped mode".to_string(),
-        );
+    // Overlays own input; `x` must never reach the underlying view. Key routing
+    // already consumes the key, so this is the defense-in-depth half of the same
+    // rule and stays silent rather than reporting a block the operator did not ask
+    // for.
+    if state.has_overlay() {
+        return Vec::new();
+    }
+
+    if let Err(rejection) = classify_bulk_toggle_mode(state.execution_mode) {
+        report_bulk_toggle_block(state, rejection.message());
         return Vec::new();
     }
 
     let snapshot =
-        build_bulk_toggle_snapshot(state.mode.clone(), state.parallel_mode, &state.changes);
+        build_bulk_toggle_snapshot(state.execution_mode, state.parallel_mode, &state.changes);
 
     if snapshot.eligible.is_empty() {
         let message = if snapshot.excluded.is_empty() {
@@ -164,7 +227,7 @@ pub(super) fn toggle_all_marks(state: &mut AppState) -> Vec<TuiCommand> {
         return Vec::new();
     }
 
-    let is_running = matches!(state.mode, AppMode::Running);
+    let is_running = matches!(state.execution_mode, AppExecutionMode::Running);
     let mut commands = Vec::new();
 
     for &index in &snapshot.eligible {
@@ -250,19 +313,22 @@ pub(super) fn toggle_selection(state: &mut AppState) -> Option<TuiCommand> {
         }
     }
 
-    let mode = state.mode.clone();
+    let mode = state.execution_mode;
     let mut new_change_count = state.new_change_count;
     let result = {
         let change = &mut state.changes[state.cursor_index];
         match mode {
-            AppMode::Select => guards::handle_toggle_select_mode(change, &mut new_change_count),
-            AppMode::Running => guards::handle_toggle_running_mode(change, &mut new_change_count),
-            AppMode::Stopped => guards::handle_toggle_stopped_mode(change, &mut new_change_count),
-            AppMode::Stopping
-            | AppMode::Error
-            | AppMode::ConfirmWorktreeDelete
-            | AppMode::QrPopup
-            | AppMode::ConfirmForceKill { .. } => return None,
+            AppExecutionMode::Select => {
+                guards::handle_toggle_select_mode(change, &mut new_change_count)
+            }
+            AppExecutionMode::Running => {
+                guards::handle_toggle_running_mode(change, &mut new_change_count)
+            }
+            AppExecutionMode::Stopped => {
+                guards::handle_toggle_stopped_mode(change, &mut new_change_count)
+            }
+            // Stopping is immutable and Error recovery is retry-owned.
+            AppExecutionMode::Stopping | AppExecutionMode::Error => return None,
         }
     };
     state.new_change_count = new_change_count;
@@ -328,16 +394,32 @@ mod tests {
     fn running_mode_excludes_active_rows_from_bulk_toggle() {
         let change = make_change_state("active", "applying", true);
 
-        assert!(!can_bulk_toggle_change(AppMode::Running, false, &change));
-        assert!(can_bulk_toggle_change(AppMode::Select, false, &change));
+        assert!(!can_bulk_toggle_change(
+            AppExecutionMode::Running,
+            false,
+            &change
+        ));
+        assert!(can_bulk_toggle_change(
+            AppExecutionMode::Select,
+            false,
+            &change
+        ));
     }
 
     #[test]
     fn parallel_mode_excludes_uncommitted_rows_from_bulk_toggle() {
         let ineligible = make_change_state("uncommitted", "not queued", false);
 
-        assert!(!can_bulk_toggle_change(AppMode::Select, true, &ineligible));
-        assert!(can_bulk_toggle_change(AppMode::Select, false, &ineligible));
+        assert!(!can_bulk_toggle_change(
+            AppExecutionMode::Select,
+            true,
+            &ineligible
+        ));
+        assert!(can_bulk_toggle_change(
+            AppExecutionMode::Select,
+            false,
+            &ineligible
+        ));
     }
 
     #[test]
@@ -348,19 +430,19 @@ mod tests {
         let eligible = make_change_state("eligible", "not queued", true);
 
         assert_eq!(
-            classify_bulk_toggle_change(AppMode::Running, false, &active),
+            classify_bulk_toggle_change(AppExecutionMode::Running, false, &active),
             Some(BulkToggleExclusion::ActiveInRunning)
         );
         assert_eq!(
-            classify_bulk_toggle_change(AppMode::Select, false, &rejected),
+            classify_bulk_toggle_change(AppExecutionMode::Select, false, &rejected),
             Some(BulkToggleExclusion::Rejected)
         );
         assert_eq!(
-            classify_bulk_toggle_change(AppMode::Select, true, &uncommitted),
+            classify_bulk_toggle_change(AppExecutionMode::Select, true, &uncommitted),
             Some(BulkToggleExclusion::ParallelUncommitted)
         );
         assert_eq!(
-            classify_bulk_toggle_change(AppMode::Select, false, &eligible),
+            classify_bulk_toggle_change(AppExecutionMode::Select, false, &eligible),
             None
         );
 
@@ -379,7 +461,7 @@ mod tests {
         ];
         changes[0].selected = true;
 
-        let snapshot = build_bulk_toggle_snapshot(AppMode::Select, false, &changes);
+        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Select, false, &changes);
 
         assert_eq!(snapshot.eligible, vec![0, 1, 2]);
         assert!(snapshot.excluded.is_empty());
@@ -399,7 +481,7 @@ mod tests {
         // Ineligible rows must not influence the target state.
         changes[1].selected = false;
 
-        let snapshot = build_bulk_toggle_snapshot(AppMode::Select, false, &changes);
+        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Select, false, &changes);
 
         assert_eq!(snapshot.eligible, vec![0]);
         assert_eq!(
@@ -421,7 +503,7 @@ mod tests {
             make_change_state("eligible", "not queued", true),
         ];
 
-        let snapshot = build_bulk_toggle_snapshot(AppMode::Running, false, &changes);
+        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Running, false, &changes);
 
         assert_eq!(snapshot.eligible, vec![3]);
         assert_eq!(snapshot.excluded.len(), 3);
@@ -437,7 +519,7 @@ mod tests {
 
     #[test]
     fn snapshot_with_no_changes_has_empty_target_set() {
-        let snapshot = build_bulk_toggle_snapshot(AppMode::Select, false, &[]);
+        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Select, false, &[]);
 
         assert!(snapshot.eligible.is_empty());
         assert!(snapshot.excluded.is_empty());
@@ -447,10 +529,10 @@ mod tests {
 
     #[test]
     fn is_bulk_toggle_mode_covers_only_interactive_modes() {
-        assert!(is_bulk_toggle_mode(&AppMode::Select));
-        assert!(is_bulk_toggle_mode(&AppMode::Running));
-        assert!(is_bulk_toggle_mode(&AppMode::Stopped));
-        assert!(!is_bulk_toggle_mode(&AppMode::Error));
-        assert!(!is_bulk_toggle_mode(&AppMode::Stopping));
+        assert!(is_bulk_toggle_mode(&AppExecutionMode::Select));
+        assert!(is_bulk_toggle_mode(&AppExecutionMode::Running));
+        assert!(is_bulk_toggle_mode(&AppExecutionMode::Stopped));
+        assert!(!is_bulk_toggle_mode(&AppExecutionMode::Error));
+        assert!(!is_bulk_toggle_mode(&AppExecutionMode::Stopping));
     }
 }

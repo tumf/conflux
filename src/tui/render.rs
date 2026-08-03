@@ -13,7 +13,7 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
 use super::state::{AppState, ChangeState};
-use super::types::AppMode;
+use super::types::{AppExecutionMode, ModalState};
 use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
 
 /// Parsed parts of a remote change ID.
@@ -228,14 +228,18 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
         }
     }
 
-    // Render QR popup on top if in QrPopup mode
-    if app.mode == AppMode::QrPopup {
-        popups::render_qr(frame, app, area);
-    }
-
-    // Render worktree delete confirmation modal on top if needed
-    if app.mode == AppMode::ConfirmWorktreeDelete {
-        worktree_view::render_delete_confirm(frame, app, area);
+    // Overlays render from the modal axis, after the base screen. There is no
+    // fallback that rewrites an unsupported execution/modal combination: the base
+    // above already painted whatever execution state is current.
+    match &app.modal {
+        Some(ModalState::QrPopup) => popups::render_qr(frame, app, area),
+        Some(ModalState::ConfirmWorktreeDelete { .. }) => {
+            worktree_view::render_delete_confirm(frame, app, area)
+        }
+        // Force-kill confirmation keeps its existing in-list presentation (the
+        // `Y: confirm kill` / `N: cancel` hints and the header label); it has no
+        // separate popup widget, and this change does not add one.
+        Some(ModalState::ConfirmForceKill { .. }) | None => {}
     }
 
     // Render warning popup on top if present
@@ -419,23 +423,32 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
     // - Running mode: Running / Running <count>
     // - Stopping mode: Stopping
     // - Stopped/Error modes: no status label
-    let (mode_text, mode_color, show_status) = match app.mode {
-        AppMode::Select => ("Ready".to_string(), Color::Cyan, true),
-        AppMode::Running => {
-            if active_count > 0 {
-                (format!("Running {}", active_count), Color::Yellow, true)
-            } else {
-                ("Running".to_string(), Color::Yellow, true)
+    // An active overlay may relabel the header, but that label is presentation
+    // only: it never changes what the execution axis is, and the status panel
+    // below still reports the execution mode's own controls.
+    let (mode_text, mode_color, show_status) = match &app.modal {
+        Some(modal @ ModalState::QrPopup) => (modal.title_label().to_string(), Color::Green, true),
+        Some(modal @ ModalState::ConfirmWorktreeDelete { .. }) => {
+            (modal.title_label().to_string(), Color::Yellow, true)
+        }
+        Some(modal @ ModalState::ConfirmForceKill { .. }) => {
+            (modal.title_label().to_string(), Color::Red, true)
+        }
+        None => match app.execution_mode {
+            AppExecutionMode::Select => ("Ready".to_string(), Color::Cyan, true),
+            AppExecutionMode::Running => {
+                if active_count > 0 {
+                    (format!("Running {}", active_count), Color::Yellow, true)
+                } else {
+                    ("Running".to_string(), Color::Yellow, true)
+                }
             }
-        }
-        AppMode::Stopping => ("Stopping".to_string(), Color::Yellow, true),
-        AppMode::Stopped | AppMode::Error => {
-            // Hide status in Stopped and Error modes per spec
-            (String::new(), Color::White, false)
-        }
-        AppMode::ConfirmWorktreeDelete => ("Confirm Delete".to_string(), Color::Yellow, true),
-        AppMode::QrPopup => ("QR Code".to_string(), Color::Green, true),
-        AppMode::ConfirmForceKill { .. } => ("Confirm Kill".to_string(), Color::Red, true),
+            AppExecutionMode::Stopping => ("Stopping".to_string(), Color::Yellow, true),
+            AppExecutionMode::Stopped | AppExecutionMode::Error => {
+                // Hide status in Stopped and Error modes per spec
+                (String::new(), Color::White, false)
+            }
+        },
     };
 
     // Build header spans
@@ -724,7 +737,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             item.display_status_cache.as_str(),
             "applying" | "accepting" | "archiving" | "resolving"
         ) {
-            if let AppMode::ConfirmForceKill { .. } = app.mode {
+            if let Some(ModalState::ConfirmForceKill { .. }) = app.modal {
                 keys.push("Y: confirm kill".to_string());
                 keys.push("N: cancel".to_string());
             } else {
@@ -744,8 +757,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         // - When resolve IS running and current item is MergeWait: "M: queue resolve"
         if item.display_status_cache == "merge wait"
             && matches!(
-                app.mode,
-                AppMode::Select | AppMode::Running | AppMode::Stopped
+                app.execution_mode,
+                AppExecutionMode::Select | AppExecutionMode::Running | AppExecutionMode::Stopped
             )
         {
             if app.is_resolving() {
@@ -1083,7 +1096,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             item.display_status_cache.as_str(),
             "applying" | "accepting" | "archiving" | "resolving"
         ) {
-            if let AppMode::ConfirmForceKill { .. } = app.mode {
+            if let Some(ModalState::ConfirmForceKill { .. }) = app.modal {
                 keys.push("Y: confirm kill".to_string());
                 keys.push("N: cancel".to_string());
             } else {
@@ -1103,8 +1116,8 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         // - When resolve IS running and current item is MergeWait: "M: queue resolve"
         if item.display_status_cache == "merge wait"
             && matches!(
-                app.mode,
-                AppMode::Select | AppMode::Running | AppMode::Stopped
+                app.execution_mode,
+                AppExecutionMode::Select | AppExecutionMode::Running | AppExecutionMode::Stopped
             )
         {
             if app.is_resolving() {
@@ -1188,7 +1201,10 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     // Show accumulated running time (elapsed)
     // Per spec: accumulated running duration in Ready or Stopped mode
     if let Some(started) = app.orchestration_started_at {
-        let elapsed = if matches!(app.mode, AppMode::Running | AppMode::Stopping) {
+        let elapsed = if matches!(
+            app.execution_mode,
+            AppExecutionMode::Running | AppExecutionMode::Stopping
+        ) {
             // Use current running time
             started.elapsed()
         } else {
@@ -1210,15 +1226,17 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
 
     // Build title with app control keys based on mode
     let start_key_label = app.start_key_label();
-    let title = match app.mode {
-        AppMode::Running => " Status (Esc: stop, Ctrl+C: quit) ".to_string(),
-        AppMode::Stopping => {
+    // Base controls come from the execution axis alone. An overlay adds its own
+    // instructions inside the overlay itself, so it must not erase the retry or
+    // resume affordance the execution state underneath still owns.
+    let title = match app.execution_mode {
+        AppExecutionMode::Select => " Status (Ctrl+C: quit) ".to_string(),
+        AppExecutionMode::Running => " Status (Esc: stop, Ctrl+C: quit) ".to_string(),
+        AppExecutionMode::Stopping => {
             format!(" Status ({start_key_label}: continue, Esc: force stop, Ctrl+C: quit) ")
         }
-        AppMode::Stopped => format!(" Status ({start_key_label}: resume, Ctrl+C: quit) "),
-        AppMode::ConfirmWorktreeDelete => " Status (Y/N: confirm, Ctrl+C: quit) ".to_string(),
-        AppMode::Error => format!(" Status ({start_key_label}: retry, Ctrl+C: quit) "),
-        _ => " Status (Ctrl+C: quit) ".to_string(),
+        AppExecutionMode::Stopped => format!(" Status ({start_key_label}: resume, Ctrl+C: quit) "),
+        AppExecutionMode::Error => format!(" Status ({start_key_label}: retry, Ctrl+C: quit) "),
     };
 
     let status = Paragraph::new(content).block(
@@ -1825,11 +1843,10 @@ fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
 
 /// Render the worktree delete confirmation modal
 fn render_worktree_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
-    use crate::tui::types::WorktreeAction;
-
-    let Some((path, WorktreeAction::Delete)) = &app.pending_worktree_action else {
+    let Some(ModalState::ConfirmWorktreeDelete { path, .. }) = &app.modal else {
         return;
     };
+    let path = path.display();
 
     let modal_width = (area.width * 60 / 100).clamp(40, 90);
     let modal_height = (area.height * 30 / 100).clamp(7, 12);
@@ -2073,7 +2090,7 @@ mod tests {
     #[test]
     fn running_logs_enabled_layout_expands_logs_for_few_changes() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.add_log(LogEntry::info("expanded log area"));
 
         let buffer = render_buffer(&mut app, 100, 50);
@@ -2088,7 +2105,7 @@ mod tests {
             .map(|index| create_test_change(&format!("change-{index:02}")))
             .collect();
         let mut app = create_test_app(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.add_log(LogEntry::info("target log area"));
 
         let buffer = render_buffer(&mut app, 100, 50);
@@ -2103,7 +2120,7 @@ mod tests {
             .map(|index| create_test_change(&format!("change-{index:02}")))
             .collect();
         let mut app = create_test_app(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.logs_panel_enabled = true;
         app.new_change_count = 1;
         app.changes[29].is_new = true;
@@ -2119,7 +2136,7 @@ mod tests {
     #[test]
     fn running_logs_disabled_layout_does_not_render_logs_panel() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.logs_panel_enabled = false;
         app.add_log(LogEntry::info("hidden log area"));
 
@@ -2185,8 +2202,8 @@ mod tests {
     #[test]
     fn qr_popup_render_shows_url_and_close_hint() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::QrPopup;
         app.web_url = Some("http://127.0.0.1:8080".to_string());
+        app.show_qr_popup();
 
         let buffer = render_buffer(&mut app, 100, 40);
         let content = buffer_to_string(&buffer);
@@ -2216,7 +2233,7 @@ mod tests {
     #[test]
     fn status_logs_characterization_shows_progress_elapsed_and_log_header() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].selected = true;
         app.changes[0].completed_tasks = 1;
         app.changes[0].total_tasks = 4;
@@ -2239,13 +2256,13 @@ mod tests {
 
     #[test]
     fn worktree_view_characterization_shows_key_hints_and_delete_confirmation() {
-        use crate::tui::types::WorktreeAction;
-
         let mut app = create_test_app(vec![]);
         app.view_mode = ViewMode::Worktrees;
         app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a")];
-        app.pending_worktree_action = Some(("/tmp/worktree-a".to_string(), WorktreeAction::Delete));
-        app.mode = AppMode::ConfirmWorktreeDelete;
+        app.modal = Some(ModalState::ConfirmWorktreeDelete {
+            path: std::path::PathBuf::from("/tmp/worktree-a"),
+            branch: "feature-a".to_string(),
+        });
 
         let buffer = render_buffer(&mut app, 120, 30);
         let content = buffer_to_string(&buffer);
@@ -2331,7 +2348,7 @@ mod tests {
     #[test]
     fn test_render_hides_new_badge_for_rejected_row_in_select_mode() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
         app.changes[0].display_status_cache = "rejected".to_string();
         app.changes[0].is_new = true;
 
@@ -2347,7 +2364,7 @@ mod tests {
     #[test]
     fn test_render_hides_new_badge_for_rejected_row_in_running_mode() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "rejected".to_string();
         app.changes[0].is_new = true;
         app.add_log(LogEntry::info("log"));
@@ -2414,7 +2431,7 @@ mod tests {
     #[test]
     fn test_render_keeps_start_run_hint_while_resolving() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
         app.set_resolving("__active__");
         app.cursor_index = 0;
         app.changes[0].selected = true;
@@ -2431,7 +2448,7 @@ mod tests {
             )
             .unwrap(),
         );
-        configured_app.mode = AppMode::Select;
+        configured_app.execution_mode = AppExecutionMode::Select;
         configured_app.set_resolving("__active__");
         configured_app.cursor_index = 0;
         configured_app.changes[0].selected = true;
@@ -2447,7 +2464,7 @@ mod tests {
     fn test_render_uses_centralized_resolve_check_in_select_mode() {
         // Verify that render shows M: resolve in Select mode with MergeWait
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.clear_resolving();
         app.cursor_index = 0;
@@ -2465,7 +2482,7 @@ mod tests {
     fn test_render_hides_resolve_in_error_mode() {
         // Verify that render does NOT show M: resolve in Error mode
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Error; // Error mode
+        app.execution_mode = AppExecutionMode::Error; // Error mode
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.clear_resolving();
         app.cursor_index = 0;
@@ -2484,7 +2501,7 @@ mod tests {
     fn test_render_shows_resolve_in_running_mode() {
         // Verify that render shows M: resolve in Running mode for MergeWait
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.clear_resolving();
         app.cursor_index = 0;
@@ -2507,35 +2524,47 @@ mod tests {
         let test_cases = vec![
             // (mode, display_status_cache, is_resolving, should_show_resolve, should_show_queue_resolve)
             (
-                AppMode::Select,
-                "merge wait".to_string(),
-                false,
-                true,
-                false,
-            ),
-            (AppMode::Select, "merge wait".to_string(), true, false, true),
-            (
-                AppMode::Running,
+                AppExecutionMode::Select,
                 "merge wait".to_string(),
                 false,
                 true,
                 false,
             ),
             (
-                AppMode::Running,
+                AppExecutionMode::Select,
                 "merge wait".to_string(),
                 true,
                 false,
                 true,
             ),
             (
-                AppMode::Error,
+                AppExecutionMode::Running,
+                "merge wait".to_string(),
+                false,
+                true,
+                false,
+            ),
+            (
+                AppExecutionMode::Running,
+                "merge wait".to_string(),
+                true,
+                false,
+                true,
+            ),
+            (
+                AppExecutionMode::Error,
                 "merge wait".to_string(),
                 false,
                 false,
                 false,
             ),
-            (AppMode::Select, "queued".to_string(), false, false, false),
+            (
+                AppExecutionMode::Select,
+                "queued".to_string(),
+                false,
+                false,
+                false,
+            ),
         ];
 
         for (
@@ -2547,13 +2576,13 @@ mod tests {
         ) in test_cases
         {
             let mut app = create_test_app(vec![create_test_change("change-a")]);
-            app.mode = mode.clone();
+            app.execution_mode = mode;
             app.changes[0].display_status_cache = display_status_cache.clone();
             if is_resolving {
                 app.set_resolving("__active__");
             }
             app.cursor_index = 0;
-            if mode != AppMode::Select {
+            if mode != AppExecutionMode::Select {
                 app.add_log(LogEntry::info("log")); // Ensure logs exist for running mode
             }
 
@@ -2577,12 +2606,11 @@ mod tests {
 
     #[test]
     fn test_render_shows_worktree_delete_confirm_modal() {
-        use crate::tui::types::WorktreeAction;
-
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.pending_worktree_action =
-            Some(("/path/to/worktree".to_string(), WorktreeAction::Delete));
-        app.mode = AppMode::ConfirmWorktreeDelete;
+        app.modal = Some(ModalState::ConfirmWorktreeDelete {
+            path: std::path::PathBuf::from("/path/to/worktree"),
+            branch: "feature-a".to_string(),
+        });
 
         let buffer = render_buffer(&mut app, 80, 20);
         let content = buffer_to_string(&buffer);
@@ -2667,7 +2695,7 @@ mod tests {
     fn test_focused_blocked_row_has_readable_fg_running_mode() {
         // Same contrast rule applies in Running view.
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].is_parallel_eligible = false;
@@ -2688,7 +2716,7 @@ mod tests {
             create_test_change("change-a"),
             create_test_change("change-b"),
         ]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].is_parallel_eligible = false;
@@ -2735,7 +2763,7 @@ mod tests {
             )
             .unwrap(),
         );
-        stopped_app.mode = AppMode::Stopped;
+        stopped_app.execution_mode = AppExecutionMode::Stopped;
         stopped_app.logs.push(LogEntry::info("show status"));
         let buffer = render_buffer(&mut stopped_app, 100, 24);
         let content = buffer_to_string(&buffer);
@@ -2749,7 +2777,7 @@ mod tests {
             )
             .unwrap(),
         );
-        stopping_app.mode = AppMode::Stopping;
+        stopping_app.execution_mode = AppExecutionMode::Stopping;
         stopping_app.logs.push(LogEntry::info("show status"));
         let buffer = render_buffer(&mut stopping_app, 100, 24);
         let content = buffer_to_string(&buffer);
@@ -2956,7 +2984,7 @@ mod tests {
         ]);
 
         // Set mode to Running
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         // Set up different statuses:
         // - change-a: Queued (should NOT be counted)
@@ -2998,7 +3026,7 @@ mod tests {
         ]);
 
         // Set mode to Running
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         // Set one change to Resolving, one to Queued
         app.changes[0].display_status_cache = "resolving".to_string();
@@ -3021,7 +3049,7 @@ mod tests {
     #[test]
     fn running_header_count_reflects_reducer_synced_active_status_after_refresh() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "queued".to_string();
         app.changes[0].selected = true;
         app.apply_display_statuses_from_reducer(&std::collections::HashMap::from([(
@@ -3051,7 +3079,7 @@ mod tests {
             create_test_change("change-b"),
         ]);
 
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "queued".to_string();
 
@@ -3074,7 +3102,7 @@ mod tests {
     fn test_running_mode_shows_running_without_count_when_no_in_flight() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
 
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "queued".to_string();
 
         let buffer = render_buffer(&mut app, 80, 24);
@@ -3100,7 +3128,7 @@ mod tests {
     #[test]
     fn test_stopping_mode_header_shows_stopping() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Stopping;
+        app.execution_mode = AppExecutionMode::Stopping;
 
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
@@ -3187,7 +3215,7 @@ mod tests {
             create_test_change("alpha"),
             create_test_change("beta"),
         ]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.add_log(LogEntry::info("alpha-apply-output").with_change_id("alpha"));
         app.add_log(LogEntry::info("beta-apply-output").with_change_id("beta"));
         app.add_log(LogEntry::info("global-orchestration-output"));
@@ -3234,7 +3262,7 @@ mod tests {
     #[test]
     fn logs_panel_filter_hides_global_only_buffers_without_panicking() {
         let mut app = create_test_app(vec![create_test_change("alpha")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.add_log(LogEntry::info("global-orchestration-output"));
         app.toggle_selected_proposal_log_filter();
 
@@ -3272,7 +3300,7 @@ mod tests {
             create_test_change("alpha"),
             create_test_change("beta"),
         ]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         for index in 0..40 {
             app.add_log(LogEntry::info(format!("beta-noise-{index}")).with_change_id("beta"));
         }
@@ -3382,7 +3410,7 @@ mod tests {
     #[test]
     fn logs_panel_visible_buffer_shows_navigation_guidance() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.add_log(LogEntry::info("Test log message"));
 
         let buffer = render_buffer(&mut app, 120, 24);
@@ -3768,7 +3796,7 @@ mod tests {
     #[test]
     fn test_toggle_all_hint_shown_in_select_mode() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
@@ -3781,7 +3809,7 @@ mod tests {
     #[test]
     fn test_toggle_all_hint_shown_in_stopped_mode() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Stopped;
+        app.execution_mode = AppExecutionMode::Stopped;
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
@@ -3794,7 +3822,7 @@ mod tests {
     #[test]
     fn test_toggle_all_hint_shown_in_running_mode_with_non_active_target() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "not queued".to_string();
 
         let buffer = render_buffer(&mut app, 100, 24);
@@ -3808,7 +3836,7 @@ mod tests {
     #[test]
     fn test_toggle_all_hint_not_shown_in_running_mode_without_non_active_targets() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "resolving".to_string();
 
         let buffer = render_buffer(&mut app, 100, 24);
@@ -3822,7 +3850,7 @@ mod tests {
     #[test]
     fn test_toggle_all_hint_not_shown_in_stopping_mode() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Stopping;
+        app.execution_mode = AppExecutionMode::Stopping;
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
@@ -3835,7 +3863,7 @@ mod tests {
     #[test]
     fn test_toggle_all_hint_not_shown_in_error_mode() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Error;
+        app.execution_mode = AppExecutionMode::Error;
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
@@ -3850,7 +3878,7 @@ mod tests {
         // Regression test: verify that toggle all hint is shown in Select mode
         // when logs are present (i.e., when render_changes_list_running is called)
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
         app.add_log(LogEntry::info("Test log")); // Add log to trigger running mode rendering
 
         let buffer = render_buffer(&mut app, 100, 24);
@@ -3868,7 +3896,7 @@ mod tests {
     #[test]
     fn analysis_fallback_running_status_header_keeps_running_controls() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.current_change = Some("change-a".to_string());
         app.changes[0].display_status_cache = "applying".to_string();
         app.orchestration_started_at = Some(std::time::Instant::now());
@@ -3901,7 +3929,7 @@ mod tests {
     #[test]
     fn fatal_global_error_status_header_still_shows_retry_controls() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.current_change = Some("change-a".to_string());
         app.orchestration_started_at = Some(std::time::Instant::now());
         app.add_log(LogEntry::info("log"));
@@ -3924,7 +3952,7 @@ mod tests {
     #[test]
     fn fatal_global_error_status_header_quoting_fallback_shows_retry_controls() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.current_change = Some("change-a".to_string());
         app.orchestration_started_at = Some(std::time::Instant::now());
         app.add_log(LogEntry::info("log"));
@@ -4090,5 +4118,200 @@ mod tests {
             content.contains("feat-b"),
             "Should show bare change id feat-b"
         );
+    }
+
+    // ========================================================================
+    // Base execution rendering with independent modal overlays
+    // ========================================================================
+
+    const ALL_EXECUTION_MODES: [AppExecutionMode; 5] = [
+        AppExecutionMode::Select,
+        AppExecutionMode::Running,
+        AppExecutionMode::Stopping,
+        AppExecutionMode::Stopped,
+        AppExecutionMode::Error,
+    ];
+
+    fn overlay_app() -> AppState {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.web_url = Some("http://127.0.0.1:8080".to_string());
+        app.add_log(LogEntry::info("orchestration log"));
+        app
+    }
+
+    fn delete_overlay() -> ModalState {
+        ModalState::ConfirmWorktreeDelete {
+            path: std::path::PathBuf::from("/tmp/worktree-a"),
+            branch: "change-a".to_string(),
+        }
+    }
+
+    #[test]
+    fn qr_overlay_renders_above_every_execution_mode() {
+        for mode in ALL_EXECUTION_MODES {
+            let mut app = overlay_app();
+            app.execution_mode = mode;
+            app.show_qr_popup();
+
+            let content = buffer_to_string(&render_buffer(&mut app, 100, 40));
+
+            assert!(
+                content.contains("Web UI QR Code"),
+                "QR overlay must render above {mode:?}"
+            );
+            assert!(content.contains("http://127.0.0.1:8080"));
+        }
+    }
+
+    #[test]
+    fn worktree_confirmation_renders_above_every_execution_mode() {
+        for mode in ALL_EXECUTION_MODES {
+            let mut app = overlay_app();
+            app.execution_mode = mode;
+            app.modal = Some(delete_overlay());
+
+            let content = buffer_to_string(&render_buffer(&mut app, 100, 40));
+
+            assert!(
+                content.contains("Delete Worktree"),
+                "worktree confirmation must render above {mode:?}"
+            );
+            assert!(content.contains("/tmp/worktree-a"));
+        }
+    }
+
+    #[test]
+    fn worktree_confirmation_over_error_keeps_the_error_base_and_retry_control() {
+        let mut app = overlay_app();
+        app.execution_mode = AppExecutionMode::Error;
+        app.modal = Some(delete_overlay());
+
+        let content = buffer_to_string(&render_buffer(&mut app, 100, 40));
+
+        assert!(
+            content.contains(&format!("{}: retry", app.start_key_label())),
+            "the Error base must keep its retry control under an overlay: {content}"
+        );
+        assert!(content.contains("Delete Worktree"));
+        assert!(
+            !content.contains("[Ready]") && !content.contains("[Running]"),
+            "an overlay must not rewrite the base to Select or Running"
+        );
+    }
+
+    #[test]
+    fn force_kill_over_stopping_keeps_the_stopping_base_and_shows_confirm_hints() {
+        let mut app = overlay_app();
+        app.execution_mode = AppExecutionMode::Stopping;
+        app.changes[0].set_display_status_cache("applying");
+        app.modal = Some(ModalState::ConfirmForceKill {
+            change_id: "change-a".to_string(),
+        });
+
+        let content = buffer_to_string(&render_buffer(&mut app, 120, 40));
+
+        assert!(
+            content.contains("force stop"),
+            "the Stopping base must keep its own controls: {content}"
+        );
+        assert!(content.contains("Y: confirm kill"));
+        assert!(content.contains("N: cancel"));
+        assert!(
+            !content.contains("K: kill"),
+            "the confirmation replaces the kill hint while it owns input"
+        );
+    }
+
+    #[test]
+    fn invalidated_force_kill_reveals_the_current_base_without_conversion() {
+        let mut app = overlay_app();
+        app.execution_mode = AppExecutionMode::Stopped;
+        app.changes[0].set_display_status_cache("applying");
+        // The confirmation was invalidated; only the modal axis changed.
+        app.modal = None;
+
+        let content = buffer_to_string(&render_buffer(&mut app, 120, 40));
+
+        assert!(!content.contains("Y: confirm kill"));
+        assert!(content.contains("K: kill"));
+        assert!(
+            content.contains(&format!("{}: resume", app.start_key_label())),
+            "the Stopped base renders as itself, not as Running: {content}"
+        );
+    }
+
+    #[test]
+    fn base_status_controls_come_from_execution_state_only() {
+        let expectations = [
+            (AppExecutionMode::Select, "Status (Ctrl+C: quit)"),
+            (AppExecutionMode::Running, "Status (Esc: stop"),
+            (AppExecutionMode::Stopping, "force stop"),
+            (AppExecutionMode::Stopped, ": resume"),
+            (AppExecutionMode::Error, ": retry"),
+        ];
+
+        for (mode, expected) in expectations {
+            // The QR popup is a large centered overlay that legitimately covers the
+            // status panel, so it is exercised by its own test above.
+            for modal in [
+                None,
+                Some(delete_overlay()),
+                Some(ModalState::ConfirmForceKill {
+                    change_id: "change-a".to_string(),
+                }),
+            ] {
+                let mut app = overlay_app();
+                app.execution_mode = mode;
+                app.modal = modal.clone();
+
+                let content = buffer_to_string(&render_buffer(&mut app, 120, 40));
+
+                assert!(
+                    content.contains(expected),
+                    "{mode:?} with {modal:?} must keep base control {expected:?}: {content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_header_label_is_presentation_only() {
+        let mut app = overlay_app();
+        app.execution_mode = AppExecutionMode::Running;
+
+        let running = buffer_to_string(&render_buffer(&mut app, 120, 40));
+        assert!(running.contains("[Running]"));
+
+        app.show_qr_popup();
+        let qr = buffer_to_string(&render_buffer(&mut app, 120, 40));
+        assert!(qr.contains("[QR Code]"));
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Running,
+            "rendering must never mutate the execution axis"
+        );
+
+        app.modal = Some(delete_overlay());
+        let delete = buffer_to_string(&render_buffer(&mut app, 120, 40));
+        assert!(delete.contains("[Confirm Delete]"));
+
+        app.modal = Some(ModalState::ConfirmForceKill {
+            change_id: "change-a".to_string(),
+        });
+        let kill = buffer_to_string(&render_buffer(&mut app, 120, 40));
+        assert!(kill.contains("[Confirm Kill]"));
+    }
+
+    #[test]
+    fn warning_popup_renders_above_an_interaction_modal() {
+        let mut app = overlay_app();
+        app.execution_mode = AppExecutionMode::Running;
+        app.show_qr_popup();
+        app.show_warning_popup("Merge warning", "conflict in file.rs");
+
+        let content = buffer_to_string(&render_buffer(&mut app, 120, 40));
+
+        assert!(content.contains("Merge warning"));
+        assert!(content.contains("conflict in file.rs"));
     }
 }

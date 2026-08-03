@@ -355,6 +355,23 @@ impl ParallelRunService {
             }
         };
 
+        // A CLI target list is explicit operator intent, exactly like a TUI or
+        // remote Start, so it enters the same reducer contract that
+        // `initialize_parallel_shared_state` and `RunControlService::start_marked`
+        // use: the scheduler reads reducer queue intent — not the local candidate
+        // list — when it decides what may still run, and registration alone
+        // leaves a change `NotQueued`. Intent is recorded *after* the committed
+        // filter, so a change this run just rejected is not granted eligibility
+        // that reconciliation would hand straight back.
+        {
+            let mut guard = self.shared_orchestrator_state.write().await;
+            for change in &changes {
+                guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                    change.id.clone(),
+                ));
+            }
+        }
+
         info!(
             "Starting parallel execution with re-analysis for {} changes",
             changes.len()

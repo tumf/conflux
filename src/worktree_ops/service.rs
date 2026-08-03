@@ -247,6 +247,35 @@ pub fn classify_delete_eligibility(
     Ok(())
 }
 
+/// Decide whether the freshly observed worktree is still the one the caller confirmed.
+///
+/// A confirmation names a worktree, not a path. Between the moment a frontend
+/// confirms a deletion and the moment the service takes the mutation guard, the
+/// path can be re-occupied by a different worktree, so the confirmed branch is
+/// re-checked against the fresh observation before anything is torn down.
+///
+/// `None` means the caller has no confirmed identity to revalidate against and
+/// accepts whatever currently occupies the path.
+pub fn classify_delete_identity(
+    facts: &WorktreeFacts,
+    expected_branch: Option<&str>,
+) -> WorktreeOpResult<()> {
+    let Some(expected) = expected_branch else {
+        return Ok(());
+    };
+    if facts.branch == expected {
+        return Ok(());
+    }
+    let observed = if facts.branch.is_empty() {
+        "<detached>"
+    } else {
+        facts.branch.as_str()
+    };
+    Err(WorktreeOpError::NotFound(format!(
+        "the confirmed worktree on branch '{expected}' is no longer at this path (it is now on '{observed}'); refresh and confirm again"
+    )))
+}
+
 /// Decide whether a worktree may be merged into base under the caller's policy.
 pub fn classify_merge_eligibility(
     facts: &WorktreeFacts,
@@ -495,14 +524,21 @@ impl WorktreeService {
     }
 
     /// Delete a managed worktree after mandatory teardown.
+    ///
+    /// `expected_branch` is the identity the caller confirmed. It is revalidated
+    /// against the fresh observation taken under the mutation guard, so a path
+    /// that was re-occupied since the confirmation refuses instead of deleting
+    /// whichever worktree now happens to live there. `None` waives that check.
     pub async fn delete_worktree(
         &self,
         path: &Path,
+        expected_branch: Option<&str>,
         options: DeleteOptions,
     ) -> WorktreeOpResult<WorktreeOpOutcome> {
         let _guard = self.acquire_root()?;
 
         let facts = self.locate(path).await?;
+        classify_delete_identity(&facts, expected_branch)?;
         classify_delete_eligibility(&facts, options)?;
 
         // Teardown must succeed before the resource is retired: a failed delete

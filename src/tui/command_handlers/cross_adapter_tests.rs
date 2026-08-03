@@ -23,7 +23,7 @@ use super::*;
 
 use crate::events::ExecutionEvent;
 use crate::orchestration::run_control::testing::SchedulerCall;
-use crate::tui::types::AppMode;
+use crate::tui::types::AppExecutionMode;
 use crate::web::remote_control_api::dto::{CommandSpec, ErrorCode};
 use crate::web::remote_control_api::executor::{RemoteControlExecutor, SharedServiceExecutor};
 use crate::web::state::WebState;
@@ -172,18 +172,14 @@ async fn merge_wait(harness: &AdapterHarness) {
         });
 }
 
-/// The `app_mode` string the v2 projection publishes for a TUI mode.
+/// The `app_mode` string the v2 projection publishes for a TUI execution mode.
 ///
 /// Both adapters must be given the *same* operator mode or the comparison would
-/// be meaningless, and this is the only place the two vocabularies meet.
-fn app_mode_string(mode: &AppMode) -> &'static str {
-    match mode {
-        AppMode::Running => "running",
-        AppMode::Stopping => "stopping",
-        AppMode::Stopped => "stopped",
-        AppMode::Error => "error",
-        _ => "select",
-    }
+/// be meaningless, and this is the only place the two vocabularies meet. The
+/// token comes from the shared execution vocabulary rather than a table local to
+/// this test, so canonical `app_mode` stays execution-only for both sides.
+fn app_mode_string(mode: &AppExecutionMode) -> &'static str {
+    mode.app_mode_token()
 }
 
 // ============================================================================
@@ -191,12 +187,12 @@ fn app_mode_string(mode: &AppMode) -> &'static str {
 // ============================================================================
 
 /// Run one intent through the TUI adapter and report what it settled as.
-async fn through_tui(setup: Setup, mode: AppMode, command: TuiCommand) -> (Effects, bool) {
+async fn through_tui(setup: Setup, mode: AppExecutionMode, command: TuiCommand) -> (Effects, bool) {
     let harness = AdapterHarness::new(&CHANGES);
     arrange(&harness, setup).await;
 
     let mut app = harness.app(&CHANGES);
-    app.mode = mode;
+    app.execution_mode = mode;
     app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
     app.warning_message = None;
 
@@ -206,7 +202,11 @@ async fn through_tui(setup: Setup, mode: AppMode, command: TuiCommand) -> (Effec
 }
 
 /// Run one intent through the `/api/v2` executor and report what it settled as.
-async fn through_v2(setup: Setup, mode: AppMode, command: CommandSpec) -> (Effects, Settlement) {
+async fn through_v2(
+    setup: Setup,
+    mode: AppExecutionMode,
+    command: CommandSpec,
+) -> (Effects, Settlement) {
     let harness = AdapterHarness::new(&CHANGES);
     arrange(&harness, setup).await;
 
@@ -247,7 +247,7 @@ struct Row {
     /// What the row demonstrates; used as the assertion label.
     name: &'static str,
     setup: Setup,
-    mode: AppMode,
+    mode: AppExecutionMode,
     tui: TuiCommand,
     v2: CommandSpec,
     expect: Settlement,
@@ -259,7 +259,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "start with an idle scheduler spawns one run over the marked set",
             setup: Setup::Marked,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
@@ -267,7 +267,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "start with a live scheduler wakes it instead of spawning a second run",
             setup: Setup::MarkedWithLiveScheduler,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
@@ -275,7 +275,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "start from a stopped run resumes the marked set",
             setup: Setup::Marked,
-            mode: AppMode::Stopped,
+            mode: AppExecutionMode::Stopped,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
@@ -283,7 +283,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "start is refused while a run owns the lifecycle",
             setup: Setup::MarkedWithLiveScheduler,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
@@ -291,7 +291,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "start with an empty target set is not a success",
             setup: Setup::Bare,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Failed(ErrorCode::TargetIneligible),
@@ -299,7 +299,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "a runtime launch failure is reported, not claimed as started",
             setup: Setup::MarkedWithFailingLaunch,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Failed(ErrorCode::InternalError),
@@ -310,7 +310,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "retry routes a marked error row and dispatches the scheduler",
             setup: Setup::MarkedError,
-            mode: AppMode::Error,
+            mode: AppExecutionMode::Error,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
@@ -318,7 +318,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "retry without retryable evidence changes nothing",
             setup: Setup::Marked,
-            mode: AppMode::Error,
+            mode: AppExecutionMode::Error,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::NoOp,
@@ -327,7 +327,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "graceful stop while running sets the stop request",
             setup: Setup::LiveScheduler,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             tui: TuiCommand::Stop,
             v2: CommandSpec::Stop,
             expect: Settlement::Changed,
@@ -335,7 +335,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "graceful stop outside running is refused",
             setup: Setup::Bare,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::Stop,
             v2: CommandSpec::Stop,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
@@ -343,7 +343,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "cancel stop while stopping withdraws the request",
             setup: Setup::LiveScheduler,
-            mode: AppMode::Stopping,
+            mode: AppExecutionMode::Stopping,
             tui: TuiCommand::CancelStop,
             v2: CommandSpec::CancelStop,
             expect: Settlement::Changed,
@@ -351,7 +351,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "cancel stop outside stopping is refused",
             setup: Setup::LiveScheduler,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             tui: TuiCommand::CancelStop,
             v2: CommandSpec::CancelStop,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
@@ -359,7 +359,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "force stop while running cancels the live run",
             setup: Setup::LiveScheduler,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             tui: TuiCommand::ForceStop,
             v2: CommandSpec::ForceStop,
             expect: Settlement::Changed,
@@ -367,7 +367,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "force stop outside running and stopping is refused",
             setup: Setup::Bare,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::ForceStop,
             v2: CommandSpec::ForceStop,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
@@ -376,7 +376,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "resolve of a merge-wait change takes the single resolver slot",
             setup: Setup::MergeWait,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::ResolveMerge("c1".to_string()),
             v2: CommandSpec::ResolveMerge {
                 change_id: "c1".to_string(),
@@ -386,7 +386,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "a duplicate resolve submission does not reserve twice",
             setup: Setup::MergeWaitAlreadyReserved,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::ResolveMerge("c1".to_string()),
             v2: CommandSpec::ResolveMerge {
                 change_id: "c1".to_string(),
@@ -396,7 +396,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "resolve of a stale target is refused without a reservation",
             setup: Setup::Bare,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::ResolveMerge("c1".to_string()),
             v2: CommandSpec::ResolveMerge {
                 change_id: "c1".to_string(),
@@ -409,9 +409,8 @@ fn rows() -> Vec<Row> {
 #[tokio::test]
 async fn tui_and_v2_settle_every_lifecycle_intent_identically() {
     for row in rows() {
-        let (tui_effects, tui_reported) =
-            through_tui(row.setup, row.mode.clone(), row.tui.clone()).await;
-        let (v2_effects, v2_settlement) = through_v2(row.setup, row.mode.clone(), row.v2).await;
+        let (tui_effects, tui_reported) = through_tui(row.setup, row.mode, row.tui.clone()).await;
+        let (v2_effects, v2_settlement) = through_v2(row.setup, row.mode, row.v2).await;
 
         assert_eq!(
             v2_settlement, row.expect,

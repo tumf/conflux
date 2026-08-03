@@ -351,7 +351,11 @@ async fn remote_worktree_delete_runs_mandatory_teardown_and_deletes_the_branch()
     let (service, sink) = service(backend.clone());
 
     let outcome = service
-        .delete_worktree(Path::new("/workspaces/c1"), DeleteOptions::fail_closed())
+        .delete_worktree(
+            Path::new("/workspaces/c1"),
+            Some("c1"),
+            DeleteOptions::fail_closed(),
+        )
         .await
         .expect("deleted");
     assert_eq!(outcome.branch, "c1");
@@ -375,7 +379,11 @@ async fn remote_worktree_failed_teardown_retains_the_resource() {
     let (service, sink) = service(backend.clone());
 
     let failure = service
-        .delete_worktree(Path::new("/workspaces/c1"), DeleteOptions::fail_closed())
+        .delete_worktree(
+            Path::new("/workspaces/c1"),
+            Some("c1"),
+            DeleteOptions::fail_closed(),
+        )
         .await
         .expect_err("must fail");
     assert!(matches!(failure, WorktreeOpError::Internal(_)));
@@ -395,10 +403,81 @@ async fn remote_worktree_delete_of_an_unobserved_path_is_not_found() {
     let (service, _sink) = service(backend);
 
     let failure = service
-        .delete_worktree(Path::new("/workspaces/gone"), DeleteOptions::fail_closed())
+        .delete_worktree(
+            Path::new("/workspaces/gone"),
+            None,
+            DeleteOptions::fail_closed(),
+        )
         .await
         .expect_err("must fail");
     assert!(matches!(failure, WorktreeOpError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn remote_worktree_delete_refuses_when_another_branch_now_occupies_the_path() {
+    // The caller confirmed `c1`, but by the time the mutation guard is taken the
+    // path is occupied by a replacement worktree on a different branch.
+    let backend = FakeBackend::stable(vec![managed("/workspaces/c1", "replacement")]);
+    let (service, sink) = service(backend.clone());
+
+    let refusal = service
+        .delete_worktree(
+            Path::new("/workspaces/c1"),
+            Some("c1"),
+            DeleteOptions::fail_closed(),
+        )
+        .await
+        .expect_err("must refuse");
+    assert!(matches!(refusal, WorktreeOpError::NotFound(_)));
+    assert!(
+        refusal.to_string().contains("c1") && refusal.to_string().contains("replacement"),
+        "the refusal must name both the confirmed and the observed identity: {refusal}"
+    );
+
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Remove { .. })),
+        "a stale identity must refuse before the backend is asked to remove anything"
+    );
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::DeleteBranch { .. })),
+        "a stale identity must not delete a branch either"
+    );
+    assert!(sink.events().is_empty());
+}
+
+#[tokio::test]
+async fn remote_worktree_delete_proceeds_when_the_confirmed_branch_still_occupies_the_path() {
+    let backend = FakeBackend::stable(vec![managed("/workspaces/c1", "c1")]);
+    let (service, _sink) = service(backend.clone());
+
+    service
+        .delete_worktree(
+            Path::new("/workspaces/c1"),
+            Some("c1"),
+            DeleteOptions::fail_closed(),
+        )
+        .await
+        .expect("a matching identity must delete");
+
+    assert!(backend.calls().contains(&Call::Remove {
+        skip_teardown: false
+    }));
+}
+
+#[test]
+fn remote_worktree_delete_identity_waives_the_check_without_a_confirmed_branch() {
+    assert!(classify_delete_identity(&managed("/workspaces/c1", "c1"), None).is_ok());
+    assert!(classify_delete_identity(&managed("/workspaces/c1", "c1"), Some("c1")).is_ok());
+    assert!(matches!(
+        classify_delete_identity(&managed("/workspaces/c1", ""), Some("c1")),
+        Err(WorktreeOpError::NotFound(_))
+    ));
 }
 
 // ── Merge ────────────────────────────────────────────────────────────────────
@@ -533,7 +612,11 @@ async fn remote_worktree_concurrent_mutation_reports_root_busy() {
         .acquire_root()
         .expect("first caller takes the guard");
     let refusal = service
-        .delete_worktree(Path::new("/workspaces/c1"), DeleteOptions::fail_closed())
+        .delete_worktree(
+            Path::new("/workspaces/c1"),
+            Some("c1"),
+            DeleteOptions::fail_closed(),
+        )
         .await
         .expect_err("second caller must be refused");
     assert!(matches!(refusal, WorktreeOpError::RootBusy(_)));
