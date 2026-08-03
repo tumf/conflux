@@ -47,10 +47,3 @@ Acceptance repair round 2 — findings without a runtime checkbox. The acceptanc
 
 - Evaluate Archive operation-level recovery separately if concrete logs show repository-local evidence can distinguish recoverable command crashes from unsafe partial archive state.
 - Consider configurable operation retry bounds only if fixed safety bounds prove operationally insufficient and a stable cross-operation configuration contract is justified.
-
-## Current Acceptance Follow-up
-- attempt: 2
-- [x] [major] src/parallel/dispatch.rs:2100-2107 records typed iteration_limit, but src/tui/orchestrator.rs:1129-1198 never reads it or invokes on_finish; add TUI-parallel routing and integration coverage for exactly one on_finish(status=iteration_limit) with the exact count.
-  evidence: src/tui/orchestrator.rs run_orchestrator_parallel now calls run_tui_parallel_finish_hook once before any terminal event, deriving status/count from the shared OrchestratorState::parallel_finish_report the dispatch record feeds; tui::orchestrator::tests::parallel_finish_hook proves one `iteration_limit 7` on_finish line, the completed fallback, and boundary parity with `cflx run`
-- [x] [minor] src/ai_command_runner.rs:229-252 logs spawn/wrap failures without forwarding their cause, then 664-668 and 763-768 return only a synthetic status; propagate bounded launch errors into Apply, Acceptance, and cleanup recovery diagnostics.
-  evidence: both launch failure arms now emit launch_failure_line on the same output channel Apply history, the Acceptance command diagnostic, and cleanup-review all collect stderr tails from; ai_command_runner::tests::launch_failure_diagnostics covers stage/op/change/cause, bounding, and a real failed spawn reaching the caller
