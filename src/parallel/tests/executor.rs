@@ -486,13 +486,17 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
         1,
         ExecutionMode::Parallel,
     )));
-    shared
-        .write()
-        .await
-        .apply_execution_event(&ExecutionEvent::ResolveStarted {
+    {
+        let mut guard = shared.write().await;
+        // Production start records queue intent for its targets before the
+        // scheduler runs; ordinary dispatch reads that intent, not the local list.
+        guard.apply_command(ReducerCommand::AddToQueue("dependent".to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue("unrelated".to_string()));
+        guard.apply_execution_event(&ExecutionEvent::ResolveStarted {
             change_id: "resolving".to_string(),
             command: "resolve".to_string(),
         });
+    }
     executor.set_shared_orchestrator_state(shared.clone());
 
     let analysis = crate::analyzer::AnalysisResult {
@@ -623,13 +627,16 @@ async fn resolving_dependency_diagnostic_dedupes_and_reemits_after_signature_cha
         1,
         ExecutionMode::Parallel,
     )));
-    shared
-        .write()
-        .await
-        .apply_execution_event(&ExecutionEvent::ResolveStarted {
+    {
+        let mut guard = shared.write().await;
+        // Production start records queue intent for its targets before the
+        // scheduler runs; ordinary dispatch reads that intent, not the local list.
+        guard.apply_command(ReducerCommand::AddToQueue("dependent".to_string()));
+        guard.apply_execution_event(&ExecutionEvent::ResolveStarted {
             change_id: "resolving-a".to_string(),
             command: "resolve".to_string(),
         });
+    }
     executor.set_shared_orchestrator_state(shared.clone());
     let resolving_analysis = crate::analyzer::AnalysisResult {
         order: vec!["dependent".to_string()],
@@ -2986,6 +2993,11 @@ async fn test_blocked_only_classifier_distinguishes_scheduler_work_classes() {
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue("candidate-missing".to_string()));
+        // Ordinary candidates carry the queue intent an explicit start records
+        // for them; the lane and terminal fixtures below are classified by their
+        // own reducer-owned state.
+        guard.apply_command(ReducerCommand::AddToQueue("dispatchable".to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue("dependency-blocked".to_string()));
         guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "manual-merge".to_string(),
             reason: "manual merge required".to_string(),
@@ -12620,6 +12632,219 @@ async fn queue_revocation_blocks_worktree_and_dynamic_reacquisition_until_explic
         "explicit requeue restores archived-dirty recovery"
     );
     assert_eq!(queued_after_requeue[0].id, "stale");
+}
+
+/// Membership in the scheduler-local candidate list is history, not intent: it
+/// proves the change was admitted on some earlier pass. A candidate that was
+/// added while it carried queue intent, and is then revoked under a perfectly
+/// readable reducer, must stop being ordinary work immediately — it leaves the
+/// local list, stays out of the analyzer's input, is refused by dispatch
+/// selection even when a stale analysis order still names it, and returns only
+/// after an explicit `AddToQueue`. A second candidate keeps real intent
+/// throughout, so the run stays live and the refusal cannot be an artifact of a
+/// blocked-only pass.
+#[tokio::test]
+async fn revoked_queue_intent_stops_an_already_added_candidate_before_analysis_and_dispatch() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    for change_id in ["keeper", "revoked"] {
+        write_change_proposal(repo_dir.path(), change_id, &[]);
+        std::fs::write(
+            repo_dir
+                .path()
+                .join("openspec/changes")
+                .join(change_id)
+                .join("tasks.md"),
+            "## Implementation Tasks\n\n- [ ] Do the work\n",
+        )
+        .or_fail("write change tasks");
+    }
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["keeper".to_string(), "revoked".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue("keeper".to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue("revoked".to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    // Both candidates enter the local list the ordinary way, while both still
+    // carry accepted queue intent.
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await
+            .queued_added,
+        2,
+        "both explicitly queued changes are admitted"
+    );
+    assert_eq!(
+        executor
+            .classify_queued_work(&queued, &in_flight)
+            .await
+            .class_for("revoked"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::DispatchableApply),
+        "this fixture must start from a genuinely dispatchable candidate"
+    );
+
+    // Revocation happens with the reducer fully readable: nothing about lock
+    // contention or an unknown ID can explain what follows.
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::RemoveFromQueue("revoked".to_string()));
+    assert!(
+        queued.iter().any(|change| change.id == "revoked"),
+        "the revoked candidate is deliberately still on the scheduler-local list"
+    );
+
+    let classification = executor.classify_queued_work(&queued, &in_flight).await;
+    assert_eq!(
+        classification.class_for("revoked"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::CandidateUnavailable),
+        "a readable reducer that no longer admits the change makes it non-dispatchable"
+    );
+    assert_eq!(
+        classification
+            .dispatchable
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["keeper"],
+        "only current reducer intent stays dispatchable"
+    );
+
+    // Dispatch selection refuses it too, even when handed an order computed
+    // before the revocation.
+    let stale_order = crate::analyzer::AnalysisResult {
+        order: vec!["keeper".to_string(), "revoked".to_string()],
+        dependencies: HashMap::new(),
+        groups: None,
+    };
+    assert_eq!(
+        executor
+            .select_changes_for_dispatch(&stale_order, 4, &in_flight)
+            .await,
+        vec!["keeper".to_string()],
+        "a stale analysis order must not carry a revoked candidate into dispatch"
+    );
+
+    // Reconciliation drops it from the local list, so the analyzer is never
+    // handed work nobody wants any more.
+    let reconciliation = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+    assert_eq!(reconciliation.revoked_removed, 1);
+    assert_eq!(reconciliation.total_added(), 0);
+    assert_eq!(
+        queued
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["keeper"],
+        "revoked work leaves the scheduler-local candidate list"
+    );
+
+    let analyzer_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let analyzer = recording_analyzer(analyzer_inputs.clone());
+    let mut in_flight_for_dispatch = HashSet::new();
+    let mut join_set = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    executor
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight_for_dispatch,
+            // Zero capacity keeps this at the analysis boundary: eligibility,
+            // not slots, is what must exclude the revoked candidate.
+            max_parallelism: 0,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::Initial,
+            analyzer: &analyzer,
+            semaphore: Arc::new(Semaphore::new(1)),
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
+        .await
+        .or_fail("analysis must succeed");
+    assert_eq!(
+        analyzer_inputs.lock().expect("analyzer input lock").clone(),
+        vec![vec!["keeper".to_string()]],
+        "a revoked candidate must never reach the analyzer"
+    );
+    assert!(
+        in_flight_for_dispatch.is_empty() && join_set.is_empty(),
+        "nothing may be dispatched for a revoked candidate"
+    );
+
+    // Explicit requeue is the only way back, and it works on the very next pass.
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("revoked".to_string()));
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await
+            .queued_added,
+        1,
+        "explicit requeue restores ordinary eligibility"
+    );
+    assert_eq!(
+        executor
+            .classify_queued_work(&queued, &in_flight)
+            .await
+            .class_for("revoked"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::DispatchableApply),
+        "a requeued candidate is dispatchable again"
+    );
+    assert!(
+        executor
+            .select_changes_for_dispatch(&stale_order, 4, &in_flight)
+            .await
+            .contains(&"revoked".to_string()),
+        "dispatch selection admits the requeued candidate again"
+    );
+
+    // Stop-and-dequeue revokes the same way, and `dequeued` outlives a refresh.
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::DequeueChange("revoked".to_string()));
+    assert_eq!(
+        executor
+            .classify_queued_work(&queued, &in_flight)
+            .await
+            .class_for("revoked"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::CandidateUnavailable),
+        "a dequeued candidate is non-dispatchable for the same reason"
+    );
+    assert_eq!(
+        executor
+            .select_changes_for_dispatch(&stale_order, 4, &in_flight)
+            .await,
+        vec!["keeper".to_string()],
+        "dequeue keeps the candidate out of dispatch selection"
+    );
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await
+            .revoked_removed,
+        1,
+        "dequeued work leaves the scheduler-local candidate list too"
+    );
 }
 
 /// A dynamic queue entry is a wake-up hint, never intent. An ID the reducer has

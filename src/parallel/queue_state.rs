@@ -29,6 +29,8 @@ use tracing::{debug, error, info, warn};
 pub(super) struct QueueReconciliationOutcome {
     pub queued_added: usize,
     pub repair_added: usize,
+    /// Scheduler-local candidates dropped because reducer intent revoked them.
+    pub revoked_removed: usize,
 }
 
 fn analysis_attempt_id(
@@ -693,6 +695,19 @@ impl ParallelExecutor {
                 info!(
                     change_id = %change_id,
                     "Skipping ordinary apply dispatch because terminal error requires explicit retry"
+                );
+                continue;
+            }
+
+            // The analysis order is computed from the scheduler-local candidate
+            // list, so a candidate whose queue intent was revoked after it was
+            // added can still appear here whenever some *other* candidate keeps
+            // analysis running. Current reducer intent decides, exactly as it
+            // does in `classify_queued_work`.
+            if dependency_context.withholds_ordinary_queue_intent(change_id) {
+                info!(
+                    change_id = %change_id,
+                    "Skipping ordinary apply dispatch because current reducer intent does not admit ordinary work"
                 );
                 continue;
             }
@@ -2102,20 +2117,77 @@ impl ParallelExecutor {
         // ordinary queue intent until `RetryError` clears it. The terminal-error
         // stop gate itself stays where it can still be reached, in dispatch
         // selection.
-        let (queued_intent_ids, active_ids_from_reducer, merge_wait_ids) =
-            match shared_state.try_read() {
-                Ok(state) => (
-                    state.queued_change_ids(),
-                    state.active_change_ids(),
-                    state.merge_wait_change_ids(),
-                ),
-                Err(_) => return QueueReconciliationOutcome::default(),
-            };
+        let (
+            queued_intent_ids,
+            active_ids_from_reducer,
+            merge_wait_ids,
+            lane_wait_ids,
+            revoked_local_ids,
+        ) = match shared_state.try_read() {
+            Ok(state) => (
+                state.queued_change_ids(),
+                state.active_change_ids(),
+                state.merge_wait_change_ids(),
+                state
+                    .resolve_wait_change_ids()
+                    .into_iter()
+                    .chain(state.reject_wait_change_ids())
+                    .collect::<std::collections::HashSet<String>>(),
+                queued
+                    .iter()
+                    .filter(|change| !state.is_ordinary_queue_eligible(&change.id))
+                    .map(|change| change.id.clone())
+                    .collect::<Vec<String>>(),
+            ),
+            Err(_) => return QueueReconciliationOutcome::default(),
+        };
 
         let reducer_active_set: std::collections::HashSet<String> =
             active_ids_from_reducer.into_iter().collect();
         let reducer_merge_wait_set: std::collections::HashSet<String> =
             merge_wait_ids.into_iter().collect();
+
+        let mut outcome = QueueReconciliationOutcome::default();
+
+        // Reconciliation runs in both directions. Revoked work must leave the
+        // scheduler-local candidate list, not merely be refused at dispatch:
+        // `RemoveFromQueue` and `DequeueChange` clear intent without touching
+        // this list, so a candidate admitted on an earlier pass would otherwise
+        // keep being analysed and keep an otherwise drained run alive. Anything
+        // the reducer or the scheduler still owns as waiting work is kept —
+        // merge, resolve, and reject lanes are reducer-owned intent of their
+        // own, and an in-flight change is already running. A later explicit
+        // `AddToQueue` re-adds the change from `queued_change_ids()` below, so
+        // dropping it here loses nothing an operator asked for.
+        let revoked_local_ids: Vec<String> = revoked_local_ids
+            .into_iter()
+            .filter(|change_id| {
+                !in_flight.contains(change_id)
+                    && !reducer_active_set.contains(change_id)
+                    && !reducer_merge_wait_set.contains(change_id)
+                    && !lane_wait_ids.contains(change_id)
+                    && !self.merge_wait_changes.contains(change_id)
+                    && !self.resolve_wait_changes.contains(change_id)
+                    && !self.reject_wait_changes.contains(change_id)
+            })
+            .collect();
+        if !revoked_local_ids.is_empty() {
+            let revoked: std::collections::HashSet<&String> = revoked_local_ids.iter().collect();
+            queued.retain(|change| !revoked.contains(&change.id));
+            outcome.revoked_removed = revoked_local_ids.len();
+            for change_id in &revoked_local_ids {
+                info!(
+                    change_id = %change_id,
+                    "Queue reconciliation dropped candidate because reducer queue intent was revoked"
+                );
+                self.emit_queue_reconciliation_diagnostic(
+                    QueueReconciliationDiagnosticLevel::Info,
+                    change_id,
+                    "queue_intent_revoked",
+                )
+                .await;
+            }
+        }
 
         // Ordinary execution intent is explicit, never discovered.
         //
@@ -2134,7 +2206,7 @@ impl ParallelExecutor {
         // workspace into implicit execution intent. Preserved workspaces are
         // still inspected below, but only for an ID that is already eligible.
         if queued_intent_ids.is_empty() {
-            return QueueReconciliationOutcome::default();
+            return outcome;
         }
 
         let mut known_changes = match crate::openspec::list_changes_native_from(&self.repo_root) {
@@ -2152,7 +2224,7 @@ impl ParallelExecutor {
                     ))),
                 )
                 .await;
-                return QueueReconciliationOutcome::default();
+                return outcome;
             }
         };
 
@@ -2162,7 +2234,6 @@ impl ParallelExecutor {
                 .map(|change| (change.id.clone(), change))
                 .collect();
 
-        let mut outcome = QueueReconciliationOutcome::default();
         // Resolved on first use only. Without a repository-wide scan the base
         // branch is needed only when an already-eligible ID is missing from the
         // active catalog, so an ordinary reconciliation pass no longer pays for
@@ -2400,6 +2471,22 @@ impl ParallelExecutor {
                 classification
                     .terminal_error_retry_required
                     .push(change.id.clone());
+                continue;
+            }
+            // Ordinary dispatch requires *current* reducer intent. Sitting in the
+            // scheduler-local candidate list only proves the change was admitted
+            // on an earlier pass: `RemoveFromQueue` and `DequeueChange` revoke
+            // intent without touching that list, so a candidate added before the
+            // revocation would otherwise stay dispatchable for the rest of the
+            // run. Reducer-owned lane waits are classified above, so this gate
+            // removes ordinary eligibility only, and an explicit `AddToQueue`
+            // restores it on the very next pass.
+            if dependency_context.withholds_ordinary_queue_intent(&change.id) {
+                debug!(
+                    change_id = %change.id,
+                    "Withholding queued candidate because current reducer intent does not admit ordinary work"
+                );
+                classification.candidate_unavailable.push(change.id.clone());
                 continue;
             }
             if self.failed_tracker.should_skip(&change.id).is_some() {
