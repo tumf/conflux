@@ -2,34 +2,59 @@
 
 ## Scope
 
-The barrier covers the transition from a completed Apply command to Conflux-owned repository finalization in the same managed worktree. It does not serialize unrelated worktrees and does not replace Git's own locking.
+The barrier covers the Unix transition from a completed Apply command to Conflux-owned repository finalization in the same managed worktree. It does not serialize unrelated worktrees, replace Git locking, detect processes that escaped the owned process group, or change Windows job-object behavior.
 
-## Root Cause
+## Confirmed Evidence and Hypothesis
 
-The completion-grace path terminates a managed process group and waits on the group leader. Unix leader exit is not proof that all descendants have exited. A descendant may still hold stdout/stderr, mutate files, or retain Git's `index.lock` while the Apply loop starts WIP and final commit operations.
+Confirmed: completion-grace termination was followed by finalization before a later `index.lock` failure, and current cleanup waits for the spawned leader. Hypothesis: a descendant retained the lock after leader exit. The design removes the unsafe interval regardless of who owned the historical lock.
 
-## Decisions
+## Quiescence Contract
 
-### Quiescence is stronger than leader exit
+Two independent conditions are required:
 
-A successful cleanup outcome requires both leader reaping and no remaining members in the owned process group. The process manager owns this platform-specific proof. Callers must not infer it from elapsed time, PID disappearance, or lock-file age.
+1. the spawned leader has been reaped with an exit status
+2. the original Unix process group is absent
 
-### Keep the existing bounded termination sequence
+The injected group probe performs signal 0 against the PGID and maps results as follows:
 
-Use SIGTERM, wait for bounded quiescence, then SIGKILL and wait again. Return an unconfirmed outcome if members remain or membership cannot be checked within the budget. Never continue silently.
+| Probe result | Meaning | Finalization |
+| --- | --- | --- |
+| success | one or more group members remain | forbidden |
+| `ESRCH` | process group absent | allowed only if leader is also reaped |
+| `EPERM` | group may exist but cannot be inspected | forbidden |
+| any other error | presence unknown | forbidden |
 
-### Gate at the shared Apply boundary
+A zombie or reused PGID may conservatively appear present. That can delay/fail cleanup but cannot create an unsafe success. Lock-file absence and age are never process evidence.
 
-The Apply loop consumes the cleanup outcome before any WIP snapshot, cleanup review, final Apply commit, rejecting handoff, or Acceptance dispatch. This keeps serial and parallel callers consistent and avoids scattered sleeps around individual Git commands.
+## Bounded State Machine
 
-### Test with a real descendant-held lock
+1. Send SIGTERM to the owned process group.
+2. Until the graceful deadline, concurrently reap the leader and poll group presence.
+3. If both conditions become true, return `Quiescent { termination: Graceful, leader_status }`.
+4. Otherwise send SIGKILL to the group unless the probe already proves absence, then continue reaping/probing through a separate forceful deadline.
+5. Return `Quiescent { termination: Forced, leader_status }` only when both conditions become true.
+6. Otherwise return `Unconfirmed` with phase, PGID, leader-reap state, last probe result, and signal error if any.
 
-The regression fixture starts a process-group leader that spawns a descendant. The descendant creates and holds the managed worktree's real `index.lock`. The test observes that Conflux finalization does not begin before group cleanup and that the lock disappears through process exit, never runtime deletion.
+Probe, monotonic clock, and sleeper are injected so deadline and errno branches are unit-testable without wall-clock delay.
+
+## Caller Matrix
+
+| Command outcome | Cleanup outcome | Apply result |
+| --- | --- | --- |
+| stable completion/rejecting handoff | quiescent | continue to repository handoff |
+| stable completion/rejecting handoff | unconfirmed | fail Apply; no Git finalization or handoff |
+| explicit cancellation | either | preserve cancellation result; record cleanup diagnostics |
+| natural command completion with strict cleanup | quiescent | preserve command result |
+| natural command completion with strict cleanup | unconfirmed | strict cleanup failure overrides success, but does not convert an existing command failure into success |
+
+## Verification
+
+Deterministic unit tests own the state-machine proof. A Unix heavy integration fixture starts a leader and descendant in one group; the descendant creates a real managed-worktree `index.lock`. An event channel records cleanup and finalization ordering. The test asserts finalization is never called while the synthetic descendant exists and that Conflux never removes the lock.
 
 ## Constitution Alignment
 
-The cleanup outcome is ephemeral process-lifetime evidence. Workflow routing after restart remains derived from workspace and Git state. Acceptance is withheld unless repository-verifiable finalization can run after confirmed process cleanup, preserving truthful completion.
+Cleanup evidence is ephemeral. Restart routing remains derived from workspace and Git state. Successful handoff requires repository-verifiable finalization after confirmed cleanup.
 
 ## Relationship to final commit lock retry
 
-`retry-final-apply-commit-lock-contention` is independent defense for transient external Git contention after this barrier succeeds. This proposal fixes the internal lifecycle race and must not rely on retries to hide incomplete process cleanup.
+`retry-final-apply-commit-lock-contention` consumes this change's typed quiescence gate and therefore depends on it. Retry must not hide unconfirmed Apply cleanup.

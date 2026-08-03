@@ -2,30 +2,36 @@
 
 ### Requirement: Apply process-group cleanup gates repository finalization
 
-When Conflux observes a stable Apply completion condition while its owned command is still running, it MUST complete bounded process-group cleanup and confirm that no owned process-group members remain before starting any Conflux-owned index-mutating Git operation, cleanup review, rejecting handoff, or Acceptance handoff for that managed worktree. Leader exit alone MUST NOT be treated as process-group quiescence. If quiescence cannot be confirmed, Apply MUST fail with actionable cleanup diagnostics and MUST NOT report successful completion.
+On Unix, when Conflux observes a stable Apply completion condition while its owned command is still running, it MUST complete bounded process-group cleanup before any repository finalization or handoff. Confirmed quiescence requires both reaping the spawned leader and probing the original process group as absent. Signal-0 success means present, `ESRCH` means absent, and `EPERM` or any other error means unknown. Present or unknown MUST fail closed. Windows job-object behavior remains unchanged.
 
-#### Scenario: descendant releases Git lock before finalization
+#### Scenario: descendant releases synthetic Git lock before finalization
 
-- **GIVEN** an Apply command has reached a stable completion condition
-- **AND** a descendant in the owned process group still holds the managed worktree `index.lock`
-- **WHEN** the completion grace period expires
-- **THEN** Conflux runs bounded graceful-then-forceful process-group cleanup
-- **AND** Conflux does not start a WIP snapshot, cleanup review, or final Apply commit while that descendant remains
-- **AND** repository finalization may begin only after no owned process-group members remain
-
-#### Scenario: process-group cleanup cannot prove quiescence
-
-- **GIVEN** an Apply command has reached a stable completion condition
-- **AND** bounded graceful and forceful cleanup cannot confirm that the owned process group is empty
-- **WHEN** the cleanup budget is exhausted
-- **THEN** Apply fails with process-group cleanup diagnostics
-- **AND** no WIP snapshot or final Apply commit is created after the unconfirmed cleanup
-- **AND** cleanup review, rejecting handoff, and Acceptance are not dispatched
+- **GIVEN** a Unix Apply command has reached a stable completion condition
+- **AND** a synthetic descendant in the owned process group holds the managed-worktree `index.lock`
+- **WHEN** completion-grace cleanup begins
+- **THEN** Conflux does not start a WIP snapshot, cleanup review, or final Apply commit while the descendant remains
+- **AND** finalization may begin only after the leader is reaped and the process-group probe reports `ESRCH`
 
 #### Scenario: leader exits before descendant
 
-- **GIVEN** the owned Apply process-group leader exits during cleanup
-- **AND** at least one owned descendant remains alive
+- **GIVEN** the owned Unix Apply leader has been reaped
+- **AND** signal 0 still reports the process group present
 - **WHEN** Conflux evaluates cleanup completion
-- **THEN** it does not classify the process group as quiescent from leader exit alone
-- **AND** it continues the bounded cleanup sequence until quiescence is confirmed or cleanup fails
+- **THEN** leader exit alone does not establish quiescence
+- **AND** bounded cleanup continues or returns an unconfirmed failure
+
+#### Scenario: process-group presence is unknown
+
+- **GIVEN** leader reaping has completed
+- **AND** the process-group probe returns `EPERM` or another error besides `ESRCH`
+- **WHEN** Conflux evaluates cleanup completion
+- **THEN** it treats quiescence as unconfirmed
+- **AND** it does not begin repository finalization or successful handoff
+
+#### Scenario: forceful cleanup cannot prove quiescence
+
+- **GIVEN** graceful cleanup did not confirm both required conditions
+- **AND** the forceful cleanup deadline also expires without leader reaping plus `ESRCH`
+- **WHEN** cleanup returns to Apply
+- **THEN** Apply fails with phase, PGID, leader-reap, probe, and signal diagnostics
+- **AND** no WIP/final commit, cleanup review, rejecting handoff, or Acceptance starts
