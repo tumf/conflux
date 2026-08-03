@@ -2,74 +2,104 @@
 
 ### Requirement: HTTP Server Lifecycle
 
-When the `web-monitoring` feature is compiled, every local default TUI, `cflx tui`, and `cflx run` orchestration-owning process SHALL start its process-scoped single-instance monitoring and remote-control endpoint on a Unix domain socket before orchestration-side effects. The default socket SHALL be `${GIT_COMMON_DIR}/cflx-api.sock`; an explicit socket path SHALL override it and an explicit opt-out SHALL disable it. `--web` SHALL additionally start the retained TCP HTTP/Web UI listener against the same application state. The system SHALL NOT provide a standalone multi-project server daemon.
+When `web-monitoring` is compiled, a local default TUI, `cflx tui`, or `cflx run` process SHALL start a process-scoped single-instance monitoring and remote-control endpoint on its selected Unix domain socket before effectful startup work. `--web` or retained `web.enabled = true` SHALL additionally start the TCP HTTP/Web UI listener against the same application state. The system SHALL NOT provide a standalone multi-project server daemon.
 
-#### Scenario: Default local API starts without web flag
+#### Scenario: Server enabled via CLI flag
+- **WHEN** ユーザーが`--web`を指定し、CLIおよび設定ファイルでポートが未指定
+- **THEN** TCP HTTPサーバーはOSが割り当てる未使用ポート（ポート0による自動割り当て）で起動する
+- **AND** default or explicit UDS remains active unless explicitly opted out
+- **AND** 実際のTCPバインド先（アドレス/ポート）がログに表示される
+- **AND** オーケストレーターは通常通り動作を継続する
 
-- **GIVEN** a web-enabled build running inside a Git repository
-- **WHEN** the user starts default TUI, `cflx tui`, or `cflx run` without `--web`
-- **THEN** `/api/v2` is served on `${GIT_COMMON_DIR}/cflx-api.sock`
-- **AND** no TCP port is bound for web monitoring
-- **AND** orchestration begins only after the socket is usable
+#### Scenario: Server disabled by default
+- **WHEN** ユーザーが`--web`を指定せずに実行する
+- **THEN** TCP HTTP/Web UI listener does not start
+- **AND** no TCP network port is bound for web monitoring
+- **AND** the default or explicit Unix API listener still starts unless opted out
 
-#### Scenario: Web flag adds TCP without replacing UDS
+#### Scenario: Port already in use
+- **WHEN** TCP HTTPサーバーが明示指定されたポートにバインドしようとして、そのポートが使用中
+- **THEN** オーケストレーターはポート番号を含む明確なエラーメッセージを出力する
+- **AND** already-created listener resources are rolled back
+- **AND** オーケストレーターは非ゼロのステータスで終了する
 
-- **GIVEN** the default Unix listener is enabled
-- **WHEN** the user starts local orchestration with `--web`
-- **THEN** UDS and TCP listeners both serve the same process-scoped app and state
-- **AND** the embedded browser console remains available through TCP
+#### Scenario: Graceful shutdown
+- **WHEN** オーケストレーターが終了シグナル（Ctrl+CまたはSIGTERM）を受信する
+- **THEN** refresh, SSE, and WebSocket producers are cancelled
+- **AND** ordinary HTTP requests receive a bounded grace period
+- **AND** remaining listener tasks are stopped and awaited after the deadline
+- **AND** the owned Unix socket is cleaned up
+- **AND** オーケストレーターは正常に終了する
 
-#### Scenario: Required Unix listener fails before orchestration
+#### Scenario: Run mode success shuts down web monitoring
+- **GIVEN** ユーザーが `cflx run` を実行し、Unix listenerと任意のTCP listenerが起動している
+- **AND** オーケストレーションが成功裏に完了する
+- **WHEN** run モードが成功終了へ遷移する
+- **THEN** run モードが起動した全listener、stream producer、refresh taskは停止する
+- **AND** owned Unix socket is cleaned up
+- **AND** プロセスは追加の外部シグナルなしで正常終了する
 
-- **WHEN** the selected Unix socket cannot be safely prepared, bound, or restricted to the required permissions
-- **THEN** startup exits non-zero
-- **AND** lifecycle adapters, AI subprocesses, and orchestration do not start
-- **AND** any listener created during the failed startup transaction is stopped
+#### Scenario: No standalone daemon lifecycle
+- **GIVEN** the installed CLI
+- **WHEN** a user requests CLI help
+- **THEN** no standalone multi-project server command or service lifecycle is advertised
 
-#### Scenario: Finite run cleans up listeners
-
-- **GIVEN** `cflx run` started the default Unix listener and optional TCP listener
-- **WHEN** orchestration reaches terminal completion
-- **THEN** all listener and refresh tasks stop without another external signal
-- **AND** the Unix socket entry created by that process is removed
+#### Scenario: Default Unix API starts before effectful startup
+- **GIVEN** a Linux or macOS web-enabled build inside a Git repository
+- **WHEN** a local orchestration-owning invocation starts without Unix override or opt-out
+- **THEN** `/api/v2` binds `${GIT_COMMON_DIR}/cflx-api.sock`
+- **AND** endpoint publication completes before effectful upstream preparation, lifecycle adapters, AI subprocesses, or orchestration
 
 #### Scenario: Feature-disabled build remains API-free
-
 - **GIVEN** Conflux is compiled without `web-monitoring`
-- **WHEN** a local TUI or run invocation starts
+- **WHEN** local TUI or run starts
 - **THEN** it retains existing API-free behavior
-- **AND** the default Unix socket contract is not applied
+- **AND** no Unix listener contract or Unix-only CLI flag applies
 
 ### Requirement: Configuration Options
 
-The local server SHALL support a default repository-scoped Unix listener, an explicit Unix socket path override, and an explicit Unix listener opt-out. Retained web bind, port, token, token-environment, and allowed-origin options SHALL continue to configure the additional TCP listener enabled by `--web`. Removed multi-project `server.*` configuration SHALL NOT be required.
+The HTTP monitoring server SHALL remain configurable by its retained CLI options and `web` configuration. On Linux and macOS web-enabled builds, the local API SHALL additionally support the default repository-scoped Unix listener, an explicit Unix path override, and an explicit Unix opt-out. Removed multi-project `server.*` configuration SHALL NOT be required.
 
-#### Scenario: Default path follows repository identity
+#### Scenario: Port configuration via CLI
+- **WHEN** ユーザーが`--web --web-port 3000`で実行する
+- **THEN** TCP HTTPサーバーはデフォルトではなくポート3000にバインドする
+- **AND** the selected Unix listener remains active unless opted out
 
-- **GIVEN** two linked worktrees resolve to the same canonical Git common directory
-- **WHEN** either worktree resolves the default API endpoint
-- **THEN** both resolve `${GIT_COMMON_DIR}/cflx-api.sock`
+#### Scenario: Auto port selection by default
+- **WHEN** TCP web monitoring is enabled and CLIと設定ファイルの両方でポートが未指定
+- **THEN** TCP HTTPサーバーはOSが割り当てる未使用ポートで起動する
+- **AND** 実際のバインド先がログとendpoint metadataに表示される
+
+#### Scenario: Configuration via config file
+- **WHEN** 設定ファイルに`web.enabled = true`と`web.port = 9000`がある
+- **THEN** CLIフラグがなくてもTCP HTTPサーバーはポート9000で起動する
+- **AND** the selected Unix listener also starts unless opted out
+- **AND** CLIで指定した値は設定ファイルより優先される
+
+#### Scenario: Retained web options configure listener
+- **GIVEN** a local TUI or run invocation
+- **WHEN** the user supplies retained web bind, port, token, token-env, or allowed-origin options
+- **THEN** bind, port, and browser-origin values configure the retained TCP listener under existing validation rules
+- **AND** resolved authentication applies to every active listener
+
+#### Scenario: Server configuration is absent
+- **GIVEN** a configuration without obsolete `server.*` fields
+- **WHEN** local web monitoring starts
+- **THEN** startup does not require multi-project server configuration
 
 #### Scenario: Explicit Unix path overrides default
-
+- **GIVEN** a Linux or macOS web-enabled build
 - **WHEN** the user supplies `--web-unix-socket PATH`
-- **THEN** the process binds UDS at `PATH` instead of `${GIT_COMMON_DIR}/cflx-api.sock`
+- **THEN** UDS binds the validated absolute `PATH` instead of `${GIT_COMMON_DIR}/cflx-api.sock`
 
-#### Scenario: Explicit opt-out disables UDS
-
+#### Scenario: Explicit Unix opt-out
+- **GIVEN** a Linux or macOS web-enabled build
 - **WHEN** the user supplies `--no-web-unix-socket`
-- **THEN** no Unix socket is bound
-- **AND** `--web` may still enable the retained TCP listener
+- **THEN** no Unix listener starts
+- **AND** retained TCP web monitoring may still start
 
-#### Scenario: Non-Git default path is unavailable
-
-- **GIVEN** a local orchestration invocation is outside a Git repository
-- **WHEN** neither an explicit Unix socket path nor opt-out is supplied
-- **THEN** startup exits non-zero with an actionable path-selection error
-
-#### Scenario: Retained TCP options configure only TCP listener
-
-- **GIVEN** a local TUI or run invocation uses `--web`
-- **WHEN** the user supplies retained web bind, port, token, token-environment, or allowed-origin options
-- **THEN** those values configure the process-scoped TCP listener under existing validation rules
-- **AND** the active Unix listener uses the same authentication policy without becoming a browser URL
+#### Scenario: Non-Git default is rejected
+- **GIVEN** a Linux or macOS web-enabled orchestration invocation outside Git
+- **WHEN** neither explicit Unix path nor opt-out is supplied
+- **THEN** startup fails before effectful work
+- **AND** the error explains both supported choices
