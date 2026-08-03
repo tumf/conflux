@@ -36,12 +36,3 @@ Results on 2026-08-03:
 
 - A separate change may introduce repository-wide cross-process mutation coordination if scoped ownership and read-only lock suppression prove insufficient.
 - Push refspec narrowing or atomic branch/tag publication may be proposed separately.
-
-## Current Acceptance Follow-up
-- attempt: 1
-- [x] `openspec/changes/scope-release-bump-commit/tasks.md` (lines 7 and 29) claims staging-failure integration evidence, but `tests/release_bump_scope_tests.rs` injects generation and commit failures only; inject a real `git add` failure and assert no tag/push and no version-advancing retry.
-  evidence: `staging_failure_blocks_tag_push_and_a_version_advancing_retry` holds `.git/index.lock` so the real `git add -- <owned paths>` fails, and asserts no commit, no tag, unchanged origin refs, and a retry that stops at dirty owned paths without advancing past 0.1.1; tasks.md notes now describe that injection.
-- [x] Recovery in `scripts/bump.sh` (lines 140-167) treats a matching subject as sufficient proof of a valid release commit and accepts a lightweight `vX.Y.Z` tag at HEAD, violating scoped-release-commit and annotated-tag requirements; validate commit contents/tag object type and add integration cases for both invalid states.
-  evidence: `scripts/bump.sh` adds `head_is_scoped_release_commit` (subject plus a non-empty change set limited to owned paths and including `Cargo.toml`) and `tag_is_annotated` gating both recovery branches, covered by `release_labelled_commit_with_unrelated_contents_is_not_resumed` and `lightweight_tag_at_head_is_rejected_instead_of_published`.
-- [x] `scripts/bump.sh:set_release_owned_paths` (lines 74-79) excludes a tracked `docs/openapi.yaml` after it is deleted from the worktree, allowing a dirty release-owned artifact to bypass pre-mutation rejection; determine ownership from tracked/HEAD state and add an integration test proving deletion creates no commit, tag, or push.
-  evidence: `set_release_owned_paths` now claims `docs/openapi.yaml` when it exists in the worktree, in the index (`git ls-files --error-unmatch`), or in `HEAD` (`git cat-file -e`), proven by `deleted_tracked_openapi_blocks_release` and `staged_deletion_of_tracked_openapi_blocks_release`.
