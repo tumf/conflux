@@ -68,8 +68,22 @@ next_core_version() {
 	esac
 }
 
-is_clean_tree() {
-	git diff --quiet --exit-code && git diff --cached --quiet --exit-code && [[ -z "$(git ls-files --others --exclude-standard)" ]]
+# Release-owned artifacts for a main/master release. The same set is reused for
+# start-state validation, generated-delta checks, staging, and commit isolation
+# so a release can never absorb unrelated concurrent work in the repository.
+set_release_owned_paths() {
+	RELEASE_OWNED_PATHS=(Cargo.toml Cargo.lock)
+	if [[ -f docs/openapi.yaml ]]; then
+		RELEASE_OWNED_PATHS+=(docs/openapi.yaml)
+	fi
+}
+
+# True when every release-owned path matches HEAD in both index and worktree.
+# Unrelated staged, unstaged, and untracked work is deliberately ignored.
+owned_paths_clean() {
+	git diff --quiet --exit-code -- "${RELEASE_OWNED_PATHS[@]}" &&
+		git diff --cached --quiet --exit-code -- "${RELEASE_OWNED_PATHS[@]}" &&
+		[[ -z "$(git ls-files --others --exclude-standard -- "${RELEASE_OWNED_PATHS[@]}")" ]]
 }
 
 acquire_bump_lock() {
@@ -112,10 +126,43 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
 		exit 1
 	fi
 
+	set_release_owned_paths
+
+	# Reject only dirty release-owned paths; unrelated dirty work is allowed and
+	# must survive the release untouched.
+	if ! owned_paths_clean; then
+		echo "Release-owned paths must match HEAD before a release:" >&2
+		git status --porcelain -- "${RELEASE_OWNED_PATHS[@]}" >&2
+		echo "Resolve or restore these paths and retry" >&2
+		exit 1
+	fi
+
 	CURRENT_HEAD=$(git rev-parse HEAD)
 	CURRENT_TAG_HEAD=$(git rev-list -n 1 "v${CURRENT_VERSION}" 2>/dev/null || true)
-	if [[ "$CURRENT_TAG_HEAD" == "$CURRENT_HEAD" ]] && is_clean_tree; then
-		echo "Release v${CURRENT_VERSION} already exists at HEAD; nothing to do"
+
+	# Recovery: the tag for the manifest version already points at HEAD, so the
+	# release commit and tag exist and only publication may be incomplete.
+	if [[ -n "$CURRENT_TAG_HEAD" && "$CURRENT_TAG_HEAD" == "$CURRENT_HEAD" ]]; then
+		if $DRY_RUN; then
+			echo "[dry-run] Would push ${CURRENT_BRANCH} and existing tag v${CURRENT_VERSION}"
+			exit 0
+		fi
+		echo "Release v${CURRENT_VERSION} is committed and tagged at HEAD; resuming publication"
+		git push origin "$CURRENT_BRANCH" --follow-tags
+		exit 0
+	fi
+
+	# Recovery: HEAD is the release commit for the manifest version but its tag
+	# is missing, so complete the same release instead of bumping again.
+	HEAD_SUBJECT=$(git log -1 --pretty=%s)
+	if [[ -z "$CURRENT_TAG_HEAD" && "$HEAD_SUBJECT" == "chore(release): release v${CURRENT_VERSION}" ]]; then
+		if $DRY_RUN; then
+			echo "[dry-run] Would tag v${CURRENT_VERSION} at HEAD and push ${CURRENT_BRANCH}"
+			exit 0
+		fi
+		echo "Release commit v${CURRENT_VERSION} is at HEAD without its tag; resuming release"
+		git tag -a "v${CURRENT_VERSION}" -m "Release v${CURRENT_VERSION}"
+		git push origin "$CURRENT_BRANCH" --follow-tags
 		exit 0
 	fi
 
@@ -132,7 +179,7 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
 	replace_versions "$NEW_VERSION"
 	cargo generate-lockfile
 
-	if is_clean_tree; then
+	if owned_paths_clean; then
 		echo "No release changes produced for v${NEW_VERSION}" >&2
 		exit 1
 	fi
@@ -142,8 +189,11 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
 		COMMIT_ARGS=(--no-verify "${COMMIT_ARGS[@]}")
 	fi
 
-	git add -A
-	git commit "${COMMIT_ARGS[@]}"
+	# Stage and commit only the owned paths. `--only` builds the commit from
+	# HEAD plus these paths, so unrelated pre-existing index entries stay staged
+	# and out of the release commit.
+	git add -- "${RELEASE_OWNED_PATHS[@]}"
+	git commit "${COMMIT_ARGS[@]}" --only -- "${RELEASE_OWNED_PATHS[@]}"
 	git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
 	git push origin "$CURRENT_BRANCH" --follow-tags
 	exit 0
