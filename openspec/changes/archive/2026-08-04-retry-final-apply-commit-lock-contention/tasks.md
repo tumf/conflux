@@ -54,14 +54,3 @@ Expected archive gate: `cflx openspec validate retry-final-apply-commit-lock-con
 ## Future Work
 
 - Introduce a shared local-VCS retry abstraction only if another independently specified operation needs identical classification, identity, and idempotency semantics.
-
-## Current Acceptance Follow-up
-- attempt: 1
-- [x] `src/execution/final_commit_lock_retry.rs:200-209,272-298` の dirty/add-and-commit 曖昧成功判定は試行前の期待 workspace tree を保存・比較せず、親・subject・事後 clean のみで成功扱いするため、同じ subject と親を持つ別 tree の commit を誤認できる。期待 dirty-workspace tree を厳密に比較し、same-subject/same-parent/clean だが tree 不一致の unit test と temporary-repository test を追加すること。
-  evidence: `FinalizationState.workspace_tree` captures the pre-attempt dirty-worktree tree via `FinalCommitEnvironment::workspace_tree`, and the add-and-commit branch of `final_commit_recorded` now rejects any observed commit whose tree differs from it
-  evidence: `GitFinalCommitEnvironment::workspace_tree` replays `git add -A` plus `git write-tree` against a throwaway copy of the index through `GIT_INDEX_FILE`, so the expected tree is observed without writing the managed worktree's index or taking its `index.lock`
-  evidence: unit `final_apply_commit_lock_ambiguous_success_rejects_mismatched_tree_on_the_add_path` builds a same-subject, same-parent, worktree-clean commit of other content and asserts 3 attempts then `did not clear`
-  evidence: temporary-repository `git_tests::final_apply_commit_lock_ambiguous_success_rejects_mismatched_tree_on_the_add_path` lands a real same-subject/same-parent commit of tampered content and asserts exhaustion plus an untouched foreign commit and worktree
-  evidence: temporary-repository `git_tests::final_apply_commit_lock_environment_workspace_tree_matches_the_committed_tree` proves the captured tree equals the tree real `git add -A` plus `git commit` records over addition, removal and ignored-file cases, with nothing staged in the real index and no `index.lock` taken
-  evidence: both new mismatch tests fail with `Committed` when the tree comparison is removed, so they are non-vacuous
-  evidence: `cargo test --lib` passed with 3019 passed, 0 failed, 9 ignored; `cargo clippy --all-targets -- -D warnings` passed with no warnings
