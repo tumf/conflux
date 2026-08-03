@@ -54,6 +54,42 @@ fn configure_parallel_upstream_integration(
 const PARALLEL_CANCELLATION_CLEANUP_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(120);
 
+/// Run `on_finish` exactly once for a TUI parallel run.
+///
+/// The workspace task records the shared Apply-budget owner's refusal as a typed
+/// observation on the reducer, so this boundary reports `iteration_limit` with
+/// that change's exact cumulative dispatch count — the same contract `cflx run`
+/// reports through `Orchestrator::run_parallel_finish_hook` and serial reports
+/// through `LoopControl::Break`. Without this call the TUI never delivered the
+/// typed outcome to the hook at all.
+async fn run_tui_parallel_finish_hook(
+    hooks: &crate::hooks::HookRunner,
+    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+) -> Result<()> {
+    use crate::hooks::{HookContext, HookType};
+
+    let state = shared_state.read().await;
+    let (finish_status, finish_apply_count) = state.parallel_finish_report();
+    let iteration_limit = state.apply_iteration_limits().first().cloned();
+    let processed = state.changes_processed();
+    let total = state.total_changes();
+    drop(state);
+
+    if let Some(record) = &iteration_limit {
+        tracing::info!(
+            change_id = %record.change_id,
+            attempts = record.attempts,
+            max = record.max,
+            "Parallel run stopped on the Apply-dispatch ceiling"
+        );
+    }
+
+    let finish_context = HookContext::new(processed, total, 0, false)
+        .with_status(finish_status)
+        .with_apply_count(finish_apply_count);
+    hooks.run_hook(HookType::OnFinish, &finish_context).await
+}
+
 /// How one parallel orchestration boundary run reached its terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParallelTermination {
@@ -1133,6 +1169,29 @@ pub async fn run_orchestrator_parallel(
         has_reducer_owned_lane_wait_or_active,
     );
 
+    // Exactly one `on_finish` per TUI parallel boundary run, before any terminal
+    // event, so a hook log can never be ordered after completion. A run stopped
+    // by the shared Apply-dispatch ceiling reports the typed `iteration_limit`
+    // status with its exact cumulative count.
+    {
+        let (hook_event_bridge, hook_bridge_handle) = dispatcher.bridge(EVENT_BRIDGE_BUFFER);
+        let hooks = crate::hooks::HookRunner::with_event_tx(
+            config.get_hooks(),
+            &repo_root,
+            hook_event_bridge,
+        );
+        if let Err(e) = run_tui_parallel_finish_hook(&hooks, &shared_state).await {
+            dispatcher
+                .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
+                    "on_finish hook failed: {}",
+                    e
+                ))))
+                .await;
+        }
+        drop(hooks);
+        let _ = tokio::time::timeout(EVENT_BRIDGE_DRAIN_TIMEOUT, hook_bridge_handle).await;
+    }
+
     match report {
         ParallelTerminalReport::Stopped => {
             if termination.is_operator_cancellation() {
@@ -1201,6 +1260,117 @@ pub async fn run_orchestrator_parallel(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    /// The TUI parallel boundary owns the same typed finish contract `cflx run`
+    /// owns: the reducer's Apply-ceiling observation, not an error string, is
+    /// what `on_finish` reports.
+    mod parallel_finish_hook {
+        use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        fn hooks_writing_finish_status(
+            log: &std::path::Path,
+            repo_root: &std::path::Path,
+        ) -> HookRunner {
+            HookRunner::new(
+                HooksConfig {
+                    on_finish: Some(HookConfigValue::Full(HookConfig {
+                        command: format!(
+                            "sh -c 'echo \"$OPENSPEC_STATUS $OPENSPEC_APPLY_COUNT\" >> {}'",
+                            log.display()
+                        ),
+                        continue_on_failure: false,
+                        timeout: 30,
+                        git_commit_no_verify: false,
+                        max_retries: 0,
+                        retry_delay_secs: 0,
+                    })),
+                    ..Default::default()
+                },
+                repo_root,
+            )
+        }
+
+        fn lines(log: &std::path::Path) -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        }
+
+        fn parallel_state(
+            change_id: &str,
+            max_iterations: u32,
+        ) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
+            Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+                vec![change_id.to_string()],
+                max_iterations,
+                ExecutionMode::Parallel,
+            )))
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_recorded_iteration_limit_reports_status_and_exact_count_once() {
+            let temp_dir = TempDir::new().unwrap();
+            let log = temp_dir.path().join("on-finish.log");
+            let hooks = hooks_writing_finish_status(&log, temp_dir.path());
+            let shared_state = parallel_state("change-a", 7);
+
+            {
+                let mut state = shared_state.write().await;
+                // The workspace task's typed observation: the ceiling refused
+                // dispatch 8 after 7 cumulative dispatches.
+                state.record_apply_iteration_limit("change-a", 7, 7);
+                // A repeated observation for the same change must not duplicate.
+                state.record_apply_iteration_limit("change-a", 7, 7);
+            }
+
+            super::super::run_tui_parallel_finish_hook(&hooks, &shared_state)
+                .await
+                .expect("the finish hook must run");
+
+            assert_eq!(
+                lines(&log),
+                vec!["iteration_limit 7".to_string()],
+                "the TUI parallel boundary runs on_finish exactly once with the typed status and \
+                 the exact cumulative count"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_run_without_an_iteration_limit_reports_completed() {
+            let temp_dir = TempDir::new().unwrap();
+            let log = temp_dir.path().join("on-finish.log");
+            let hooks = hooks_writing_finish_status(&log, temp_dir.path());
+            let shared_state = parallel_state("change-a", 7);
+
+            super::super::run_tui_parallel_finish_hook(&hooks, &shared_state)
+                .await
+                .expect("the finish hook must run");
+
+            assert_eq!(lines(&log), vec!["completed 0".to_string()]);
+        }
+
+        /// Both parallel boundaries read the same reducer observation, so a
+        /// frontend can never report a different finish status for one run.
+        #[tokio::test]
+        async fn tui_and_run_derive_the_same_report_from_one_observation() {
+            let mut state = OrchestratorState::with_mode(
+                vec!["change-a".to_string()],
+                7,
+                ExecutionMode::Parallel,
+            );
+            assert_eq!(state.parallel_finish_report(), ("completed", 0));
+            state.record_apply_iteration_limit("change-a", 7, 7);
+            assert_eq!(state.parallel_finish_report(), ("iteration_limit", 7));
+        }
+    }
 
     #[test]
     fn parallel_service_uses_tui_post_archive_action() {

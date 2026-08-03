@@ -11744,6 +11744,25 @@ async fn dispatch_scripted_command_failure_cycle(
     failing_attempts: &[u32],
     verdicts: &[String],
 ) -> ScriptedRepairDispatch {
+    dispatch_scripted_acceptance_failure_cycle(
+        change_id,
+        failing_attempts,
+        "acceptance transport crashed on attempt $n",
+        verdicts,
+    )
+    .await
+}
+
+/// Same scaffolding as [`dispatch_scripted_command_failure_cycle`], with the
+/// text a failing acceptance invocation writes to stderr under the caller's
+/// control so a failure can carry classified permission-denial evidence instead
+/// of an ordinary crash message.
+async fn dispatch_scripted_acceptance_failure_cycle(
+    change_id: &str,
+    failing_attempts: &[u32],
+    failure_stderr: &str,
+    verdicts: &[String],
+) -> ScriptedRepairDispatch {
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_base = TempDir::new().or_fail("create temp workspace base");
     let state_dir = TempDir::new().or_fail("create scripted verdict state dir");
@@ -11787,7 +11806,7 @@ async fn dispatch_scripted_command_failure_cycle(
              echo $n > \"{counter}\"; \
              for f in {failing}; do \
              if [ \"$f\" = \"$n\" ]; then \
-             echo \"acceptance transport crashed on attempt $n\" >&2; exit 1; fi; done; \
+             echo \"{failure_stderr}\" >&2; exit 1; fi; done; \
              verdict=\"{verdict_dir}/verdict-$n.json\"; \
              [ -f \"$verdict\" ] || verdict=\"{verdict_dir}/verdict-last.json\"; cat \"$verdict\"'"
         )),
@@ -11846,6 +11865,12 @@ async fn dispatch_scripted_command_failure_cycle(
             }
             ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
                 observed.apply_invocations += 1;
+            }
+            ExecutionEvent::ExecutionBlocked {
+                change_id: id,
+                blocker,
+            } if id == change_id => {
+                observed.execution_hold = Some(blocker);
             }
             ExecutionEvent::Log(log)
                 if matches!(log.level, crate::events::LogLevel::Error)
@@ -11954,6 +11979,49 @@ async fn parallel_completed_protocol_result_resets_acceptance_command_recovery()
     assert_eq!(
         observed.apply_invocations, 1,
         "neither command recovery nor protocol retry reruns Apply"
+    );
+}
+
+/// A permission/tool-policy denial observed by an invocation that never
+/// completed is still a denial: the classification survives the command-failure
+/// retry, so the unchanged repeat enters the existing non-terminal hold instead
+/// of spending the whole command-recovery budget.
+///
+/// Regression: command failures record no canonical Acceptance attempt, so
+/// reconstructing "the previous denial" from history alone always saw `None`
+/// and every repeat looked like a first observation.
+#[tokio::test]
+async fn parallel_repeated_acceptance_denial_holds_without_spending_command_recovery() {
+    let change_id = "parallel-cmd-denial";
+    let observed = dispatch_scripted_acceptance_failure_cycle(
+        change_id,
+        &[1, 2, 3, 4],
+        "Tool access denied: Bash(git push)",
+        &["{\"acceptance\":\"pass\"}".to_string()],
+    )
+    .await;
+
+    assert_eq!(
+        observed.acceptance_invocations, 2,
+        "the second unchanged denial holds instead of consuming the third attempt"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "a permission hold never reruns Apply"
+    );
+    assert_eq!(
+        observed.result.error, None,
+        "a permission hold is non-terminal, not a workspace failure"
+    );
+    let blocker = observed
+        .execution_hold
+        .as_ref()
+        .or_fail("the repeated denial must enter the existing non-terminal hold");
+    let summary = blocker.summary();
+    assert!(
+        summary.to_lowercase().contains("permission")
+            || summary.to_lowercase().contains("tool_access"),
+        "the hold must name the classified denial: {summary}"
     );
 }
 

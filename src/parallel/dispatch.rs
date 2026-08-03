@@ -175,6 +175,25 @@ async fn hold_repair_stop(
     }
 }
 
+/// Whether an Apply-stage error is shaped like cancellation at all.
+///
+/// Only such an error may consume the per-change queue stop flag; an ordinary
+/// failure must leave a pending stop untouched.
+fn cancellation_shaped_apply_error(error: &OrchestratorError) -> bool {
+    error.is_cancellation() || error.to_string().contains("Cancelled")
+}
+
+/// Whether the run boundary reports an Apply-stage error as an intentional stop
+/// instead of an execution failure.
+///
+/// The typed cancellation outcome covers both global cancellation and a
+/// per-change queue stop, which is what post-apply cleanup-review now returns.
+/// The message check remains for the Apply loop's own untyped cancellation,
+/// where a queue stop is what proves the stop was intentional.
+fn apply_error_is_intentional_stop(error: &OrchestratorError, queue_stopped: bool) -> bool {
+    error.is_cancellation() || (queue_stopped && error.to_string().contains("Cancelled"))
+}
+
 fn stalled_blocker_from_marker(marker: &BlockedMarker) -> crate::events::StalledBlocker {
     crate::events::StalledBlocker {
         category: "acceptance_marker".to_string(),
@@ -206,6 +225,72 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+
+    /// How the parallel run boundary reports an Apply-stage error.
+    ///
+    /// Cleanup-review runs inside Apply, so its cancellation arrives here; a
+    /// boundary that only recognised a per-change queue stop reported an
+    /// operator's global stop as an execution failure.
+    mod apply_boundary_stop_routing {
+        use super::super::{apply_error_is_intentional_stop, cancellation_shaped_apply_error};
+        use crate::error::OrchestratorError;
+        use std::path::Path;
+
+        fn cleanup_cancelled() -> OrchestratorError {
+            OrchestratorError::cancelled("cleanup-review", "change-a", Path::new("/tmp/ws"))
+        }
+
+        fn apply_cancelled_message() -> OrchestratorError {
+            OrchestratorError::AgentCommand(
+                "Cancelled apply for 'change-a' in workspace '/tmp/ws'".to_string(),
+            )
+        }
+
+        #[test]
+        fn typed_cancellation_is_an_intentional_stop_without_a_queue_stop() {
+            // Global cancellation: no per-change queue stop was recorded.
+            assert!(apply_error_is_intentional_stop(&cleanup_cancelled(), false));
+            assert!(apply_error_is_intentional_stop(&cleanup_cancelled(), true));
+        }
+
+        #[test]
+        fn an_untyped_cancellation_message_still_needs_its_queue_stop() {
+            assert!(apply_error_is_intentional_stop(
+                &apply_cancelled_message(),
+                true
+            ));
+            assert!(!apply_error_is_intentional_stop(
+                &apply_cancelled_message(),
+                false
+            ));
+        }
+
+        #[test]
+        fn an_ordinary_failure_is_never_an_intentional_stop() {
+            let failure = OrchestratorError::AgentCommand(
+                "Cleanup-review failed on 3 operation attempts".to_string(),
+            );
+            assert!(!apply_error_is_intentional_stop(&failure, false));
+            assert!(!apply_error_is_intentional_stop(&failure, true));
+        }
+
+        #[test]
+        fn only_a_cancellation_shaped_error_may_consume_the_queue_stop_flag() {
+            assert!(cancellation_shaped_apply_error(&cleanup_cancelled()));
+            assert!(cancellation_shaped_apply_error(&apply_cancelled_message()));
+            assert!(!cancellation_shaped_apply_error(
+                &OrchestratorError::AgentCommand("Apply command failed".to_string())
+            ));
+            assert!(!cancellation_shaped_apply_error(
+                &OrchestratorError::IterationLimit {
+                    change_id: "change-a".to_string(),
+                    attempts: 7,
+                    max: 7,
+                    diagnostic: "spent".to_string(),
+                }
+            ));
+        }
+    }
 
     fn init_git_workspace(path: &std::path::Path) {
         Command::new("git")
@@ -2034,36 +2119,53 @@ impl ParallelExecutor {
                         (rev, iter, blocked_handoff, rejected_handoff)
                     },
                     Err(e) => {
-                        // Check if this was a single-change stop
-                        let error_str = e.to_string();
-                        if error_str.contains("Cancelled") {
-                            if let Some(ref queue) = dynamic_queue {
-                                if queue.is_stopped(&change_id).await {
+                        // Explicit cancellation is an intentional stop, never an
+                        // execution failure. Apply, and the post-apply
+                        // cleanup-review it owns, report it as the typed
+                        // `Cancelled` outcome, so a global stop is now suppressed
+                        // the same way a per-change queue stop already was; the
+                        // queue bookkeeping is the only remaining difference.
+                        let queue_stopped = if cancellation_shaped_apply_error(&e) {
+                            match dynamic_queue {
+                                Some(ref queue) if queue.is_stopped(&change_id).await => {
                                     queue.clear_stopped(&change_id).await;
-                                    info!("Change '{}' stopped during apply", change_id);
-                                    if let Some(ref tx) = event_tx {
-                                        let _ = tx
-                                            .send(ParallelEvent::ChangeDequeued {
-                                                change_id: change_id.clone(),
-                                            })
-                                            .await;
-                                        let _ = tx
-                                            .send(ParallelEvent::Log(LogEntry::info(format!(
-                                                "Change stopped: {}",
-                                                change_id
-                                            ))))
-                                            .await;
-                                    }
-                                    cancel_monitor.abort();
-                                    return WorkspaceResult {
-                                        change_id,
-                                        workspace_name: workspace.name,
-                                        final_revision: None,
-                                        error: None, // No error - intentionally stopped
-                                        rejected: None,
-                                    };
+                                    true
                                 }
+                                _ => false,
                             }
+                        } else {
+                            false
+                        };
+                        if apply_error_is_intentional_stop(&e, queue_stopped) {
+                            info!(
+                                change_id = %change_id,
+                                queue_stopped = queue_stopped,
+                                "Change stopped during apply: {}",
+                                e
+                            );
+                            if let Some(ref tx) = event_tx {
+                                if queue_stopped {
+                                    let _ = tx
+                                        .send(ParallelEvent::ChangeDequeued {
+                                            change_id: change_id.clone(),
+                                        })
+                                        .await;
+                                }
+                                let _ = tx
+                                    .send(ParallelEvent::Log(LogEntry::info(format!(
+                                        "Change stopped: {}",
+                                        change_id
+                                    ))))
+                                    .await;
+                            }
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: None, // No error - intentionally stopped
+                                rejected: None,
+                            };
                         }
                         if matches!(e, OrchestratorError::PermissionStalled { .. }) {
                             if let Some(ref tx) = event_tx {

@@ -89,6 +89,41 @@ pub enum OrchestratorError {
         max: u32,
         diagnostic: String,
     },
+
+    /// An in-flight operation observed explicit cancellation and terminated its
+    /// child.
+    ///
+    /// Typed rather than an untyped [`OrchestratorError::AgentCommand`] so run
+    /// boundaries can report one intentional stop for both global cancellation
+    /// and a per-change queue stop instead of an execution failure. The
+    /// rendering is unchanged, so existing message-based handling keeps working.
+    #[error("Cancelled {operation} for '{change_id}' in workspace '{workspace}'")]
+    Cancelled {
+        operation: String,
+        change_id: String,
+        workspace: String,
+    },
+}
+
+impl OrchestratorError {
+    /// Explicit cancellation of `operation` for `change_id` in `workspace`.
+    pub fn cancelled(
+        operation: impl Into<String>,
+        change_id: impl Into<String>,
+        workspace: &std::path::Path,
+    ) -> Self {
+        OrchestratorError::Cancelled {
+            operation: operation.into(),
+            change_id: change_id.into(),
+            workspace: workspace.display().to_string(),
+        }
+    }
+
+    /// True when this error is an explicit operator/queue cancellation rather
+    /// than a failure.
+    pub fn is_cancellation(&self) -> bool {
+        matches!(self, OrchestratorError::Cancelled { .. })
+    }
 }
 
 #[allow(dead_code)] // Legacy API helpers, kept for backward compatibility

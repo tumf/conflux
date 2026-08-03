@@ -1154,7 +1154,63 @@ async fn repository_progress_fingerprint(workspace_path: &Path) -> Option<String
     let (_, status) = crate::vcs::git::commands::has_uncommitted_changes(workspace_path)
         .await
         .ok()?;
-    Some(format!("{}\n{}", head.trim(), status))
+    let content = repository_content_digest(workspace_path).await;
+    Some(format!("{}\n{}\ncontent:{}", head.trim(), status, content))
+}
+
+/// Fixed-size digest of the content currently present in the worktree.
+///
+/// `git status --porcelain` reports only a path and its status letters, so an
+/// attempt that rewrites a file which was *already* dirty leaves an identical
+/// status line. Without content evidence that real repository progress reads as
+/// an empty stall step. Hashing the tracked diff against `HEAD` together with
+/// the object hashes of untracked files supplies that evidence while keeping
+/// the fingerprint bounded: only the digest is retained, never the diff itself.
+///
+/// A query that cannot be answered contributes a stable `unavailable` marker
+/// rather than a fresh value, so missing evidence still reports "no change"
+/// instead of inventing progress.
+async fn repository_content_digest(workspace_path: &Path) -> String {
+    use crate::vcs::git::commands::run_git;
+
+    let mut evidence = String::new();
+
+    match run_git(&["diff", "HEAD"], workspace_path).await {
+        Ok(diff) => evidence.push_str(&diff),
+        Err(_) => evidence.push_str("tracked-diff:unavailable"),
+    }
+    evidence.push('\n');
+
+    // Untracked files are absent from `git diff`, so their content is hashed
+    // separately. `hash-object` only reads the files; it never writes to the
+    // object store or the index.
+    match run_git(
+        &["ls-files", "--others", "--exclude-standard"],
+        workspace_path,
+    )
+    .await
+    {
+        Ok(untracked) if untracked.trim().is_empty() => {}
+        Ok(untracked) => {
+            let paths: Vec<&str> = untracked.lines().filter(|line| !line.is_empty()).collect();
+            let mut args = vec!["hash-object", "--"];
+            args.extend(paths.iter().copied());
+            match run_git(&args, workspace_path).await {
+                Ok(hashes) => {
+                    evidence.push_str(&untracked);
+                    evidence.push('\n');
+                    evidence.push_str(&hashes);
+                }
+                // Falling back to the path list alone keeps the digest stable
+                // and conservative: it can miss content-only progress, never
+                // invent it.
+                Err(_) => evidence.push_str(&untracked),
+            }
+        }
+        Err(_) => evidence.push_str("untracked:unavailable"),
+    }
+
+    format!("{:x}", md5::compute(evidence.as_bytes()))
 }
 
 /// Execute apply iterations until tasks are complete or max iterations reached.
@@ -2146,6 +2202,127 @@ fn format_apply_failure_diagnostic(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Stall accounting for a failed Apply attempt asks one question: did the
+    /// repository move? These pin the evidence that answers it.
+    mod repository_progress_evidence {
+        use super::*;
+
+        fn git(repo: &std::path::Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn repo_with_committed_file() -> TempDir {
+            let temp_dir = TempDir::new().unwrap();
+            let repo = temp_dir.path();
+            git(repo, &["init", "-b", "main"]);
+            git(repo, &["config", "user.email", "test@example.com"]);
+            git(repo, &["config", "user.name", "Test User"]);
+            std::fs::write(repo.join("src.rs"), "fn main() {}\n").unwrap();
+            git(repo, &["add", "src.rs"]);
+            git(repo, &["commit", "-m", "base"]);
+            temp_dir
+        }
+
+        /// Regression: a path that is *already* dirty keeps the same porcelain
+        /// path and status letters no matter how much its content changes, so a
+        /// fingerprint built from status alone reported "no progress" for an
+        /// attempt that really did advance the repository — and drove it into
+        /// the stall threshold.
+        #[tokio::test]
+        async fn editing_an_already_dirty_tracked_file_counts_as_progress() {
+            let repo_dir = repo_with_committed_file();
+            let repo = repo_dir.path();
+
+            std::fs::write(repo.join("src.rs"), "fn main() { first(); }\n").unwrap();
+            let before = repository_progress_fingerprint(repo)
+                .await
+                .expect("a Git worktree answers the fingerprint query");
+
+            // Same path, same ` M` status letters, different content.
+            std::fs::write(repo.join("src.rs"), "fn main() { second(); }\n").unwrap();
+            let after = repository_progress_fingerprint(repo)
+                .await
+                .expect("a Git worktree answers the fingerprint query");
+
+            let (_, status) = crate::vcs::git::commands::has_uncommitted_changes(repo)
+                .await
+                .unwrap();
+            assert_eq!(
+                status.trim(),
+                "M src.rs",
+                "the porcelain status is unchanged, which is exactly why it cannot be the only \
+                 evidence"
+            );
+            assert_ne!(
+                before, after,
+                "content progress on an already-dirty path must change the fingerprint"
+            );
+        }
+
+        /// The same holds for an untracked file the attempt keeps rewriting: it
+        /// never appears in `git diff`, so its content is hashed on its own.
+        #[tokio::test]
+        async fn rewriting_an_already_untracked_file_counts_as_progress() {
+            let repo_dir = repo_with_committed_file();
+            let repo = repo_dir.path();
+
+            std::fs::write(repo.join("new.rs"), "first\n").unwrap();
+            let before = repository_progress_fingerprint(repo).await.unwrap();
+
+            std::fs::write(repo.join("new.rs"), "second\n").unwrap();
+            let after = repository_progress_fingerprint(repo).await.unwrap();
+
+            assert_ne!(
+                before, after,
+                "content progress on an already-untracked path must change the fingerprint"
+            );
+        }
+
+        /// An attempt that changed nothing must still read as no progress, or
+        /// stall detection would never fire.
+        #[tokio::test]
+        async fn an_unchanged_worktree_keeps_one_stable_fingerprint() {
+            let repo_dir = repo_with_committed_file();
+            let repo = repo_dir.path();
+            std::fs::write(repo.join("src.rs"), "fn main() { first(); }\n").unwrap();
+            std::fs::write(repo.join("new.rs"), "untracked\n").unwrap();
+
+            let first = repository_progress_fingerprint(repo).await.unwrap();
+            let second = repository_progress_fingerprint(repo).await.unwrap();
+
+            assert_eq!(
+                first, second,
+                "an unchanged worktree must not look like progress"
+            );
+        }
+
+        /// The digest is what keeps the fingerprint bounded: a huge diff must not
+        /// grow the value the loop holds across a dispatch.
+        #[tokio::test]
+        async fn the_fingerprint_stays_bounded_for_large_diffs() {
+            let repo_dir = repo_with_committed_file();
+            let repo = repo_dir.path();
+            std::fs::write(repo.join("src.rs"), "x\n".repeat(20_000)).unwrap();
+
+            let fingerprint = repository_progress_fingerprint(repo).await.unwrap();
+
+            assert!(
+                fingerprint.len() < 512,
+                "content evidence is hashed, never retained: {} chars",
+                fingerprint.len()
+            );
+        }
+    }
 
     // === ApplyConfig tests ===
 

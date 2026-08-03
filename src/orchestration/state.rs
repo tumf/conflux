@@ -827,6 +827,20 @@ impl OrchestratorState {
         &self.apply_iteration_limits
     }
 
+    /// Finish status and Apply count a parallel run reports to `on_finish`.
+    ///
+    /// Parallel execution has no `LoopControl` return path, so this reducer is
+    /// where the typed budget outcome crosses the boundary. Every parallel run
+    /// boundary — `cflx run` and the TUI alike — derives the hook's status from
+    /// this one observation instead of parsing an error string, so both report
+    /// `iteration_limit` with the same exact cumulative count.
+    pub fn parallel_finish_report(&self) -> (&'static str, u32) {
+        match self.apply_iteration_limits.first() {
+            Some(record) => ("iteration_limit", record.attempts),
+            None => ("completed", 0),
+        }
+    }
+
     /// Mark a change as skipped.
     ///
     /// Returns true when the value was newly inserted.

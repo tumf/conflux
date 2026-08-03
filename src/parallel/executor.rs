@@ -42,12 +42,10 @@ async fn wait_for_streaming_child_with_cancel(
                     "Cancellation observed while waiting for child status; terminating child"
                 );
                 let _ = child.terminate();
-                Err(OrchestratorError::AgentCommand(format!(
-                    "Cancelled {} for '{}' in workspace '{}'",
-                    operation,
-                    change_id,
-                    workspace_path.display()
-                )))
+                // Typed intentional stop: the run boundary must be able to tell
+                // cancellation apart from an agent-command crash without
+                // matching on message text.
+                Err(OrchestratorError::cancelled(operation, change_id, workspace_path))
             }
             status = child.wait() => status.map_err(|e| {
                 let attempt_context = attempt
@@ -172,13 +170,15 @@ async fn run_post_apply_cleanup_review(
     let mut latest: Option<CleanupReviewDiagnostic> = None;
 
     for attempt in 1..=max_attempts {
-        // Explicit cancellation never starts another attempt.
+        // Explicit cancellation never starts another attempt. It is a typed
+        // intentional stop, not a cleanup failure, so the run boundary reports
+        // it as a stop for both global cancellation and a per-change queue stop.
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
-            return Err(OrchestratorError::AgentCommand(format!(
-                "Cancelled cleanup-review for '{}' in workspace '{}'",
+            return Err(OrchestratorError::cancelled(
+                "cleanup-review",
                 change_id,
-                workspace_path.display()
-            )));
+                workspace_path,
+            ));
         }
 
         match run_cleanup_review_attempt(
@@ -391,11 +391,11 @@ async fn run_cleanup_review_attempt(
                     let _ = child.terminate();
                     output_rx.close();
                     while output_rx.recv().await.is_some() {}
-                    return Err(OrchestratorError::AgentCommand(format!(
-                        "Cancelled cleanup-review for '{}' in workspace '{}'",
+                    return Err(OrchestratorError::cancelled(
+                        "cleanup-review",
                         change_id,
-                        workspace_path.display()
-                    )));
+                        workspace_path,
+                    ));
                 }
                 line = output_rx.recv() => line,
             }
@@ -1668,11 +1668,22 @@ pub async fn execute_acceptance_in_workspace(
     let previous_findings_text = agent
         .get_last_acceptance_finding_texts(change_id)
         .map(|findings| findings.join("\n"));
-    let previous_acceptance_denial = crate::permission::classify_permission_denial(&[
-        stdout_tail.as_deref(),
-        stderr_tail.as_deref(),
-        previous_findings_text.as_deref(),
-    ]);
+    // A denial observed by an invocation that never completed records no
+    // canonical attempt, so its evidence is not in the history tails above. The
+    // latest-only command-recovery diagnostic is where that classification
+    // survives: without it, an unchanged repeated denial would be retried as an
+    // ordinary command failure until the recovery budget is spent instead of
+    // entering the existing non-terminal hold on the second observation.
+    let previous_acceptance_denial = agent
+        .acceptance_command_recovery(change_id)
+        .and_then(crate::orchestration::acceptance::classify_acceptance_command_denial)
+        .or_else(|| {
+            crate::permission::classify_permission_denial(&[
+                stdout_tail.as_deref(),
+                stderr_tail.as_deref(),
+                previous_findings_text.as_deref(),
+            ])
+        });
     let last_output_context = crate::agent::build_last_acceptance_output_context(
         stdout_tail.as_deref(),
         stderr_tail.as_deref(),
@@ -3082,7 +3093,62 @@ mod tests {
             assert!(is_dirty(repo_dir.path()).await);
         }
 
+        /// Cancellation observed before an attempt starts is an intentional stop.
+        ///
+        /// Deterministic and process-free: no fixture runs, so this is the fast
+        /// default-suite coverage of the cancellation contract that the
+        /// process-boundary test below exercises against a live child.
+        #[tokio::test]
+        async fn an_already_cancelled_token_starts_no_attempt() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            let command = fixture(state.path(), "echo 'CLEANUP_REVIEW: CLEAN'");
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                Some(&cancel),
+                None,
+            )
+            .await
+            .expect_err("cancellation is an intentional stop, not a cleanup success");
+
+            assert!(
+                error.is_cancellation(),
+                "the run boundary must be able to classify the stop without parsing text: {error}"
+            );
+            assert!(
+                matches!(
+                    &error,
+                    OrchestratorError::Cancelled { operation, change_id, .. }
+                        if operation == "cleanup-review" && change_id == "change-a"
+                ),
+                "the typed stop names the operation and change: {error}"
+            );
+            assert!(
+                error.to_string().contains("Cancelled cleanup-review"),
+                "the existing rendering is unchanged: {error}"
+            );
+            assert_eq!(
+                attempts(state.path()),
+                0,
+                "explicit cancellation must not start an attempt"
+            );
+        }
+
+        /// Cancellation while a real child is streaming terminates that child and
+        /// starts no corrective attempt.
+        ///
+        /// Gated: it owns a live process that must be observed running before it
+        /// is cancelled, so its wall clock follows process spawn latency rather
+        /// than this crate's logic. The fast test above keeps the cancellation
+        /// contract itself in the default suite.
         #[cfg_attr(windows, ignore)]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
         #[tokio::test]
         async fn cancellation_terminates_the_child_and_starts_no_further_attempt() {
             let repo_dir = dirty_worktree();
@@ -3094,15 +3160,17 @@ mod tests {
             );
             let cancel = CancellationToken::new();
 
-            // Cancel only once the child has actually started. Cancelling on a fixed
-            // deadline would race a loaded machine's process spawn and stop the loop
-            // before any attempt ran, which is a different code path than the one
-            // under test. The bound only exists so a never-starting fixture still
-            // fails the assertion instead of hanging.
+            // Cancel only once the child has actually started. Cancelling on a
+            // fixed deadline would race process spawn and stop the loop before
+            // any attempt ran, which is the other code path. Waiting for the
+            // marker instead of a deadline is what makes the observation, rather
+            // than the machine's load, decide when to cancel.
             let started_marker = state.path().join("started");
             let waiter = cancel.clone();
-            tokio::spawn(async move {
-                for _ in 0..6_000 {
+            let starter = tokio::spawn(async move {
+                // Generous, not tight: the bound exists only so a fixture that
+                // never starts fails the assertions instead of hanging.
+                for _ in 0..12_000 {
                     if started_marker.exists() {
                         break;
                     }
@@ -3122,9 +3190,10 @@ mod tests {
             .await
             .expect_err("cancellation is an intentional stop, not a cleanup success");
 
+            starter.abort();
             assert!(
-                error.to_string().contains("Cancelled cleanup-review"),
-                "cancellation keeps the existing intentional-stop routing: {error}"
+                error.is_cancellation(),
+                "cancellation keeps the typed intentional-stop routing: {error}"
             );
             assert_eq!(
                 attempts(state.path()),

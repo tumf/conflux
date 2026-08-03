@@ -1463,22 +1463,19 @@ impl Orchestrator {
     async fn run_parallel_finish_hook(&self) -> Result<()> {
         let state = self.shared_state.read().await;
         let iteration_limit = state.apply_iteration_limits().first().cloned();
+        let (finish_status, finish_apply_count) = state.parallel_finish_report();
         let processed = state.changes_processed();
         let total = state.total_changes();
         drop(state);
 
-        let (finish_status, finish_apply_count) = match &iteration_limit {
-            Some(record) => {
-                info!(
-                    change_id = %record.change_id,
-                    attempts = record.attempts,
-                    max = record.max,
-                    "Parallel run stopped on the Apply-dispatch ceiling"
-                );
-                ("iteration_limit", record.attempts)
-            }
-            None => ("completed", 0),
-        };
+        if let Some(record) = &iteration_limit {
+            info!(
+                change_id = %record.change_id,
+                attempts = record.attempts,
+                max = record.max,
+                "Parallel run stopped on the Apply-dispatch ceiling"
+            );
+        }
 
         let finish_context = HookContext::new(processed, total, 0, false)
             .with_status(finish_status)
