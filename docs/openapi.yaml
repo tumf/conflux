@@ -43,7 +43,7 @@ info:
   license:
     name: MIT
     identifier: MIT
-  version: 0.6.230
+  version: 0.6.231
 paths:
   /api/v2/capabilities:
     get:
