@@ -1210,15 +1210,15 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         merge_result_channel_override: None,
     };
 
-    let revisions = vec![workspace_a.name.clone()];
-    let change_ids = vec!["change-a".to_string()];
+    let items = crate::parallel::resolve_state::SequentialMergeItem::batch(
+        std::slice::from_ref(&workspace_a.name),
+        &["change-a".to_string()],
+        std::slice::from_ref(&workspace_a.path),
+    )
+    .or_fail("well-formed sequential merge batch");
 
     executor
-        .merge_and_resolve_with(
-            &revisions,
-            &change_ids,
-            |_revs, _details| async move { Ok(()) },
-        )
+        .merge_and_resolve_with(&items, |_revs, _details| async move { Ok(()) })
         .await
         .or_fail("unexpected error");
 
@@ -1376,15 +1376,15 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         merge_result_channel_override: None,
     };
 
-    let revisions = vec![workspace_a.name.clone()];
-    let change_ids = vec!["change-a".to_string()];
+    let items = crate::parallel::resolve_state::SequentialMergeItem::batch(
+        std::slice::from_ref(&workspace_a.name),
+        &["change-a".to_string()],
+        std::slice::from_ref(&workspace_a.path),
+    )
+    .or_fail("well-formed sequential merge batch");
 
     executor
-        .merge_and_resolve_with(
-            &revisions,
-            &change_ids,
-            |_revs, _details| async move { Ok(()) },
-        )
+        .merge_and_resolve_with(&items, |_revs, _details| async move { Ok(()) })
         .await
         .or_fail("unexpected error");
 
@@ -1597,15 +1597,15 @@ async fn test_merge_retries_when_merge_commit_missing() {
         merge_result_channel_override: None,
     };
 
-    let revisions = vec![workspace_a.name, workspace_b.name];
-    let change_ids = vec!["change-a".to_string(), "change-b".to_string()];
+    let items = crate::parallel::resolve_state::SequentialMergeItem::batch(
+        &[workspace_a.name.clone(), workspace_b.name.clone()],
+        &["change-a".to_string(), "change-b".to_string()],
+        &[workspace_a.path.clone(), workspace_b.path.clone()],
+    )
+    .or_fail("well-formed sequential merge batch");
 
     executor
-        .merge_and_resolve_with(
-            &revisions,
-            &change_ids,
-            |_revs, _details| async move { Ok(()) },
-        )
+        .merge_and_resolve_with(&items, |_revs, _details| async move { Ok(()) })
         .await
         .or_fail("unexpected error");
 
@@ -1810,15 +1810,15 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         merge_result_channel_override: None,
     };
 
-    let revisions = vec![workspace_a.name, workspace_b.name];
-    let change_ids = vec!["change-a".to_string(), "change-b".to_string()];
+    let items = crate::parallel::resolve_state::SequentialMergeItem::batch(
+        &[workspace_a.name.clone(), workspace_b.name.clone()],
+        &["change-a".to_string(), "change-b".to_string()],
+        &[workspace_a.path.clone(), workspace_b.path.clone()],
+    )
+    .or_fail("well-formed sequential merge batch");
 
     executor
-        .merge_and_resolve_with(
-            &revisions,
-            &change_ids,
-            |_revs, _details| async move { Ok(()) },
-        )
+        .merge_and_resolve_with(&items, |_revs, _details| async move { Ok(()) })
         .await
         .or_fail("unexpected error");
 
@@ -2029,15 +2029,15 @@ async fn test_merge_retries_after_pre_commit_changes() {
         merge_result_channel_override: None,
     };
 
-    let revisions = vec![workspace_a.name];
-    let change_ids = vec!["change-a".to_string()];
+    let items = crate::parallel::resolve_state::SequentialMergeItem::batch(
+        std::slice::from_ref(&workspace_a.name),
+        &["change-a".to_string()],
+        std::slice::from_ref(&workspace_a.path),
+    )
+    .or_fail("well-formed sequential merge batch");
 
     executor
-        .merge_and_resolve_with(
-            &revisions,
-            &change_ids,
-            |_revs, _details| async move { Ok(()) },
-        )
+        .merge_and_resolve_with(&items, |_revs, _details| async move { Ok(()) })
         .await
         .or_fail("unexpected error");
 
