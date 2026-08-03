@@ -52,7 +52,17 @@ Useful TUI keys:
 | `F5` | Start, resume, retry, or continue processing |
 | `x` | Queue eligible `not queued` changes while processing is running |
 
-For the web monitoring UI, REST API, and `/api/v2`, see the [Web UI Guide (English)](docs/guides/WEBUI.md).
+`cflx`, `cflx tui`, and `cflx run` serve `/api/v2` on a repository-scoped Unix
+socket at `${GIT_COMMON_DIR}/cflx-api.sock` by default — no TCP port, no flag:
+
+```bash
+curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" http://localhost/api/v2/state
+```
+
+Use `--web-unix-socket PATH` to move it, `--no-web-unix-socket` to turn it off,
+and `--web` to additionally start the browser-facing TCP Web UI. For the web
+monitoring UI, REST API, and `/api/v2`, see the
+[Web UI Guide (English)](docs/guides/WEBUI.md).
 
 ## Quick Start
 

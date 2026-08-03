@@ -47,9 +47,11 @@ KEY OPTIONS:
   --max-concurrent N    Limit concurrent workspaces (default: 3)
   --dry-run             Preview parallelization groups without execution
   --vcs BACKEND         VCS backend: auto, git (default: auto)
-  --web                 Enable web monitoring server
+  --web                 Enable the browser-facing TCP web monitoring server
   --web-port PORT       Web server port (default: 0 = auto-assign)
     --web-bind ADDR       Web server bind address (default: 127.0.0.1)
+  --web-unix-socket PATH     Override the default ${GIT_COMMON_DIR}/cflx-api.sock
+  --no-web-unix-socket       Do not serve /api/v2 on a Unix socket
   --web-auth-token TOKEN     Bearer token for the /api/v2 remote-control API
                              (visible in process listings; prefer the -env form)
   --web-auth-token-env VAR   Environment variable holding that bearer token
@@ -94,6 +96,22 @@ pub struct Cli {
     /// that changes the external origin must name it here.
     #[arg(long = "web-allowed-origin", value_name = "ORIGIN")]
     pub web_allowed_origins: Vec<String>,
+
+    /// Path for the local `/api/v2` Unix-domain socket.
+    ///
+    /// Overrides the default `${GIT_COMMON_DIR}/cflx-api.sock`, which every
+    /// linked worktree of one repository shares. Mutually exclusive with
+    /// `--no-web-unix-socket`.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_web_unix_socket")]
+    pub web_unix_socket: Option<PathBuf>,
+
+    /// Do not serve `/api/v2` on a Unix-domain socket.
+    ///
+    /// The Unix socket is the only listener a web-enabled build starts without
+    /// `--web`, so opting out leaves the process API-free unless `--web` adds
+    /// the TCP listener.
+    #[arg(long, conflicts_with = "web_unix_socket")]
+    pub no_web_unix_socket: bool,
 
     /// Push completed parallel TUI change branches to a remote instead of merging to base.
     #[arg(long, num_args = 0..=1, default_missing_value = "origin", value_parser = parse_push_remote)]
@@ -368,9 +386,14 @@ PARALLEL EXECUTION:
   --parallel enables concurrent processing using git worktrees. Changes are
   analyzed for dependencies and executed in optimal parallel groups.
 
+LOCAL API:
+  /api/v2 is served on ${GIT_COMMON_DIR}/cflx-api.sock by default, with no TCP
+  port. Use --web-unix-socket PATH for another location, or --no-web-unix-socket
+  to serve no Unix socket at all.
+
 WEB MONITORING:
-  --web enables remote monitoring via HTTP. Access progress from any browser
-  while orchestration runs in background.
+  --web additionally enables remote monitoring via HTTP. Access progress from
+  any browser while orchestration runs in background.
 
 EXAMPLES:
   cflx run --all                           # Process all current changes
@@ -457,6 +480,22 @@ pub struct RunArgs {
     /// that changes the external origin must name it here.
     #[arg(long = "web-allowed-origin", value_name = "ORIGIN")]
     pub web_allowed_origins: Vec<String>,
+
+    /// Path for the local `/api/v2` Unix-domain socket.
+    ///
+    /// Overrides the default `${GIT_COMMON_DIR}/cflx-api.sock`, which every
+    /// linked worktree of one repository shares. Mutually exclusive with
+    /// `--no-web-unix-socket`.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_web_unix_socket")]
+    pub web_unix_socket: Option<PathBuf>,
+
+    /// Do not serve `/api/v2` on a Unix-domain socket.
+    ///
+    /// The Unix socket is the only listener a web-enabled build starts without
+    /// `--web`, so opting out leaves the process API-free unless `--web` adds
+    /// the TCP listener.
+    #[arg(long, conflicts_with = "web_unix_socket")]
+    pub no_web_unix_socket: bool,
 
     /// Integrate the selected remote's same-name base branch into the cumulative
     /// base during the run, and push the verified result once at completion.
@@ -548,8 +587,13 @@ TUI USER CONFIG:
     { \"keybindings\": { \"start\": [\"F5\", \"!\"] } }
   The help text documents defaults only and does not render dynamic user config values.
 
+LOCAL API:
+  /api/v2 is served on ${GIT_COMMON_DIR}/cflx-api.sock by default, with no TCP
+  port. Use --web-unix-socket PATH for another location, or --no-web-unix-socket
+  to serve no Unix socket at all.
+
 WEB MONITORING:
-  --web enables simultaneous web-based monitoring alongside the TUI.
+  --web additionally enables simultaneous web-based monitoring alongside the TUI.
 
 EXAMPLES:
   cflx tui                                        # Launch TUI (default when no subcommand)
@@ -590,6 +634,22 @@ pub struct TuiArgs {
     /// that changes the external origin must name it here.
     #[arg(long = "web-allowed-origin", value_name = "ORIGIN")]
     pub web_allowed_origins: Vec<String>,
+
+    /// Path for the local `/api/v2` Unix-domain socket.
+    ///
+    /// Overrides the default `${GIT_COMMON_DIR}/cflx-api.sock`, which every
+    /// linked worktree of one repository shares. Mutually exclusive with
+    /// `--no-web-unix-socket`.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_web_unix_socket")]
+    pub web_unix_socket: Option<PathBuf>,
+
+    /// Do not serve `/api/v2` on a Unix-domain socket.
+    ///
+    /// The Unix socket is the only listener a web-enabled build starts without
+    /// `--web`, so opting out leaves the process API-free unless `--web` adds
+    /// the TCP listener.
+    #[arg(long, conflicts_with = "web_unix_socket")]
+    pub no_web_unix_socket: bool,
 
     /// Push completed parallel TUI change branches to a remote instead of merging to base.
     #[arg(long, num_args = 0..=1, default_missing_value = "origin", value_parser = parse_push_remote)]
@@ -1032,7 +1092,7 @@ mod tests {
 
     /// Bare `cflx` has no subcommand; it forwards its own options into `TuiArgs`,
     /// exactly as `main` does.
-    fn bare_tui_args(argv: &[&str]) -> TuiArgs {
+    pub(super) fn bare_tui_args(argv: &[&str]) -> TuiArgs {
         let cli = Cli::parse_from(argv);
         assert!(cli.command.is_none(), "expected bare invocation");
         TuiArgs {
@@ -1043,6 +1103,8 @@ mod tests {
             web_auth_token: cli.web_auth_token,
             web_auth_token_env: cli.web_auth_token_env,
             web_allowed_origins: cli.web_allowed_origins,
+            web_unix_socket: cli.web_unix_socket,
+            no_web_unix_socket: cli.no_web_unix_socket,
             push: cli.push,
             integrate_upstream: cli.integrate_upstream,
             integrate_upstream_default_remote: cli.integrate_upstream_default_remote,
@@ -2690,6 +2752,162 @@ mod remote_control_api_cli_tests {
         assert!(
             unsafe_config.validate().is_err(),
             "a routable bind without credentials must never reach a listener"
+        );
+    }
+
+    /// A UDS-only process never becomes reachable from the network, so a bind
+    /// address it will not use must not be able to refuse its startup.
+    #[test]
+    #[cfg(feature = "web-monitoring")]
+    fn a_routable_bind_only_matters_when_the_tcp_listener_participates() {
+        let config = crate::web::WebConfig::enabled(0, "0.0.0.0".to_string())
+            .with_tcp_enabled(false)
+            .with_auth(None, None, Vec::new());
+        assert!(config.validate().is_ok());
+        assert!(config
+            .with_tcp_enabled(true)
+            .validate()
+            .is_err_and(|e| e.contains("non-loopback")));
+    }
+
+    // ── Unix socket selection ──────────────────────────────────────────────
+
+    fn unix_options(args: &[&str]) -> (Option<PathBuf>, bool) {
+        let cli = parse(args);
+        match cli.command {
+            None => (cli.web_unix_socket, cli.no_web_unix_socket),
+            Some(Commands::Run(run)) => (run.web_unix_socket, run.no_web_unix_socket),
+            Some(Commands::Tui(tui)) => (tui.web_unix_socket, tui.no_web_unix_socket),
+            other => panic!("unexpected command {other:?}"),
+        }
+    }
+
+    /// Every invocation shape that owns local orchestration.
+    const UNIX_SCOPES: [&[&str]; 3] = [&["cflx"], &["cflx", "tui"], &["cflx", "run", "--all"]];
+
+    #[test]
+    fn unix_socket_options_default_to_the_repository_default_in_every_scope() {
+        for scope in UNIX_SCOPES {
+            assert_eq!(
+                unix_options(scope),
+                (None, false),
+                "scope={scope:?} must default to neither override nor opt-out"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_unix_path_parses_in_every_scope() {
+        for scope in UNIX_SCOPES {
+            let mut args = scope.to_vec();
+            args.extend_from_slice(&["--web-unix-socket", "/run/user/1000/custom.sock"]);
+            assert_eq!(
+                unix_options(&args),
+                (Some(PathBuf::from("/run/user/1000/custom.sock")), false),
+                "scope={scope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unix_opt_out_parses_in_every_scope() {
+        for scope in UNIX_SCOPES {
+            let mut args = scope.to_vec();
+            args.push("--no-web-unix-socket");
+            assert_eq!(unix_options(&args), (None, true), "scope={scope:?}");
+        }
+    }
+
+    #[test]
+    fn the_unix_override_and_opt_out_are_mutually_exclusive_in_every_scope() {
+        for scope in UNIX_SCOPES {
+            let mut args = scope.to_vec();
+            args.extend_from_slice(&["--web-unix-socket", "/tmp/a.sock", "--no-web-unix-socket"]);
+            let error = parse_err(&args);
+            assert!(
+                error.contains("cannot be used with"),
+                "scope={scope:?} must report a conflict, got {error}"
+            );
+        }
+    }
+
+    /// `--web` adds TCP; it never turns the Unix listener off.
+    #[test]
+    fn the_web_flag_leaves_the_unix_selection_alone() {
+        for scope in UNIX_SCOPES {
+            let mut args = scope.to_vec();
+            args.push("--web");
+            assert_eq!(unix_options(&args), (None, false), "scope={scope:?}");
+        }
+    }
+
+    /// Bare `cflx` forwards its own Unix options into `TuiArgs` exactly as
+    /// `main` does, so the default TUI is not a second, weaker contract.
+    #[test]
+    fn bare_invocation_forwards_its_unix_options_to_the_tui_args() {
+        let bare = super::tests::bare_tui_args(&["cflx", "--web-unix-socket", "/tmp/bare.sock"]);
+        assert_eq!(bare.web_unix_socket, Some(PathBuf::from("/tmp/bare.sock")));
+        assert!(!bare.no_web_unix_socket);
+
+        let opted_out = super::tests::bare_tui_args(&["cflx", "--no-web-unix-socket"]);
+        assert_eq!(opted_out.web_unix_socket, None);
+        assert!(opted_out.no_web_unix_socket);
+    }
+
+    #[test]
+    fn help_documents_both_unix_socket_choices() {
+        for help in [
+            Cli::command().render_long_help().to_string(),
+            Cli::command()
+                .find_subcommand_mut("run")
+                .expect("run subcommand")
+                .render_long_help()
+                .to_string(),
+            Cli::command()
+                .find_subcommand_mut("tui")
+                .expect("tui subcommand")
+                .render_long_help()
+                .to_string(),
+        ] {
+            assert!(help.contains("--web-unix-socket"), "help={help}");
+            assert!(help.contains("--no-web-unix-socket"), "help={help}");
+            assert!(
+                help.contains("cflx-api.sock"),
+                "the default socket name must be discoverable from help, help={help}"
+            );
+        }
+    }
+
+    /// The parsed options must reach the resolver that decides the actual path,
+    /// including the non-Git refusal an operator will hit outside a repository.
+    #[test]
+    #[cfg(all(unix, feature = "web-monitoring"))]
+    fn parsed_unix_options_flow_into_socket_resolution() {
+        use crate::web::unix_socket::{resolve_unix_socket, UnixSocketSelection};
+        use std::path::Path;
+
+        let (explicit, opt_out) = unix_options(&["cflx", "run", "--all"]);
+        assert_eq!(
+            resolve_unix_socket(explicit.as_deref(), opt_out, Some(Path::new("/repo/.git")))
+                .unwrap(),
+            UnixSocketSelection::Bind(PathBuf::from("/repo/.git/cflx-api.sock"))
+        );
+        assert!(
+            resolve_unix_socket(explicit.as_deref(), opt_out, None).is_err(),
+            "outside Git the default must be refused rather than guessed"
+        );
+
+        let (explicit, opt_out) =
+            unix_options(&["cflx", "tui", "--web-unix-socket", "/tmp/x.sock"]);
+        assert_eq!(
+            resolve_unix_socket(explicit.as_deref(), opt_out, None).unwrap(),
+            UnixSocketSelection::Bind(PathBuf::from("/tmp/x.sock"))
+        );
+
+        let (explicit, opt_out) = unix_options(&["cflx", "--no-web-unix-socket"]);
+        assert_eq!(
+            resolve_unix_socket(explicit.as_deref(), opt_out, None).unwrap(),
+            UnixSocketSelection::Disabled
         );
     }
 }
