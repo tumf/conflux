@@ -28,27 +28,34 @@ The constitution requires restart routing to be derived from workspace files, Gi
 | Layer | Purpose | Budget owner | Context passed forward |
 |---|---|---|---|
 | Command queue | Retry one command process after crash/inactivity according to existing queue policy | `CommandQueueConfig` | Same configured command/prompt; streamed diagnostics remain observable |
-| Apply iteration | Continue implementation using repository progress | `max_iterations`; positive total or zero unlimited | Existing `ApplyHistory` with exit code and bounded stdout/stderr |
+| Apply iteration | Continue implementation using repository progress | One per-change active-run counter shared across every Apply entry; positive `max_iterations` total or zero unlimited | Existing `ApplyHistory` with exit code and bounded stdout/stderr |
 | Acceptance command recovery | Re-run review when the configured command cannot complete | Fixed initial plus two retries | Latest bounded command failure only |
 | Acceptance protocol correction | Correct missing/malformed canonical output | Existing protocol counter | Existing bounded protocol context |
 | Acceptance FAIL repair | Return actionable findings to Apply | Existing Apply/Acceptance cycle ceiling and finding ledger | Repository-backed findings and repair context |
 | Cleanup-review correction | Repair handoff after command/protocol/dirty failure | Fixed initial plus two retries | Latest structured cleanup failure and fresh dirty evidence only |
 
-No counter in one row consumes another row's budget. Command-queue attempts are internal to one operation attempt. A canonical Acceptance outcome ends consecutive command-failure recovery before normal verdict routing. Cleanup-review never enters the ordinary Apply loop.
+No counter in one row consumes another row's budget. Command-queue attempts are internal to one operation attempt. Any Acceptance invocation that completes as a non-command-failure result ends consecutive command-failure recovery before its normal canonical or protocol routing. Cleanup-review never enters the ordinary Apply loop.
+
+## Apply Budget Ownership
+
+`max_iterations` is a per-change, active-run cumulative Apply-dispatch budget. One counter is created when a change first enters Apply in a process and is passed through serial CLI, TUI, and parallel orchestration into every later `execute_apply_loop` call for that change. It survives Acceptance FAIL-to-Apply cycles, ordinary command-failure recovery, task-format repair, escalation, and final-commit rejection repair. It resets only when the process starts a fresh run; it is not reconstructed from logs or persisted state.
+
+The sole counter owner reserves/increments immediately before dispatching an Apply agent. Command-queue transport retries remain inside that reservation. Existing independent CLI/TUI workflow-loop counters must not impose a second Apply ceiling, and parallel `_initial_iteration` plumbing must either carry the shared counter or be removed. At 80% of a positive limit, the owner emits the configured warning once for the threshold crossing. Before reserving beyond the exact positive ceiling, it returns a typed `iteration_limit { change_id, attempts, latest_diagnostic }` outcome. CLI, TUI, and parallel run boundaries use that outcome to stop consistently and invoke existing `on_finish(status = iteration_limit, iteration = attempts)` ownership exactly once rather than converting it to an untyped command error.
 
 ## Apply Control Flow
 
-For each dispatched Apply attempt:
+For each reserved Apply attempt:
 
-1. Check cancellation.
-2. If `max_iterations > 0` and the next attempt would exceed it, terminate with the existing max-iteration error augmented by latest actionable diagnostics.
-3. Execute through the retrying command queue and collect bounded stdout/stderr.
-4. Record the `ApplyAttempt` regardless of status.
-5. Preserve existing completion-finalized, blocked/rejecting, and permission-denial handling.
-6. For any remaining ordinary non-zero result, run existing `on_error` hook behavior and continue the outer loop instead of returning immediately.
-7. Recompute task/Git state on the next iteration; do not trust the prior narrative result.
+1. Check cancellation and the positive budget before dispatch.
+2. Inspect current task/Git state, task-format state, blocked/rejecting handoff, and pending final-commit repair before choosing the command.
+3. Run `pre_apply` in its existing position, execute through the retrying command queue, collect bounded stdout/stderr, and record `ApplyAttempt` regardless of status.
+4. Preserve completion-finalized and cancellation routing, then classify permission denial.
+5. For an ordinary non-zero result, run `on_error` once but do not return before repository evaluation.
+6. Re-read tasks and Git state, apply completion and blocked/rejecting handoff, emit progress, and run the same WIP/progress/stall accounting used after a successful command. An ordinary non-zero result cannot be considered progress merely because output was produced.
+7. Run `post_apply` only under its existing successful/owned-handoff eligibility; ordinary command failure does not newly authorize a success-style post hook.
+8. Dispatch another attempt only if fresh routing says Apply remains eligible, stall policy has not stopped/escalated it, and positive budget remains.
 
-All dispatched Apply agents, including task-format repair, ordinary command-failure repair, escalation, and final-commit rejection repair, share the same positive `max_iterations` total. `0` skips only the ceiling check; cancellation and stall protections remain active.
+This ordering ensures `max_iterations = 0` disables only the numeric ceiling. Repeated no-progress non-zero results still advance existing empty-WIP/no-progress tracking and reach diagnosis, escalation, or stalled termination. Prior narrative output never substitutes for fresh repository evidence.
 
 ## Acceptance Command Recovery
 
@@ -70,8 +77,8 @@ Exact names may follow local style. Required semantics:
 - `max_retries` is two, yielding at most three consecutive command invocations.
 - `CommandDiagnostic` contains an error summary, exit code when available, and bounded latest stdout/stderr. It is Conflux-managed context, not an Acceptance verdict.
 - `CommandFailed` records one consecutive failure. `Retry` invokes the normal configured Acceptance command again without entering Apply or cleanup-review.
-- PASS, FAIL, CONTINUE, validated stalled/permission-stalled, and protocol-bearing output reset command-failure state before their existing routing.
-- Missing-verdict, malformed-finding, and bare-blocker correction retain their existing independent protocol counters. They do not become command failures.
+- Every invocation that completes as a non-command-failure result resets command-failure state before its existing routing. This includes PASS, FAIL, CONTINUE, validated stalled/permission-stalled, missing-verdict, malformed-finding, bare-blocker correction, and other completed protocol-bearing output.
+- Missing-verdict, malformed-finding, and bare-blocker correction retain their existing independent protocol counters after reset. They do not become command failures. Therefore `CommandFailed → MissingVerdict → CommandFailed` records the final command failure as the first consecutive failure of a new sequence.
 - Cancellation is not `CommandFailed` and starts no retry.
 - Exhaustion returns the existing terminal error shape with attempt count and latest bounded diagnostics.
 
@@ -126,7 +133,7 @@ Success requires all three. A marker never overrides Git state, and clean Git st
 
 ### Permission denial
 
-Classify bounded stdout/stderr with the shared permission classifier. Permission denial retains the existing first/changed-versus-repeated semantics where applicable and may produce a non-terminal permission stall. It must not burn all cleanup corrective attempts as indistinguishable command failures.
+Classify bounded stdout/stderr with the shared permission classifier before generic cleanup failure. A classified cleanup permission denial immediately returns the existing non-terminal permission hold for the change. It starts no corrective cleanup attempt and does not increment the generic cleanup operation-failure counter. Cleanup-review does not create a new first/changed/repeated permission tracker; explicit operator retry after the permission condition changes re-enters cleanup from workspace/Git evidence with a fresh active-run cleanup budget.
 
 ## Prompt Trust Boundary
 
@@ -137,7 +144,7 @@ The cleanup-review retry prompt has two sources:
 
 Agent output inside the diagnostic cannot add instructions, relax the marker count, authorize blind staging, or declare the repository clean. The skill continues to prohibit `git add -A` and indiscriminate commits.
 
-Acceptance command diagnostics use the existing Acceptance prompt trust model: prior output is evidence only and cannot be interpreted as a canonical current verdict.
+Acceptance command diagnostics use the existing Acceptance prompt trust model: `src/agent/runner.rs` stores only the latest bounded command diagnostic separately from canonical `AcceptanceHistory`, `src/agent/prompt.rs` renders it as untrusted evidence, and serial/parallel execution clears it after any completed non-command-failure invocation. Prior failed output cannot be interpreted as a canonical current verdict or merged into missing-verdict protocol history.
 
 ## Restart and Workspace Evidence
 
@@ -155,15 +162,17 @@ After restart:
 Use deterministic shell fixtures and in-memory counters rather than external providers:
 
 - Apply fixture exits non-zero after writing partial progress and diagnostics, then verifies the next invocation receives bounded history and completes.
-- Apply ceiling fixtures prove exact positive bound and zero-unlimited multi-attempt behavior.
-- Shared Acceptance policy unit tests prove two retries, third-failure exhaustion, latest-only bounded context, and canonical reset.
+- Apply budget fixtures cross serial/TUI/parallel and FAIL-to-Apply re-entry, proving one per-change count, exact positive bound, one 80% warning, typed `iteration_limit`, exact `on_finish` count/status, restart reset, and zero-unlimited multi-attempt behavior.
+- Apply failure fixtures prove fresh progress/handoff/permission/stall evaluation, `on_error` cardinality, no success-style `post_apply`, and no-progress stall termination with `max_iterations = 0`.
+- Shared Acceptance policy unit tests prove two retries, third-failure exhaustion, latest-only bounded context, and reset after every completed non-command-failure result, including `CommandFailed → MissingVerdict → CommandFailed`.
+- Agent runner/prompt tests prove failed Acceptance output remains latest-only untrusted command evidence and cannot become a verdict or protocol history.
 - Serial and parallel fixtures count Apply, cleanup, and Acceptance invocations to prove command retry is Acceptance-only and budget-independent.
-- Cleanup fixtures emit combinations of status, marker count, and dirty state to cover all classification rows and second-attempt recovery.
+- Cleanup fixtures retain canonical dirty-trigger, clean-skip, completion-grace, blocked-handoff-grace, and incomplete-Apply scenarios, then add all command/marker/status classification rows and second-attempt recovery.
 - Cancellation fixture keeps a cleanup child alive, cancels it, and proves termination plus no next invocation.
-- Permission fixture proves classified denial does not become generic terminal command failure.
+- Permission fixture proves classified denial immediately enters non-terminal hold with zero corrective invocations and zero generic counter consumption.
 - Restart fixtures create fresh service/driver instances against unchanged workspace state and prove no durable retry artifacts are consulted or created.
 
-All default tests must complete under one second. Any unavoidable process-boundary test exceeding that limit must use the repository heavy-test feature and retain fast unit coverage of its state machine.
+All default tests must complete under one second. Any unavoidable process-boundary test exceeding that limit must use the repository `heavy-tests` feature and retain fast default state-machine coverage of the same routing.
 
 ## Risks and Mitigations
 

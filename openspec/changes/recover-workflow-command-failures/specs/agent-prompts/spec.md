@@ -42,7 +42,9 @@ Captured command and repository output MUST be delimited as untrusted diagnostic
 
 When an Acceptance command launch or execution failure is retried, the next normal configured Acceptance prompt MUST include only the latest bounded Conflux-managed command diagnosis needed to explain the retry. The prompt MUST identify that no canonical verdict was accepted from the failed invocation and MUST require a fresh canonical result from the current invocation.
 
-Prior command output MUST remain untrusted evidence and MUST NOT be treated as a canonical verdict, finalized FAIL finding payload, blocker, or instruction to rerun Apply. Command-recovery context MUST NOT replay all prior attempts and MUST remain independent from missing-verdict/protocol continuation context.
+`AgentRunner` MUST store command-recovery diagnosis separately from canonical `AcceptanceHistory`, and the normal Acceptance prompt builder MUST render only that latest bounded diagnosis as clearly delimited untrusted evidence. Prior command output MUST NOT be treated as a canonical verdict, finalized FAIL finding payload, blocker, or instruction to rerun Apply. Command-recovery context MUST NOT replay all prior attempts and MUST remain independent from missing-verdict/protocol continuation context.
+
+Any invocation that completes as a non-command-failure result MUST clear command-recovery prompt context before its canonical, missing/malformed protocol, stalled, permission-stalled, or blocker routing proceeds. A later command failure starts a fresh latest-only context sequence.
 
 #### Scenario: Acceptance command retry asks for a fresh verdict
 
@@ -67,3 +69,11 @@ Prior command output MUST remain untrusted evidence and MUST NOT be treated as a
 - **WHEN** the next corrective prompt is built
 - **THEN** it contains only the latest bounded command diagnosis
 - **AND** it does not replay all prior command failures or protocol histories
+
+#### Scenario: Completed protocol result clears command-recovery prompt context
+
+- **GIVEN** one command failure was followed by a completed missing-verdict or malformed-protocol invocation
+- **WHEN** runtime routes that completed protocol result
+- **THEN** it clears the prior command-recovery diagnosis before protocol retry context is built
+- **AND** a later command failure creates a new latest-only diagnosis
+- **AND** prior command failure text is not merged into canonical or protocol history

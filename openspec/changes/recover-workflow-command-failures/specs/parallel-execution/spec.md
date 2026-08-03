@@ -4,7 +4,9 @@
 
 Apply または Archive コマンドが異常終了（exit code ≠ 0）した場合、システムはコマンドキューの既存 transport retry を適用しなければならない（SHALL）。transport retry が終了しても Apply command が非ゼロの場合、workspace-local completion、cancellation、permission、blocked/rejecting handoff の別 routing が所有しない限り、システムは失敗 attempt を既存 Apply history に記録し、同一 managed workspace 上の次の Apply iteration を実行しなければならない（MUST）。
 
-Apply の全 outer attempt は正式な `max_iterations` 設定を共有しなければならない（MUST）。正の値は command failure、通常実装、task-format repair、escalation、final-commit repair を含む dispatched Apply attempt の総上限であり、`0` は numeric limit を無効化しなければならない（MUST）。Archive command の transport retry は既存 `ARCHIVE_COMMAND_MAX_RETRIES` を使用し、operation-level Archive recovery はこの requirement では追加しない。
+Apply の全 configured agent dispatch は、serial CLI、TUI、parallel execution、および Acceptance FAIL 後の再入を通じて、同じ per-change active-run `max_iterations` counter を共有しなければならない（MUST）。正の値は command failure、通常実装、task-format repair、escalation、final-commit repair を含む dispatched Apply attempt の総上限であり、command queue transport retry は一つの dispatch 内部として数えなければならない（MUST）。`0` は numeric limit のみを無効化し、fresh repository/handoff evaluation、permission、progress/WIP/stall policy を無効化してはならない（MUST NOT）。
+
+Ordinary non-zero Apply result は、history 記録と `on_error` 後に即時 redispatch してはならない（MUST NOT）。システムは fresh task/Git state、completion、blocked/rejecting handoff、permission、progress/WIP/stall accounting、および既存 hook eligibility を評価し、その routing が Apply continuation を許可した場合のみ次の dispatch を開始しなければならない（MUST）。Archive command の transport retry は既存 `ARCHIVE_COMMAND_MAX_RETRIES` を使用し、operation-level Archive recovery はこの requirement では追加しない。
 
 #### Scenario: Parallel Apply command failure continues with bounded history
 
@@ -17,20 +19,24 @@ Apply の全 outer attempt は正式な `max_iterations` 設定を共有しな�
 - **AND** 次の prompt はその bounded failure context を含む
 - **AND** queue state は Applying のままで terminal processing error を生成しない
 
-#### Scenario: Apply command failures exhaust one total iteration budget
+#### Scenario: Apply command failures exhaust one per-change active-run budget
 
 - **GIVEN** `max_iterations` が `3` である
+- **AND** one change has Apply dispatches before and after an Acceptance FAIL-to-Apply cycle
 - **AND** command queue 内部 retry 後の Apply command が繰り返し非ゼロで終了する
-- **WHEN** 3 回の outer Apply attempt が完了する
-- **THEN** 4 回目の Apply command は開始しない
-- **AND** terminal diagnostic は上限と最新の bounded actionable failure を含む
+- **WHEN** that change completes its third cumulative configured Apply dispatch
+- **THEN** 4 回目の Apply command は serial CLI、TUI、parallel のいずれからも開始しない
+- **AND** typed `iteration_limit` diagnostic は change ID、上限、exact cumulative count、最新の bounded actionable failure を含む
+- **AND** process restartだけがactive-run countをresetする
 
-#### Scenario: Zero leaves Apply iteration count unlimited
+#### Scenario: Zero leaves Apply iteration count unlimited but still reaches stall
 
 - **GIVEN** `max_iterations` が `0` である
-- **WHEN** Apply command failure または未完了 progress により複数の outer iteration が必要になる
+- **AND** Apply commands repeatedly exit non-zero without task or Git progress
+- **WHEN** each command result is recorded
 - **THEN** iteration count のみを理由に Apply loop を停止しない
-- **AND** completion、cancellation、stall、permission、blocked/rejecting handoff、または他の owned terminal outcome は引き続き有効である
+- **AND** each result reaches fresh completion、cancellation、stall、permission、blocked/rejecting handoff evaluation
+- **AND** existing no-progress diagnosis、escalation、または stalled outcome can stop redispatch
 
 #### Scenario: Owned Apply outcomes do not become generic crash recovery
 
@@ -45,7 +51,7 @@ Apply の全 outer attempt は正式な `max_iterations` 設定を共有しな�
 
 Serial および parallel execution は、configured Acceptance command の launch または execution failure を、同一の applied かつ clean な workspace 上で Acceptance だけを再実行する active-run recovery として扱わなければならない（MUST）。初回 failure 後の retry は最大 2 回で、3 回目の連続 command failure 後にのみ terminal error としなければならない（MUST）。
 
-この command-failure counter は missing-verdict または他の protocol correction、explicit `CONTINUE`、canonical FAIL から Apply への repair cycle、および `MAX_ACCEPTANCE_RETRY_CYCLES` から独立しなければならない（MUST）。retry は Apply または cleanup-review を再実行してはならず（MUST NOT）、canonical Acceptance outcome は counter を reset して既存 routing を保持しなければならない（MUST）。
+この command-failure counter は missing-verdict または他の protocol correction、explicit `CONTINUE`、canonical FAIL から Apply への repair cycle、および `MAX_ACCEPTANCE_RETRY_CYCLES` から独立しなければならない（MUST）。retry は Apply または cleanup-review を再実行してはならない（MUST NOT）。Acceptance invocation が command failure 以外の completed result を返した場合、runtime は canonical、missing/malformed protocol、stalled、permission-stalled、または blocker routing に入る前に command-failure counter を reset しなければならない（MUST）。
 
 #### Scenario: Acceptance command recovers without rerunning Apply
 
@@ -64,12 +70,20 @@ Serial および parallel execution は、configured Acceptance command の laun
 - **AND** FAIL findings を tasks に追加しない
 - **AND** outer Apply/Acceptance `cycle_count` を command failure のみを理由に増加させない
 
-#### Scenario: Canonical outcome resets Acceptance command recovery
+#### Scenario: Any completed non-command-failure result resets Acceptance command recovery
 
-- **GIVEN** one or more Acceptance command failures were followed by a successful command invocation
-- **WHEN** that invocation emits canonical PASS, FAIL, CONTINUE, validated stalled, or permission-stalled output
-- **THEN** consecutive command-failure state resets
-- **AND** the canonical outcome follows its existing routing semantics
+- **GIVEN** one or more Acceptance command failures were followed by a completed command invocation
+- **WHEN** that invocation produces canonical PASS, FAIL, CONTINUE, validated stalled/permission-stalled, missing verdict, malformed finding, bare blocker, or another completed protocol-bearing result
+- **THEN** consecutive command-failure state resets before that result follows its existing routing semantics
+- **AND** its dedicated canonical or protocol counter remains independent
+
+#### Scenario: Protocol completion breaks command-failure consecutiveness
+
+- **GIVEN** Acceptance results occur as `CommandFailed`, then `MissingVerdict`, then `CommandFailed`
+- **WHEN** runtime records the final result
+- **THEN** the completed missing-verdict invocation has already reset command-failure state
+- **AND** the final command failure is attempt one of a new command-failure sequence
+- **AND** missing-verdict budget follows its own existing accounting
 
 #### Scenario: Acceptance command recovery exhausts after three failures
 
@@ -100,9 +114,54 @@ Parallel mode で Conflux-managed isolated worktree 上の Apply が task comple
 
 各 corrective prompt は latest failure kind、利用可能な exit code、bounded stdout/stderr、standalone marker count、および fresh bounded porcelain status を含まなければならない（MUST）。成功には acceptable command completion、`CLEANUP_REVIEW: CLEAN` standalone marker が exactly once、および fresh repository query による clean worktree のすべてが必要である（MUST）。cleanup-review が成功するまで Acceptance に進めてはならない（MUST NOT）。
 
-Cleanup retry control は active-run memory にのみ保持し、通常 Apply loop へ戻ってはならない（MUST NOT）。cancellation は active child を terminate して retry を停止し、classified permission denial は既存 permission/stall routing を保持しなければならない（MUST）。3 回の operation attempt が失敗した場合のみ、latest bounded diagnosis を伴う terminal error とし、managed workspace evidence を保持しなければならない（MUST）。
+Cleanup retry control は active-run memory にのみ保持し、通常 Apply loop へ戻ってはならない（MUST NOT）。cancellation は active child を terminate して retry を停止しなければならない（MUST）。classified cleanup permission denial は直ちに既存 non-terminal permission hold へ遷移し、corrective cleanup attempt を開始せず、generic cleanup failure counter を消費してはならない（MUST NOT）。3 回の ordinary operation attempt が失敗した場合のみ、latest bounded diagnosis を伴う terminal error とし、managed workspace evidence を保持しなければならない（MUST）。
 
 Apply runtime が tasks.md 上の完了条件、または `REJECTED.md` による apply-blocked handoff を既に観測した run では、agent process やその子プロセスが stdout/stderr を保持したまま自然終了しなくても、システムは有限な grace period 後に当該 process group を terminate して handoff 判定へ進まなければならない（MUST）。この早期 terminate は完了条件を観測済みの場合にのみ成功相当として扱われなければならない（MUST）。
+
+#### Scenario: Dirty managed worktree triggers cleanup review after apply completion
+
+- **GIVEN** parallel mode の apply が managed git worktree 上で実行されている
+- **AND** apply loop が tasks.md 上の完了条件を満たして終了した
+- **AND** worktree に未コミット変更または未追跡ファイルが残っている
+- **WHEN** orchestrator が apply 完了 handoff を判定する
+- **THEN** orchestrator は acceptance を開始せず cleanup review operation を起動する
+- **AND** cleanup review 成功後にのみ apply 完了を確定して acceptance に進む
+
+#### Scenario: Clean managed worktree skips cleanup review
+
+- **GIVEN** parallel mode の apply が managed git worktree 上で実行されている
+- **AND** apply loop が tasks.md 上の完了条件を満たして終了した
+- **AND** worktree が clean である
+- **WHEN** orchestrator が apply 完了 handoff を判定する
+- **THEN** cleanup review は不要である
+- **AND** orchestrator は従来どおり apply 完了を確定して acceptance に進む
+
+#### Scenario: Completion grace period terminates stale apply agent after tasks complete
+
+- **GIVEN** parallel mode の apply command が tasks.md 上の完了条件を満たす変更を書き込む
+- **AND** その後 agent process または子プロセスが stdout/stderr pipe を保持したまま居残り、自然終了しない
+- **WHEN** orchestrator が apply 実行中に task completion を観測する
+- **THEN** orchestrator は apply completion grace period を開始する
+- **AND** grace period が満了しても process が終了しない場合は process group を terminate する
+- **AND** 収集済みの workspace 状態に基づいて apply 完了 handoff を続行し acceptance に進む
+
+#### Scenario: Completion grace period terminates stale apply agent after blocked handoff
+
+- **GIVEN** parallel mode の apply command が worktree に `openspec/changes/{change_id}/REJECTED.md` を生成する
+- **AND** その後 agent process または子プロセスが自然終了しない
+- **WHEN** orchestrator が apply-blocked handoff を観測する
+- **THEN** orchestrator は apply completion grace period を開始する
+- **AND** grace period 満了後も child が残っていれば terminate する
+- **AND** apply loop は rejecting review handoff として有限時間で終了する
+
+#### Scenario: Incomplete apply does not get success-equivalent terminate treatment
+
+- **GIVEN** parallel mode の apply command が tasks.md を未完了のままにしている
+- **AND** `REJECTED.md` も生成していない
+- **WHEN** agent process が終了せず inactivity timeout や terminate 対象になる
+- **THEN** orchestrator はその run を apply 完了として扱ってはならない（MUST NOT）
+- **AND** acceptance handoff を開始してはならない（MUST NOT）
+- **AND** failure/retry/stall policy に従って扱う
 
 #### Scenario: Dirty managed worktree recovers on corrective cleanup attempt
 
@@ -138,6 +197,15 @@ Apply runtime が tasks.md 上の完了条件、または `REJECTED.md` によ�
 - **WHEN** orchestrator completes validation
 - **THEN** it marks cleanup handoff successful
 - **AND** only then may it start Acceptance
+
+#### Scenario: Cleanup-review permission denial enters hold without retry
+
+- **GIVEN** cleanup-review bounded output is classified as permission denial
+- **WHEN** orchestrator processes the attempt
+- **THEN** it records the existing non-terminal permission hold for the change
+- **AND** it starts no corrective cleanup attempt
+- **AND** it does not increment the generic cleanup operation-failure counter
+- **AND** explicit operator retry later re-derives cleanup from workspace and Git evidence with a fresh active-run cleanup budget
 
 #### Scenario: Cleanup-review exhaustion preserves workspace
 
