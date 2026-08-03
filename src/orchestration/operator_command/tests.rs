@@ -1484,14 +1484,13 @@ async fn parallel_toggle_is_refused_when_parallel_execution_is_unavailable() {
 
 #[tokio::test]
 async fn enabling_parallel_mode_clears_ineligible_marks_and_queue_intent() {
-    let fixture = parallel_fixture(&["committed", "uncommitted", "idle-uncommitted"], &[
-        "uncommitted",
-        "idle-uncommitted",
-    ]);
-    fixture.marks.replace([
-        "committed".to_string(),
-        "uncommitted".to_string(),
-    ]);
+    let fixture = parallel_fixture(
+        &["committed", "uncommitted", "idle-uncommitted"],
+        &["uncommitted", "idle-uncommitted"],
+    );
+    fixture
+        .marks
+        .replace(["committed".to_string(), "uncommitted".to_string()]);
     {
         let mut guard = fixture.state.write().await;
         guard.apply_command(ReducerCommand::AddToQueue("committed".to_string()));
@@ -1585,10 +1584,7 @@ async fn bulk_mark_marks_every_eligible_change_and_reports_exclusions() {
             assert_eq!(changed, vec!["b".to_string()], "'a' was already marked");
             assert_eq!(
                 excluded,
-                vec![(
-                    "uncommitted".to_string(),
-                    MarkExclusion::ParallelIneligible
-                )]
+                vec![("uncommitted".to_string(), MarkExclusion::ParallelIneligible)]
             );
         }
         other => panic!("unexpected outcome: {other:?}"),

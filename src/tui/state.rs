@@ -463,7 +463,8 @@ impl AppState {
     /// [`AppState::sync_parallel_mode_from_runtime`].
     pub fn publish_parallel_runtime(&self) {
         self.parallel_runtime.set_available(self.parallel_available);
-        self.parallel_runtime.set_max_concurrent(self.max_concurrent);
+        self.parallel_runtime
+            .set_max_concurrent(self.max_concurrent);
         self.parallel_runtime
             .set_vcs_backend(self.vcs_backend.clone());
         self.parallel_runtime.set_parallel_ineligible(
@@ -496,7 +497,9 @@ impl AppState {
     /// Returns the affected change IDs so the caller can report them; an
     /// operator whose marks silently disappeared cannot tell that from a bug.
     fn clear_parallel_ineligible_intent(&mut self) -> Vec<String> {
-        use crate::orchestration::operator_command::{parallel_cleanup_targets, ParallelCleanupRow};
+        use crate::orchestration::operator_command::{
+            parallel_cleanup_targets, ParallelCleanupRow,
+        };
 
         let rows: Vec<ParallelCleanupRow<'_>> = self
             .changes

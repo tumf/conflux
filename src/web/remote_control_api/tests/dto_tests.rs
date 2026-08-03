@@ -15,9 +15,7 @@ fn closed_command_set_matches_the_advertised_list() {
             "start" | "stop" | "cancel_stop" | "force_stop" | "set_all_execution_marks" => {
                 format!(r#"{{"type":"{name}"}}"#)
             }
-            "set_parallel_mode" => {
-                r#"{"type":"set_parallel_mode","enabled":true}"#.to_string()
-            }
+            "set_parallel_mode" => r#"{"type":"set_parallel_mode","enabled":true}"#.to_string(),
             "set_execution_mark" => {
                 r#"{"type":"set_execution_mark","change_id":"a","marked":true}"#.to_string()
             }

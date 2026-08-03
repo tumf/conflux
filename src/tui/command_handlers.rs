@@ -338,7 +338,10 @@ pub async fn handle_tui_command(
             // cleanup. The TUI adopts the resulting toggle and reports what the
             // service actually did, so `=` and `/api/v2` cannot diverge.
             let service = ctx.run_control.operator();
-            match service.set_parallel_mode(ctx.app.operator_mode(), enabled).await {
+            match service
+                .set_parallel_mode(ctx.app.operator_mode(), enabled)
+                .await
+            {
                 Ok(OperatorOutcome::ParallelMode { enabled, cleared }) => {
                     ctx.app.sync_parallel_mode_from_runtime();
                     ctx.app.apply_display_statuses_from_reducer(
@@ -366,7 +369,10 @@ pub async fn handle_tui_command(
                     ctx.app.warning_message = Some(message.clone());
                     ctx.app.add_log(LogEntry::info(message));
                 }
-                Ok(other) => debug!("Parallel toggle produced an unexpected outcome: {:?}", other),
+                Ok(other) => debug!(
+                    "Parallel toggle produced an unexpected outcome: {:?}",
+                    other
+                ),
                 Err(error) => {
                     let message = format!("Parallel mode change rejected: {}", error);
                     ctx.app.warning_message = Some(message.clone());
@@ -716,8 +722,7 @@ mod tests {
         pub(super) run_control: Arc<RunControlService>,
         pub(super) marks: Arc<ExecutionMarkStore>,
         /// The one parallel runtime store both adapters read and mutate.
-        pub(super) parallel:
-            Arc<crate::orchestration::operator_command::ParallelRuntime>,
+        pub(super) parallel: Arc<crate::orchestration::operator_command::ParallelRuntime>,
         pub(super) resolves: Arc<ResolveReservations>,
         pub(super) config: OrchestratorConfig,
         pub(super) tx: mpsc::Sender<OrchestratorEvent>,

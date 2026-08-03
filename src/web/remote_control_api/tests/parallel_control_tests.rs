@@ -47,7 +47,11 @@ fn change(id: &str) -> Change {
 }
 
 /// One workspace observation: which changes are committed and which are dirty.
-fn changes_refreshed(changes: Vec<Change>, committed: &[&str], uncommitted: &[&str]) -> ExecutionEvent {
+fn changes_refreshed(
+    changes: Vec<Change>,
+    committed: &[&str],
+    uncommitted: &[&str],
+) -> ExecutionEvent {
     ExecutionEvent::ChangesRefreshed {
         changes,
         rejected_changes: Vec::new(),
@@ -316,19 +320,17 @@ async fn the_new_commands_are_admitted_delegated_and_replayed_like_every_other()
         envelope.insert("idempotency_key".to_string(), json!("k1"));
         let envelope = serde_json::Value::Object(envelope).to_string();
 
-        let (status, record) = status_and_json(
-            send(&h.router, post_json("/api/v2/commands", None, &envelope)).await,
-        )
-        .await;
+        let (status, record) =
+            status_and_json(send(&h.router, post_json("/api/v2/commands", None, &envelope)).await)
+                .await;
         assert_eq!(status, StatusCode::OK, "{envelope}");
         assert_eq!(record["state"], "succeeded");
         assert_eq!(h.executor.calls(), vec![expected.clone()]);
 
         // An exact replay resolves from the record without a second side effect.
-        let (replay_status, replay) = status_and_json(
-            send(&h.router, post_json("/api/v2/commands", None, &envelope)).await,
-        )
-        .await;
+        let (replay_status, replay) =
+            status_and_json(send(&h.router, post_json("/api/v2/commands", None, &envelope)).await)
+                .await;
         assert_eq!(replay_status, StatusCode::OK);
         assert_eq!(replay["command_id"], record["command_id"]);
         assert_eq!(
@@ -387,17 +389,12 @@ async fn remote_parallel_toggle_clears_ineligible_intent_and_reports_it() {
     wired
         .observe(&["committed", "uncommitted"], &["committed"], &[], "select")
         .await;
-    wired.marks.replace([
-        "committed".to_string(),
-        "uncommitted".to_string(),
-    ]);
     wired
-        .reducer
-        .write()
-        .await
-        .apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
-            "uncommitted".to_string(),
-        ));
+        .marks
+        .replace(["committed".to_string(), "uncommitted".to_string()]);
+    wired.reducer.write().await.apply_command(
+        crate::orchestration::state::ReducerCommand::AddToQueue("uncommitted".to_string()),
+    );
 
     let summary = wired
         .executor
@@ -435,7 +432,11 @@ async fn remote_parallel_toggle_is_refused_in_a_running_or_stopping_lifecycle() 
             .await
             .expect_err("a live lifecycle owns scheduling decisions the toggle would invalidate");
 
-        assert_eq!(failure.error_code, ErrorCode::LifecycleConflict, "{app_mode}");
+        assert_eq!(
+            failure.error_code,
+            ErrorCode::LifecycleConflict,
+            "{app_mode}"
+        );
         assert!(
             !wired.parallel.parallel_mode(),
             "{app_mode}: a refused toggle must change nothing"
@@ -531,7 +532,9 @@ async fn remote_bulk_mark_is_atomic_over_one_revision_and_names_its_exclusions()
 #[tokio::test]
 async fn remote_bulk_mark_with_no_eligible_row_settles_as_a_no_op() {
     let wired = Wired::new(&["rejected"]).await;
-    wired.observe(&["rejected"], &["rejected"], &[], "select").await;
+    wired
+        .observe(&["rejected"], &["rejected"], &[], "select")
+        .await;
     wired
         .reducer
         .write()
@@ -580,10 +583,9 @@ async fn one_ineligible_marked_target_rejects_a_remote_parallel_start_entirely()
         .observe(&["committed", "uncommitted"], &["committed"], &[], "select")
         .await;
     wired.parallel.set_parallel_mode(true);
-    wired.marks.replace([
-        "committed".to_string(),
-        "uncommitted".to_string(),
-    ]);
+    wired
+        .marks
+        .replace(["committed".to_string(), "uncommitted".to_string()]);
 
     let failure = wired
         .executor
