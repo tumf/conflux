@@ -44,8 +44,9 @@ The two recovery scanners may continue issuing ancestry/ref commands only for co
 
 - Unit tests use a fake Git port that can fail if the wrong observation method is called.
 - Native Git fixture tests validate framing, ordering, limits, and absence of tree commands on recovery metadata reads.
-- Existing coordinator and spine tests retain semantic coverage for refusal and archive evidence.
-- A heavy ignored benchmark asserts subprocess-count shape rather than a machine-specific elapsed-time threshold; elapsed time is retained as diagnostic evidence.
+- Native subprocess-count verification uses a serialized heavy test with a PATH-shim `git` wrapper that records commands before delegating to the real Git binary, avoiding process-global environment races with parallel tests.
+- Existing coordinator and spine tests retain semantic coverage for refusal and archive evidence, and existing restart-recovery cases in `tests/e2e_git_worktree_tests.rs` remain required regression coverage.
+- A `#[cfg_attr(not(feature = "heavy-tests"), ignore)]` heavy benchmark asserts subprocess-count shape rather than a machine-specific elapsed-time threshold; elapsed time is retained as diagnostic evidence.
 
 ## Alternatives Rejected
 

@@ -27,6 +27,14 @@ Option-less cumulative parallel startup MAY inspect bounded first-parent commit 
 **And**: ordinary no-match discovery performs no per-commit OpenSpec tree inspection
 **And**: the number of Git subprocesses used for no-match recovery discovery does not grow per scanned commit
 
+#### Scenario: enabled spine validation retains tree evidence
+
+**Given**: upstream integration is enabled after startup recovery discovery
+**And**: first-parent history contains a cumulative change integration subject
+**When**: Conflux validates the selected upstream spine
+**Then**: it loads that commit's archive and active-change tree evidence
+**And**: it rejects the integration when archive evidence is missing or the change remains active
+
 #### Scenario: run and local TUI options are equivalent
 
 **Given**: one invocation uses `cflx run -u`, one uses bare `cflx -u`, and one uses `cflx tui -u`
@@ -69,11 +77,3 @@ When a trailer-identified Conflux upstream merge is reachable from cumulative HE
 **When**: option-less startup performs recovery discovery
 **Then**: Conflux does not classify that commit as valid upstream recovery evidence
 **And**: this classification requires no commit-tree archive or active-change lookup
-
-#### Scenario: enabled spine validation retains tree evidence
-
-**Given**: upstream integration is enabled after startup recovery discovery
-**And**: first-parent history contains a cumulative change integration subject
-**When**: Conflux validates the selected upstream spine
-**Then**: it loads that commit's archive and active-change tree evidence
-**And**: it rejects the integration when archive evidence is missing or the change remains active

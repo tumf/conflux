@@ -30,7 +30,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: benchmark output comparing recovery discovery across short and 500-commit first-parent histories
-    rerun: cargo test upstream --lib --features heavy -- --ignored
+    rerun: cargo test upstream --lib --features heavy-tests
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -55,7 +55,7 @@ Split first-parent history observation into two explicit capabilities:
 1. A metadata-only bounded walk returning SHA, parents, and raw message in oldest-first order for offline recovery discovery.
 2. The existing evidence-bearing spine walk for selected upstream integration, retaining archive and active-change tree evidence for every commit that `validate_spine` classifies.
 
-Route `scan_pending_publications` and `scan_unpushed_upstream_merges` through the metadata-only walk. Preserve their 500-commit bound, trailer parsing, merge-parent validation, local remote-tracking ref checks, and refusal diagnostics. Keep enabled upstream spine validation on the evidence-bearing path.
+Route `scan_pending_publications` and `scan_unpushed_upstream_merges` through the metadata-only walk. Preserve their 500-commit bound, trailer parsing, merge-parent validation, local remote-tracking ref checks, and refusal diagnostics. Because these scanners are shared, the optimization applies to both option-less startup recovery and enabled-mode recovery/finalization calls. Keep enabled upstream spine validation on the evidence-bearing path.
 
 This remains one proposal because the API separation, recovery rewiring, and spine preservation must ship atomically: changing only one side either leaves the startup regression or weakens repository-evidence validation.
 
