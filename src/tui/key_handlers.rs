@@ -657,8 +657,10 @@ pub(crate) fn handle_warning_popup_key(app: &mut AppState, key: KeyEvent) -> boo
 /// underneath. It sits below the warning popup (which is dispatched first) and
 /// above interaction modals.
 ///
-/// Modified keys are deliberately not claimed: `Ctrl+C` keeps its global quit
-/// meaning rather than being redefined as the popup copy action.
+/// `Ctrl`- and `Alt`-modified keys are deliberately not claimed at all, so
+/// `Ctrl+C` keeps its global quit meaning rather than being redefined as the
+/// popup copy action. Copy itself is spec'd as *unmodified* `c`, so any other
+/// modifier (`Shift`, `Super`, …) is swallowed by the popup without copying.
 ///
 /// Returns true when the key was consumed by the popup.
 pub(crate) fn handle_error_details_popup_key(app: &mut AppState, key: KeyEvent) -> bool {
@@ -689,7 +691,7 @@ pub(crate) fn handle_error_details_popup_key(app: &mut AppState, key: KeyEvent) 
         KeyCode::PageDown => {
             app.scroll_error_details_popup(5);
         }
-        KeyCode::Char('c') => {
+        KeyCode::Char('c') if key.modifiers.is_empty() => {
             app.copy_error_details();
         }
         _ => {}
@@ -2439,6 +2441,76 @@ mod tests {
             popup.copy_feedback,
             Some(crate::tui::state::CopyFeedback::Copied)
         );
+    }
+
+    /// Copy is spec'd as *unmodified* `c`. Any other modifier combination stays
+    /// owned by the popup but must not reach the clipboard, and `Ctrl+C` keeps
+    /// falling through to the global quit binding.
+    #[tokio::test]
+    async fn only_unmodified_c_copies_and_ctrl_c_still_quits() {
+        for (code, modifiers) in [
+            (KeyCode::Char('c'), KeyModifiers::SHIFT),
+            (KeyCode::Char('C'), KeyModifiers::SHIFT),
+            (KeyCode::Char('c'), KeyModifiers::SUPER),
+            (
+                KeyCode::Char('c'),
+                KeyModifiers::SHIFT | KeyModifiers::SUPER,
+            ),
+        ] {
+            let mut app = error_details_app();
+            let clipboard =
+                Arc::new(crate::tui::clipboard::test_doubles::RecordingClipboard::default());
+            app.set_clipboard(clipboard.clone());
+            assert!(app.open_error_details_popup());
+
+            assert!(
+                handle_error_details_popup_key(&mut app, KeyEvent::new(code, modifiers)),
+                "{code:?}+{modifiers:?} stays owned by the popup"
+            );
+
+            assert!(
+                clipboard.copies().is_empty(),
+                "{code:?}+{modifiers:?} must not copy"
+            );
+            let popup = app.error_details_popup.as_ref().expect("popup stays open");
+            assert!(
+                popup.copy_feedback.is_none(),
+                "{code:?}+{modifiers:?} reports no copy feedback"
+            );
+        }
+
+        let mut app = error_details_app();
+        let clipboard =
+            Arc::new(crate::tui::clipboard::test_doubles::RecordingClipboard::default());
+        app.set_clipboard(clipboard.clone());
+        assert!(app.open_error_details_popup());
+
+        assert!(handle_error_details_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)
+        ));
+
+        assert_eq!(
+            clipboard.copies(),
+            vec!["Change: change-b\nError: Apply failed: stalled".to_string()],
+            "unmodified c is the one binding that copies"
+        );
+        assert!(!app.should_quit, "unmodified c never quits");
+
+        let mut app = error_details_app();
+        let clipboard =
+            Arc::new(crate::tui::clipboard::test_doubles::RecordingClipboard::default());
+        app.set_clipboard(clipboard.clone());
+        assert!(app.open_error_details_popup());
+
+        route_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        )
+        .await;
+
+        assert!(app.should_quit, "Ctrl+C keeps its global quit meaning");
+        assert!(clipboard.copies().is_empty(), "Ctrl+C must not copy");
     }
 
     #[test]

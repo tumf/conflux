@@ -24,3 +24,9 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate show-copyable-tui-error-details --archive-gate`
+
+## Current Acceptance Follow-up
+- attempt: 1
+- [x] [error-details-copy-requires-unmodified-c] (minor) 修飾された c でもコピー処理が実行される | evidence: src/tui/key_handlers.rs:669-674 は CONTROL と ALT だけを除外しており、SHIFT/SUPER などを許可する; src/tui/key_handlers.rs:692-694 は KeyCode::Char('c') を修飾状態に関係なくコピーとして処理するため、仕様の「unmodified c」に違反する | required_changes: src/tui/key_handlers.rs — コピー操作を修飾キーなしの c に限定し、Ctrl+C のグローバル終了動作を維持する | verification: src/tui/key_handlers.rs — SHIFT/SUPER などで修飾された c がコピーされず、無修飾 c と Ctrl+C がそれぞれ所定の動作をするテストを追加する
+  finding: {"evidence":["src/tui/key_handlers.rs:669-674 は CONTROL と ALT だけを除外しており、SHIFT/SUPER などを許可する","src/tui/key_handlers.rs:692-694 は KeyCode::Char('c') を修飾状態に関係なくコピーとして処理するため、仕様の「unmodified c」に違反する"],"id":"error-details-copy-requires-unmodified-c","required_changes":[{"description":"コピー操作を修飾キーなしの c に限定し、Ctrl+C のグローバル終了動作を維持する","file":"src/tui/key_handlers.rs"}],"severity":"minor","summary":"修飾された c でもコピー処理が実行される","verification":[{"description":"SHIFT/SUPER などで修飾された c がコピーされず、無修飾 c と Ctrl+C がそれぞれ所定の動作をするテストを追加する","file":"src/tui/key_handlers.rs"}]}
+  evidence: src/tui/key_handlers.rs:694 copy arm now guards `key.modifiers.is_empty()` (Ctrl/Alt still fall through to global quit), and test `only_unmodified_c_copies_and_ctrl_c_still_quits` (src/tui/key_handlers.rs:2450) proves Shift/Super/Shift+Super `c` and `C` copy nothing, unmodified `c` copies, Ctrl+C quits — `cargo test --lib tui::key_handlers` 52 passed, `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` exit 0
