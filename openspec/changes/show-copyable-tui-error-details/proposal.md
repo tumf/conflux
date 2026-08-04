@@ -40,7 +40,9 @@ Treat the final change-level error as presentation state independent of the boun
 - Allow `Enter` on an `error` row to open an Error Details popup containing the change ID and untruncated final error.
 - Give the popup local scrolling, `Esc` close behavior, and a visible `c: copy` action.
 - Copy a stable plain-text representation containing the change ID and error to the OS clipboard. Report copy success or failure inside the popup without closing it.
-- Ensure reducer/state synchronization supplies the actual retained diagnostic instead of a placeholder such as `reducer` when the direct failure event was not observed by the TUI.
+- Ensure reducer/state synchronization supplies the actual retained diagnostic instead of a placeholder such as `reducer` when the direct failure event was not observed by the TUI, replacing any stale cached non-error reason.
+- In remote TUI mode, consume the API-projected `error_detail` when available and use the explicit unavailable fallback otherwise.
+- Show `Enter: details` in the Changes-panel hints while the cursor is on an error row.
 - Keep all error presentation state non-authoritative: it must not influence retry, scheduling, acceptance, archive, or other workflow-control decisions.
 
 The row preview and popup ship together because both consume the same retained error state and jointly make the final failure discoverable and actionable after log eviction.
@@ -51,8 +53,9 @@ The row preview and popup ship together because both consume the same retained e
 - A buffered ordinary log never replaces the retained error preview while the row remains `error`.
 - The error preview truncates safely at terminal display width without wrapping or splitting Unicode characters.
 - `Enter` on an `error` row opens a popup showing the change ID and complete final diagnostic; `Enter` retains its existing behavior for non-error rows.
-- The popup owns its scroll, close, and copy keys so they do not affect the underlying Changes list or Logs panel.
-- Pressing `c` copies plain text in the form `Change: <id>\nError: <diagnostic>` and leaves the popup open with visible success feedback.
+- The popup owns its scroll, close, and copy keys so they do not affect the underlying Changes list or Logs panel; warning popups retain higher input priority and `Ctrl+C` retains global quit behavior.
+- The Changes panel shows `Enter: details` when the cursor is on an error row.
+- Pressing unmodified `c` copies plain text in the form `Change: <id>\nError: <diagnostic>` and leaves the popup open with visible success feedback.
 - Clipboard failure leaves the popup open and displays an actionable failure message without losing the diagnostic.
 - The popup visibly advertises scrolling, copying, and closing controls.
 - Retry or any transition away from `error` clears stale error presentation according to the existing state lifecycle.
@@ -60,7 +63,7 @@ The row preview and popup ship together because both consume the same retained e
 
 ## Explicit Completion Conditions
 
-- `ChangeState` contains the full final diagnostic for every reducer-visible change error path used by the TUI; no operator-facing error detail resolves to the placeholder `reducer`.
+- `ChangeState` contains the full final diagnostic for every local reducer-visible and remote API-projected change error path used by the TUI; the final error replaces stale cached non-error reasons and no operator-facing error detail resolves to the placeholder `reducer`.
 - `src/tui/render.rs` renders error-first previews in both Changes-list render paths and renders a scrollable Error Details popup with visible key guidance and copy feedback.
 - `src/tui/key_handlers.rs` routes `Enter`, popup-local navigation, `c`, and `Esc` with modal input ownership while preserving existing non-error key behavior.
 - Clipboard access is behind a minimal injectable boundary so unit tests do not mutate the developer clipboard.

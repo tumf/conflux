@@ -4,7 +4,7 @@
 
 The TUI SHALL expose the retained final diagnostic for a change-level `error` through an Error Details popup that is independent of the bounded log buffer. Pressing `Enter` on an `error` row SHALL open the popup; `Enter` on non-error rows SHALL preserve its existing behavior. The popup SHALL display the change ID and complete untruncated diagnostic, support popup-local scrolling for content that exceeds its body, and visibly advertise scroll, `c: copy`, and `Esc: close` controls.
 
-While visible, the Error Details popup SHALL own its handled input so popup scroll, copy, and close keys do not move or activate the underlying Changes list, Logs panel, or another interaction modal. Pressing `c` SHALL request copying plain text formatted exactly as `Change: <id>\nError: <diagnostic>` to the OS clipboard. Copy success or failure SHALL be reported inside the popup, and either result SHALL leave the popup open with the diagnostic intact. Clipboard access SHALL be testable through an injected implementation so automated tests do not alter the operator's clipboard.
+While visible, the Error Details popup SHALL own its handled input so popup scroll, copy, and close keys do not move or activate the underlying Changes list, Logs panel, or another interaction modal. If a warning popup is also visible, the warning popup SHALL retain first claim on popup keys; otherwise the Error Details popup SHALL handle its keys before interaction modals and underlying views. Global quit input such as `Ctrl+C` SHALL retain its existing behavior rather than being redefined as popup copy. Pressing unmodified `c` SHALL request copying plain text formatted exactly as `Change: <id>\nError: <diagnostic>` to the OS clipboard. Copy success or failure SHALL be reported inside the popup, and either result SHALL leave the popup open with the diagnostic intact. Clipboard access SHALL be testable through an injected implementation so automated tests do not alter the operator's clipboard.
 
 The retained diagnostic and popup are observability presentation only and MUST NOT become workflow-control inputs for scheduling, retry routing, acceptance, archive, or merge decisions.
 
@@ -49,6 +49,20 @@ The retained diagnostic and popup are observability presentation only and MUST N
 - **WHEN** the user presses `Esc`
 - **THEN** the popup SHALL close
 - **AND** no workflow-control state SHALL change because of closing it
+
+#### Scenario: Warning popup retains input priority
+
+- **GIVEN** an Error Details popup and a warning popup are both visible
+- **WHEN** the user presses a popup scroll or close key
+- **THEN** the warning popup SHALL process that key first
+- **AND** the Error Details popup and underlying views SHALL NOT process the same key
+
+#### Scenario: Global quit remains available
+
+- **GIVEN** an Error Details popup is open
+- **WHEN** the user presses `Ctrl+C`
+- **THEN** the TUI SHALL preserve its existing global quit behavior
+- **AND** it SHALL NOT treat the modified key as the popup copy action
 
 #### Scenario: Non-error Enter behavior is unchanged
 
