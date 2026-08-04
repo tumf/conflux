@@ -6,7 +6,7 @@ Known dirty SHALL mean tracked/index changes or non-ignored untracked entries re
 
 Dirty-discard permission and commits-ahead-discard permission SHALL be independent local deletion permissions. Dirty-discard permission MAY waive only known `Dirty`. Commits-ahead-discard permission MAY waive only known commits ahead of base and MAY authorize deletion of the confirmed local branch after worktree removal. Neither permission SHALL waive unknown dirty state, unknown commits-ahead state, unknown base-merge state, main-worktree status, active/deleting state at the TUI boundary, expected Git worktree identity/ref mismatch, or a permission it does not explicitly grant. Both permissions MUST default to disabled, and only the local TUI destructive-confirmation paths MAY enable them. Remote deletion MUST remain fail-closed and MUST NOT expose either permission.
 
-Safety-critical target facts MUST be re-observed after teardown and immediately before Git removal. Ordinary branch cleanup MUST retain the branch and warn when its ref moved or safe reachability cannot be reconfirmed. Explicit ahead-branch cleanup MUST read the ref again after worktree removal and delete the unmerged branch only when it still points to the confirmed HEAD; otherwise it MUST retain the branch and report partial success.
+Safety-critical target facts MUST be re-observed after teardown and immediately before Git removal. Ordinary branch cleanup MUST retain the branch and warn when its ref moved or safe reachability cannot be reconfirmed. Explicit ahead-branch cleanup MUST delete the branch through an atomic compare-and-delete ref transaction conditional on the confirmed HEAD OID; a separate ref read followed by unconditional force deletion is insufficient. A moved, missing, or unverifiable ref MUST retain the branch and report partial success.
 
 #### Scenario: Ordinary deletion refuses known dirty state
 
@@ -18,7 +18,7 @@ Safety-critical target facts MUST be re-observed after teardown and immediately 
 
 #### Scenario: Ordinary deletion escalates a clean ahead worktree
 
-**Given**: A non-main managed worktree is clean and has commits ahead of base
+**Given**: A non-main managed worktree is known clean and has commits ahead of base
 **And**: Commits-ahead-discard permission is disabled
 **When**: Local managed deletion is evaluated
 **Then**: Deletion returns a typed ahead refusal containing fresh path, identity, branch, HEAD, and dirty evidence
@@ -65,6 +65,7 @@ Safety-critical target facts MUST be re-observed after teardown and immediately 
 **When**: Ordinary or explicitly authorized deletion is evaluated
 **Then**: Deletion is refused
 **And**: The worktree and branch are retained
+**And**: No destructive confirmation is opened
 
 #### Scenario: Teardown-induced drift refuses removal
 
@@ -87,7 +88,7 @@ Safety-critical target facts MUST be re-observed after teardown and immediately 
 **Given**: Worktree removal was explicitly authorized from a validated branch OID
 **And**: The worktree was removed
 **And**: The branch ref then moves or cannot be reconfirmed
-**When**: Explicit ahead-branch cleanup runs
+**When**: Explicit ahead-branch cleanup performs its atomic compare-and-delete
 **Then**: The branch is retained
 **And**: The outcome reports partial success and why branch deletion was skipped
 

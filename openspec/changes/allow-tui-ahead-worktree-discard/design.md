@@ -10,7 +10,7 @@ The requested behavior introduces a second destructive authorization boundary: a
 
 `classify_delete_eligibility` will return an ahead-specific typed refusal carrying the freshly observed path, Git worktree identity, branch, HEAD, and dirty classification when commits are known ahead and ahead-discard permission is absent. The TUI opens the destructive modal only from this service result, not from the potentially stale worktree list projection.
 
-If the worktree is both dirty and ahead, ahead classification remains first. Its target includes the known dirty fact so one modal can explicitly disclose both losses. Uppercase `X` then grants both permissions in the submitted intent. This is not implicit permission composition: the combined loss is named before the one keypress authorizes it.
+If the worktree is both dirty and ahead, ahead classification remains first only when dirty state is known. Its target includes the known dirty fact so one modal can explicitly disclose both losses. Uppercase `X` then grants both permissions in the submitted intent. This is not implicit permission composition: the combined loss is named before the one keypress authorizes it. If dirty state is unknown, the service returns a non-escalating fail-closed refusal and the TUI opens no destructive confirmation.
 
 ### Keep three permissions independent
 
@@ -24,13 +24,13 @@ Ordinary local deletion sets only the teardown choice. Dirty-only confirmation s
 
 ### Revalidate before each irreversible boundary
 
-The service re-observes after teardown and before worktree removal. It requires the expected worktree identity, path, branch, and HEAD to remain stable; dirty, ahead, and base-merge state must remain known and authorized. `confirm_branch_ref` must still prove the branch ref equals the observed HEAD before worktree removal.
+The service re-observes after teardown and before worktree removal. The second observation must report worktree identity, path, branch, HEAD, dirty classification, commits-ahead state, and base-merge state unchanged from the pre-teardown observation. `confirm_branch_ref` must still prove the branch ref equals the observed HEAD before worktree removal.
 
 After worktree removal, explicit ahead-branch deletion reads the branch ref again. It force-deletes only the branch ref that still equals the confirmed HEAD. A moved or unreadable ref is retained and reported; the already removed worktree is not reconstructed.
 
 ### Separate ordinary and destructive branch cleanup
 
-Ordinary deletion continues to call merged-only branch cleanup. Explicit ahead discard uses a distinct backend operation that can delete an unmerged local branch. The destructive operation is not selected from `has_commits_ahead` alone; it requires the explicit local permission and confirmed target evidence.
+Ordinary deletion continues to call merged-only branch cleanup. Explicit ahead discard uses a distinct backend operation that accepts the confirmed OID and deletes the unmerged local branch through an atomic compare-and-delete ref transaction equivalent to `git update-ref -d refs/heads/<branch> <expected-oid>`. A separate ref read followed by unconditional `git branch -D` is not sufficient. The destructive operation is not selected from `has_commits_ahead` alone; it requires the explicit local permission and confirmed target evidence.
 
 ### Keep remote deletion fail-closed
 

@@ -59,10 +59,10 @@ This is one atomic change because the policy flag, typed refusal, confirmation U
 5. Known-dirty discard, ahead-commit discard, and teardown skipping remain independent permissions. No one permission silently grants another.
 6. Immediately before removal, changed or unknown identity, branch, HEAD/ref, dirty, ahead, or base-merge facts refuse deletion and preserve both worktree and branch.
 7. A teardown failure preserves both worktree and branch unless teardown was independently skipped before the destructive confirmation.
-8. After successful worktree removal, the branch is force-deleted only when its ref still equals the confirmed HEAD. Ref drift or ref observation failure retains the branch and reports partial success.
+8. After successful worktree removal, the branch is deleted through an atomic compare-and-delete conditional on the confirmed HEAD OID. A moved, missing, or unverifiable ref retains the branch and reports partial success.
 9. Main, active, already-deleting, detached, or merge-busy targets remain ineligible regardless of destructive permissions.
 10. Remote API and WebUI continue to report ahead worktrees as undeletable and reject unsafe parameters; they expose no ahead-discard permission.
-11. Tests exercise clean-ahead success, dirty-ahead success, inert confirmation keys, cancellation, independent permissions, teardown failure, safety drift, branch deletion failure/ref drift, and remote refusal.
+11. Tests exercise clean-ahead success, dirty-ahead success, ahead with unknown dirty state, inert confirmation keys, cancellation, independent permissions, teardown failure, concurrent root-busy refusal, safety drift, worktree removal failure, branch deletion failure/ref drift, atomic compare-and-delete, remote error mapping, remote path redaction, and remote refusal.
 
 ## Explicit Completion Conditions
 
