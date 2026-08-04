@@ -432,7 +432,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         .filter(|c| {
             matches!(
                 c.display_status_cache.as_str(),
-                "applying" | "accepting" | "archiving" | "resolving"
+                "preparing" | "applying" | "accepting" | "archiving" | "resolving"
             )
         })
         .count();
@@ -798,7 +798,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
         if matches!(
             item.display_status_cache.as_str(),
-            "applying" | "accepting" | "archiving" | "resolving"
+            "preparing" | "applying" | "accepting" | "archiving" | "resolving"
         ) {
             if let Some(ModalState::ConfirmForceKill { .. }) = app.modal {
                 keys.push("Y: confirm kill".to_string());
@@ -982,6 +982,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 // Build status text (without spinner for in-flight states)
                 // For in-flight states, spinner will be prepended separately with elapsed time
                 let (spinner_prefix, status_text) = match change.display_status_cache.as_str() {
+                    // Preparation spins like any other active row, but never
+                    // carries an iteration: no operation agent has started, so
+                    // a retained apply count would describe a different phase.
+                    "preparing" => (format!("{} ", spinner_char), "[preparing]".to_string()),
                     "applying" | "archiving" | "resolving" | "accepting" => {
                         let status = if let Some(iter) = change.iteration_number {
                             format!("[{}:{}]", change.display_status_cache.as_str(), iter)
@@ -1142,7 +1146,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
         if matches!(
             item.display_status_cache.as_str(),
-            "applying" | "accepting" | "archiving" | "resolving"
+            "preparing" | "applying" | "accepting" | "archiving" | "resolving"
         ) {
             if let Some(ModalState::ConfirmForceKill { .. }) = app.modal {
                 keys.push("Y: confirm kill".to_string());

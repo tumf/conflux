@@ -806,6 +806,16 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
         ),
 
         // Workspace lane.
+        E::WorkspacePreparationStarted { change_id } => (
+            "workspace_preparation_started",
+            Some(change_id.clone()),
+            json!({}),
+        ),
+        E::WorkspacePreparationEnded { change_id } => (
+            "workspace_preparation_ended",
+            Some(change_id.clone()),
+            json!({}),
+        ),
         E::WorkspaceCreated {
             change_id,
             workspace,

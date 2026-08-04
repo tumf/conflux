@@ -14426,3 +14426,282 @@ async fn cli_explicit_targets_enter_the_initial_candidate_contract_without_unrel
         "an explicitly requested archived-dirty workspace is still recoverable"
     );
 }
+
+// ============================================================================
+// Workspace preparation is announced before slow workspace work
+// ============================================================================
+//
+// Integration evidence: real Git worktree creation and a real `.wt/setup`
+// process, held open on a filesystem synchronization primitive so the
+// externally projected status can be inspected *while* preparation runs.
+
+/// Install a `.wt/setup` test double that blocks until `release` appears.
+#[cfg(feature = "heavy-tests")]
+fn write_blocking_setup_script(repo_root: &Path, release: &Path) {
+    let wt_dir = repo_root.join(".wt");
+    std::fs::create_dir_all(&wt_dir).or_fail("create .wt");
+    let script = wt_dir.join("setup");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nwhile [ ! -f '{}' ]; do sleep 0.02; done\n",
+            release.display()
+        ),
+    )
+    .or_fail("write blocking setup");
+    #[cfg(unix)]
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .or_fail("chmod setup");
+}
+
+/// Forward parallel events into a reducer the way the production dispatch owner
+/// does, recording each variant name so ordering is assertable.
+#[cfg(feature = "heavy-tests")]
+fn spawn_reducer_forwarder(
+    mut rx: mpsc::Receiver<ExecutionEvent>,
+    reducer: Arc<RwLock<OrchestratorState>>,
+    recorded: Arc<Mutex<Vec<String>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            reducer.write().await.apply_execution_event(&event);
+            recorded
+                .lock()
+                .await
+                .push(crate::events::event_variant_name(&event).to_string());
+        }
+    })
+}
+
+#[cfg(feature = "heavy-tests")]
+async fn wait_for_status(
+    reducer: &Arc<RwLock<OrchestratorState>>,
+    change_id: &str,
+    expected: &str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let observed = reducer.read().await.display_status(change_id).to_string();
+        if observed == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "'{change_id}' never reached '{expected}' (last: '{observed}')"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// While `.wt/setup` runs, the admitted change must externally read as
+/// `preparing`, a candidate the scheduler has not reached must still read as
+/// `queued`, and no Apply transition may have been claimed.
+///
+/// Releasing the stop mark that a refused dequeue leaves behind then stops
+/// execution after preparation and before any operation agent starts.
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn preparing_is_visible_during_setup_and_a_retained_stop_prevents_agent_startup() {
+    let repo_dir = TempDir::new().or_fail("repo tempdir");
+    let workspace_base = TempDir::new().or_fail("workspace tempdir");
+    let control_dir = TempDir::new().or_fail("control tempdir");
+    init_git_repo(repo_dir.path()).await;
+
+    let release = control_dir.path().join("release-setup");
+    write_blocking_setup_script(repo_dir.path(), &release);
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some("sh -c 'true'".to_string()),
+        ..Default::default()
+    });
+
+    let (tx, rx) = mpsc::channel(256);
+    let reducer = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["admitted".to_string(), "waiting".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = reducer.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue("admitted".to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue("waiting".to_string()));
+    }
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let forwarder = spawn_reducer_forwarder(rx, reducer.clone(), recorded.clone());
+
+    let queue = Arc::new(crate::tui::queue::DynamicQueue::new());
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.set_shared_orchestrator_state(reducer.clone());
+    executor.set_dynamic_queue(queue.clone());
+    // A dependency-resolved candidate takes the force-recreate path, which is
+    // the earliest slow work preparation has to cover.
+    executor
+        .force_recreate_worktree
+        .insert("admitted".to_string());
+
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("base revision");
+    let semaphore = Arc::new(Semaphore::new(1));
+    let repo_root = repo_dir.path().to_path_buf();
+
+    let dispatch = tokio::spawn(async move {
+        let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+        let mut in_flight = HashSet::new();
+        let mut cleanup_guard =
+            crate::parallel::cleanup::WorkspaceCleanupGuard::new(VcsBackend::Git, repo_root);
+        executor
+            .dispatch_change_to_workspace(
+                "admitted".to_string(),
+                base_revision,
+                semaphore,
+                &mut join_set,
+                &mut in_flight,
+                &mut cleanup_guard,
+            )
+            .await
+            .or_fail("dispatch should succeed");
+        join_set
+            .join_next()
+            .await
+            .or_fail("workspace task should exist")
+            .or_fail("workspace task join should succeed")
+    });
+
+    // `.wt/setup` is blocked, so this is the interval that used to render as a
+    // stalled `queued` row.
+    wait_for_status(&reducer, "admitted", "preparing").await;
+    assert_eq!(
+        reducer.read().await.display_status("waiting"),
+        "queued",
+        "a candidate the scheduler has not admitted must not be labelled active"
+    );
+    {
+        let names = recorded.lock().await;
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "WorkspacePreparationStarted"),
+            "preparation must be announced before slow workspace work: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "ApplyStarted"),
+            "preparation must not claim that Apply started: {names:?}"
+        );
+    }
+
+    // A dequeue requested during inline preparation is refused, but its stop
+    // mark survives; releasing setup must then stop before the Apply agent.
+    queue.mark_stopped("admitted".to_string()).await;
+    std::fs::write(&release, "go").or_fail("release setup");
+
+    let result = dispatch.await.or_fail("dispatch task join");
+    assert!(
+        result.error.is_none(),
+        "unexpected error: {:?}",
+        result.error
+    );
+    assert!(result.final_revision.is_none());
+
+    drop(queue);
+    let names = recorded.lock().await.clone();
+    let preparation_index = names
+        .iter()
+        .position(|name| name == "WorkspacePreparationStarted")
+        .or_fail("preparation event must be recorded");
+    let dequeued_index = names
+        .iter()
+        .position(|name| name == "ChangeDequeued")
+        .or_fail("the retained stop must produce a reducer-visible transition");
+    assert!(
+        preparation_index < dequeued_index,
+        "preparation must precede its own terminal transition: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "ApplyStarted"),
+        "a change stopped during preparation must never start an operation agent: {names:?}"
+    );
+    assert_eq!(
+        reducer.read().await.display_status("admitted"),
+        "not queued"
+    );
+
+    forwarder.abort();
+}
+
+/// A dispatch refused by the pre-permit stop gate must never announce
+/// preparation at all: the change was never admitted to a slot.
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn preparing_is_not_announced_for_a_change_stopped_before_dispatch() {
+    let repo_dir = TempDir::new().or_fail("repo tempdir");
+    let workspace_base = TempDir::new().or_fail("workspace tempdir");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+
+    let (tx, rx) = mpsc::channel(64);
+    let reducer = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["stopped-early".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    reducer
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("stopped-early".to_string()));
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let forwarder = spawn_reducer_forwarder(rx, reducer.clone(), recorded.clone());
+
+    let queue = Arc::new(crate::tui::queue::DynamicQueue::new());
+    queue.mark_stopped("stopped-early".to_string()).await;
+
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.set_shared_orchestrator_state(reducer.clone());
+    executor.set_dynamic_queue(queue.clone());
+
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("base revision");
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut in_flight = HashSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+
+    executor
+        .dispatch_change_to_workspace(
+            "stopped-early".to_string(),
+            base_revision,
+            Arc::new(Semaphore::new(1)),
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("a stopped change is skipped, not an error");
+
+    assert!(join_set.is_empty(), "no workspace task may be spawned");
+    assert!(in_flight.is_empty());
+
+    // Let the forwarder drain the events the gate emitted.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let names = recorded.lock().await.clone();
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "WorkspacePreparationStarted"),
+        "a change refused before admission must never look like active preparation: {names:?}"
+    );
+    assert_eq!(
+        reducer.read().await.display_status("stopped-early"),
+        "not queued"
+    );
+
+    forwarder.abort();
+}

@@ -41,7 +41,13 @@ pub const DEFAULT_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(30);
 // ============================================================================
 
 /// Display statuses that represent active execution.
-const ACTIVE_STATUSES: [&str; 5] = [
+///
+/// `preparing` belongs here even though no agent process is running yet: an
+/// admitted change is already creating, recreating, or setting up its managed
+/// worktree, so destructive mutation and mark-based intent changes must be
+/// refused exactly as they are for an operation in flight.
+const ACTIVE_STATUSES: [&str; 6] = [
+    "preparing",
     "applying",
     "accepting",
     "rejecting",
@@ -781,9 +787,14 @@ impl std::fmt::Display for OperatorCommandError {
                 "execution mark for '{change_id}' is not allowed in {mode:?} mode \
                  (status '{display_status}', route {route:?})"
             ),
+            // Inline workspace preparation is the common way to reach this: the
+            // worktree is being created or `.wt/setup` is running, and neither
+            // is killable. The stop request itself is still recorded, so saying
+            // only "refused" would understate what actually happened.
             Self::MissingCancellationHandle { change_id } => write!(
                 f,
-                "no cancellation handle registered for active change '{change_id}'"
+                "no cancellation handle registered for active change '{change_id}'; \
+                 the stop request is recorded and takes effect before the next operation starts"
             ),
             Self::CancellationFailed { change_id, message } => {
                 write!(f, "cancellation failed for '{change_id}': {message}")

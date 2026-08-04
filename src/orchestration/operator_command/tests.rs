@@ -1866,3 +1866,86 @@ async fn bulk_mark_is_refused_in_error_and_stopping_modes_without_side_effects()
         assert!(fixture.queue.contents.lock().unwrap().is_empty());
     }
 }
+
+// ============================================================================
+// Workspace preparation counts as active execution
+// ============================================================================
+
+/// Put a change into the reducer's ephemeral preparation activity.
+async fn enter_preparation(state: &Arc<RwLock<OrchestratorState>>, change_id: &str) {
+    let mut guard = state.write().await;
+    guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+    guard.apply_execution_event(&ExecutionEvent::WorkspacePreparationStarted {
+        change_id: change_id.to_string(),
+    });
+    assert_eq!(guard.display_status(change_id), "preparing");
+}
+
+/// Unit: the shared lifecycle matrix classifies `preparing` as active, so no
+/// frontend can offer a mark or queue-intent mutation on a change whose worktree
+/// Conflux is currently building.
+#[test]
+fn preparing_is_active_in_the_shared_lifecycle_matrix() {
+    assert!(is_active_status("preparing"));
+    assert!(!is_final_status("preparing"));
+
+    assert_eq!(
+        classify_mark_route(OperatorMode::Running, "preparing"),
+        MarkRoute::Immutable
+    );
+    assert_eq!(
+        classify_bulk_mark_row(OperatorMode::Running, true, "preparing", true),
+        Some(MarkExclusion::ChangeActive)
+    );
+}
+
+/// Unit: inline preparation registers no termination handle, so an immediate
+/// dequeue cannot be proven and must be refused with the active state intact.
+#[tokio::test]
+async fn preparing_is_active_so_dequeue_without_a_handle_is_refused() {
+    let fixture = fixture_with_cancellation(&["change-a"], CancellationBehavior::NoHandle);
+    enter_preparation(&fixture.state, "change-a").await;
+
+    let error = fixture
+        .service
+        .stop_and_dequeue("change-a")
+        .await
+        .expect_err("preparation has no handle, so termination cannot be confirmed");
+
+    assert_eq!(
+        error,
+        OperatorCommandError::MissingCancellationHandle {
+            change_id: "change-a".to_string()
+        }
+    );
+    assert_eq!(
+        fixture.state.read().await.display_status("change-a"),
+        "preparing",
+        "a refused stop must not fabricate a dequeued row"
+    );
+}
+
+/// Unit: the refusal still records the stop mark, which is what later stops
+/// execution before an operation agent starts. `DynamicQueue` is in-memory
+/// state with no external boundary, so this stays unit-scoped.
+#[tokio::test]
+async fn preparing_is_active_and_a_refused_stop_retains_the_stop_mark() {
+    let (service, state, _hooks, queue) = dynamic_queue_fixture(&["change-a"]);
+    enter_preparation(&state, "change-a").await;
+
+    let error = service
+        .stop_and_dequeue("change-a")
+        .await
+        .expect_err("preparation has no handle");
+    assert_eq!(
+        error,
+        OperatorCommandError::MissingCancellationHandle {
+            change_id: "change-a".to_string()
+        }
+    );
+
+    assert!(
+        queue.is_stopped("change-a").await,
+        "the stop mark must survive the refusal so preparation cannot hand off to an agent"
+    );
+}

@@ -36,8 +36,8 @@ pub struct ChangeStatus {
     /// Dependencies on other changes
     pub dependencies: Vec<String>,
     /// Queue status (for parallel/serial execution tracking)
-    /// Aligned with canonical display taxonomy values: "not queued", "queued", "blocked", "stalled", "applying",
-    /// "accepting", "archiving", "archived", "merged", "pushed", "rejected", "merge wait", "resolving", "resolve pending", "reject pending", "error"
+    /// Aligned with canonical display taxonomy values: "not queued", "queued", "blocked", "stalled", "preparing",
+    /// "applying", "accepting", "archiving", "archived", "merged", "pushed", "rejected", "merge wait", "resolving", "resolve pending", "reject pending", "error"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_status: Option<String>,
     /// Current iteration number for apply/archive loops
@@ -189,7 +189,8 @@ impl OrchestratorStateSnapshot {
             .iter()
             .filter(|c| {
                 c.queue_status.as_ref().is_some_and(|s| {
-                    s == "applying"
+                    s == "preparing"
+                        || s == "applying"
                         || s == "accepting"
                         || s == "archiving"
                         || s == "resolving"
@@ -327,7 +328,11 @@ fn refresh_summary(state: &mut OrchestratorStateSnapshot) {
         .iter()
         .filter(|change| {
             change.queue_status.as_ref().is_some_and(|s| {
-                s == "applying" || s == "accepting" || s == "archiving" || s == "resolving"
+                s == "preparing"
+                    || s == "applying"
+                    || s == "accepting"
+                    || s == "archiving"
+                    || s == "resolving"
             })
         })
         .count();
@@ -847,6 +852,21 @@ impl WebState {
                             change.iteration_number = Some(*iter);
                             updated = true;
                         }
+                    }
+                }
+
+                // Workspace preparation.
+                //
+                // Both arms exist only to mark the snapshot dirty so the
+                // reducer-derived `queue_status` is re-read below. Preparation is
+                // the one interval during which no other event arrives for
+                // minutes, so leaving it to the next unrelated refresh is exactly
+                // the blind window this transition exists to close. No field is
+                // written here: the status still comes from the reducer.
+                ExecutionEvent::WorkspacePreparationStarted { change_id }
+                | ExecutionEvent::WorkspacePreparationEnded { change_id } => {
+                    if state.changes.iter().any(|c| c.id == *change_id) {
+                        updated = true;
                     }
                 }
 

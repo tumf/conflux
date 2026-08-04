@@ -1397,6 +1397,24 @@ impl ParallelExecutor {
             })?
         };
 
+        // The change now owns an execution slot and has passed the stop and
+        // terminal gates, so everything below is admitted work that can take
+        // minutes: force-recreate cleanup, `git worktree add`, and `.wt/setup`
+        // all run before any operation agent starts. Announcing preparation here
+        // — rather than for every selected candidate, or after the workspace
+        // exists — is what makes the interval observable without labelling
+        // changes that are still waiting behind an earlier slow setup.
+        //
+        // A failure below propagates through `?` to the dispatch loop, which
+        // emits `ProcessingError`; that terminal transition clears preparation.
+        send_event(
+            &self.event_tx,
+            ParallelEvent::WorkspacePreparationStarted {
+                change_id: change_id.clone(),
+            },
+        )
+        .await;
+
         let force_recreate = self.force_recreate_worktree.remove(&change_id);
         if force_recreate {
             info!(
@@ -1688,6 +1706,45 @@ impl ParallelExecutor {
                     }
                 }
                     _ => {}
+                }
+            }
+
+            // Inline workspace preparation has no termination handle, so an
+            // operator stop requested while the worktree was being created or
+            // set up could not abort it; the request only left a stop mark
+            // behind. Honouring that mark here — before any operation agent is
+            // created, and on every resume route, not just Apply — is what makes
+            // the refused immediate dequeue still stop execution.
+            if let Some(ref queue) = dynamic_queue {
+                if queue.is_stopped(&change_id).await {
+                    queue.clear_stopped(&change_id).await;
+                    info!(
+                        "Change '{}' stopped during workspace preparation; no operation agent started",
+                        change_id
+                    );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::ChangeDequeued {
+                                change_id: change_id.clone(),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                LogEntry::info(format!(
+                                    "Change stopped during workspace preparation: {}",
+                                    change_id
+                                ))
+                                .with_change_id(&change_id),
+                            ))
+                            .await;
+                    }
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: None, // No error - intentionally stopped
+                        rejected: None,
+                    };
                 }
             }
 

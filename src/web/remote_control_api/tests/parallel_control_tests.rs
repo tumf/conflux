@@ -904,3 +904,156 @@ async fn a_fully_eligible_marked_set_starts_in_parallel_mode() {
     assert_eq!(wired.status("a").await, "queued");
     assert_eq!(wired.status("b").await, "queued");
 }
+
+// ============================================================================
+// Workspace preparation projects one shared token
+// ============================================================================
+
+/// One internal preparation event must produce the same `preparing` token in the
+/// reducer and in the `/api/v2` snapshot, with the action set an active row
+/// gets. A surface that inferred preparation from logs or filesystem timing
+/// instead would be free to disagree with the reducer; this is what stops that.
+#[tokio::test]
+async fn preparing_projection_is_one_reducer_token_across_every_surface() {
+    use crate::events::{dispatch_event, EventSink};
+    use crate::web::remote_control_api::dto::ActionBlockedReason;
+    use crate::web::remote_control_api::projection::change_actions_for_test;
+    use crate::web::state::WebEventSink;
+
+    let wired = Wired::new(&["prep", "waiting"]).await;
+    wired
+        .observe(&["prep", "waiting"], &["prep", "waiting"], &[], "running")
+        .await;
+
+    let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(wired.web_state.clone()))];
+    dispatch_event(
+        wired.reducer.as_ref(),
+        &sinks,
+        ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "prep".to_string(),
+        },
+    )
+    .await;
+    wired.web_state.sync_remote_control_projection().await;
+
+    // The reducer is the single source.
+    assert_eq!(wired.status("prep").await, "preparing");
+    // A change still waiting behind an occupied slot is untouched.
+    assert_eq!(wired.status("waiting").await, "not queued");
+
+    let snapshot = wired.snapshot();
+    let row = |id: &str| {
+        snapshot
+            .changes
+            .iter()
+            .find(|change| change.id == id)
+            .unwrap_or_else(|| panic!("'{id}' must be projected"))
+            .clone()
+    };
+    assert_eq!(row("prep").display_status, "preparing");
+    assert_eq!(row("waiting").display_status, "not queued");
+
+    // Preparation is active work, not a blocker and not a final outcome.
+    assert!(
+        row("prep").blocker.is_none(),
+        "an active row must not grow a blocker badge"
+    );
+    let actions = row("prep").actions;
+    assert!(
+        actions.stop_and_dequeue.allowed,
+        "stop remains expressible; the refusal is the queue's to make"
+    );
+    assert!(
+        !actions.set_execution_mark.allowed && !actions.set_queue_intent.allowed,
+        "an admitted change mutating its worktree is not mark- or queue-mutable"
+    );
+    assert_eq!(
+        actions.resolve_merge.blocked_reason,
+        Some(ActionBlockedReason::ChangeActive)
+    );
+    // The point is not any particular reason token: it is that a remote client
+    // is offered exactly what an in-flight operation is offered, so preparation
+    // cannot become a hole in the active-row action contract.
+    assert_eq!(
+        actions,
+        change_actions_for_test("running", "applying", None),
+        "preparing must advertise the same action set as a running operation"
+    );
+
+    // The legacy monitoring snapshot counts it as in-progress work too, so the
+    // two web payloads cannot disagree about whether anything is running.
+    let legacy = wired.web_state.get_state().await;
+    assert_eq!(
+        legacy
+            .changes
+            .iter()
+            .find(|change| change.id == "prep")
+            .and_then(|change| change.queue_status.as_deref()),
+        Some("preparing")
+    );
+    assert_eq!(legacy.in_progress_changes, 1);
+
+    // Preparation yields to the repository-derived phase, from the same reducer.
+    dispatch_event(
+        wired.reducer.as_ref(),
+        &sinks,
+        ExecutionEvent::ApplyStarted {
+            change_id: "prep".to_string(),
+            command: "apply".to_string(),
+        },
+    )
+    .await;
+    wired.web_state.sync_remote_control_projection().await;
+    assert_eq!(wired.status("prep").await, "applying");
+    assert_eq!(
+        wired
+            .snapshot()
+            .changes
+            .iter()
+            .find(|change| change.id == "prep")
+            .map(|change| change.display_status.clone()),
+        Some("applying".to_string())
+    );
+}
+
+/// A dispatch that ends before any operation-started event must leave the row
+/// visibly not-preparing rather than stranding an active-looking status.
+#[tokio::test]
+async fn preparing_projection_clears_on_a_pre_operation_exit() {
+    use crate::events::{dispatch_event, EventSink};
+    use crate::web::state::WebEventSink;
+
+    let wired = Wired::new(&["prep"]).await;
+    wired.observe(&["prep"], &["prep"], &[], "running").await;
+    {
+        let mut guard = wired.reducer.write().await;
+        guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+            "prep".to_string(),
+        ));
+    }
+
+    let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(wired.web_state.clone()))];
+    for event in [
+        ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "prep".to_string(),
+        },
+        ExecutionEvent::WorkspacePreparationEnded {
+            change_id: "prep".to_string(),
+        },
+    ] {
+        dispatch_event(wired.reducer.as_ref(), &sinks, event).await;
+    }
+    wired.web_state.sync_remote_control_projection().await;
+
+    assert_eq!(wired.status("prep").await, "queued");
+    assert_eq!(
+        wired
+            .snapshot()
+            .changes
+            .iter()
+            .find(|change| change.id == "prep")
+            .map(|change| change.display_status.clone()),
+        Some("queued".to_string())
+    );
+    assert_eq!(wired.web_state.get_state().await.in_progress_changes, 0);
+}

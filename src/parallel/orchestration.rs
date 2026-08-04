@@ -364,6 +364,7 @@ impl ParallelExecutor {
                     }
                 }
                 self.release_execution_handles_after_cancellation().await;
+                self.clear_preparation_for_aborted_changes(&in_flight).await;
                 in_flight.clear();
                 queued.clear();
                 self.drain_pending_merge_results_after_cancellation(
@@ -403,6 +404,7 @@ impl ParallelExecutor {
                 // Aborted tasks never reach `handle_workspace_completion`, so their
                 // registered execution handles are released here instead.
                 self.release_execution_handles_after_cancellation().await;
+                self.clear_preparation_for_aborted_changes(&in_flight).await;
                 in_flight.clear();
                 // Detached background merge / base-lane tasks may still be mutating the
                 // base repository. Terminal stop follows their result handling.
@@ -730,6 +732,25 @@ impl ParallelExecutor {
                 released,
                 "Released registered execution handles for aborted in-flight changes after cancellation"
             );
+        }
+    }
+
+    /// Clear ephemeral workspace preparation for tasks cancellation aborted.
+    ///
+    /// An aborted task never returns through `handle_workspace_completion`, so a
+    /// change that was still creating or setting up its worktree would otherwise
+    /// stay rendered as `preparing` for the rest of the process. The clear is a
+    /// no-op for any change that already reached a real phase or a terminal
+    /// state, so it cannot rewrite the outcome of work that did finish.
+    async fn clear_preparation_for_aborted_changes(&self, in_flight: &HashSet<String>) {
+        for change_id in in_flight {
+            send_event(
+                &self.event_tx,
+                ParallelEvent::WorkspacePreparationEnded {
+                    change_id: change_id.clone(),
+                },
+            )
+            .await;
         }
     }
 
