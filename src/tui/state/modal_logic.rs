@@ -47,6 +47,8 @@ pub(crate) enum ModalInvalidation {
     WorktreeTargetDeleting,
     /// The path now carries a different branch identity.
     WorktreeIdentityChanged,
+    /// The worktree moved to a different commit since the confirmation opened.
+    WorktreeHeadMoved,
     /// The force-kill target is no longer present in the change list.
     ForceKillTargetAbsent,
     /// The force-kill target reached a final status.
@@ -69,6 +71,7 @@ impl ModalInvalidation {
             ModalInvalidation::WorktreeIdentityChanged => {
                 "the worktree now carries a different branch"
             }
+            ModalInvalidation::WorktreeHeadMoved => "the worktree moved to a different commit",
             ModalInvalidation::ForceKillTargetAbsent => "the change is no longer listed",
             ModalInvalidation::ForceKillTargetFinal => "the change already reached a final status",
             ModalInvalidation::ForceKillTargetNotActive => "the change is no longer active work",
@@ -131,6 +134,32 @@ pub(crate) fn evaluate_worktree_delete(
     Ok(())
 }
 
+/// Whether a dirty-discard confirmation still targets the worktree it was opened over.
+///
+/// This is the ordinary delete policy plus one more anchor: the destructive
+/// confirmation was escalated from a specific observed commit, so a target that
+/// moved its HEAD in the meantime is no longer the thing the operator agreed to
+/// discard. The check is necessary but not sufficient — the shared service
+/// revalidates the same identity under its own mutation guard, where an
+/// active-state transition after this point is still visible.
+pub(crate) fn evaluate_dirty_discard(
+    path: &Path,
+    branch: &str,
+    head: &str,
+    ctx: &ModalValidityContext<'_>,
+) -> Result<(), ModalInvalidation> {
+    evaluate_worktree_delete(path, branch, ctx)?;
+
+    let Some(worktree) = find_worktree(ctx.worktrees, path) else {
+        return Err(ModalInvalidation::WorktreeTargetAbsent);
+    };
+    if worktree.head != head {
+        return Err(ModalInvalidation::WorktreeHeadMoved);
+    }
+
+    Ok(())
+}
+
 /// Whether a force-kill confirmation still targets retryable active work.
 pub(crate) fn evaluate_force_kill(
     change_id: &str,
@@ -176,6 +205,9 @@ pub(crate) fn evaluate(
         ModalState::ConfirmWorktreeDelete { path, branch } => {
             evaluate_worktree_delete(path, branch, ctx)
         }
+        ModalState::ConfirmDirtyDiscard {
+            path, branch, head, ..
+        } => evaluate_dirty_discard(path, branch, head, ctx),
         ModalState::ConfirmForceKill { change_id } => evaluate_force_kill(change_id, ctx),
     }
 }
@@ -379,6 +411,97 @@ mod tests {
         );
     }
 
+    /// A named mutation and the invalidation it must produce.
+    type InvalidationCase = (&'static str, fn(&mut Fixture), ModalInvalidation);
+
+    fn dirty_discard_modal() -> ModalState {
+        ModalState::ConfirmDirtyDiscard {
+            path: PathBuf::from("/tmp/wt-a"),
+            identity: "gitdir: /tmp/wt-a/.git".to_string(),
+            branch: "change-a".to_string(),
+            head: "abc1234".to_string(),
+            skip_teardown: false,
+        }
+    }
+
+    #[test]
+    fn tui_dirty_worktree_delete_confirmation_survives_while_the_target_holds_still() {
+        let mut fixture = Fixture::new();
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            fixture.execution_mode = mode;
+            assert_eq!(evaluate(&dirty_discard_modal(), &fixture.ctx()), Ok(()));
+        }
+    }
+
+    #[test]
+    fn tui_dirty_worktree_delete_confirmation_inherits_every_delete_invalidation() {
+        // A destructive confirmation may not be *easier* to satisfy than the
+        // ordinary one it was escalated from.
+        let cases: [InvalidationCase; 6] = [
+            (
+                "absent",
+                |f: &mut Fixture| f.worktrees.clear(),
+                ModalInvalidation::WorktreeTargetAbsent,
+            ),
+            (
+                "main",
+                |f: &mut Fixture| f.worktrees[0].is_main = true,
+                ModalInvalidation::WorktreeTargetIsMain,
+            ),
+            (
+                "deleting",
+                |f: &mut Fixture| {
+                    f.deleting.insert(PathBuf::from("/tmp/wt-a"));
+                },
+                ModalInvalidation::WorktreeTargetDeleting,
+            ),
+            (
+                "rebranded",
+                |f: &mut Fixture| f.worktrees[0].branch = "change-z".to_string(),
+                ModalInvalidation::WorktreeIdentityChanged,
+            ),
+            (
+                "detached",
+                |f: &mut Fixture| f.worktrees[0].is_detached = true,
+                ModalInvalidation::WorktreeIdentityChanged,
+            ),
+            (
+                "active",
+                |f: &mut Fixture| f.changes[0].set_display_status_cache("applying"),
+                ModalInvalidation::WorktreeTargetActive,
+            ),
+        ];
+
+        for (name, mutate, expected) in cases {
+            let mut fixture = Fixture::new();
+            mutate(&mut fixture);
+            assert_eq!(
+                evaluate(&dirty_discard_modal(), &fixture.ctx()),
+                Err(expected),
+                "{name}: a destructive confirmation must invalidate like an ordinary one"
+            );
+        }
+    }
+
+    #[test]
+    fn tui_dirty_worktree_delete_confirmation_invalidates_when_head_moves() {
+        // The escalation named a specific commit. A worktree that moved is no
+        // longer the thing the operator was shown and agreed to discard.
+        let mut moved = Fixture::new();
+        moved.worktrees[0].head = "def5678".to_string();
+
+        assert_eq!(
+            evaluate(&dirty_discard_modal(), &moved.ctx()),
+            Err(ModalInvalidation::WorktreeHeadMoved)
+        );
+    }
+
     #[test]
     fn force_kill_survives_running_to_stopping_while_the_target_is_active() {
         let mut fixture = Fixture::new();
@@ -442,6 +565,7 @@ mod tests {
             ModalInvalidation::WorktreeTargetActive,
             ModalInvalidation::WorktreeTargetDeleting,
             ModalInvalidation::WorktreeIdentityChanged,
+            ModalInvalidation::WorktreeHeadMoved,
             ModalInvalidation::ForceKillTargetAbsent,
             ModalInvalidation::ForceKillTargetFinal,
             ModalInvalidation::ForceKillTargetNotActive,

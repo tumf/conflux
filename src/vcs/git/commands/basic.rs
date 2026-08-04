@@ -70,8 +70,24 @@ pub async fn check_git_repo<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
 /// Returns a tuple of (has_changes, status_output) where:
 /// - has_changes: true if there are uncommitted changes or untracked files
 /// - status_output: the output from `git status --porcelain` for error messages
+///
+/// The untracked and ignored modes are passed explicitly rather than inherited:
+/// `status.showUntrackedFiles=no` in a repository or a user's global config would
+/// otherwise make a worktree full of untracked work report as clean, and that
+/// answer is what a destructive deletion is allowed to act on. Ignored entries
+/// stay excluded on purpose — generated content is not operator work, and
+/// enumerating it is not what this observation is for.
 pub async fn has_uncommitted_changes<P: AsRef<Path>>(cwd: P) -> VcsResult<(bool, String)> {
-    let output = run_git(&["status", "--porcelain"], cwd).await?;
+    let output = run_git(
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignored=no",
+        ],
+        cwd,
+    )
+    .await?;
     let has_changes = !output.is_empty();
     Ok((has_changes, output))
 }
@@ -236,6 +252,50 @@ pub async fn branch_delete<P: AsRef<Path>>(cwd: P, branch_name: &str) -> VcsResu
     debug!("Deleting branch {}", branch_name);
     run_git(&["branch", "-D", branch_name], cwd).await?;
     Ok(())
+}
+
+/// Delete a branch only when Git can still reach its commits from elsewhere.
+///
+/// `git branch -d` is the reachability reconfirmation itself: it refuses when the
+/// branch carries commits no other ref reaches, so a cleanup decision made from a
+/// now-stale observation cannot orphan work.
+pub async fn branch_delete_if_merged<P: AsRef<Path>>(cwd: P, branch_name: &str) -> VcsResult<()> {
+    debug!("Deleting merged branch {}", branch_name);
+    run_git(&["branch", "-d", branch_name], cwd).await?;
+    Ok(())
+}
+
+/// Current commit a local branch ref points at.
+///
+/// `Ok(None)` means the ref does not exist; `Err` means the ref state could not
+/// be read at all, which callers must not confuse with "already gone".
+pub async fn branch_ref_oid<P: AsRef<Path>>(
+    cwd: P,
+    branch_name: &str,
+) -> VcsResult<Option<String>> {
+    let output = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            &format!("refs/heads/{}", branch_name),
+        ])
+        .current_dir(cwd.as_ref())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(format!("Failed to read branch ref: {}", e)))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match stdout.split_whitespace().next() {
+        Some(oid) => Ok(Some(oid.to_string())),
+        None => Err(VcsError::git_command(format!(
+            "git show-ref reported no object for branch '{}'",
+            branch_name
+        ))),
+    }
 }
 
 /// Check if a branch exists.

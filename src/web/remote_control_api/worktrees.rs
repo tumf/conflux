@@ -24,7 +24,7 @@ use utoipa::ToSchema;
 
 use crate::worktree_ops::service::{
     classify_delete_eligibility, classify_merge_eligibility, ConflictPolicy, DeleteOptions,
-    WorktreeFacts, WorktreeOpError, WorktreeService, RECOVERY_LOCAL_OR_TUI,
+    ExpectedTarget, WorktreeFacts, WorktreeOpError, WorktreeService, RECOVERY_LOCAL_OR_TUI,
 };
 
 use super::dto::{new_hex_id, ErrorCode};
@@ -288,6 +288,10 @@ pub struct WorktreeResource {
     /// makes the worktree undeletable rather than deletable.
     pub dirty: Option<bool>,
     /// True when this branch has commits base does not have.
+    // Deliberately not a doc comment: the published description is part of the
+    // v2 contract. An unobservable commits-ahead state reads as `false` here —
+    // it is not evidence *for* the condition — and is reported where it matters,
+    // as an undeletable `operations.deletable` with a reason.
     pub has_commits_ahead: bool,
     /// Conflict evidence, when a base merge would conflict or already has.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -315,7 +319,7 @@ impl WorktreeResource {
             is_main: facts.is_main,
             is_detached: facts.is_detached,
             dirty: facts.dirty.as_option(),
-            has_commits_ahead: facts.has_commits_ahead,
+            has_commits_ahead: facts.has_commits_ahead.is_known_yes(),
             conflict: if facts.conflict_files.is_empty() {
                 None
             } else {
@@ -436,7 +440,7 @@ pub fn map_worktree_error(error: &WorktreeOpError) -> CommandFailure {
     let code = match error {
         WorktreeOpError::NotFound(_) => ErrorCode::WorktreeNotFound,
         WorktreeOpError::Exists(_) => ErrorCode::WorktreeExists,
-        WorktreeOpError::Dirty(_) => ErrorCode::WorktreeDirty,
+        WorktreeOpError::Dirty { .. } => ErrorCode::WorktreeDirty,
         WorktreeOpError::DirtyUnknown(_) => ErrorCode::WorktreeDirtyUnknown,
         WorktreeOpError::Ineligible(_) => ErrorCode::TargetIneligible,
         WorktreeOpError::RootBusy(_) => ErrorCode::RootBusy,
@@ -554,13 +558,21 @@ impl WorktreeOperations for RemoteWorktreeOperations {
         let key = self.resolve(worktree_id)?;
         let outcome = self
             .service
-            // Fail-closed on purpose: teardown is mandatory and an unobservable
-            // dirty state refuses. Neither is a client-supplied parameter.
+            // Fail-closed on purpose: teardown is mandatory, a known-dirty
+            // worktree refuses, and an unobservable safety fact refuses. None of
+            // the three is a client-supplied parameter, and there is no remote
+            // escalation path that could make one so.
             //
-            // The confirmed identity here is the registry key, which the listing
-            // sync retires as soon as a bound worktree disappears, so no branch
-            // is passed as a second expectation.
-            .delete_worktree(&key.path, None, DeleteOptions::fail_closed())
+            // The confirmed identity is the registry key's Git identity: an
+            // opaque ID is bound to a `(path, identity)` pair, so revalidating
+            // the identity under the service's own mutation guard is what makes
+            // "this ID still addresses that resource" true at mutation time and
+            // not merely at listing time.
+            .delete_worktree(
+                &key.path,
+                &ExpectedTarget::unchecked().with_identity(key.identity.clone()),
+                DeleteOptions::fail_closed(),
+            )
             .await
             .map_err(|error| map_worktree_error(&error))?;
 

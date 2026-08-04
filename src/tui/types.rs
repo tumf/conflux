@@ -110,6 +110,28 @@ pub enum ModalState {
         /// branch to name (detached HEAD) cannot reach this confirmation at all.
         branch: String,
     },
+    /// Second, explicitly destructive confirmation for a known-dirty worktree.
+    ///
+    /// Only the shared service's own fresh `Dirty` refusal opens this, so every
+    /// field is the service's observation rather than a TUI projection: the
+    /// worktree list carries no dirty state and could not be trusted to.
+    ConfirmDirtyDiscard {
+        /// Path the service observed as dirty.
+        path: PathBuf,
+        /// Git worktree identity at observation time.
+        identity: String,
+        /// Branch at observation time.
+        branch: String,
+        /// HEAD commit at observation time.
+        head: String,
+        /// Teardown choice captured from the ordinary confirmation.
+        ///
+        /// `Y` captures `false` and `S` captures `true`. Carrying it here is what
+        /// keeps skip-teardown and dirty discard independent permissions: this
+        /// value records one operator decision and the `X` keypress grants the
+        /// other.
+        skip_teardown: bool,
+    },
     /// Force-kill confirmation for a single active change.
     ConfirmForceKill {
         /// The change ID being confirmed for force-kill
@@ -123,6 +145,7 @@ impl ModalState {
         match self {
             ModalState::QrPopup => "QR Code",
             ModalState::ConfirmWorktreeDelete { .. } => "Confirm Delete",
+            ModalState::ConfirmDirtyDiscard { .. } => "Discard Changes",
             ModalState::ConfirmForceKill { .. } => "Confirm Kill",
         }
     }
@@ -132,6 +155,42 @@ impl ModalState {
     /// QR is presentation only, so it never blocks a workflow.
     pub fn is_user_decision(&self) -> bool {
         !matches!(self, ModalState::QrPopup)
+    }
+}
+
+/// One confirmed worktree deletion, with every permission it was granted.
+///
+/// The two permissions are deliberately separate values rather than one "force"
+/// flag: skipping teardown and discarding uncommitted work are different
+/// decisions, taken by different keypresses, and one must never imply the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteIntent {
+    /// Worktree the confirmation targets.
+    pub path: PathBuf,
+    /// Branch identity revalidated before the mutation.
+    pub branch: String,
+    /// Git worktree identity to revalidate, when the service supplied one.
+    pub identity: Option<String>,
+    /// HEAD commit to revalidate, when the service supplied one.
+    pub head: Option<String>,
+    /// Skip `.wt/teardown`. Chosen with `S` in the ordinary confirmation.
+    pub skip_teardown: bool,
+    /// Discard known uncommitted work. Granted only by `X` in the destructive
+    /// confirmation, and never by `Y` or `S`.
+    pub allow_known_dirty: bool,
+}
+
+impl DeleteIntent {
+    /// The ordinary intent: no dirty discard, whatever teardown was chosen.
+    pub fn ordinary(path: PathBuf, branch: String, skip_teardown: bool) -> Self {
+        Self {
+            path,
+            branch,
+            identity: None,
+            head: None,
+            skip_teardown,
+            allow_known_dirty: false,
+        }
     }
 }
 

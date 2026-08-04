@@ -689,6 +689,23 @@ pub(crate) async fn handle_modal_key(key: KeyEvent, ctx: &mut KeyEventContext<'_
             }
             _ => {}
         },
+        // Uppercase `X` alone discards uncommitted work. The keys that opened
+        // this confirmation — `Y` and `S` — deliberately do nothing here: an
+        // operator repeating the keypress that got them a refusal must not
+        // thereby grant the permission the refusal was about. Lowercase `x` is
+        // the Changes view's bulk-mark key and is likewise inert, so a mistimed
+        // habit cannot destroy work.
+        ModalState::ConfirmDirtyDiscard { .. } => match (key.code, key.modifiers) {
+            (KeyCode::Char('X'), _) => {
+                if let Some(cmd) = ctx.app.confirm_dirty_discard() {
+                    let _ = ctx.cmd_tx.send(cmd).await;
+                }
+            }
+            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
+                ctx.app.cancel_worktree_action();
+            }
+            _ => {}
+        },
     }
 
     true
@@ -2064,8 +2081,11 @@ mod tests {
         assert!(
             matches!(
                 commands.as_slice(),
-                [TuiCommand::DeleteWorktreeByPath(path, branch, false)]
-                    if path == &PathBuf::from("/tmp/wt-a") && branch == "change-b"
+                [TuiCommand::DeleteWorktree(intent)]
+                    if intent.path == *"/tmp/wt-a"
+                        && intent.branch == "change-b"
+                        && !intent.skip_teardown
+                        && !intent.allow_known_dirty
             ),
             "expected a single worktree delete command, got {commands:?}"
         );
@@ -2123,6 +2143,152 @@ mod tests {
                     .as_ref()
                     .is_some_and(|msg| msg.contains("Worktree delete canceled")));
             }
+        }
+    }
+
+    /// A named way the confirmation's target can drift before the keypress.
+    type DriftCase = (&'static str, fn(&mut AppState));
+
+    /// An app in the destructive dirty-discard confirmation over `/tmp/wt-a`.
+    fn tui_dirty_worktree_delete_app(skip_teardown: bool) -> AppState {
+        let mut app = routing_app();
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![crate::tui::types::WorktreeInfo {
+            path: PathBuf::from("/tmp/wt-a"),
+            head: "abc1234".to_string(),
+            branch: "change-b".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: false,
+            is_merging: false,
+        }];
+        app.modal = Some(ModalState::ConfirmDirtyDiscard {
+            path: PathBuf::from("/tmp/wt-a"),
+            identity: "gitdir: /tmp/wt-a/.git".to_string(),
+            branch: "change-b".to_string(),
+            head: "abc1234".to_string(),
+            skip_teardown,
+        });
+        app
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_uppercase_x_is_the_only_key_that_discards() {
+        for skip_teardown in [false, true] {
+            let mut app = tui_dirty_worktree_delete_app(skip_teardown);
+
+            let commands = route_key(&mut app, KeyCode::Char('X')).await;
+
+            let [TuiCommand::DeleteWorktree(intent)] = commands.as_slice() else {
+                panic!("expected a single delete command, got {commands:?}");
+            };
+            assert!(intent.allow_known_dirty);
+            assert_eq!(intent.skip_teardown, skip_teardown);
+            assert_eq!(intent.path, PathBuf::from("/tmp/wt-a"));
+            assert_eq!(intent.branch, "change-b");
+            assert_eq!(intent.identity.as_deref(), Some("gitdir: /tmp/wt-a/.git"));
+            assert_eq!(intent.head.as_deref(), Some("abc1234"));
+            assert!(app.modal.is_none());
+            assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/wt-a")));
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_confirmation_ignores_every_other_key() {
+        // `y`/`Y`/`s`/`S` are the keys that got the operator here, and lowercase
+        // `x` is the Changes view's bulk-mark key. None of them may become the
+        // destructive decision by habit or by shift key slipping.
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Char('Y'),
+            KeyCode::Char('s'),
+            KeyCode::Char('S'),
+            KeyCode::Char('x'),
+            KeyCode::Char('d'),
+            KeyCode::Char('D'),
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Tab,
+            KeyCode::F(5),
+        ] {
+            let mut app = tui_dirty_worktree_delete_app(false);
+            let before = app.modal.clone();
+
+            let commands = route_key(&mut app, code).await;
+
+            assert!(
+                commands.is_empty(),
+                "{code:?} must not dispatch anything from the destructive confirmation"
+            );
+            assert_eq!(
+                app.modal, before,
+                "{code:?} must leave the destructive confirmation exactly as it was"
+            );
+            assert!(
+                !app.is_worktree_deleting(&PathBuf::from("/tmp/wt-a")),
+                "{code:?} must not start a deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_n_and_esc_cancel_and_retain_the_content() {
+        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            let mut app = tui_dirty_worktree_delete_app(false);
+
+            let commands = route_key(&mut app, code).await;
+
+            assert!(commands.is_empty(), "{code:?} must dispatch nothing");
+            assert!(app.modal.is_none(), "{code:?} must close the confirmation");
+            assert!(
+                !app.is_worktree_deleting(&PathBuf::from("/tmp/wt-a")),
+                "{code:?} must retain the worktree and its uncommitted work"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_refuses_a_target_that_became_active_before_dispatch() {
+        // The confirmation is advisory presentation state; the target can move
+        // underneath it. Re-checking at input time is what stops an activation
+        // that lands between the escalation and the keypress.
+        let cases: [DriftCase; 6] = [
+            ("absent", |app: &mut AppState| app.worktrees.clear()),
+            ("main", |app: &mut AppState| app.worktrees[0].is_main = true),
+            ("rebranded", |app: &mut AppState| {
+                app.worktrees[0].branch = "change-z".to_string()
+            }),
+            ("head-moved", |app: &mut AppState| {
+                app.worktrees[0].head = "def5678".to_string()
+            }),
+            ("active", |app: &mut AppState| {
+                app.changes[1].set_display_status_cache("applying")
+            }),
+            ("deleting", |app: &mut AppState| {
+                app.mark_worktree_deleting(PathBuf::from("/tmp/wt-a"))
+            }),
+        ];
+
+        for (name, mutate) in cases {
+            let mut app = tui_dirty_worktree_delete_app(false);
+            mutate(&mut app);
+
+            let commands = route_key(&mut app, KeyCode::Char('X')).await;
+
+            assert!(
+                commands.is_empty(),
+                "{name}: a drifted target must not be discarded"
+            );
+            assert!(
+                app.modal.is_none(),
+                "{name}: the stale confirmation must be cleared"
+            );
+            assert!(app
+                .warning_message
+                .as_ref()
+                .is_some_and(|msg| msg.contains("Dirty worktree discard canceled")));
         }
     }
 

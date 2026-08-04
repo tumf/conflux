@@ -619,7 +619,12 @@ async fn remote_worktree_service_refusals_surface_as_typed_v2_errors() {
             StatusCode::NOT_FOUND,
         ),
         (
-            WorktreeOpError::Dirty("dirty".to_string()),
+            WorktreeOpError::Dirty {
+                message: "dirty".to_string(),
+                target: Box::new(crate::worktree_ops::service::DirtyTarget::from_facts(
+                    &facts("/srv/workspaces/a", "a"),
+                )),
+            },
             "worktree_dirty",
             StatusCode::CONFLICT,
         ),
@@ -755,8 +760,8 @@ async fn remote_worktree_capabilities_report_the_operations_and_recovery_boundar
 #[tokio::test]
 async fn remote_worktree_adapters_share_one_service_implementation() {
     use crate::worktree_ops::service::{
-        ConflictPolicy, DeleteOptions, MergeAttempt, WorktreeBackend, WorktreeEventSink,
-        WorktreeOpResult, WorktreeOperationEvent, WorktreeService,
+        ConflictPolicy, DeleteOptions, ExpectedTarget, MergeAttempt, WorktreeBackend,
+        WorktreeEventSink, WorktreeOpResult, WorktreeOperationEvent, WorktreeService,
     };
 
     /// One backend, driven twice: once with the TUI's policy values and once
@@ -774,7 +779,9 @@ async fn remote_worktree_adapters_share_one_service_implementation() {
             let mut wt = WorktreeFacts::new("/srv/workspaces/change-a", "change-a");
             // Merging is what makes the worktree deletable, so the observation
             // has to move with it or the second half of the run is untestable.
-            wt.has_commits_ahead = !self.merged.load(std::sync::atomic::Ordering::SeqCst);
+            wt.has_commits_ahead = crate::worktree_ops::service::SafetyFact::from(
+                !self.merged.load(std::sync::atomic::Ordering::SeqCst),
+            );
             Ok(vec![wt])
         }
         async fn base_head(&self) -> WorktreeOpResult<String> {
@@ -783,14 +790,18 @@ async fn remote_worktree_adapters_share_one_service_implementation() {
         async fn create(&self, _p: &Path, _b: &str, _c: &str) -> WorktreeOpResult<()> {
             Ok(())
         }
-        async fn remove(&self, _path: &Path, skip_teardown: bool) -> WorktreeOpResult<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("remove(skip_teardown={skip_teardown})"));
+        async fn teardown(&self, _path: &Path) -> WorktreeOpResult<()> {
+            self.calls.lock().unwrap().push("teardown".to_string());
             Ok(())
         }
-        async fn delete_branch(&self, _branch: &str) -> WorktreeOpResult<()> {
+        async fn remove_worktree(&self, _path: &Path) -> WorktreeOpResult<()> {
+            self.calls.lock().unwrap().push("remove".to_string());
+            Ok(())
+        }
+        async fn branch_ref(&self, _branch: &str) -> WorktreeOpResult<Option<String>> {
+            Ok(Some(String::new()))
+        }
+        async fn delete_branch_if_merged(&self, _branch: &str) -> WorktreeOpResult<()> {
             self.calls.lock().unwrap().push("delete_branch".to_string());
             Ok(())
         }
@@ -836,7 +847,7 @@ async fn remote_worktree_adapters_share_one_service_implementation() {
         let path = Path::new("/srv/workspaces/change-a");
         service.merge_worktree(path, policy).await.expect("merged");
         service
-            .delete_worktree(path, None, options)
+            .delete_worktree(path, &ExpectedTarget::unchecked(), options)
             .await
             .expect("deleted");
         let calls = backend.calls.lock().unwrap().clone();
@@ -859,7 +870,8 @@ async fn remote_worktree_adapters_share_one_service_implementation() {
         vec![
             "merge(AbortOnConflict)".to_string(),
             "on_merged".to_string(),
-            "remove(skip_teardown=false)".to_string(),
+            "teardown".to_string(),
+            "remove".to_string(),
             "delete_branch".to_string(),
         ]
     );
@@ -868,7 +880,8 @@ async fn remote_worktree_adapters_share_one_service_implementation() {
         vec![
             "merge(PreserveConflict)".to_string(),
             "on_merged".to_string(),
-            "remove(skip_teardown=false)".to_string(),
+            "teardown".to_string(),
+            "remove".to_string(),
             "delete_branch".to_string(),
         ]
     );
@@ -941,6 +954,214 @@ fn remote_worktree_published_schemas_expose_no_path_branch_or_base_commit_input(
         assert_eq!(
             schema["additionalProperties"],
             serde_json::Value::Bool(false)
+        );
+    }
+}
+
+// ============================================================================
+// Explicit dirty discard is a local-only permission
+// ============================================================================
+
+#[test]
+fn remote_worktree_dirty_discard_command_shapes_are_rejected_wholesale() {
+    // Every way a client could try to ask for the local escalation: as a target
+    // field, as a parameter, and as its own command type. `deny_unknown_fields`
+    // on both objects is what turns each of these into a schema failure rather
+    // than a silently ignored field.
+    let smuggled = [
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"allow_dirty":true}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"dirty_discard":true}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"allow_known_dirty":true}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"force":true}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"skip_teardown":true}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"path":"/srv/workspaces/a"}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"branch":"change-a"}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a","allow_dirty":true},"params":{}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a","dirty_discard":true},"params":{}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a","force":true},"params":{}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a","skip_teardown":true},"params":{}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a","path":"/srv/workspaces/a"},"params":{}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a","branch":"change-a"},"params":{}}"#,
+        r#"{"type":"discard_worktree_changes","target":{"worktree_id":"a"},"params":{}}"#,
+        r#"{"type":"force_delete_worktree","target":{"worktree_id":"a"},"params":{}}"#,
+    ];
+
+    for body in smuggled {
+        assert!(
+            serde_json::from_str::<CommandSpec>(body).is_err(),
+            "a remote dirty-discard request must fail typed validation: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn remote_worktree_dirty_discard_request_is_a_422_with_no_delegation() {
+    for params in [
+        r#"{"allow_dirty":true}"#,
+        r#"{"dirty_discard":true}"#,
+        r#"{"force":true}"#,
+        r#"{"skip_teardown":true}"#,
+        r#"{"path":"/srv/workspaces/a"}"#,
+        r#"{"branch":"change-a"}"#,
+    ] {
+        let harness = harness(Some(TOKEN), &[]);
+        let body = command_body(
+            &format!(
+                r#"{{"type":"delete_worktree","target":{{"worktree_id":"id-a"}},"params":{params}}}"#
+            ),
+            0,
+            "k1",
+        );
+
+        let (status, _json) = status_and_json(
+            send(
+                &harness.router,
+                post_json("/api/v2/commands", Some(TOKEN), &body),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "params {params} must be refused as a schema violation"
+        );
+        assert!(
+            harness.worktrees.deletes().is_empty(),
+            "params {params} must not reach the worktree service at all"
+        );
+    }
+}
+
+#[tokio::test]
+async fn remote_worktree_dirty_discard_is_never_granted_by_the_remote_port() {
+    use crate::worktree_ops::service::{
+        ConflictPolicy, MergeAttempt, WorktreeBackend, WorktreeEventSink, WorktreeOpResult,
+        WorktreeOperationEvent, WorktreeService,
+    };
+
+    /// A backend whose only worktree is known dirty and whose removal panics.
+    ///
+    /// The recorded facts alone would let a caller that granted discard through
+    /// to removal, so "no removal delegation" is enforced here by making the
+    /// removal itself impossible to survive.
+    #[derive(Default)]
+    struct DirtyBackend {
+        removals: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl WorktreeBackend for DirtyBackend {
+        async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
+            let mut wt = facts("/srv/workspaces/change-a", "change-a");
+            wt.dirty = DirtyState::Dirty;
+            Ok(vec![wt])
+        }
+        async fn base_head(&self) -> WorktreeOpResult<String> {
+            Ok("head".to_string())
+        }
+        async fn create(&self, _p: &Path, _b: &str, _c: &str) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+        async fn teardown(&self, _path: &Path) -> WorktreeOpResult<()> {
+            self.removals.lock().unwrap().push("teardown".to_string());
+            Ok(())
+        }
+        async fn remove_worktree(&self, _path: &Path) -> WorktreeOpResult<()> {
+            self.removals.lock().unwrap().push("remove".to_string());
+            Ok(())
+        }
+        async fn branch_ref(&self, _branch: &str) -> WorktreeOpResult<Option<String>> {
+            Ok(None)
+        }
+        async fn delete_branch_if_merged(&self, _branch: &str) -> WorktreeOpResult<()> {
+            self.removals
+                .lock()
+                .unwrap()
+                .push("delete_branch".to_string());
+            Ok(())
+        }
+        async fn merge_into_base(
+            &self,
+            _branch: &str,
+            _policy: ConflictPolicy,
+        ) -> WorktreeOpResult<MergeAttempt> {
+            Ok(MergeAttempt::Merged)
+        }
+        async fn run_on_merged(&self, _c: &str, _p: &Path) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+        async fn change_is_eligible(&self, _change_id: &str) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+    }
+
+    struct NullSink;
+
+    #[async_trait]
+    impl WorktreeEventSink for NullSink {
+        async fn emit(&self, _event: WorktreeOperationEvent) {}
+    }
+
+    let backend = Arc::new(DirtyBackend::default());
+    let service = Arc::new(WorktreeService::new(
+        backend.clone(),
+        Arc::new(NullSink),
+        PathBuf::from("/srv/workspaces"),
+    ));
+    let registry = Arc::new(WorktreeRegistry::new());
+    let port = crate::web::remote_control_api::worktrees::RemoteWorktreeOperations::new(
+        service,
+        registry,
+        PathBuf::from(REPO),
+    );
+
+    let listing = port.list().await.expect("listed");
+    let worktree_id = listing.worktrees[0].worktree_id.clone();
+    assert_eq!(listing.worktrees[0].dirty, Some(true));
+    assert!(!listing.worktrees[0].operations.deletable);
+
+    let failure = port
+        .delete(&worktree_id)
+        .await
+        .expect_err("a dirty worktree must refuse remote deletion");
+    assert_eq!(failure.error_code, ErrorCode::WorktreeDirty);
+
+    // No teardown, no removal, no branch deletion: the remote port has no way to
+    // express the permission that would have let any of them happen.
+    assert!(
+        backend.removals.lock().unwrap().is_empty(),
+        "a remote delete must not delegate removal for a dirty worktree: {:?}",
+        backend.removals.lock().unwrap()
+    );
+}
+
+#[test]
+fn remote_worktree_dirty_discard_capabilities_advertise_no_bypass() {
+    use crate::web::remote_control_api::worktrees::WorktreeCapabilities;
+
+    let capabilities = WorktreeCapabilities::default();
+    assert!(capabilities.delete_requires_teardown);
+    assert_eq!(
+        capabilities.operations,
+        WORKTREE_OPERATIONS
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>()
+    );
+
+    let json = serde_json::to_string(&capabilities).unwrap();
+    for forbidden in [
+        "dirty_discard",
+        "allow_dirty",
+        "allow_known_dirty",
+        "force",
+        "discard",
+    ] {
+        assert!(
+            !json.contains(forbidden),
+            "worktree capabilities must not advertise '{forbidden}': {json}"
         );
     }
 }
