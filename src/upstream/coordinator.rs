@@ -34,6 +34,10 @@ use super::trailers::{format_upstream_merge_message, parse_upstream_trailers, Up
 const MAX_FINALIZE_ATTEMPTS: u32 = 5;
 
 /// Bounded first-parent walk for the offline recovery scan.
+///
+/// Both recovery scanners walk this bound through the metadata-only observation:
+/// their classification reads trailers, merge parents, and local refs only, so
+/// per-commit tree evidence would be unused work on every startup.
 const RECOVERY_SCAN_LIMIT: usize = 500;
 
 /// Explicit outcome of the parallel scheduler.
@@ -113,12 +117,15 @@ pub struct InitialValidation {
 /// remote and branch, and reachability is checked against the local
 /// remote-tracking ref. A merge whose remote-tracking ref is missing counts as
 /// unpushed, because nothing locally proves it was published.
+///
+/// Discovery is metadata-only: identity comes from the commit's own trailers and
+/// parent list, so no commit tree is read.
 pub async fn scan_unpushed_upstream_merges(
     git: &dyn UpstreamGit,
 ) -> PortResult<Vec<UpstreamRecoveryEvidence>> {
     let head = git.head_sha().await?;
     let commits = git
-        .first_parent_commits(None, &head, Some(RECOVERY_SCAN_LIMIT))
+        .first_parent_recovery_metadata(&head, Some(RECOVERY_SCAN_LIMIT))
         .await?;
 
     let mut evidence = Vec::new();
@@ -170,12 +177,15 @@ fn describe_publication_stall(attribution: Option<&str>, reason: &str) -> String
 ///
 /// Ordinary disabled-mode merges carry no marker, so they can never be surfaced
 /// here and are never retroactively promoted.
+///
+/// Discovery is metadata-only: the marker is an empty commit whose whole content
+/// is its trailers, so no commit tree is read.
 pub async fn scan_pending_publications(
     git: &dyn UpstreamGit,
 ) -> PortResult<Vec<PublicationEvidence>> {
     let head = git.head_sha().await?;
     let commits = git
-        .first_parent_commits(None, &head, Some(RECOVERY_SCAN_LIMIT))
+        .first_parent_recovery_metadata(&head, Some(RECOVERY_SCAN_LIMIT))
         .await?;
 
     let mut evidence = Vec::new();
