@@ -39,6 +39,7 @@ use tracing::warn;
 
 use crate::events::EventSink;
 use crate::orchestration::state::OrchestratorState;
+use crate::tui::types::DeleteIntent;
 
 /// Commands sent from TUI to orchestrator
 #[derive(Debug, Clone)]
@@ -60,11 +61,12 @@ pub enum TuiCommand {
     CancelStop,
     /// Force stop immediately
     ForceStop,
-    /// Delete a worktree by path (from worktree view)
-    /// The String is the confirmed branch identity: it is revalidated against a
-    /// fresh observation before the mutation and deleted after worktree removal.
-    /// bool=true means skip teardown hook explicitly for recovery
-    DeleteWorktreeByPath(PathBuf, String, bool),
+    /// Delete a worktree confirmed in the worktree view.
+    ///
+    /// The intent carries the identity the confirmation was taken against — it
+    /// is revalidated against a fresh observation before the mutation — plus the
+    /// teardown and dirty-discard permissions the operator actually granted.
+    DeleteWorktree(DeleteIntent),
     /// Resolve a deferred merge for a change
     ResolveMerge(String),
     /// Merge a worktree branch into the base branch

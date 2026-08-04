@@ -14,9 +14,15 @@ use crate::config::OrchestratorConfig;
 use crate::vcs::git::commands;
 
 use super::service::{
-    ConflictPolicy, DirtyState, MergeAttempt, WorktreeBackend, WorktreeFacts, WorktreeOpError,
-    WorktreeOpResult,
+    ConflictPolicy, DirtyState, MergeAttempt, SafetyFact, WorktreeBackend, WorktreeFacts,
+    WorktreeOpError, WorktreeOpResult,
 };
+
+/// Every Git worktree command takes its path as a string argument.
+fn utf8_path(path: &Path) -> WorktreeOpResult<&str> {
+    path.to_str()
+        .ok_or_else(|| WorktreeOpError::Internal("worktree path is not valid UTF-8".to_string()))
+}
 
 /// Git-backed worktree operations for one repository.
 pub struct GitWorktreeBackend {
@@ -50,18 +56,18 @@ impl GitWorktreeBackend {
 #[async_trait]
 impl WorktreeBackend for GitWorktreeBackend {
     async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
-        let enriched = super::get_worktrees(&self.repo_root)
+        let enriched = super::observe_worktrees(&self.repo_root)
             .await
             .map_err(|e| WorktreeOpError::Internal(format!("failed to list worktrees: {e}")))?;
 
         // One base-side read, not one per worktree: `MERGE_HEAD` is a property of
         // the repository root, and every worktree's eligibility depends on it.
-        let base_merge_in_progress = commands::is_merge_in_progress(&self.repo_root)
-            .await
-            .unwrap_or(false);
+        let base_merge_in_progress =
+            SafetyFact::observed(commands::is_merge_in_progress(&self.repo_root).await);
 
         let mut facts = Vec::with_capacity(enriched.len());
-        for worktree in enriched {
+        for observation in enriched {
+            let worktree = observation.info;
             let dirty = match commands::has_uncommitted_changes(&worktree.path).await {
                 Ok((true, _)) => DirtyState::Dirty,
                 Ok((false, _)) => DirtyState::Clean,
@@ -80,7 +86,7 @@ impl WorktreeBackend for GitWorktreeBackend {
                 head: worktree.head,
                 is_main: worktree.is_main,
                 is_detached: worktree.is_detached,
-                has_commits_ahead: worktree.has_commits_ahead,
+                has_commits_ahead: observation.has_commits_ahead,
                 conflict_files: worktree
                     .merge_conflict
                     .map(|c| c.conflict_files)
@@ -118,21 +124,28 @@ impl WorktreeBackend for GitWorktreeBackend {
         Ok(())
     }
 
-    async fn remove(&self, path: &Path, skip_teardown: bool) -> WorktreeOpResult<()> {
-        let path_str = path.to_str().ok_or_else(|| {
-            WorktreeOpError::Internal("worktree path is not valid UTF-8".to_string())
-        })?;
-        commands::worktree_remove_with_options(
-            &self.repo_root,
-            path_str,
-            commands::WorktreeRemoveOptions { skip_teardown },
-        )
-        .await
-        .map_err(|e| WorktreeOpError::Internal(format!("failed to remove worktree: {e}")))
+    async fn teardown(&self, path: &Path) -> WorktreeOpResult<()> {
+        let path_str = utf8_path(path)?;
+        commands::run_worktree_teardown(&self.repo_root, path_str)
+            .await
+            .map_err(|e| WorktreeOpError::Internal(format!("worktree teardown failed: {e}")))
     }
 
-    async fn delete_branch(&self, branch: &str) -> WorktreeOpResult<()> {
-        commands::branch_delete(&self.repo_root, branch)
+    async fn remove_worktree(&self, path: &Path) -> WorktreeOpResult<()> {
+        let path_str = utf8_path(path)?;
+        commands::worktree_remove_forced(&self.repo_root, path_str)
+            .await
+            .map_err(|e| WorktreeOpError::Internal(format!("failed to remove worktree: {e}")))
+    }
+
+    async fn branch_ref(&self, branch: &str) -> WorktreeOpResult<Option<String>> {
+        commands::branch_ref_oid(&self.repo_root, branch)
+            .await
+            .map_err(|e| WorktreeOpError::Internal(format!("failed to read branch ref: {e}")))
+    }
+
+    async fn delete_branch_if_merged(&self, branch: &str) -> WorktreeOpResult<()> {
+        commands::branch_delete_if_merged(&self.repo_root, branch)
             .await
             .map_err(|e| WorktreeOpError::Internal(format!("failed to delete branch: {e}")))
     }

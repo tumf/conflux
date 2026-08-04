@@ -509,6 +509,11 @@ async fn run_tui_loop(
         app.resolve_reservations(),
         start_eligibility.clone(),
     ));
+    // One worktree service for this repository, for the same reason: it owns the
+    // repository mutation guard, and two instances would be two guards that
+    // cannot see each other's in-flight deletion.
+    let worktree_service =
+        crate::tui::command_handlers::build_worktree_service(&repo_root, &config, &tx);
 
     // Bind `/api/v2` command delegation to the shared application services.
     //
@@ -521,28 +526,13 @@ async fn run_tui_loop(
         let service = operator_service.clone();
         // The remote worktree port is built once and bound to both halves of v2:
         // the read routes and the command executor must agree about which
-        // worktrees exist and which opaque IDs address them.
-        let workspace_base_dir = config
-            .get_workspace_base_dir()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                crate::config::defaults::default_workspace_base_dir(Some(&repo_root))
-            });
-        let worktree_service = Arc::new(crate::worktree_ops::service::WorktreeService::new(
-            Arc::new(
-                crate::worktree_ops::git_backend::GitWorktreeBackend::new(
-                    repo_root.clone(),
-                    Arc::new(config.clone()),
-                )
-                .with_hook_events(tx.clone()),
-            ),
-            Arc::new(crate::worktree_ops::service::NullEventSink),
-            workspace_base_dir,
-        ));
+        // worktrees exist and which opaque IDs address them. It is wired to the
+        // *same* service the TUI commands through, so a remote delete and a
+        // keypress contend for one guard rather than racing through two.
         let worktree_port: Arc<dyn crate::web::remote_control_api::worktrees::WorktreeOperations> =
             Arc::new(
                 crate::web::remote_control_api::worktrees::RemoteWorktreeOperations::new(
-                    worktree_service,
+                    worktree_service.clone(),
                     Arc::new(crate::web::remote_control_api::worktrees::WorktreeRegistry::new()),
                     repo_root.clone(),
                 ),
@@ -872,10 +862,9 @@ async fn run_tui_loop(
             // Create context for TuiCommand handling
             let mut cmd_ctx = TuiCommandContext {
                 app: &mut app,
-                repo_root: &repo_root,
-                config: &config,
                 tx: &tx,
                 run_control: &run_control,
+                worktree_service: &worktree_service,
                 #[cfg(feature = "web-monitoring")]
                 web_state: &web_state,
             };

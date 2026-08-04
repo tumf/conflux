@@ -661,8 +661,18 @@ pub async fn worktree_remove_with_options<P: AsRef<Path>>(
         run_worktree_teardown(cwd_ref, worktree_path).await?;
     }
 
+    worktree_remove_forced(cwd_ref, worktree_path).await
+}
+
+/// Remove a worktree without running teardown.
+///
+/// Teardown is arbitrary operator code and can change the very facts a deletion
+/// was authorized from, so a caller that must re-observe between the two phases
+/// drives them separately instead of through
+/// [`worktree_remove_with_options`].
+pub async fn worktree_remove_forced<P: AsRef<Path>>(cwd: P, worktree_path: &str) -> VcsResult<()> {
     debug!("Removing worktree at {}", worktree_path);
-    run_git(&["worktree", "remove", worktree_path, "--force"], cwd_ref).await?;
+    run_git(&["worktree", "remove", worktree_path, "--force"], cwd).await?;
     Ok(())
 }
 

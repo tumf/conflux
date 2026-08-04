@@ -2910,3 +2910,333 @@ mod remote_worktree_tests {
         assert!(fx.registry.resolve(&second).is_some());
     }
 }
+
+// ============================================================================
+// Explicit dirty worktree deletion — real Git
+// ============================================================================
+//
+// These exercise the local TUI deletion path against a real repository: real
+// `git status` output, a real `.wt/teardown` script, real worktree removal, and
+// real branch refs. The decision logic is unit-tested elsewhere; what only a
+// real repository can show is that the facts the decisions are made from are the
+// ones Git actually reports, and that teardown can move them.
+
+mod tui_dirty_worktree_delete_support {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use conflux::config::OrchestratorConfig;
+    use conflux::worktree_ops::git_backend::GitWorktreeBackend;
+    use conflux::worktree_ops::service::{NullEventSink, WorktreeService};
+
+    pub use super::upstream_integration_support::{configure_identity, git, git_allow_failure};
+
+    /// A real repository plus the shared worktree service over it.
+    pub struct DirtyFixture {
+        pub _dir: tempfile::TempDir,
+        pub repo: PathBuf,
+        pub workspaces: PathBuf,
+        pub service: WorktreeService,
+    }
+
+    impl DirtyFixture {
+        /// Add a worktree on `branch` at the current base commit.
+        pub fn add_worktree(&self, branch: &str) -> PathBuf {
+            let path = self.workspaces.join(branch);
+            git(
+                &self.repo,
+                &["worktree", "add", "-b", branch, path.to_str().unwrap()],
+            );
+            path
+        }
+
+        /// Commit an executable `.wt/teardown` running `body` onto base.
+        ///
+        /// Installed on base *before* the worktree is added, so the script is
+        /// inherited rather than committed onto the worktree's own branch: a
+        /// commit there would put the branch ahead of base and refuse the
+        /// deletion for a reason that has nothing to do with what is under test.
+        pub fn install_base_teardown(&self, body: &str) {
+            let dir = self.repo.join(".wt");
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("teardown");
+            std::fs::write(&script, format!("#!/bin/sh\nset -e\n{body}\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            git(&self.repo, &["add", "-A"]);
+            git(&self.repo, &["commit", "-m", "Install teardown"]);
+        }
+
+        /// True when `branch` still has a local ref.
+        pub fn branch_exists(&self, branch: &str) -> bool {
+            std::process::Command::new("git")
+                .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
+                .current_dir(&self.repo)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        }
+    }
+
+    /// Build the fixture, or `None` when git is unavailable.
+    pub fn dirty_fixture() -> Option<DirtyFixture> {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let workspaces = dir.path().join("workspaces");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&workspaces).unwrap();
+
+        if !git_allow_failure(&repo, &["init", "-b", "main"]) {
+            return None;
+        }
+        configure_identity(&repo);
+        std::fs::write(repo.join("README.md"), "# base\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "generated/\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "Initial commit"]);
+
+        let service = WorktreeService::new(
+            Arc::new(GitWorktreeBackend::new(
+                repo.clone(),
+                Arc::new(OrchestratorConfig::default()),
+            )),
+            Arc::new(NullEventSink),
+            workspaces.clone(),
+        );
+
+        Some(DirtyFixture {
+            _dir: dir,
+            repo,
+            workspaces,
+            service,
+        })
+    }
+}
+
+mod tui_dirty_worktree_delete_tests {
+    use super::tui_dirty_worktree_delete_support::*;
+    use conflux::worktree_ops::service::{DeleteOptions, ExpectedTarget, WorktreeOpError};
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_e2e_ordinary_delete_refuses_and_names_the_target() {
+        let Some(fx) = dirty_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        let worktree = fx.add_worktree("change-dirty");
+        // Both kinds of known dirt Git reports without ignored-file enumeration.
+        std::fs::write(worktree.join("README.md"), "# edited\n").unwrap();
+        std::fs::write(worktree.join("scratch.txt"), "untracked\n").unwrap();
+
+        for options in [
+            DeleteOptions::local(false),
+            DeleteOptions::local(true),
+            DeleteOptions::fail_closed(),
+        ] {
+            let refusal = fx
+                .service
+                .delete_worktree(
+                    &worktree,
+                    &ExpectedTarget::on_branch("change-dirty"),
+                    options,
+                )
+                .await
+                .expect_err("a dirty worktree must refuse an ordinary delete");
+
+            let WorktreeOpError::Dirty { target, .. } = refusal else {
+                panic!("expected a dirty refusal for {options:?}, got {refusal:?}");
+            };
+            // The escalation payload is the service's own fresh observation.
+            assert_eq!(target.branch, "change-dirty");
+            assert_eq!(target.head, git(&worktree, &["rev-parse", "HEAD"]));
+            assert!(!target.identity.is_empty());
+        }
+
+        assert!(worktree.is_dir(), "the refused worktree is retained");
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("scratch.txt")).unwrap(),
+            "untracked\n",
+            "and so is everything uncommitted in it"
+        );
+        assert!(fx.branch_exists("change-dirty"));
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_e2e_explicit_discard_removes_the_worktree_and_branch() {
+        let Some(fx) = dirty_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        let worktree = fx.add_worktree("change-dirty");
+        std::fs::write(worktree.join("README.md"), "# edited\n").unwrap();
+        std::fs::write(worktree.join("scratch.txt"), "untracked\n").unwrap();
+
+        let outcome = fx
+            .service
+            .delete_worktree(
+                &worktree,
+                &ExpectedTarget::on_branch("change-dirty"),
+                DeleteOptions::local_discarding_dirty(false),
+            )
+            .await
+            .expect("explicit discard must delete");
+
+        assert_eq!(outcome.branch, "change-dirty");
+        assert!(!worktree.exists(), "the directory is gone");
+        assert!(
+            !fx.branch_exists("change-dirty"),
+            "a branch with nothing ahead of base is cleaned up: {}",
+            outcome.detail
+        );
+        assert!(!git(&fx.repo, &["worktree", "list", "--porcelain"]).contains("change-dirty"));
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_e2e_skip_teardown_discards_without_running_teardown() {
+        let Some(fx) = dirty_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        let marker = fx.repo.join("teardown-ran");
+        fx.install_base_teardown(&format!("touch {}", marker.to_str().unwrap()));
+        let worktree = fx.add_worktree("change-dirty");
+        std::fs::write(worktree.join("README.md"), "# edited\n").unwrap();
+
+        fx.service
+            .delete_worktree(
+                &worktree,
+                &ExpectedTarget::on_branch("change-dirty"),
+                DeleteOptions::local_discarding_dirty(true),
+            )
+            .await
+            .expect("explicit discard with skip-teardown must delete");
+
+        assert!(!worktree.exists());
+        assert!(
+            !marker.exists(),
+            "skip-teardown must not run the teardown script"
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_e2e_teardown_commit_refuses_removal_and_keeps_the_branch() {
+        let Some(fx) = dirty_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        // Teardown is operator code. This one commits, which moves both HEAD and
+        // the branch ref out from under the facts the deletion was authorized
+        // from — and creates a commit base does not have.
+        fx.install_base_teardown(
+            "printf 'teardown\\n' > teardown-artifact.txt\n\
+             git add -A\n\
+             git commit -m 'Teardown commit'",
+        );
+        let worktree = fx.add_worktree("change-dirty");
+        let authorized_head = git(&worktree, &["rev-parse", "HEAD"]);
+        std::fs::write(worktree.join("README.md"), "# edited\n").unwrap();
+
+        let refusal = fx
+            .service
+            .delete_worktree(
+                &worktree,
+                &ExpectedTarget::on_branch("change-dirty"),
+                DeleteOptions::local_discarding_dirty(false),
+            )
+            .await
+            .expect_err("post-teardown drift must refuse removal");
+
+        assert!(
+            matches!(
+                refusal,
+                WorktreeOpError::NotFound(_) | WorktreeOpError::Ineligible(_)
+            ),
+            "expected a drift or eligibility refusal, got {refusal:?}"
+        );
+        assert!(
+            worktree.is_dir(),
+            "forced removal must not run on facts teardown invalidated"
+        );
+        assert!(
+            fx.branch_exists("change-dirty"),
+            "and the branch the teardown commit lives on must survive"
+        );
+        let head_now = git(&worktree, &["rev-parse", "HEAD"]);
+        assert_ne!(
+            head_now, authorized_head,
+            "the test is only meaningful if teardown really moved HEAD"
+        );
+        assert_eq!(
+            git(&fx.repo, &["rev-parse", "refs/heads/change-dirty"]),
+            head_now,
+            "the teardown commit is still reachable from the retained branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_e2e_ignored_only_content_deletes_through_the_ordinary_path()
+    {
+        let Some(fx) = dirty_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        let worktree = fx.add_worktree("change-generated");
+        // `generated/` is ignored by the committed `.gitignore`. Explicit status
+        // observation without ignored-file enumeration classifies this clean, so
+        // no destructive confirmation is involved — and the directory, generated
+        // content included, still goes away.
+        std::fs::create_dir_all(worktree.join("generated")).unwrap();
+        std::fs::write(worktree.join("generated/build.log"), "noise\n").unwrap();
+
+        fx.service
+            .delete_worktree(
+                &worktree,
+                &ExpectedTarget::on_branch("change-generated"),
+                DeleteOptions::local(false),
+            )
+            .await
+            .expect("ignored-only content must not require a dirty discard");
+
+        assert!(!worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn tui_dirty_worktree_delete_e2e_commits_ahead_never_offer_a_dirty_escalation() {
+        let Some(fx) = dirty_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        let worktree = fx.add_worktree("change-ahead");
+        std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-m", "Unmerged work"]);
+        // Dirty *and* ahead: discard could waive the first but never the second,
+        // so the refusal must be the one no keypress can answer.
+        std::fs::write(worktree.join("README.md"), "# edited\n").unwrap();
+
+        for options in [
+            DeleteOptions::local(false),
+            DeleteOptions::local_discarding_dirty(false),
+        ] {
+            let refusal = fx
+                .service
+                .delete_worktree(
+                    &worktree,
+                    &ExpectedTarget::on_branch("change-ahead"),
+                    options,
+                )
+                .await
+                .expect_err("unmerged commits must refuse deletion");
+            assert!(
+                matches!(refusal, WorktreeOpError::Ineligible(_)),
+                "{options:?} must refuse without offering a discard: {refusal:?}"
+            );
+        }
+
+        assert!(worktree.is_dir());
+        assert!(fx.branch_exists("change-ahead"));
+    }
+}

@@ -16,8 +16,10 @@ enum Call {
     Create {
         branch: String,
     },
-    Remove {
-        skip_teardown: bool,
+    Teardown,
+    RemoveWorktree,
+    BranchRef {
+        branch: String,
     },
     DeleteBranch {
         branch: String,
@@ -39,8 +41,17 @@ struct FakeBackend {
     observations: Mutex<Vec<Vec<WorktreeFacts>>>,
     merge: Mutex<WorktreeOpResult<MergeAttempt>>,
     on_merged: Mutex<WorktreeOpResult<()>>,
+    teardown: Mutex<WorktreeOpResult<()>>,
     remove: Mutex<WorktreeOpResult<()>>,
     eligible: Mutex<WorktreeOpResult<()>>,
+    /// Successive answers each branch's ref reads produce, or the failure reading it.
+    ///
+    /// A missing entry means "no entry recorded"; the default answer is the
+    /// observed HEAD, which is the ordinary case. Deletion reads the ref twice —
+    /// once to authorize removal and once during cleanup — so an entry is a
+    /// script whose last answer repeats, not a single value.
+    branch_refs: Mutex<std::collections::HashMap<String, Vec<WorktreeOpResult<Option<String>>>>>,
+    delete_branch: Mutex<WorktreeOpResult<()>>,
 }
 
 impl FakeBackend {
@@ -51,8 +62,11 @@ impl FakeBackend {
             observations: Mutex::new(vec![facts]),
             merge: Mutex::new(Ok(MergeAttempt::Merged)),
             on_merged: Mutex::new(Ok(())),
+            teardown: Mutex::new(Ok(())),
             remove: Mutex::new(Ok(())),
             eligible: Mutex::new(Ok(())),
+            branch_refs: Mutex::new(std::collections::HashMap::new()),
+            delete_branch: Mutex::new(Ok(())),
         })
     }
 
@@ -69,6 +83,19 @@ impl FakeBackend {
 
     fn record(&self, call: Call) {
         self.calls.lock().unwrap().push(call);
+    }
+
+    /// Every `branch_ref()` for `branch` answers this.
+    fn set_branch_ref(&self, branch: &str, answer: WorktreeOpResult<Option<String>>) {
+        self.set_branch_refs(branch, vec![answer]);
+    }
+
+    /// Successive `branch_ref()` calls for `branch` walk the script, then repeat the last.
+    fn set_branch_refs(&self, branch: &str, answers: Vec<WorktreeOpResult<Option<String>>>) {
+        self.branch_refs
+            .lock()
+            .unwrap()
+            .insert(branch.to_string(), answers);
     }
 }
 
@@ -96,16 +123,36 @@ impl WorktreeBackend for FakeBackend {
         Ok(())
     }
 
-    async fn remove(&self, _path: &Path, skip_teardown: bool) -> WorktreeOpResult<()> {
-        self.record(Call::Remove { skip_teardown });
+    async fn teardown(&self, _path: &Path) -> WorktreeOpResult<()> {
+        self.record(Call::Teardown);
+        self.teardown.lock().unwrap().clone()
+    }
+
+    async fn remove_worktree(&self, _path: &Path) -> WorktreeOpResult<()> {
+        self.record(Call::RemoveWorktree);
         self.remove.lock().unwrap().clone()
     }
 
-    async fn delete_branch(&self, branch: &str) -> WorktreeOpResult<()> {
+    async fn branch_ref(&self, branch: &str) -> WorktreeOpResult<Option<String>> {
+        self.record(Call::BranchRef {
+            branch: branch.to_string(),
+        });
+        let mut scripts = self.branch_refs.lock().unwrap();
+        match scripts.get_mut(branch) {
+            Some(script) if script.len() > 1 => script.remove(0),
+            Some(script) => script
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Ok(Some("cafebabe".to_string()))),
+            None => Ok(Some("cafebabe".to_string())),
+        }
+    }
+
+    async fn delete_branch_if_merged(&self, branch: &str) -> WorktreeOpResult<()> {
         self.record(Call::DeleteBranch {
             branch: branch.to_string(),
         });
-        Ok(())
+        self.delete_branch.lock().unwrap().clone()
     }
 
     async fn merge_into_base(
@@ -171,54 +218,147 @@ fn service(backend: Arc<FakeBackend>) -> (WorktreeService, Arc<RecordingSink>) {
 // ── Delete eligibility ───────────────────────────────────────────────────────
 
 #[test]
-fn remote_worktree_unknown_dirty_blocks_fail_closed_delete() {
+fn dirty_discard_never_waives_an_unobservable_dirty_state() {
     let mut facts = managed("/w/a", "a");
     facts.dirty = DirtyState::Unknown;
 
-    let refusal =
-        classify_delete_eligibility(&facts, DeleteOptions::fail_closed()).expect_err("must refuse");
-    assert!(matches!(refusal, WorktreeOpError::DirtyUnknown(_)));
+    // "I could not look" is not "there is nothing there". No policy — remote,
+    // ordinary local, or explicitly destructive local — turns it into one.
+    for options in [
+        DeleteOptions::fail_closed(),
+        DeleteOptions::local(false),
+        DeleteOptions::local(true),
+        DeleteOptions::local_discarding_dirty(false),
+        DeleteOptions::local_discarding_dirty(true),
+    ] {
+        assert!(
+            matches!(
+                classify_delete_eligibility(&facts, options),
+                Err(WorktreeOpError::DirtyUnknown(_))
+            ),
+            "{options:?} must refuse an unobservable dirty state"
+        );
+    }
 }
 
 #[test]
-fn remote_worktree_unknown_dirty_is_allowed_only_by_explicit_local_policy() {
+fn dirty_discard_is_the_only_policy_that_deletes_known_dirty_content() {
     let mut facts = managed("/w/a", "a");
-    facts.dirty = DirtyState::Unknown;
+    facts.dirty = DirtyState::Dirty;
 
+    for options in [
+        DeleteOptions::fail_closed(),
+        DeleteOptions::local(false),
+        DeleteOptions::local(true),
+    ] {
+        match classify_delete_eligibility(&facts, options) {
+            Err(WorktreeOpError::Dirty { target, .. }) => {
+                // The refusal carries the observation a local escalation is
+                // allowed to confirm against, so the destructive modal never has
+                // to trust a projection it was already holding.
+                assert_eq!(target.path, PathBuf::from("/w/a"));
+                assert_eq!(target.branch, "a");
+                assert_eq!(target.head, "cafebabe");
+                assert_eq!(target.identity, "gitdir: /w/a/.git");
+            }
+            other => panic!("{options:?} must refuse a known dirty worktree, got {other:?}"),
+        }
+    }
+
+    assert!(
+        classify_delete_eligibility(&facts, DeleteOptions::local_discarding_dirty(false)).is_ok()
+    );
+    assert!(
+        classify_delete_eligibility(&facts, DeleteOptions::local_discarding_dirty(true)).is_ok()
+    );
+}
+
+#[test]
+fn dirty_discard_leaves_ignored_only_content_classified_as_clean() {
+    // Status is observed without ignored-file enumeration, so a worktree whose
+    // only extra content is generated stays `Clean` and deletes through the
+    // ordinary path — no destructive confirmation, no escalation.
+    let facts = managed("/w/a", "a");
+    assert_eq!(facts.dirty, DirtyState::Clean);
     assert!(classify_delete_eligibility(&facts, DeleteOptions::local(false)).is_ok());
+    assert!(classify_delete_eligibility(&facts, DeleteOptions::fail_closed()).is_ok());
 }
 
 #[test]
-fn remote_worktree_dirty_and_main_and_ahead_all_block_delete() {
-    let mut dirty = managed("/w/a", "a");
-    dirty.dirty = DirtyState::Dirty;
-    assert!(matches!(
-        classify_delete_eligibility(&dirty, DeleteOptions::fail_closed()),
-        Err(WorktreeOpError::Dirty(_))
-    ));
-
+fn dirty_discard_never_waives_main_status_or_commits_ahead() {
     let mut main = managed("/repo", "main");
     main.is_main = true;
+    main.dirty = DirtyState::Dirty;
     assert!(matches!(
-        classify_delete_eligibility(&main, DeleteOptions::fail_closed()),
+        classify_delete_eligibility(&main, DeleteOptions::local_discarding_dirty(false)),
         Err(WorktreeOpError::Ineligible(_))
     ));
 
     let mut ahead = managed("/w/a", "a");
-    ahead.has_commits_ahead = true;
-    assert!(matches!(
-        classify_delete_eligibility(&ahead, DeleteOptions::fail_closed()),
-        Err(WorktreeOpError::Ineligible(_))
-    ));
+    ahead.has_commits_ahead = SafetyFact::Yes;
+    ahead.dirty = DirtyState::Dirty;
+    for options in [
+        DeleteOptions::fail_closed(),
+        DeleteOptions::local(false),
+        DeleteOptions::local_discarding_dirty(false),
+    ] {
+        // Ahead is reported *instead of* dirty on purpose: `Dirty` is the one
+        // refusal a frontend escalates, so a worktree carrying unmerged commits
+        // must never produce it and must never reach the destructive modal.
+        assert!(
+            matches!(
+                classify_delete_eligibility(&ahead, options),
+                Err(WorktreeOpError::Ineligible(_))
+            ),
+            "{options:?} must refuse commits ahead without offering a dirty escalation"
+        );
+    }
 }
 
 #[test]
-fn remote_worktree_unresolved_base_merge_makes_the_root_busy() {
+fn dirty_discard_never_waives_an_unobservable_ahead_or_merge_state() {
+    let mut ahead_unknown = managed("/w/a", "a");
+    ahead_unknown.has_commits_ahead = SafetyFact::Unknown;
+    ahead_unknown.dirty = DirtyState::Dirty;
+
+    let mut merge_unknown = managed("/w/a", "a");
+    merge_unknown.base_merge_in_progress = SafetyFact::Unknown;
+    merge_unknown.dirty = DirtyState::Dirty;
+
+    for (name, facts) in [
+        ("commits-ahead", ahead_unknown),
+        ("base-merge", merge_unknown),
+    ] {
+        for options in [
+            DeleteOptions::fail_closed(),
+            DeleteOptions::local(false),
+            DeleteOptions::local_discarding_dirty(false),
+        ] {
+            let refusal = classify_delete_eligibility(&facts, options)
+                .expect_err(&format!("{name} must refuse under {options:?}"));
+            assert!(
+                matches!(refusal, WorktreeOpError::Ineligible(_)),
+                "{name}: an unobservable safety fact must refuse, not escalate: {refusal:?}"
+            );
+            assert!(
+                refusal.to_string().contains("could not be determined"),
+                "{name}: the refusal must say why: {refusal}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dirty_discard_unresolved_base_merge_makes_the_root_busy() {
     let mut facts = managed("/w/a", "a");
-    facts.base_merge_in_progress = true;
+    facts.base_merge_in_progress = SafetyFact::Yes;
 
     assert!(matches!(
         classify_delete_eligibility(&facts, DeleteOptions::fail_closed()),
+        Err(WorktreeOpError::RootBusy(_))
+    ));
+    assert!(matches!(
+        classify_delete_eligibility(&facts, DeleteOptions::local_discarding_dirty(false)),
         Err(WorktreeOpError::RootBusy(_))
     ));
     assert!(matches!(
@@ -227,12 +367,48 @@ fn remote_worktree_unresolved_base_merge_makes_the_root_busy() {
     ));
 }
 
+#[test]
+fn dirty_discard_options_keep_teardown_and_discard_independent() {
+    assert_eq!(
+        DeleteOptions::fail_closed(),
+        DeleteOptions {
+            skip_teardown: false,
+            allow_known_dirty: false
+        }
+    );
+    // `S` chooses teardown only. It is not a force flag and never was.
+    assert_eq!(
+        DeleteOptions::local(true),
+        DeleteOptions {
+            skip_teardown: true,
+            allow_known_dirty: false
+        }
+    );
+    assert_eq!(
+        DeleteOptions::local_discarding_dirty(false),
+        DeleteOptions {
+            skip_teardown: false,
+            allow_known_dirty: true
+        }
+    );
+}
+
+#[test]
+fn dirty_discard_safety_facts_fold_observation_failure_into_unknown() {
+    assert_eq!(SafetyFact::observed::<()>(Ok(true)), SafetyFact::Yes);
+    assert_eq!(SafetyFact::observed::<()>(Ok(false)), SafetyFact::No);
+    assert_eq!(SafetyFact::observed(Err("boom")), SafetyFact::Unknown);
+    assert!(SafetyFact::Yes.is_known_yes());
+    assert!(!SafetyFact::Unknown.is_known_yes());
+    assert!(!SafetyFact::No.is_known_yes());
+}
+
 // ── Merge eligibility ────────────────────────────────────────────────────────
 
 #[test]
 fn remote_worktree_preserving_policy_attempts_a_predicted_conflict() {
     let mut facts = managed("/w/a", "a");
-    facts.has_commits_ahead = true;
+    facts.has_commits_ahead = SafetyFact::Yes;
     facts.conflict_files = vec!["src/main.rs".to_string()];
 
     // The aborting frontend refuses up front; the preserving one must run the
@@ -248,7 +424,7 @@ fn remote_worktree_preserving_policy_attempts_a_predicted_conflict() {
 fn remote_worktree_merge_requires_a_branch_and_commits_ahead() {
     let mut detached = managed("/w/a", "");
     detached.is_detached = true;
-    detached.has_commits_ahead = true;
+    detached.has_commits_ahead = SafetyFact::Yes;
     assert!(matches!(
         classify_merge_eligibility(&detached, ConflictPolicy::PreserveConflict),
         Err(WorktreeOpError::Ineligible(_))
@@ -345,25 +521,55 @@ async fn remote_worktree_create_refuses_an_unmanaged_change() {
 
 // ── Delete ───────────────────────────────────────────────────────────────────
 
+/// A branch-cleanup case: name, cleanup-time ref answer, safe-delete answer, expected reason.
+type BranchCleanupCase = (
+    &'static str,
+    WorktreeOpResult<Option<String>>,
+    WorktreeOpResult<()>,
+    &'static str,
+);
+
+/// A pre-removal ref case: name, ref answer, expected refusal fragment.
+type BranchRefGateCase = (&'static str, WorktreeOpResult<Option<String>>, &'static str);
+
+fn dirty(path: &str, branch: &str) -> WorktreeFacts {
+    let mut facts = managed(path, branch);
+    facts.dirty = DirtyState::Dirty;
+    facts
+}
+
 #[tokio::test]
-async fn remote_worktree_delete_runs_mandatory_teardown_and_deletes_the_branch() {
+async fn dirty_discard_clean_delete_tears_down_then_removes_then_deletes_the_branch() {
     let backend = FakeBackend::stable(vec![managed("/workspaces/c1", "c1")]);
     let (service, sink) = service(backend.clone());
 
     let outcome = service
         .delete_worktree(
             Path::new("/workspaces/c1"),
-            Some("c1"),
+            &ExpectedTarget::on_branch("c1"),
             DeleteOptions::fail_closed(),
         )
         .await
         .expect("deleted");
     assert_eq!(outcome.branch, "c1");
 
-    assert!(backend.calls().contains(&Call::Remove {
-        skip_teardown: false
-    }));
-    assert!(backend.calls().contains(&Call::DeleteBranch {
+    // Teardown, a *second* observation, and only then the irreversible step.
+    let calls = backend.calls();
+    let teardown = calls.iter().position(|c| c == &Call::Teardown).unwrap();
+    let remove = calls
+        .iter()
+        .position(|c| c == &Call::RemoveWorktree)
+        .unwrap();
+    let reobserve = calls
+        .iter()
+        .enumerate()
+        .position(|(idx, call)| idx > teardown && call == &Call::Observe)
+        .expect("safety facts must be re-observed after teardown");
+    assert!(
+        teardown < reobserve && reobserve < remove,
+        "expected teardown -> re-observe -> remove, got {calls:?}"
+    );
+    assert!(calls.contains(&Call::DeleteBranch {
         branch: "c1".to_string()
     }));
     assert!(sink.events().contains(&WorktreeOperationEvent::Deleted {
@@ -372,16 +578,45 @@ async fn remote_worktree_delete_runs_mandatory_teardown_and_deletes_the_branch()
 }
 
 #[tokio::test]
-async fn remote_worktree_failed_teardown_retains_the_resource() {
+async fn dirty_discard_skip_teardown_runs_no_teardown_but_still_re_observes() {
     let backend = FakeBackend::stable(vec![managed("/workspaces/c1", "c1")]);
-    *backend.remove.lock().unwrap() =
+    let (service, _sink) = service(backend.clone());
+
+    service
+        .delete_worktree(
+            Path::new("/workspaces/c1"),
+            &ExpectedTarget::on_branch("c1"),
+            DeleteOptions::local(true),
+        )
+        .await
+        .expect("deleted");
+
+    let calls = backend.calls();
+    assert!(
+        !calls.contains(&Call::Teardown),
+        "skip-teardown must not run teardown: {calls:?}"
+    );
+    // Skipping teardown does not skip the fresh look: the guard excludes
+    // Conflux's own mutations, not the rest of the machine.
+    assert_eq!(
+        calls.iter().filter(|c| **c == Call::Observe).count(),
+        2,
+        "safety facts must still be re-observed immediately before removal: {calls:?}"
+    );
+    assert!(calls.contains(&Call::RemoveWorktree));
+}
+
+#[tokio::test]
+async fn dirty_discard_failed_teardown_retains_the_resource() {
+    let backend = FakeBackend::stable(vec![managed("/workspaces/c1", "c1")]);
+    *backend.teardown.lock().unwrap() =
         Err(WorktreeOpError::Internal("teardown exited 1".to_string()));
     let (service, sink) = service(backend.clone());
 
     let failure = service
         .delete_worktree(
             Path::new("/workspaces/c1"),
-            Some("c1"),
+            &ExpectedTarget::on_branch("c1"),
             DeleteOptions::fail_closed(),
         )
         .await
@@ -391,21 +626,305 @@ async fn remote_worktree_failed_teardown_retains_the_resource() {
         !backend
             .calls()
             .iter()
-            .any(|call| matches!(call, Call::DeleteBranch { .. })),
-        "a failed teardown must not proceed to branch deletion"
+            .any(|call| matches!(call, Call::RemoveWorktree | Call::DeleteBranch { .. })),
+        "a failed teardown must not proceed to removal or branch deletion"
     );
     assert!(sink.events().is_empty());
 }
 
 #[tokio::test]
-async fn remote_worktree_delete_of_an_unobserved_path_is_not_found() {
+async fn dirty_discard_teardown_induced_drift_refuses_before_removal() {
+    // Each case is one fact the teardown script moved out from under the
+    // authorization. All of them are observable, and all of them must stop the
+    // irreversible step rather than be carried across it.
+    let cases: Vec<(&str, WorktreeFacts)> = vec![
+        ("identity", {
+            let mut after = managed("/workspaces/c1", "c1");
+            after.identity = "gitdir: /workspaces/c1/.git-replaced".to_string();
+            after
+        }),
+        ("branch", managed("/workspaces/c1", "c1-renamed")),
+        ("head", {
+            let mut after = managed("/workspaces/c1", "c1");
+            after.head = "deadbeef".to_string();
+            after
+        }),
+        ("commits-ahead", {
+            let mut after = managed("/workspaces/c1", "c1");
+            after.has_commits_ahead = SafetyFact::Yes;
+            after
+        }),
+        ("unobservable-dirty", {
+            let mut after = managed("/workspaces/c1", "c1");
+            after.dirty = DirtyState::Unknown;
+            after
+        }),
+        ("base-merge", {
+            let mut after = managed("/workspaces/c1", "c1");
+            after.base_merge_in_progress = SafetyFact::Yes;
+            after
+        }),
+    ];
+
+    for (name, after) in cases {
+        let backend =
+            FakeBackend::scripted(vec![vec![managed("/workspaces/c1", "c1")], vec![after]]);
+        let (service, sink) = service(backend.clone());
+
+        let refusal = service
+            .delete_worktree(
+                Path::new("/workspaces/c1"),
+                &ExpectedTarget::on_branch("c1"),
+                DeleteOptions::local(false),
+            )
+            .await
+            .expect_err(&format!("{name} drift must refuse"));
+        assert!(
+            !backend.calls().contains(&Call::RemoveWorktree),
+            "{name}: forced removal must not run on drifted facts ({refusal})"
+        );
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::DeleteBranch { .. })),
+            "{name}: a refused removal must not delete the branch"
+        );
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, WorktreeOperationEvent::Deleted { .. })),
+            "{name}: nothing was deleted, so nothing may be announced as deleted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dirty_discard_removes_a_known_dirty_worktree_after_explicit_permission() {
+    let backend = FakeBackend::stable(vec![dirty("/workspaces/c1", "c1")]);
+    let (service, sink) = service(backend.clone());
+
+    // Ordinary local policy refuses and hands back the escalation target.
+    let refusal = service
+        .delete_worktree(
+            Path::new("/workspaces/c1"),
+            &ExpectedTarget::on_branch("c1"),
+            DeleteOptions::local(false),
+        )
+        .await
+        .expect_err("an ordinary confirmation must not delete dirty content");
+    let WorktreeOpError::Dirty { target, .. } = refusal else {
+        panic!("expected a dirty refusal, got {refusal:?}");
+    };
+    assert!(
+        !backend.calls().contains(&Call::Teardown)
+            && !backend.calls().contains(&Call::RemoveWorktree),
+        "a refused dirty delete must not tear down or remove anything"
+    );
+
+    // The explicit destructive confirmation replays the same identity.
+    service
+        .delete_worktree(
+            &target.path,
+            &ExpectedTarget::on_branch(target.branch.clone())
+                .with_identity(target.identity.clone())
+                .with_head(target.head.clone()),
+            DeleteOptions::local_discarding_dirty(false),
+        )
+        .await
+        .expect("explicit discard must delete");
+
+    assert!(backend.calls().contains(&Call::RemoveWorktree));
+    assert!(sink.events().contains(&WorktreeOperationEvent::Deleted {
+        branch: "c1".to_string()
+    }));
+}
+
+#[tokio::test]
+async fn dirty_discard_retains_the_branch_when_its_ref_moved_or_cannot_be_reconfirmed() {
+    let cases: [BranchCleanupCase; 3] = [
+        (
+            "ref-moved",
+            Ok(Some("0ddba11".to_string())),
+            Ok(()),
+            "its ref moved",
+        ),
+        (
+            "ref-unreadable",
+            Err(WorktreeOpError::Internal("show-ref failed".to_string())),
+            Ok(()),
+            "could not be reconfirmed",
+        ),
+        (
+            "unreachable-commits",
+            Ok(Some("cafebabe".to_string())),
+            Err(WorktreeOpError::Internal("not fully merged".to_string())),
+            "not reachable from elsewhere",
+        ),
+    ];
+
+    for (name, branch_ref, delete, expected_reason) in cases {
+        let backend = FakeBackend::stable(vec![dirty("/workspaces/c1", "c1")]);
+        // The ref is intact when removal is authorized and only drifts
+        // afterwards: that residual window is exactly what cleanup must survive.
+        backend.set_branch_refs("c1", vec![Ok(Some("cafebabe".to_string())), branch_ref]);
+        *backend.delete_branch.lock().unwrap() = delete;
+        let (service, _sink) = service(backend.clone());
+
+        let outcome = service
+            .delete_worktree(
+                Path::new("/workspaces/c1"),
+                &ExpectedTarget::on_branch("c1"),
+                DeleteOptions::local_discarding_dirty(false),
+            )
+            .await
+            .expect("the worktree itself is still removed");
+
+        // Removal and branch deletion are distinct outcomes: losing the branch
+        // would make its commits unreachable on the strength of a stale fact.
+        assert!(
+            backend.calls().contains(&Call::RemoveWorktree),
+            "{name}: the worktree removal itself must still happen"
+        );
+        assert!(
+            outcome.detail.contains("was retained") && outcome.detail.contains(expected_reason),
+            "{name}: the outcome must say why the branch survived: {}",
+            outcome.detail
+        );
+    }
+}
+
+#[tokio::test]
+async fn dirty_discard_deletes_the_branch_only_when_its_ref_still_matches() {
+    let backend = FakeBackend::stable(vec![managed("/workspaces/c1", "c1")]);
+    backend.set_branch_ref("c1", Ok(Some("cafebabe".to_string())));
+    let (service, _sink) = service(backend.clone());
+
+    let outcome = service
+        .delete_worktree(
+            Path::new("/workspaces/c1"),
+            &ExpectedTarget::on_branch("c1"),
+            DeleteOptions::fail_closed(),
+        )
+        .await
+        .expect("deleted");
+
+    let calls = backend.calls();
+    let checks: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| {
+            *call
+                == &Call::BranchRef {
+                    branch: "c1".to_string(),
+                }
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let removed = calls
+        .iter()
+        .position(|c| c == &Call::RemoveWorktree)
+        .unwrap();
+    assert!(
+        checks.first().is_some_and(|first| *first < removed),
+        "the ref is confirmed before the irreversible removal: {calls:?}"
+    );
+    assert!(
+        checks.last().is_some_and(|last| *last > removed),
+        "and reconfirmed after it, against the OID removal was authorized from: {calls:?}"
+    );
+    assert!(outcome.detail.contains("was deleted"));
+}
+
+#[tokio::test]
+async fn dirty_discard_refuses_removal_when_the_branch_ref_cannot_be_confirmed() {
+    // The worktree's own HEAD says nothing about where the branch ref points.
+    // Discarding a dirty worktree destroys its uncommitted work, so the branch
+    // still naming the authorized commit is the only thing keeping the
+    // committed work recoverable — an unconfirmable ref must stop the removal,
+    // not be discovered by best-effort cleanup once the directory is gone.
+    let cases: [BranchRefGateCase; 3] = [
+        ("ref-moved", Ok(Some("0ddba11".to_string())), "moved from"),
+        ("ref-missing", Ok(None), "no longer exists"),
+        (
+            "ref-unreadable",
+            Err(WorktreeOpError::Internal("show-ref failed".to_string())),
+            "could not be determined",
+        ),
+    ];
+
+    for (name, branch_ref, expected_reason) in cases {
+        let backend = FakeBackend::stable(vec![dirty("/workspaces/c1", "c1")]);
+        backend.set_branch_ref("c1", branch_ref);
+        let (service, sink) = service(backend.clone());
+
+        let refusal = service
+            .delete_worktree(
+                Path::new("/workspaces/c1"),
+                &ExpectedTarget::on_branch("c1"),
+                DeleteOptions::local_discarding_dirty(false),
+            )
+            .await
+            .expect_err(&format!("{name} must refuse"));
+        assert!(
+            refusal.to_string().contains(expected_reason)
+                && refusal.to_string().contains("nothing was removed"),
+            "{name}: the refusal must say why nothing was removed: {refusal}"
+        );
+        assert!(
+            !backend.calls().contains(&Call::RemoveWorktree),
+            "{name}: forced removal must not run on an unconfirmed branch ref"
+        );
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::DeleteBranch { .. })),
+            "{name}: the branch must be retained too"
+        );
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, WorktreeOperationEvent::Deleted { .. })),
+            "{name}: nothing was deleted, so nothing may be announced as deleted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dirty_discard_refuses_when_the_branch_ref_moves_during_teardown() {
+    // Teardown is operator code: the ref can be intact when the deletion is
+    // authorized and moved by the time removal would run.
+    let backend = FakeBackend::stable(vec![dirty("/workspaces/c1", "c1")]);
+    backend.set_branch_ref("c1", Ok(Some("0ddba11".to_string())));
+    let (service, _sink) = service(backend.clone());
+
+    let refusal = service
+        .delete_worktree(
+            Path::new("/workspaces/c1"),
+            &ExpectedTarget::on_branch("c1"),
+            DeleteOptions::local_discarding_dirty(false),
+        )
+        .await
+        .expect_err("a ref that moved during teardown must refuse");
+    let calls = backend.calls();
+    assert!(
+        calls.contains(&Call::Teardown) && !calls.contains(&Call::RemoveWorktree),
+        "teardown ran, but the removal it authorized must not: {refusal}"
+    );
+}
+
+#[tokio::test]
+async fn dirty_discard_delete_of_an_unobserved_path_is_not_found() {
     let backend = FakeBackend::stable(vec![managed("/workspaces/c1", "c1")]);
     let (service, _sink) = service(backend);
 
     let failure = service
         .delete_worktree(
             Path::new("/workspaces/gone"),
-            None,
+            &ExpectedTarget::unchecked(),
             DeleteOptions::fail_closed(),
         )
         .await
@@ -414,7 +933,7 @@ async fn remote_worktree_delete_of_an_unobserved_path_is_not_found() {
 }
 
 #[tokio::test]
-async fn remote_worktree_delete_refuses_when_another_branch_now_occupies_the_path() {
+async fn dirty_discard_delete_refuses_when_another_branch_now_occupies_the_path() {
     // The caller confirmed `c1`, but by the time the mutation guard is taken the
     // path is occupied by a replacement worktree on a different branch.
     let backend = FakeBackend::stable(vec![managed("/workspaces/c1", "replacement")]);
@@ -423,7 +942,7 @@ async fn remote_worktree_delete_refuses_when_another_branch_now_occupies_the_pat
     let refusal = service
         .delete_worktree(
             Path::new("/workspaces/c1"),
-            Some("c1"),
+            &ExpectedTarget::on_branch("c1"),
             DeleteOptions::fail_closed(),
         )
         .await
@@ -438,7 +957,7 @@ async fn remote_worktree_delete_refuses_when_another_branch_now_occupies_the_pat
         !backend
             .calls()
             .iter()
-            .any(|call| matches!(call, Call::Remove { .. })),
+            .any(|call| matches!(call, Call::Teardown | Call::RemoveWorktree)),
         "a stale identity must refuse before the backend is asked to remove anything"
     );
     assert!(
@@ -452,30 +971,57 @@ async fn remote_worktree_delete_refuses_when_another_branch_now_occupies_the_pat
 }
 
 #[tokio::test]
-async fn remote_worktree_delete_proceeds_when_the_confirmed_branch_still_occupies_the_path() {
+async fn dirty_discard_delete_proceeds_when_the_confirmed_identity_still_occupies_the_path() {
     let backend = FakeBackend::stable(vec![managed("/workspaces/c1", "c1")]);
     let (service, _sink) = service(backend.clone());
 
     service
         .delete_worktree(
             Path::new("/workspaces/c1"),
-            Some("c1"),
+            &ExpectedTarget::on_branch("c1")
+                .with_identity("gitdir: /workspaces/c1/.git")
+                .with_head("cafebabe"),
             DeleteOptions::fail_closed(),
         )
         .await
         .expect("a matching identity must delete");
 
-    assert!(backend.calls().contains(&Call::Remove {
-        skip_teardown: false
-    }));
+    assert!(backend.calls().contains(&Call::RemoveWorktree));
 }
 
 #[test]
-fn remote_worktree_delete_identity_waives_the_check_without_a_confirmed_branch() {
-    assert!(classify_delete_identity(&managed("/workspaces/c1", "c1"), None).is_ok());
-    assert!(classify_delete_identity(&managed("/workspaces/c1", "c1"), Some("c1")).is_ok());
+fn dirty_discard_expected_identity_checks_only_what_the_caller_can_name() {
+    let facts = managed("/workspaces/c1", "c1");
+
+    assert!(classify_delete_identity(&facts, &ExpectedTarget::unchecked()).is_ok());
+    assert!(classify_delete_identity(&facts, &ExpectedTarget::on_branch("c1")).is_ok());
+    assert!(classify_delete_identity(
+        &facts,
+        &ExpectedTarget::on_branch("c1")
+            .with_identity("gitdir: /workspaces/c1/.git")
+            .with_head("cafebabe")
+    )
+    .is_ok());
+
+    for expected in [
+        ExpectedTarget::on_branch("other"),
+        ExpectedTarget::unchecked().with_identity("gitdir: /elsewhere/.git"),
+        ExpectedTarget::unchecked().with_head("deadbeef"),
+    ] {
+        assert!(
+            matches!(
+                classify_delete_identity(&facts, &expected),
+                Err(WorktreeOpError::NotFound(_))
+            ),
+            "{expected:?} must refuse a mismatched observation"
+        );
+    }
+
     assert!(matches!(
-        classify_delete_identity(&managed("/workspaces/c1", ""), Some("c1")),
+        classify_delete_identity(
+            &managed("/workspaces/c1", ""),
+            &ExpectedTarget::on_branch("c1")
+        ),
         Err(WorktreeOpError::NotFound(_))
     ));
 }
@@ -484,7 +1030,7 @@ fn remote_worktree_delete_identity_waives_the_check_without_a_confirmed_branch()
 
 fn mergeable() -> WorktreeFacts {
     let mut facts = managed("/workspaces/c1", "c1");
-    facts.has_commits_ahead = true;
+    facts.has_commits_ahead = SafetyFact::Yes;
     facts
 }
 
@@ -603,7 +1149,7 @@ async fn remote_worktree_on_merged_failure_blocks_the_merged_transition() {
 // ── Root guard ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn remote_worktree_concurrent_mutation_reports_root_busy() {
+async fn dirty_discard_concurrent_mutation_reports_root_busy() {
     let backend = FakeBackend::stable(vec![mergeable()]);
     let (service, _sink) = service(backend);
 
@@ -614,7 +1160,7 @@ async fn remote_worktree_concurrent_mutation_reports_root_busy() {
     let refusal = service
         .delete_worktree(
             Path::new("/workspaces/c1"),
-            Some("c1"),
+            &ExpectedTarget::on_branch("c1"),
             DeleteOptions::fail_closed(),
         )
         .await

@@ -35,13 +35,24 @@ Handles all keyboard input:
 Handles all TuiCommand variants:
 - `handle_start_processing_command()`: Spawn orchestrator tasks
 - `handle_tui_command()`: Main TuiCommand dispatcher
-- Processes commands: StartProcessing (also the retry intent — `Error` mode is what makes a start an explicit retry), AddToQueue, RemoveFromQueue, DequeueChange, DeleteWorktreeByPath, Stop, CancelStop, ForceStop, MergeWorktreeBranch, ResolveMerge
+- Processes commands: StartProcessing (also the retry intent — `Error` mode is what makes a start an explicit retry), AddToQueue, RemoveFromQueue, DequeueChange, DeleteWorktree, Stop, CancelStop, ForceStop, MergeWorktreeBranch, ResolveMerge
 
 Queue, stop-and-dequeue, and retry commands are adapters over the shared
 `orchestration::operator_command::OperatorCommandService`. Lifecycle validation,
 reducer ordering, dynamic queue mutation, `on_queue_add`/`on_queue_remove`
 cardinality, cancellation-before-dequeue ordering, and retry routing live in that
 service so a remote frontend behaves identically.
+
+Worktree create/delete/merge are adapters over one shared
+`worktree_ops::service::WorktreeService`, built once in `runner.rs` and handed to
+both the TUI command loop and the `/api/v2` worktree port so the two contend for
+a single repository mutation guard.
+
+`DeleteWorktree` carries a typed `DeleteIntent`. Its two permissions are
+independent: `skip_teardown` is chosen by `S` in the ordinary confirmation, and
+`allow_known_dirty` is granted only by uppercase `X` in the destructive
+`ConfirmDirtyDiscard` confirmation, which the service's own fresh `Dirty` refusal
+is what opens.
 
 ### Integration Status
 
