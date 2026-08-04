@@ -6,6 +6,7 @@
 //! - Dynamic queue management
 //! - Auto-refresh of change list
 
+pub mod clipboard;
 mod command_handlers;
 pub mod config;
 mod events;

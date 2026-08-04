@@ -45,6 +45,12 @@ pub const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
 /// Maximum number of log entries to keep
 pub const MAX_LOG_ENTRIES: usize = 1000;
 
+/// Stated when an `error` row has no retained diagnostic at all.
+///
+/// Explicit by design: the alternative — presenting an unrelated ordinary log as
+/// the failure reason — would misreport why the change failed.
+pub const ERROR_DETAILS_UNAVAILABLE: &str = "Error details unavailable";
+
 // ============================================================================
 // Type Definitions
 // ============================================================================
@@ -61,6 +67,58 @@ impl WarningPopup {
             title: title.into(),
             message: message.into(),
         }
+    }
+}
+
+/// Outcome of the most recent copy attempt made from the Error Details popup.
+///
+/// Kept on the popup rather than in the log panel so the operator reads the
+/// result where the action happened, without the popup closing under them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyFeedback {
+    /// The clipboard accepted the text.
+    Copied,
+    /// The clipboard refused, carrying the reason it gave.
+    Failed(String),
+}
+
+impl CopyFeedback {
+    /// Operator-facing one-line message for this outcome.
+    pub fn message(&self) -> String {
+        match self {
+            CopyFeedback::Copied => "Copied to clipboard".to_string(),
+            CopyFeedback::Failed(reason) => {
+                format!("Copy failed: {reason}. Select the text manually to copy it.")
+            }
+        }
+    }
+}
+
+/// Error Details popup content and popup-local presentation state.
+///
+/// Process-local observability state. It holds the retained final diagnostic for
+/// one change so the operator can read and copy it after the matching log entry
+/// has been evicted from the bounded buffer. It is never persisted and never
+/// used as scheduler dispatch, retry routing, acceptance, archive, or merge input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorDetailsPopup {
+    /// Change the diagnostic belongs to.
+    pub change_id: String,
+    /// Complete, untruncated final diagnostic.
+    pub error: String,
+    /// Popup-local scroll offset; it never moves the Changes list or Logs panel.
+    pub scroll: u16,
+    /// Result of the last copy attempt, if one has been made.
+    pub copy_feedback: Option<CopyFeedback>,
+}
+
+impl ErrorDetailsPopup {
+    /// The exact plain text `c` places on the clipboard.
+    ///
+    /// Stable by contract: `Change: <id>` and `Error: <diagnostic>` on two
+    /// lines, so a pasted report is the same shape every time.
+    pub fn clipboard_text(&self) -> String {
+        format!("Change: {}\nError: {}", self.change_id, self.error)
     }
 }
 
@@ -149,6 +207,17 @@ pub struct AppState {
     pub warning_popup: Option<WarningPopup>,
     /// Scroll offset for the warning popup body (presentation-only state)
     pub warning_popup_scroll: u16,
+    /// Error Details popup for a change-level failure, if one is open.
+    ///
+    /// Lives on its own axis rather than in [`AppState::modal`] so opening it can
+    /// never replace a pending confirmation, and so it can claim its keys ahead
+    /// of interaction modals while still yielding to the warning popup.
+    pub error_details_popup: Option<ErrorDetailsPopup>,
+    /// Clipboard boundary used by the Error Details popup.
+    ///
+    /// Injectable so tests assert what would have been copied without mutating
+    /// the developer's clipboard.
+    clipboard: std::sync::Arc<dyn crate::tui::clipboard::Clipboard>,
     /// Current spinner animation frame
     pub spinner_frame: usize,
     /// Log scroll offset (0 = show most recent at bottom)
@@ -397,6 +466,8 @@ impl AppState {
             warning_message: None,
             warning_popup: None,
             warning_popup_scroll: 0,
+            error_details_popup: None,
+            clipboard: crate::tui::clipboard::default_clipboard(),
             spinner_frame: 0,
             log_scroll_offset: 0,
             log_auto_scroll: true,
@@ -632,6 +703,96 @@ impl AppState {
         } else {
             self.warning_popup_scroll = self.warning_popup_scroll.saturating_add(delta as u16);
         }
+    }
+
+    /// Open the Error Details popup for the change under the Changes cursor.
+    ///
+    /// Only an `error` row can open it: every other row keeps whatever `Enter`
+    /// already did. Returns whether the popup was opened, so the caller can fall
+    /// through to the pre-existing behavior when it was not.
+    ///
+    /// Opening is presentation only — no workflow-control state changes.
+    pub fn open_error_details_popup(&mut self) -> bool {
+        if self.view_mode != ViewMode::Changes {
+            return false;
+        }
+
+        let Some(change) = self.changes.get(self.cursor_index) else {
+            return false;
+        };
+        if change.display_status_cache != "error" {
+            return false;
+        }
+
+        self.error_details_popup = Some(ErrorDetailsPopup {
+            change_id: change.id.clone(),
+            error: change
+                .error_message_cache
+                .clone()
+                .unwrap_or_else(|| ERROR_DETAILS_UNAVAILABLE.to_string()),
+            scroll: 0,
+            copy_feedback: None,
+        });
+        true
+    }
+
+    /// Close the Error Details popup and drop its popup-local state.
+    ///
+    /// Closing is presentation only: it never transitions the change, the queue,
+    /// or the run.
+    pub fn close_error_details_popup(&mut self) {
+        self.error_details_popup = None;
+    }
+
+    /// Scroll the Error Details popup body by a signed amount.
+    ///
+    /// The offset stays non-negative and the Changes cursor and Logs-panel
+    /// position are untouched, so popup scrolling can never move the views
+    /// underneath it.
+    pub fn scroll_error_details_popup(&mut self, delta: i16) {
+        let Some(popup) = self.error_details_popup.as_mut() else {
+            return;
+        };
+        popup.scroll = if delta.is_negative() {
+            popup.scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            popup.scroll.saturating_add(delta as u16)
+        };
+    }
+
+    /// Copy the open Error Details popup's diagnostic to the OS clipboard.
+    ///
+    /// The popup stays open and keeps its complete diagnostic either way; the
+    /// outcome is reported inside the popup so the operator never loses the text
+    /// they were trying to copy.
+    pub fn copy_error_details(&mut self) {
+        let Some(popup) = self.error_details_popup.as_ref() else {
+            return;
+        };
+
+        let text = popup.clipboard_text();
+        let feedback = match self.clipboard.set_text(&text) {
+            Ok(()) => CopyFeedback::Copied,
+            Err(reason) => CopyFeedback::Failed(reason),
+        };
+
+        if let Some(popup) = self.error_details_popup.as_mut() {
+            popup.copy_feedback = Some(feedback);
+        }
+    }
+
+    /// Replace the clipboard boundary with a test double.
+    ///
+    /// Test-only: production always keeps
+    /// [`crate::tui::clipboard::default_clipboard`], so this is the seam that
+    /// lets automated tests assert what would have been copied without writing
+    /// to the developer's real clipboard.
+    #[cfg(test)]
+    pub fn set_clipboard(
+        &mut self,
+        clipboard: std::sync::Arc<dyn crate::tui::clipboard::Clipboard>,
+    ) {
+        self.clipboard = clipboard;
     }
 
     /// Set reference to shared orchestration state for unified tracking.
@@ -1173,9 +1334,11 @@ impl AppState {
                     if change.display_status_cache == "error" {
                         continue;
                     }
-                    if change.error_message_cache.is_none() {
-                        change.error_message_cache = Some("reducer".to_string());
-                    }
+                    // The diagnostic itself is never invented here. It arrives
+                    // from the reducer through
+                    // [`AppState::apply_error_details_from_reducer`], so an
+                    // operator sees the retained failure text or the explicit
+                    // "unavailable" fallback — never a placeholder token.
                     change.set_display_status_cache("error");
                 } else {
                     change.set_display_status_cache(normalized);
@@ -1183,6 +1346,54 @@ impl AppState {
                         change.selected = false;
                     }
                 }
+            }
+        }
+
+        self.prune_stale_error_details_popup();
+    }
+
+    /// Close an Error Details popup whose change has left `error`.
+    ///
+    /// A retry is the common case: once the row is queued again, the popup would
+    /// otherwise keep presenting a diagnostic that no longer describes the
+    /// change's current state.
+    fn prune_stale_error_details_popup(&mut self) {
+        let Some(popup) = self.error_details_popup.as_ref() else {
+            return;
+        };
+
+        let still_failed = self
+            .changes
+            .iter()
+            .any(|change| change.id == popup.change_id && change.display_status_cache == "error");
+        if !still_failed {
+            self.error_details_popup = None;
+        }
+    }
+
+    /// Sync retained final diagnostics for error rows from the reducer.
+    ///
+    /// Presentation only. The diagnostic is what the operator reads in the row
+    /// preview and the Error Details popup; it never becomes scheduling, retry,
+    /// acceptance, archive, or merge input.
+    ///
+    /// It is kept independent of the bounded log buffer on purpose: a change can
+    /// stay in `error` long after the failure log entry has been evicted, so the
+    /// row must be able to explain itself without any retained `LogEntry`.
+    ///
+    /// The reducer's diagnostic wins over whatever the row already cached. A row
+    /// can reach `error` carrying an unrelated compatibility reason (a skipped
+    /// dependency, for example), and that stale non-error text must not survive
+    /// as the operator-facing failure reason. Rows the reducer does not report as
+    /// failed are left alone: `set_display_status_cache` already drops the cache
+    /// when a row transitions away from `error`.
+    pub fn apply_error_details_from_reducer(&mut self, error_details: &HashMap<String, String>) {
+        for change in &mut self.changes {
+            if change.display_status_cache != "error" {
+                continue;
+            }
+            if let Some(detail) = error_details.get(&change.id) {
+                change.error_message_cache = Some(detail.clone());
             }
         }
     }
@@ -3169,6 +3380,270 @@ mod tests {
         assert!(
             app.changes[0].selected,
             "only rejected rows should be forcibly deselected during reducer sync"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Retained final diagnostics for error rows
+    // ------------------------------------------------------------------
+
+    /// Build a reducer holding one change that failed with `error`.
+    ///
+    /// The reducer is a pure in-memory state machine, so driving it with its own
+    /// event is unit-scoped: no process, filesystem, VCS, or clock boundary is
+    /// touched.
+    fn reducer_with_failed_change(
+        change_id: &str,
+        error: &str,
+    ) -> crate::orchestration::state::OrchestratorState {
+        let mut state =
+            crate::orchestration::state::OrchestratorState::new(vec![change_id.to_string()], 1);
+        state.apply_execution_event(&crate::events::ExecutionEvent::ApplyFailed {
+            change_id: change_id.to_string(),
+            error: error.to_string(),
+        });
+        state
+    }
+
+    /// A direct failure event the TUI observed itself must keep the whole
+    /// diagnostic, not a summary of it.
+    #[test]
+    fn direct_failure_events_retain_the_full_final_diagnostic() {
+        let diagnostic = "Apply failed: stalled after 5 empty WIP commits";
+        for (label, apply) in [
+            (
+                "processing error",
+                Box::new(|app: &mut AppState, detail: String| {
+                    app.handle_orchestrator_event(OrchestratorEvent::ProcessingError {
+                        id: "test-change".to_string(),
+                        error: detail,
+                    })
+                }) as Box<dyn Fn(&mut AppState, String)>,
+            ),
+            (
+                "apply failed",
+                Box::new(|app: &mut AppState, detail: String| {
+                    app.handle_orchestrator_event(OrchestratorEvent::ApplyFailed {
+                        change_id: "test-change".to_string(),
+                        error: detail,
+                    })
+                }),
+            ),
+            (
+                "archive failed",
+                Box::new(|app: &mut AppState, detail: String| {
+                    app.handle_orchestrator_event(OrchestratorEvent::ArchiveFailed {
+                        change_id: "test-change".to_string(),
+                        error: detail,
+                        reason: None,
+                        summary: None,
+                    })
+                }),
+            ),
+        ] {
+            let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+            apply(&mut app, diagnostic.to_string());
+
+            assert_eq!(app.changes[0].display_status_cache, "error", "{label}");
+            assert_eq!(
+                app.changes[0].error_message_cache.as_deref(),
+                Some(diagnostic),
+                "{label} must retain the complete diagnostic"
+            );
+        }
+    }
+
+    /// The reducer's retained diagnostic is what an operator reads, even when a
+    /// row already cached an unrelated compatibility reason before failing.
+    #[test]
+    fn reducer_error_detail_replaces_a_stale_non_error_reason() {
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        // `ChangeSkipped` leaves a dependency note behind on the row.
+        app.handle_orchestrator_event(OrchestratorEvent::ChangeSkipped {
+            change_id: "test-change".to_string(),
+            reason: "Dependency 'other-change' failed".to_string(),
+        });
+        assert_eq!(
+            app.changes[0].error_message_cache.as_deref(),
+            Some("Dependency 'other-change' failed")
+        );
+
+        let reducer = reducer_with_failed_change("test-change", "Apply failed: stalled");
+        app.apply_display_statuses_from_reducer(&reducer.all_display_statuses());
+        app.apply_error_details_from_reducer(&reducer.all_error_details());
+
+        assert_eq!(app.changes[0].display_status_cache, "error");
+        assert_eq!(
+            app.changes[0].error_message_cache.as_deref(),
+            Some("Apply failed: stalled"),
+            "the reducer's retained failure must replace the stale skip reason"
+        );
+    }
+
+    /// A row that reaches `error` only through the reducer must never show a
+    /// placeholder token; it shows the retained diagnostic instead.
+    #[test]
+    fn reducer_only_error_row_never_resolves_to_a_placeholder() {
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        let reducer = reducer_with_failed_change("test-change", "Apply failed: stalled");
+
+        app.apply_display_statuses_from_reducer(&reducer.all_display_statuses());
+        app.apply_error_details_from_reducer(&reducer.all_error_details());
+
+        assert_eq!(app.changes[0].display_status_cache, "error");
+        assert_eq!(
+            app.changes[0].error_message_cache.as_deref(),
+            Some("Apply failed: stalled")
+        );
+        assert_ne!(
+            app.changes[0].error_message_cache.as_deref(),
+            Some("reducer")
+        );
+    }
+
+    /// The diagnostic a TUI row shows and the one `/api/v2` projects are the
+    /// same reducer-owned text, so an operator reading either surface reads the
+    /// same failure.
+    #[test]
+    fn tui_error_detail_matches_the_api_projected_error_detail() {
+        let reducer = reducer_with_failed_change("test-change", "Apply failed: \u{1b}[31mstalled");
+        let projected = reducer
+            .change_runtime("test-change")
+            .and_then(crate::orchestration::state::ChangeRuntimeState::error_message)
+            .map(crate::events::sanitize_detail);
+
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        app.apply_display_statuses_from_reducer(&reducer.all_display_statuses());
+        app.apply_error_details_from_reducer(&reducer.all_error_details());
+
+        assert_eq!(app.changes[0].error_message_cache, projected);
+    }
+
+    /// With no reducer-retained diagnostic there is nothing to adopt; the row
+    /// keeps an empty cache so rendering can state that details are unavailable.
+    #[test]
+    fn missing_reducer_error_detail_leaves_the_cache_empty() {
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "test-change".to_string(),
+            "error",
+        )]));
+        app.apply_error_details_from_reducer(&HashMap::new());
+
+        assert_eq!(app.changes[0].display_status_cache, "error");
+        assert_eq!(app.changes[0].error_message_cache, None);
+    }
+
+    /// Leaving `error` drops the diagnostic, and a later reducer sync must not
+    /// resurrect it onto the now-healthy row.
+    #[test]
+    fn transition_away_from_error_clears_the_retained_diagnostic() {
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        app.changes[0].set_error_message_cache("Apply failed: stalled".to_string());
+
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "test-change".to_string(),
+            "queued",
+        )]));
+        assert_eq!(app.changes[0].display_status_cache, "queued");
+        assert_eq!(app.changes[0].error_message_cache, None);
+
+        // A stale detail map from before the retry must not repaint the row.
+        app.apply_error_details_from_reducer(&HashMap::from([(
+            "test-change".to_string(),
+            "Apply failed: stalled".to_string(),
+        )]));
+        assert_eq!(app.changes[0].error_message_cache, None);
+    }
+
+    /// A retry closes an open Error Details popup rather than leaving it
+    /// describing a state the change has already left.
+    #[test]
+    fn leaving_error_closes_an_open_error_details_popup() {
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        app.changes[0].set_error_message_cache("Apply failed: stalled".to_string());
+        assert!(app.open_error_details_popup());
+
+        // Still failing: the popup survives an ordinary sync.
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "test-change".to_string(),
+            "error",
+        )]));
+        assert!(app.error_details_popup.is_some());
+
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "test-change".to_string(),
+            "queued",
+        )]));
+        assert!(app.error_details_popup.is_none());
+    }
+
+    /// Opening, scrolling, copying, and closing the popup are presentation only.
+    #[test]
+    fn error_details_popup_is_presentation_only() {
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        app.changes[0].set_error_message_cache("Apply failed: stalled".to_string());
+        app.changes[0].selected = true;
+
+        assert!(app.open_error_details_popup());
+        app.scroll_error_details_popup(5);
+        app.scroll_error_details_popup(-99);
+        assert_eq!(
+            app.error_details_popup.as_ref().map(|popup| popup.scroll),
+            Some(0),
+            "the scroll offset stays non-negative"
+        );
+        app.close_error_details_popup();
+
+        assert_eq!(app.changes[0].display_status_cache, "error");
+        assert!(app.changes[0].selected);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
+        assert!(app.modal.is_none());
+    }
+
+    /// Only an `error` row can open the popup.
+    #[test]
+    fn a_non_error_row_cannot_open_the_error_details_popup() {
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        for status in ["not queued", "queued", "applying", "blocked", "archived"] {
+            app.changes[0].set_display_status_cache(status);
+            assert!(
+                !app.open_error_details_popup(),
+                "{status} must not open the Error Details popup"
+            );
+            assert!(app.error_details_popup.is_none());
+        }
+    }
+
+    /// An error row with no retained diagnostic still opens, stating that the
+    /// details are unavailable rather than showing an empty popup.
+    #[test]
+    fn error_details_popup_states_when_no_diagnostic_is_available() {
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        app.changes[0].set_display_status_cache("error");
+
+        assert!(app.open_error_details_popup());
+        assert_eq!(
+            app.error_details_popup
+                .as_ref()
+                .map(|popup| popup.error.as_str()),
+            Some(ERROR_DETAILS_UNAVAILABLE)
+        );
+    }
+
+    /// The copied text is stable by contract.
+    #[test]
+    fn error_details_clipboard_text_is_stable_plain_text() {
+        let popup = ErrorDetailsPopup {
+            change_id: "alpha".to_string(),
+            error: "Apply failed: stalled".to_string(),
+            scroll: 0,
+            copy_feedback: None,
+        };
+
+        assert_eq!(
+            popup.clipboard_text(),
+            "Change: alpha\nError: Apply failed: stalled"
         );
     }
 
