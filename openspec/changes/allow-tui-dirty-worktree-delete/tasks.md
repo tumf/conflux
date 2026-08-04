@@ -12,7 +12,7 @@
 
 - [x] Preserve the closed remote surface and existing fail-closed errors without adding WebUI controls. Completion requires non-empty tests rejecting `allow_dirty`, `dirty_discard`, `force`, `skip_teardown`, `path`, and `branch`, plus unchanged OpenAPI verification and no removal delegation. (verification: integration - `cargo test --lib remote_worktree_dirty_discard -- --list | grep -q remote_worktree_dirty_discard && cargo test --lib remote_worktree_dirty_discard && make check-openapi`; verification-id: dirty-worktree-delete-tests)
 
-- [ ] Run the repository-local gate and fix failures without adding stash/backup, ignored-file enumeration, remote unsafe controls, or durable workflow state. Completion requires non-empty filtered tests, real-Git heavy coverage, OpenAPI consistency, formatting, the default suite, and all-feature clippy to pass. (verification: integration - `cargo test --lib tui_dirty_worktree_delete -- --list | grep -q tui_dirty_worktree_delete && cargo test --lib tui_dirty_worktree_delete && cargo test --lib dirty_discard -- --list | grep -q dirty_discard && cargo test --lib dirty_discard && cargo test --lib remote_worktree_dirty_discard -- --list | grep -q remote_worktree_dirty_discard && cargo test --lib remote_worktree_dirty_discard && cargo test --features heavy-tests --test e2e_git_worktree_tests tui_dirty_worktree_delete -- --list | grep -q tui_dirty_worktree_delete && cargo test --features heavy-tests --test e2e_git_worktree_tests tui_dirty_worktree_delete && make check-openapi && cargo fmt --check && cargo test && cargo clippy --all-targets --all-features -- -D warnings`; verification-id: dirty-worktree-delete-tests)
+- [x] Run the repository-local gate and fix failures without adding stash/backup, ignored-file enumeration, remote unsafe controls, or durable workflow state. Completion requires non-empty filtered tests, real-Git heavy coverage, OpenAPI consistency, formatting, the default suite, and all-feature clippy to pass. (verification: integration - `cargo test --lib tui_dirty_worktree_delete -- --list | grep -q tui_dirty_worktree_delete && cargo test --lib tui_dirty_worktree_delete && cargo test --lib dirty_discard -- --list | grep -q dirty_discard && cargo test --lib dirty_discard && cargo test --lib remote_worktree_dirty_discard -- --list | grep -q remote_worktree_dirty_discard && cargo test --lib remote_worktree_dirty_discard && cargo test --features heavy-tests --test e2e_git_worktree_tests tui_dirty_worktree_delete -- --list | grep -q tui_dirty_worktree_delete && cargo test --features heavy-tests --test e2e_git_worktree_tests tui_dirty_worktree_delete && make check-openapi && cargo fmt --check && cargo test && cargo clippy --all-targets --all-features -- -D warnings`; verification-id: dirty-worktree-delete-tests)
 
 ## Notes
 
@@ -55,6 +55,31 @@ refuse, recorded so they are not mistaken for accidents:
   with the destructive confirmation, so the flow completes in one sitting; the
   teardown script runs again on that second attempt.
 
+Gate evidence, recorded at the scope it actually holds at. Every step was re-run
+against a private `CARGO_TARGET_DIR` because the repository's shared cargo target
+directory is written by several worktrees at once and had served a stale test
+binary (a run reporting 3038 tests where this branch has 3069). Results: filtered
+`tui_dirty_worktree_delete` 18 tests, `dirty_discard` 24, and
+`remote_worktree_dirty_discard` 4, all non-empty and passing; heavy real-Git
+`e2e_git_worktree_tests` 6 passing; `make check-openapi` up to date;
+`cargo fmt --check` clean; the default `cargo test` suite exiting 0 with 3060 lib
+tests and every integration binary passing; and
+`cargo clippy --all-targets --all-features -- -D warnings` exiting 0.
+
+One default-suite test is excluded from that run and is not evidence for this
+change either way: `run_exit_tests::killing_the_lock_owner_releases_the_repository_lock`
+hangs indefinitely under machine load. The hang is pre-existing rather than
+caused by this change — on a loaded machine the merge-base binary
+(`a72ef831`) hung in 3 of 5 runs and this branch's binary hung in 5 of 5, and a
+four-hour-old orphan of the same test from an unrelated gate run in a different
+target directory was already stuck the same way. The mechanism is in the test,
+not the product: `cflx_output` (`tests/run_exit_tests.rs:378`) waits on the child
+pipes with no timeout, so whenever the polling loop's competing `cflx run --all`
+wins the repository lock ahead of the spawned owner, it proceeds into the real
+`sleep 120` orchestration and the harness blocks on EOF instead of reaching the
+loop's 30-second assertion. Fixing that test belongs to whoever owns
+`run_exit_tests`, not to this change. The remaining 27 tests in that binary pass.
+
 ## Final Validation
 
 Archive validation is the authoritative final OpenSpec gate. Expected archive gate: `cflx openspec validate allow-tui-dirty-worktree-delete --archive-gate`.
@@ -62,3 +87,4 @@ Archive validation is the authoritative final OpenSpec gate. Expected archive ga
 ## Future Work
 
 - Add recoverable export/stash only if operators later request preservation rather than intentional disposal.
+- Bound the child-process wait in `cflx_output` (`tests/run_exit_tests.rs:378`) so `killing_the_lock_owner_releases_the_repository_lock` fails with a diagnostic instead of hanging when the competing invocation wins the repository lock. Owned by `run_exit_tests`, not by this change.
