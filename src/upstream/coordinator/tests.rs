@@ -496,17 +496,15 @@ impl UpstreamGit for FakeGit {
                 "evidence-bearing first-parent walk is forbidden on this path",
             ));
         }
-        Ok(
-            Self::walk_first_parent(&inner, from_exclusive, to, limit)
-                .into_iter()
-                .map(|(sha_value, commit)| SpineCommit {
-                    sha: sha_value,
-                    message: commit.message,
-                    parents: commit.parents,
-                    tree_evidence: commit.tree_evidence,
-                })
-                .collect(),
-        )
+        Ok(Self::walk_first_parent(&inner, from_exclusive, to, limit)
+            .into_iter()
+            .map(|(sha_value, commit)| SpineCommit {
+                sha: sha_value,
+                message: commit.message,
+                parents: commit.parents,
+                tree_evidence: commit.tree_evidence,
+            })
+            .collect())
     }
 
     async fn local_ref_sha(&self, reference: &str) -> PortResult<Option<String>> {
@@ -1417,7 +1415,10 @@ async fn upstream_integration_spine_validation_keeps_commit_tree_evidence() {
         Err(UpstreamOptionError::UnrelatedLocalHistory { commit, .. }) => {
             assert_eq!(commit, sha("local"));
         }
-        other => panic!("expected rejection without archive evidence, got {:?}", other),
+        other => panic!(
+            "expected rejection without archive evidence, got {:?}",
+            other
+        ),
     }
 
     // A change merge that left its change directory active is rejected too.

@@ -12,10 +12,14 @@
 //! - The **elapsed time is diagnostic output only**. A wall-clock threshold would
 //!   fail on a loaded or slow machine without proving anything the count does not.
 //!
-//! `PATH` is process-global, so the shim is installed under a mutex and removed
-//! before the lock is released. The shim additionally records only invocations
-//! whose working directory is the fixture repository, so a concurrently running
-//! test that happens to spawn Git cannot pollute the measurement.
+//! `PATH` is process-global and the test harness runs tests on many threads, so
+//! the shim is never installed into this process. Each measurement re-executes
+//! this same test binary for [`CHILD_TEST`] with the shimmed `PATH` in the
+//! child's own environment, which keeps the sibling tests that shell out to Git
+//! on the untouched real binary. Measurements are additionally serialized under
+//! a mutex so two shims can never be in flight at once. The shim also records
+//! only invocations whose working directory is the fixture repository, so
+//! nothing else the child runs can pollute the measurement.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as SyncCommand;
@@ -31,7 +35,16 @@ const SHORT_HISTORY: usize = 5;
 /// Deep history at the bounded recovery limit.
 const DEEP_HISTORY: usize = 500;
 
-/// `PATH` mutation is process-global; only one shim may be installed at a time.
+/// Full test path of the child-side scan re-executed under the shim.
+const CHILD_TEST: &str = "upstream::recovery_benchmark::recovery_benchmark_child_scan";
+/// Fixture repository the child must scan. Its absence makes the child a no-op.
+const REPO_ENV: &str = "CFLX_RECOVERY_BENCHMARK_REPO";
+/// Shim log the child truncates between its warm-up and measured passes.
+const LOG_ENV: &str = "CFLX_RECOVERY_BENCHMARK_LOG";
+/// Prefix the child prints its own scan duration behind.
+const ELAPSED_MARKER: &str = "cflx-recovery-benchmark-elapsed-ms=";
+
+/// Only one shimmed measurement runs at a time.
 static SHIM_LOCK: Mutex<()> = Mutex::new(());
 
 fn git(root: &Path, args: &[&str]) {
@@ -103,8 +116,45 @@ impl Measurement {
     }
 }
 
-/// Run the production option-less recovery check against `repo_root` with a
-/// recording `git` shim installed for the duration of the scan.
+/// The measured side of one scan, run in a child process so the shimmed `PATH`
+/// stays inside that child.
+///
+/// Always `#[ignore]`: it is driven by [`measure_recovery_scan`] through
+/// `--exact --ignored`, never by an ordinary test run. Without [`REPO_ENV`] it
+/// does nothing, so an operator who runs it by hand cannot get a false pass.
+#[test]
+#[ignore = "driven as a child process by the recovery benchmark"]
+fn recovery_benchmark_child_scan() {
+    let Some(repo_root) = std::env::var_os(REPO_ENV) else {
+        return;
+    };
+    let repo_root = Path::new(&repo_root);
+    let log = PathBuf::from(std::env::var_os(LOG_ENV).expect("shim log path"));
+
+    let scan = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ensure_no_unpushed_upstream_recovery(repo_root))
+            .expect("a history with no recovery evidence must not refuse startup");
+    };
+
+    // A cold child pays for demand-paging this test binary and warming Git's
+    // object cache, which would otherwise swamp the reported duration. Discard
+    // that pass and the commands it logged, then measure and count the warm one.
+    scan();
+    std::fs::write(&log, "").expect("reset the shim log between passes");
+
+    let started = Instant::now();
+    scan();
+    let elapsed = started.elapsed();
+
+    println!("{}{}", ELAPSED_MARKER, elapsed.as_millis());
+}
+
+/// Run the production option-less recovery check against `repo_root` in a child
+/// process whose `PATH` leads with a recording `git` shim.
 fn measure_recovery_scan(repo_root: &Path) -> Measurement {
     let shim_dir = TempDir::new().unwrap();
     let log = shim_dir.path().join("git-commands.log");
@@ -134,9 +184,7 @@ fn measure_recovery_scan(repo_root: &Path) -> Measurement {
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let guard = SHIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let original_path = std::env::var_os("PATH");
-    let shimmed = match &original_path {
+    let shimmed = match std::env::var_os("PATH") {
         Some(existing) => format!(
             "{}:{}",
             shim_dir.path().display(),
@@ -144,23 +192,33 @@ fn measure_recovery_scan(repo_root: &Path) -> Measurement {
         ),
         None => shim_dir.path().display().to_string(),
     };
-    std::env::set_var("PATH", shimmed);
 
-    let started = Instant::now();
-    let outcome = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(ensure_no_unpushed_upstream_recovery(repo_root));
-    let elapsed = started.elapsed();
-
-    match original_path {
-        Some(value) => std::env::set_var("PATH", value),
-        None => std::env::remove_var("PATH"),
-    }
+    let guard = SHIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let output = SyncCommand::new(std::env::current_exe().expect("test binary path"))
+        .args([CHILD_TEST, "--exact", "--ignored", "--nocapture"])
+        .env("PATH", shimmed)
+        .env(REPO_ENV, repo_root)
+        .env(LOG_ENV, &log)
+        .output()
+        .expect("re-execute the test binary for the shimmed scan");
     drop(guard);
 
-    outcome.expect("a history with no recovery evidence must not refuse startup");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "shimmed child scan failed:\n{}\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The child times its own warm pass, so neither process startup nor a cold
+    // page cache is charged to the reported duration.
+    let elapsed = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(ELAPSED_MARKER))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| panic!("child did not report its elapsed time:\n{}", stdout));
 
     let commands = std::fs::read_to_string(&log)
         .unwrap_or_default()

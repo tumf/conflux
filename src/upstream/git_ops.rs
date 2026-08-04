@@ -461,7 +461,10 @@ mod tests {
         assert_eq!(parsed[0].sha, "aaa");
         assert!(parsed[0].parents.is_empty());
         assert_eq!(parsed[1].sha, "bbb");
-        assert_eq!(parsed[1].parents, vec!["aaa".to_string(), "ccc".to_string()]);
+        assert_eq!(
+            parsed[1].parents,
+            vec!["aaa".to_string(), "ccc".to_string()]
+        );
         assert!(parsed[1].message.contains("Merge change: x"));
         assert!(
             parsed[1].message.contains("body"),
