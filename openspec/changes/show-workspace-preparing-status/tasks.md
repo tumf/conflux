@@ -22,8 +22,21 @@
 - evidence: `cargo test --all-features preparing` -> 19 passed, 0 failed.
 - evidence: `npm --prefix tests/web test` (`make web-test`) -> 172 passed across 8 files.
 - evidence: `cargo fmt --all --check` -> clean; `cargo clippy --all-targets --all-features -- -D warnings` -> clean.
+- The stop and terminal gates are evaluated twice per dispatch, from one `admission_gates_reject` helper: once before the change waits for an execution slot, and once after the permit is granted. The wait is unbounded, so the pre-permit answer expires; without the second evaluation a change stopped or made terminal during the wait would still emit `preparing` and run `git worktree add` and `.wt/setup`. Refusal after the permit drops the owned permit, so the slot goes straight to the next candidate.
+- The two post-permit tests hold the semaphore's only permit in the test body, which is what parks the dispatch exactly between the two gates. They create no worktree and run no setup, so they are cheap, but they live with the other `preparing*` integration tests behind `heavy-tests`.
 
 ## Final Validation
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate show-workspace-preparing-status --archive-gate`
+
+## Current Acceptance Follow-up
+- attempt: 1
+- [x] [ARCHIVE_COMMIT_PATH_BLOCKED] 実コミットフックの `make check-openapi` が、`/Volumes/OWCUS4EXP1M2/mini-data/work-cache/rust-target/default/debug/openapi-gen` の `_dyld_start` 停止により単独再実行でも完了しない。設定済み CARGO_TARGET_DIR の生成物を正常に再ビルドした後、`make check-openapi` と `pre-commit run --all-files` を再実行する必要がある。
+  evidence: 破損した `openapi-gen` を削除し `cargo build --bin openapi-gen --features web-monitoring` で再ビルド後、`make check-openapi` -> `docs/openapi.yaml matches the generated contract` + contract assertions 16 passed。
+  evidence: `pre-commit run --all-files` -> 9 hooks 全て Passed（rustfmt / clippy / openapi contract を含む）。
+- [x] [preparing-post-permit-gates] (major) セマフォ待機後に停止・終端ゲートを再検証していない | evidence: src/parallel/dispatch.rs:1320-1372 は停止・終端ゲートを permit 取得前にのみ評価している; src/parallel/dispatch.rs:1383-1416 は permit 待機後、状態を再検証せず WorkspacePreparationStarted を発行するため、待機中に停止または終端化された変更でも worktree 作成や .wt/setup が実行され得る; openspec/changes/show-workspace-preparing-status/specs/cli/spec.md:30-34 は permit 取得後に停止・終端ゲートを通過した変更だけが preparing になることを要求している | required_changes: src/parallel/dispatch.rs — permit 取得後かつ WorkspacePreparationStarted 発行前に停止・終端状態を再検証し、拒否された変更では準備処理を開始しない | verification: src/parallel/tests/executor.rs — permit を保持して候補を待機させ、その間に停止指定または終端化してから permit を解放し、preparing イベント、worktree 作成、setup、操作エージェント起動が発生しないことを検証する
+  finding: {"evidence":["src/parallel/dispatch.rs:1320-1372 は停止・終端ゲートを permit 取得前にのみ評価している","src/parallel/dispatch.rs:1383-1416 は permit 待機後、状態を再検証せず WorkspacePreparationStarted を発行するため、待機中に停止または終端化された変更でも worktree 作成や .wt/setup が実行され得る","openspec/changes/show-workspace-preparing-status/specs/cli/spec.md:30-34 は permit 取得後に停止・終端ゲートを通過した変更だけが preparing になることを要求している"],"id":"preparing-post-permit-gates","required_changes":[{"description":"permit 取得後かつ WorkspacePreparationStarted 発行前に停止・終端状態を再検証し、拒否された変更では準備処理を開始しない","file":"src/parallel/dispatch.rs"}],"severity":"major","summary":"セマフォ待機後に停止・終端ゲートを再検証していない","verification":[{"description":"permit を保持して候補を待機させ、その間に停止指定または終端化してから permit を解放し、preparing イベント、worktree 作成、setup、操作エージェント起動が発生しないことを検証する","file":"src/parallel/tests/executor.rs"}]}
+  evidence: src/parallel/dispatch.rs — 停止・終端ゲートを `admission_gates_reject` に抽出し、permit 取得直後かつ `WorkspacePreparationStarted` 発行前に再評価、拒否時は permit を解放して復帰する。
+  evidence: src/parallel/tests/executor.rs — `preparing_is_not_announced_for_a_change_stopped_while_waiting_for_a_slot` / `..._made_terminal_while_waiting_for_a_slot` がテスト側で唯一の permit を保持して待機させ、待機中の停止・終端化後に解放し、preparing イベント・worktree 作成・`.wt/setup`・操作エージェント起動が一切起きないことを検証する。
+  evidence: `cargo test --all-features --lib parallel::tests::executor::preparing` -> 4 passed, 0 failed; 事後ゲートを無効化した反転実行では新規 2 件が `["WorkspacePreparationStarted", "WorkspaceCreated"]` で失敗し、ゲート依存であることを確認。

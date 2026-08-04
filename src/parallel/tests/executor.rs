@@ -14705,3 +14705,247 @@ async fn preparing_is_not_announced_for_a_change_stopped_before_dispatch() {
 
     forwarder.abort();
 }
+
+/// Install a `.wt/setup` test double that records the fact it ran.
+#[cfg(feature = "heavy-tests")]
+fn write_marker_setup_script(repo_root: &Path, marker: &Path) {
+    let wt_dir = repo_root.join(".wt");
+    std::fs::create_dir_all(&wt_dir).or_fail("create .wt");
+    let script = wt_dir.join("setup");
+    std::fs::write(&script, format!("#!/bin/sh\n: > '{}'\n", marker.display()))
+        .or_fail("write marker setup");
+    #[cfg(unix)]
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .or_fail("chmod setup");
+}
+
+/// Outcome of a dispatch that had to wait for an occupied execution slot.
+#[cfg(feature = "heavy-tests")]
+struct WaitedDispatch {
+    event_names: Vec<String>,
+    spawned_task: bool,
+    in_flight: bool,
+    setup_ran: bool,
+    workspace_entries: Vec<String>,
+}
+
+/// Dispatch `change_id` while the single slot is already taken, run `revoke`
+/// during the wait, then release the slot and report what dispatch did.
+///
+/// The permit is held by the test itself, so the change is parked exactly where
+/// the pre-permit gates can no longer protect it: admissible when it started
+/// waiting, revoked by the time the slot is granted.
+#[cfg(feature = "heavy-tests")]
+async fn dispatch_revoked_while_waiting_for_slot<F, Fut>(
+    change_id: &str,
+    reducer: Arc<RwLock<OrchestratorState>>,
+    queue: Arc<crate::tui::queue::DynamicQueue>,
+    revoke: F,
+) -> WaitedDispatch
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let repo_dir = TempDir::new().or_fail("repo tempdir");
+    let workspace_base = TempDir::new().or_fail("workspace tempdir");
+    let marker_dir = TempDir::new().or_fail("marker tempdir");
+    init_git_repo(repo_dir.path()).await;
+
+    let setup_marker = marker_dir.path().join("setup-ran");
+    write_marker_setup_script(repo_dir.path(), &setup_marker);
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some("sh -c 'true'".to_string()),
+        ..Default::default()
+    });
+
+    let (tx, rx) = mpsc::channel(256);
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let forwarder = spawn_reducer_forwarder(rx, reducer.clone(), recorded.clone());
+
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.set_shared_orchestrator_state(reducer.clone());
+    executor.set_dynamic_queue(queue.clone());
+
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("base revision");
+    let semaphore = Arc::new(Semaphore::new(1));
+    // The one slot is occupied, so dispatch parks on `acquire_owned`.
+    let held = semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .or_fail("hold the only execution slot");
+
+    let repo_root = repo_dir.path().to_path_buf();
+    let owned_id = change_id.to_string();
+    let dispatch = tokio::spawn(async move {
+        let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+        let mut in_flight = HashSet::new();
+        let mut cleanup_guard =
+            crate::parallel::cleanup::WorkspaceCleanupGuard::new(VcsBackend::Git, repo_root);
+        executor
+            .dispatch_change_to_workspace(
+                owned_id,
+                base_revision,
+                semaphore,
+                &mut join_set,
+                &mut in_flight,
+                &mut cleanup_guard,
+            )
+            .await
+            .or_fail("a revoked change is skipped, not an error");
+        (!join_set.is_empty(), !in_flight.is_empty())
+    });
+
+    // Give dispatch time to clear the pre-permit gates and block on the slot.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        reducer.read().await.display_status(change_id),
+        "queued",
+        "a candidate still waiting for a slot must not be labelled active"
+    );
+
+    revoke().await;
+    drop(held);
+
+    let (spawned_task, in_flight) = dispatch.await.or_fail("dispatch task join");
+    // Let the forwarder drain the events the post-permit gate emitted.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let event_names = recorded.lock().await.clone();
+    forwarder.abort();
+
+    let workspace_entries = std::fs::read_dir(workspace_base.path())
+        .or_fail("read workspace base")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+
+    WaitedDispatch {
+        event_names,
+        spawned_task,
+        in_flight,
+        setup_ran: setup_marker.exists(),
+        workspace_entries,
+    }
+}
+
+/// Assert that a dispatch revoked during the slot wait started no preparation.
+#[cfg(feature = "heavy-tests")]
+fn assert_no_preparation_happened(outcome: &WaitedDispatch, change_id: &str) {
+    let names = &outcome.event_names;
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "WorkspacePreparationStarted"),
+        "a change revoked while waiting for a slot must never be announced as preparing: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "ApplyStarted"),
+        "a change revoked while waiting for a slot must never start an operation agent: {names:?}"
+    );
+    assert!(
+        !outcome.spawned_task,
+        "no workspace task may be spawned: {names:?}"
+    );
+    assert!(
+        !outcome.in_flight,
+        "the change must not be marked in-flight"
+    );
+    assert!(
+        !outcome.setup_ran,
+        "`.wt/setup` must not run for a change refused after the slot was granted"
+    );
+    assert!(
+        !outcome
+            .workspace_entries
+            .iter()
+            .any(|entry| entry.contains(change_id)),
+        "no managed worktree may be created: {:?}",
+        outcome.workspace_entries
+    );
+}
+
+/// A stop recorded while the change waits behind an occupied slot must be
+/// honoured when the permit is finally granted, before any preparation starts.
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn preparing_is_not_announced_for_a_change_stopped_while_waiting_for_a_slot() {
+    let reducer = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["stopped-late".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    reducer
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("stopped-late".to_string()));
+    let queue = Arc::new(crate::tui::queue::DynamicQueue::new());
+
+    let stopping = queue.clone();
+    let outcome = dispatch_revoked_while_waiting_for_slot(
+        "stopped-late",
+        reducer.clone(),
+        queue.clone(),
+        || async move {
+            stopping.mark_stopped("stopped-late".to_string()).await;
+        },
+    )
+    .await;
+
+    assert_no_preparation_happened(&outcome, "stopped-late");
+    assert!(
+        outcome
+            .event_names
+            .iter()
+            .any(|name| name == "ChangeDequeued"),
+        "the stop must produce a reducer-visible transition: {:?}",
+        outcome.event_names
+    );
+    assert_eq!(
+        reducer.read().await.display_status("stopped-late"),
+        "not queued"
+    );
+    assert!(
+        !queue.is_stopped("stopped-late").await,
+        "the honoured stop mark must be consumed"
+    );
+}
+
+/// The same applies to a reducer terminal transition that lands during the
+/// wait: the slot is granted, but the change is no longer ordinary work.
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn preparing_is_not_announced_for_a_change_made_terminal_while_waiting_for_a_slot() {
+    let reducer = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["failed-late".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    reducer
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("failed-late".to_string()));
+    let queue = Arc::new(crate::tui::queue::DynamicQueue::new());
+
+    let terminal_reducer = reducer.clone();
+    let outcome = dispatch_revoked_while_waiting_for_slot(
+        "failed-late",
+        reducer.clone(),
+        queue.clone(),
+        || async move {
+            terminal_reducer.write().await.apply_execution_event(
+                &ExecutionEvent::ProcessingError {
+                    id: "failed-late".to_string(),
+                    error: "terminal while waiting".to_string(),
+                },
+            );
+        },
+    )
+    .await;
+
+    assert_no_preparation_happened(&outcome, "failed-late");
+    assert_eq!(reducer.read().await.display_status("failed-late"), "error");
+}
