@@ -51,7 +51,7 @@ This remains one proposal because the event contract, reducer state, active-oper
 - `preparing` is replaced by `applying[:iteration]`, accepting, rejecting, archiving, or resolving when repository evidence routes execution to that phase.
 - A preparation or `.wt/setup` failure produces an error state and a diagnostic that identifies the failed preparation step.
 - TUI, WebUI, and `/api/v2` expose the same `preparing` status from the shared reducer.
-- `preparing` counts as active execution for stop/dequeue classification and worktree mutation guards.
+- `preparing` counts as active execution for stop/dequeue classification and worktree mutation guards; while no preparation termination handle exists, dequeue is refused, the stop mark is retained, and execution stops after preparation before an operation agent starts.
 - Logs expose `.wt/setup` start and completion with elapsed duration without using those logs as routing input.
 - Restart and resume behavior remains derived only from workspace files, Git state, and base-tree comparison; `preparing` is not persisted as authoritative workflow state.
 
@@ -69,3 +69,5 @@ This remains one proposal because the event contract, reducer state, active-oper
 - Persisting setup progress, command-level percentages, or estimated completion times.
 - Treating `preparing` as proof that Apply started or as repository evidence for resume decisions.
 - Changing the configured `.wt/setup` command contract.
+- Making the current parallel dispatch loop non-blocking while workspace setup runs.
+- Adding this preparation status to obsolete serial execution paths.

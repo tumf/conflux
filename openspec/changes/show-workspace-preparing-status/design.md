@@ -22,9 +22,9 @@ Parallel dispatch currently crosses a long unobservable boundary: a change is se
 
 `applying` means the Apply operation has begun and may carry an iteration. Worktree setup runs before the operation and can route to a different next phase on resume. A distinct activity avoids false agent-running claims and false iteration data.
 
-### Emit preparation at scheduler admission
+### Emit preparation at the admitted workspace boundary
 
-The transition must occur after dependency and capacity selection has admitted the change, but before worktree creation/recreation begins. Emitting at queue selection would label changes that are still waiting for capacity as active; emitting after `create_worktree` reproduces the current blind interval.
+The transition must occur after the parallel slot permit is acquired and stop/terminal gates pass, immediately before force-recreate cleanup or worktree creation/recreation begins. Emitting once for every selected candidate would label changes waiting behind an earlier slow setup as active; emitting after `create_worktree` reproduces the current blind interval.
 
 ### Keep preparation ephemeral
 
@@ -36,7 +36,7 @@ TUI, WebUI, and `/api/v2` consume the same reducer transition. Adapters may choo
 
 ### Treat preparation as active for safety
 
-Once admitted, preparation can mutate a managed worktree and run project code. Stop/dequeue and deletion logic must therefore classify it as active, request cancellation through the owned execution path, and avoid concurrent destructive mutation.
+Once admitted, preparation can mutate a managed worktree and run project code. Stop/dequeue and deletion logic therefore classify it as active and avoid concurrent destructive mutation. The current inline preparation path has no termination handle until setup returns, so an immediate dequeue request is refused while its stop mark remains recorded; after preparation returns, that mark must stop execution before an operation agent starts. This change does not make setup itself killable.
 
 ### Keep setup telemetry bounded
 
@@ -56,13 +56,14 @@ queued
       → stopped/not queued after confirmed cancellation
 ```
 
-The selected next phase remains determined by workspace and Git evidence after preparation.
+The selected next phase remains determined by workspace and Git evidence after preparation. Preparation includes any existing operation-stagger wait after setup and before the next `*Started` event; it still truthfully means no operation agent has started.
 
 ## Failure Handling
 
 - Worktree-add failure transitions the change from `preparing` to `error` with a worktree-creation diagnostic.
 - `.wt/setup` non-zero exit transitions to `error` with command failure context.
-- Cancellation must terminate or confirm termination of the owned preparation task before dequeue state is applied.
+- A stop/dequeue request during inline preparation is refused when no termination handle exists, preserves the stop mark, and prevents operation-agent startup after preparation returns.
+- Every path that leaves dispatch after emitting preparation but before a next-phase event, including global cancellation and pre-spawn early return, emits a reducer-visible clearing or terminal transition so `preparing` cannot remain stale.
 - A late completion event after terminal error or confirmed stop must not resurrect active preparation.
 
 ## Verification Strategy
