@@ -13,14 +13,15 @@ mod runner;
 pub use output::OutputLine;
 #[allow(unused_imports)]
 pub use prompt::{
-    append_optional_prompt, build_acceptance_diff_context, build_acceptance_findings_context,
-    build_acceptance_prompt, build_acceptance_prompt_context_only,
-    build_acceptance_prompt_context_only_with_skill, build_acceptance_prompt_with_skill,
-    build_apply_prompt, build_apply_prompt_with_skill, build_archive_prompt,
-    build_archive_prompt_with_skill, build_cleanup_review_prompt,
-    build_cleanup_review_prompt_with_skill, build_last_acceptance_output_context,
-    build_missing_verdict_continuation_context, build_task_format_repair_context,
-    parse_cleanup_review_output,
+    append_optional_prompt, build_acceptance_command_recovery_context,
+    build_acceptance_diff_context, build_acceptance_findings_context, build_acceptance_prompt,
+    build_acceptance_prompt_context_only, build_acceptance_prompt_context_only_with_skill,
+    build_acceptance_prompt_with_skill, build_apply_prompt, build_apply_prompt_with_skill,
+    build_archive_prompt, build_archive_prompt_with_skill, build_cleanup_review_correction_context,
+    build_cleanup_review_prompt, build_cleanup_review_prompt_with_skill,
+    build_last_acceptance_output_context, build_missing_verdict_continuation_context,
+    build_task_format_repair_context, count_cleanup_review_markers, parse_cleanup_review_output,
+    CleanupMarkerScanner, CleanupReviewDiagnostic, CleanupReviewFailureKind,
 };
 pub use runner::AgentRunner;
 

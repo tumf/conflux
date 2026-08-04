@@ -345,7 +345,11 @@ pub struct HookContext {
     pub completed_tasks: Option<u32>,
     /// Total tasks for current change
     pub total_tasks: Option<u32>,
-    /// Apply count for current change (how many times applied)
+    /// Apply count for current change (how many times applied).
+    ///
+    /// For `on_finish` with `status = iteration_limit`, this is the exact
+    /// cumulative per-change Apply-dispatch count reported by the sole budget
+    /// owner. Expanded as both `{apply_count}` and `{iteration}`.
     pub apply_count: u32,
     /// Finish status (for on_finish: "completed", "iteration_limit", "cancelled")
     pub status: Option<String>,
@@ -493,6 +497,10 @@ impl HookContext {
         }
         result =
             expand::expand_placeholder(&result, "{apply_count}", &self.apply_count.to_string());
+        // `{iteration}` is the run-boundary spelling of the same cumulative Apply
+        // dispatch count. `on_finish` reports it alongside `status =
+        // iteration_limit` so a hook can read the exact count that stopped the run.
+        result = expand::expand_placeholder(&result, "{iteration}", &self.apply_count.to_string());
         if let Some(ref status) = self.status {
             result = expand::expand_placeholder(&result, "{status}", status);
         }

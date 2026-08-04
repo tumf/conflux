@@ -65,7 +65,29 @@ prek run rustfmt clippy
 prek list
 ```
 
-Hook configuration lives in `.pre-commit-config.yaml`. Running `prek run --all-files` also runs `make openapi` and stages `docs/openapi.yaml`.
+Hook configuration lives in `.pre-commit-config.yaml`. Running `prek run --all-files` also runs `make check-openapi`, which fails if `docs/openapi.yaml` no longer matches the generated contract. See [The API contract](#the-api-contract).
+
+## The API contract
+
+`docs/openapi.yaml` is the single canonical description of `/api/v2`, and it is
+generated — never hand-edited. There is no second OpenAPI file in the
+repository, because a duplicate cannot be kept honest and a stale one is worse
+than none: a generated client will believe it.
+
+| Command | Effect |
+| --- | --- |
+| `make openapi` | Regenerate `docs/openapi.yaml` from `src/web/openapi.rs`. |
+| `make check-openapi` | Fail on any drift. Generates to a temporary file and never writes to your working tree. |
+
+`make check-openapi` also runs `tests/openapi_contract_tests.rs`, which holds the
+tracked artifact against the running router: every published path must be bound
+and enforce the authentication it declares, the command union must match the
+advertised command set, the error and event vocabularies must be complete, and
+real serialized DTOs must satisfy the published schemas.
+
+So: change a route, DTO field, command variant, error code, or security
+declaration, then run `make openapi` and commit the regenerated artifact with the
+code. A running instance serves the same bytes at `GET /api/v2/openapi.yaml`.
 
 ## Project Structure
 

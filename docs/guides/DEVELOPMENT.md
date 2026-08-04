@@ -48,6 +48,7 @@ Conflux separates tests into two explicit tiers:
 | `tests/merge_conflict_check_tests.rs` | heavy integration / real-boundary | no (requires `heavy-tests`) | Real `git merge-tree` process + repo mutation |
 | `src/parallel/tests/executor.rs` (selected tests) | heavy integration / real-boundary | no (requires `heavy-tests`) | Real git repo/worktree/merge lifecycle used by parallel executor merge tests |
 | `src/ai_command_runner.rs` (selected inactivity-timeout tests) | heavy integration / real-time | no (requires `heavy-tests`) | Deliberately waits on inactivity timeout/retry behavior and is too slow for default path |
+| `src/execution/apply.rs` (`apply_process_group_barrier_*` real-process tests) | heavy E2E / real-boundary | no (requires `heavy-tests`) | Real apply child, descendant-held `index.lock`, and real git finalization ordering |
 | `src/orchestration/archive.rs` (selected retry/verify test) | heavy integration / shell-retry | no (requires `heavy-tests`) | End-to-end archive retry verification via shell script and filesystem mutation |
 
 For heavy suites, keep `#![cfg(feature = "heavy-tests")]` at file top so they remain opt-in by design.
@@ -249,7 +250,33 @@ brew install prek
 prek install
 ```
 
-The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format). When you run `prek run --all-files`, it auto-runs `make openapi` and stages `docs/openapi.yaml`.
+The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format). When you run `prek run --all-files`, it also runs `make check-openapi`.
+
+## The API contract
+
+`docs/openapi.yaml` is the one canonical description of `/api/v2` in this
+repository. It is generated from `src/web/openapi.rs` and the `#[utoipa::path]`
+attributes that module names, and it is never hand-edited — the file opens with a
+generated-file banner saying so. No second OpenAPI artifact is allowed to exist.
+
+```bash
+make openapi        # regenerate docs/openapi.yaml
+make check-openapi  # fail on drift; writes nothing to the working tree
+```
+
+`make check-openapi` regenerates into a temporary file, prints a unified diff
+when the tracked artifact disagrees, and then runs
+`tests/openapi_contract_tests.rs`. Those assertions cover what a diff alone
+cannot: every published path is bound by the router and enforces the
+authentication it declares, the command union matches the advertised command
+set, the error-code and event-category vocabularies are complete, no removed
+legacy path has reappeared, no schema is dangling or unreachable, and real
+serialized DTOs satisfy their published schemas.
+
+Anything that changes a route, a published DTO field, a command variant, an
+error code, an event envelope, or a security declaration must be committed
+together with a regenerated artifact. A running instance serves the identical
+bytes at `GET /api/v2/openapi.yaml`.
 
 ## Adding New Features
 

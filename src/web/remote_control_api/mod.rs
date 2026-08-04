@@ -5,10 +5,15 @@
 //! command from a closed set with optimistic concurrency and idempotency, and
 //! follow an ordered, resumable event stream.
 //!
-//! It is deliberately separate from the legacy single-instance `/api/*` routes
-//! and `/ws`, which the browser monitoring UI still uses and which keep working
-//! unchanged. `/api/v2` is the only versioned remote-control namespace; the
-//! multi-project `/api/v1` namespace was removed with server mode.
+//! `/api/v2` is the *only* API namespace this process serves. The legacy
+//! unversioned `/api/*` and `/ws` surface and the multi-project `/api/v1`
+//! namespace are both gone: the embedded operator console is a v2 client now, and
+//! a second unauthenticated contract would only be a way around v2's bearer
+//! policy, revision checks, and typed errors.
+//!
+//! The contract itself is generated from [`crate::web::openapi`] into
+//! `docs/openapi.yaml`, which is the one tracked artifact a consumer should
+//! read.
 //!
 //! Everything v2 tracks — `instance_id`, `state_revision`, `event_sequence`, the
 //! command registry — is scoped to one process incarnation and is gone after a
@@ -48,11 +53,23 @@ use worktrees::{UnboundWorktreeOperations, WorktreeListing, WorktreeOperations};
 /// The only v2 path that is served without authentication.
 pub const HEALTH_PATH: &str = "/api/v2/health";
 
-async fn openapi_yaml() -> impl IntoResponse {
+/// This build's canonical contract, byte-for-byte the same document that
+/// `make openapi` writes to `docs/openapi.yaml`.
+///
+/// Unauthenticated on purpose: it describes the API and reads no instance state,
+/// so requiring a token here would only stop a client from discovering how to
+/// present one.
+#[utoipa::path(
+    get,
+    path = "/api/v2/openapi.yaml",
+    tag = "contract",
+    security(),
+    responses((status = 200, description = "OpenAPI document (YAML), content type `application/yaml`"))
+)]
+pub async fn openapi_yaml() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/yaml")],
-        serde_yaml::to_string(&crate::web::openapi::document())
-            .expect("OpenAPI document must serialize as YAML"),
+        crate::web::openapi::document_yaml(),
     )
 }
 
@@ -197,8 +214,14 @@ impl RemoteControlState {
 /// Mounted only by single-instance web monitoring. Server-mode project routing
 /// does not merge it: the two namespaces describe different things and sharing
 /// them would make `instance_id` meaningless.
+///
+/// Every route — including the contract-discovery routes, which need no bearer
+/// token — is registered before the gate layer, so origin policy, preflight
+/// handling, and the refusal of out-of-band credentials cover the whole
+/// namespace. Exempting a route from the *bearer* check is [`gate`]'s decision,
+/// not a reason to mount it outside the gate.
 pub fn router(state: RemoteControlState) -> Router {
-    let protected = Router::new()
+    Router::new()
         .route(HEALTH_PATH, get(reads::health))
         .route("/api/v2/capabilities", get(reads::capabilities))
         .route("/api/v2/instance", get(reads::instance))
@@ -212,15 +235,13 @@ pub fn router(state: RemoteControlState) -> Router {
         .route("/api/v2/commands/{command_id}", get(commands::get_command))
         .route("/api/v2/events", get(stream::events))
         .route("/api/v2/ws", get(stream::ws))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), gate))
-        .with_state(state);
-
-    protected
         .route("/api/v2/openapi.yaml", get(openapi_yaml))
         .merge(
             SwaggerUi::new("/api/v2/docs")
                 .url("/api/v2/openapi.json", crate::web::openapi::document()),
         )
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), gate))
+        .with_state(state)
 }
 
 /// Origin, credential-transport, and bearer enforcement for every v2 request.
@@ -254,7 +275,9 @@ async fn gate(State(state): State<RemoteControlState>, request: Request, next: N
         return error.into_response();
     }
 
-    if request.uri().path() != HEALTH_PATH {
+    // The gate and the published contract read the same list, so a route cannot
+    // be documented as authenticated while being served without credentials.
+    if !crate::web::openapi::is_unauthenticated_v2_path(request.uri().path()) {
         if let Err(error) = state.auth.check_bearer(request.headers(), &correlation) {
             return error.into_response();
         }

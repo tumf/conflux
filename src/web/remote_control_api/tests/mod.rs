@@ -9,6 +9,7 @@ mod compatibility_tests;
 mod dto_tests;
 mod event_ownership_tests;
 mod operator_snapshot_tests;
+mod parallel_control_tests;
 mod projection_tests;
 mod read_tests;
 mod registry_tests;
@@ -26,7 +27,7 @@ use tower::ServiceExt;
 use crate::web::remote_control_api::auth::RemoteControlAuth;
 use crate::web::remote_control_api::dto::{
     AttentionState, ChangeResource, ChangeTiming, CommandSpec, InstanceSnapshot,
-    ParallelEligibility, QueueIntent, SnapshotTotals,
+    ParallelEligibility, ParallelRuntimeState, QueueIntent, SnapshotTotals,
 };
 use crate::web::remote_control_api::executor::{
     CommandFailure, ExecutionSummary, RemoteControlExecutor,
@@ -159,6 +160,7 @@ pub(crate) fn snapshot_with(change_id: &str, display_status: &str) -> InstanceSn
         app_mode: "running".to_string(),
         is_resolving: false,
         process_error: None,
+        parallel: ParallelRuntimeState::default(),
         changes: vec![change_resource(change_id, display_status)],
         totals: SnapshotTotals {
             total: 1,

@@ -1,6 +1,6 @@
 //! Workspace execution logic for apply and archive operations.
 
-use crate::agent::{AgentRunner, OutputLine};
+use crate::agent::{AgentRunner, CleanupReviewDiagnostic, CleanupReviewFailureKind, OutputLine};
 use crate::ai_command_runner::AiCommandRunner;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
@@ -42,12 +42,10 @@ async fn wait_for_streaming_child_with_cancel(
                     "Cancellation observed while waiting for child status; terminating child"
                 );
                 let _ = child.terminate();
-                Err(OrchestratorError::AgentCommand(format!(
-                    "Cancelled {} for '{}' in workspace '{}'",
-                    operation,
-                    change_id,
-                    workspace_path.display()
-                )))
+                // Typed intentional stop: the run boundary must be able to tell
+                // cancellation apart from an agent-command crash without
+                // matching on message text.
+                Err(OrchestratorError::cancelled(operation, change_id, workspace_path))
             }
             status = child.wait() => status.map_err(|e| {
                 let attempt_context = attempt
@@ -126,16 +124,230 @@ fn build_parallel_hook_context(
     ctx
 }
 
+/// Maximum corrective cleanup-review attempts after the initial one.
+///
+/// Fixed protocol safety bound rather than configuration: the initial attempt
+/// plus these corrections gives three operation attempts, each of which contains
+/// its own command-queue transport retries. Active-run memory only, so a restart
+/// re-derives cleanup-review from workspace and Git evidence with a fresh budget.
+const MAX_CLEANUP_REVIEW_RETRIES: u32 = 2;
+
+/// Outcome of one cleanup-review operation attempt.
+enum CleanupReviewAttempt {
+    /// Command completed, exactly one standalone marker was emitted, and a fresh
+    /// repository query proved the worktree clean.
+    Success,
+    /// An ordinary failure that may consume corrective budget.
+    Failure(CleanupReviewDiagnostic),
+    /// Classified permission/tool-policy denial. It enters the existing
+    /// non-terminal hold immediately, starts no corrective attempt, and consumes
+    /// no generic cleanup failure budget.
+    PermissionDenied(crate::permission::PermissionDenial),
+}
+
+/// Post-apply cleanup-review with bounded operation-level correction.
+///
+/// The command queue already retries one cleanup-review command at transport
+/// level. Above it, this owns at most three operation attempts. Every attempt is
+/// validated in a fixed order — command ownership, then exactly one standalone
+/// marker, then a fresh repository query — and each corrective prompt carries
+/// only the latest bounded diagnostic.
+///
+/// Cancellation and classified permission denial are owned by their existing
+/// routing: neither starts another attempt, and permission denial does not
+/// consume the generic failure budget. All retry state lives in this future, so
+/// nothing durable is written and a restart recomputes cleanup-review from the
+/// workspace alone.
 async fn run_post_apply_cleanup_review(
     change_id: &str,
     workspace_path: &Path,
     config: &OrchestratorConfig,
     ai_runner: &AiCommandRunner,
+    cancel_token: Option<&CancellationToken>,
+    event_tx: Option<&mpsc::Sender<ParallelEvent>>,
 ) -> Result<()> {
+    let max_attempts = MAX_CLEANUP_REVIEW_RETRIES.saturating_add(1);
+    let mut latest: Option<CleanupReviewDiagnostic> = None;
+
+    for attempt in 1..=max_attempts {
+        // Explicit cancellation never starts another attempt. It is a typed
+        // intentional stop, not a cleanup failure, so the run boundary reports
+        // it as a stop for both global cancellation and a per-change queue stop.
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            return Err(OrchestratorError::cancelled(
+                "cleanup-review",
+                change_id,
+                workspace_path,
+            ));
+        }
+
+        match run_cleanup_review_attempt(
+            change_id,
+            workspace_path,
+            config,
+            ai_runner,
+            cancel_token,
+            attempt,
+            max_attempts,
+            latest.as_ref(),
+        )
+        .await?
+        {
+            CleanupReviewAttempt::Success => {
+                info!(
+                    change_id = %change_id,
+                    workspace = %workspace_path.display(),
+                    attempt = attempt,
+                    "Post-apply cleanup review succeeded and worktree is clean"
+                );
+                return Ok(());
+            }
+            CleanupReviewAttempt::PermissionDenied(denial) => {
+                warn!(
+                    change_id = %change_id,
+                    category = denial.category.as_str(),
+                    denied_target = %denial.denied_target,
+                    "Cleanup-review blocked by permission/tool policy denial; entering non-terminal hold without a corrective attempt"
+                );
+                if let Some(tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::ExecutionBlocked {
+                            change_id: change_id.to_string(),
+                            blocker: crate::events::StalledBlocker::permission_denial(
+                                "cleanup-review",
+                                &denial,
+                            ),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(ParallelEvent::WorkspaceStatusUpdated {
+                            change_id: change_id.to_string(),
+                            workspace_name: workspace_path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().to_string())
+                                .unwrap_or_else(|| workspace_path.display().to_string()),
+                            status: crate::vcs::WorkspaceStatus::Blocked,
+                        })
+                        .await;
+                }
+                return Err(OrchestratorError::PermissionStalled {
+                    denied_path: denial.denied_target.clone(),
+                    guidance: denial.format_guidance(),
+                });
+            }
+            CleanupReviewAttempt::Failure(diagnostic) => {
+                warn!(
+                    change_id = %change_id,
+                    workspace = %workspace_path.display(),
+                    attempt = attempt,
+                    max_attempts = max_attempts,
+                    failure_kind = diagnostic.kind.label(),
+                    marker_count = diagnostic.marker_count,
+                    "Cleanup-review attempt did not produce a handoff-ready worktree"
+                );
+                if let Some(tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::Log(
+                            crate::events::LogEntry::warn(format!(
+                                "Cleanup-review attempt {}/{} failed ({})",
+                                attempt,
+                                max_attempts,
+                                diagnostic.kind.label()
+                            ))
+                            .with_change_id(change_id)
+                            .with_operation("cleanup-review"),
+                        ))
+                        .await;
+                }
+                latest = Some(diagnostic);
+            }
+        }
+    }
+
+    // Exhaustion leaves the managed worktree exactly as the cleanup agent left
+    // it, so an explicit operator retry re-derives cleanup from that evidence.
+    let diagnostic = latest.expect("an exhausted cleanup-review loop recorded a failure");
+    Err(OrchestratorError::AgentCommand(format!(
+        "Cleanup-review failed on {} operation attempts for change '{}' in workspace '{}': {}",
+        max_attempts,
+        change_id,
+        workspace_path.display(),
+        format_cleanup_review_diagnostic(&diagnostic)
+    )))
+}
+
+/// One-line bounded rendering of the latest cleanup-review diagnosis.
+fn format_cleanup_review_diagnostic(diagnostic: &CleanupReviewDiagnostic) -> String {
+    const MAX_TAIL_CHARS: usize = 400;
+
+    fn condense(tail: &str) -> String {
+        let single_line = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+        match single_line.char_indices().nth(MAX_TAIL_CHARS) {
+            Some((idx, _)) => format!("{}...", &single_line[..idx]),
+            None => single_line,
+        }
+    }
+
+    let mut parts = vec![format!("failure_kind: {}", diagnostic.kind.label())];
+    if let Some(code) = diagnostic.exit_code {
+        parts.push(format!("exit_code: {}", code));
+    }
+    parts.push(format!(
+        "standalone_clean_marker_count: {}",
+        diagnostic.marker_count
+    ));
+    if let Some(status) = diagnostic
+        .status_tail
+        .as_deref()
+        .filter(|tail| !tail.trim().is_empty())
+    {
+        parts.push(format!("status: {}", condense(status)));
+    }
+    // Reported independently of the primary kind: a command or marker failure
+    // that also lost status evidence must say so in the terminal diagnostic.
+    if let Some(status_error) = diagnostic
+        .status_error
+        .as_deref()
+        .filter(|tail| !tail.trim().is_empty())
+    {
+        parts.push(format!("status_error: {}", condense(status_error)));
+    }
+    // stdout and stderr are bounded separately, so both are reported: an exit
+    // code with only one stream is an incomplete picture of the failure.
+    if let Some(stdout) = diagnostic
+        .stdout_tail
+        .as_deref()
+        .filter(|tail| !tail.trim().is_empty())
+    {
+        parts.push(format!("stdout: {}", condense(stdout)));
+    }
+    if let Some(stderr) = diagnostic
+        .stderr_tail
+        .as_deref()
+        .filter(|tail| !tail.trim().is_empty())
+    {
+        parts.push(format!("stderr: {}", condense(stderr)));
+    }
+    parts.join(" | ")
+}
+
+/// Run and validate exactly one cleanup-review operation attempt.
+#[allow(clippy::too_many_arguments)]
+async fn run_cleanup_review_attempt(
+    change_id: &str,
+    workspace_path: &Path,
+    config: &OrchestratorConfig,
+    ai_runner: &AiCommandRunner,
+    cancel_token: Option<&CancellationToken>,
+    attempt: u32,
+    max_attempts: u32,
+    previous: Option<&CleanupReviewDiagnostic>,
+) -> Result<CleanupReviewAttempt> {
     let user_template = config.get_acceptance_command()?;
     let prompt = crate::agent::build_cleanup_review_prompt_with_skill(
         config.get_cleanup_review_skill(),
         change_id,
+        previous,
     );
     let command = OrchestratorConfig::expand_prompt(
         &OrchestratorConfig::expand_change_id(user_template, change_id),
@@ -145,6 +357,8 @@ async fn run_post_apply_cleanup_review(
     info!(
         change_id = %change_id,
         workspace = %workspace_path.display(),
+        attempt = attempt,
+        max_attempts = max_attempts,
         "Starting post-apply cleanup review for dirty managed worktree"
     );
 
@@ -157,63 +371,160 @@ async fn run_post_apply_cleanup_review(
         )
         .await?;
 
-    let mut stdout = String::new();
-    while let Some(line) = output_rx.recv().await {
+    // Bounded tails for diagnostics; the marker contract is evaluated with a
+    // fixed-size streaming scanner so an attempt that floods stdout cannot grow
+    // this frame's memory with retained output.
+    let mut output_collector = crate::history::OutputCollector::new();
+    let mut marker_scanner = crate::agent::CleanupMarkerScanner::new();
+    loop {
+        let line = if let Some(token) = cancel_token {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    warn!(
+                        change_id = %change_id,
+                        workspace = %workspace_path.display(),
+                        attempt = attempt,
+                        "Cancellation observed while streaming cleanup-review output; terminating child"
+                    );
+                    // Terminate through the managed handle, then drain and close
+                    // the owned channel so no producer is left writing into it.
+                    let _ = child.terminate();
+                    output_rx.close();
+                    while output_rx.recv().await.is_some() {}
+                    return Err(OrchestratorError::cancelled(
+                        "cleanup-review",
+                        change_id,
+                        workspace_path,
+                    ));
+                }
+                line = output_rx.recv() => line,
+            }
+        } else {
+            output_rx.recv().await
+        };
+
+        let Some(line) = line else { break };
         match line {
             crate::ai_command_runner::OutputLine::Stdout(s) => {
-                stdout.push_str(&s);
-                stdout.push('\n');
+                output_collector.add_stdout(&s);
+                marker_scanner.observe(&s);
             }
-            crate::ai_command_runner::OutputLine::Stderr(_) => {}
+            crate::ai_command_runner::OutputLine::Stderr(s) => {
+                output_collector.add_stderr(&s);
+            }
         }
     }
 
-    let status = child.wait().await.map_err(|e| {
-        OrchestratorError::AgentCommand(format!(
-            "Failed to wait for cleanup-review command for change '{}' in workspace '{}': {}",
-            change_id,
-            workspace_path.display(),
-            e
-        ))
-    })?;
+    let status = wait_for_streaming_child_with_cancel(
+        child,
+        cancel_token,
+        "cleanup-review",
+        change_id,
+        workspace_path,
+        Some(attempt),
+    )
+    .await?;
+
+    let stdout_tail = output_collector.stdout_tail();
+    let stderr_tail = output_collector.stderr_tail();
+    let marker_count = marker_scanner.count();
+
+    // Step 1 — command ownership. A classified permission/tool-policy denial is
+    // distinguished before generic command failure so it can enter the existing
+    // non-terminal hold without consuming corrective budget.
+    if let Some(denial) = crate::permission::classify_permission_denial(&[
+        stdout_tail.as_deref(),
+        stderr_tail.as_deref(),
+    ]) {
+        return Ok(CleanupReviewAttempt::PermissionDenied(denial));
+    }
 
     if !status.success() {
-        return Err(OrchestratorError::AgentCommand(format!(
-            "Cleanup-review command failed with exit code {:?} for change '{}'",
-            status.code(),
-            change_id
-        )));
+        // A status query that failed at the same time is kept as its own field:
+        // dropping it would make "no status evidence" indistinguishable from a
+        // clean worktree in the corrective prompt.
+        let (status_tail, status_error) = split_status_inspection(workspace_path).await;
+        return Ok(CleanupReviewAttempt::Failure(CleanupReviewDiagnostic {
+            kind: CleanupReviewFailureKind::CommandFailed,
+            exit_code: status.code(),
+            stdout_tail,
+            stderr_tail,
+            marker_count,
+            status_tail,
+            status_error,
+        }));
     }
 
-    if !crate::agent::parse_cleanup_review_output(&stdout) {
-        return Err(OrchestratorError::AgentCommand(format!(
-            "Cleanup-review output missing required single marker CLEANUP_REVIEW: CLEAN for change '{}'",
-            change_id
-        )));
+    // Step 2 — protocol marker. Missing and duplicate markers both fail.
+    if marker_count != 1 {
+        let (status_tail, status_error) = split_status_inspection(workspace_path).await;
+        let kind = if marker_count == 0 {
+            CleanupReviewFailureKind::MarkerMissing
+        } else {
+            CleanupReviewFailureKind::MarkerDuplicate
+        };
+        return Ok(CleanupReviewAttempt::Failure(CleanupReviewDiagnostic {
+            kind,
+            exit_code: status.code(),
+            stdout_tail,
+            stderr_tail,
+            marker_count,
+            status_tail,
+            status_error,
+        }));
     }
 
-    let (still_dirty, dirty_status) =
-        has_uncommitted_changes(workspace_path).await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!(
-                "Failed to verify post-cleanup dirty state for change '{}': {}",
-                change_id, e
-            ))
-        })?;
-
-    if still_dirty {
-        return Err(OrchestratorError::AgentCommand(format!(
-            "Cleanup-review reported clean marker but worktree remains dirty for change '{}': {}",
-            change_id, dirty_status
-        )));
+    // Step 3 — repository truth. A marker never overrides Git state, and a
+    // failed status query is never clean.
+    match has_uncommitted_changes(workspace_path).await {
+        Ok((false, _)) => Ok(CleanupReviewAttempt::Success),
+        Ok((true, dirty_status)) => Ok(CleanupReviewAttempt::Failure(CleanupReviewDiagnostic {
+            kind: CleanupReviewFailureKind::DirtyRemains,
+            exit_code: status.code(),
+            stdout_tail,
+            stderr_tail,
+            marker_count,
+            status_tail: Some(dirty_status),
+            status_error: None,
+        })),
+        Err(e) => Ok(CleanupReviewAttempt::Failure(CleanupReviewDiagnostic {
+            kind: CleanupReviewFailureKind::StatusInspectionFailed,
+            exit_code: status.code(),
+            stdout_tail,
+            stderr_tail,
+            marker_count,
+            status_tail: None,
+            status_error: Some(format!("status inspection failed: {}", e)),
+        })),
     }
+}
 
-    info!(
-        change_id = %change_id,
-        workspace = %workspace_path.display(),
-        "Post-apply cleanup review succeeded and worktree is clean"
-    );
+/// Fresh porcelain evidence for a corrective prompt, split into the observed
+/// status and the inspection error.
+///
+/// Exactly one side is `Some`: a failed query is reported as an error rather
+/// than silently omitted, so the next attempt can tell "unproven" apart from
+/// "nothing reported".
+async fn split_status_inspection(workspace_path: &Path) -> (Option<String>, Option<String>) {
+    match current_porcelain_status(workspace_path).await {
+        Ok(status) => (Some(status), None),
+        Err(e) => (None, Some(e.to_string())),
+    }
+}
 
-    Ok(())
+/// Fresh porcelain evidence for a corrective prompt.
+///
+/// A failed query is reported as such rather than silently omitted, so the next
+/// attempt knows cleanliness is unproven.
+async fn current_porcelain_status(workspace_path: &Path) -> Result<String> {
+    match has_uncommitted_changes(workspace_path).await {
+        Ok((true, status)) => Ok(status),
+        Ok((false, _)) => Ok("clean".to_string()),
+        Err(e) => Err(OrchestratorError::GitCommand(format!(
+            "status inspection failed: {}",
+            e
+        ))),
+    }
 }
 
 async fn mark_acceptance_context_injected(
@@ -266,7 +577,11 @@ pub async fn execute_apply_in_workspace(
     _apply_history: &Arc<Mutex<crate::history::ApplyHistory>>,
     acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
     acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
-    _initial_iteration: u32,
+    // The sole per-change `max_iterations` owner for this process run. Replaces
+    // the previous `_initial_iteration` plumbing: parallel no longer carries a
+    // per-cycle starting count, because the shared owner already holds the
+    // cumulative per-change total across every Apply entry.
+    apply_budget: &common_apply::ApplyBudget,
 ) -> Result<(
     String,
     u32,
@@ -369,6 +684,7 @@ pub async fn execute_apply_in_workspace(
         &event_handler,
         cancel_token,
         ai_runner,
+        apply_budget,
         |_line| async move {
             // Output is handled by event_handler
         },
@@ -472,7 +788,15 @@ pub async fn execute_apply_in_workspace(
                 dirty_status = %dirty_status,
                 "Managed worktree is dirty after apply completion; running post-apply cleanup review before acceptance handoff"
             );
-            run_post_apply_cleanup_review(change_id, workspace_path, config, ai_runner).await?;
+            run_post_apply_cleanup_review(
+                change_id,
+                workspace_path,
+                config,
+                ai_runner,
+                cancel_token,
+                event_tx_for_permission.as_ref(),
+            )
+            .await?;
         }
     }
 
@@ -1344,11 +1668,22 @@ pub async fn execute_acceptance_in_workspace(
     let previous_findings_text = agent
         .get_last_acceptance_finding_texts(change_id)
         .map(|findings| findings.join("\n"));
-    let previous_acceptance_denial = crate::permission::classify_permission_denial(&[
-        stdout_tail.as_deref(),
-        stderr_tail.as_deref(),
-        previous_findings_text.as_deref(),
-    ]);
+    // A denial observed by an invocation that never completed records no
+    // canonical attempt, so its evidence is not in the history tails above. The
+    // latest-only command-recovery diagnostic is where that classification
+    // survives: without it, an unchanged repeated denial would be retried as an
+    // ordinary command failure until the recovery budget is spent instead of
+    // entering the existing non-terminal hold on the second observation.
+    let previous_acceptance_denial = agent
+        .acceptance_command_recovery(change_id)
+        .and_then(crate::orchestration::acceptance::classify_acceptance_command_denial)
+        .or_else(|| {
+            crate::permission::classify_permission_denial(&[
+                stdout_tail.as_deref(),
+                stderr_tail.as_deref(),
+                previous_findings_text.as_deref(),
+            ])
+        });
     let last_output_context = crate::agent::build_last_acceptance_output_context(
         stdout_tail.as_deref(),
         stderr_tail.as_deref(),
@@ -1366,6 +1701,13 @@ pub async fn execute_acceptance_in_workspace(
         )
     });
 
+    // Latest-only command-recovery evidence for an Acceptance retry after a
+    // command failure. Empty for every other invocation, and stored apart from
+    // canonical acceptance history so it can never become a verdict.
+    let command_recovery_context = crate::agent::build_acceptance_command_recovery_context(
+        agent.acceptance_command_recovery(change_id),
+    );
+
     // Build prompt injected into `{prompt}`
     let full_prompt = crate::agent::append_optional_prompt(
         match config.get_acceptance_prompt_mode() {
@@ -1378,6 +1720,7 @@ pub async fn execute_acceptance_in_workspace(
                     &last_output_context,
                     &diff_context,
                     &protocol_retry_context,
+                    &command_recovery_context,
                 )
             }
             crate::config::AcceptancePromptMode::ContextOnly => {
@@ -1389,6 +1732,7 @@ pub async fn execute_acceptance_in_workspace(
                     &last_output_context,
                     &diff_context,
                     &protocol_retry_context,
+                    &command_recovery_context,
                 )
             }
         },
@@ -1681,27 +2025,19 @@ pub async fn execute_acceptance_in_workspace(
             "Acceptance command failed with exit code: {:?}",
             status.code()
         );
-        let attempt_number = agent.next_acceptance_attempt_number(change_id);
-        let attempt = crate::history::AcceptanceAttempt {
-            attempt: attempt_number,
-            passed: false,
-            duration: start_time.elapsed(),
-            findings: Some(crate::acceptance::legacy_findings(tail_findings.clone())),
-            exit_code: status.code(),
-            stdout_tail: stdout_tail.clone(),
-            stderr_tail: stderr_tail.clone(),
-            commit_hash: revision_to_history_commit_hash(&end_revision),
-        };
-        agent.record_acceptance_attempt(change_id, attempt.clone());
-        acceptance_history.lock().await.record(change_id, attempt);
 
+        // A command that never completed produced no verdict, so it records no
+        // canonical `AcceptanceAttempt` in either the agent-local or the shared
+        // Acceptance history: transport evidence must not be replayed as
+        // previous findings, and it must not consume attempt numbering. The
+        // dedicated latest-only command-recovery context below is the only place
+        // this output travels.
         if let Some(ref tx) = event_tx {
             let _ = tx
                 .send(ParallelEvent::Log(
                     crate::events::LogEntry::error(&error_msg)
                         .with_change_id(change_id)
-                        .with_operation("acceptance")
-                        .with_iteration(attempt_number),
+                        .with_operation("acceptance"),
                 ))
                 .await;
             let _ = tx
@@ -1713,10 +2049,18 @@ pub async fn execute_acceptance_in_workspace(
 
         return Ok((
             crate::orchestration::AcceptanceResult::CommandFailed {
+                diagnostic: crate::orchestration::acceptance::AcceptanceCommandDiagnostic {
+                    error: error_msg.clone(),
+                    exit_code: status.code(),
+                    stdout_tail: stdout_tail.clone(),
+                    stderr_tail: stderr_tail.clone(),
+                },
                 error: error_msg,
                 findings: tail_findings,
             },
-            attempt_number,
+            // No canonical attempt was recorded, so no attempt number is
+            // reported.
+            0,
         ));
     }
 
@@ -2419,7 +2763,7 @@ mod tests {
         };
         let ai_runner = test_ai_runner();
 
-        run_post_apply_cleanup_review("change-a", temp_dir.path(), &config, &ai_runner)
+        run_post_apply_cleanup_review("change-a", temp_dir.path(), &config, &ai_runner, None, None)
             .await
             .expect("cleanup review should succeed");
 
@@ -2441,18 +2785,694 @@ mod tests {
 
         let config = OrchestratorConfig {
             acceptance_command: Some(
-                "sh -c 'git add dirty.txt && git commit -m cleanup && echo done'".to_string(),
+                // Idempotent so every operation attempt exits successfully and
+                // the only failure observed is the missing marker.
+                "sh -c 'git add dirty.txt; git diff --cached --quiet || git commit -m cleanup; \
+                 echo done'"
+                    .to_string(),
             ),
             ..Default::default()
         };
         let ai_runner = test_ai_runner();
 
-        let err = run_post_apply_cleanup_review("change-a", temp_dir.path(), &config, &ai_runner)
-            .await
-            .expect_err("cleanup review must fail without marker");
+        let err = run_post_apply_cleanup_review(
+            "change-a",
+            temp_dir.path(),
+            &config,
+            &ai_runner,
+            None,
+            None,
+        )
+        .await
+        .expect_err("cleanup review must fail without marker");
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("CLEANUP_REVIEW: CLEAN"),
-            "error should mention missing marker: {err}"
+            message.contains("marker_missing"),
+            "error should name the missing-marker failure kind: {message}"
         );
+        assert!(
+            message.contains("3 operation attempts"),
+            "error should report the exhausted attempt count: {message}"
+        );
+    }
+
+    /// Post-Apply cleanup-review corrective loop: ordered validation, bounded
+    /// correction, cancellation, and the non-terminal permission hold.
+    ///
+    /// Nested under `tests` so the change proposal's declared verification command
+    /// `cargo test --lib parallel::executor::tests` covers this whole set.
+    mod cleanup_review_recovery {
+        use super::super::run_post_apply_cleanup_review;
+        use crate::ai_command_runner::AiCommandRunner;
+        use crate::command_queue::CommandQueueConfig;
+        use crate::config::OrchestratorConfig;
+        use crate::error::OrchestratorError;
+        use std::path::Path;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+        use tokio::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        fn ai_runner() -> AiCommandRunner {
+            let queue_config = CommandQueueConfig {
+                stagger_delay_ms: 0,
+                max_retries: 0,
+                retry_delay_ms: 0,
+                retry_error_patterns: Vec::new(),
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 1,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+            };
+            AiCommandRunner::new(queue_config, Arc::new(Mutex::new(None)))
+        }
+
+        fn git(repo: &Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// A task-complete managed worktree that is dirty after Apply.
+        fn dirty_worktree() -> TempDir {
+            let temp_dir = TempDir::new().unwrap();
+            let repo = temp_dir.path();
+            git(repo, &["init", "-b", "main"]);
+            git(repo, &["config", "user.email", "test@example.com"]);
+            git(repo, &["config", "user.name", "Test User"]);
+            std::fs::write(repo.join("README.md"), "base\n").unwrap();
+            git(repo, &["add", "README.md"]);
+            git(repo, &["commit", "-m", "base"]);
+            std::fs::write(repo.join("leftover.txt"), "apply artifact\n").unwrap();
+            temp_dir
+        }
+
+        /// Install an executable cleanup-review fixture that receives the expanded
+        /// prompt as `$1`, records every attempt, and runs `body` with `$ATTEMPT`
+        /// set. Using a script keeps the prompt out of nested shell quoting so the
+        /// corrective context can be asserted verbatim.
+        fn fixture(state: &Path, body: &str) -> String {
+            let script = state.join("cleanup-review.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n\
+                 STATE={state}\n\
+                 ATTEMPT=$(cat \"$STATE/attempts\" 2>/dev/null || echo 0)\n\
+                 ATTEMPT=$((ATTEMPT+1))\n\
+                 echo $ATTEMPT > \"$STATE/attempts\"\n\
+                 printf '%s' \"$1\" > \"$STATE/prompt-$ATTEMPT.txt\"\n\
+                 {body}\n",
+                    state = state.display(),
+                    body = body
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            format!("{} {{prompt}}", script.display())
+        }
+
+        fn config(command: String) -> OrchestratorConfig {
+            OrchestratorConfig {
+                acceptance_command: Some(command),
+                ..Default::default()
+            }
+        }
+
+        fn attempts(state: &Path) -> u32 {
+            std::fs::read_to_string(state.join("attempts"))
+                .map(|text| text.trim().parse().unwrap_or(0))
+                .unwrap_or(0)
+        }
+
+        fn prompt(state: &Path, attempt: u32) -> String {
+            std::fs::read_to_string(state.join(format!("prompt-{attempt}.txt")))
+                .unwrap_or_else(|e| panic!("attempt {attempt} prompt should exist: {e}"))
+        }
+
+        async fn is_dirty(repo: &Path) -> bool {
+            crate::vcs::git::commands::has_uncommitted_changes(repo)
+                .await
+                .unwrap()
+                .0
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_corrective_attempt_recovers_a_dirty_worktree() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            // Attempt 1 commits nothing and emits no marker; attempt 2 does the work.
+            let command = fixture(
+                state.path(),
+                "if [ \"$ATTEMPT\" = \"1\" ]; then echo 'reviewed, nothing done'; exit 0; fi\n\
+             git add leftover.txt && git commit -q -m cleanup && echo 'CLEANUP_REVIEW: CLEAN'",
+            );
+
+            run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect("the corrective attempt must recover the handoff");
+
+            assert_eq!(
+                attempts(state.path()),
+                2,
+                "exactly one correction was needed"
+            );
+            assert!(!is_dirty(repo_dir.path()).await);
+
+            // The corrective prompt carries only the latest structured diagnosis.
+            let first = prompt(state.path(), 1);
+            assert!(
+                !first.contains("<cleanup_review_correction>"),
+                "the initial attempt has nothing to correct"
+            );
+            let second = prompt(state.path(), 2);
+            assert!(second.contains("<cleanup_review_correction>"), "{second}");
+            assert!(
+                second.contains("\"failure_kind\":\"marker_missing\""),
+                "{second}"
+            );
+            assert!(
+                second.contains("\"standalone_clean_marker_count\":0"),
+                "{second}"
+            );
+            assert!(
+                second.contains("leftover.txt"),
+                "the corrective prompt must carry fresh porcelain evidence: {second}"
+            );
+            assert!(second.contains("Success is decided by Conflux"), "{second}");
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_marker_without_a_clean_repository_is_not_success() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            // Emits the marker every time but never cleans the worktree.
+            let command = fixture(state.path(), "echo 'CLEANUP_REVIEW: CLEAN'");
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a marker can never override Git state");
+
+            let message = error.to_string();
+            assert!(message.contains("dirty_remains"), "{message}");
+            assert!(message.contains("leftover.txt"), "{message}");
+            assert_eq!(attempts(state.path()), 3);
+            assert!(
+                prompt(state.path(), 2).contains("\"failure_kind\":\"dirty_remains\""),
+                "the correction must name the observed failure"
+            );
+            assert!(
+                is_dirty(repo_dir.path()).await,
+                "exhaustion preserves the managed workspace for explicit retry"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_clean_repository_without_exactly_one_marker_is_not_success() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            // Cleans the worktree but duplicates the marker, so the protocol fails
+            // even though repository truth is satisfied.
+            let command = fixture(
+                state.path(),
+                "git add leftover.txt >/dev/null 2>&1; \
+             git diff --cached --quiet || git commit -q -m cleanup; \
+             echo 'CLEANUP_REVIEW: CLEAN'; echo 'CLEANUP_REVIEW: CLEAN'",
+            );
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a clean worktree never invents the marker contract");
+
+            let message = error.to_string();
+            assert!(message.contains("marker_duplicate"), "{message}");
+            assert!(
+                message.contains("standalone_clean_marker_count: 2"),
+                "{message}"
+            );
+            assert_eq!(
+                attempts(state.path()),
+                3,
+                "exactly three operation attempts"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn exhaustion_reports_the_attempt_count_and_latest_diagnosis() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            let command = fixture(
+                state.path(),
+                "echo \"cleanup crashed on attempt $ATTEMPT\" >&2; exit 5",
+            );
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("three failed operation attempts are terminal");
+
+            let message = error.to_string();
+            assert!(message.contains("3 operation attempts"), "{message}");
+            assert!(
+                message.contains("failure_kind: command_failed"),
+                "{message}"
+            );
+            assert!(message.contains("exit_code: 5"), "{message}");
+            assert!(
+                message.contains("cleanup crashed on attempt 3"),
+                "the terminal error reports the latest diagnosis: {message}"
+            );
+            assert_eq!(
+                attempts(state.path()),
+                super::super::MAX_CLEANUP_REVIEW_RETRIES + 1,
+                "no fourth operation attempt may start"
+            );
+            assert!(is_dirty(repo_dir.path()).await);
+        }
+
+        /// Cancellation observed before an attempt starts is an intentional stop.
+        ///
+        /// Deterministic and process-free: no fixture runs, so this is the fast
+        /// default-suite coverage of the cancellation contract that the
+        /// process-boundary test below exercises against a live child.
+        #[tokio::test]
+        async fn an_already_cancelled_token_starts_no_attempt() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            let command = fixture(state.path(), "echo 'CLEANUP_REVIEW: CLEAN'");
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                Some(&cancel),
+                None,
+            )
+            .await
+            .expect_err("cancellation is an intentional stop, not a cleanup success");
+
+            assert!(
+                error.is_cancellation(),
+                "the run boundary must be able to classify the stop without parsing text: {error}"
+            );
+            assert!(
+                matches!(
+                    &error,
+                    OrchestratorError::Cancelled { operation, change_id, .. }
+                        if operation == "cleanup-review" && change_id == "change-a"
+                ),
+                "the typed stop names the operation and change: {error}"
+            );
+            assert!(
+                error.to_string().contains("Cancelled cleanup-review"),
+                "the existing rendering is unchanged: {error}"
+            );
+            assert_eq!(
+                attempts(state.path()),
+                0,
+                "explicit cancellation must not start an attempt"
+            );
+        }
+
+        /// Cancellation while a real child is streaming terminates that child and
+        /// starts no corrective attempt.
+        ///
+        /// Gated: it owns a live process that must be observed running before it
+        /// is cancelled, so its wall clock follows process spawn latency rather
+        /// than this crate's logic. The fast test above keeps the cancellation
+        /// contract itself in the default suite.
+        #[cfg_attr(windows, ignore)]
+        #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+        #[tokio::test]
+        async fn cancellation_terminates_the_child_and_starts_no_further_attempt() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            // Signals that it started, then blocks until terminated.
+            let command = fixture(
+                state.path(),
+                "touch \"$STATE/started\"; sleep 30; echo 'CLEANUP_REVIEW: CLEAN'",
+            );
+            let cancel = CancellationToken::new();
+
+            // Cancel only once the child has actually started. Cancelling on a
+            // fixed deadline would race process spawn and stop the loop before
+            // any attempt ran, which is the other code path. Waiting for the
+            // marker instead of a deadline is what makes the observation, rather
+            // than the machine's load, decide when to cancel.
+            let started_marker = state.path().join("started");
+            let waiter = cancel.clone();
+            let starter = tokio::spawn(async move {
+                // Generous, not tight: the bound exists only so a fixture that
+                // never starts fails the assertions instead of hanging.
+                for _ in 0..12_000 {
+                    if started_marker.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                waiter.cancel();
+            });
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                Some(&cancel),
+                None,
+            )
+            .await
+            .expect_err("cancellation is an intentional stop, not a cleanup success");
+
+            starter.abort();
+            assert!(
+                error.is_cancellation(),
+                "cancellation keeps the typed intentional-stop routing: {error}"
+            );
+            assert_eq!(
+                attempts(state.path()),
+                1,
+                "explicit cancellation must not start a corrective attempt"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_classified_permission_denial_holds_without_consuming_the_failure_budget() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            let command = fixture(
+                state.path(),
+                "echo 'Tool access denied: Bash(git commit)'; exit 0",
+            );
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a classified denial enters the non-terminal hold");
+
+            assert!(
+                matches!(error, OrchestratorError::PermissionStalled { .. }),
+                "cleanup permission denial reuses the existing non-terminal hold, got {error:?}"
+            );
+            assert_eq!(
+                attempts(state.path()),
+                1,
+                "permission denial starts no corrective attempt and consumes no generic budget"
+            );
+            assert!(
+                is_dirty(repo_dir.path()).await,
+                "the managed workspace is preserved for an explicit retry"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_restarted_run_derives_cleanup_from_workspace_evidence_with_a_fresh_budget() {
+            let repo_dir = dirty_worktree();
+
+            // First process run exhausts its active-run budget and writes nothing
+            // durable: no report, marker file, or retry checkpoint.
+            let first_state = TempDir::new().unwrap();
+            let first = fixture(first_state.path(), "echo nope; exit 1");
+            run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(first),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("the first run exhausts its budget");
+
+            let workspace_entries: Vec<String> = std::fs::read_dir(repo_dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .filter(|name| name != ".git")
+                .collect();
+            assert_eq!(
+                workspace_entries
+                    .iter()
+                    .filter(|name| name.as_str() != "README.md" && name.as_str() != "leftover.txt")
+                    .count(),
+                0,
+                "no durable retry artifact may be created: {workspace_entries:?}"
+            );
+
+            // A restart is just a fresh call against the same workspace evidence.
+            let second_state = TempDir::new().unwrap();
+            let second = fixture(
+                second_state.path(),
+                "git add leftover.txt && git commit -q -m cleanup && echo 'CLEANUP_REVIEW: CLEAN'",
+            );
+            run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(second),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect("a restarted run gets a fresh active-run cleanup budget");
+
+            assert_eq!(
+                attempts(second_state.path()),
+                1,
+                "the restarted run starts from a clean budget"
+            );
+            assert!(
+                !prompt(second_state.path(), 1).contains("<cleanup_review_correction>"),
+                "no prior-run diagnosis may be restored from outside the workspace"
+            );
+        }
+
+        // === Simultaneous status-inspection failure ===
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_command_failure_that_also_breaks_status_reports_both() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            // The command fails *and* leaves the repository unreadable, so the
+            // fresh status query cannot answer either. An absent status must not
+            // read as "nothing reported".
+            let command = fixture(
+                state.path(),
+                "rm -rf .git; echo 'cleanup crashed' >&2; exit 5",
+            );
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a broken repository is never a handoff-ready worktree");
+
+            let message = error.to_string();
+            assert!(
+                message.contains("failure_kind: command_failed"),
+                "the primary failure kind is preserved: {message}"
+            );
+            assert!(message.contains("exit_code: 5"), "{message}");
+            assert!(
+                message.contains("status_error: "),
+                "the simultaneous status-inspection failure must be reported: {message}"
+            );
+            assert!(message.contains("status inspection failed"), "{message}");
+            assert!(
+                !message.contains("| status: "),
+                "an unanswerable query must not present itself as observed status: {message}"
+            );
+
+            // The corrective prompt distinguishes unavailable evidence from an
+            // empty status.
+            let second = prompt(state.path(), 2);
+            assert!(
+                second.contains("\"failure_kind\":\"command_failed\""),
+                "{second}"
+            );
+            assert!(
+                second.contains("\"status_inspection_error\""),
+                "the corrective prompt must say cleanliness is unproven: {second}"
+            );
+            assert!(
+                !second.contains("\"current_porcelain_status\""),
+                "no status may be claimed when the query failed: {second}"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_marker_failure_that_also_breaks_status_reports_both() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            // Exits successfully with no marker, and breaks the repository.
+            let command = fixture(state.path(), "rm -rf .git; echo 'reviewed'; exit 0");
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a missing marker with unprovable cleanliness is terminal");
+
+            let message = error.to_string();
+            assert!(
+                message.contains("failure_kind: marker_missing"),
+                "the marker contract still owns the primary kind: {message}"
+            );
+            assert!(
+                message.contains("standalone_clean_marker_count: 0"),
+                "{message}"
+            );
+            assert!(
+                message.contains("status_error: "),
+                "the simultaneous status-inspection failure must be reported: {message}"
+            );
+
+            let second = prompt(state.path(), 2);
+            assert!(
+                second.contains("\"failure_kind\":\"marker_missing\""),
+                "{second}"
+            );
+            assert!(second.contains("\"status_inspection_error\""), "{second}");
+        }
+
+        // === Bounded marker accounting ===
+
+        #[test]
+        fn the_marker_scanner_state_is_fixed_size_regardless_of_stream_length() {
+            use crate::agent::CleanupMarkerScanner;
+
+            let mut scanner = CleanupMarkerScanner::new();
+            // Far more output than any bounded tail would keep.
+            for i in 0..200_000 {
+                scanner.observe(&format!("noise line {i} with some padding text"));
+            }
+            scanner.observe("CLEANUP_REVIEW: CLEAN");
+            for i in 0..200_000 {
+                scanner.observe(&format!("trailing noise {i}"));
+            }
+
+            assert_eq!(scanner.count(), 1, "the marker contract still holds");
+            // The scanner is a plain Copy value: it cannot retain the stream.
+            assert!(
+                std::mem::size_of::<CleanupMarkerScanner>() <= 2 * std::mem::size_of::<usize>(),
+                "marker state must stay bounded, got {} bytes",
+                std::mem::size_of::<CleanupMarkerScanner>()
+            );
+        }
+
+        #[test]
+        fn the_marker_scanner_ignores_fenced_markers_across_chunk_boundaries() {
+            use crate::agent::CleanupMarkerScanner;
+
+            let mut scanner = CleanupMarkerScanner::new();
+            for chunk in [
+                "```",
+                "CLEANUP_REVIEW: CLEAN",
+                "```",
+                "  CLEANUP_REVIEW: CLEAN  ",
+                "prefix CLEANUP_REVIEW: CLEAN",
+            ] {
+                scanner.observe(chunk);
+            }
+
+            assert_eq!(
+                scanner.count(),
+                1,
+                "only the standalone unfenced marker counts, even when the fence spans chunks"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_large_stream_still_validates_the_marker_exactly_once() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            // Emits a fenced decoy, a large body, then the one real marker.
+            let command = fixture(
+                state.path(),
+                "echo '```'; echo 'CLEANUP_REVIEW: CLEAN'; echo '```'; \
+             i=0; while [ $i -lt 4000 ]; do echo \"filler line $i\"; i=$((i+1)); done; \
+             git add leftover.txt && git commit -q -m cleanup && echo 'CLEANUP_REVIEW: CLEAN'",
+            );
+
+            run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect("one standalone marker outside fences plus a clean worktree is success");
+
+            assert_eq!(attempts(state.path()), 1, "no correction was needed");
+            assert!(!is_dirty(repo_dir.path()).await);
+        }
     }
 }
