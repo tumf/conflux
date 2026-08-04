@@ -365,6 +365,27 @@ mod tests {
     }
 
     #[test]
+    fn upstream_integration_never_treats_default_tree_evidence_as_archive_proof() {
+        // Recovery discovery observes commits without reading their trees. If that
+        // cheaper observation were ever routed into spine validation, every
+        // cumulative integration would arrive carrying default evidence — this
+        // spine must stay unpublishable rather than silently accepting it.
+        let commits = vec![
+            change_merge("Merge change: a", CommitTreeEvidence::default()),
+            change_merge("Merge changes: b, c", CommitTreeEvidence::default()),
+        ];
+        let validation = validate_spine(&commits, "origin", "main");
+        assert!(!validation.is_publishable());
+        assert!(validation.integrated_change_ids.is_empty());
+        assert!(validation
+            .rejected
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("no archive evidence"));
+    }
+
+    #[test]
     fn upstream_integration_accepts_fully_recognized_spine() {
         let commits = vec![change_merge(
             "Merge change: a",

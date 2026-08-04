@@ -163,7 +163,7 @@ pub async fn ensure_no_unpushed_upstream_recovery(
 mod tests {
     use super::*;
     use crate::upstream::classify::MergeRepositoryState;
-    use crate::upstream::ports::PortResult;
+    use crate::upstream::ports::{PortResult, RecoveryCommit};
     use crate::upstream::spine::SpineCommit;
     use async_trait::async_trait;
 
@@ -221,6 +221,13 @@ mod tests {
             Ok(String::new())
         }
         async fn commit_parents(&self, _sha: &str) -> PortResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn first_parent_recovery_metadata(
+            &self,
+            _to: &str,
+            _limit: Option<usize>,
+        ) -> PortResult<Vec<RecoveryCommit>> {
             Ok(Vec::new())
         }
         async fn first_parent_commits(

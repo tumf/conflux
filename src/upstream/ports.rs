@@ -46,6 +46,22 @@ pub struct MergeCommandResult {
     pub state: MergeRepositoryState,
 }
 
+/// One first-parent commit observed for bounded offline recovery discovery.
+///
+/// Recovery classification consumes trailer identity, merge-parent binding, and
+/// local ref reachability only, so this observation deliberately carries **no**
+/// commit-tree evidence: reading it would cost two `git ls-tree` subprocesses
+/// per scanned commit for data no recovery decision reads. [`SpineCommit`] stays
+/// the evidence-bearing observation for full spine validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryCommit {
+    pub sha: String,
+    /// Raw commit message (subject plus body/trailers).
+    pub message: String,
+    /// Parent SHAs in Git order.
+    pub parents: Vec<String>,
+}
+
 /// Raw result of `git push --porcelain`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushCommandResult {
@@ -107,11 +123,28 @@ pub trait UpstreamGit: Send + Sync {
     /// Parent SHAs of a commit, in Git order.
     async fn commit_parents(&self, sha: &str) -> PortResult<Vec<String>>;
 
+    /// Bounded first-parent commit **metadata** ending at `to` (inclusive),
+    /// oldest first, with at most `limit` commits.
+    ///
+    /// Metadata only: SHA, parents, and raw message. No commit tree is read, so
+    /// the cost of this observation does not grow with the number of scanned
+    /// commits. This is the offline recovery-discovery observation, used before
+    /// a remote has been selected. Anything that must classify archive or
+    /// active-change evidence uses [`Self::first_parent_commits`] instead.
+    async fn first_parent_recovery_metadata(
+        &self,
+        to: &str,
+        limit: Option<usize>,
+    ) -> PortResult<Vec<RecoveryCommit>>;
+
     /// First-parent commits from `from_exclusive` (exclusive) to `to` (inclusive),
     /// oldest first, with each commit's own tree evidence attached.
     ///
-    /// `from_exclusive` is `None` for the bounded offline recovery scan that runs
-    /// before a remote has been selected; `limit` bounds that walk.
+    /// This is the evidence-bearing spine observation: every returned commit
+    /// carries the archive and active-change evidence `validate_spine` needs, so
+    /// it reads each commit's tree. `from_exclusive` is `None` for a walk from
+    /// the root; `limit` bounds it. Recovery discovery MUST NOT use this method —
+    /// see [`Self::first_parent_recovery_metadata`].
     async fn first_parent_commits(
         &self,
         from_exclusive: Option<&str>,

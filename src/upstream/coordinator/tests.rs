@@ -14,8 +14,9 @@ use async_trait::async_trait;
 use super::*;
 use crate::upstream::classify::MergeRepositoryState;
 use crate::upstream::ports::{
-    MergeCommandResult, PushCommandResult, RepairAttemptResult, VerificationOutcome,
+    MergeCommandResult, PushCommandResult, RecoveryCommit, RepairAttemptResult, VerificationOutcome,
 };
+use crate::upstream::publication::format_publication_marker_message;
 use crate::upstream::spine::{CommitTreeEvidence, SpineCommit};
 use crate::upstream::trailers::format_upstream_merge_message;
 
@@ -71,6 +72,13 @@ struct FakeGitInner {
     /// Messages of every forward-only empty commit recorded.
     empty_commits: Vec<String>,
     next_sha: usize,
+    /// Calls to the evidence-bearing spine observation.
+    evidence_walk_calls: usize,
+    /// Calls to the metadata-only recovery observation.
+    metadata_walk_calls: usize,
+    /// When set, the evidence-bearing observation fails instead of answering, so
+    /// a caller that must stay metadata-only cannot silently regress into it.
+    deny_evidence_walk: bool,
 }
 
 #[derive(Default)]
@@ -182,6 +190,40 @@ impl FakeGit {
         self.lock().empty_commits.clone()
     }
 
+    /// Make the evidence-bearing observation unusable. Any caller that reaches
+    /// for tree evidence then fails loudly instead of quietly costing per-commit
+    /// tree reads.
+    fn deny_evidence_walk(&self) {
+        self.lock().deny_evidence_walk = true;
+    }
+
+    fn evidence_walk_calls(&self) -> usize {
+        self.lock().evidence_walk_calls
+    }
+
+    fn metadata_walk_calls(&self) -> usize {
+        self.lock().metadata_walk_calls
+    }
+
+    /// Append `count` ordinary one-parent commits on top of HEAD, oldest first.
+    fn extend_linear_history(&self, count: usize) {
+        let mut inner = self.lock();
+        for _ in 0..count {
+            inner.next_sha += 1;
+            let new = sha(&format!("filler{}", inner.next_sha));
+            let head = inner.head.clone();
+            inner.commits.insert(
+                new.clone(),
+                FakeCommit {
+                    message: "filler\n".into(),
+                    parents: vec![head],
+                    tree_evidence: CommitTreeEvidence::default(),
+                },
+            );
+            inner.head = new;
+        }
+    }
+
     /// Merge a change branch into cumulative base with the ordinary
     /// `Merge change: <id>` subject, as the resolve path does.
     fn integrate_change(&self, change_id: &str) -> String {
@@ -209,6 +251,35 @@ impl FakeGit {
         );
         inner.head = new.clone();
         new
+    }
+
+    /// Shared first-parent walk, oldest first, honoring the exclusive bound and
+    /// the commit limit exactly as the native `git log --first-parent` does.
+    fn walk_first_parent(
+        inner: &FakeGitInner,
+        from_exclusive: Option<&str>,
+        to: &str,
+        limit: Option<usize>,
+    ) -> Vec<(String, FakeCommit)> {
+        let mut collected = Vec::new();
+        let mut current = Some(to.to_string());
+        while let Some(sha_value) = current {
+            if Some(sha_value.as_str()) == from_exclusive {
+                break;
+            }
+            if let Some(max) = limit {
+                if collected.len() >= max {
+                    break;
+                }
+            }
+            let Some(commit) = inner.commits.get(&sha_value) else {
+                break;
+            };
+            collected.push((sha_value.clone(), commit.clone()));
+            current = commit.parents.first().cloned();
+        }
+        collected.reverse();
+        collected
     }
 
     fn is_ancestor_locked(inner: &FakeGitInner, ancestor: &str, descendant: &str) -> bool {
@@ -392,37 +463,50 @@ impl UpstreamGit for FakeGit {
             })
     }
 
+    async fn first_parent_recovery_metadata(
+        &self,
+        to: &str,
+        limit: Option<usize>,
+    ) -> PortResult<Vec<RecoveryCommit>> {
+        let mut inner = self.lock();
+        inner.metadata_walk_calls += 1;
+        // Metadata only: the double cannot hand back tree evidence here even by
+        // accident, which is what makes "recovery reads no tree" checkable.
+        Ok(Self::walk_first_parent(&inner, None, to, limit)
+            .into_iter()
+            .map(|(sha_value, commit)| RecoveryCommit {
+                sha: sha_value,
+                message: commit.message,
+                parents: commit.parents,
+            })
+            .collect())
+    }
+
     async fn first_parent_commits(
         &self,
         from_exclusive: Option<&str>,
         to: &str,
         limit: Option<usize>,
     ) -> PortResult<Vec<SpineCommit>> {
-        let inner = self.lock();
-        let mut collected = Vec::new();
-        let mut current = Some(to.to_string());
-        while let Some(sha_value) = current {
-            if Some(sha_value.as_str()) == from_exclusive {
-                break;
-            }
-            if let Some(max) = limit {
-                if collected.len() >= max {
-                    break;
-                }
-            }
-            let Some(commit) = inner.commits.get(&sha_value) else {
-                break;
-            };
-            collected.push(SpineCommit {
-                sha: sha_value.clone(),
-                message: commit.message.clone(),
-                parents: commit.parents.clone(),
-                tree_evidence: commit.tree_evidence.clone(),
-            });
-            current = commit.parents.first().cloned();
+        let mut inner = self.lock();
+        inner.evidence_walk_calls += 1;
+        if inner.deny_evidence_walk {
+            return Err(UpstreamPortError::new(
+                "git ls-tree",
+                "evidence-bearing first-parent walk is forbidden on this path",
+            ));
         }
-        collected.reverse();
-        Ok(collected)
+        Ok(
+            Self::walk_first_parent(&inner, from_exclusive, to, limit)
+                .into_iter()
+                .map(|(sha_value, commit)| SpineCommit {
+                    sha: sha_value,
+                    message: commit.message,
+                    parents: commit.parents,
+                    tree_evidence: commit.tree_evidence,
+                })
+                .collect(),
+        )
     }
 
     async fn local_ref_sha(&self, reference: &str) -> PortResult<Option<String>> {
@@ -1158,6 +1242,198 @@ async fn upstream_integration_scan_ignores_published_and_untrailered_merges() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// Attach an unpushed trailer-identified upstream merge on top of HEAD.
+///
+/// `recorded_parent` is the SHA the trailers claim was integrated; passing a SHA
+/// that is not one of the merge's non-first parents produces contradicted
+/// evidence.
+fn attach_unpushed_upstream_merge(git: &FakeGit, merged_parent: &str, recorded_parent: &str) {
+    let mut inner = git.lock();
+    let head = inner.head.clone();
+    inner.commits.insert(
+        sha("upmerge"),
+        FakeCommit {
+            message: format_upstream_merge_message("origin", "main", recorded_parent),
+            parents: vec![head, merged_parent.to_string()],
+            tree_evidence: CommitTreeEvidence::default(),
+        },
+    );
+    inner.head = sha("upmerge");
+    // Remote-tracking ref still points at the old base: the merge is unpushed.
+    inner
+        .tracking_refs
+        .insert("origin/main".into(), sha("root"));
+}
+
+#[tokio::test]
+async fn upstream_integration_recovery_discovery_never_reads_commit_trees() {
+    // Both scanners must find real refusal evidence while the evidence-bearing
+    // observation is unusable, which is what proves recovery discovery does not
+    // pay for per-commit tree reads.
+    let git = FakeGit::new_linear();
+    attach_unpushed_upstream_merge(&git, &sha("root"), &sha("root"));
+    {
+        let mut inner = git.lock();
+        let head = inner.head.clone();
+        inner.commits.insert(
+            sha("marker"),
+            FakeCommit {
+                message: format_publication_marker_message("alpha", "origin", "main"),
+                parents: vec![head],
+                tree_evidence: CommitTreeEvidence::default(),
+            },
+        );
+        inner.head = sha("marker");
+    }
+    git.deny_evidence_walk();
+
+    let publications = scan_pending_publications(&git).await.unwrap();
+    assert_eq!(publications.len(), 1);
+    assert_eq!(publications[0].trailers.change_id, "alpha");
+
+    let merges = scan_unpushed_upstream_merges(&git).await.unwrap();
+    assert_eq!(merges.len(), 1);
+    assert_eq!(merges[0].merge_sha, sha("upmerge"));
+    assert_eq!(merges[0].trailers.remote, "origin");
+
+    assert_eq!(
+        git.evidence_walk_calls(),
+        0,
+        "recovery discovery must not request commit-tree evidence"
+    );
+    assert_eq!(git.metadata_walk_calls(), 2);
+}
+
+#[tokio::test]
+async fn upstream_integration_recovery_rejects_contradicted_upstream_trailer() {
+    // The trailer records `root`, but the merge's only non-first parent is `wt`.
+    // Nothing in the commit binds the recorded revision, so it is not evidence —
+    // and reaching that conclusion needs no archive or active-change lookup.
+    let git = FakeGit::new_linear();
+    attach_unpushed_upstream_merge(&git, &sha("wt"), &sha("root"));
+    git.deny_evidence_walk();
+
+    assert!(scan_unpushed_upstream_merges(&git)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(git.evidence_walk_calls(), 0);
+}
+
+#[tokio::test]
+async fn upstream_integration_recovery_ignores_evidence_incorporated_by_the_remote() {
+    let git = FakeGit::new_linear();
+    attach_unpushed_upstream_merge(&git, &sha("root"), &sha("root"));
+    {
+        let mut inner = git.lock();
+        let head = inner.head.clone();
+        inner.commits.insert(
+            sha("marker"),
+            FakeCommit {
+                message: format_publication_marker_message("alpha", "origin", "main"),
+                parents: vec![head.clone()],
+                tree_evidence: CommitTreeEvidence::default(),
+            },
+        );
+        inner.head = sha("marker");
+        // The remote-tracking ref now contains both the merge and the marker.
+        inner
+            .tracking_refs
+            .insert("origin/main".into(), sha("marker"));
+    }
+    git.deny_evidence_walk();
+
+    assert!(scan_pending_publications(&git).await.unwrap().is_empty());
+    assert!(scan_unpushed_upstream_merges(&git)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(git.evidence_walk_calls(), 0);
+}
+
+#[tokio::test]
+async fn upstream_integration_recovery_discovery_stops_at_the_bounded_limit() {
+    // Evidence exactly at the bound is still found.
+    let inside = FakeGit::new_linear();
+    attach_unpushed_upstream_merge(&inside, &sha("root"), &sha("root"));
+    inside.extend_linear_history(RECOVERY_SCAN_LIMIT - 1);
+    inside.deny_evidence_walk();
+    assert_eq!(
+        scan_unpushed_upstream_merges(&inside).await.unwrap().len(),
+        1,
+        "the oldest commit within the bound must still be scanned"
+    );
+
+    // One commit further back it falls outside the bounded walk.
+    let outside = FakeGit::new_linear();
+    attach_unpushed_upstream_merge(&outside, &sha("root"), &sha("root"));
+    outside.extend_linear_history(RECOVERY_SCAN_LIMIT);
+    outside.deny_evidence_walk();
+    assert!(
+        scan_unpushed_upstream_merges(&outside)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the bounded walk must not grow past its limit"
+    );
+    assert_eq!(outside.evidence_walk_calls(), 0);
+}
+
+#[tokio::test]
+async fn upstream_integration_spine_validation_keeps_commit_tree_evidence() {
+    // Full spine validation is the evidence-bearing path: it uses the tree-reading
+    // observation, never the recovery metadata walk.
+    let publishable = FakeGit::new_linear();
+    let validation = validate_initial_fetch(&publishable, "origin", "main")
+        .await
+        .unwrap()
+        .expect("the linear fixture's change merge carries archive evidence");
+    assert_eq!(
+        validation.spine.integrated_change_ids,
+        vec!["a".to_string()]
+    );
+    assert_eq!(publishable.evidence_walk_calls(), 1);
+    assert_eq!(
+        publishable.metadata_walk_calls(),
+        0,
+        "spine validation must not fall back to the metadata-only walk"
+    );
+
+    // Strip that merge's archive evidence: without it the same subject is
+    // unrelated local history and the invocation is rejected.
+    let unproven = FakeGit::new_linear();
+    unproven
+        .lock()
+        .commits
+        .get_mut(&sha("local"))
+        .unwrap()
+        .tree_evidence = CommitTreeEvidence::default();
+    match validate_initial_fetch(&unproven, "origin", "main")
+        .await
+        .unwrap()
+    {
+        Err(UpstreamOptionError::UnrelatedLocalHistory { commit, .. }) => {
+            assert_eq!(commit, sha("local"));
+        }
+        other => panic!("expected rejection without archive evidence, got {:?}", other),
+    }
+
+    // A change merge that left its change directory active is rejected too.
+    let still_active = FakeGit::new_linear();
+    still_active
+        .lock()
+        .commits
+        .get_mut(&sha("local"))
+        .unwrap()
+        .tree_evidence = CommitTreeEvidence::new(["a".to_string()], ["a".to_string()]);
+    assert!(matches!(
+        validate_initial_fetch(&still_active, "origin", "main")
+            .await
+            .unwrap(),
+        Err(UpstreamOptionError::UnrelatedLocalHistory { .. })
+    ));
 }
 
 #[tokio::test]

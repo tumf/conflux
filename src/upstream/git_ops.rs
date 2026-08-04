@@ -13,7 +13,8 @@ use tokio::process::Command;
 
 use super::classify::MergeRepositoryState;
 use super::ports::{
-    MergeCommandResult, PortResult, PushCommandResult, UpstreamGit, UpstreamPortError,
+    MergeCommandResult, PortResult, PushCommandResult, RecoveryCommit, UpstreamGit,
+    UpstreamPortError,
 };
 use super::spine::{CommitTreeEvidence, SpineCommit};
 
@@ -22,15 +23,33 @@ const RECORD_SEP: char = '\u{1e}';
 /// Unit separator used between fields of one record.
 const UNIT_SEP: char = '\u{1f}';
 
+/// One framed `git log --first-parent` record, before any tree read.
+///
+/// Both first-parent observations share this parse; only the evidence-bearing
+/// one goes on to read each commit's tree.
+struct FirstParentRecord {
+    sha: String,
+    message: String,
+    parents: Vec<String>,
+}
+
 /// Native Git operations rooted at the cumulative base checkout.
 pub struct GitUpstreamOps {
     repo_root: PathBuf,
+    /// Non-authoritative record of every Git invocation, for in-crate tests that
+    /// assert command shape (for example that recovery discovery issues no
+    /// `ls-tree`). It is never read by production code and does not exist
+    /// outside `cfg(test)`.
+    #[cfg(test)]
+    observed_commands: std::sync::Mutex<Vec<Vec<String>>>,
 }
 
 impl GitUpstreamOps {
     pub fn new(repo_root: impl Into<PathBuf>) -> Self {
         Self {
             repo_root: repo_root.into(),
+            #[cfg(test)]
+            observed_commands: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -38,7 +57,22 @@ impl GitUpstreamOps {
         &self.repo_root
     }
 
+    /// Every Git invocation made through this instance, in order.
+    #[cfg(test)]
+    fn observed_commands(&self) -> Vec<Vec<String>> {
+        self.observed_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     async fn run(&self, operation: &str, args: &[&str]) -> PortResult<(bool, String, String)> {
+        #[cfg(test)]
+        self.observed_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(args.iter().map(|a| a.to_string()).collect());
+
         let output = Command::new("git")
             .args(args)
             .current_dir(&self.repo_root)
@@ -69,6 +103,33 @@ impl GitUpstreamOps {
             .await?;
         let value = stdout.trim().to_string();
         Ok((success && !value.is_empty()).then_some(value))
+    }
+
+    /// One bounded `git log --first-parent` invocation, parsed into records.
+    ///
+    /// Exactly one Git subprocess runs here regardless of how many commits the
+    /// walk returns; ordering is normalized to oldest first. No tree is read.
+    async fn first_parent_records(
+        &self,
+        from_exclusive: Option<&str>,
+        to: &str,
+        limit: Option<usize>,
+    ) -> PortResult<Vec<FirstParentRecord>> {
+        let range = match from_exclusive {
+            Some(from) => format!("{}..{}", from, to),
+            None => to.to_string(),
+        };
+        let format = format!("--format=%H{}%P{}%B{}", UNIT_SEP, UNIT_SEP, RECORD_SEP);
+        let limit_arg = limit.map(|n| format!("-n{}", n));
+
+        let mut args: Vec<&str> = vec!["log", "--first-parent", &format];
+        if let Some(limit_arg) = limit_arg.as_deref() {
+            args.push(limit_arg);
+        }
+        args.push(&range);
+
+        let stdout = self.run_checked("git log", &args).await?;
+        Ok(parse_first_parent_records(&stdout))
     }
 
     /// Archive/active change evidence read from one commit's own tree.
@@ -109,6 +170,45 @@ impl GitUpstreamOps {
 
         Ok(CommitTreeEvidence::new(archived, active))
     }
+}
+
+/// Parse framed `git log --first-parent` output into oldest-first records.
+///
+/// `git log` emits newest first; both consumers read oldest first. A record that
+/// carries no object name is dropped rather than becoming a commit with an empty
+/// SHA, so trailing framing and blank output produce an empty walk instead of
+/// phantom commits.
+fn parse_first_parent_records(stdout: &str) -> Vec<FirstParentRecord> {
+    let mut records = Vec::new();
+    for record in stdout.split(RECORD_SEP) {
+        let record = record.trim_start_matches('\n');
+        if record.trim().is_empty() {
+            continue;
+        }
+        let mut fields = record.split(UNIT_SEP);
+        let Some(sha) = fields.next().map(str::trim) else {
+            continue;
+        };
+        if sha.is_empty() {
+            continue;
+        }
+        let parents: Vec<String> = fields
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let message = fields.next().unwrap_or_default().to_string();
+
+        records.push(FirstParentRecord {
+            sha: sha.to_string(),
+            message,
+            parents,
+        });
+    }
+
+    records.reverse();
+    records
 }
 
 /// Strip a leading `YYYY-MM-DD-` prefix from an archive directory name.
@@ -255,58 +355,47 @@ impl UpstreamGit for GitUpstreamOps {
             .collect::<Vec<_>>())
     }
 
+    async fn first_parent_recovery_metadata(
+        &self,
+        to: &str,
+        limit: Option<usize>,
+    ) -> PortResult<Vec<RecoveryCommit>> {
+        // Deliberately no `tree_evidence` call: recovery classification never
+        // reads archive or active-change evidence, so the whole walk stays at
+        // one Git subprocess no matter how many commits it covers.
+        Ok(self
+            .first_parent_records(None, to, limit)
+            .await?
+            .into_iter()
+            .map(|record| RecoveryCommit {
+                sha: record.sha,
+                message: record.message,
+                parents: record.parents,
+            })
+            .collect())
+    }
+
     async fn first_parent_commits(
         &self,
         from_exclusive: Option<&str>,
         to: &str,
         limit: Option<usize>,
     ) -> PortResult<Vec<SpineCommit>> {
-        let range = match from_exclusive {
-            Some(from) => format!("{}..{}", from, to),
-            None => to.to_string(),
-        };
-        let format = format!("--format=%H{}%P{}%B{}", UNIT_SEP, UNIT_SEP, RECORD_SEP);
-        let limit_arg = limit.map(|n| format!("-n{}", n));
+        let records = self.first_parent_records(from_exclusive, to, limit).await?;
 
-        let mut args: Vec<&str> = vec!["log", "--first-parent", &format];
-        if let Some(limit_arg) = limit_arg.as_deref() {
-            args.push(limit_arg);
-        }
-        args.push(&range);
-
-        let stdout = self.run_checked("git log", &args).await?;
-
-        let mut commits = Vec::new();
-        for record in stdout.split(RECORD_SEP) {
-            let record = record.trim_start_matches('\n');
-            if record.trim().is_empty() {
-                continue;
-            }
-            let mut fields = record.split(UNIT_SEP);
-            let Some(sha) = fields.next().map(str::trim) else {
-                continue;
-            };
-            if sha.is_empty() {
-                continue;
-            }
-            let parents: Vec<String> = fields
-                .next()
-                .unwrap_or_default()
-                .split_whitespace()
-                .map(str::to_string)
-                .collect();
-            let message = fields.next().unwrap_or_default().to_string();
-
+        let mut commits = Vec::with_capacity(records.len());
+        for record in records {
+            // Spine classification is evidence-bearing: every commit carries its
+            // own tree evidence, and a failed read is never substituted with a
+            // default.
+            let tree_evidence = self.tree_evidence(&record.sha).await?;
             commits.push(SpineCommit {
-                sha: sha.to_string(),
-                message,
-                parents,
-                tree_evidence: self.tree_evidence(sha).await?,
+                sha: record.sha,
+                message: record.message,
+                parents: record.parents,
+                tree_evidence,
             });
         }
-
-        // `git log` emits newest first; the spine is validated oldest first.
-        commits.reverse();
         Ok(commits)
     }
 
@@ -339,11 +428,250 @@ impl UpstreamGit for GitUpstreamOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::Command as SyncCommand;
+    use tempfile::TempDir;
 
     #[test]
     fn upstream_integration_strips_dated_archive_prefix() {
         assert_eq!(strip_date_prefix("2026-07-30-my-change"), Some("my-change"));
         assert_eq!(strip_date_prefix("my-change"), None);
         assert_eq!(strip_date_prefix("2026-07-30"), None);
+    }
+
+    /// Build one framed `git log` record the way `--format` emits it.
+    fn record(sha: &str, parents: &str, message: &str) -> String {
+        format!(
+            "{}{}{}{}{}{}",
+            sha, UNIT_SEP, parents, UNIT_SEP, message, RECORD_SEP
+        )
+    }
+
+    #[test]
+    fn upstream_integration_recovery_parse_reverses_and_keeps_fields() {
+        let stdout = format!(
+            "{}{}",
+            record("bbb", "aaa ccc", "Merge change: x\n\nbody\n"),
+            record("aaa", "", "root\n"),
+        );
+        let parsed = parse_first_parent_records(&stdout);
+
+        // `git log` is newest first; the parse hands back oldest first.
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].sha, "aaa");
+        assert!(parsed[0].parents.is_empty());
+        assert_eq!(parsed[1].sha, "bbb");
+        assert_eq!(parsed[1].parents, vec!["aaa".to_string(), "ccc".to_string()]);
+        assert!(parsed[1].message.contains("Merge change: x"));
+        assert!(
+            parsed[1].message.contains("body"),
+            "the raw message body carries the trailers recovery classifies on"
+        );
+    }
+
+    #[test]
+    fn upstream_integration_recovery_parse_drops_malformed_records() {
+        // Empty output, framing-only output, and a record with no object name
+        // must all yield no commits rather than a phantom empty-SHA commit.
+        assert!(parse_first_parent_records("").is_empty());
+        assert!(parse_first_parent_records(&format!("{}\n{}", RECORD_SEP, RECORD_SEP)).is_empty());
+        assert!(parse_first_parent_records(&record("", "aaa", "orphan\n")).is_empty());
+
+        // A truncated record keeps the fields it does have.
+        let truncated = format!("ddd{}", RECORD_SEP);
+        let parsed = parse_first_parent_records(&truncated);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].sha, "ddd");
+        assert!(parsed[0].parents.is_empty());
+        assert_eq!(parsed[0].message, "");
+    }
+
+    // ── Native fixture coverage ────────────────────────────────────────────
+    //
+    // These exercise real `git` subprocesses against a throwaway repository, so
+    // they are integration-scoped rather than unit-scoped.
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = SyncCommand::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "cflx")
+            .env("GIT_AUTHOR_EMAIL", "cflx@example.com")
+            .env("GIT_COMMITTER_NAME", "cflx")
+            .env("GIT_COMMITTER_EMAIL", "cflx@example.com")
+            .output()
+            .unwrap_or_else(|e| panic!("git {:?}: {}", args, e));
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    /// `root` -> `Merge change: my-change` (two parents, archive evidence in its
+    /// tree) -> `tip`, on the first-parent line.
+    fn fixture() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        git(root, &["init", "-q", "-b", "main"]);
+        write(root, "README.md", "root\n");
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-q", "-m", "root"]);
+
+        git(root, &["checkout", "-q", "-b", "work"]);
+        write(
+            root,
+            "openspec/changes/archive/2026-01-01-my-change/proposal.md",
+            "archived\n",
+        );
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-q", "-m", "archive my-change"]);
+
+        git(root, &["checkout", "-q", "main"]);
+        git(
+            root,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                "Merge change: my-change\n\nCflx-Trailer: body line\n",
+                "work",
+            ],
+        );
+
+        write(root, "README.md", "tip\n");
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-q", "-m", "tip"]);
+
+        dir
+    }
+
+    fn issued(ops: &GitUpstreamOps, subcommand: &str) -> usize {
+        ops.observed_commands()
+            .iter()
+            .filter(|args| args.first().map(String::as_str) == Some(subcommand))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn upstream_integration_recovery_metadata_reads_no_commit_trees() {
+        let dir = fixture();
+        let ops = GitUpstreamOps::new(dir.path());
+        let head = ops.head_sha().await.unwrap();
+        let before = ops.observed_commands().len();
+
+        let commits = ops
+            .first_parent_recovery_metadata(&head, None)
+            .await
+            .unwrap();
+
+        assert_eq!(commits.len(), 3, "{:?}", commits);
+        assert_eq!(commits[0].message.trim(), "root");
+        assert!(commits[1].message.contains("Merge change: my-change"));
+        assert!(
+            commits[1].message.contains("Cflx-Trailer: body line"),
+            "the raw body must survive: recovery identity lives in trailers"
+        );
+        assert_eq!(
+            commits[1].parents.len(),
+            2,
+            "merge-parent binding needs every parent in Git order"
+        );
+        assert_eq!(commits[1].parents[0], commits[0].sha);
+        assert_eq!(commits[2].message.trim(), "tip");
+        assert_eq!(commits[2].sha, head);
+
+        // The whole bounded walk is one Git subprocess and reads no tree.
+        let walk = &ops.observed_commands()[before..];
+        assert_eq!(
+            walk.len(),
+            1,
+            "recovery discovery must issue exactly one Git command: {:?}",
+            walk
+        );
+        assert_eq!(walk[0][0], "log");
+        assert!(walk[0].iter().any(|arg| arg == "--first-parent"));
+        assert_eq!(
+            issued(&ops, "ls-tree"),
+            0,
+            "recovery discovery must not read commit trees: {:?}",
+            ops.observed_commands()
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_integration_recovery_metadata_honors_the_bound() {
+        let dir = fixture();
+        let ops = GitUpstreamOps::new(dir.path());
+        let head = ops.head_sha().await.unwrap();
+
+        let all = ops
+            .first_parent_recovery_metadata(&head, None)
+            .await
+            .unwrap();
+        let bounded = ops
+            .first_parent_recovery_metadata(&head, Some(2))
+            .await
+            .unwrap();
+
+        // The bound keeps the newest commits and still reports them oldest first,
+        // so the walk drops history beyond the limit rather than truncating the
+        // recent end an operator is recovering.
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].sha, all[1].sha);
+        assert_eq!(bounded[1].sha, all[2].sha);
+        assert!(
+            ops.observed_commands()
+                .iter()
+                .any(|args| args.iter().any(|arg| arg == "-n2")),
+            "the limit must be pushed down to `git log`: {:?}",
+            ops.observed_commands()
+        );
+        assert_eq!(issued(&ops, "ls-tree"), 0);
+    }
+
+    #[tokio::test]
+    async fn upstream_integration_spine_walk_still_reads_commit_tree_evidence() {
+        let dir = fixture();
+        let ops = GitUpstreamOps::new(dir.path());
+        let head = ops.head_sha().await.unwrap();
+
+        let commits = ops.first_parent_commits(None, &head, None).await.unwrap();
+
+        assert_eq!(commits.len(), 3);
+        let merge = &commits[1];
+        assert!(merge.message.contains("Merge change: my-change"));
+        assert!(
+            merge
+                .tree_evidence
+                .archived_change_ids
+                .contains("my-change"),
+            "spine validation still needs archive evidence from the commit tree: {:?}",
+            merge.tree_evidence
+        );
+        assert!(merge
+            .tree_evidence
+            .archived_change_ids
+            .contains("2026-01-01-my-change"));
+        assert!(
+            !merge.tree_evidence.active_change_ids.contains("my-change"),
+            "the archived change is no longer an active directory"
+        );
+        assert_eq!(
+            issued(&ops, "ls-tree"),
+            commits.len() * 2,
+            "the evidence-bearing walk reads archive and active trees per commit"
+        );
     }
 }

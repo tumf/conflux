@@ -31,6 +31,10 @@ pub mod git_ops;
 pub mod options;
 pub mod ports;
 pub mod publication;
+/// Repository-local benchmark proving bounded recovery discovery stays constant
+/// in Git subprocess count. Heavy: ignored unless `heavy-tests` is enabled.
+#[cfg(test)]
+mod recovery_benchmark;
 pub mod repair;
 pub mod spine;
 pub mod startup;
