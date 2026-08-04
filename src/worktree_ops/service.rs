@@ -791,6 +791,7 @@ impl WorktreeService {
         classify_delete_identity(&after, expected)?;
         classify_delete_drift(&before, &after)?;
         classify_delete_eligibility(&after, options)?;
+        self.confirm_branch_ref(&after).await?;
 
         if options.allow_known_dirty {
             warn!(
@@ -828,6 +829,40 @@ impl WorktreeService {
         })
     }
 
+    /// Reconfirm the target's branch ref immediately before Git removal.
+    ///
+    /// `observe()` reports the worktree's HEAD; it does not prove the branch ref
+    /// still names that commit. Forcing removal of a dirty worktree discards its
+    /// uncommitted work, so the only thing that keeps its committed work
+    /// recoverable is the branch pointing where the deletion was authorized
+    /// from. A ref that moved, vanished, or cannot be read is unknown ref safety
+    /// state, and the whole operation refuses rather than removing the directory
+    /// and discovering the problem in best-effort branch cleanup — by then the
+    /// worktree is already gone.
+    ///
+    /// A detached target has no branch ref to reconfirm; HEAD drift is already
+    /// covered by [`classify_delete_drift`].
+    async fn confirm_branch_ref(&self, facts: &WorktreeFacts) -> WorktreeOpResult<()> {
+        if facts.branch.is_empty() {
+            return Ok(());
+        }
+        match self.backend.branch_ref(&facts.branch).await {
+            Ok(Some(oid)) if oid == facts.head => Ok(()),
+            Ok(Some(oid)) => Err(WorktreeOpError::NotFound(format!(
+                "branch '{}' moved from '{}' to '{oid}' after the deletion was authorized; nothing was removed",
+                facts.branch, facts.head
+            ))),
+            Ok(None) => Err(WorktreeOpError::NotFound(format!(
+                "branch '{}' no longer exists; nothing was removed",
+                facts.branch
+            ))),
+            Err(error) => Err(WorktreeOpError::Ineligible(format!(
+                "branch '{}' ref state could not be determined ({error}); nothing was removed",
+                facts.branch
+            ))),
+        }
+    }
+
     /// Best-effort branch cleanup that refuses to act on a stale decision.
     ///
     /// Worktree removal and branch deletion are distinct outcomes. The branch is
@@ -835,6 +870,10 @@ impl WorktreeService {
     /// authorized from *and* Git can still reach those commits from elsewhere;
     /// anything else retains the branch, because an unreachable commit is not
     /// something a cleanup step gets to decide on someone's behalf.
+    ///
+    /// [`Self::confirm_branch_ref`] already established that OID immediately
+    /// before removal. This reads it again rather than trusting that answer: the
+    /// removal itself is a window in which the ref can still move.
     ///
     /// Returns the operator-facing suffix for the outcome detail.
     async fn cleanup_branch(&self, facts: &WorktreeFacts) -> String {

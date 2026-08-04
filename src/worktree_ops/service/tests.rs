@@ -44,11 +44,13 @@ struct FakeBackend {
     teardown: Mutex<WorktreeOpResult<()>>,
     remove: Mutex<WorktreeOpResult<()>>,
     eligible: Mutex<WorktreeOpResult<()>>,
-    /// Ref each branch resolves to, or the failure reading it.
+    /// Successive answers each branch's ref reads produce, or the failure reading it.
     ///
-    /// `None` for a branch means "no entry recorded"; the default answer is the
-    /// observed HEAD, which is the ordinary post-removal case.
-    branch_refs: Mutex<std::collections::HashMap<String, WorktreeOpResult<Option<String>>>>,
+    /// A missing entry means "no entry recorded"; the default answer is the
+    /// observed HEAD, which is the ordinary case. Deletion reads the ref twice —
+    /// once to authorize removal and once during cleanup — so an entry is a
+    /// script whose last answer repeats, not a single value.
+    branch_refs: Mutex<std::collections::HashMap<String, Vec<WorktreeOpResult<Option<String>>>>>,
     delete_branch: Mutex<WorktreeOpResult<()>>,
 }
 
@@ -83,11 +85,17 @@ impl FakeBackend {
         self.calls.lock().unwrap().push(call);
     }
 
+    /// Every `branch_ref()` for `branch` answers this.
     fn set_branch_ref(&self, branch: &str, answer: WorktreeOpResult<Option<String>>) {
+        self.set_branch_refs(branch, vec![answer]);
+    }
+
+    /// Successive `branch_ref()` calls for `branch` walk the script, then repeat the last.
+    fn set_branch_refs(&self, branch: &str, answers: Vec<WorktreeOpResult<Option<String>>>) {
         self.branch_refs
             .lock()
             .unwrap()
-            .insert(branch.to_string(), answer);
+            .insert(branch.to_string(), answers);
     }
 }
 
@@ -129,8 +137,13 @@ impl WorktreeBackend for FakeBackend {
         self.record(Call::BranchRef {
             branch: branch.to_string(),
         });
-        match self.branch_refs.lock().unwrap().get(branch) {
-            Some(answer) => answer.clone(),
+        let mut scripts = self.branch_refs.lock().unwrap();
+        match scripts.get_mut(branch) {
+            Some(script) if script.len() > 1 => script.remove(0),
+            Some(script) => script
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Ok(Some("cafebabe".to_string()))),
             None => Ok(Some("cafebabe".to_string())),
         }
     }
@@ -508,13 +521,16 @@ async fn remote_worktree_create_refuses_an_unmanaged_change() {
 
 // ── Delete ───────────────────────────────────────────────────────────────────
 
-/// A branch-cleanup case: name, ref answer, safe-delete answer, expected reason.
+/// A branch-cleanup case: name, cleanup-time ref answer, safe-delete answer, expected reason.
 type BranchCleanupCase = (
     &'static str,
     WorktreeOpResult<Option<String>>,
     WorktreeOpResult<()>,
     &'static str,
 );
+
+/// A pre-removal ref case: name, ref answer, expected refusal fragment.
+type BranchRefGateCase = (&'static str, WorktreeOpResult<Option<String>>, &'static str);
 
 fn dirty(path: &str, branch: &str) -> WorktreeFacts {
     let mut facts = managed(path, branch);
@@ -750,7 +766,9 @@ async fn dirty_discard_retains_the_branch_when_its_ref_moved_or_cannot_be_reconf
 
     for (name, branch_ref, delete, expected_reason) in cases {
         let backend = FakeBackend::stable(vec![dirty("/workspaces/c1", "c1")]);
-        backend.set_branch_ref("c1", branch_ref);
+        // The ref is intact when removal is authorized and only drifts
+        // afterwards: that residual window is exactly what cleanup must survive.
+        backend.set_branch_refs("c1", vec![Ok(Some("cafebabe".to_string())), branch_ref]);
         *backend.delete_branch.lock().unwrap() = delete;
         let (service, _sink) = service(backend.clone());
 
@@ -793,23 +811,109 @@ async fn dirty_discard_deletes_the_branch_only_when_its_ref_still_matches() {
         .expect("deleted");
 
     let calls = backend.calls();
-    let checked = calls
+    let checks: Vec<usize> = calls
         .iter()
-        .position(|call| {
-            call == &Call::BranchRef {
-                branch: "c1".to_string(),
-            }
+        .enumerate()
+        .filter(|(_, call)| {
+            *call
+                == &Call::BranchRef {
+                    branch: "c1".to_string(),
+                }
         })
-        .expect("the branch ref must be reconfirmed");
+        .map(|(index, _)| index)
+        .collect();
     let removed = calls
         .iter()
         .position(|c| c == &Call::RemoveWorktree)
         .unwrap();
     assert!(
-        removed < checked,
-        "the ref is reconfirmed after removal, against the OID removal was authorized from: {calls:?}"
+        checks.first().is_some_and(|first| *first < removed),
+        "the ref is confirmed before the irreversible removal: {calls:?}"
+    );
+    assert!(
+        checks.last().is_some_and(|last| *last > removed),
+        "and reconfirmed after it, against the OID removal was authorized from: {calls:?}"
     );
     assert!(outcome.detail.contains("was deleted"));
+}
+
+#[tokio::test]
+async fn dirty_discard_refuses_removal_when_the_branch_ref_cannot_be_confirmed() {
+    // The worktree's own HEAD says nothing about where the branch ref points.
+    // Discarding a dirty worktree destroys its uncommitted work, so the branch
+    // still naming the authorized commit is the only thing keeping the
+    // committed work recoverable — an unconfirmable ref must stop the removal,
+    // not be discovered by best-effort cleanup once the directory is gone.
+    let cases: [BranchRefGateCase; 3] = [
+        ("ref-moved", Ok(Some("0ddba11".to_string())), "moved from"),
+        ("ref-missing", Ok(None), "no longer exists"),
+        (
+            "ref-unreadable",
+            Err(WorktreeOpError::Internal("show-ref failed".to_string())),
+            "could not be determined",
+        ),
+    ];
+
+    for (name, branch_ref, expected_reason) in cases {
+        let backend = FakeBackend::stable(vec![dirty("/workspaces/c1", "c1")]);
+        backend.set_branch_ref("c1", branch_ref);
+        let (service, sink) = service(backend.clone());
+
+        let refusal = service
+            .delete_worktree(
+                Path::new("/workspaces/c1"),
+                &ExpectedTarget::on_branch("c1"),
+                DeleteOptions::local_discarding_dirty(false),
+            )
+            .await
+            .expect_err(&format!("{name} must refuse"));
+        assert!(
+            refusal.to_string().contains(expected_reason)
+                && refusal.to_string().contains("nothing was removed"),
+            "{name}: the refusal must say why nothing was removed: {refusal}"
+        );
+        assert!(
+            !backend.calls().contains(&Call::RemoveWorktree),
+            "{name}: forced removal must not run on an unconfirmed branch ref"
+        );
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::DeleteBranch { .. })),
+            "{name}: the branch must be retained too"
+        );
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, WorktreeOperationEvent::Deleted { .. })),
+            "{name}: nothing was deleted, so nothing may be announced as deleted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dirty_discard_refuses_when_the_branch_ref_moves_during_teardown() {
+    // Teardown is operator code: the ref can be intact when the deletion is
+    // authorized and moved by the time removal would run.
+    let backend = FakeBackend::stable(vec![dirty("/workspaces/c1", "c1")]);
+    backend.set_branch_ref("c1", Ok(Some("0ddba11".to_string())));
+    let (service, _sink) = service(backend.clone());
+
+    let refusal = service
+        .delete_worktree(
+            Path::new("/workspaces/c1"),
+            &ExpectedTarget::on_branch("c1"),
+            DeleteOptions::local_discarding_dirty(false),
+        )
+        .await
+        .expect_err("a ref that moved during teardown must refuse");
+    let calls = backend.calls();
+    assert!(
+        calls.contains(&Call::Teardown) && !calls.contains(&Call::RemoveWorktree),
+        "teardown ran, but the removal it authorized must not: {refusal}"
+    );
 }
 
 #[tokio::test]
