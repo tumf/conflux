@@ -151,8 +151,9 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
 /// the second transition for one internal event: an apply count that advances
 /// twice, a change that leaves the queue twice, a terminal state reached twice.
 ///
-/// Status and blocker view come from the same snapshot so a row's
-/// `blocked`/`stalled` word and its blocker kind can never disagree.
+/// Status, blocker view, and error detail come from the same snapshot so a row's
+/// `blocked`/`stalled` word, its blocker kind, and its final diagnostic can never
+/// disagree.
 async fn sync_reducer_display_caches(
     app: &mut AppState,
     shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
@@ -161,12 +162,20 @@ async fn sync_reducer_display_caches(
     if !should_apply_event_to_tui_reducer(event) {
         return;
     }
-    let (display_map, blocker_views) = {
+    let (display_map, blocker_views, error_details) = {
         let state = shared_state.read().await;
-        (state.all_display_statuses(), state.all_blocker_views())
+        (
+            state.all_display_statuses(),
+            state.all_blocker_views(),
+            state.all_error_details(),
+        )
     };
     app.apply_display_statuses_from_reducer(&display_map);
     app.apply_blocker_views_from_reducer(&blocker_views);
+    // Error rows adopt the reducer's retained diagnostic even when this frontend
+    // never observed the failure event itself, so the row can still name its
+    // failure after the matching log entry has been evicted.
+    app.apply_error_details_from_reducer(&error_details);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

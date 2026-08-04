@@ -360,6 +360,11 @@ pub async fn handle_enter_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
     use crate::tui::types::ViewMode;
 
     if ctx.app.view_mode != ViewMode::Worktrees {
+        // Enter on an `error` row opens the Error Details popup. Every other
+        // Changes-view row keeps the pre-existing behavior below.
+        if ctx.app.open_error_details_popup() {
+            return Ok(());
+        }
         ctx.app
             .add_log(LogEntry::warn("Enter ignored: not in Worktrees view"));
         return Ok(());
@@ -645,6 +650,56 @@ pub(crate) fn handle_warning_popup_key(app: &mut AppState, key: KeyEvent) -> boo
     true
 }
 
+/// Handle input for the Error Details popup.
+///
+/// The popup owns every key it handles, so scrolling, copying, and closing it
+/// cannot move the Changes cursor, the Logs panel, or an interaction modal
+/// underneath. It sits below the warning popup (which is dispatched first) and
+/// above interaction modals.
+///
+/// `Ctrl`- and `Alt`-modified keys are deliberately not claimed at all, so
+/// `Ctrl+C` keeps its global quit meaning rather than being redefined as the
+/// popup copy action. Copy itself is spec'd as *unmodified* `c`, so any other
+/// modifier (`Shift`, `Super`, …) is swallowed by the popup without copying.
+///
+/// Returns true when the key was consumed by the popup.
+pub(crate) fn handle_error_details_popup_key(app: &mut AppState, key: KeyEvent) -> bool {
+    if app.error_details_popup.is_none() {
+        return false;
+    }
+
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.close_error_details_popup();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.scroll_error_details_popup(-1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.scroll_error_details_popup(1);
+        }
+        KeyCode::PageUp => {
+            app.scroll_error_details_popup(-5);
+        }
+        KeyCode::PageDown => {
+            app.scroll_error_details_popup(5);
+        }
+        KeyCode::Char('c') if key.modifiers.is_empty() => {
+            app.copy_error_details();
+        }
+        _ => {}
+    }
+
+    true
+}
+
 /// Handle input for the active typed modal.
 ///
 /// Modal input sits between warning-popup input (highest priority) and ordinary
@@ -752,6 +807,10 @@ pub async fn handle_key_event(
     ctx.app.warning_message = None;
 
     if handle_warning_popup_key(ctx.app, key) {
+        return Ok(None);
+    }
+
+    if handle_error_details_popup_key(ctx.app, key) {
         return Ok(None);
     }
 
@@ -1845,6 +1904,11 @@ mod tests {
 
     /// Feed one key through the full routing entry point.
     async fn route_key(app: &mut AppState, code: KeyCode) -> Vec<TuiCommand> {
+        route_key_event(app, key(code)).await
+    }
+
+    /// Feed one fully specified key event through the full routing entry point.
+    async fn route_key_event(app: &mut AppState, event: KeyEvent) -> Vec<TuiCommand> {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let mut terminal = test_terminal();
         let config = OrchestratorConfig::default();
@@ -1865,7 +1929,7 @@ mod tests {
             supervisor: &supervisor,
         };
 
-        handle_key_event(key(code), &mut ctx).await.unwrap();
+        handle_key_event(event, &mut ctx).await.unwrap();
 
         let mut commands = Vec::new();
         while let Ok(command) = cmd_rx.try_recv() {
@@ -1912,6 +1976,11 @@ mod tests {
             }),
             ("warning-popup", |app: &mut AppState| {
                 app.show_warning_popup("warning", "diagnostic")
+            }),
+            ("error-details", |app: &mut AppState| {
+                app.changes[1].set_error_message_cache("boom".to_string());
+                app.cursor_index = 1;
+                assert!(app.open_error_details_popup());
             }),
         ];
 
@@ -2370,6 +2439,284 @@ mod tests {
             assert!(
                 !app.changes[1].selected,
                 "{mode:?} must refuse bulk mark through the shared matrix"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Error Details popup input ownership
+    // ========================================================================
+
+    /// A Changes-view app whose cursor sits on an `error` row.
+    fn error_details_app() -> AppState {
+        let mut app = routing_app();
+        app.changes[1].set_error_message_cache("Apply failed: stalled".to_string());
+        app.cursor_index = 1;
+        app
+    }
+
+    #[tokio::test]
+    async fn enter_opens_the_error_details_popup_on_an_error_row() {
+        let mut app = error_details_app();
+
+        let commands = route_key(&mut app, KeyCode::Enter).await;
+
+        assert!(commands.is_empty(), "opening a popup emits no command");
+        let popup = app
+            .error_details_popup
+            .as_ref()
+            .expect("Enter opens the Error Details popup");
+        assert_eq!(popup.change_id, "change-b");
+        assert_eq!(popup.error, "Apply failed: stalled");
+        assert_eq!(popup.scroll, 0);
+        assert!(popup.copy_feedback.is_none());
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_non_error_row_keeps_its_existing_behavior() {
+        let mut app = error_details_app();
+        app.cursor_index = 0; // `applying`
+        let before = UnderlyingState::capture(&app);
+
+        let commands = route_key(&mut app, KeyCode::Enter).await;
+
+        assert!(commands.is_empty());
+        assert!(
+            app.error_details_popup.is_none(),
+            "only an error row opens the popup"
+        );
+        assert_eq!(UnderlyingState::capture(&app), before);
+        assert!(
+            app.logs
+                .iter()
+                .any(|log| log.message.contains("Enter ignored: not in Worktrees view")),
+            "the pre-existing Enter behavior is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn popup_scroll_keys_do_not_move_the_underlying_views() {
+        for code in [KeyCode::Down, KeyCode::Char('j'), KeyCode::PageDown] {
+            let mut app = error_details_app();
+            for index in 0..12 {
+                app.add_log(LogEntry::info(format!("log {index}")));
+            }
+            app.scroll_logs_up(3);
+            assert!(app.open_error_details_popup());
+            let before = UnderlyingState::capture(&app);
+            let log_scroll_before = app.log_scroll_offset;
+
+            let commands = route_key_event(&mut app, key(code)).await;
+
+            assert!(commands.is_empty(), "{code:?} leaked a command");
+            assert!(
+                app.error_details_popup
+                    .as_ref()
+                    .is_some_and(|popup| popup.scroll > 0),
+                "{code:?} must scroll the popup"
+            );
+            assert_eq!(
+                UnderlyingState::capture(&app),
+                before,
+                "{code:?} moved the Changes list underneath the popup"
+            );
+            assert_eq!(
+                app.log_scroll_offset, log_scroll_before,
+                "{code:?} moved the Logs panel underneath the popup"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn escape_closes_the_popup_without_a_workflow_transition() {
+        let mut app = error_details_app();
+        assert!(app.open_error_details_popup());
+        let before = UnderlyingState::capture(&app);
+
+        let commands = route_key(&mut app, KeyCode::Esc).await;
+
+        assert!(commands.is_empty(), "closing a popup emits no command");
+        assert!(app.error_details_popup.is_none());
+        assert_eq!(UnderlyingState::capture(&app), before);
+        assert_eq!(app.stop_mode, StopMode::None, "Esc must not reach the view");
+    }
+
+    #[tokio::test]
+    async fn warning_popup_retains_first_claim_over_the_error_details_popup() {
+        let mut app = error_details_app();
+        assert!(app.open_error_details_popup());
+        app.show_warning_popup("warning", "line 1\nline 2\nline 3");
+        let before = UnderlyingState::capture(&app);
+
+        route_key(&mut app, KeyCode::Down).await;
+
+        assert_eq!(app.warning_popup_scroll, 1, "the warning popup scrolled");
+        assert_eq!(
+            app.error_details_popup.as_ref().map(|popup| popup.scroll),
+            Some(0),
+            "the Error Details popup must not process the same key"
+        );
+        assert_eq!(UnderlyingState::capture(&app), before);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_keeps_its_global_quit_meaning_while_the_popup_is_open() {
+        let mut app = error_details_app();
+        app.set_clipboard(Arc::new(
+            crate::tui::clipboard::test_doubles::RecordingClipboard::default(),
+        ));
+        assert!(app.open_error_details_popup());
+
+        route_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        )
+        .await;
+
+        assert!(app.should_quit, "Ctrl+C must still quit");
+        assert!(
+            app.error_details_popup
+                .as_ref()
+                .is_some_and(|popup| popup.copy_feedback.is_none()),
+            "a modified key must not be treated as the popup copy action"
+        );
+    }
+
+    /// Copying is unit-scoped: the clipboard boundary is injected, so the
+    /// developer's real clipboard is never touched.
+    #[test]
+    fn unmodified_c_copies_stable_plain_text_and_keeps_the_popup_open() {
+        let mut app = error_details_app();
+        let clipboard =
+            Arc::new(crate::tui::clipboard::test_doubles::RecordingClipboard::default());
+        app.set_clipboard(clipboard.clone());
+        assert!(app.open_error_details_popup());
+
+        assert!(handle_error_details_popup_key(
+            &mut app,
+            key(KeyCode::Char('c'))
+        ));
+
+        assert_eq!(
+            clipboard.copies(),
+            vec!["Change: change-b\nError: Apply failed: stalled".to_string()]
+        );
+        let popup = app.error_details_popup.as_ref().expect("popup stays open");
+        assert_eq!(popup.error, "Apply failed: stalled");
+        assert_eq!(
+            popup.copy_feedback,
+            Some(crate::tui::state::CopyFeedback::Copied)
+        );
+    }
+
+    /// Copy is spec'd as *unmodified* `c`. Any other modifier combination stays
+    /// owned by the popup but must not reach the clipboard, and `Ctrl+C` keeps
+    /// falling through to the global quit binding.
+    #[tokio::test]
+    async fn only_unmodified_c_copies_and_ctrl_c_still_quits() {
+        for (code, modifiers) in [
+            (KeyCode::Char('c'), KeyModifiers::SHIFT),
+            (KeyCode::Char('C'), KeyModifiers::SHIFT),
+            (KeyCode::Char('c'), KeyModifiers::SUPER),
+            (
+                KeyCode::Char('c'),
+                KeyModifiers::SHIFT | KeyModifiers::SUPER,
+            ),
+        ] {
+            let mut app = error_details_app();
+            let clipboard =
+                Arc::new(crate::tui::clipboard::test_doubles::RecordingClipboard::default());
+            app.set_clipboard(clipboard.clone());
+            assert!(app.open_error_details_popup());
+
+            assert!(
+                handle_error_details_popup_key(&mut app, KeyEvent::new(code, modifiers)),
+                "{code:?}+{modifiers:?} stays owned by the popup"
+            );
+
+            assert!(
+                clipboard.copies().is_empty(),
+                "{code:?}+{modifiers:?} must not copy"
+            );
+            let popup = app.error_details_popup.as_ref().expect("popup stays open");
+            assert!(
+                popup.copy_feedback.is_none(),
+                "{code:?}+{modifiers:?} reports no copy feedback"
+            );
+        }
+
+        let mut app = error_details_app();
+        let clipboard =
+            Arc::new(crate::tui::clipboard::test_doubles::RecordingClipboard::default());
+        app.set_clipboard(clipboard.clone());
+        assert!(app.open_error_details_popup());
+
+        assert!(handle_error_details_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)
+        ));
+
+        assert_eq!(
+            clipboard.copies(),
+            vec!["Change: change-b\nError: Apply failed: stalled".to_string()],
+            "unmodified c is the one binding that copies"
+        );
+        assert!(!app.should_quit, "unmodified c never quits");
+
+        let mut app = error_details_app();
+        let clipboard =
+            Arc::new(crate::tui::clipboard::test_doubles::RecordingClipboard::default());
+        app.set_clipboard(clipboard.clone());
+        assert!(app.open_error_details_popup());
+
+        route_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        )
+        .await;
+
+        assert!(app.should_quit, "Ctrl+C keeps its global quit meaning");
+        assert!(clipboard.copies().is_empty(), "Ctrl+C must not copy");
+    }
+
+    #[test]
+    fn a_refused_copy_keeps_the_popup_open_with_actionable_feedback() {
+        let mut app = error_details_app();
+        app.set_clipboard(Arc::new(
+            crate::tui::clipboard::test_doubles::FailingClipboard::new("no clipboard provider"),
+        ));
+        assert!(app.open_error_details_popup());
+
+        assert!(handle_error_details_popup_key(
+            &mut app,
+            key(KeyCode::Char('c'))
+        ));
+
+        let popup = app.error_details_popup.as_ref().expect("popup stays open");
+        assert_eq!(popup.error, "Apply failed: stalled");
+        let feedback = popup.copy_feedback.clone().expect("failure is reported");
+        assert_eq!(
+            feedback,
+            crate::tui::state::CopyFeedback::Failed("no clipboard provider".to_string())
+        );
+        let message = feedback.message();
+        assert!(message.contains("no clipboard provider"), "{message}");
+        assert!(message.contains("manually"), "{message}");
+    }
+
+    #[test]
+    fn popup_keys_are_ignored_when_no_popup_is_open() {
+        let mut app = error_details_app();
+
+        for code in [
+            KeyCode::Char('c'),
+            KeyCode::Char('j'),
+            KeyCode::Esc,
+            KeyCode::PageDown,
+        ] {
+            assert!(
+                !handle_error_details_popup_key(&mut app, key(code)),
+                "{code:?} must fall through when the popup is closed"
             );
         }
     }

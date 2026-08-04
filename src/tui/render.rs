@@ -12,7 +12,9 @@ use ratatui::{
 use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
-use super::state::{AppState, ChangeState};
+use super::state::{
+    AppState, ChangeState, CopyFeedback, ErrorDetailsPopup, ERROR_DETAILS_UNAVAILABLE,
+};
 use super::types::{AppExecutionMode, ModalState};
 use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
 
@@ -245,6 +247,12 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
         Some(ModalState::ConfirmForceKill { .. }) | None => {}
     }
 
+    // The Error Details popup sits above the interaction modals and below the
+    // warning popup, matching the order in which the two claim input.
+    if app.error_details_popup.is_some() {
+        popups::render_error_details(frame, app, area);
+    }
+
     // Render warning popup on top if present
     if app.warning_popup.is_some() {
         popups::render_warning(frame, app, area);
@@ -410,6 +418,10 @@ mod popups {
     pub(super) fn render_qr(frame: &mut Frame, app: &AppState, area: Rect) {
         super::render_qr_popup(frame, app, area);
     }
+
+    pub(super) fn render_error_details(frame: &mut Frame, app: &AppState, area: Rect) {
+        super::render_error_details_popup(frame, app, area);
+    }
 }
 
 /// Render header
@@ -512,6 +524,66 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
             .border_style(Style::default().fg(Color::Blue)),
     );
     frame.render_widget(right_header, chunks[1]);
+}
+
+/// Minimum remaining row width a preview needs before it is worth showing.
+const MIN_PREVIEW_WIDTH: usize = 10;
+
+/// Preview text for one change row, before width truncation.
+///
+/// An `error` row explains itself from the retained final diagnostic, which is
+/// independent of the bounded log buffer: a change stays `error` long after its
+/// failure entry has been evicted, so the row must not depend on a surviving
+/// `LogEntry` to name its failure. Every other row keeps the existing
+/// latest-log preview, relative time and shortened header included.
+///
+/// The returned text is presentation only and carries no workflow-control meaning.
+fn change_row_preview_text(app: &AppState, change: &ChangeState) -> Option<String> {
+    if change.display_status_cache == "error" {
+        return Some(match change.error_message_cache.as_deref() {
+            Some(detail) => format!(" Error: {}", detail),
+            None => format!(" {}", ERROR_DETAILS_UNAVAILABLE),
+        });
+    }
+
+    let log = app.get_latest_log_for_change(&change.id)?;
+
+    // Format relative time with parentheses
+    let relative_time = format!("({})", format_relative_time(&log.created_at));
+
+    // Build shortened header: [operation:iteration] or [operation]
+    let header = match (&log.operation, log.iteration) {
+        (Some(op), Some(iter)) => format!(" [{}:{}]", op, iter),
+        (Some(op), None) => format!(" [{}]", op),
+        (None, _) => String::new(),
+    };
+
+    Some(if !header.is_empty() {
+        format!(" {}{} {}", relative_time, header, log.message)
+    } else {
+        format!(" {} {}", relative_time, log.message)
+    })
+}
+
+/// Foreground color for a row preview.
+///
+/// An error preview stays readable in both row states: `LightRed` against the
+/// `DarkGray` highlight of the focused row, `Red` against the ordinary
+/// background. Non-error previews keep their existing dim styling.
+fn change_row_preview_color(change: &ChangeState, is_focused_row: bool) -> Color {
+    if change.display_status_cache == "error" {
+        return if is_focused_row {
+            Color::LightRed
+        } else {
+            Color::Red
+        };
+    }
+
+    if is_focused_row {
+        Color::Gray
+    } else {
+        Color::DarkGray
+    }
 }
 
 /// Render changes list in selection mode
@@ -652,8 +724,10 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                     ),
                 ];
 
-                // Add log preview if available
-                if let Some(log) = app.get_latest_log_for_change(&change.id) {
+                // Add the row preview if there is anything to preview: the
+                // retained final diagnostic for an error row, otherwise the
+                // latest buffered log.
+                if let Some(preview_text) = change_row_preview_text(app, change) {
                     // Calculate actual occupied width dynamically
                     let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
                     let checkbox_cursor_width = checkbox_cursor_text.len();
@@ -683,37 +757,16 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
                     let available = (area.width as usize).saturating_sub(base_width);
 
-                    // Only show preview if available width >= 10 chars
-                    if available >= 10 {
-                        // Format relative time with parentheses
-                        let relative_time = format!("({})", format_relative_time(&log.created_at));
-
-                        // Build shortened header: [operation:iteration] or [operation]
-                        let header = match (&log.operation, log.iteration) {
-                            (Some(op), Some(iter)) => format!(" [{}:{}]", op, iter),
-                            (Some(op), None) => format!(" [{}]", op),
-                            (None, _) => String::new(),
-                        };
-
-                        // Combine relative time, header, and message
-                        let preview_text = if !header.is_empty() {
-                            format!(" {}{} {}", relative_time, header, log.message)
-                        } else {
-                            format!(" {} {}", relative_time, log.message)
-                        };
-
+                    // Only show preview if available width is wide enough
+                    if available >= MIN_PREVIEW_WIDTH {
                         // Truncate if necessary (Unicode-safe)
                         let truncated =
                             truncate_to_display_width_with_suffix(&preview_text, available, "…");
 
-                        // Use brighter color for selected row to ensure visibility on DarkGray background
-                        let preview_color = if is_selected_row {
-                            Color::Gray
-                        } else {
-                            Color::DarkGray
-                        };
-
-                        spans.push(Span::styled(truncated, Style::default().fg(preview_color)));
+                        spans.push(Span::styled(
+                            truncated,
+                            Style::default().fg(change_row_preview_color(change, is_selected_row)),
+                        ));
                     }
                 }
 
@@ -762,6 +815,10 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             });
         }
         keys.push("e: edit".to_string());
+        // Advertise the Error Details popup only on a row that can open it.
+        if item.display_status_cache == "error" {
+            keys.push("Enter: details".to_string());
+        }
         // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
         // - When resolve is NOT running and current item is MergeWait: "M: resolve"
         // - When resolve IS running and current item is MergeWait: "M: queue resolve"
@@ -1017,8 +1074,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     Style::default().fg(dim_color),
                 ));
 
-                // Add log preview if available
-                if let Some(log) = app.get_latest_log_for_change(&change.id) {
+                // Add the row preview if there is anything to preview: the
+                // retained final diagnostic for an error row, otherwise the
+                // latest buffered log.
+                if let Some(preview_text) = change_row_preview_text(app, change) {
                     // Calculate actual occupied width dynamically
                     let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
                     let checkbox_cursor_width = checkbox_cursor_text.len();
@@ -1044,37 +1103,16 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
                     let available = (area.width as usize).saturating_sub(base_width);
 
-                    // Only show preview if available width >= 10 chars
-                    if available >= 10 {
-                        // Format relative time with parentheses
-                        let relative_time = format!("({})", format_relative_time(&log.created_at));
-
-                        // Build shortened header: [operation:iteration] or [operation]
-                        let header = match (&log.operation, log.iteration) {
-                            (Some(op), Some(iter)) => format!(" [{}:{}]", op, iter),
-                            (Some(op), None) => format!(" [{}]", op),
-                            (None, _) => String::new(),
-                        };
-
-                        // Combine relative time, header, and message
-                        let preview_text = if !header.is_empty() {
-                            format!(" {}{} {}", relative_time, header, log.message)
-                        } else {
-                            format!(" {} {}", relative_time, log.message)
-                        };
-
+                    // Only show preview if available width is wide enough
+                    if available >= MIN_PREVIEW_WIDTH {
                         // Truncate if necessary (Unicode-safe)
                         let truncated =
                             truncate_to_display_width_with_suffix(&preview_text, available, "…");
 
-                        // Use brighter color for selected row to ensure visibility on DarkGray background
-                        let preview_color = if is_selected_row {
-                            Color::Gray
-                        } else {
-                            Color::DarkGray
-                        };
-
-                        spans.push(Span::styled(truncated, Style::default().fg(preview_color)));
+                        spans.push(Span::styled(
+                            truncated,
+                            Style::default().fg(change_row_preview_color(change, is_selected_row)),
+                        ));
                     }
                 }
 
@@ -1121,6 +1159,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             });
         }
         keys.push("e: edit".to_string());
+        // Advertise the Error Details popup only on a row that can open it.
+        if item.display_status_cache == "error" {
+            keys.push("Enter: details".to_string());
+        }
         // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
         // - When resolve is NOT running and current item is MergeWait: "M: resolve"
         // - When resolve IS running and current item is MergeWait: "M: queue resolve"
@@ -2036,6 +2078,84 @@ fn render_warning_popup(frame: &mut Frame, app: &AppState, area: Rect) {
     .alignment(Alignment::Center)
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, chunks[1]);
+}
+
+/// Body lines of the Error Details popup: the change ID, then the complete
+/// untruncated diagnostic.
+///
+/// A diagnostic that carries explicit newlines keeps them as separate lines;
+/// anything wider than the popup is wrapped by the caller rather than cut, so no
+/// part of the failure text is lost.
+fn error_details_popup_lines(popup: &ErrorDetailsPopup) -> Vec<Line<'_>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Change: ", Style::default().fg(Color::Cyan)),
+            Span::styled(popup.change_id.as_str(), Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+    ];
+    lines.extend(
+        popup
+            .error
+            .split('\n')
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::LightRed)))),
+    );
+    lines
+}
+
+/// Render the Error Details popup for a change-level failure.
+fn render_error_details_popup(frame: &mut Frame, app: &AppState, area: Rect) {
+    let Some(popup) = &app.error_details_popup else {
+        return;
+    };
+
+    let modal_area = warning_popup_modal_area(area);
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(" Error Details ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+
+    let inner_area = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    // Body, then a single feedback line, then the always-visible key guidance.
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner_area);
+
+    let body = Paragraph::new(error_details_popup_lines(popup))
+        .scroll((popup.scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(body, chunks[0]);
+
+    let feedback = match &popup.copy_feedback {
+        Some(feedback) => {
+            let color = match feedback {
+                CopyFeedback::Copied => Color::Green,
+                CopyFeedback::Failed(_) => Color::Yellow,
+            };
+            Paragraph::new(feedback.message()).style(Style::default().fg(color))
+        }
+        None => Paragraph::new(""),
+    };
+    frame.render_widget(feedback, chunks[1]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("↑↓/jk PgUp/PgDn", Style::default().fg(Color::Cyan)),
+        Span::raw(" scroll  "),
+        Span::styled("c", Style::default().fg(Color::Cyan)),
+        Span::raw(": copy  "),
+        Span::styled("Esc", Style::default().fg(Color::Cyan)),
+        Span::raw(": close"),
+    ]))
+    .alignment(Alignment::Center)
+    .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, chunks[2]);
 }
 
 /// Render the QR code popup
@@ -4469,5 +4589,294 @@ mod tests {
 
         assert!(content.contains("Merge warning"));
         assert!(content.contains("conflict in file.rs"));
+    }
+
+    // ------------------------------------------------------------------
+    // Error row previews and the Error Details popup
+    // ------------------------------------------------------------------
+
+    const STALLED: &str = "Apply failed: stalled after 5 empty WIP commits";
+
+    /// A Select-view app with one `error` row whose failure log is gone.
+    ///
+    /// The buffer is left empty on purpose: it is the state a change reaches
+    /// once its failure entry has been pushed out of the bounded log buffer.
+    fn error_row_app(detail: Option<&str>) -> AppState {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        match detail {
+            Some(detail) => app.changes[0].set_error_message_cache(detail.to_string()),
+            None => app.changes[0].set_display_status_cache("error"),
+        }
+        app
+    }
+
+    /// Foreground color of the first cell of `needle` in the rendered buffer.
+    fn fg_at(buffer: &Buffer, needle: &str) -> Color {
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            if let Some(byte_index) = line.find(needle) {
+                let column = line[..byte_index].chars().count() as u16;
+                return buffer[(column, y)].fg;
+            }
+        }
+        panic!("{needle:?} not found in rendered buffer");
+    }
+
+    #[test]
+    fn error_row_preview_survives_log_eviction() {
+        let mut app = error_row_app(Some(STALLED));
+        assert!(
+            app.get_latest_log_for_change("change-a").is_none(),
+            "the failure entry is gone from the bounded buffer"
+        );
+
+        let content = buffer_to_string(&render_buffer(&mut app, 160, 20));
+
+        assert!(
+            content.contains(&format!("Error: {STALLED}")),
+            "an error row must name its failure without any retained log: {content}"
+        );
+    }
+
+    #[test]
+    fn error_row_preview_takes_precedence_over_the_latest_log() {
+        let mut app = error_row_app(Some(STALLED));
+        app.add_log(LogEntry::info("refreshed workspace status").with_change_id("change-a"));
+
+        let content = buffer_to_string(&render_buffer(&mut app, 160, 20));
+        let changes_panel = content
+            .lines()
+            .find(|line| line.contains("change-a") && line.contains("[error]"))
+            .expect("the error row is rendered")
+            .to_string();
+
+        assert!(
+            changes_panel.contains(&format!("Error: {STALLED}")),
+            "the retained diagnostic must win: {changes_panel}"
+        );
+        assert!(
+            !changes_panel.contains("refreshed workspace status"),
+            "an unrelated log must not be presented as the failure reason: {changes_panel}"
+        );
+    }
+
+    #[test]
+    fn error_row_without_a_diagnostic_states_that_details_are_unavailable() {
+        let mut app = error_row_app(None);
+        app.add_log(LogEntry::info("refreshed workspace status").with_change_id("change-a"));
+
+        let content = buffer_to_string(&render_buffer(&mut app, 160, 20));
+        let changes_panel = content
+            .lines()
+            .find(|line| line.contains("change-a") && line.contains("[error]"))
+            .expect("the error row is rendered")
+            .to_string();
+
+        assert!(
+            changes_panel.contains(ERROR_DETAILS_UNAVAILABLE),
+            "a missing diagnostic must be explicit: {changes_panel}"
+        );
+        assert!(
+            !changes_panel.contains("refreshed workspace status"),
+            "no error reason may be inferred from an ordinary log: {changes_panel}"
+        );
+    }
+
+    #[test]
+    fn non_error_rows_keep_the_latest_log_preview() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.changes[0].set_display_status_cache("applying");
+        app.add_log(LogEntry::info("applying tasks").with_change_id("change-a"));
+
+        let content = buffer_to_string(&render_buffer(&mut app, 160, 20));
+
+        assert!(
+            content.contains("applying tasks"),
+            "non-error preview behavior is unchanged: {content}"
+        );
+        assert!(!content.contains("Error: "));
+    }
+
+    #[test]
+    fn error_preview_is_omitted_when_the_remaining_width_is_too_small() {
+        let mut app = error_row_app(Some(STALLED));
+
+        let content = buffer_to_string(&render_buffer(&mut app, 72, 20));
+
+        assert!(
+            content.contains("change-a"),
+            "the row itself is still rendered: {content}"
+        );
+        assert!(
+            !content.contains("Error: "),
+            "no preview fits below the minimum preview width: {content}"
+        );
+    }
+
+    #[test]
+    fn error_preview_truncation_is_unicode_safe() {
+        // A wide character occupies two buffer cells, so assertions here look at
+        // the characters that survived rather than at a raw substring match.
+        let diagnostic = "適用に失敗しました🚀 スタックしています 追記済みです。";
+
+        for width in [85u16, 90, 100, 110, 120, 140, 160] {
+            let mut app = error_row_app(Some(diagnostic));
+
+            // Rendering must complete at every width without panicking on a
+            // split character, and the preview must never wrap onto a second line.
+            let content = buffer_to_string(&render_buffer(&mut app, width, 20));
+            let preview_lines: Vec<&str> =
+                content.lines().filter(|line| line.contains('適')).collect();
+            assert_eq!(
+                preview_lines.len(),
+                1,
+                "the error preview must be rendered on exactly one line at width {width}: {content}"
+            );
+            let preview = preview_lines[0];
+
+            // The diagnostic needs 54 display columns plus the 8-column
+            // `" Error: "` prefix, so it only fits once the row is wide enough
+            // to leave that much space beside the fixed columns.
+            if width >= 140 {
+                assert!(
+                    preview.contains('。') && !preview.contains('…'),
+                    "the whole diagnostic fits at width {width}: {preview}"
+                );
+            } else {
+                assert!(
+                    preview.contains('…'),
+                    "a diagnostic wider than the row must be truncated at width {width}: {preview}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn error_preview_uses_error_styling_on_focused_and_unfocused_rows() {
+        let mut app = create_test_app(vec![
+            create_test_change("change-a"),
+            create_test_change("change-b"),
+        ]);
+        app.changes[0].set_error_message_cache("first failure".to_string());
+        app.changes[1].set_error_message_cache("second failure".to_string());
+        app.cursor_index = 0;
+
+        let buffer = render_buffer(&mut app, 160, 20);
+
+        assert_eq!(
+            fg_at(&buffer, "Error: first failure"),
+            Color::LightRed,
+            "the focused row needs a color readable on the highlight background"
+        );
+        assert_eq!(fg_at(&buffer, "Error: second failure"), Color::Red);
+    }
+
+    #[test]
+    fn changes_panel_advertises_details_only_on_an_error_row() {
+        for mode in [AppExecutionMode::Select, AppExecutionMode::Running] {
+            let mut app = create_test_app(vec![
+                create_test_change("change-a"),
+                create_test_change("change-b"),
+            ]);
+            app.execution_mode = mode;
+            if mode == AppExecutionMode::Running {
+                app.add_log(LogEntry::info("orchestration log"));
+            }
+            app.changes[0].set_error_message_cache(STALLED.to_string());
+            app.cursor_index = 0;
+
+            let on_error = buffer_to_string(&render_buffer(&mut app, 200, 24));
+            assert!(
+                on_error.contains("Enter: details"),
+                "{mode:?} must advertise the details action on an error row: {on_error}"
+            );
+
+            app.cursor_index = 1;
+            let off_error = buffer_to_string(&render_buffer(&mut app, 200, 24));
+            assert!(
+                !off_error.contains("Enter: details"),
+                "{mode:?} must not advertise it on a non-error row: {off_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_details_popup_shows_the_change_id_and_complete_diagnostic() {
+        let mut app = error_row_app(Some(STALLED));
+        assert!(app.open_error_details_popup());
+
+        let content = buffer_to_string(&render_buffer(&mut app, 160, 30));
+
+        assert!(content.contains("Error Details"), "{content}");
+        assert!(content.contains("Change: change-a"), "{content}");
+        assert!(content.contains(STALLED), "{content}");
+    }
+
+    #[test]
+    fn error_details_popup_advertises_scroll_copy_and_close() {
+        let mut app = error_row_app(Some(STALLED));
+        assert!(app.open_error_details_popup());
+
+        let content = buffer_to_string(&render_buffer(&mut app, 160, 30));
+
+        assert!(content.contains("scroll"), "{content}");
+        assert!(content.contains("c: copy"), "{content}");
+        assert!(content.contains("Esc"), "{content}");
+    }
+
+    #[test]
+    fn error_details_popup_reports_copy_outcomes_without_losing_the_diagnostic() {
+        let mut app = error_row_app(Some(STALLED));
+        assert!(app.open_error_details_popup());
+
+        app.set_clipboard(std::sync::Arc::new(
+            crate::tui::clipboard::test_doubles::RecordingClipboard::default(),
+        ));
+        app.copy_error_details();
+        let success = buffer_to_string(&render_buffer(&mut app, 160, 30));
+        assert!(success.contains("Copied to clipboard"), "{success}");
+        assert!(success.contains(STALLED), "{success}");
+
+        app.set_clipboard(std::sync::Arc::new(
+            crate::tui::clipboard::test_doubles::FailingClipboard::new("no clipboard provider"),
+        ));
+        app.copy_error_details();
+        let failure = buffer_to_string(&render_buffer(&mut app, 160, 30));
+        assert!(
+            failure.contains("Copy failed: no clipboard provider"),
+            "{failure}"
+        );
+        assert!(
+            failure.contains("manually"),
+            "failure feedback must be actionable: {failure}"
+        );
+        assert!(failure.contains(STALLED), "{failure}");
+    }
+
+    #[test]
+    fn error_details_popup_renders_above_an_interaction_modal_and_below_a_warning() {
+        let mut app = error_row_app(Some(STALLED));
+        app.web_url = Some("http://127.0.0.1:8080".to_string());
+        assert!(app.open_error_details_popup());
+        app.show_qr_popup();
+
+        let over_modal = buffer_to_string(&render_buffer(&mut app, 160, 30));
+        assert!(over_modal.contains("Error Details"), "{over_modal}");
+        assert!(over_modal.contains(STALLED), "{over_modal}");
+
+        app.show_warning_popup("Merge warning", "conflict in file.rs");
+        let under_warning = buffer_to_string(&render_buffer(&mut app, 160, 30));
+        assert!(under_warning.contains("Merge warning"), "{under_warning}");
+        assert!(
+            under_warning.contains("conflict in file.rs"),
+            "{under_warning}"
+        );
+        assert!(
+            !under_warning.contains("Error Details"),
+            "the warning popup owns the top of the stack: {under_warning}"
+        );
     }
 }

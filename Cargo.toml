@@ -69,6 +69,11 @@ shlex = "1.3"
 rand = "0.8"
 agent-skills-rs = "0.3.1"
 
+# OS clipboard access for the TUI Error Details popup. Default features are off
+# on purpose: only plain text is ever copied, so the image-data support (and its
+# image decoding dependencies) would be dead weight.
+arboard = { version = "3", default-features = false }
+
 # WebSocket/stream support for the local `/api/v2` remote-control API and its
 # observation-stream tests.
 tokio-tungstenite = "0.24"
