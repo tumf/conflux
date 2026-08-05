@@ -12,7 +12,7 @@ use async_trait::async_trait;
 
 use crate::orchestration::operator_command::{
     MarkExclusion, MarkRoute, NoOpReason, OperatorCommandError, OperatorCommandService,
-    OperatorMode, OperatorOutcome,
+    OperatorMode, OperatorOutcome, PARALLEL_INELIGIBLE_CLEANUP_REASON,
 };
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
@@ -150,10 +150,11 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
             } else {
                 // Naming the cleared rows is the whole point: an operator whose
                 // marks silently vanished cannot tell that from a lost command.
+                // The cleanup clears every ineligible row, so the reason stays
+                // generic rather than claiming they all had uncommitted files.
                 ExecutionSummary::changed(format!(
                     "execution mode is now {mode}; cleared mark and queue intent for {cleared:?} \
-                     ({})",
-                    MarkExclusion::ParallelIneligible.reason()
+                     ({PARALLEL_INELIGIBLE_CLEANUP_REASON})"
                 ))
             }
         }

@@ -26,7 +26,7 @@ use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
 use crate::orchestration::operator_command::{
     ExecutionMarkStore, MarkExclusion, NoopQueueHooks, OperatorCommandService, OperatorMode,
-    OperatorOutcome, ParallelRuntime, QueuePort, TerminationWaiter,
+    OperatorOutcome, ParallelEligibility, ParallelRuntime, QueuePort, TerminationWaiter,
 };
 use crate::orchestration::run_control::{
     testing::RecordingScheduler, ResolveReservations, RunControlService,
@@ -153,12 +153,20 @@ impl Wired {
             .await;
         self.web_state.update_with_mode(&changes, app_mode).await;
 
-        let mut ineligible = Vec::new();
-        for id in change_ids {
-            if !committed.contains(id) || uncommitted.contains(id) {
-                ineligible.push((*id).to_string());
-            }
-        }
+        // The same shared classification the refresh loop uses, so the store's
+        // reason and the projected per-change reason cannot disagree.
+        let committed_ids: HashSet<String> = committed.iter().map(|id| (*id).to_string()).collect();
+        let uncommitted_ids: HashSet<String> =
+            uncommitted.iter().map(|id| (*id).to_string()).collect();
+        let ineligible: Vec<(String, ParallelEligibility)> = change_ids
+            .iter()
+            .map(|id| {
+                (
+                    (*id).to_string(),
+                    ParallelEligibility::observe(id, &committed_ids, &uncommitted_ids),
+                )
+            })
+            .collect();
         self.parallel.set_parallel_ineligible(ineligible);
         self.web_state.sync_remote_control_projection().await;
     }
@@ -473,12 +481,16 @@ async fn remote_parallel_toggle_without_git_is_target_ineligible_not_a_lifecycle
 
 #[tokio::test]
 async fn remote_bulk_mark_is_atomic_over_one_revision_and_names_its_exclusions() {
-    let wired = Wired::new(&["a", "b", "uncommitted", "active"]).await;
+    // `dirty` is committed but has uncommitted proposal files; `absent` is
+    // simply missing from HEAD. Both are refused, and the two must be named
+    // apart: telling an operator to commit `absent` describes work that does
+    // not exist.
+    let wired = Wired::new(&["a", "b", "dirty", "absent", "active"]).await;
     wired
         .observe(
-            &["a", "b", "uncommitted", "active"],
-            &["a", "b", "active"],
-            &[],
+            &["a", "b", "dirty", "absent", "active"],
+            &["a", "b", "dirty", "active"],
+            &["dirty"],
             "running",
         )
         .await;
@@ -501,9 +513,10 @@ async fn remote_bulk_mark_is_atomic_over_one_revision_and_names_its_exclusions()
     let detail = summary.detail.unwrap_or_default();
     assert!(
         detail.contains("2 change(s) marked")
-            && detail.contains("2 excluded")
+            && detail.contains("3 excluded")
             && detail.contains("change_active")
-            && detail.contains("parallel_ineligible"),
+            && detail.contains("parallel_ineligible")
+            && detail.contains("parallel_proposal_absent"),
         "the outcome must report changed IDs and stable exclusion reasons: {detail}"
     );
 
@@ -513,11 +526,13 @@ async fn remote_bulk_mark_is_atomic_over_one_revision_and_names_its_exclusions()
     );
     assert_eq!(wired.status("a").await, "queued");
     assert_eq!(wired.status("b").await, "queued");
-    assert_eq!(
-        wired.status("uncommitted").await,
-        "not queued",
-        "an excluded row keeps coherent intent"
-    );
+    for excluded in ["dirty", "absent"] {
+        assert_eq!(
+            wired.status(excluded).await,
+            "not queued",
+            "an excluded row keeps coherent intent"
+        );
+    }
     assert_eq!(wired.status("active").await, "applying");
     assert!(
         wired.scheduler.calls().is_empty(),
@@ -878,7 +893,10 @@ async fn a_bulk_mark_arriving_inside_a_toggle_classifies_against_the_settled_mod
             assert_eq!(changed, vec!["a_eligible".to_string()]);
             assert_eq!(
                 excluded,
-                vec![("z_blocked".to_string(), MarkExclusion::ParallelIneligible)],
+                vec![(
+                    "z_blocked".to_string(),
+                    MarkExclusion::ParallelProposalAbsent
+                )],
                 "the plan must be derived from the mode the toggle settled on"
             );
         }
