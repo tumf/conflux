@@ -460,6 +460,20 @@ impl ChangeRuntimeState {
         !matches!(self.terminal, TerminalState::None)
     }
 
+    /// Check whether the entry carries no reducer-owned state at all.
+    ///
+    /// This is the only shape a workspace refresh observation may fill in.
+    /// Any activity, wait, queue intent, terminal outcome, or explicit dequeue
+    /// is stronger reducer-owned evidence than a refresh scan, so a startup
+    /// reconciliation must leave those entries exactly as they are.
+    fn is_fresh_idle(&self) -> bool {
+        matches!(self.activity, ActivityState::Idle)
+            && matches!(self.wait_state, WaitState::None)
+            && matches!(self.queue_intent, QueueIntent::NotQueued)
+            && matches!(self.terminal, TerminalState::None)
+            && !self.dequeued
+    }
+
     /// Check whether a repository-visible success event may replace the current terminal state.
     ///
     /// Recoverable execution errors are terminal for retry/slot accounting, but later
@@ -1745,6 +1759,10 @@ impl OrchestratorState {
     /// Apply a workspace observation to reconcile wait states without overwriting
     /// active execution (Phase 2.4).
     pub fn apply_observation(&mut self, change_id: &str, obs: WorkspaceObservation) {
+        // Scheduler-owned base-lane membership is reducer state the observation
+        // must not duplicate, even if the runtime entry itself looks idle.
+        let scheduler_pending = self.resolve_wait_queue.iter().any(|id| id == change_id)
+            || self.reject_wait_queue.iter().any(|id| id == change_id);
         let rt = self.runtime_entry(change_id);
 
         // Never overwrite an active execution stage.
@@ -1758,12 +1776,21 @@ impl OrchestratorState {
 
         match obs {
             WorkspaceObservation::WorkspaceArchived => {
-                // Restore MergeWait only when the reducer already has explicit manual-wait
-                // evidence. A bare archived workspace observation is only a repository
-                // milestone: in parallel mode, no-blocker archive completion must remain in
-                // active merge handling until MergeCompleted or a concrete MergeDeferred
-                // event explains manual wait.
+                // Restore MergeWait when the reducer already has explicit manual-wait
+                // evidence. A bare archived workspace observation is otherwise only a
+                // repository milestone: in parallel mode, no-blocker archive completion
+                // must remain in active merge handling until MergeCompleted or a concrete
+                // MergeDeferred event explains manual wait.
                 if matches!(rt.wait_state, WaitState::MergeWait) {
+                    rt.observation = WorkspaceObservation::WorkspaceArchived;
+                } else if rt.is_fresh_idle() && !scheduler_pending {
+                    // Startup reconciliation: a fresh process has no reducer history at
+                    // all, so archived-but-not-yet-merged workspace evidence is the only
+                    // authority for this row. Restoring MergeWait here is what makes the
+                    // reducer agree with the row the refresh scan already displays, and
+                    // is what manual resolve admission is then evaluated against.
+                    rt.wait_state = WaitState::MergeWait;
+                    rt.clear_blocked_metadata();
                     rt.observation = WorkspaceObservation::WorkspaceArchived;
                 }
             }
@@ -4066,6 +4093,201 @@ mod tests {
             merge_wait_ids: HashSet::new(),
         });
         assert_eq!(state.display_status("c"), "not queued");
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup reconciliation: archived-but-not-yet-merged workspace evidence
+    // -----------------------------------------------------------------------
+
+    /// A `ChangesRefreshed` carrying only archived-but-not-yet-merged evidence.
+    fn startup_refresh(merge_wait_ids: &[&str]) -> crate::events::ExecutionEvent {
+        use std::collections::{HashMap, HashSet};
+
+        crate::events::ExecutionEvent::ChangesRefreshed {
+            changes: vec![],
+            rejected_changes: Vec::new(),
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: merge_wait_ids.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn startup_refresh_restores_merge_wait_for_a_fresh_idle_change() {
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+        assert_eq!(state.display_status("alpha"), "not queued");
+
+        state.apply_execution_event(&startup_refresh(&["alpha"]));
+
+        assert_eq!(state.display_status("alpha"), "merge wait");
+        assert!(matches!(
+            state.change_runtime("alpha").unwrap().wait_state,
+            WaitState::MergeWait
+        ));
+        assert!(
+            state.resolve_wait_change_ids().is_empty(),
+            "restoring the wait must not enqueue scheduler-owned resolve work"
+        );
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn startup_refresh_merge_wait_restoration_is_idempotent() {
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_execution_event(&startup_refresh(&["alpha"]));
+        state.apply_execution_event(&startup_refresh(&["alpha"]));
+
+        assert_eq!(state.display_status("alpha"), "merge wait");
+        assert!(state.resolve_wait_change_ids().is_empty());
+    }
+
+    #[test]
+    fn startup_refresh_does_not_regress_stronger_reducer_state_to_merge_wait() {
+        use crate::events::ExecutionEvent;
+
+        // Each case is set up through the same reducer transitions production uses,
+        // then re-observed with the change still reported as archived-but-not-merged.
+        let cases: Vec<(&str, &str, Box<dyn Fn(&mut OrchestratorState)>)> = vec![
+            (
+                "resolving",
+                "resolving",
+                Box::new(|state: &mut OrchestratorState| {
+                    state.apply_execution_event(&ExecutionEvent::ChangeArchived("x".to_string()));
+                }),
+            ),
+            (
+                "resolve pending",
+                "resolve pending",
+                Box::new(|state: &mut OrchestratorState| {
+                    state.runtime_entry("x").wait_state = WaitState::MergeWait;
+                    state.apply_command(ReducerCommand::ResolveMerge("x".to_string()));
+                }),
+            ),
+            (
+                "rejecting",
+                "rejecting",
+                Box::new(|state: &mut OrchestratorState| {
+                    state.runtime_entry("x").activity = ActivityState::Rejecting;
+                }),
+            ),
+            (
+                "reject pending",
+                "reject pending",
+                Box::new(|state: &mut OrchestratorState| {
+                    // Rejection review only waits while another change holds the
+                    // single base-mutating lane.
+                    state.runtime_entry("lane").activity = ActivityState::Resolving;
+                    state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+                        change_id: "x".to_string(),
+                        workspace_name: "ws-x".to_string(),
+                        status: crate::vcs::WorkspaceStatus::Rejecting,
+                    });
+                }),
+            ),
+            (
+                "queued",
+                "queued",
+                Box::new(|state: &mut OrchestratorState| {
+                    state.apply_command(ReducerCommand::AddToQueue("x".to_string()));
+                }),
+            ),
+            (
+                "merged",
+                "merged",
+                Box::new(|state: &mut OrchestratorState| {
+                    state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+                        change_id: "x".to_string(),
+                        revision: "rev-x".to_string(),
+                    });
+                }),
+            ),
+            (
+                "rejected",
+                "rejected",
+                Box::new(|state: &mut OrchestratorState| {
+                    state.apply_execution_event(&ExecutionEvent::ChangeRejected {
+                        change_id: "x".to_string(),
+                        reason: "blocked".to_string(),
+                    });
+                }),
+            ),
+            (
+                "error",
+                "error",
+                Box::new(|state: &mut OrchestratorState| {
+                    state.apply_execution_event(&ExecutionEvent::ProcessingError {
+                        id: "x".to_string(),
+                        error: "boom".to_string(),
+                    });
+                }),
+            ),
+            (
+                "stopped",
+                "stopped",
+                Box::new(|state: &mut OrchestratorState| {
+                    state.apply_command(ReducerCommand::StopChange("x".to_string()));
+                }),
+            ),
+            (
+                "blocked",
+                "blocked",
+                Box::new(|state: &mut OrchestratorState| {
+                    state.apply_execution_event(&ExecutionEvent::DependencyBlocked {
+                        change_id: "x".to_string(),
+                        dependency_ids: vec!["dep".to_string()],
+                    });
+                }),
+            ),
+            (
+                "dequeued",
+                "not queued",
+                Box::new(|state: &mut OrchestratorState| {
+                    state.apply_command(ReducerCommand::AddToQueue("x".to_string()));
+                    state.apply_command(ReducerCommand::DequeueChange("x".to_string()));
+                }),
+            ),
+        ];
+
+        for (label, expected, setup) in cases {
+            // `lane` exists only so a case can occupy the single base-mutating lane.
+            let mut state = OrchestratorState::with_mode(
+                vec!["x".to_string(), "lane".to_string()],
+                0,
+                ExecutionMode::Parallel,
+            );
+            setup(&mut state);
+            assert_eq!(state.display_status("x"), expected, "setup for {}", label);
+            let resolve_wait_before = state.resolve_wait_change_ids();
+            let reject_wait_before = state.reject_wait_change_ids();
+
+            state.apply_execution_event(&startup_refresh(&["x"]));
+
+            assert_eq!(
+                state.display_status("x"),
+                expected,
+                "refresh evidence must not regress {} to merge wait",
+                label
+            );
+            assert_eq!(
+                state.resolve_wait_change_ids(),
+                resolve_wait_before,
+                "refresh must not create a duplicate manual resolve reservation for {}",
+                label
+            );
+            assert_eq!(
+                state.reject_wait_change_ids(),
+                reject_wait_before,
+                "refresh must not disturb reject-wait membership for {}",
+                label
+            );
+            assert!(state.global_invariants_hold(), "invariants for {}", label);
+        }
     }
 
     // -----------------------------------------------------------------------
