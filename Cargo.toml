@@ -31,11 +31,6 @@ path = "src/lib.rs"
 name = "cflx"
 path = "src/main.rs"
 
-[[bin]]
-name = "openapi-gen"
-path = "src/bin/openapi_gen.rs"
-required-features = ["web-monitoring"]
-
 [features]
 default = ["web-monitoring"]
 web-monitoring = ["axum", "tower", "tower-http", "qrcode", "local-ip-address", "utoipa", "utoipa-swagger-ui"]

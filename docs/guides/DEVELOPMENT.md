@@ -250,28 +250,35 @@ brew install prek
 prek install
 ```
 
-The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format). When you run `prek run --all-files`, it also runs `make check-openapi`.
+The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format).
 
 ## The API contract
 
-`docs/openapi.yaml` is the one canonical description of `/api/v2` in this
-repository. It is generated from `src/web/openapi.rs` and the `#[utoipa::path]`
-attributes that module names, and it is never hand-edited — the file opens with a
-generated-file banner saying so. No second OpenAPI artifact is allowed to exist.
+`src/web/openapi.rs` and the `#[utoipa::path]` attributes that module names are
+the one canonical description of `/api/v2`. The document is generated from them
+and is **not tracked in this repository** — there is no file to regenerate and
+nothing to commit. Every copy opens with a banner saying so.
 
 ```bash
-make openapi        # regenerate docs/openapi.yaml
-make check-openapi  # fail on drift; writes nothing to the working tree
+cflx openapi                 # print the schema to stdout
+cflx openapi > openapi.yaml  # export it for client generation (do not commit)
+curl http://127.0.0.1:PORT/api/v2/openapi.yaml   # same document, live
 ```
 
-`make check-openapi` regenerates into a temporary file, prints a unified diff
-when the tracked artifact disagrees, and then runs
-`tests/openapi_contract_tests.rs`. Those assertions cover what a diff alone
-cannot: every published path is bound by the router and enforces the
-authentication it declares, the command union matches the advertised command
-set, the error-code and event-category vocabularies are complete, no removed
-legacy path has reappeared, no schema is dangling or unreachable, and real
-serialized DTOs satisfy their published schemas.
+Because there is no artifact to diff, `tests/openapi_contract_tests.rs` is what
+keeps the generated document honest, and CI runs it on every pull request:
+
+```bash
+cargo test --features web-monitoring --test openapi_contract_tests
+```
+
+Those assertions cover what a diff alone never could: every published path is
+bound by the router and enforces the authentication it declares, the command
+union matches the advertised command set, the error-code and event-category
+vocabularies are complete, no removed legacy path has reappeared, no schema is
+dangling or unreachable, real serialized DTOs satisfy their published schemas,
+`cflx openapi` and the live endpoint emit identical bytes, and the checks
+themselves are proven to fail on a deliberately incomplete document.
 
 Anything that changes a route, a published DTO field, a command variant, an
 error code, an event envelope, or a security declaration must be committed

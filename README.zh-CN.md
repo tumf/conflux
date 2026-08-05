@@ -129,7 +129,7 @@ cargo install cflx
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | 开发指南 |
 | [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | 发布指南 |
-| [docs/openapi.yaml](docs/openapi.yaml) | `/api/v2` 权威契约（自动生成） |
+| `cflx openapi` / `GET /api/v2/openapi.yaml` | `/api/v2` 权威契约（运行时生成，仓库不追踪） |
 
 ## 许可证
 

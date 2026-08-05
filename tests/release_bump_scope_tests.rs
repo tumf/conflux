@@ -33,9 +33,6 @@ if [[ "${1:-}" == "generate-lockfile" ]]; then
 		;;
 	revert)
 		git checkout -- Cargo.toml
-		if [[ -f docs/openapi.yaml ]]; then
-			git checkout -- docs/openapi.yaml
-		fi
 		exit 0
 		;;
 	esac
@@ -85,7 +82,7 @@ struct Fixture {
 impl Fixture {
     /// Each test gets its own repository, bare origin, and fake `cargo`, so
     /// tests stay independent and can run in parallel.
-    fn new(with_openapi: bool) -> Self {
+    fn new() -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().to_path_buf();
         let repo = root.join("repo");
@@ -113,11 +110,11 @@ impl Fixture {
             gitconfig,
         };
 
-        fixture.init_repo(with_openapi);
+        fixture.init_repo();
         fixture
     }
 
-    fn init_repo(&self, with_openapi: bool) {
+    fn init_repo(&self) {
         // Identity comes from the environment and signing config cannot leak in
         // (GIT_CONFIG_GLOBAL points at an empty file and system config is off),
         // so the fixture needs no `git config` calls here.
@@ -133,12 +130,6 @@ impl Fixture {
         );
         self.write("README.md", "# fixture\n");
         self.write("notes.md", "tracked unrelated notes\n");
-        if with_openapi {
-            self.write(
-                "docs/openapi.yaml",
-                "openapi: 3.0.3\ninfo:\n  title: Fixture API\n  version: 0.1.0\n",
-            );
-        }
 
         self.git_ok(&["add", "-A"]);
         self.git_ok(&["commit", "-q", "-m", "init"]);
@@ -430,7 +421,7 @@ fn assert_failure(out: &Output) {
 
 #[test]
 fn release_commit_contains_only_owned_paths_and_preserves_unrelated_work() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     fx.add_unrelated_work();
     let base_head = fx.head();
 
@@ -440,11 +431,7 @@ fn release_commit_contains_only_owned_paths_and_preserves_unrelated_work() {
     assert_eq!(fx.head_subject(), format!("{RELEASE_COMMIT_PREFIX}0.1.1"));
     assert_eq!(
         fx.commit_files("HEAD"),
-        vec![
-            "Cargo.lock".to_string(),
-            "Cargo.toml".to_string(),
-            "docs/openapi.yaml".to_string()
-        ],
+        vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()],
         "release commit must contain only release-owned artifacts"
     );
     assert_eq!(fx.commit_count(), 2, "exactly one release commit is added");
@@ -452,7 +439,6 @@ fn release_commit_contains_only_owned_paths_and_preserves_unrelated_work() {
 
     assert_eq!(fx.manifest_version(), "0.1.1");
     assert!(fx.read("Cargo.lock").contains("version = \"0.1.1\""));
-    assert!(fx.read("docs/openapi.yaml").contains("version: 0.1.1"));
 
     fx.assert_unrelated_work_preserved();
 
@@ -474,23 +460,51 @@ fn release_commit_contains_only_owned_paths_and_preserves_unrelated_work() {
     assert!(published.contains_key("refs/tags/v0.1.1"));
 }
 
+/// The OpenAPI contract is generated at runtime and is not a release artifact.
+///
+/// An operator can still have an exported copy sitting in the worktree — the
+/// export command writes wherever they redirect it, and nothing stops them from
+/// committing one by mistake. The release must treat such a file as ordinary
+/// content: not owned, so its dirtiness never blocks a bump; not staged, so it
+/// never lands in the release commit; and never version-rewritten, because a
+/// release that edits a file it does not own is how the old artifact ownership
+/// leaked into unrelated commits.
 #[test]
-fn release_without_openapi_commits_only_manifest_and_lockfile() {
-    let fx = Fixture::new(false);
+fn an_exported_openapi_copy_is_neither_owned_nor_rewritten() {
+    let fx = Fixture::new();
+    const EXPORT: &str = "openapi: 3.1.0\ninfo:\n  title: Fixture API\n  version: 0.1.0\n";
+    fx.write("docs/openapi.yaml", EXPORT);
+    fx.git_ok(&["add", "docs/openapi.yaml"]);
+    fx.git_ok(&["commit", "-q", "-m", "an exported copy someone committed"]);
+
+    // Dirty it, both staged and in the worktree, the way an owned path would be.
+    fx.write(
+        "docs/openapi.yaml",
+        "openapi: 3.1.0\ninfo:\n  title: Fixture API\n  version: 0.1.0\n  contact: local\n",
+    );
+    fx.git_ok(&["add", "docs/openapi.yaml"]);
 
     let out = fx.bump(&["patch"]);
     assert_success(&out);
 
     assert_eq!(
         fx.commit_files("HEAD"),
-        vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()]
+        vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()],
+        "an exported OpenAPI copy must stay out of the release commit"
     );
-    assert!(!fx.exists("docs/openapi.yaml"));
+    assert!(
+        fx.read("docs/openapi.yaml").contains("version: 0.1.0"),
+        "the release must not rewrite a version string in a file it does not own"
+    );
+    assert!(
+        fx.read("docs/openapi.yaml").contains("contact: local"),
+        "the operator's local edit must survive the release untouched"
+    );
 }
 
 #[test]
 fn pre_staged_unrelated_entry_stays_out_of_the_release_commit() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     // An unrelated file staged before the bump must not be swept into the
     // release commit by a pathless commit.
     fx.write(
@@ -524,7 +538,7 @@ fn pre_staged_unrelated_entry_stays_out_of_the_release_commit() {
 
 #[test]
 fn unstaged_owned_path_change_blocks_release_before_mutation() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     fx.add_unrelated_work();
     let base_head = fx.head();
     fx.write(
@@ -555,29 +569,29 @@ fn unstaged_owned_path_change_blocks_release_before_mutation() {
 
 #[test]
 fn staged_owned_path_change_blocks_release() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     let base_head = fx.head();
     fx.write(
-        "docs/openapi.yaml",
-        "openapi: 3.0.3\ninfo:\n  title: Fixture API\n  version: 0.1.0\n  contact: staged\n",
+        "Cargo.lock",
+        "# fake lockfile\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\n# staged\n",
     );
-    fx.git_ok(&["add", "docs/openapi.yaml"]);
+    fx.git_ok(&["add", "Cargo.lock"]);
 
     let out = fx.bump(&["patch"]);
     assert_failure(&out);
     assert!(stderr_of(&out).contains("Release-owned paths must match HEAD"));
     assert_eq!(fx.head(), base_head);
     assert!(fx.tags().is_empty());
-    assert!(fx.read("docs/openapi.yaml").contains("contact: staged"));
+    assert!(fx.read("Cargo.lock").contains("# staged"));
 }
 
+/// An owned path deleted from the worktree is still owned, so the deletion is
+/// rejected before any mutation rather than silently dropping out of validation.
 #[test]
-fn deleted_tracked_openapi_blocks_release() {
-    let fx = Fixture::new(true);
+fn deleted_tracked_lockfile_blocks_release() {
+    let fx = Fixture::new();
     let base_head = fx.head();
-    // A tracked release-owned artifact deleted from the worktree is still
-    // release-owned, so its deletion must be rejected before any mutation.
-    fs::remove_file(fx.repo.join("docs/openapi.yaml")).unwrap();
+    fs::remove_file(fx.repo.join("Cargo.lock")).unwrap();
 
     let out = fx.bump(&["patch"]);
     assert_failure(&out);
@@ -587,7 +601,7 @@ fn deleted_tracked_openapi_blocks_release() {
         describe(&out)
     );
     assert!(
-        stderr_of(&out).contains("docs/openapi.yaml"),
+        stderr_of(&out).contains("Cargo.lock"),
         "the deleted owned path must be reported: {}",
         describe(&out)
     );
@@ -600,7 +614,7 @@ fn deleted_tracked_openapi_blocks_release() {
     assert!(!published.contains_key("refs/tags/v0.1.1"));
     // Mutation never ran and the deletion was not silently restored.
     assert_eq!(fx.manifest_version(), "0.1.0");
-    assert!(!fx.exists("docs/openapi.yaml"));
+    assert!(!fx.exists("Cargo.lock"));
     assert!(
         fx.cargo_log().trim().is_empty(),
         "cargo must not run once owned paths are dirty"
@@ -608,10 +622,10 @@ fn deleted_tracked_openapi_blocks_release() {
 }
 
 #[test]
-fn staged_deletion_of_tracked_openapi_blocks_release() {
-    let fx = Fixture::new(true);
+fn staged_deletion_of_tracked_lockfile_blocks_release() {
+    let fx = Fixture::new();
     let base_head = fx.head();
-    fx.git_ok(&["rm", "-q", "docs/openapi.yaml"]);
+    fx.git_ok(&["rm", "-q", "Cargo.lock"]);
 
     let out = fx.bump(&["patch"]);
     assert_failure(&out);
@@ -625,7 +639,7 @@ fn staged_deletion_of_tracked_openapi_blocks_release() {
 
 #[test]
 fn untracked_owned_lockfile_blocks_release() {
-    let fx = Fixture::new(false);
+    let fx = Fixture::new();
     // Simulate a lockfile that exists but was never committed.
     fx.git_ok(&["rm", "-q", "--cached", "Cargo.lock"]);
     fx.git_ok(&["commit", "-q", "-m", "drop lockfile from tracking"]);
@@ -642,7 +656,7 @@ fn untracked_owned_lockfile_blocks_release() {
 
 #[test]
 fn missing_owned_delta_exits_without_release_even_when_other_files_are_dirty() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     fx.add_unrelated_work();
     let base_head = fx.head();
 
@@ -664,7 +678,7 @@ fn missing_owned_delta_exits_without_release_even_when_other_files_are_dirty() {
 
 #[test]
 fn generation_failure_blocks_tag_push_and_a_version_advancing_retry() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     let base_head = fx.head();
 
     let out = fx.bump_with_env(&["patch"], &[("FAKE_CARGO_MODE", "fail")]);
@@ -691,7 +705,7 @@ fn generation_failure_blocks_tag_push_and_a_version_advancing_retry() {
 
 #[test]
 fn staging_failure_blocks_tag_push_and_a_version_advancing_retry() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     let base_head = fx.head();
     // A held index lock is the real staging failure this scoping change was
     // written for: `git add` cannot lock the index, so the release must stop
@@ -733,7 +747,7 @@ fn staging_failure_blocks_tag_push_and_a_version_advancing_retry() {
 
 #[test]
 fn commit_failure_blocks_tag_push_and_a_version_advancing_retry() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     let base_head = fx.head();
     fx.install_hook("pre-commit", FAILING_HOOK);
 
@@ -756,7 +770,7 @@ fn commit_failure_blocks_tag_push_and_a_version_advancing_retry() {
 
 #[test]
 fn commit_no_verify_env_bypasses_a_failing_pre_commit_hook() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     fx.install_hook("pre-commit", FAILING_HOOK);
 
     let out = fx.bump_with_env(&["patch"], &[("OPENSPEC_GIT_COMMIT_NO_VERIFY", "true")]);
@@ -765,11 +779,7 @@ fn commit_no_verify_env_bypasses_a_failing_pre_commit_hook() {
     assert_eq!(fx.head_subject(), format!("{RELEASE_COMMIT_PREFIX}0.1.1"));
     assert_eq!(
         fx.commit_files("HEAD"),
-        vec![
-            "Cargo.lock".to_string(),
-            "Cargo.toml".to_string(),
-            "docs/openapi.yaml".to_string()
-        ]
+        vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()]
     );
     assert_eq!(fx.tags(), vec!["v0.1.1".to_string()]);
     assert_eq!(fx.origin_rev("refs/heads/main"), Some(fx.head()));
@@ -814,7 +824,7 @@ fn tagged_release_without_push(fx: &Fixture) -> String {
 
 #[test]
 fn release_commit_missing_its_tag_resumes_the_same_version() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     let release_head = release_commit_without_tag(&fx);
     assert!(fx.origin_rev("refs/tags/v0.1.1").is_none());
 
@@ -834,7 +844,7 @@ fn release_commit_missing_its_tag_resumes_the_same_version() {
 
 #[test]
 fn tagged_release_missing_its_push_resumes_the_same_version() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     let release_head = tagged_release_without_push(&fx);
     let before = fx.origin_refs();
     assert!(before.contains_key("refs/heads/main"));
@@ -869,7 +879,7 @@ fn tagged_release_missing_its_push_resumes_the_same_version() {
 
 #[test]
 fn release_labelled_commit_with_unrelated_contents_is_not_resumed() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     // A commit carrying the release subject but also unrelated contents is not
     // a valid scoped release commit, so it must never be tagged or published.
     fx.write(
@@ -913,7 +923,7 @@ fn release_labelled_commit_with_unrelated_contents_is_not_resumed() {
 
 #[test]
 fn lightweight_tag_at_head_is_rejected_instead_of_published() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     let release_head = release_commit_without_tag(&fx);
     // The requirement is an annotated tag; a lightweight tag left at HEAD is
     // not acceptable evidence of a completed release.
@@ -963,7 +973,7 @@ fn lightweight_tag_at_head_is_rejected_instead_of_published() {
 
 #[test]
 fn dry_run_creates_no_release_side_effects() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     fx.add_unrelated_work();
     let base_head = fx.head();
 
@@ -980,7 +990,7 @@ fn dry_run_creates_no_release_side_effects() {
 
 #[test]
 fn dry_run_in_missing_tag_recovery_state_creates_nothing() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     let release_head = release_commit_without_tag(&fx);
 
     let out = fx.bump(&["patch", "--dry-run"]);
@@ -1001,7 +1011,7 @@ fn dry_run_in_missing_tag_recovery_state_creates_nothing() {
 
 #[test]
 fn dry_run_in_missing_push_recovery_state_creates_nothing() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     let release_head = tagged_release_without_push(&fx);
     let origin_before = fx.origin_rev("refs/heads/main");
 
@@ -1021,7 +1031,7 @@ fn dry_run_in_missing_push_recovery_state_creates_nothing() {
 
 #[test]
 fn minor_level_calculates_expected_version() {
-    let fx = Fixture::new(false);
+    let fx = Fixture::new();
     assert_success(&fx.bump(&["minor"]));
     assert_eq!(fx.manifest_version(), "0.2.0");
     assert_eq!(fx.tags(), vec!["v0.2.0".to_string()]);
@@ -1030,7 +1040,7 @@ fn minor_level_calculates_expected_version() {
 
 #[test]
 fn major_level_calculates_expected_version() {
-    let fx = Fixture::new(false);
+    let fx = Fixture::new();
     assert_success(&fx.bump(&["major"]));
     assert_eq!(fx.manifest_version(), "1.0.0");
     assert_eq!(fx.tags(), vec!["v1.0.0".to_string()]);
@@ -1039,7 +1049,7 @@ fn major_level_calculates_expected_version() {
 
 #[test]
 fn existing_tag_for_next_version_is_skipped() {
-    let fx = Fixture::new(false);
+    let fx = Fixture::new();
     fx.git_ok(&["tag", "-a", "v0.1.1", "-m", "Release v0.1.1"]);
 
     assert_success(&fx.bump(&["patch"]));
@@ -1051,7 +1061,7 @@ fn existing_tag_for_next_version_is_skipped() {
 
 #[test]
 fn feature_branch_still_delegates_to_cargo_release_unchanged() {
-    let fx = Fixture::new(true);
+    let fx = Fixture::new();
     fx.git_ok(&["checkout", "-q", "-b", "Feature/Nice_Branch"]);
     let base_head = fx.head();
 
@@ -1073,7 +1083,7 @@ fn feature_branch_still_delegates_to_cargo_release_unchanged() {
 
 #[test]
 fn feature_branch_dry_run_delegates_without_execute() {
-    let fx = Fixture::new(false);
+    let fx = Fixture::new();
     fx.git_ok(&["checkout", "-q", "-b", "develop"]);
 
     let out = fx.bump(&["patch", "--dry-run"]);
@@ -1102,14 +1112,13 @@ fn release_guide_documents_the_owned_path_contract() {
         "release-owned paths",
         "`Cargo.toml`",
         "`Cargo.lock`",
-        "`docs/openapi.yaml`",
         "staged, unstaged, and untracked",
         "chore(release): release vX.Y.Z",
         "--dry-run",
         "Resuming an interrupted release",
-        // Ownership survives deletion of a tracked artifact, and a resume needs
-        // commit/tag evidence rather than a matching subject.
-        "in the index, or in",
+        // The owned set is closed, and a resume needs commit/tag evidence
+        // rather than a matching subject.
+        "That is the whole set",
         "Resuming only happens on evidence",
         "is annotated",
     ] {
