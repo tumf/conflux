@@ -123,6 +123,26 @@ impl Harness {
         .await;
     }
 
+    /// Reconstruct a merge wait the way TUI startup does.
+    ///
+    /// No prior reducer history exists; the only input is a refresh scan that
+    /// reports the change as archived but not yet merged into base.
+    async fn to_startup_merge_wait(&self, change_id: &str) {
+        use std::collections::{HashMap, HashSet};
+
+        self.apply(ExecutionEvent::ChangesRefreshed {
+            changes: Vec::new(),
+            rejected_changes: Vec::new(),
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::from([change_id.to_string()]),
+        })
+        .await;
+    }
+
     /// Move a change into a terminal error state.
     async fn to_error(&self, change_id: &str) {
         self.apply(ExecutionEvent::ProcessingError {
@@ -657,6 +677,111 @@ async fn duplicate_resolve_submission_does_not_create_a_second_queue_entry() {
         }
     );
     assert_eq!(harness.resolves.waiting(), vec!["b".to_string()]);
+}
+
+#[tokio::test]
+async fn resolve_from_startup_reconstructed_merge_wait_reserves_and_dispatches() {
+    let harness = Harness::new(&["a"]);
+    harness.to_startup_merge_wait("a").await;
+    assert_eq!(
+        harness.status("a").await,
+        "merge wait",
+        "workspace evidence alone must make the reducer agree with the row"
+    );
+
+    let outcome = harness.service.resolve_merge("a").await.unwrap();
+
+    assert_eq!(
+        outcome,
+        RunControlOutcome::ResolveReserved {
+            change_id: "a".to_string(),
+            reservation: ResolveReservation::Active,
+            scheduler: SchedulerEffect::Started,
+        }
+    );
+    assert_eq!(harness.status("a").await, "resolve pending");
+    assert!(harness.resolves.is_active());
+    assert_eq!(
+        harness.state.read().await.resolve_wait_change_ids(),
+        vec!["a".to_string()],
+        "the accepted intent must be scheduler-consumable retry membership"
+    );
+    assert_eq!(
+        harness.scheduler.started_targets(),
+        vec![Vec::<String>::new()]
+    );
+}
+
+#[tokio::test]
+async fn resolve_from_startup_merge_wait_notifies_a_live_scheduler() {
+    let harness = Harness::new(&["a"]);
+    harness.to_startup_merge_wait("a").await;
+    harness.scheduler.set_running(true);
+
+    let outcome = harness.service.resolve_merge("a").await.unwrap();
+
+    assert_eq!(
+        outcome,
+        RunControlOutcome::ResolveReserved {
+            change_id: "a".to_string(),
+            reservation: ResolveReservation::Active,
+            scheduler: SchedulerEffect::Notified,
+        }
+    );
+    assert_eq!(harness.scheduler.calls(), vec![SchedulerCall::Notified]);
+}
+
+#[tokio::test]
+async fn resolve_of_a_not_queued_target_without_workspace_evidence_is_refused() {
+    // Same reducer shape the startup case starts from, minus the refresh
+    // evidence: admission must still refuse it.
+    let harness = Harness::new(&["a"]);
+    assert_eq!(harness.status("a").await, "not queued");
+
+    let error = harness
+        .service
+        .resolve_merge("a")
+        .await
+        .expect_err("an idle, not-queued change is not waiting on a merge");
+
+    assert!(matches!(
+        error,
+        RunControlError::TargetIneligible {
+            command: RunCommandKind::Resolve,
+            ..
+        }
+    ));
+    assert_eq!(harness.status("a").await, "not queued");
+    assert!(!harness.resolves.is_active());
+    assert!(harness
+        .state
+        .read()
+        .await
+        .resolve_wait_change_ids()
+        .is_empty());
+    assert!(harness.scheduler.calls().is_empty());
+}
+
+#[tokio::test]
+async fn refresh_evidence_for_another_change_leaves_a_stale_target_ineligible() {
+    let harness = Harness::new(&["a", "b"]);
+    harness.to_startup_merge_wait("b").await;
+
+    let error = harness
+        .service
+        .resolve_merge("a")
+        .await
+        .expect_err("evidence for 'b' must not make 'a' resolve-eligible");
+
+    assert!(matches!(
+        error,
+        RunControlError::TargetIneligible {
+            command: RunCommandKind::Resolve,
+            ..
+        }
+    ));
+    assert!(!harness.resolves.is_reserved("a"));
+    assert!(harness.scheduler.calls().is_empty());
 }
 
 #[tokio::test]

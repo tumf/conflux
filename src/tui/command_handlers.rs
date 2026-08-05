@@ -2115,6 +2115,88 @@ mod tests {
         );
     }
 
+    /// Replay the startup refresh: no reducer history, only a workspace scan
+    /// reporting the change as archived but not yet merged into base.
+    async fn startup_refresh_merge_wait(harness: &AdapterHarness, change_id: &str) {
+        use std::collections::{HashMap, HashSet};
+
+        harness.state.write().await.apply_execution_event(
+            &crate::events::ExecutionEvent::ChangesRefreshed {
+                changes: vec![create_test_change(change_id)],
+                rejected_changes: Vec::new(),
+                committed_change_ids: HashSet::new(),
+                uncommitted_file_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::new(),
+                worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
+                merge_wait_ids: HashSet::from([change_id.to_string()]),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_merge_from_startup_refreshed_row_reaches_resolve_pending() {
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+
+        // Startup order: the reducer reconciles the refresh, then the row syncs
+        // from the reducer-owned status, then the operator presses `M`.
+        startup_refresh_merge_wait(&harness, "change-a").await;
+        let reducer_status = harness.status("change-a").await;
+        assert_eq!(reducer_status, "merge wait");
+        app.apply_display_statuses_from_reducer(&std::collections::HashMap::from([(
+            "change-a".to_string(),
+            "merge wait",
+        )]));
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+
+        harness
+            .run(&mut app, TuiCommand::ResolveMerge("change-a".to_string()))
+            .await;
+
+        assert_eq!(harness.status("change-a").await, "resolve pending");
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
+        assert_eq!(
+            app.warning_message, None,
+            "a reconstructed merge wait must not be refused by scheduler state"
+        );
+        assert_eq!(log_count(&app, "was not accepted by scheduler state"), 0);
+        assert_eq!(log_count(&app, "started scheduler for manual resolve"), 1);
+        assert_eq!(
+            harness.state.read().await.resolve_wait_change_ids(),
+            vec!["change-a".to_string()],
+            "the visible resolve pending must be scheduler-consumable retry membership"
+        );
+        assert_eq!(
+            harness.scheduler.started_targets(),
+            vec![Vec::<String>::new()]
+        );
+        assert!(harness.resolves.is_active());
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
+    }
+
+    #[tokio::test]
+    async fn resolve_merge_without_startup_workspace_evidence_is_refused() {
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        assert_eq!(harness.status("change-a").await, "not queued");
+
+        harness
+            .run(&mut app, TuiCommand::ResolveMerge("change-a".to_string()))
+            .await;
+
+        assert_eq!(log_count(&app, "was not accepted by scheduler state"), 1);
+        assert!(app.warning_message.is_some());
+        assert!(harness.scheduler.calls().is_empty());
+        assert!(!harness.resolves.is_active());
+        assert!(harness
+            .state
+            .read()
+            .await
+            .resolve_wait_change_ids()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn test_resolve_merge_starts_scheduler_when_idle() {
         let harness = AdapterHarness::new(&["change-a"]);
