@@ -1,4 +1,4 @@
-.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy check pre-commit audit openapi check-openapi publish build-linux build-linux-x86 build-linux-arm
+.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy check pre-commit audit publish build-linux build-linux-x86 build-linux-arm
 
 # Ensure rustup-managed toolchain is used (not Homebrew rustc)
 RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-$(shell rustup show active-toolchain 2>/dev/null | awk '{print $$1}' | sed 's/^stable-//')/bin
@@ -128,20 +128,6 @@ bump-major:
 	./scripts/bump.sh major
 	@echo "Major version bumped and tagged successfully"
 
-# The one canonical /api/v2 contract in this repository. Generated from
-# src/web/openapi.rs; never hand-edited. There is no second OpenAPI file.
-OPENAPI_ARTIFACT := docs/openapi.yaml
-
-# Regenerate the canonical OpenAPI artifact.
-openapi:
-	@echo "Generating $(OPENAPI_ARTIFACT)..."
-	@mkdir -p $(dir $(OPENAPI_ARTIFACT))
-	@tmp="$$(mktemp "$${TMPDIR:-/tmp}/cflx-openapi.XXXXXX")"; \
-	trap 'rm -f "$$tmp"' EXIT INT TERM; \
-	cargo run --quiet --bin openapi-gen --features web-monitoring > "$$tmp" || exit 1; \
-	mv "$$tmp" $(OPENAPI_ARTIFACT)
-	@echo "OpenAPI specification generated at $(OPENAPI_ARTIFACT)"
-
 # Publish to crates.io (requires `cargo login` beforehand)
 publish: check
 	@echo "Publishing to crates.io..."
@@ -151,24 +137,3 @@ publish: check
 publish-dry-run: check
 	@echo "Running crates.io dry-run..."
 	cargo publish --dry-run --allow-dirty
-
-# Fail on any drift between the code and the canonical OpenAPI artifact.
-#
-# Read-only by construction: generation goes to a private temporary file and the
-# check never writes to the working tree, so running it can neither hide drift
-# nor disturb unrelated edits. The diff is the error message — it names the route,
-# field, enum member, or security declaration that moved.
-check-openapi:
-	@echo "Checking $(OPENAPI_ARTIFACT) against the generated contract..."
-	@tmp="$$(mktemp "$${TMPDIR:-/tmp}/cflx-openapi-check.XXXXXX")"; \
-	trap 'rm -f "$$tmp"' EXIT INT TERM; \
-	cargo run --quiet --bin openapi-gen --features web-monitoring > "$$tmp" || exit 1; \
-	if ! diff -u $(OPENAPI_ARTIFACT) "$$tmp"; then \
-		echo ""; \
-		echo "ERROR: $(OPENAPI_ARTIFACT) does not match the generated contract."; \
-		echo "       Run 'make openapi' and commit the result."; \
-		exit 1; \
-	fi; \
-	echo "$(OPENAPI_ARTIFACT) matches the generated contract."
-	@echo "Running canonical-artifact contract assertions..."
-	@cargo test --quiet --features web-monitoring --test openapi_contract_tests

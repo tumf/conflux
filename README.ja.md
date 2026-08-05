@@ -129,7 +129,7 @@ cargo install cflx
 | [CONTRIBUTING.md](CONTRIBUTING.md) | コントリビューションガイド |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | 開発ガイド |
 | [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | リリースガイド |
-| [docs/openapi.yaml](docs/openapi.yaml) | `/api/v2` の正規契約（自動生成） |
+| `cflx openapi` / `GET /api/v2/openapi.yaml` | `/api/v2` の正規契約（実行時に生成。リポジトリでは追跡しない） |
 
 ## ライセンス
 

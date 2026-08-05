@@ -146,8 +146,20 @@ fn selector_matches_rust_impacting_paths_only() {
 fn non_rust_local_hooks_keep_running_unconditionally() {
     let config = config();
 
-    for id in ["beads-pre-commit", "openapi-contract"] {
-        let hook = local_hook(&config, id);
+    // Derived rather than listed: only the two Rust hooks are path-scoped, so
+    // any other local hook — present or future — must keep running on every
+    // commit rather than inherit the narrowing by accident.
+    let non_rust: Vec<&Value> = local_hooks(&config)
+        .into_iter()
+        .filter(|hook| !matches!(hook["id"].as_str(), Some("rustfmt") | Some("clippy")))
+        .collect();
+    assert!(
+        !non_rust.is_empty(),
+        "the local repo must still declare at least one non-Rust hook"
+    );
+
+    for hook in non_rust {
+        let id = hook["id"].as_str().expect("every local hook needs an id");
         assert_eq!(
             hook["always_run"].as_bool(),
             Some(true),

@@ -311,32 +311,31 @@ Parallel start MUST validate the complete marked target set at the admitted revi
 
 ### Requirement: Canonical OpenAPI ownership
 
-The repository MUST define one source-generated OpenAPI artifact as the tracked contract of `/api/v2`. Every supported v2 route and schema MUST appear in that deterministically generated artifact. Duplicate artifacts MUST either be removed or generated deterministically from the same source and ownership rule. Stale legacy routes MUST NOT appear as supported API paths.
+The generated OpenAPI document produced from the source declarations MUST be the canonical contract of `/api/v2`; the repository MUST NOT track a generated OpenAPI YAML or JSON artifact. Every supported v2 route and schema MUST appear in the deterministic document exposed by both `cflx openapi` and `GET /api/v2/openapi.yaml`. Stale legacy routes MUST NOT appear as supported API paths.
 
-#### Scenario: Canonical artifact matches generated contract
+#### Scenario: CLI and live endpoint share the canonical contract
 
-**Given**: The repository is clean
-**When**: The documented OpenAPI generation and check commands run
-**Then**: Generation is byte-for-byte deterministic
-**And**: The tracked canonical artifact has no diff
-**And**: All supported v2 routes and schemas are present
+**Given**: one `cflx` build with web monitoring enabled
+**When**: a client captures `cflx openapi` and `GET /api/v2/openapi.yaml`
+**Then**: both outputs contain the same deterministic OpenAPI document
+**And**: all supported v2 routes and schemas are present
 
-#### Scenario: Contract drift fails validation
+#### Scenario: Contract completeness fails validation
 
-**Given**: A route, DTO field, command variant, error code, event envelope, or security declaration changes without regenerating the canonical artifact
-**When**: `make check-openapi` runs
-**Then**: The check fails with a useful diff
-**And**: It does not overwrite unrelated working-tree changes
+**Given**: a route, DTO field, command variant, error code, event envelope, or security declaration is absent from the generated contract
+**When**: repository-local OpenAPI contract verification runs
+**Then**: verification fails with an assertion identifying the missing contract element
+**And**: verification does not write generated artifacts into the working tree
 
-#### Scenario: Consumer uses the canonical artifact
+#### Scenario: Consumer exports the canonical contract
 
-**Given**: A generated client or schema assertion consumes the v2 contract
-**When**: Repository-local verification runs
-**Then**: It reads the canonical artifact
-**And**: It compiles or validates every current command and authoritative snapshot field
+**Given**: a generated client or schema assertion needs the v2 contract
+**When**: it invokes `cflx openapi` or reads the live OpenAPI endpoint
+**Then**: it receives the canonical generated document
+**And**: it can validate every current command and authoritative snapshot field
 
 #### Scenario: Security and recovery semantics are documented
 
-**Given**: A client reads the canonical API contract
-**When**: It inspects authentication, events, commands, and worktree schemas
-**Then**: It can identify bearer-header authentication, fetch-streamed SSE, process incarnation, replay-gap resnapshot, revision and idempotency rules, and opaque worktree safety
+**Given**: a client reads the generated canonical API contract
+**When**: it inspects authentication, events, commands, and worktree schemas
+**Then**: it can identify bearer-header authentication, fetch-streamed SSE, process incarnation, replay-gap resnapshot, revision and idempotency rules, and opaque worktree safety

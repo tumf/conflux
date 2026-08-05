@@ -83,18 +83,26 @@ The AGENTS.md SHALL accurately document the current project structure and module
 - **AND** each dependency has its purpose described
 
 ### Requirement: OpenAPI YAML generation
-ドキュメントは Web 監視 API の OpenAPI 3.1 形式の YAML をコードから自動生成し、`docs/openapi.yaml` として提供しなければならない（SHALL）。OpenAPI YAML は手動編集してはならない（MUST NOT）。
 
-#### Scenario: 生成コマンドで更新する
-- **WHEN** 開発者が `make openapi` を実行する
-- **THEN** `docs/openapi.yaml` が最新の仕様で生成される
-- **AND** `GET /api/health`, `GET /api/state`, `GET /api/changes`, `GET /api/changes/{id}` の仕様が含まれる
-- **AND** 変更の承認 API と WebSocket `/ws` が記載される
+ドキュメントは Web 監視 API の OpenAPI 3.1 YAML をコードから動的に生成し、`cflx openapi` および `GET /api/v2/openapi.yaml` で提供しなければならない（SHALL）。リポジトリは生成済み OpenAPI YAML/JSON を追跡してはならない（MUST NOT）。
 
-#### Scenario: 生成差分を検知する
-- **WHEN** API 実装が変更され、生成結果がリポジトリと一致しない
-- **THEN** `make check-openapi` は失敗する
-- **AND** CI は差分を検知して失敗する
+#### Scenario: CLIでスキーマを出力する
+
+- **WHEN** 開発者が `cflx openapi` を実行する
+- **THEN** 標準出力に最新の `/api/v2` OpenAPI YAML が出力される
+- **AND** 出力はファイルへリダイレクトして利用できる
+
+#### Scenario: ライブAPIからスキーマを取得する
+
+- **WHEN** クライアントが `GET /api/v2/openapi.yaml` を要求する
+- **THEN** `cflx openapi` と同じ生成元の最新仕様が返される
+- **AND** 生成済みスキーマファイルをリポジトリへ保存する必要がない
+
+#### Scenario: 生成契約を検証する
+
+- **WHEN** API実装または公開スキーマが変更される
+- **THEN** repository-local contract tests は生成ドキュメントのルート・スキーマ・セキュリティ宣言を検証する
+- **AND** CLI出力とライブAPI出力の不一致を検知して失敗する
 
 ### Requirement: Git hooks ツールの案内
 README.md、README.ja.md、DEVELOPMENT.md は Git hooks 管理に prek を使用することを明示し、インストール/フック導入/実行方法を記載しなければならない（SHALL）。

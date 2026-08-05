@@ -129,7 +129,7 @@ cargo install cflx
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Hướng dẫn đóng góp |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | Hướng dẫn phát triển |
 | [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | Hướng dẫn phát hành |
-| [docs/openapi.yaml](docs/openapi.yaml) | Hợp đồng `/api/v2` chuẩn (được sinh tự động) |
+| `cflx openapi` / `GET /api/v2/openapi.yaml` | Hợp đồng `/api/v2` chuẩn (sinh lúc chạy, không lưu trong kho mã) |
 
 ## Giấy phép
 

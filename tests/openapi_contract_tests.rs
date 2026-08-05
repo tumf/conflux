@@ -1,26 +1,30 @@
-//! Contract assertions against the canonical tracked OpenAPI artifact.
+//! Contract assertions against the generated `/api/v2` OpenAPI document.
 //!
-//! `docs/openapi.yaml` is the one artifact a generated consumer is allowed to
-//! read, so this file behaves like that consumer: it loads the *tracked file*
-//! rather than the in-memory document wherever the question is "would a client
-//! reading the repository get the right answer?".
+//! This repository tracks no OpenAPI file. The contract exists in exactly two
+//! places a consumer can reach — `cflx openapi` and `GET /api/v2/openapi.yaml` —
+//! and both are the same function, so there is no artifact to keep in sync and
+//! no drift check to run. What replaces the drift check is *completeness*:
 //!
-//! Two independent properties are enforced here, and they fail for different
-//! reasons on purpose:
-//!
-//! * **The artifact is current.** Regenerating must reproduce the tracked bytes
-//!   exactly. `make check-openapi` proves this from a shell too; the test proves
-//!   it inside `cargo test` so a plain `make test` cannot miss it.
-//! * **The artifact is complete.** Every supported route, command variant, error
-//!   code, event category, security declaration, and required response field is
-//!   present — and nothing removed has crept back in. A regenerated-but-wrong
-//!   artifact passes the first property and fails this one.
+//! * **The document is complete.** Every supported route, command variant, error
+//!   code, event category, security declaration, and required published field is
+//!   present — and nothing removed has crept back in. A document that generates
+//!   cleanly and still says too little fails here.
+//! * **The document is the one consumers get.** The bytes `cflx openapi` writes
+//!   and the bytes the router serves are compared directly, so an export path
+//!   cannot quietly diverge from the live one.
+//! * **The completeness check would notice.** Positive assertions can never
+//!   establish that about themselves, so the same predicates are also run against
+//!   deliberately incomplete copies of the document, which must fail.
 //!
 //! The payload checks are the "generated consumer compiles" property expressed in
 //! Rust: the DTO values below are constructed field by field from the real types,
 //! so adding a field to a published response forces this file to change, and the
 //! structural validator then proves the published schema describes what those
 //! types actually serialize to.
+//!
+//! ```text
+//! cargo test --features web-monitoring --test openapi_contract_tests
+//! ```
 
 #![cfg(feature = "web-monitoring")]
 
@@ -41,9 +45,6 @@ use conflux::web::remote_control_api::dto::{
 use conflux::web::remote_control_api::worktrees::{
     WorktreeConflict, WorktreeEligibility, WorktreeResource, WorktreeResponse,
 };
-
-/// The path a consumer is told to read, relative to the repository root.
-const CANONICAL_ARTIFACT: &str = "docs/openapi.yaml";
 
 /// Paths this repository removed. None of them may reappear as supported API.
 ///
@@ -73,19 +74,78 @@ const REMOVED_PATHS: &[&str] = &[
     "/api/v1/stats/projects/{id}/history",
 ];
 
+/// Fields a client cannot work without, per published schema.
+///
+/// These are the members a consumer branches on rather than merely reads:
+/// stream ordering, optimistic-concurrency revisions, command identity, and
+/// error dispatch. Publishing them as optional would compile a client that
+/// silently tolerates their absence, which is exactly the failure a schema is
+/// supposed to prevent.
+const REQUIRED_MEMBERS: &[(&str, &[&str])] = &[
+    (
+        "StateResponse",
+        &[
+            "instance_id",
+            "state_revision",
+            "event_sequence",
+            "snapshot",
+        ],
+    ),
+    (
+        "EventEnvelope",
+        &[
+            "instance_id",
+            "event_sequence",
+            "state_revision",
+            "category",
+            "event_type",
+            "timestamp",
+        ],
+    ),
+    (
+        "CommandRecord",
+        &[
+            "command_id",
+            "instance_id",
+            // `command_type` on the wire; the discriminant a client dispatches on.
+            "type",
+            "state",
+            "expected_revision",
+            "correlation_id",
+            "idempotency_key",
+        ],
+    ),
+    ("ApiError", &["error_code", "message", "correlation_id"]),
+    (
+        "WorktreeResponse",
+        &["instance_id", "state_revision", "worktree"],
+    ),
+];
+
+/// Snapshot members an operator console decides from.
+///
+/// A silently dropped member is the drift most likely to go unnoticed: the
+/// payload still validates, it just says less.
+const REQUIRED_CHANGE_FIELDS: &[&str] = &[
+    "queue_intent",
+    "attention",
+    "actions",
+    "parallel",
+    "timing",
+    "blocker",
+    "latest_activity",
+    "worktree",
+    "execution_marked",
+    "error_detail",
+];
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn artifact_text() -> String {
-    let path = repo_root().join(CANONICAL_ARTIFACT);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("canonical artifact {} is unreadable: {e}", path.display()))
-}
-
-/// The tracked artifact parsed as JSON, which is what a consumer works with.
-fn artifact() -> Value {
-    serde_yaml::from_str(&artifact_text()).expect("canonical artifact must be valid YAML")
+/// The generated contract, parsed as JSON — which is what a consumer works with.
+fn generated() -> Value {
+    serde_yaml::from_str(&document_yaml()).expect("the generated document must be valid YAML")
 }
 
 fn schemas(doc: &Value) -> &Value {
@@ -93,17 +153,8 @@ fn schemas(doc: &Value) -> &Value {
 }
 
 // ============================================================================
-// The artifact is current
+// The document consumers actually get
 // ============================================================================
-
-#[test]
-fn tracked_artifact_matches_the_generated_document() {
-    assert_eq!(
-        artifact_text(),
-        document_yaml(),
-        "{CANONICAL_ARTIFACT} is stale. Run `make openapi` and commit the result."
-    );
-}
 
 #[test]
 fn generation_is_byte_for_byte_deterministic() {
@@ -114,118 +165,94 @@ fn generation_is_byte_for_byte_deterministic() {
     );
 }
 
+/// A copy of a generated document outlives the build that produced it, so the
+/// document has to carry its own provenance and its own export instructions —
+/// naming the two ways to regenerate it and nothing that no longer exists.
 #[test]
-fn the_artifact_declares_itself_generated() {
+fn the_document_carries_current_export_instructions() {
+    let text = document_yaml();
     assert!(
-        artifact_text().starts_with(GENERATED_BANNER),
-        "{CANONICAL_ARTIFACT} must open with the generated-file banner so it is never hand-edited"
+        text.starts_with(GENERATED_BANNER),
+        "the generated document must open with the generated-document banner"
     );
+    assert!(
+        GENERATED_BANNER.contains("cflx openapi"),
+        "the banner must name the CLI export path"
+    );
+    assert!(
+        GENERATED_BANNER.contains("/api/v2/openapi.yaml"),
+        "the banner must name the live endpoint"
+    );
+    for removed in ["docs/openapi.yaml", "make openapi", "make check-openapi"] {
+        assert!(
+            !text.contains(removed),
+            "the generated document still points at `{removed}`, which no longer exists"
+        );
+    }
 }
 
-/// Everything else here proves the artifact is *currently* right. This proves
-/// the check would notice if it stopped being right — the one property a suite
-/// of positive assertions can never establish about itself.
+/// The export path and the live path must be one document, byte for byte.
 ///
-/// A scratch copy of the artifact is drifted by dropping a required field, then
-/// run through the exact predicate `make check-openapi` uses (`diff -u tracked
-/// generated`, whose exit status is the target's pass/fail). The failure has to
-/// name the field that moved, because a diff that does not is not a useful
-/// error message. Regenerating over the fixture — the byte-for-byte effect of
-/// `make openapi` — then has to clear it.
-///
-/// The fixture is a private copy in a scratch directory: the check must be
-/// provable without the tracked artifact ever being written to.
-#[test]
-fn the_drift_check_fails_on_a_mutated_schema_and_passes_after_regeneration() {
-    let dir = scratch_dir("drift-fixture");
-    let tracked = dir.join("openapi.yaml");
-    let generated = dir.join("generated.yaml");
-    std::fs::write(&generated, document_yaml()).expect("scratch generated artifact");
+/// `cflx openapi` is the offline half of the contract surface. Comparing the
+/// process's stdout against the router's response body is the only check that
+/// covers both halves end to end: a CLI layer that added a preamble, trimmed a
+/// newline, or served a stale document would pass every structural assertion in
+/// this file and still hand a consumer different bytes than the server does.
+#[tokio::test]
+async fn the_cli_export_and_the_live_endpoint_serve_identical_bytes() {
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
 
-    // An omitted required field is the drift a reviewer is least likely to
-    // catch by eye and a generated client is most likely to trust.
-    let drifted = without_required_event_sequence(&artifact_text());
-    assert_ne!(drifted, document_yaml(), "the fixture must actually drift");
-    std::fs::write(&tracked, &drifted).expect("scratch drifted artifact");
+    let response = protected_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v2/openapi.yaml")
+                .header("host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("the contract route answers without credentials");
+    let served = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the contract body is readable");
 
-    let (matches, diff) = unified_diff(&tracked, &generated);
-    assert!(
-        !matches,
-        "the drift check accepted an artifact whose EventEnvelope no longer requires event_sequence"
-    );
-    assert!(
-        diff.contains("event_sequence"),
-        "the drift failure must name what moved, got:\n{diff}"
-    );
-
-    std::fs::write(&tracked, document_yaml()).expect("regenerate scratch artifact");
-    let (matches, diff) = unified_diff(&tracked, &generated);
-    assert!(matches, "regeneration must clear the drift, got:\n{diff}");
-
-    std::fs::remove_dir_all(&dir).expect("scratch dir is removable");
-}
-
-/// The comparison `check-openapi` performs, run the same way the target runs it.
-fn unified_diff(tracked: &Path, generated: &Path) -> (bool, String) {
-    let output = std::process::Command::new("diff")
-        .arg("-u")
-        .arg(tracked)
-        .arg(generated)
+    let exported = std::process::Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .arg("openapi")
+        // Outside the repository, so the export cannot be reading anything local.
+        .current_dir(std::env::temp_dir())
         .output()
-        .expect("diff(1) is available; check-openapi depends on it too");
-    (
-        output.status.success(),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-    )
-}
-
-fn scratch_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("cflx-openapi-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch directory is creatable");
-    dir
-}
-
-/// Drop `event_sequence` from `EventEnvelope`'s required list, touching no other
-/// byte so the resulting diff is exactly the one line that drifted.
-fn without_required_event_sequence(text: &str) -> String {
-    const SCHEMA: &str = "\n    EventEnvelope:\n";
-    const ENTRY: &str = "\n      - event_sequence\n";
-    let schema_at = text
-        .find(SCHEMA)
-        .expect("EventEnvelope is a published schema");
-    let entry_at = text[schema_at..]
-        .find(ENTRY)
-        .map(|offset| schema_at + offset)
-        .expect("EventEnvelope requires event_sequence");
-    let mut drifted = String::with_capacity(text.len());
-    drifted.push_str(&text[..=entry_at]);
-    drifted.push_str(&text[entry_at + ENTRY.len()..]);
-    drifted
-}
-
-#[test]
-fn the_repository_tracks_exactly_one_openapi_artifact() {
-    // A second file cannot be kept honest, and a stale one is worse than none
-    // because a generated consumer will believe it.
-    let stray = repo_root().join("openapi.yaml");
+        .expect("the cflx binary under test is runnable");
     assert!(
-        !stray.exists(),
-        "{} duplicates the canonical contract; {CANONICAL_ARTIFACT} is the only OpenAPI artifact",
-        stray.display()
+        exported.status.success(),
+        "cflx openapi failed: {}",
+        String::from_utf8_lossy(&exported.stderr)
     );
 
+    assert_eq!(
+        String::from_utf8(exported.stdout).expect("the export is UTF-8"),
+        String::from_utf8(served.to_vec()).expect("the served body is UTF-8"),
+        "cflx openapi and GET /api/v2/openapi.yaml must serve the same document"
+    );
+}
+
+/// A tracked schema file is the failure mode this change removed: it is a second
+/// representation that cannot be kept honest, and a stale one is worse than none
+/// because a generated consumer will believe it.
+#[test]
+fn the_repository_tracks_no_openapi_artifact() {
     let mut found = Vec::new();
     collect_openapi_files(&repo_root(), 0, &mut found);
-    assert_eq!(
-        found,
-        vec![repo_root().join(CANONICAL_ARTIFACT)],
-        "exactly one tracked OpenAPI artifact is allowed"
+    assert!(
+        found.is_empty(),
+        "the contract is generated, not tracked; these files duplicate it: {found:?}"
     );
 }
 
 /// Walk the working tree for OpenAPI-looking files, skipping build and vendor
-/// output that is not part of the tracked contract.
+/// output that is not part of the repository's own content.
 fn collect_openapi_files(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
     const SKIP: &[&str] = &["target", "node_modules", ".git", ".codegraph", ".beads"];
     if depth > 4 {
@@ -252,36 +279,415 @@ fn collect_openapi_files(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 }
 
 // ============================================================================
-// The route surface
+// Completeness predicates
+//
+// Each returns the assertion failures it found rather than panicking, so the
+// same predicate can be run against the real document (which must produce none)
+// and against a deliberately incomplete copy (which must produce some).
+// ============================================================================
+
+/// Every completeness predicate, run over one document.
+fn contract_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    errors.extend(route_surface_errors(doc));
+    errors.extend(removed_path_errors(doc));
+    errors.extend(security_errors(doc));
+    errors.extend(command_vocabulary_errors(doc));
+    errors.extend(error_code_errors(doc));
+    errors.extend(event_vocabulary_errors(doc));
+    errors.extend(reference_errors(doc));
+    errors.extend(required_member_errors(doc));
+    errors.extend(payload_errors(doc));
+    errors.extend(snapshot_field_errors(doc));
+    errors
+}
+
+fn published_paths(doc: &Value) -> BTreeSet<String> {
+    doc["paths"]
+        .as_object()
+        .map(|paths| paths.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn route_surface_errors(doc: &Value) -> Vec<String> {
+    let published = published_paths(doc);
+    let supported: BTreeSet<String> = SUPPORTED_V2_PATHS.iter().map(|p| p.to_string()).collect();
+    let mut errors = Vec::new();
+    for missing in supported.difference(&published) {
+        errors.push(format!(
+            "{missing} is a supported route but is not published"
+        ));
+    }
+    for extra in published.difference(&supported) {
+        errors.push(format!(
+            "{extra} is published but is not a supported v2 route"
+        ));
+    }
+    errors
+}
+
+fn removed_path_errors(doc: &Value) -> Vec<String> {
+    let published = published_paths(doc);
+    let mut errors = Vec::new();
+    for removed in REMOVED_PATHS {
+        if published.contains(*removed) {
+            errors.push(format!(
+                "{removed} was removed from this server but is still published as supported API"
+            ));
+        }
+    }
+    for path in &published {
+        if !path.starts_with("/api/v2/") {
+            errors.push(format!(
+                "{path} is outside the only namespace this process serves"
+            ));
+        }
+    }
+    errors
+}
+
+fn security_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let scheme = &doc["components"]["securitySchemes"][BEARER_SCHEME];
+    if scheme["type"] != "http" || scheme["scheme"] != "bearer" {
+        errors.push(format!("{BEARER_SCHEME} is not declared as HTTP bearer"));
+    }
+    if !scheme["description"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Authorization")
+    {
+        errors.push("the bearer scheme must name the header credentials are accepted in".into());
+    }
+
+    match doc["security"].as_array() {
+        Some(global) if global.iter().any(|req| req.get(BEARER_SCHEME).is_some()) => {}
+        _ => errors.push(format!("the document default must require {BEARER_SCHEME}")),
+    }
+
+    let empty = serde_json::Map::new();
+    for (path, item) in doc["paths"].as_object().unwrap_or(&empty) {
+        for (method, operation) in item.as_object().unwrap_or(&empty) {
+            let declared = operation.get("security").and_then(Value::as_array);
+            if UNAUTHENTICATED_V2_PATHS.contains(&path.as_str()) {
+                if declared.map(Vec::len) != Some(0) {
+                    errors.push(format!(
+                        "{method} {path} is unauthenticated and must override the default with `security: []`"
+                    ));
+                }
+            } else if declared.is_some() {
+                errors.push(format!(
+                    "{method} {path} must inherit the document-wide bearer requirement"
+                ));
+            }
+        }
+    }
+    errors
+}
+
+fn published_enum(doc: &Value, schema: &str) -> BTreeSet<String> {
+    schemas(doc)[schema]["enum"]
+        .as_array()
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn command_vocabulary_errors(doc: &Value) -> Vec<String> {
+    let Some(variants) = schemas(doc)["CommandSpec"]["oneOf"].as_array() else {
+        return vec!["CommandSpec must be a discriminated union".into()];
+    };
+
+    let mut errors = Vec::new();
+    let mut published = BTreeSet::new();
+    for variant in variants {
+        match variant["properties"]["type"]["enum"][0].as_str() {
+            Some(discriminant) => {
+                published.insert(discriminant.to_string());
+            }
+            None => errors.push(format!(
+                "a command variant does not pin its `type`: {variant}"
+            )),
+        }
+        let required: Vec<&str> = variant["required"]
+            .as_array()
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if !required.contains(&"type") {
+            errors.push(format!(
+                "a command variant that does not require `type` cannot be dispatched: {variant}"
+            ));
+        }
+    }
+
+    let supported: BTreeSet<String> = SUPPORTED_COMMANDS.iter().map(|c| c.to_string()).collect();
+    for missing in supported.difference(&published) {
+        errors.push(format!(
+            "the command `{missing}` is accepted but is not published"
+        ));
+    }
+    for extra in published.difference(&supported) {
+        errors.push(format!(
+            "the command `{extra}` is published but is not accepted"
+        ));
+    }
+    errors
+}
+
+fn error_code_errors(doc: &Value) -> Vec<String> {
+    let published = published_enum(doc, "ErrorCode");
+    let known: BTreeSet<String> = ALL_ERROR_CODES
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect();
+
+    let mut errors = Vec::new();
+    for missing in known.difference(&published) {
+        errors.push(format!(
+            "the error code `{missing}` can be emitted but is not published"
+        ));
+    }
+    for extra in published.difference(&known) {
+        errors.push(format!(
+            "the error code `{extra}` is published but is never emitted"
+        ));
+    }
+    errors
+}
+
+fn event_vocabulary_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let states = published_enum(doc, "CommandState");
+    let known_states = serialized_names(&[
+        CommandState::Running,
+        CommandState::Succeeded,
+        CommandState::NoOp,
+        CommandState::Failed,
+    ]);
+    for missing in known_states.difference(&states) {
+        errors.push(format!(
+            "the command outcome `{missing}` is reachable but is not published"
+        ));
+    }
+
+    let categories = published_enum(doc, "EventCategory");
+    let known_categories =
+        serialized_names(&[EventCategory::State, EventCategory::Log, EventCategory::Gap]);
+    for missing in known_categories.difference(&categories) {
+        errors.push(format!(
+            "the event category `{missing}` is emitted but is not published"
+        ));
+    }
+    if !categories.contains("gap") {
+        errors.push("the replay-gap category is what tells a client to resnapshot".into());
+    }
+    errors
+}
+
+fn serialized_names<T: serde::Serialize>(values: &[T]) -> BTreeSet<String> {
+    values
+        .iter()
+        .map(|value| {
+            serde_json::to_value(value)
+                .expect("closed vocabularies serialize")
+                .as_str()
+                .expect("closed vocabularies serialize as strings")
+                .to_string()
+        })
+        .collect()
+}
+
+fn reference_errors(doc: &Value) -> Vec<String> {
+    let defined: BTreeSet<String> = schemas(doc)
+        .as_object()
+        .map(|s| s.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let mut referenced = BTreeSet::new();
+    collect_refs(doc, &mut referenced);
+
+    let mut errors = Vec::new();
+    for dangling in referenced.difference(&defined) {
+        errors.push(format!(
+            "the schema `{dangling}` is referenced but never defined"
+        ));
+    }
+    for orphan in defined.difference(&referenced) {
+        errors.push(format!(
+            "the schema `{orphan}` is defined but unreachable from any operation"
+        ));
+    }
+    errors
+}
+
+fn collect_refs(value: &Value, into: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == "$ref" {
+                    if let Some(name) = child
+                        .as_str()
+                        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+                    {
+                        into.insert(name.to_string());
+                    }
+                } else {
+                    collect_refs(child, into);
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| collect_refs(item, into)),
+        _ => {}
+    }
+}
+
+fn required_member_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (schema, members) in REQUIRED_MEMBERS {
+        let required: BTreeSet<&str> = schemas(doc)[*schema]["required"]
+            .as_array()
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        for member in *members {
+            if !required.contains(member) {
+                errors.push(format!(
+                    "{schema}.{member} must be published as required; a client branches on it"
+                ));
+            }
+        }
+    }
+    errors
+}
+
+fn payload_errors(doc: &Value) -> Vec<String> {
+    // Each pair is a schema name and a value produced by the real DTO types.
+    // Constructing them field by field is the compile-time half of the check:
+    // a new published field cannot land without this file being updated.
+    let cases: Vec<(&str, Value)> = vec![
+        ("StateResponse", to_value(&state_response())),
+        ("CommandRecord", to_value(&command_record())),
+        ("WorktreeResponse", to_value(&worktree_response())),
+        ("EventEnvelope", to_value(&event_envelope())),
+        ("ApiError", to_value(&api_error())),
+    ];
+
+    let mut errors = Vec::new();
+    for (name, payload) in cases {
+        let schema = &schemas(doc)[name];
+        if schema.is_null() {
+            errors.push(format!("{name} is served by this API but is not published"));
+            continue;
+        }
+        validate(&payload, schema, schemas(doc), name, &mut errors);
+    }
+    errors
+}
+
+fn snapshot_field_errors(doc: &Value) -> Vec<String> {
+    let payload = to_value(&state_response());
+    let change = &payload["snapshot"]["changes"][0];
+
+    let published: BTreeSet<&str> = schemas(doc)["ChangeResource"]["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let serialized: BTreeSet<&str> = change
+        .as_object()
+        .expect("serialized change")
+        .keys()
+        .map(String::as_str)
+        .collect();
+
+    let mut errors = Vec::new();
+    for unpublished in serialized.difference(&published) {
+        errors.push(format!(
+            "the server serializes the change field `{unpublished}` but the contract omits it"
+        ));
+    }
+    for expected in REQUIRED_CHANGE_FIELDS {
+        if !published.contains(expected) {
+            errors.push(format!(
+                "the authoritative snapshot must publish `{expected}`"
+            ));
+        }
+    }
+    errors
+}
+
+// ============================================================================
+// The generated document is complete
 // ============================================================================
 
 #[test]
-fn the_artifact_publishes_exactly_the_supported_route_surface() {
-    let doc = artifact();
-    let published: BTreeSet<String> = doc["paths"]
-        .as_object()
-        .expect("paths object")
-        .keys()
-        .cloned()
-        .collect();
-    let supported: BTreeSet<String> = SUPPORTED_V2_PATHS.iter().map(|p| p.to_string()).collect();
+fn the_document_publishes_exactly_the_supported_route_surface() {
+    assert_eq!(route_surface_errors(&generated()), Vec::<String>::new());
+}
 
+#[test]
+fn no_removed_path_is_presented_as_supported() {
+    assert_eq!(removed_path_errors(&generated()), Vec::<String>::new());
+}
+
+#[test]
+fn bearer_authentication_is_declared_and_scoped() {
+    assert_eq!(security_errors(&generated()), Vec::<String>::new());
+}
+
+#[test]
+fn the_command_schema_covers_exactly_the_supported_command_set() {
     assert_eq!(
-        published, supported,
-        "the published paths and the declared v2 route surface disagree"
+        command_vocabulary_errors(&generated()),
+        Vec::<String>::new()
     );
 }
 
+#[test]
+fn the_error_code_enum_covers_every_typed_error() {
+    assert_eq!(error_code_errors(&generated()), Vec::<String>::new());
+}
+
+#[test]
+fn command_outcome_and_event_vocabularies_are_complete() {
+    assert_eq!(event_vocabulary_errors(&generated()), Vec::<String>::new());
+}
+
+#[test]
+fn every_reference_resolves_and_no_schema_is_unreachable() {
+    assert_eq!(reference_errors(&generated()), Vec::<String>::new());
+}
+
+#[test]
+fn the_members_a_client_branches_on_are_published_as_required() {
+    assert_eq!(required_member_errors(&generated()), Vec::<String>::new());
+}
+
+#[test]
+fn published_schemas_describe_what_the_server_actually_serializes() {
+    assert_eq!(payload_errors(&generated()), Vec::<String>::new());
+}
+
+#[test]
+fn the_authoritative_snapshot_publishes_every_operator_field() {
+    assert_eq!(snapshot_field_errors(&generated()), Vec::<String>::new());
+}
+
+/// Closes the third side of the triangle: the constant and the document could
+/// agree with each other and still describe a route the server never binds.
+///
+/// The probe is credential-free against a token-protected instance, which
+/// separates the two answers cleanly. A gated route refuses with 401 before any
+/// handler runs, so a bound route cannot be mistaken for an unbound one just
+/// because its handler happens to answer 404 for a missing resource; an
+/// unmatched path never reaches the gate at all and falls through to 404.
 #[tokio::test]
 async fn every_published_path_is_bound_with_the_authentication_it_declares() {
-    // Closes the third side of the triangle: the constant and the artifact could
-    // agree with each other and still describe a route the server never binds.
-    //
-    // The probe is credential-free against a token-protected instance, which
-    // separates the two answers cleanly. A gated route refuses with 401 before
-    // any handler runs, so a bound route cannot be mistaken for an unbound one
-    // just because its handler happens to answer 404 for a missing resource;
-    // an unmatched path never reaches the gate at all and falls through to 404.
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
@@ -360,327 +766,157 @@ fn protected_router() -> axum::Router {
     ))
 }
 
-#[test]
-fn no_removed_path_is_presented_as_supported() {
-    let doc = artifact();
-    let paths = doc["paths"].as_object().expect("paths object");
-    for removed in REMOVED_PATHS {
-        assert!(
-            !paths.contains_key(*removed),
-            "{removed} was removed from this server but is still published as supported API"
-        );
-    }
-    for path in paths.keys() {
-        assert!(
-            path.starts_with("/api/v2/"),
-            "{path} is outside the only namespace this process serves"
-        );
-    }
-}
-
 // ============================================================================
-// Security declarations
+// The completeness check would notice
 // ============================================================================
 
+/// One incompleteness fixture: what it does to the document, the substring the
+/// resulting failure must name, and the mutation that removes the contract element.
+type IncompleteCase = (&'static str, &'static str, Box<dyn Fn(&mut Value)>);
+
+/// Everything above proves the document is *currently* complete. This proves the
+/// check would notice if it stopped being complete — the one property a suite of
+/// positive assertions can never establish about itself.
+///
+/// Each case removes exactly one contract element from a private copy of the
+/// document and requires the predicates to fail *and* to name what went missing,
+/// because a failure that does not identify the element is not a useful error
+/// message. The real document is never written to or mutated.
 #[test]
-fn bearer_authentication_is_declared_and_scoped() {
-    let doc = artifact();
-
-    let scheme = &doc["components"]["securitySchemes"][BEARER_SCHEME];
-    assert_eq!(scheme["type"], "http", "bearer scheme must be declared");
-    assert_eq!(scheme["scheme"], "bearer");
-    let description = scheme["description"].as_str().unwrap_or_default();
-    assert!(
-        description.contains("Authorization"),
-        "the scheme must name the header credentials are accepted in"
-    );
-
-    let global = doc["security"]
-        .as_array()
-        .expect("a document-wide security requirement");
-    assert!(
-        global.iter().any(|req| req.get(BEARER_SCHEME).is_some()),
-        "the document default must require {BEARER_SCHEME}"
-    );
-
-    let paths = doc["paths"].as_object().expect("paths object");
-    for (path, item) in paths {
-        for (method, operation) in item.as_object().expect("path item") {
-            let declared = operation.get("security").and_then(Value::as_array);
-            if UNAUTHENTICATED_V2_PATHS.contains(&path.as_str()) {
-                assert_eq!(
-                    declared.map(Vec::len),
-                    Some(0),
-                    "{method} {path} is unauthenticated and must override the default with `security: []`"
-                );
-            } else {
-                assert!(
-                    declared.is_none(),
-                    "{method} {path} must inherit the document-wide bearer requirement"
-                );
-            }
-        }
-    }
-}
-
-// ============================================================================
-// Closed vocabularies
-// ============================================================================
-
-#[test]
-fn the_command_schema_covers_exactly_the_supported_command_set() {
-    let doc = artifact();
-    let variants = schemas(&doc)["CommandSpec"]["oneOf"]
-        .as_array()
-        .expect("CommandSpec must be a discriminated union");
-
-    let published: BTreeSet<String> = variants
-        .iter()
-        .map(|variant| {
-            variant["properties"]["type"]["enum"][0]
-                .as_str()
-                .expect("each variant must pin its `type` discriminant")
-                .to_string()
-        })
-        .collect();
-    let supported: BTreeSet<String> = SUPPORTED_COMMANDS.iter().map(|c| c.to_string()).collect();
-
-    assert_eq!(
-        published, supported,
-        "the published command union and the advertised command set disagree"
-    );
-}
-
-#[test]
-fn every_command_variant_requires_its_discriminant() {
-    let doc = artifact();
-    for variant in schemas(&doc)["CommandSpec"]["oneOf"]
-        .as_array()
-        .expect("CommandSpec union")
-    {
-        let required: Vec<&str> = variant["required"]
-            .as_array()
-            .map(|r| r.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        assert!(
-            required.contains(&"type"),
-            "a command variant that does not require `type` cannot be dispatched: {variant}"
-        );
-    }
-}
-
-#[test]
-fn the_error_code_enum_covers_every_typed_error() {
-    let doc = artifact();
-    let published: BTreeSet<String> = schemas(&doc)["ErrorCode"]["enum"]
-        .as_array()
-        .expect("ErrorCode enum")
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
-    let known: BTreeSet<String> = ALL_ERROR_CODES
-        .iter()
-        .map(|c| c.as_str().to_string())
-        .collect();
-
-    assert_eq!(
-        published, known,
-        "the published error vocabulary and the codes the server can emit disagree"
-    );
-}
-
-#[test]
-fn command_outcome_and_event_vocabularies_are_complete() {
-    let doc = artifact();
-
-    let states: BTreeSet<String> = schemas(&doc)["CommandState"]["enum"]
-        .as_array()
-        .expect("CommandState enum")
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
-    let known_states: BTreeSet<String> = [
-        CommandState::Running,
-        CommandState::Succeeded,
-        CommandState::NoOp,
-        CommandState::Failed,
-    ]
-    .iter()
-    .map(|s| {
-        serde_json::to_value(s)
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string()
-    })
-    .collect();
-    assert_eq!(
-        states, known_states,
-        "command outcomes must all be published"
-    );
-
-    let categories: BTreeSet<String> = schemas(&doc)["EventCategory"]["enum"]
-        .as_array()
-        .expect("EventCategory enum")
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
-    let known_categories: BTreeSet<String> =
-        [EventCategory::State, EventCategory::Log, EventCategory::Gap]
-            .iter()
-            .map(|c| {
-                serde_json::to_value(c)
+fn incomplete_contracts_are_rejected_and_the_failure_names_what_is_missing() {
+    let cases: Vec<IncompleteCase> = vec![
+        (
+            "a supported route is dropped",
+            "/api/v2/state",
+            Box::new(|doc| {
+                doc["paths"]
+                    .as_object_mut()
                     .unwrap()
-                    .as_str()
+                    .remove("/api/v2/state")
+                    .expect("the route was published");
+            }),
+        ),
+        (
+            "a removed route reappears",
+            "/ws",
+            Box::new(|doc| {
+                let health = doc["paths"]["/api/v2/health"].clone();
+                doc["paths"]
+                    .as_object_mut()
                     .unwrap()
-                    .to_string()
-            })
-            .collect();
-    assert_eq!(
-        categories, known_categories,
-        "event categories must all be published, including the replay `gap`"
-    );
-    assert!(
-        known_categories.contains("gap"),
-        "the replay-gap category is what tells a client to resnapshot"
-    );
-}
-
-// ============================================================================
-// Schema integrity
-// ============================================================================
-
-#[test]
-fn every_reference_resolves_and_no_schema_is_unreachable() {
-    let doc = artifact();
-    let defined: BTreeSet<String> = schemas(&doc)
-        .as_object()
-        .expect("components.schemas")
-        .keys()
-        .cloned()
-        .collect();
-
-    let mut referenced = BTreeSet::new();
-    collect_refs(&doc, &mut referenced);
-
-    let dangling: Vec<&String> = referenced.difference(&defined).collect();
-    assert!(
-        dangling.is_empty(),
-        "these schemas are referenced but never defined: {dangling:?}"
-    );
-
-    let orphans: Vec<&String> = defined.difference(&referenced).collect();
-    assert!(
-        orphans.is_empty(),
-        "these schemas are defined but unreachable from any operation: {orphans:?}"
-    );
-}
-
-fn collect_refs(value: &Value, into: &mut BTreeSet<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                if key == "$ref" {
-                    if let Some(name) = child
-                        .as_str()
-                        .and_then(|r| r.strip_prefix("#/components/schemas/"))
-                    {
-                        into.insert(name.to_string());
-                    }
-                } else {
-                    collect_refs(child, into);
-                }
-            }
-        }
-        Value::Array(items) => items.iter().for_each(|item| collect_refs(item, into)),
-        _ => {}
-    }
-}
-
-// ============================================================================
-// The generated consumer
-// ============================================================================
-
-#[test]
-fn published_schemas_describe_what_the_server_actually_serializes() {
-    let doc = artifact();
-
-    // Each pair is a schema name and a value produced by the real DTO types.
-    // Constructing them field by field is the compile-time half of the check:
-    // a new published field cannot land without this file being updated.
-    let cases: Vec<(&str, Value)> = vec![
-        ("StateResponse", to_value(&state_response())),
-        ("CommandRecord", to_value(&command_record())),
-        ("WorktreeResponse", to_value(&worktree_response())),
-        ("EventEnvelope", to_value(&event_envelope())),
-        ("ApiError", to_value(&api_error())),
+                    .insert("/ws".to_string(), health);
+            }),
+        ),
+        (
+            "a command variant is dropped",
+            "the command",
+            Box::new(|doc| {
+                doc["components"]["schemas"]["CommandSpec"]["oneOf"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop()
+                    .expect("the union has variants");
+            }),
+        ),
+        (
+            "an error code is dropped",
+            "the error code",
+            Box::new(|doc| {
+                doc["components"]["schemas"]["ErrorCode"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop()
+                    .expect("the vocabulary has members");
+            }),
+        ),
+        (
+            "the replay-gap event category is dropped",
+            "gap",
+            Box::new(|doc| {
+                doc["components"]["schemas"]["EventCategory"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|member| member != "gap");
+            }),
+        ),
+        (
+            "the bearer scheme is dropped",
+            BEARER_SCHEME,
+            Box::new(|doc| {
+                doc["components"]["securitySchemes"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(BEARER_SCHEME)
+                    .expect("the scheme was declared");
+            }),
+        ),
+        (
+            "an unauthenticated route stops overriding the default",
+            "/api/v2/health",
+            Box::new(|doc| {
+                doc["paths"]["/api/v2/health"]["get"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("security")
+                    .expect("the override was declared");
+            }),
+        ),
+        (
+            "a required stream-ordering member becomes optional",
+            "event_sequence",
+            Box::new(|doc| {
+                doc["components"]["schemas"]["EventEnvelope"]["required"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|member| member != "event_sequence");
+            }),
+        ),
+        (
+            "a snapshot field is dropped",
+            "queue_intent",
+            Box::new(|doc| {
+                doc["components"]["schemas"]["ChangeResource"]["properties"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("queue_intent")
+                    .expect("the field was published");
+            }),
+        ),
     ];
 
-    for (name, payload) in cases {
-        let schema = &schemas(&doc)[name];
-        assert!(
-            !schema.is_null(),
-            "{name} is served by this API but is not published"
-        );
-        let mut errors = Vec::new();
-        validate(&payload, schema, schemas(&doc), name, &mut errors);
-        assert!(
-            errors.is_empty(),
-            "{name} does not match its published schema:\n  {}",
-            errors.join("\n  ")
-        );
-    }
-}
-
-#[test]
-fn the_authoritative_snapshot_publishes_every_operator_field() {
-    // The snapshot is the field set a controller decides from, so a silently
-    // dropped member is the drift most likely to go unnoticed: the payload still
-    // validates, it just says less.
-    let doc = artifact();
-    let payload = to_value(&state_response());
-    let change = &payload["snapshot"]["changes"][0];
-
-    let published: BTreeSet<&str> = schemas(&doc)["ChangeResource"]["properties"]
-        .as_object()
-        .expect("ChangeResource properties")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    let serialized: BTreeSet<&str> = change
-        .as_object()
-        .expect("serialized change")
-        .keys()
-        .map(String::as_str)
-        .collect();
-
-    assert!(
-        serialized.is_subset(&published),
-        "the server serializes change fields the contract omits: {:?}",
-        serialized.difference(&published).collect::<Vec<_>>()
+    let baseline = generated();
+    assert_eq!(
+        contract_errors(&baseline),
+        Vec::<String>::new(),
+        "the generated contract must start complete"
     );
 
-    for expected in [
-        "queue_intent",
-        "attention",
-        "actions",
-        "parallel",
-        "timing",
-        "blocker",
-        "latest_activity",
-        "worktree",
-        "execution_marked",
-        "error_detail",
-    ] {
+    for (case, expected, mutate) in cases {
+        let mut incomplete = baseline.clone();
+        mutate(&mut incomplete);
+        assert_ne!(
+            incomplete, baseline,
+            "the `{case}` fixture must actually change the document"
+        );
+
+        let errors = contract_errors(&incomplete);
         assert!(
-            published.contains(expected),
-            "the authoritative snapshot must publish `{expected}`"
+            !errors.is_empty(),
+            "contract verification accepted a document where {case}"
+        );
+        assert!(
+            errors.iter().any(|error| error.contains(expected)),
+            "the failure for `{case}` must name `{expected}`, got: {errors:?}"
         );
     }
+
+    // The mutations were applied to private copies; the real contract is intact.
+    assert_eq!(contract_errors(&generated()), Vec::<String>::new());
 }
+
+// ============================================================================
+// Structural validation
+// ============================================================================
 
 fn to_value<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value).expect("DTOs must serialize")

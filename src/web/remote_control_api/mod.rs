@@ -11,9 +11,9 @@
 //! a second unauthenticated contract would only be a way around v2's bearer
 //! policy, revision checks, and typed errors.
 //!
-//! The contract itself is generated from [`crate::web::openapi`] into
-//! `docs/openapi.yaml`, which is the one tracked artifact a consumer should
-//! read.
+//! The contract itself is generated from [`crate::web::openapi`] and never
+//! tracked as a file. A consumer reads it from this endpoint or exports it with
+//! `cflx openapi`; both return the same generated document.
 //!
 //! Everything v2 tracks — `instance_id`, `state_revision`, `event_sequence`, the
 //! command registry — is scoped to one process incarnation and is gone after a
@@ -54,7 +54,7 @@ use worktrees::{UnboundWorktreeOperations, WorktreeListing, WorktreeOperations};
 pub const HEALTH_PATH: &str = "/api/v2/health";
 
 /// This build's canonical contract, byte-for-byte the same document that
-/// `make openapi` writes to `docs/openapi.yaml`.
+/// `cflx openapi` writes to stdout.
 ///
 /// Unauthenticated on purpose: it describes the API and reads no instance state,
 /// so requiring a token here would only stop a client from discovering how to

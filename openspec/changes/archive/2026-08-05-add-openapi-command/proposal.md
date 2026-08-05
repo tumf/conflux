@@ -19,7 +19,7 @@ verifications:
     trigger: pull-request-validation
     automation: .github/workflows/ci.yml
     evidence: cargo test output covering CLI parsing, feature-disabled rejection, schema output, live endpoint parity, and contract completeness
-    rerun: cargo test --features web-monitoring --test openapi_contract_tests && cargo test --no-default-features --bin cflx openapi
+    rerun: cargo test --features web-monitoring --test openapi_contract_tests --test openapi_cli_tests && cargo test --no-default-features --test openapi_cli_tests
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -63,7 +63,7 @@ Remove `docs/openapi.yaml`, the `openapi-gen` binary, `make openapi`, `make chec
 - Contract tests fail if a supported route or required published schema element is missing or if a removed route reappears, and pull-request CI runs those tests without regenerating a tracked artifact.
 - A feature-disabled test proves `cflx openapi` rejects unavailable OpenAPI support clearly without schema output.
 - Repository search finds no active ownership, generation, release, workflow-comment, generated-banner, or documentation dependency on `docs/openapi.yaml`, `make openapi`, or `make check-openapi` outside archived historical changes.
-- `cargo test --features web-monitoring --test openapi_contract_tests` and `cargo test --no-default-features --bin cflx openapi` pass.
+- `cargo test --features web-monitoring --test openapi_contract_tests --test openapi_cli_tests` and `cargo test --no-default-features --test openapi_cli_tests` pass. (The feature-disabled proof lives in an integration test rather than a `--bin cflx` unit test because `src/main.rs` opens with `#![cfg(not(test))]`, so a `--bin cflx` filter matches zero tests and would pass vacuously.)
 
 ## Split Rationale
 

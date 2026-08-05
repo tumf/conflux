@@ -72,16 +72,9 @@ next_core_version() {
 # start-state validation, generated-delta checks, staging, and commit isolation
 # so a release can never absorb unrelated concurrent work in the repository.
 set_release_owned_paths() {
+	# The manifest and lockfile are the whole release-owned set. Nothing
+	# generated is tracked, so a release rewrites no other file.
 	RELEASE_OWNED_PATHS=(Cargo.toml Cargo.lock)
-	# Ownership of the optional artifact is decided from tracked/HEAD state as
-	# well as worktree presence. A file that is tracked but deleted from the
-	# worktree stays owned, so its deletion is rejected as a dirty release-owned
-	# path instead of silently dropping out of validation.
-	if [[ -f docs/openapi.yaml ]] ||
-		git ls-files --error-unmatch -- docs/openapi.yaml >/dev/null 2>&1 ||
-		git cat-file -e HEAD:docs/openapi.yaml 2>/dev/null; then
-		RELEASE_OWNED_PATHS+=(docs/openapi.yaml)
-	fi
 }
 
 path_is_release_owned() {
@@ -157,9 +150,6 @@ acquire_bump_lock() {
 replace_versions() {
 	local version="$1"
 	perl -0pi -e 'BEGIN { $v = shift @ARGV } s/(^\[package\]\s*.*?^version\s*=\s*")[^"]+(")/$1$v$2/ms' "$version" Cargo.toml
-	if [[ -f docs/openapi.yaml ]]; then
-		perl -0pi -e 'BEGIN { $v = shift @ARGV } s/(^  version: ).*/$1$v/m' "$version" docs/openapi.yaml
-	fi
 }
 
 if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
