@@ -2,10 +2,22 @@ use crate::tui::types::WorktreeInfo;
 
 use super::ChangeState;
 
+/// Whether a change still owns its managed worktree, so deleting it would race
+/// live work.
+///
+/// `preparing` is included for the strongest reason of all: that is exactly the
+/// window in which Conflux is itself creating, recreating, or running
+/// `.wt/setup` inside the worktree an operator is asking to delete.
 pub(super) fn is_change_in_active_state(change: &ChangeState) -> bool {
     matches!(
         change.display_status_cache.as_str(),
-        "queued" | "applying" | "archiving" | "resolving" | "accepting" | "merge wait"
+        "queued"
+            | "preparing"
+            | "applying"
+            | "archiving"
+            | "resolving"
+            | "accepting"
+            | "merge wait"
     )
 }
 
@@ -78,6 +90,31 @@ mod tests {
         };
 
         assert!(!is_change_in_active_state(&inactive));
+    }
+
+    /// Deleting the worktree Conflux is currently building is the one race this
+    /// guard exists to prevent, so `preparing` must never fall through it.
+    #[test]
+    fn preparing_is_active_for_the_worktree_delete_guard() {
+        let preparing = ChangeState {
+            id: "change-a".to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            display_status_cache: "preparing".to_string(),
+            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
+            blocker_detail_cache: None,
+            display_color_cache: ratatui::style::Color::Green,
+            error_message_cache: None,
+            selected: false,
+            is_new: false,
+            is_parallel_eligible: true,
+            has_worktree: true,
+            started_at: None,
+            elapsed_time: None,
+            iteration_number: None,
+        };
+
+        assert!(is_change_in_active_state(&preparing));
     }
 
     #[test]

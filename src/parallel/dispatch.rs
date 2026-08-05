@@ -1285,6 +1285,76 @@ fn resume_cycle_flags(resume_action: ResumeAction) -> (bool, bool) {
 }
 
 impl ParallelExecutor {
+    /// Evaluate the stop and terminal gates that decide whether `change_id` may
+    /// still be admitted as ordinary dispatch work, returning `true` when it is
+    /// refused.
+    ///
+    /// This is checked twice per dispatch — once before the change waits for an
+    /// execution slot, and once after the permit is granted — because the wait
+    /// is unbounded and the answer can change during it. Refusal is reported
+    /// through the same reducer-visible transitions in both places: a stop
+    /// consumes its mark and emits `ChangeDequeued`, and a terminal state emits
+    /// an explanatory log without touching reducer intent. `stage` only labels
+    /// the diagnostics.
+    async fn admission_gates_reject(&self, change_id: &str, stage: &str) -> bool {
+        if let Some(ref queue) = self.dynamic_queue {
+            if queue.is_stopped(change_id).await {
+                queue.clear_stopped(change_id).await;
+                info!("Change '{}' stopped {}", change_id, stage);
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ChangeDequeued {
+                        change_id: change_id.to_string(),
+                    },
+                )
+                .await;
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::info(format!("Change stopped: {}", change_id))),
+                )
+                .await;
+                return true;
+            }
+        }
+
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let terminal_gate = shared.try_read().ok().and_then(|guard| {
+                if guard.is_final_terminal_dispatch_stop(change_id) {
+                    Some((
+                        "final_terminal",
+                        format!(
+                            "Change {} is already in a final terminal state; skipping dispatch",
+                            change_id
+                        ),
+                    ))
+                } else if guard.is_terminal_error_change(change_id) {
+                    Some((
+                        "terminal_error",
+                        format!(
+                            "Change {} remains error until explicitly retried",
+                            change_id
+                        ),
+                    ))
+                } else {
+                    None
+                }
+            });
+
+            if let Some((gate, message)) = terminal_gate {
+                info!(
+                    change_id = %change_id,
+                    gate,
+                    stage,
+                    "Skipping workspace dispatch because reducer terminal state blocks ordinary dispatch"
+                );
+                send_event(&self.event_tx, ParallelEvent::Log(LogEntry::info(message))).await;
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Dispatch a single change to a workspace for apply + acceptance + archive.
     ///
     /// This method:
@@ -1316,59 +1386,13 @@ impl ParallelExecutor {
             return Ok(());
         }
 
-        // Check if this change has been stopped (single-change stop)
-        if let Some(ref queue) = self.dynamic_queue {
-            if queue.is_stopped(&change_id).await {
-                queue.clear_stopped(&change_id).await;
-                info!("Change '{}' stopped before dispatch", change_id);
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::ChangeDequeued {
-                        change_id: change_id.clone(),
-                    },
-                )
-                .await;
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::Log(LogEntry::info(format!("Change stopped: {}", change_id))),
-                )
-                .await;
-                return Ok(());
-            }
-        }
-
-        if let Some(shared) = &self.shared_orchestrator_state {
-            let terminal_gate = shared.try_read().ok().and_then(|guard| {
-                if guard.is_final_terminal_dispatch_stop(&change_id) {
-                    Some((
-                        "final_terminal",
-                        format!(
-                            "Change {} is already in a final terminal state; skipping dispatch",
-                            change_id
-                        ),
-                    ))
-                } else if guard.is_terminal_error_change(&change_id) {
-                    Some((
-                        "terminal_error",
-                        format!(
-                            "Change {} remains error until explicitly retried",
-                            change_id
-                        ),
-                    ))
-                } else {
-                    None
-                }
-            });
-
-            if let Some((gate, message)) = terminal_gate {
-                info!(
-                    change_id = %change_id,
-                    gate,
-                    "Skipping workspace dispatch because reducer terminal state blocks ordinary dispatch"
-                );
-                send_event(&self.event_tx, ParallelEvent::Log(LogEntry::info(message))).await;
-                return Ok(());
-            }
+        // Check if this change has been stopped (single-change stop) or has been
+        // moved into a terminal state that blocks ordinary dispatch.
+        if self
+            .admission_gates_reject(&change_id, "before dispatch")
+            .await
+        {
+            return Ok(());
         }
 
         // Check if already in-flight (avoid duplicate dispatch)
@@ -1396,6 +1420,39 @@ impl ParallelExecutor {
                 OrchestratorError::AgentCommand(format!("Failed to acquire semaphore: {}", e))
             })?
         };
+
+        // Waiting for a slot can take minutes, and the gates above only describe
+        // the moment the change entered the queue: an operator can stop it, and
+        // the reducer can archive, reject, or fail it, while it waits. Re-check
+        // both gates now that the permit is held so preparation — and the slow
+        // worktree work it announces — is reserved for changes that are still
+        // admissible at the instant the slot is taken. Returning here drops the
+        // owned permit, releasing the slot to the next candidate.
+        if self
+            .admission_gates_reject(&change_id, "after acquiring an execution slot")
+            .await
+        {
+            drop(permit);
+            return Ok(());
+        }
+
+        // The change now owns an execution slot and has passed the stop and
+        // terminal gates, so everything below is admitted work that can take
+        // minutes: force-recreate cleanup, `git worktree add`, and `.wt/setup`
+        // all run before any operation agent starts. Announcing preparation here
+        // — rather than for every selected candidate, or after the workspace
+        // exists — is what makes the interval observable without labelling
+        // changes that are still waiting behind an earlier slow setup.
+        //
+        // A failure below propagates through `?` to the dispatch loop, which
+        // emits `ProcessingError`; that terminal transition clears preparation.
+        send_event(
+            &self.event_tx,
+            ParallelEvent::WorkspacePreparationStarted {
+                change_id: change_id.clone(),
+            },
+        )
+        .await;
 
         let force_recreate = self.force_recreate_worktree.remove(&change_id);
         if force_recreate {
@@ -1688,6 +1745,45 @@ impl ParallelExecutor {
                     }
                 }
                     _ => {}
+                }
+            }
+
+            // Inline workspace preparation has no termination handle, so an
+            // operator stop requested while the worktree was being created or
+            // set up could not abort it; the request only left a stop mark
+            // behind. Honouring that mark here — before any operation agent is
+            // created, and on every resume route, not just Apply — is what makes
+            // the refused immediate dequeue still stop execution.
+            if let Some(ref queue) = dynamic_queue {
+                if queue.is_stopped(&change_id).await {
+                    queue.clear_stopped(&change_id).await;
+                    info!(
+                        "Change '{}' stopped during workspace preparation; no operation agent started",
+                        change_id
+                    );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::ChangeDequeued {
+                                change_id: change_id.clone(),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                LogEntry::info(format!(
+                                    "Change stopped during workspace preparation: {}",
+                                    change_id
+                                ))
+                                .with_change_id(&change_id),
+                            ))
+                            .await;
+                    }
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: None, // No error - intentionally stopped
+                        rejected: None,
+                    };
                 }
             }
 

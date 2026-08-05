@@ -97,6 +97,14 @@ pub enum ActivityState {
     /// No active execution.
     #[default]
     Idle,
+    /// Admitted to an execution slot and preparing its managed workspace.
+    ///
+    /// Covers force-recreate cleanup, worktree creation/recreation, `.wt/setup`,
+    /// and workspace inspection — everything between slot admission and the
+    /// first operation agent. It never claims that an agent has started, and it
+    /// is discarded on restart: the next action is recomputed from workspace
+    /// files, Git state, and base-tree comparison.
+    Preparing,
     /// Currently applying.
     Applying,
     /// Currently running acceptance checks.
@@ -490,9 +498,9 @@ impl ChangeRuntimeState {
 
     /// Derive the display status string used by TUI and Web.
     ///
-    /// Returns one of: "not queued", "queued", "blocked", "stalled", "applying",
-    /// "accepting", "rejecting", "archiving", "resolving", "merge wait", "resolve pending",
-    /// "reject pending", "archived", "merged", "error", "stopped".
+    /// Returns one of: "not queued", "queued", "blocked", "stalled", "preparing",
+    /// "applying", "accepting", "rejecting", "archiving", "resolving", "merge wait",
+    /// "resolve pending", "reject pending", "archived", "merged", "error", "stopped".
     pub fn display_status(&self) -> &'static str {
         // Terminal states take precedence.
         match &self.terminal {
@@ -506,6 +514,7 @@ impl ChangeRuntimeState {
         }
         // Active execution stages next.
         match self.activity {
+            ActivityState::Preparing => return "preparing",
             ActivityState::Applying => return "applying",
             ActivityState::Accepting => return "accepting",
             ActivityState::Rejecting => return "rejecting",
@@ -539,6 +548,7 @@ impl ChangeRuntimeState {
             "queued" => ratatui::style::Color::Yellow,
             "blocked" => ratatui::style::Color::Gray,
             "stalled" => ratatui::style::Color::LightYellow,
+            "preparing" => ratatui::style::Color::Green,
             "applying" => ratatui::style::Color::Cyan,
             "accepting" => ratatui::style::Color::LightGreen,
             "rejecting" => ratatui::style::Color::LightYellow,
@@ -1790,6 +1800,34 @@ impl OrchestratorState {
         }
     }
 
+    /// Enter the ephemeral workspace-preparation activity.
+    ///
+    /// Only an idle, non-terminal, non-dequeued change may enter it: a change
+    /// that is already running an operation must never be relabelled as if no
+    /// agent had started, and a stopped or terminal change must never be
+    /// reactivated by a late preparation event.
+    fn on_workspace_preparation_started(&mut self, change_id: &str) {
+        let rt = self.runtime_entry(change_id);
+        if rt.is_terminal() || rt.dequeued || !matches!(rt.activity, ActivityState::Idle) {
+            return;
+        }
+        rt.activity = ActivityState::Preparing;
+        rt.wait_state = WaitState::None;
+        rt.clear_blocked_metadata();
+    }
+
+    /// Leave workspace preparation without claiming any next phase.
+    ///
+    /// Deliberately narrow: it only undoes `Preparing`. Once another transition
+    /// has taken over — an operation started, an error, a stop — this is a no-op,
+    /// so a late or duplicate clear can never regress real state.
+    fn on_workspace_preparation_ended(&mut self, change_id: &str) {
+        let rt = self.runtime_entry(change_id);
+        if matches!(rt.activity, ActivityState::Preparing) {
+            rt.activity = ActivityState::Idle;
+        }
+    }
+
     fn on_apply_started(&mut self, change_id: &str) {
         let mut should_start = false;
         {
@@ -2030,6 +2068,14 @@ impl OrchestratorState {
             }
             ExecutionEvent::RejectionReviewFailed { change_id, error } => {
                 self.on_rejection_review_failed(change_id, error.clone());
+            }
+
+            // Workspace preparation (parallel mode, process-local only)
+            ExecutionEvent::WorkspacePreparationStarted { change_id } => {
+                self.on_workspace_preparation_started(change_id);
+            }
+            ExecutionEvent::WorkspacePreparationEnded { change_id } => {
+                self.on_workspace_preparation_ended(change_id);
             }
 
             // Workspace status synchronization events (parallel mode)
@@ -2705,6 +2751,10 @@ mod tests {
 
         rt.wait_state = WaitState::DependencyBlocked;
         assert_eq!(rt.display_color(), ratatui::style::Color::Gray);
+
+        rt.activity = ActivityState::Preparing;
+        assert_eq!(rt.display_status(), "preparing");
+        assert_eq!(rt.display_color(), ratatui::style::Color::Green);
 
         rt.activity = ActivityState::Applying;
         assert_eq!(rt.display_color(), ratatui::style::Color::Cyan);
@@ -6031,5 +6081,206 @@ mod tests {
             "explicit requeue restores eligibility"
         );
         assert_eq!(state.queued_change_ids(), vec!["alpha".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Ephemeral workspace preparation
+    // -----------------------------------------------------------------------
+
+    /// A queued change admitted to a slot, ready to receive preparation events.
+    fn queued_state(change_id: &str) -> OrchestratorState {
+        let mut state = OrchestratorState::new(vec![change_id.to_string()], 0);
+        state.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+        assert_eq!(state.display_status(change_id), "queued");
+        state
+    }
+
+    fn prepare(state: &mut OrchestratorState, change_id: &str) {
+        state.apply_execution_event(
+            &crate::events::ExecutionEvent::WorkspacePreparationStarted {
+                change_id: change_id.to_string(),
+            },
+        );
+    }
+
+    fn end_preparation(state: &mut OrchestratorState, change_id: &str) {
+        state.apply_execution_event(&crate::events::ExecutionEvent::WorkspacePreparationEnded {
+            change_id: change_id.to_string(),
+        });
+    }
+
+    #[test]
+    fn preparing_replaces_queued_and_then_yields_to_the_repository_derived_phase() {
+        use crate::events::ExecutionEvent;
+
+        // Apply route: queued -> preparing -> applying.
+        let mut state = queued_state("c");
+        prepare(&mut state, "c");
+        assert_eq!(state.display_status("c"), "preparing");
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "c".to_string(),
+            command: "apply".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "applying");
+
+        // A resumed workspace routes straight to acceptance, and preparation
+        // must not have manufactured an Apply transition on the way.
+        let mut state = queued_state("c");
+        prepare(&mut state, "c");
+        state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+            change_id: "c".to_string(),
+            command: "accept".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "accepting");
+        assert_eq!(state.apply_count("c"), 0);
+
+        // Archive resume.
+        let mut state = queued_state("c");
+        prepare(&mut state, "c");
+        state.apply_execution_event(&ExecutionEvent::ArchiveStarted {
+            change_id: "c".to_string(),
+            command: "archive".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "archiving");
+    }
+
+    #[test]
+    fn preparing_failure_becomes_error_with_the_preparation_diagnostic() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = queued_state("c");
+        prepare(&mut state, "c");
+        state.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "c".to_string(),
+            error: "Worktree setup failed after 1.0s: .wt/setup exited with code 3".to_string(),
+        });
+
+        assert_eq!(state.display_status("c"), "error");
+        let rt = state.change_runtime("c").expect("runtime entry");
+        assert!(matches!(rt.activity, ActivityState::Idle));
+        assert!(rt
+            .error_message()
+            .is_some_and(|message| message.contains(".wt/setup")));
+    }
+
+    #[test]
+    fn preparing_is_cleared_by_a_pre_operation_exit() {
+        let mut state = queued_state("c");
+        prepare(&mut state, "c");
+        assert_eq!(state.display_status("c"), "preparing");
+
+        // Global cancellation or a terminal resume route ends dispatch without
+        // any operation-started event.
+        end_preparation(&mut state, "c");
+        assert_eq!(
+            state.display_status("c"),
+            "queued",
+            "preparation must not outlive the dispatch that announced it"
+        );
+    }
+
+    #[test]
+    fn preparing_leaves_through_a_stop_before_an_operation_agent_starts() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = queued_state("c");
+        prepare(&mut state, "c");
+        state.apply_execution_event(&ExecutionEvent::ChangeDequeued {
+            change_id: "c".to_string(),
+        });
+
+        assert_eq!(state.display_status("c"), "not queued");
+        let rt = state.change_runtime("c").expect("runtime entry");
+        assert!(matches!(rt.activity, ActivityState::Idle));
+
+        // A clear that arrives after the stop cannot resurrect anything.
+        end_preparation(&mut state, "c");
+        assert_eq!(state.display_status("c"), "not queued");
+    }
+
+    #[test]
+    fn preparing_never_overwrites_a_running_operation_or_a_terminal_change() {
+        use crate::events::ExecutionEvent;
+
+        // A late preparation event must not relabel a running Apply as if no
+        // agent had started.
+        let mut state = queued_state("c");
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "c".to_string(),
+            command: "apply".to_string(),
+        });
+        prepare(&mut state, "c");
+        assert_eq!(state.display_status("c"), "applying");
+
+        // Nor may it reactivate a terminal change.
+        let mut state = queued_state("c");
+        state.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "c".to_string(),
+            error: "boom".to_string(),
+        });
+        prepare(&mut state, "c");
+        assert_eq!(state.display_status("c"), "error");
+
+        // Nor a change an operator force-stopped.
+        let mut state = queued_state("c");
+        state.apply_command(ReducerCommand::DequeueChange("c".to_string()));
+        prepare(&mut state, "c");
+        assert_eq!(state.display_status("c"), "not queued");
+    }
+
+    #[test]
+    fn preparing_clearing_is_narrow_and_idempotent() {
+        use crate::events::ExecutionEvent;
+
+        // Clearing a change that is applying leaves the operation alone: the
+        // completion funnel emits it for every task, including ones that did
+        // reach a real phase.
+        let mut state = queued_state("c");
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "c".to_string(),
+            command: "apply".to_string(),
+        });
+        end_preparation(&mut state, "c");
+        assert_eq!(state.display_status("c"), "applying");
+
+        // Repeating the clear on an already-cleared change changes nothing.
+        let mut state = queued_state("c");
+        prepare(&mut state, "c");
+        end_preparation(&mut state, "c");
+        end_preparation(&mut state, "c");
+        assert_eq!(state.display_status("c"), "queued");
+    }
+
+    #[test]
+    fn preparing_counts_as_active_execution_but_not_as_a_running_agent() {
+        let mut state = queued_state("c");
+        prepare(&mut state, "c");
+
+        assert!(
+            state.is_active_change("c"),
+            "an admitted change mutating its worktree is active execution"
+        );
+        assert!(
+            !state.is_agent_execution_active(),
+            "preparation must never justify a force-stopped-process claim"
+        );
+        assert!(
+            crate::orchestration::operator_command::is_active_status(state.display_status("c")),
+            "every operator surface must treat preparing as active"
+        );
+    }
+
+    #[test]
+    fn preparing_is_not_durable_routing_state() {
+        let mut state = queued_state("c");
+        prepare(&mut state, "c");
+        assert_eq!(state.display_status("c"), "preparing");
+
+        // A restart rebuilds the reducer from the same workspace contents. The
+        // ephemeral preparation observation is gone, and nothing about the next
+        // action was derived from it.
+        let restarted = OrchestratorState::new(vec!["c".to_string()], 0);
+        assert_eq!(restarted.display_status("c"), "not queued");
+        assert!(!restarted.is_active_change("c"));
     }
 }

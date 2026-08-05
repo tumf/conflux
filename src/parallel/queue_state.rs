@@ -923,6 +923,20 @@ impl ParallelExecutor {
         // Remove from in-flight
         in_flight.remove(&workspace_result.change_id);
 
+        // Every ordinary workspace-task return funnels through here, including
+        // the ones that never emitted an operation-started event (an already
+        // merged resume, a deferred rejection review, a pre-operation stop). One
+        // clearing event here is what keeps `preparing` from outliving the
+        // dispatch that announced it; it is a no-op once a real transition has
+        // already taken over.
+        send_event(
+            &self.event_tx,
+            ParallelEvent::WorkspacePreparationEnded {
+                change_id: workspace_result.change_id.clone(),
+            },
+        )
+        .await;
+
         // Clean up kill token registry
         if let Some(ref queue) = self.dynamic_queue {
             queue
