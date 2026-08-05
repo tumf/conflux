@@ -51,24 +51,26 @@ Represent the reason a change is not parallel-eligible instead of collapsing eve
 
 Render `UNCOMMITTED` only when repository observation reports uncommitted or untracked files under that change's active proposal directory. Do not render that badge merely because the proposal is absent from `HEAD`, including archived changes with a retained managed worktree or failed merge state. Continue to show the independent `WT` badge whenever a managed worktree exists.
 
-Update related key-hint and row-action suppression logic to use the same explicit reason: genuinely dirty active proposals remain non-actionable and suppress queue hints, while the UI must not describe a clean but otherwise ineligible row as uncommitted. This is one atomic scope because reason classification without renderer and interaction wiring would preserve the false claim, while a renderer-only fix would continue inferring from the lossy boolean.
+Keep key-hint, checkbox, row styling, and row-action suppression based on broad parallel eligibility. A clean proposal absent from `HEAD` remains grayed out, non-markable, and without queue affordances exactly as today; only the badge and operator-facing refusal reason distinguish it from genuinely dirty proposal content. This is one atomic scope because reason classification without renderer, warning, and exclusion-summary wiring would preserve false claims, while a renderer-only fix would continue inferring from the lossy boolean.
 
 ## Acceptance Criteria
 
 - A queued or not-queued active change with uncommitted or untracked files under `openspec/changes/<change_id>/` is non-actionable and displays `UNCOMMITTED`.
 - A clean change that is parallel-ineligible only because its proposal is absent from the current `HEAD` tree does not display `UNCOMMITTED`.
 - An archived change or failed-merge row with a retained clean managed worktree may display `WT` but does not display `UNCOMMITTED` solely because the active proposal directory is absent.
-- The existing parallel-execution safety rule remains intact: a change absent from `HEAD` or containing dirty proposal files is not admitted to parallel queueing merely because its badge differs.
-- Changes-list rendering and key hints consume one consistent eligibility-reason model in both select and running layouts.
+- The existing parallel-execution safety rule remains intact: a change absent from `HEAD` or containing dirty proposal files remains grayed out, non-markable, without queue affordances, and not admitted to parallel queueing merely because its badge differs.
+- Single-row toggle warnings and bulk-toggle exclusion summaries describe the observed reason truthfully: dirty proposal content retains a commit instruction, while clean proposal absence identifies that the change is not present in `HEAD` and cannot be queued in parallel mode.
+- Changes-list rendering, toggle warnings, and bulk exclusion summaries consume one consistent eligibility-reason model in select and running layouts and shared operator-command paths.
 - All user-visible instances and tests use the correctly spelled `UNCOMMITTED`; `UNCOMMITED` is removed from the active TUI contract.
 
 ## Explicit Completion Conditions
 
 - TUI state carries repository-derived parallel-ineligibility reason information without introducing durable state outside the workspace.
 - Eligibility calculation still rejects both proposals absent from `HEAD` and proposals with uncommitted or untracked files.
-- Renderer and key-hint/actionability decisions test the explicit dirty-proposal reason rather than treating every `is_parallel_eligible == false` value as uncommitted.
-- Repository-local regression tests separately cover a dirty active proposal, a proposal absent from `HEAD`, and an archived or failed-merge row retaining a clean worktree.
-- Regression tests prove the dirty case displays `UNCOMMITTED`, the clean absent-proposal case does not, and neither case weakens queue admission.
+- Renderer badge decisions test the explicit dirty-proposal reason, while key-hint, checkbox, styling, actionability, and admission decisions continue to block every parallel-ineligible reason.
+- Single-row and bulk-toggle refusal paths distinguish dirty proposal content from clean proposal absence and provide an actionable, truthful message for each.
+- Repository-local regression tests separately cover a dirty active proposal, a clean proposal absent from `HEAD`, and an archived or failed-merge change retaining a clean worktree while displayed in a queueable status.
+- Regression tests prove the dirty case displays `UNCOMMITTED`, the clean absent-proposal case does not, both remain non-actionable, and neither case weakens queue admission.
 - `make fmt`, `make lint`, and `make test` pass.
 
 ## Out of Scope

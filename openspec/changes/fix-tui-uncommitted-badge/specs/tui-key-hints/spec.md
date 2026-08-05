@@ -22,7 +22,9 @@
 - **AND** その change の proposal directory に未コミットまたは未追跡ファイルはない
 - **WHEN** Changes パネルを描画する
 - **THEN** TUI はその行を未コミットであるとは表示しない
+- **AND** the row remains grayed out, non-markable, and without queue affordances
 - **AND** proposal absence による parallel queue admission refusal は維持される
+- **AND** any refusal message identifies proposal absence from `HEAD` instead of instructing the operator to commit nonexistent dirty content
 
 ### Requirement: 未コミット change は操作不可として表示する
 
@@ -50,14 +52,33 @@
 - **AND** no uncommitted or untracked proposal files are observed for that change
 - **WHEN** the Changes list is rendered
 - **THEN** the row SHALL NOT display `UNCOMMITTED`
+- **AND** the row SHALL remain grayed out, non-markable, and without queue affordances
 - **AND** the change SHALL remain ineligible for parallel queue admission
+
+#### Scenario: clean proposal absence has a truthful refusal reason
+
+- **GIVEN** a parallel-ineligible change has no proposal directory in `HEAD`
+- **AND** no uncommitted or untracked proposal files are observed for that change
+- **WHEN** a single-row or bulk-toggle operation reports why the change was excluded
+- **THEN** the reason SHALL identify that the change is not present in `HEAD`
+- **AND** the reason SHALL NOT describe the change as uncommitted or instruct the operator to commit it
 
 #### Scenario: retained worktree marker is independent of dirty state
 
 - **GIVEN** an archived or failed-merge change retains a clean managed worktree
 - **AND** its active proposal directory is absent from `HEAD`
+- **AND** the change row is displayed in a queueable status such as `NotQueued` or `Queued`
 - **WHEN** the Changes list is rendered
 - **THEN** the row MAY display `WT`
+- **AND** the row SHALL NOT display `UNCOMMITTED`
+- **AND** the row SHALL remain grayed out and non-actionable
+
+#### Scenario: Archived 行はアーカイブ済み表示を優先する
+
+- **GIVEN** the TUI is in parallel mode
+- **AND** a change row is in `Archived` status
+- **WHEN** the Changes list is rendered
+- **THEN** the row SHALL display the archived checkbox styling (e.g., gray `[x]`)
 - **AND** the row SHALL NOT display `UNCOMMITTED`
 
 #### Scenario: active TUI contract uses the correct spelling
