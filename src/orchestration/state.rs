@@ -3534,8 +3534,7 @@ mod tests {
 
             let runtime = state.change_runtime("c").expect("runtime");
             assert_eq!(
-                runtime.commit_phase_attempt,
-                None,
+                runtime.commit_phase_attempt, None,
                 "{closing:?} must clear commit presentation"
             );
             assert_eq!(runtime.apply_operation_label(), "apply");
