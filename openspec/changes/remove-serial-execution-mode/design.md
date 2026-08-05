@@ -43,6 +43,8 @@ Remove `ExecutionMode` if no non-test consumer needs a mode after branch deletio
 
 Hook contexts always have managed-worktree identity during change execution. Run-level hooks remain workspace-neutral where they already represent the whole run.
 
+Canonical deltas must cover every requirement that normatively exposes mode selection or serial-only terminal behavior, including `cli`, `configuration`, `tui-editor`, `remote-control-api`, `orchestration-state`, `runtime-state`, `parallel-execution`, `code-maintenance`, and `documentation`. Ordered dependency chains and sequential merge integration remain untouched.
+
 ## Deletion Order
 
 1. Add regression tests for default dispatch, Git preflight, removed inputs, and terminal transitions.

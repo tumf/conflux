@@ -89,6 +89,58 @@ CLI SHALL apply `--vcs` directly to the sole worktree execution path.
 - **THEN** error message "Invalid VCS backend: invalid. Valid options: auto, git" is displayed
 - **AND** exit code is non-zero
 
+### Requirement: run Subcommand
+
+The `run` subcommand SHALL execute explicit targets through cumulative worktree orchestration. Push post-archive mode and upstream integration remain mutually exclusive; upstream integration SHALL be rejected for unsupported remote-client or server surfaces before work starts.
+
+#### Scenario: run uses explicit targets
+
+- **WHEN** user provides `--all`, positional change IDs, or legacy `--change` values
+- **THEN** targets are normalized and dispatched through worktree orchestration
+- **AND** no execution-mode selection is required
+
+### Requirement: Apply Context History
+
+The orchestrator MUST use one history-injection loop for every managed-worktree apply attempt. Each attempt summary and one-shot acceptance failure tail MUST retain their existing bounded injection semantics.
+
+#### Scenario: second apply includes history
+
+- **GIVEN** a change's first managed-worktree apply returned an agent summary
+- **WHEN** its second apply starts
+- **THEN** the prompt includes `<last_apply attempt="1">`
+- **AND** the block contains the first summary
+
+### Requirement: Git Repository Detection
+
+Executable CLI orchestration SHALL require a usable Git repository and Git command. Validation SHALL happen before orchestration side effects.
+
+#### Scenario: Git repository unavailable
+
+- **WHEN** user starts `cflx run --all` outside a usable Git repository
+- **THEN** the command exits non-zero with an actionable Git error
+- **AND** no hook, lifecycle adapter, AI subprocess, or workspace mutation starts
+
+### Requirement: Enhanced Help Output
+
+CLI help SHALL document all current subcommands and supported options. It SHALL include `--max-concurrent`, `--dry-run`, `--vcs`, web controls, and `--push [remote]` where accepted, and SHALL NOT advertise `--parallel`.
+
+#### Scenario: Run help describes standard worktree execution
+
+- **WHEN** user runs `cflx run --help`
+- **THEN** help describes explicit targets, concurrency, dry-run, VCS, web monitoring, and post-archive options
+- **AND** it contains no `--parallel` option or mode-selection example
+
+### Requirement: run Surfaces Hook Output
+
+The `run` subcommand SHALL preserve hook command, output, and failure ordering on the sole worktree execution path.
+
+#### Scenario: CLI run preserves hook visibility
+
+- **GIVEN** a hook is configured for a lifecycle stage reached during `cflx run`
+- **WHEN** the hook executes
+- **THEN** users see the hook command followed by captured output and any failure result
+- **AND** debug-only tracing is not required
+
 ## REMOVED Requirements
 
 ### Requirement: Serial Apply Iteration WIP Commits

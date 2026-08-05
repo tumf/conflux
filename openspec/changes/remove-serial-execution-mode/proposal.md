@@ -8,6 +8,10 @@ references:
   - openspec/specs/tui-editor/spec.md
   - openspec/specs/code-maintenance/spec.md
   - openspec/specs/runtime-state/spec.md
+  - openspec/specs/orchestration-state/spec.md
+  - openspec/specs/configuration/spec.md
+  - openspec/specs/remote-control-api/spec.md
+  - openspec/specs/parallel-execution/spec.md
   - src/orchestrator.rs
   - src/orchestration/state.rs
   - src/orchestration/operator_command.rs
