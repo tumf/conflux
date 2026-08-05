@@ -532,11 +532,6 @@ impl ChangeRuntimeState {
         }
     }
 
-    /// The finalization attempt currently being presented, if any.
-    pub fn commit_phase_attempt(&self) -> Option<u32> {
-        self.commit_phase_attempt
-    }
-
     /// Derive the display status string used by TUI and Web.
     ///
     /// Returns one of: "not queued", "queued", "blocked", "stalled", "preparing",
@@ -3507,7 +3502,7 @@ mod tests {
             "the canonical status must not become a commit state"
         );
         assert_eq!(during.apply_operation_label(), "commit");
-        assert_eq!(during.commit_phase_attempt(), Some(4));
+        assert_eq!(during.commit_phase_attempt, Some(4));
         assert_eq!(during.activity, before.activity);
         assert_eq!(during.wait_state, before.wait_state);
         assert_eq!(during.queue_intent, before.queue_intent);
@@ -3539,7 +3534,7 @@ mod tests {
 
             let runtime = state.change_runtime("c").expect("runtime");
             assert_eq!(
-                runtime.commit_phase_attempt(),
+                runtime.commit_phase_attempt,
                 None,
                 "{closing:?} must clear commit presentation"
             );
@@ -3569,7 +3564,7 @@ mod tests {
             state
                 .change_runtime("c")
                 .expect("runtime")
-                .commit_phase_attempt(),
+                .commit_phase_attempt,
             None,
             "ApplyStarted always clears commit presentation"
         );
@@ -3601,7 +3596,7 @@ mod tests {
             state
                 .change_runtime("c")
                 .expect("runtime")
-                .commit_phase_attempt(),
+                .commit_phase_attempt,
             None
         );
     }
@@ -3626,7 +3621,7 @@ mod tests {
             state
                 .change_runtime("c")
                 .expect("runtime")
-                .commit_phase_attempt(),
+                .commit_phase_attempt,
             None,
             "process-local commit presentation starts empty"
         );
