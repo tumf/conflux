@@ -2,7 +2,7 @@
 //!
 //! This module provides a shared execution layer for all AI-driven commands
 //! (apply, archive, resolve, analyze) to ensure consistent stagger delays
-//! across parallel and serial execution modes.
+//! across every execution frontend.
 
 use crate::command_queue::{CommandQueue, CommandQueueConfig};
 use crate::config::OrchestratorConfig;

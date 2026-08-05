@@ -643,7 +643,7 @@ impl AcceptanceHistory {
         self.retry_identities.get(change_id).cloned()
     }
 
-    #[allow(dead_code)] // Consumed by restart diagnostics and serial checkpoint regression coverage.
+    #[allow(dead_code)] // Consumed by restart diagnostics and checkpoint regression coverage.
     pub fn semantic_fingerprint(&self, change_id: &str) -> Option<String> {
         self.semantic_fingerprints.get(change_id).cloned()
     }

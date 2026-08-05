@@ -73,7 +73,6 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         // Reducer-visible lifecycle and workspace observations that derive TUI display status,
         // queue intent, active counts, wait states, or terminal state.
         ExecutionEvent::ProcessingStarted(_)
-        | ExecutionEvent::ProcessingCompleted(_)
         | ExecutionEvent::ProcessingError { .. }
         | ExecutionEvent::ApplyStarted { .. }
         | ExecutionEvent::ApplyCompleted { .. }
@@ -382,23 +381,10 @@ async fn run_tui_loop(
     app.worktree_paths = initial_worktree_paths;
     // Inject shared state reference into TUI for unified tracking
     app.set_shared_state(shared_state.clone());
-    let git_dir_exists = crate::cli::check_git_directory();
-    let parallel_available = crate::cli::check_parallel_available();
-    let mut parallel_mode = config.resolve_parallel_mode(false, git_dir_exists);
-
-    if parallel_mode && !parallel_available {
-        parallel_mode = false;
-        app.warning_message =
-            Some("Parallel mode disabled because git is not available".to_string());
-    }
-    app.parallel_available = parallel_available;
-    app.parallel_mode = parallel_mode;
+    // Startup already refused a workspace without a usable Git repository, so
+    // worktree execution is available here by construction.
     app.max_concurrent = config.get_max_concurrent_workspaces();
     app.vcs_backend = config.get_vcs_backend().to_string();
-    // The shared store is the toggle's home, so seed it before anything reads
-    // it: the start guard, the v2 snapshot, and the run supervisor all resolve
-    // the mode from here rather than from this frontend's field.
-    app.parallel_runtime().set_parallel_mode(parallel_mode);
     app.publish_parallel_runtime();
     app.apply_parallel_eligibility(&committed_change_ids, &uncommitted_file_change_ids);
     app.apply_worktree_status(&worktree_change_ids);
@@ -461,10 +447,6 @@ async fn run_tui_loop(
     // Shared flag for graceful stop (signaling orchestrator to stop after current change)
     let graceful_stop_flag = Arc::new(AtomicBool::new(false));
 
-    // The parallel toggle is read by the run supervisor when it spawns, and by
-    // the shared start-eligibility guard, so it lives outside `AppState`.
-    let parallel_mode_flag = Arc::new(AtomicBool::new(app.parallel_mode));
-
     // One run supervisor owns the local orchestrator task for this invocation.
     // The TUI adapter and the `/api/v2` adapter drive it through the same
     // run-control service, so neither can start or cancel a run the other
@@ -483,7 +465,6 @@ async fn run_tui_loop(
         post_archive_action.clone(),
         upstream_runtime.clone(),
         graceful_stop_flag.clone(),
-        parallel_mode_flag.clone(),
         #[cfg(feature = "web-monitoring")]
         web_state.clone(),
     ));
@@ -888,21 +869,8 @@ async fn run_tui_loop(
         }
 
         // The eligibility set is a TUI observation, so it is republished once
-        // per frame instead of at every place the TUI can change it. The toggle
-        // travels the other way: the shared store owns it, so a remote
-        // `set_parallel_mode` is adopted here rather than overwritten.
+        // per frame instead of at every place the TUI can change it.
         app.publish_parallel_runtime();
-        if app.sync_parallel_mode_from_runtime() {
-            app.add_log(LogEntry::info(format!(
-                "Parallel mode {} by a remote command",
-                if app.parallel_mode {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            )));
-        }
-        parallel_mode_flag.store(app.parallel_mode, std::sync::atomic::Ordering::SeqCst);
 
         publish_lifecycle_state(&app);
 
@@ -1068,7 +1036,6 @@ mod tests {
     fn tui_reducer_sync_includes_running_lifecycle_display_events() {
         let reducer_visible_events = vec![
             ExecutionEvent::ProcessingStarted("change-a".to_string()),
-            ExecutionEvent::ProcessingCompleted("change-a".to_string()),
             ExecutionEvent::ProcessingError {
                 id: "change-a".to_string(),
                 error: "boom".to_string(),

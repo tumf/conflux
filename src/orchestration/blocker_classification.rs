@@ -284,7 +284,7 @@ pub fn classify_reported_facts(blocker: &crate::events::StalledBlocker) -> Lifec
 /// Classify an execution stop the runtime decided on its own.
 ///
 /// Kept behind the same classifier as reported claims so a stop can never
-/// acquire an external category, and so both serial and parallel produce
+/// acquire an external category, and so every frontend produces
 /// identical stalled metadata for the same judgement.
 pub fn classify_execution_stop(
     reason: ExecutionStopReason,

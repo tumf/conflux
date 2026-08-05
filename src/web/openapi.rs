@@ -151,7 +151,6 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::dto::ParallelBlockedReason,
             crate::web::remote_control_api::dto::ParallelCapabilities,
             crate::web::remote_control_api::dto::ParallelEligibility,
-            crate::web::remote_control_api::dto::ParallelMode,
             crate::web::remote_control_api::dto::ParallelRuntimeState,
             crate::web::remote_control_api::dto::QueueIntent,
             crate::web::remote_control_api::dto::CapabilitiesResponse,

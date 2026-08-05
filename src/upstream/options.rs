@@ -41,8 +41,6 @@ pub enum UpstreamOptionError {
     VerifyCommandWithoutOption,
     /// Remote name is empty or carries branch selection syntax.
     InvalidRemote(String),
-    /// Effective execution is not cumulative parallel mode.
-    NotParallelMode,
     /// `--push` maintains per-change branches instead of the cumulative base.
     ConflictsWithPush,
     /// HEAD is not attached to a branch, so there is no same-name remote branch.
@@ -93,10 +91,6 @@ impl fmt::Display for UpstreamOptionError {
                 f,
                 "invalid upstream remote '{}': use a remote name only (no branch selection)",
                 value
-            ),
-            Self::NotParallelMode => write!(
-                f,
-                "-u/--integrate-upstream is only valid for cumulative parallel run mode"
             ),
             Self::ConflictsWithPush => write!(
                 f,
@@ -241,8 +235,6 @@ pub fn resolve_frontend_upstream_config(
 /// initial fetch and validates remote branch existence and first-parent spine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticPreconditions {
-    /// Effective execution mode is cumulative parallel.
-    pub parallel: bool,
     /// `--push` remote, when the operator requested per-change pushes.
     pub push_remote: Option<String>,
     /// Workspace resolves to a Git repository.
@@ -260,9 +252,6 @@ pub fn validate_static_preconditions(
     config: &UpstreamIntegrationConfig,
     facts: &StaticPreconditions,
 ) -> Result<String, UpstreamOptionError> {
-    if !facts.parallel {
-        return Err(UpstreamOptionError::NotParallelMode);
-    }
     if facts.push_remote.is_some() {
         return Err(UpstreamOptionError::ConflictsWithPush);
     }
@@ -289,7 +278,6 @@ mod tests {
 
     fn facts() -> StaticPreconditions {
         StaticPreconditions {
-            parallel: true,
             push_remote: None,
             is_git_repository: true,
             attached_branch: Some("main".to_string()),
@@ -355,17 +343,6 @@ mod tests {
             Err(UpstreamOptionError::InvalidRemote(
                 "origin:main".to_string()
             ))
-        );
-    }
-
-    #[test]
-    fn upstream_integration_rejects_serial_mode() {
-        let config = UpstreamIntegrationConfig::new("origin", "cargo test");
-        let mut f = facts();
-        f.parallel = false;
-        assert_eq!(
-            validate_static_preconditions(&config, &f),
-            Err(UpstreamOptionError::NotParallelMode)
         );
     }
 

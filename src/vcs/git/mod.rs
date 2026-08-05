@@ -96,7 +96,7 @@ impl GitWorkspaceManager {
         if has_changes {
             let warning_msg = format!(
                 "Warning: Uncommitted changes detected.\n\
-                 Parallel mode will continue, but uncommitted changes remain in your working directory.\n\
+                 Execution will continue, but uncommitted changes remain in your working directory.\n\
                  Consider committing or stashing if you need isolated workspaces.\n\n\
                  The following files have uncommitted changes:\n{}",
                 if status.trim().is_empty() {
@@ -127,7 +127,7 @@ impl GitWorkspaceManager {
             *branch_guard = match commands::get_current_branch(&self.repo_root).await? {
                 Some(branch) => Some(branch),
                 None => return Err(VcsError::git_command(
-                    "Detached HEAD state detected. Checkout a branch before running parallel mode.",
+                    "Detached HEAD state detected. Checkout a branch before running.",
                 )),
             };
         }
@@ -1123,7 +1123,7 @@ mod tests {
         assert!(warning
             .message
             .contains("Warning: Uncommitted changes detected."));
-        assert!(warning.message.contains("Parallel mode will continue"));
+        assert!(warning.message.contains("Execution will continue"));
         assert_eq!(warning.title, "Uncommitted Changes Detected");
     }
 

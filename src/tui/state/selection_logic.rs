@@ -104,12 +104,10 @@ impl BulkToggleSnapshot {
 /// Classifies a single change for bulk toggle; `None` means eligible.
 pub(super) fn classify_bulk_toggle_change(
     mode: AppExecutionMode,
-    parallel_mode: bool,
     change: &ChangeState,
 ) -> Option<BulkToggleExclusion> {
     crate::orchestration::operator_command::classify_bulk_mark_row(
         mode.operator_mode(),
-        parallel_mode,
         &change.display_status_cache,
         change.parallel_eligibility,
     )
@@ -118,7 +116,6 @@ pub(super) fn classify_bulk_toggle_change(
 /// Classifies every change once and derives the shared target mark state.
 pub(super) fn build_bulk_toggle_snapshot(
     mode: AppExecutionMode,
-    parallel_mode: bool,
     changes: &[ChangeState],
 ) -> BulkToggleSnapshot {
     let rows: Vec<MarkTargetRow<'_>> = changes
@@ -130,7 +127,7 @@ pub(super) fn build_bulk_toggle_snapshot(
             marked: change.selected,
         })
         .collect();
-    let plan = plan_bulk_marks(mode.operator_mode(), parallel_mode, &rows);
+    let plan = plan_bulk_marks(mode.operator_mode(), &rows);
 
     // The plan names changes; the TUI mutates rows, so translate once here
     // rather than letting the row list and the plan drift apart.
@@ -147,12 +144,8 @@ pub(super) fn build_bulk_toggle_snapshot(
     }
 }
 
-pub(super) fn can_bulk_toggle_change(
-    mode: AppExecutionMode,
-    parallel_mode: bool,
-    change: &ChangeState,
-) -> bool {
-    classify_bulk_toggle_change(mode, parallel_mode, change).is_none()
+pub(super) fn can_bulk_toggle_change(mode: AppExecutionMode, change: &ChangeState) -> bool {
+    classify_bulk_toggle_change(mode, change).is_none()
 }
 
 /// Modes where the bulk execution-mark toggle is meaningful.
@@ -179,8 +172,7 @@ pub(super) fn toggle_all_marks(state: &mut AppState) -> Vec<TuiCommand> {
         return Vec::new();
     }
 
-    let snapshot =
-        build_bulk_toggle_snapshot(state.execution_mode, state.parallel_mode, &state.changes);
+    let snapshot = build_bulk_toggle_snapshot(state.execution_mode, &state.changes);
 
     if snapshot.eligible.is_empty() {
         let message = if snapshot.excluded.is_empty() {
@@ -273,7 +265,6 @@ pub(super) fn toggle_selection(state: &mut AppState) -> Option<TuiCommand> {
         let change = &state.changes[state.cursor_index];
         if let guards::ToggleGuardResult::Blocked(msg) = guards::validate_change_toggleable(
             change.parallel_eligibility,
-            state.parallel_mode,
             &change.display_status_cache,
             &change.id,
         ) {
@@ -384,30 +375,32 @@ mod tests {
 
         assert!(!can_bulk_toggle_change(
             AppExecutionMode::Running,
-            false,
             &change
         ));
         assert!(can_bulk_toggle_change(
             AppExecutionMode::Select,
-            false,
             &change
         ));
     }
 
+    /// Worktree eligibility is an unconditional input, so an uncommitted row is
+    /// excluded in every mode that supports a bulk toggle.
     #[test]
-    fn parallel_mode_excludes_uncommitted_rows_from_bulk_toggle() {
+    fn uncommitted_rows_are_always_excluded_from_bulk_toggle() {
         let ineligible = make_change_state("uncommitted", "not queued", false);
+        let eligible = make_change_state("committed", "not queued", true);
 
-        assert!(!can_bulk_toggle_change(
+        for mode in [
             AppExecutionMode::Select,
-            true,
-            &ineligible
-        ));
-        assert!(can_bulk_toggle_change(
-            AppExecutionMode::Select,
-            false,
-            &ineligible
-        ));
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopped,
+        ] {
+            assert!(
+                !can_bulk_toggle_change(mode, &ineligible),
+                "{mode:?} must exclude an ineligible row"
+            );
+        }
+        assert!(can_bulk_toggle_change(AppExecutionMode::Select, &eligible));
     }
 
     #[test]
@@ -418,19 +411,19 @@ mod tests {
         let eligible = make_change_state("eligible", "not queued", true);
 
         assert_eq!(
-            classify_bulk_toggle_change(AppExecutionMode::Running, false, &active),
+            classify_bulk_toggle_change(AppExecutionMode::Running, &active),
             Some(BulkToggleExclusion::ChangeActive)
         );
         assert_eq!(
-            classify_bulk_toggle_change(AppExecutionMode::Select, false, &rejected),
+            classify_bulk_toggle_change(AppExecutionMode::Select, &rejected),
             Some(BulkToggleExclusion::FinalStatus)
         );
         assert_eq!(
-            classify_bulk_toggle_change(AppExecutionMode::Select, true, &uncommitted),
+            classify_bulk_toggle_change(AppExecutionMode::Select, &uncommitted),
             Some(BulkToggleExclusion::ParallelIneligible)
         );
         assert_eq!(
-            classify_bulk_toggle_change(AppExecutionMode::Select, false, &eligible),
+            classify_bulk_toggle_change(AppExecutionMode::Select, &eligible),
             None
         );
 
@@ -459,28 +452,23 @@ mod tests {
         );
 
         assert_eq!(
-            classify_bulk_toggle_change(AppExecutionMode::Select, true, &absent),
+            classify_bulk_toggle_change(AppExecutionMode::Select, &absent),
             Some(BulkToggleExclusion::ParallelProposalAbsent)
         );
         assert_eq!(
-            classify_bulk_toggle_change(AppExecutionMode::Select, true, &dirty),
+            classify_bulk_toggle_change(AppExecutionMode::Select, &dirty),
             Some(BulkToggleExclusion::ParallelIneligible)
         );
-        assert!(!can_bulk_toggle_change(
-            AppExecutionMode::Select,
-            true,
-            &absent
-        ));
         assert!(
-            can_bulk_toggle_change(AppExecutionMode::Select, false, &absent),
-            "proposal absence is a parallel-mode constraint only"
+            !can_bulk_toggle_change(AppExecutionMode::Select, &absent),
+            "a proposal absent from HEAD is never a bulk-toggle target"
         );
 
-        let summary = build_bulk_toggle_snapshot(AppExecutionMode::Select, true, &[absent, dirty])
+        let summary = build_bulk_toggle_snapshot(AppExecutionMode::Select, &[absent, dirty])
             .exclusion_summary();
         assert!(
-            summary.contains("not present in HEAD (cannot queue in parallel mode)")
-                && summary.contains("uncommitted in parallel mode (commit first)"),
+            summary.contains("not present in HEAD (cannot queue)")
+                && summary.contains("uncommitted (commit first)"),
             "each excluded row is explained by what was observed: {summary}"
         );
     }
@@ -494,7 +482,7 @@ mod tests {
         ];
         changes[0].selected = true;
 
-        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Select, false, &changes);
+        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Select, &changes);
 
         assert_eq!(snapshot.eligible, vec![0, 1, 2]);
         assert!(snapshot.excluded.is_empty());
@@ -514,7 +502,7 @@ mod tests {
         // Ineligible rows must not influence the target state.
         changes[1].selected = false;
 
-        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Select, false, &changes);
+        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Select, &changes);
 
         assert_eq!(snapshot.eligible, vec![0]);
         assert_eq!(
@@ -536,7 +524,7 @@ mod tests {
             make_change_state("eligible", "not queued", true),
         ];
 
-        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Running, false, &changes);
+        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Running, &changes);
 
         assert_eq!(snapshot.eligible, vec![3]);
         assert_eq!(snapshot.excluded.len(), 3);
@@ -552,7 +540,7 @@ mod tests {
 
     #[test]
     fn snapshot_with_no_changes_has_empty_target_set() {
-        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Select, false, &[]);
+        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Select, &[]);
 
         assert!(snapshot.eligible.is_empty());
         assert!(snapshot.excluded.is_empty());

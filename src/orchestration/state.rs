@@ -1,11 +1,11 @@
 //! Shared state management for orchestration operations.
 //!
 //! Provides a unified state structure that tracks orchestration progress
-//! across different execution modes (serial CLI, TUI, parallel).
+//! across every frontend (CLI `run`, TUI, remote control).
 //!
 //! ## Integration Status
 //!
-//! - **Serial Orchestrator** (`src/orchestrator.rs`): Fully integrated. The orchestrator
+//! - **CLI Orchestrator** (`src/orchestrator.rs`): Fully integrated. The orchestrator
 //!   maintains a `shared_state: Arc<RwLock<OrchestratorState>>` instance and updates it
 //!   via `apply_execution_event` when processing changes (ProcessingStarted, ApplyStarted,
 //!   ApplyCompleted, ChangeArchived). The shared state is wrapped in Arc<RwLock<>> to enable
@@ -59,23 +59,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error_history::{CircuitBreakerConfig, ErrorHistory};
-
-// ============================================================================
-// Execution mode – determines terminal states for the state machine
-// ============================================================================
-
-/// Execution mode that determines how the state machine handles terminal states.
-///
-/// - **Serial**: `ChangeArchived` is the terminal state (no merge step).
-/// - **Parallel**: `ChangeArchived` enters post-archive merge handling; `MergeCompleted` is the terminal state.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum ExecutionMode {
-    /// Serial execution: archive is the final step.
-    #[default]
-    Serial,
-    /// Parallel execution: archive is followed by a merge step.
-    Parallel,
-}
 
 // ============================================================================
 // ChangeRuntimeState types (Phase 1 – reducer-owned state)
@@ -234,11 +217,9 @@ pub enum TerminalState {
     /// Not yet in a terminal state.
     #[default]
     None,
-    /// Successfully archived.
-    Archived,
-    /// Successfully merged to the base branch (parallel only).
+    /// Successfully merged to the base branch.
     Merged,
-    /// Successfully pushed to a remote branch (parallel only).
+    /// Successfully pushed to a remote branch.
     Pushed,
     /// Rejected after acceptance blocker detection.
     Rejected(String),
@@ -536,7 +517,7 @@ impl ChangeRuntimeState {
     ///
     /// Returns one of: "not queued", "queued", "blocked", "stalled", "preparing",
     /// "applying", "accepting", "rejecting", "archiving", "resolving", "merge wait",
-    /// "resolve pending", "reject pending", "archived", "merged", "error", "stopped".
+    /// "resolve pending", "reject pending", "merged", "pushed", "error", "stopped".
     ///
     /// The ephemeral commit subphase deliberately does not appear here: it is
     /// presentation detail, and the canonical lifecycle stays `applying` for the
@@ -544,7 +525,6 @@ impl ChangeRuntimeState {
     pub fn display_status(&self) -> &'static str {
         // Terminal states take precedence.
         match &self.terminal {
-            TerminalState::Archived => return "archived",
             TerminalState::Merged => return "merged",
             TerminalState::Pushed => return "pushed",
             TerminalState::Rejected(_) => return "rejected",
@@ -593,7 +573,6 @@ impl ChangeRuntimeState {
             "accepting" => ratatui::style::Color::LightGreen,
             "rejecting" => ratatui::style::Color::LightYellow,
             "archiving" => ratatui::style::Color::Magenta,
-            "archived" => ratatui::style::Color::Blue,
             "merged" => ratatui::style::Color::LightBlue,
             "rejected" => ratatui::style::Color::LightRed,
             "merge wait" => ratatui::style::Color::LightMagenta,
@@ -723,10 +702,6 @@ pub struct OrchestratorState {
     /// Reducer-owned reject-wait queue (FIFO list of change_ids awaiting rejection review).
     reject_wait_queue: Vec<String>,
 
-    /// Execution mode: Serial or Parallel.
-    /// Determines how `ChangeArchived` events are handled.
-    execution_mode: ExecutionMode,
-
     /// Changes stopped by the per-change Apply-dispatch ceiling, in observation
     /// order.
     ///
@@ -751,17 +726,8 @@ pub struct ApplyIterationLimit {
 
 #[allow(dead_code)] // Public API for future use by TUI/Web states
 impl OrchestratorState {
-    /// Create a new orchestrator state with the given initial changes and execution mode.
+    /// Create a new orchestrator state with the given initial changes.
     pub fn new(change_ids: Vec<String>, max_iterations: u32) -> Self {
-        Self::with_mode(change_ids, max_iterations, ExecutionMode::Serial)
-    }
-
-    /// Create a new orchestrator state for a specific execution mode.
-    pub fn with_mode(
-        change_ids: Vec<String>,
-        max_iterations: u32,
-        execution_mode: ExecutionMode,
-    ) -> Self {
         let initial_set: HashSet<String> = change_ids.iter().cloned().collect();
         let pending_set = initial_set.clone();
         let total = change_ids.len();
@@ -789,7 +755,6 @@ impl OrchestratorState {
             change_runtime,
             resolve_wait_queue: Vec::new(),
             reject_wait_queue: Vec::new(),
-            execution_mode,
             apply_iteration_limits: Vec::new(),
         }
     }
@@ -1536,10 +1501,7 @@ impl OrchestratorState {
             .map(|rt| {
                 matches!(
                     rt.terminal,
-                    TerminalState::Archived
-                        | TerminalState::Merged
-                        | TerminalState::Pushed
-                        | TerminalState::Rejected(_)
+                    TerminalState::Merged | TerminalState::Pushed | TerminalState::Rejected(_)
                 )
             })
             .unwrap_or(false)
@@ -1727,13 +1689,12 @@ impl OrchestratorState {
                 // TUI/manual resolve commands are already gated by a visible
                 // `merge wait` row. In the observed stuck case the visible row
                 // can be reconstructed from archive-complete workspace evidence
-                // while the reducer still carries terminal Archived from an
-                // earlier serial/archive observation. Treat explicit operator
-                // retry for Archived as scheduler-owned merge retry intent, but
+                // while the reducer still shows the row as idle. Treat explicit
+                // operator retry there as scheduler-owned merge retry intent, but
                 // continue to reject permanent terminal states such as Merged or
                 // Rejected so stale clicks cannot reintroduce resolve work.
                 if matches!(rt.activity, ActivityState::Idle)
-                    && matches!(rt.terminal, TerminalState::None | TerminalState::Archived)
+                    && matches!(rt.terminal, TerminalState::None)
                 {
                     rt.terminal = TerminalState::None;
                     rt.wait_state = WaitState::MergeWait;
@@ -1759,10 +1720,7 @@ impl OrchestratorState {
         let rt = self.runtime_entry(&change_id);
         if matches!(
             rt.terminal,
-            TerminalState::Archived
-                | TerminalState::Merged
-                | TerminalState::Pushed
-                | TerminalState::Rejected(_)
+            TerminalState::Merged | TerminalState::Pushed | TerminalState::Rejected(_)
         ) {
             return ReduceOutcome::NoOp;
         }
@@ -1825,7 +1783,7 @@ impl OrchestratorState {
             WorkspaceObservation::WorkspaceArchived => {
                 // Restore MergeWait when the reducer already has explicit manual-wait
                 // evidence. A bare archived workspace observation is otherwise only a
-                // repository milestone: in parallel mode, no-blocker archive completion
+                // repository milestone: no-blocker archive completion
                 // must remain in active merge handling until MergeCompleted or a concrete
                 // MergeDeferred event explains manual wait.
                 if matches!(rt.wait_state, WaitState::MergeWait) {
@@ -2041,9 +1999,9 @@ impl OrchestratorState {
             crate::vcs::WorkspaceStatus::Blocked if self.stalled_change_ids.contains(change_id) => {
                 self.transition_change_to_stalled(
                     change_id,
-                    "serial change stalled with recoverable blocker",
+                    "change stalled with recoverable blocker",
                     "resolve blocker evidence and retry explicitly",
-                    "serial workflow state is preserved in the workspace",
+                    "workflow state is preserved in the workspace",
                 );
             }
             crate::vcs::WorkspaceStatus::Rejecting => {
@@ -2123,7 +2081,7 @@ impl OrchestratorState {
     ///
     /// ## Current Usage
     ///
-    /// - **Serial Orchestrator**: Calls this method in `src/orchestrator.rs` to track:
+    /// - **CLI Orchestrator**: Calls this method in `src/orchestrator.rs` to track:
     ///   - `ProcessingStarted` - When a change begins processing
     ///   - `ApplyStarted` - When apply operation starts
     ///   - `ApplyCompleted` - When apply operation completes (increments apply count)
@@ -2137,10 +2095,6 @@ impl OrchestratorState {
         match event {
             // Processing lifecycle
             ExecutionEvent::ProcessingStarted(change_id) => self.on_processing_started(change_id),
-            ExecutionEvent::ProcessingCompleted(change_id) => {
-                // Keep current_change_id set until archived
-                let _ = change_id;
-            }
             ExecutionEvent::ProcessingError { id, error } => {
                 self.on_processing_error(id, error.clone());
             }
@@ -2179,7 +2133,7 @@ impl OrchestratorState {
                 self.on_rejection_review_failed(change_id, error.clone());
             }
 
-            // Workspace preparation (parallel mode, process-local only)
+            // Workspace preparation (process-local only)
             ExecutionEvent::WorkspacePreparationStarted { change_id } => {
                 self.on_workspace_preparation_started(change_id);
             }
@@ -2187,7 +2141,7 @@ impl OrchestratorState {
                 self.on_workspace_preparation_ended(change_id);
             }
 
-            // Workspace status synchronization events (parallel mode)
+            // Workspace status synchronization events
             ExecutionEvent::WorkspaceStatusUpdated {
                 change_id, status, ..
             } => {
@@ -2220,7 +2174,6 @@ impl OrchestratorState {
             }
             ExecutionEvent::ChangeArchived(change_id) => {
                 self.mark_archived(change_id);
-                let mode = self.execution_mode;
                 let has_other_resolve_lane_blocker =
                     self.change_runtime.iter().any(|(id, runtime)| {
                         id != change_id
@@ -2232,30 +2185,22 @@ impl OrchestratorState {
                     });
                 let rt = self.runtime_entry(change_id);
                 if Self::clear_recoverable_terminal_for_success(rt) {
-                    match mode {
-                        ExecutionMode::Serial => {
-                            // Serial: archive is terminal.
-                            rt.terminal = TerminalState::Archived;
-                            rt.wait_state = WaitState::None;
-                            rt.queue_intent = QueueIntent::NotQueued;
-                        }
-                        ExecutionMode::Parallel => {
-                            rt.queue_intent = QueueIntent::NotQueued;
-                            if has_other_resolve_lane_blocker {
-                                // Lane occupied: keep this row scheduler-owned for automatic retry
-                                // after the active merge/reject lane clears.
-                                rt.activity = ActivityState::Idle;
-                                rt.wait_state = WaitState::ResolveWait;
-                                self.enqueue_unique_resolve_wait(change_id);
-                            } else {
-                                // No blocker known yet: make active merge handling truthful in the
-                                // reducer. Manual MergeWait is set only by a later concrete
-                                // MergeDeferred(auto_resumable=false) event from merge readiness.
-                                rt.activity = ActivityState::Resolving;
-                                rt.wait_state = WaitState::None;
-                                self.remove_from_resolve_wait_queue(change_id);
-                            }
-                        }
+                    // Archive is never terminal on its own: it always enters
+                    // post-archive handling.
+                    rt.queue_intent = QueueIntent::NotQueued;
+                    if has_other_resolve_lane_blocker {
+                        // Lane occupied: keep this row scheduler-owned for automatic retry
+                        // after the active merge/reject lane clears.
+                        rt.activity = ActivityState::Idle;
+                        rt.wait_state = WaitState::ResolveWait;
+                        self.enqueue_unique_resolve_wait(change_id);
+                    } else {
+                        // No blocker known yet: make active merge handling truthful in the
+                        // reducer. Manual MergeWait is set only by a later concrete
+                        // MergeDeferred(auto_resumable=false) event from merge readiness.
+                        rt.activity = ActivityState::Resolving;
+                        rt.wait_state = WaitState::None;
+                        self.remove_from_resolve_wait_queue(change_id);
                     }
                 }
             }
@@ -2265,7 +2210,7 @@ impl OrchestratorState {
                 self.transition_change_to_error(change_id, error.clone());
             }
 
-            // Merge / resolve events (parallel mode)
+            // Merge / resolve events
             ExecutionEvent::MergeDeferred {
                 change_id,
                 auto_resumable,
@@ -2470,10 +2415,7 @@ impl OrchestratorState {
                 let rt = self.runtime_entry(change_id);
                 if matches!(
                     rt.terminal,
-                    TerminalState::Archived
-                        | TerminalState::Merged
-                        | TerminalState::Pushed
-                        | TerminalState::Rejected(_)
+                    TerminalState::Merged | TerminalState::Pushed | TerminalState::Rejected(_)
                 ) {
                     return;
                 }
@@ -2532,23 +2474,6 @@ impl OrchestratorState {
 impl Default for OrchestratorState {
     fn default() -> Self {
         Self::new(Vec::new(), 0)
-    }
-}
-
-impl OrchestratorState {
-    /// Get the execution mode.
-    #[allow(dead_code)]
-    pub fn execution_mode(&self) -> ExecutionMode {
-        self.execution_mode
-    }
-
-    /// Set the execution mode without replacing reducer-owned runtime state.
-    ///
-    /// This is used by scheduler startup paths that need to preserve existing
-    /// reducer intent (for example manual ResolveWait work) while ensuring
-    /// subsequent execution events are interpreted with the correct mode.
-    pub fn set_execution_mode(&mut self, execution_mode: ExecutionMode) {
-        self.execution_mode = execution_mode;
     }
 }
 
@@ -2815,7 +2740,7 @@ mod tests {
     #[test]
     fn pushed_terminal_status_is_distinct_from_merged() {
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 1, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 1);
         state.apply_execution_event(&crate::events::ExecutionEvent::PushCompleted {
             change_id: "c".to_string(),
             remote: "origin".to_string(),
@@ -2846,8 +2771,8 @@ mod tests {
 
         // Terminal takes highest priority.
         let rt = state.runtime_entry("c");
-        rt.terminal = TerminalState::Archived;
-        assert_eq!(state.display_status("c"), "archived");
+        rt.terminal = TerminalState::Merged;
+        assert_eq!(state.display_status("c"), "merged");
     }
 
     #[test]
@@ -2889,9 +2814,6 @@ mod tests {
         assert_eq!(rt.display_color(), ratatui::style::Color::LightMagenta);
 
         rt.wait_state = WaitState::None;
-        rt.terminal = TerminalState::Archived;
-        assert_eq!(rt.display_color(), ratatui::style::Color::Blue);
-
         rt.terminal = TerminalState::Merged;
         assert_eq!(rt.display_color(), ratatui::style::Color::LightBlue);
 
@@ -2936,7 +2858,7 @@ mod tests {
         assert!(state.is_active_change("c"));
 
         // Terminal → not active (invariant-wise, but is_active_change checks activity).
-        state.runtime_entry("c").terminal = TerminalState::Archived;
+        state.runtime_entry("c").terminal = TerminalState::Merged;
         state.runtime_entry("c").activity = ActivityState::Idle;
         assert!(!state.is_active_change("c"));
         assert!(state.is_terminal_change("c"));
@@ -2948,21 +2870,19 @@ mod tests {
 
     #[test]
     fn final_terminal_dispatch_stop_excludes_recoverable_terminal_error() {
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec![
                 "merged".to_string(),
                 "archived".to_string(),
                 "rejected".to_string(),
                 "error".to_string(),
             ],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
         state.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
             change_id: "merged".to_string(),
             revision: "rev".to_string(),
         });
-        state.runtime_entry("archived").terminal = TerminalState::Archived;
+        state.runtime_entry("archived").terminal = TerminalState::Pushed;
         state.runtime_entry("rejected").terminal = TerminalState::Rejected("no".to_string());
         state.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
             id: "error".to_string(),
@@ -3076,7 +2996,7 @@ mod tests {
     #[test]
     fn retry_terminal_error_clears_error_gate_and_stale_retry_metadata() {
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         state.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
             change_id: "c".to_string(),
@@ -3116,7 +3036,7 @@ mod tests {
     #[test]
     fn late_success_supersedes_recoverable_error_without_requeueing_apply() {
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
         state.apply_execution_event(&crate::events::ExecutionEvent::ApplyFailed {
             change_id: "c".to_string(),
             error: "boom".to_string(),
@@ -3139,7 +3059,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
         state.apply_execution_event(&ExecutionEvent::ArchiveFailed {
             change_id: "c".to_string(),
             error: "Archive commit finalization failed".to_string(),
@@ -3164,11 +3084,9 @@ mod tests {
     fn test_base_mutating_lane_is_single_occupant_across_resolving_and_rejecting() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["a".to_string(), "b".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("a".to_string()));
         assert_eq!(state.display_status("a"), "resolving");
@@ -3188,7 +3106,7 @@ mod tests {
     #[test]
     fn release_base_mutating_lane_after_retry_restores_resolve_wait_uniquely() {
         let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
             change_id: "alpha".to_string(),
@@ -3216,11 +3134,9 @@ mod tests {
 
     #[test]
     fn abandon_base_mutating_lane_occupant_releases_resolve_without_requeueing() {
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["alpha".to_string(), "beta".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
             change_id: "alpha".to_string(),
@@ -3269,15 +3185,13 @@ mod tests {
 
     #[test]
     fn abandon_base_mutating_lane_occupant_releases_reject_and_noops_terminal_or_non_occupant() {
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec![
                 "lane".to_string(),
                 "reject".to_string(),
                 "terminal".to_string(),
             ],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&crate::events::ExecutionEvent::ChangeArchived(
             "lane".to_string(),
@@ -3311,11 +3225,9 @@ mod tests {
 
     #[test]
     fn release_base_mutating_lane_after_retry_restores_reject_wait_and_noops_terminal() {
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["lane".to_string(), "reject".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&crate::events::ExecutionEvent::ChangeArchived(
             "lane".to_string(),
@@ -3349,11 +3261,9 @@ mod tests {
     fn test_reject_wait_queue_membership_and_clear_on_start_completion() {
         use crate::events::{ExecutionEvent, RejectionOutcome};
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["a".to_string(), "b".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("a".to_string()));
         state.mark_reject_wait("b");
 
@@ -3380,11 +3290,9 @@ mod tests {
 
     #[test]
     fn command_side_effects_update_terminal_wait_and_base_lane_queues() {
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["c".to_string(), "d".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.resolve_wait_queue.push("c".to_string());
         state.reject_wait_queue.push("c".to_string());
@@ -3437,15 +3345,13 @@ mod tests {
     fn execution_event_side_effects_update_wait_queues_and_blocked_metadata() {
         use crate::events::{ExecutionEvent, RejectionOutcome};
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec![
                 "resolving".to_string(),
                 "archived".to_string(),
                 "reject".to_string(),
             ],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&ExecutionEvent::ResolveStarted {
             change_id: "resolving".to_string(),
@@ -4436,7 +4342,7 @@ mod tests {
     #[test]
     fn startup_refresh_restores_merge_wait_for_a_fresh_idle_change() {
         let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
         assert_eq!(state.display_status("alpha"), "not queued");
 
         state.apply_execution_event(&startup_refresh(&["alpha"]));
@@ -4456,7 +4362,7 @@ mod tests {
     #[test]
     fn startup_refresh_merge_wait_restoration_is_idempotent() {
         let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&startup_refresh(&["alpha"]));
         state.apply_execution_event(&startup_refresh(&["alpha"]));
@@ -4577,11 +4483,9 @@ mod tests {
 
         for (label, expected, setup) in cases {
             // `lane` exists only so a case can occupy the single base-mutating lane.
-            let mut state = OrchestratorState::with_mode(
+            let mut state = OrchestratorState::new(
                 vec!["x".to_string(), "lane".to_string()],
-                0,
-                ExecutionMode::Parallel,
-            );
+                0);
             setup(&mut state);
             assert_eq!(state.display_status("x"), expected, "setup for {}", label);
             let resolve_wait_before = state.resolve_wait_change_ids();
@@ -4673,15 +4577,13 @@ mod tests {
     fn test_base_mutating_lane_exclusivity_and_wait_membership() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec![
                 "resolving-a".to_string(),
                 "rejecting-b".to_string(),
                 "archive-c".to_string(),
             ],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
             change_id: "resolving-a".to_string(),
@@ -4717,15 +4619,13 @@ mod tests {
     fn test_reject_wait_clear_and_deterministic_single_promotion() {
         use crate::events::{ExecutionEvent, RejectionOutcome};
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec![
                 "lane-a".to_string(),
                 "resolve-b".to_string(),
                 "reject-c".to_string(),
             ],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
             change_id: "lane-a".to_string(),
@@ -4786,7 +4686,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
 
@@ -4806,7 +4706,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
         assert_eq!(state.display_status("c"), "resolving");
@@ -4839,7 +4739,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
         state.apply_execution_event(&ExecutionEvent::MergeCompleted {
@@ -4869,7 +4769,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert_eq!(state.queued_change_ids(), vec!["c".to_string()]);
@@ -4896,7 +4796,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "c".to_string(),
@@ -4923,7 +4823,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
@@ -4945,21 +4845,44 @@ mod tests {
         );
     }
 
+    /// Archive is never terminal on its own: it enters active post-archive
+    /// handling, so an explicit manual retry there changes nothing, while a
+    /// concrete manual wait is still admitted as scheduler-consumable intent.
     #[test]
-    fn test_archived_manual_retry_becomes_scheduler_consumable_resolve_wait() {
-        let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Serial);
+    fn test_archived_change_enters_active_merge_handling_before_manual_retry() {
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&crate::events::ExecutionEvent::ChangeArchived(
             "alpha".to_string(),
         ));
-        assert_eq!(state.display_status("alpha"), "archived");
+        assert_eq!(
+            state.display_status("alpha"),
+            "resolving",
+            "archive alone must never be terminal"
+        );
+
+        assert!(
+            matches!(
+                state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string())),
+                ReduceOutcome::NoOp
+            ),
+            "a row already in active merge handling needs no manual retry"
+        );
+        assert_eq!(state.display_status("alpha"), "resolving");
+
+        // A concrete manual deferral is what makes the retry meaningful.
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "manual resolution required".to_string(),
+            auto_resumable: false,
+        });
+        assert_eq!(state.display_status("alpha"), "merge wait");
 
         let outcome = state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
 
         assert!(
             matches!(outcome, ReduceOutcome::Changed(_)),
-            "explicit manual retry for repository-visible archived merge-wait must not be dropped"
+            "explicit manual retry for a merge-wait row must not be dropped"
         );
         assert_eq!(state.display_status("alpha"), "resolve pending");
         assert_eq!(state.resolve_wait_change_ids(), vec!["alpha".to_string()]);
@@ -4969,7 +4892,7 @@ mod tests {
     #[test]
     fn test_merged_manual_retry_remains_noop() {
         let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
             change_id: "alpha".to_string(),
@@ -4988,7 +4911,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
@@ -5006,11 +4929,9 @@ mod tests {
     fn test_archive_merge_defers_to_resolve_pending_when_rejecting_active() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["a".to_string(), "b".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
             change_id: "a".to_string(),
@@ -5030,11 +4951,9 @@ mod tests {
     fn test_active_applying_does_not_create_resolve_pending_on_archive() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["a".to_string(), "b".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&ExecutionEvent::ApplyStarted {
             change_id: "a".to_string(),
@@ -5104,7 +5023,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::MergeCompleted {
             change_id: "alpha".to_string(),
@@ -5126,7 +5045,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "alpha".to_string(),
@@ -5152,7 +5071,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "alpha".to_string(),
@@ -5172,11 +5091,11 @@ mod tests {
     fn test_resolve_completed_clears_resolve_wait_and_survives_refresh() {
         use crate::events::ExecutionEvent;
 
-        // Parallel mode is required to model MergeWait/ResolveWait lifecycle.
-        let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
 
-        // Step 1: concrete manual merge blocker -> enters MergeWait in parallel mode.
+        let mut state =
+            OrchestratorState::new(vec!["c".to_string()], 0);
+
+        // Step 1: concrete manual merge blocker -> enters MergeWait.
         // A bare ChangeArchived event now truthfully enters active post-archive
         // merge handling; only MergeDeferred(auto_resumable=false) represents
         // operator-owned manual merge wait.
@@ -5241,7 +5160,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["change-a".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["change-a".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "change-a".to_string(),
@@ -5274,11 +5193,9 @@ mod tests {
     fn test_resolve_wait_clean_lane_promotion_promotes_exactly_one_waiter() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["alpha".to_string(), "beta".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         for change_id in ["alpha", "beta"] {
             state.apply_execution_event(&ExecutionEvent::MergeDeferred {
@@ -5413,24 +5330,29 @@ mod tests {
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
-        // Archive the change.
+        // Archive, then complete the post-archive merge that terminates it.
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
-        assert_eq!(state.display_status("c"), "archived");
+        assert_eq!(state.display_status("c"), "resolving");
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "c".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "merged");
 
-        // Late ResolveFailed must NOT regress archived state.
+        // Late ResolveFailed must NOT regress the terminal state.
         state.apply_execution_event(&ExecutionEvent::ResolveFailed {
             change_id: "c".to_string(),
             error: "late".to_string(),
         });
-        assert_eq!(state.display_status("c"), "archived");
+        assert_eq!(state.display_status("c"), "merged");
 
         // Duplicate ApplyStarted on a terminal change must be no-op.
         state.apply_execution_event(&ExecutionEvent::ApplyStarted {
             change_id: "c".to_string(),
             command: "cmd".to_string(),
         });
-        // Terminal wins: still archived.
-        assert_eq!(state.display_status("c"), "archived");
+        // Terminal wins: still merged.
+        assert_eq!(state.display_status("c"), "merged");
     }
 
     /// Phase 7.2: reducer runtime state and legacy aggregates (pending_changes, archived_changes,
@@ -5478,8 +5400,9 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("a".to_string()));
         state.mark_archived("a");
 
-        // Reducer terminal and legacy archived set must agree.
-        assert_eq!(state.display_status("a"), "archived");
+        // Archive enters post-archive handling; the legacy archived set agrees
+        // that the archive itself happened.
+        assert_eq!(state.display_status("a"), "resolving");
         assert!(state.is_archived("a"));
         assert!(!state.is_pending("a"));
 
@@ -5495,40 +5418,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Execution mode tests: Serial vs Parallel state machine
+    // Archive-to-post-archive transitions (the sole execution path)
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_serial_mode_change_archived_is_terminal() {
-        use crate::events::ExecutionEvent;
-
-        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
-        // Default is Serial mode.
-        assert_eq!(state.execution_mode(), ExecutionMode::Serial);
-
-        state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
-        assert_eq!(state.display_status("c"), "archived");
-        assert!(state.is_terminal_change("c"));
-
-        // MergeCompleted after terminal Archived in serial mode is a no-op.
-        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
-            change_id: "c".to_string(),
-            revision: "rev".to_string(),
-        });
-        assert_eq!(
-            state.display_status("c"),
-            "archived",
-            "Serial: MergeCompleted must not override Archived terminal"
-        );
-    }
 
     #[test]
     fn test_parallel_mode_change_archived_transitions_to_resolving_without_blocker() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
-        assert_eq!(state.execution_mode(), ExecutionMode::Parallel);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         // Apply → Archive
         state.apply_execution_event(&ExecutionEvent::ApplyStarted {
@@ -5545,7 +5442,7 @@ mod tests {
         });
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
 
-        // In parallel mode, ChangeArchived is a merge-routing milestone, not a
+        // ChangeArchived is a merge-routing milestone, not a
         // stable terminal display. With no lane blocker or manual deferral
         // evidence, the reducer must show active merge handling immediately.
         assert_eq!(
@@ -5576,7 +5473,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::AcceptanceFailed {
             change_id: "alpha".to_string(),
@@ -5605,11 +5502,9 @@ mod tests {
     fn test_parallel_mode_acceptance_error_archive_then_merge_finishes_merged() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["add-skill-secret-ingestion".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&ExecutionEvent::AcceptanceFailed {
             change_id: "add-skill-secret-ingestion".to_string(),
@@ -5636,7 +5531,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut merge_state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
         merge_state.apply_execution_event(&ExecutionEvent::ProcessingError {
             id: "alpha".to_string(),
             error: "recoverable process failure".to_string(),
@@ -5649,7 +5544,7 @@ mod tests {
         assert_eq!(merge_state.display_status("alpha"), "merged");
 
         let mut resolve_state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
         resolve_state.apply_execution_event(&ExecutionEvent::ProcessingError {
             id: "alpha".to_string(),
             error: "recoverable process failure".to_string(),
@@ -5662,7 +5557,7 @@ mod tests {
         assert_eq!(resolve_state.display_status("alpha"), "merged");
 
         let mut rejected_state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 0);
         rejected_state.apply_execution_event(&ExecutionEvent::ChangeRejected {
             change_id: "alpha".to_string(),
             reason: "final rejection".to_string(),
@@ -5683,11 +5578,9 @@ mod tests {
     fn test_parallel_mode_change_archived_uses_resolve_pending_when_other_change_is_resolving() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["resolving".to_string(), "archived".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&ExecutionEvent::ResolveStarted {
             change_id: "resolving".to_string(),
@@ -5709,11 +5602,9 @@ mod tests {
         use crate::events::ExecutionEvent;
         use crate::vcs::WorkspaceStatus;
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["rejecting".to_string(), "archived".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
             change_id: "rejecting".to_string(),
@@ -5735,11 +5626,9 @@ mod tests {
     fn test_parallel_mode_change_archived_enters_resolving_when_other_change_is_accepting() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["accepting".to_string(), "archived".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
             change_id: "accepting".to_string(),
@@ -5759,11 +5648,9 @@ mod tests {
     fn test_parallel_mode_full_lifecycle() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::with_mode(
+        let mut state = OrchestratorState::new(
             vec!["a".to_string(), "b".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+            0);
 
         // Queue and process 'a'
         state.apply_command(ReducerCommand::AddToQueue("a".to_string()));
@@ -5799,7 +5686,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
 
         // Archive completion without a concrete blocker enters active merge handling.
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
@@ -5832,7 +5719,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["c".to_string()], 0);
 
         // Full lifecycle to merged
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
@@ -6113,21 +6000,32 @@ mod tests {
         assert_eq!(state.display_status("c"), "queued");
     }
 
-    /// AddToQueue on an Archived change must be a no-op (cannot re-queue a completed change).
+    /// AddToQueue on a change that reached its post-archive terminal state must
+    /// be a no-op: archive alone is not terminal, the merge that follows it is.
     #[test]
-    fn test_add_to_queue_noop_on_archived() {
+    fn test_add_to_queue_noop_on_merged() {
         use crate::events::ExecutionEvent;
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
-        assert_eq!(state.display_status("c"), "archived");
+        assert_eq!(
+            state.display_status("c"),
+            "resolving",
+            "archive enters post-archive handling instead of terminating"
+        );
+
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "c".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "merged");
 
         let outcome = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert!(
             matches!(outcome, ReduceOutcome::NoOp),
-            "AddToQueue on archived change must be NoOp"
+            "AddToQueue on a merged change must be NoOp"
         );
-        assert_eq!(state.display_status("c"), "archived");
+        assert_eq!(state.display_status("c"), "merged");
     }
 
     /// After AddToQueue + DependencyBlocked + DependencyResolved, the display must
@@ -6270,7 +6168,7 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state =
-            OrchestratorState::with_mode(vec![change_id.to_string()], 0, ExecutionMode::Parallel);
+            OrchestratorState::new(vec![change_id.to_string()], 0);
         state.apply_execution_event(&ExecutionEvent::ChangeArchived(change_id.to_string()));
         state
     }
@@ -6529,7 +6427,7 @@ mod tests {
         use std::collections::{HashMap, HashSet};
 
         let mut state =
-            OrchestratorState::with_mode(vec!["fresh".to_string()], 1, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["fresh".to_string()], 1);
         state.apply_command(ReducerCommand::AddToQueue("fresh".to_string()));
 
         let change = |id: &str| crate::openspec::Change {
@@ -6582,7 +6480,7 @@ mod tests {
         use std::collections::{HashMap, HashSet};
 
         let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 1, ExecutionMode::Parallel);
+            OrchestratorState::new(vec!["alpha".to_string()], 1);
         state.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
         assert!(state.is_ordinary_queue_eligible("alpha"));
 

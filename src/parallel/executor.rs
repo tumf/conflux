@@ -94,7 +94,7 @@ pub struct ParallelHookContext {
     pub changes_processed: usize,
 }
 
-/// Build a HookContext for parallel mode with workspace-specific environment variables.
+/// Build a HookContext with managed-workspace environment variables.
 fn build_parallel_hook_context(
     change_id: &str,
     completed_tasks: u32,
@@ -648,20 +648,26 @@ pub async fn execute_apply_in_workspace(
     let event_handler = ParallelApplyEventHandler::new(change_id.to_string(), event_tx);
 
     // Create hook context for apply loop
-    let hook_ctx = if let Some(ctx) = parallel_ctx {
-        let remaining_changes = ctx.total_changes.saturating_sub(ctx.changes_processed);
-        common_apply::ApplyLoopHookContext::parallel(
+    // The managed workspace is always known here, so a change-level hook always
+    // carries workspace and group identity — with or without run-level counts.
+    let hook_ctx = match parallel_ctx {
+        Some(ctx) => common_apply::ApplyLoopHookContext::new(
             ctx.changes_processed,
             ctx.total_changes,
-            remaining_changes,
+            ctx.total_changes.saturating_sub(ctx.changes_processed),
             workspace_path.to_string_lossy().to_string(),
             ctx.group_index.unwrap_or(0) as usize,
-        )
-    } else {
-        common_apply::ApplyLoopHookContext::serial(0, 0, 0)
+        ),
+        None => common_apply::ApplyLoopHookContext::new(
+            0,
+            0,
+            0,
+            workspace_path.to_string_lossy().to_string(),
+            0,
+        ),
     };
 
-    // Create workspace manager for WIP commit/stall detection in parallel mode
+    // Create workspace manager for WIP commit/stall detection
     // The workspace (Git worktree) is already created, so we just need a manager
     // for commit operations
     let workspace_manager = GitWorkspaceManager::new(

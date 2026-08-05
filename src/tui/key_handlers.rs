@@ -898,12 +898,6 @@ pub async fn handle_key_event(
             // Jump to newest log entry and re-enable auto-scroll
             ctx.app.scroll_logs_to_bottom();
         }
-        (KeyCode::Char('='), _) => {
-            // Toggle parallel mode. The request goes to the shared operator
-            // service as a command, so the mode guard and the ineligible-intent
-            // cleanup are the ones `/api/v2` also runs.
-            cmd_to_start = ctx.app.toggle_parallel_mode();
-        }
         (KeyCode::Enter, _) => {
             handle_enter_key(ctx).await?;
         }
@@ -977,7 +971,6 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             crate::parallel::PostArchiveAction::MergeToBase,
             None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "web-monitoring")]
             None,

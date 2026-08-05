@@ -28,13 +28,11 @@ use tokio::task::JoinSet;
 fn shared_state_with_queue_intent(
     change_ids: &[&str],
 ) -> Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>> {
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use crate::orchestration::state::{OrchestratorState, ReducerCommand};
 
-    let mut state = OrchestratorState::with_mode(
+    let mut state = OrchestratorState::new(
         change_ids.iter().map(|id| id.to_string()).collect(),
-        1,
-        ExecutionMode::Parallel,
-    );
+        1);
     for change_id in change_ids {
         state.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
     }

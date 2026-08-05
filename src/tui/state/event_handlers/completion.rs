@@ -7,18 +7,6 @@ use crate::tui::types::{AppExecutionMode, StopMode};
 use super::AppState;
 
 impl AppState {
-    pub(crate) fn handle_processing_completed(&mut self, id: String) {
-        self.reset_analysis_log_dedupe();
-        if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            change.set_display_status_cache("archiving");
-            if let Ok(progress) = task_parser::parse_change(&id) {
-                change.completed_tasks = progress.completed;
-                change.total_tasks = progress.total;
-            }
-        }
-        self.add_log(LogEntry::success(format!("Completed: {}", id)).with_change_id(&id));
-    }
-
     /// The app mode name this frontend reports to the shared terminal-mode rule.
     ///
     /// Only the retained terminal modes need to be named exactly; every other
@@ -363,7 +351,6 @@ mod tests {
     fn proposal_completion_skip_and_stop_logs_carry_structured_change_id() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
 
-        app.handle_processing_completed("change-a".to_string());
         app.handle_change_archived("change-a".to_string());
         app.handle_acceptance_completed("change-a".to_string());
         app.handle_merge_completed("change-a".to_string());
@@ -371,7 +358,6 @@ mod tests {
         app.handle_change_stopped("change-a".to_string());
 
         for needle in [
-            "Completed: change-a",
             "Archived: change-a",
             "Acceptance completed: change-a",
             "Merge completed for 'change-a'",
@@ -435,17 +421,6 @@ mod tests {
             change_ids_for_message(&app, "merged branch 'feature/change-a' successfully"),
             vec![None]
         );
-    }
-
-    #[test]
-    fn processing_completed_updates_status() {
-        let changes = vec![create_test_change("test-change", 0, 1)];
-        let mut app = AppState::new(changes);
-
-        app.handle_processing_completed("test-change".to_string());
-
-        let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
-        assert_eq!(change.display_status_cache, "archiving");
     }
 
     #[test]
@@ -599,16 +574,14 @@ mod tests {
             ResolveReservation, ResolveReservations, RunControlOutcome, RunControlService,
             StartEligibility,
         };
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use crate::orchestration::state::{OrchestratorState};
         use crate::tui::queue::DynamicQueue;
         use std::sync::Arc;
         use tokio::sync::RwLock;
 
-        let state = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        let state = Arc::new(RwLock::new(OrchestratorState::new(
             vec!["change-a".to_string(), "change-b".to_string()],
-            10,
-            ExecutionMode::Parallel,
-        )));
+            10)));
         {
             let mut guard = state.write().await;
             for id in ["change-a", "change-b"] {

@@ -726,13 +726,11 @@ async fn run_fatal_outcome_stops_dispatch_and_fails_the_scheduler() {
 /// intact, and the presentation telemetry that rides along changes nothing.
 #[test]
 fn reducer_keeps_exhausted_change_in_merge_wait() {
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, WorkspaceObservation};
+    use crate::orchestration::state::{OrchestratorState, WorkspaceObservation};
 
-    let mut state = OrchestratorState::with_mode(
+    let mut state = OrchestratorState::new(
         vec!["alpha".to_string(), "beta".to_string()],
-        3,
-        ExecutionMode::Parallel,
-    );
+        3);
     state.apply_observation("alpha", WorkspaceObservation::WorkspaceArchived);
 
     let detail = crate::parallel::resolve_failure_detail(

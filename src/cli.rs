@@ -44,9 +44,8 @@ SUBCOMMANDS:
   openapi  Print the generated /api/v2 OpenAPI 3.1 schema to stdout
 
 KEY OPTIONS:
-  --parallel            Enable parallel execution using git worktrees
   --max-concurrent N    Limit concurrent workspaces (default: 3)
-  --dry-run             Preview parallelization groups without execution
+  --dry-run             Preview dependency execution groups without execution
   --vcs BACKEND         VCS backend: auto, git (default: auto)
   --web                 Enable the browser-facing TCP web monitoring server
   --web-port PORT       Web server port (default: 0 = auto-assign)
@@ -114,7 +113,7 @@ pub struct Cli {
     #[arg(long, conflicts_with = "web_unix_socket")]
     pub no_web_unix_socket: bool,
 
-    /// Push completed parallel TUI change branches to a remote instead of merging to base.
+    /// Push completed TUI change branches to a remote instead of merging to base.
     #[arg(long, num_args = 0..=1, default_missing_value = "origin", value_parser = parse_push_remote)]
     pub push: Option<String>,
 
@@ -397,9 +396,10 @@ pub struct LogsArgs {
 This mode requires an explicit target: --all for every current change, positional
 change IDs for selected changes, or legacy --change for comma-separated IDs.
 
-PARALLEL EXECUTION:
-  --parallel enables concurrent processing using git worktrees. Changes are
-  analyzed for dependencies and executed in optimal parallel groups.
+EXECUTION MODEL:
+  Every run executes changes in managed git worktrees. Changes are analyzed for
+  dependencies and executed in optimal concurrent groups. There is no execution
+  mode to select; a usable git repository is required.
 
 LOCAL API:
   /api/v2 is served on ${GIT_COMMON_DIR}/cflx-api.sock by default, with no TCP
@@ -414,8 +414,8 @@ EXAMPLES:
   cflx run --all                           # Process all current changes
   cflx run my-feature other-change         # Process selected changes
   cflx run --change my-feature,other-change  # Legacy selected changes
-  cflx run --all --parallel --max-concurrent 5  # Parallel with 5 workers
-  cflx run my-feature --parallel --dry-run      # Preview selected parallel plan
+  cflx run --all --max-concurrent 5        # Run with 5 concurrent workspaces
+  cflx run my-feature --dry-run            # Preview the selected execution plan
   cflx run --all --web --web-port 8080     # Enable web monitoring on port 8080"
 )]
 pub struct RunArgs {
@@ -438,23 +438,19 @@ pub struct RunArgs {
     #[arg(long)]
     pub max_iterations: Option<u32>,
 
-    /// Enable parallel execution mode using git worktrees
-    #[arg(long)]
-    pub parallel: bool,
-
-    /// Push completed parallel change branches to a remote instead of merging to base.
+    /// Push completed change branches to a remote instead of merging to base.
     #[arg(long, num_args = 0..=1, default_missing_value = "origin", value_parser = parse_push_remote)]
     pub push: Option<String>,
 
-    /// Maximum number of concurrent workspaces for parallel execution
+    /// Maximum number of concurrent workspaces
     #[arg(long)]
     pub max_concurrent: Option<usize>,
 
-    /// Preview parallelization groups without executing (dry run)
+    /// Preview dependency execution groups without executing (dry run)
     #[arg(long)]
     pub dry_run: bool,
 
-    /// VCS backend for parallel execution: auto or git
+    /// VCS backend: auto or git
     /// Default: auto (detects git repository)
     #[arg(long, default_value = "auto")]
     pub vcs: String,
@@ -519,7 +515,7 @@ pub struct RunArgs {
     /// requires `=`, as in `--integrate-upstream=upstream`; `-u <remote>` is not
     /// supported and never consumes a following positional change ID.
     ///
-    /// Cumulative parallel run mode only. Requires `--upstream-verify-command`.
+    /// Requires `--upstream-verify-command`.
     #[arg(
         long,
         num_args = 0..=1,
@@ -666,7 +662,7 @@ pub struct TuiArgs {
     #[arg(long, conflicts_with = "web_unix_socket")]
     pub no_web_unix_socket: bool,
 
-    /// Push completed parallel TUI change branches to a remote instead of merging to base.
+    /// Push completed TUI change branches to a remote instead of merging to base.
     #[arg(long, num_args = 0..=1, default_missing_value = "origin", value_parser = parse_push_remote)]
     pub push: Option<String>,
 
@@ -944,15 +940,18 @@ pub fn check_git_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Check if parallel execution is available (git)
-pub fn check_parallel_available() -> bool {
+/// Check whether this workspace can run worktree orchestration at all.
+///
+/// Both facts are required: a repository to cut worktrees from, and the `git`
+/// command that cuts them.
+pub fn check_git_workspace_usable() -> bool {
     check_git_directory() && check_git_available()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     fn run_args(argv: &[&str]) -> RunArgs {
         match Cli::parse_from(argv).command {
@@ -963,7 +962,7 @@ mod tests {
 
     #[test]
     fn upstream_integration_is_absent_by_default() {
-        let args = run_args(&["cflx", "run", "--all", "--parallel"]);
+        let args = run_args(&["cflx", "run", "--all"]);
         assert_eq!(args.integrate_upstream, None);
         assert_eq!(args.upstream_verify_command, None);
         assert_eq!(args.upstream_integration().unwrap(), None);
@@ -975,7 +974,6 @@ mod tests {
             "cflx",
             "run",
             "--all",
-            "--parallel",
             "-u",
             "--upstream-verify-command",
             "cargo test",
@@ -984,7 +982,6 @@ mod tests {
             "cflx",
             "run",
             "--all",
-            "--parallel",
             "--integrate-upstream",
             "--upstream-verify-command",
             "cargo test",
@@ -1012,7 +1009,6 @@ mod tests {
         let args = run_args(&[
             "cflx",
             "run",
-            "--parallel",
             "-u",
             "--upstream-verify-command",
             "cargo test",
@@ -1032,7 +1028,6 @@ mod tests {
             "cflx",
             "run",
             "--all",
-            "--parallel",
             "--integrate-upstream=upstream",
             "--upstream-verify-command",
             "cargo test",
@@ -1050,7 +1045,6 @@ mod tests {
         let spaced = run_args(&[
             "cflx",
             "run",
-            "--parallel",
             "--integrate-upstream",
             "upstream",
             "--upstream-verify-command",
@@ -1066,7 +1060,6 @@ mod tests {
             "cflx",
             "run",
             "--all",
-            "--parallel",
             "--integrate-upstream=origin:main",
         ])
         .unwrap_err();
@@ -1075,7 +1068,7 @@ mod tests {
 
     #[test]
     fn upstream_integration_requires_verify_command() {
-        let args = run_args(&["cflx", "run", "--all", "--parallel", "-u"]);
+        let args = run_args(&["cflx", "run", "--all", "-u"]);
         assert_eq!(
             args.upstream_integration(),
             Err(crate::upstream::UpstreamOptionError::MissingVerifyCommand)
@@ -1088,7 +1081,6 @@ mod tests {
             "cflx",
             "run",
             "--all",
-            "--parallel",
             "--upstream-verify-command",
             "cargo test",
         ]);
@@ -1144,7 +1136,6 @@ mod tests {
             "cflx",
             "run",
             "--all",
-            "--parallel",
             "-u",
             "--upstream-verify-command",
             "cargo test",
@@ -1253,7 +1244,6 @@ mod tests {
             "cflx",
             "run",
             "--all",
-            "--parallel",
             "-u",
             "--upstream-verify-command",
             "cargo test",
@@ -1271,7 +1261,7 @@ mod tests {
         // so the short spelling must take no value on any of the three
         // entrypoints while the long spelling keeps accepting one.
         for argv in [
-            vec!["cflx", "run", "--all", "--parallel", "-u=upstream"],
+            vec!["cflx", "run", "--all", "-u=upstream"],
             vec!["cflx", "-u=upstream"],
             vec!["cflx", "tui", "-u=upstream"],
         ] {
@@ -1291,7 +1281,6 @@ mod tests {
             "cflx",
             "run",
             "--all",
-            "--parallel",
             "--integrate-upstream=upstream",
             "--upstream-verify-command",
             "cargo test",
@@ -1327,7 +1316,6 @@ mod tests {
                 "cflx",
                 "run",
                 "--all",
-                "--parallel",
                 "-u",
                 "--upstream-verify-command",
                 "cargo test",
@@ -1359,7 +1347,7 @@ mod tests {
         // `cflx -u run ...` parses, but `Commands::Run` reads its own options, so
         // the opt-in would be dropped and the run would succeed in merged mode.
         for (argv, option) in [
-            (vec!["cflx", "-u", "run", "--all", "--parallel"], "-u"),
+            (vec!["cflx", "-u", "run", "--all"], "-u"),
             (
                 vec!["cflx", "--integrate-upstream=upstream", "run", "--all"],
                 "--integrate-upstream",
@@ -1396,7 +1384,7 @@ mod tests {
         assert_eq!(bare.validate_upstream_option_placement(), Ok(()));
 
         let plain_subcommand =
-            Cli::try_parse_from(["cflx", "run", "--all", "--parallel"]).expect("run parses");
+            Cli::try_parse_from(["cflx", "run", "--all"]).expect("run parses");
         assert_eq!(
             plain_subcommand.validate_upstream_option_placement(),
             Ok(())
@@ -1867,12 +1855,11 @@ mod tests {
     }
 
     #[test]
-    fn test_run_subcommand_parallel_flag_default() {
+    fn test_run_subcommand_execution_options_default() {
         let cli = Cli::parse_from(["cflx", "run", "--all"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
-                assert!(!args.parallel);
                 assert!(args.max_concurrent.is_none());
                 assert!(!args.dry_run);
             }
@@ -1880,21 +1867,39 @@ mod tests {
         }
     }
 
+    /// Worktree orchestration is the only execution model, so the retired mode
+    /// selector must be a parse error rather than an accepted no-op, and help
+    /// output must not advertise it.
     #[test]
-    fn test_run_subcommand_parallel_flag_enabled() {
-        let cli = Cli::parse_from(["cflx", "run", "--all", "--parallel"]);
+    fn retired_parallel_flag_is_rejected_and_unadvertised() {
+        let error = Cli::try_parse_from(["cflx", "run", "--all", "--parallel"])
+            .expect_err("--parallel must not parse");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "the retired flag must fail as an unknown argument, got: {error}"
+        );
 
-        match cli.command {
-            Some(Commands::Run(args)) => {
-                assert!(args.parallel);
-            }
-            _ => panic!("Expected Run subcommand"),
-        }
+        let help = Cli::command()
+            .find_subcommand_mut("run")
+            .expect("run subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            !help.contains("--parallel"),
+            "run help must not advertise the retired flag, got: {help}"
+        );
+
+        let root_help = Cli::command().render_long_help().to_string();
+        assert!(
+            !root_help.contains("--parallel"),
+            "root help must not advertise the retired flag, got: {root_help}"
+        );
     }
 
     #[test]
     fn cli_push_defaults_to_origin() {
-        let cli = Cli::parse_from(["cflx", "run", "--all", "--parallel", "--push"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--push"]);
         match cli.command {
             Some(Commands::Run(args)) => assert_eq!(args.push.as_deref(), Some("origin")),
             _ => panic!("Expected Run subcommand"),
@@ -1903,7 +1908,7 @@ mod tests {
 
     #[test]
     fn cli_push_accepts_remote_name() {
-        let cli = Cli::parse_from(["cflx", "run", "--all", "--parallel", "--push", "upstream"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--push", "upstream"]);
         match cli.command {
             Some(Commands::Run(args)) => assert_eq!(args.push.as_deref(), Some("upstream")),
             _ => panic!("Expected Run subcommand"),
@@ -1916,7 +1921,6 @@ mod tests {
             "cflx",
             "run",
             "--all",
-            "--parallel",
             "--push",
             "origin:main",
         ])
@@ -1932,14 +1936,12 @@ mod tests {
             "cflx",
             "run",
             "--all",
-            "--parallel",
             "--max-concurrent",
             "5",
         ]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
-                assert!(args.parallel);
                 assert_eq!(args.max_concurrent, Some(5));
             }
             _ => panic!("Expected Run subcommand"),
@@ -1948,11 +1950,10 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_dry_run() {
-        let cli = Cli::parse_from(["cflx", "run", "--all", "--parallel", "--dry-run"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--dry-run"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
-                assert!(args.parallel);
                 assert!(args.dry_run);
             }
             _ => panic!("Expected Run subcommand"),

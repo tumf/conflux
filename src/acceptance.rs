@@ -65,7 +65,7 @@ impl AcceptanceBlocker {
     /// Reported blocker facts for lifecycle events and status displays.
     ///
     /// Every field is copied verbatim; nothing is re-derived from prose. This is
-    /// the single projection serial and parallel share, so equivalent blockers
+    /// the single projection every frontend shares, so equivalent blockers
     /// reach the orchestrator's classifier as equivalent facts — and therefore
     /// receive the same lifecycle classification in both modes.
     pub fn to_stalled_blocker(&self) -> crate::events::StalledBlocker {

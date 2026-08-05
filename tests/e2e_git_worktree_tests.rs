@@ -1853,12 +1853,12 @@ async fn per_change_upstream_e2e_run_and_local_tui_construct_one_runtime() {
     assert_eq!(from_run, from_tui);
 
     let run_runtime = conflux::upstream::prepare_upstream_integration(
-        from_run, &fx.repo, true, None, true, false,
+        from_run, &fx.repo, None, true, false,
     )
     .await
     .expect("run startup validation");
     let tui_runtime = conflux::upstream::prepare_upstream_integration(
-        from_tui, &fx.repo, true, None, true, false,
+        from_tui, &fx.repo, None, true, false,
     )
     .await
     .expect("local TUI startup validation");

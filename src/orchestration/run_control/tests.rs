@@ -15,7 +15,6 @@ use crate::orchestration::operator_command::{
     ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, ParallelEligibility, QueuePort,
     TerminationWaiter,
 };
-use crate::orchestration::state::ExecutionMode;
 
 /// In-memory [`QueuePort`] with no runtime behind it.
 #[derive(Debug, Default)]
@@ -66,11 +65,9 @@ struct Harness {
 
 impl Harness {
     fn new(change_ids: &[&str]) -> Self {
-        let state = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        let state = Arc::new(RwLock::new(OrchestratorState::new(
             change_ids.iter().map(|id| id.to_string()).collect(),
-            10,
-            ExecutionMode::Parallel,
-        )));
+            10)));
         let marks = Arc::new(ExecutionMarkStore::new());
         let operator = Arc::new(OperatorCommandService::new(
             state.clone(),
@@ -249,7 +246,6 @@ async fn start_with_only_ineligible_marks_fails_and_starts_nothing() {
 async fn start_refuses_parallel_ineligible_targets() {
     let harness = Harness::new(&["a"]);
     harness.mark(&["a"]);
-    harness.eligibility.set_parallel_mode(true);
     harness.eligibility.set_parallel_ineligible([(
         "a".to_string(),
         ParallelEligibility::UncommittedProposalFiles,
@@ -259,7 +255,7 @@ async fn start_refuses_parallel_ineligible_targets() {
         .service
         .start(OperatorMode::Select)
         .await
-        .expect_err("parallel mode refuses uncommitted changes");
+        .expect_err("worktree execution refuses uncommitted changes");
 
     assert!(matches!(error, RunControlError::NoEligibleTarget { .. }));
     assert!(harness.scheduler.calls().is_empty());
@@ -276,7 +272,6 @@ async fn one_ineligible_mark_refuses_the_whole_parallel_start() {
     for arrange_ineligible_as_unstartable in [false, true] {
         let harness = Harness::new(&["eligible", "ineligible"]);
         harness.mark(&["eligible", "ineligible"]);
-        harness.eligibility.set_parallel_mode(true);
         harness.eligibility.set_parallel_ineligible([(
             "ineligible".to_string(),
             ParallelEligibility::UncommittedProposalFiles,
@@ -356,7 +351,7 @@ async fn start_is_refused_while_a_run_owns_the_lifecycle() {
 async fn start_reports_a_runtime_launch_failure_instead_of_claiming_success() {
     let harness = Harness::new(&["a"]);
     harness.mark(&["a"]);
-    harness.scheduler.fail_launch("serial mode cannot run");
+    harness.scheduler.fail_launch("the scheduler refused this launch");
 
     let error = harness
         .service
@@ -885,21 +880,22 @@ fn marking_an_active_resolver_removes_it_from_the_waiting_queue() {
     assert!(ledger.waiting().is_empty());
 }
 
+/// Eligibility is an unconditional input to start selection: an ineligible
+/// target is rejected with no mode to turn the constraint off.
 #[test]
-fn start_eligibility_only_rejects_in_parallel_mode() {
+fn start_eligibility_always_rejects_an_ineligible_target() {
     let eligibility = StartEligibility::new();
-    eligibility.set_parallel_ineligible([(
-        "a".to_string(),
-        ParallelEligibility::UncommittedProposalFiles,
-    )]);
     let targets = vec!["a".to_string(), "b".to_string()];
 
     assert!(
         eligibility.rejected(&targets).is_empty(),
-        "serial mode has no parallel-eligibility constraint"
+        "nothing is rejected before an ineligible observation exists"
     );
 
-    eligibility.set_parallel_mode(true);
+    eligibility.set_parallel_ineligible([(
+        "a".to_string(),
+        ParallelEligibility::UncommittedProposalFiles,
+    )]);
     assert_eq!(eligibility.rejected(&targets), vec!["a".to_string()]);
 }
 

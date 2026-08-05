@@ -827,7 +827,7 @@ mod tests {
     async fn external_blocked_runtime_state_has_no_restart_routing_authority() {
         use crate::events::ExecutionEvent;
         use crate::orchestration::state::{
-            BlockerKind, ExecutionMode, OrchestratorState, TerminalState,
+            BlockerKind, OrchestratorState, TerminalState,
         };
 
         let repo = TempDir::new().unwrap();
@@ -840,11 +840,9 @@ mod tests {
                 .await
                 .unwrap();
 
-        let mut held = OrchestratorState::with_mode(
+        let mut held = OrchestratorState::new(
             vec!["test-change".to_string()],
-            1,
-            ExecutionMode::Parallel,
-        );
+            1);
         held.apply_execution_event(&ExecutionEvent::AcceptanceGated {
             change_id: "test-change".to_string(),
             blocker: external_blocker().to_stalled_blocker(),
@@ -863,11 +861,9 @@ mod tests {
 
         // A restart is a fresh reducer: the hold simply does not exist, and the
         // complete unarchived apply revision returns to acceptance.
-        let restarted = OrchestratorState::with_mode(
+        let restarted = OrchestratorState::new(
             vec!["test-change".to_string()],
-            1,
-            ExecutionMode::Parallel,
-        );
+            1);
         assert!(restarted.externally_blocked_change_ids().is_empty());
         assert!(restarted.all_blocker_views().is_empty());
         assert_eq!(

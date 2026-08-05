@@ -62,7 +62,7 @@ impl ParallelExecutor {
 
         if !skipped.is_empty() {
             let message = format!(
-                "Skipping uncommitted changes in parallel mode: {}",
+                "Skipping uncommitted changes: {}",
                 skipped.join(", ")
             );
             tracing::warn!("{}", message);

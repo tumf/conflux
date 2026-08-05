@@ -47,10 +47,8 @@ mod permission;
 // Public so `tests/process_cleanup_test.rs` can drive real process-group
 // cleanup against a real managed worktree.
 pub mod process_manager;
-mod progress;
 pub mod repo_lock;
 pub mod runtime;
-mod serial_run_service;
 mod shell_command;
 mod spec_delta;
 mod stall;

@@ -989,44 +989,60 @@ mod tests {
 
     // === Tests for parallel execution config (parallel-execution spec) ===
 
+    /// The retired execution-mode key must stop configuration loading with an
+    /// actionable removal message rather than being silently ignored.
     #[test]
-    fn test_parallel_mode_can_be_enabled() {
-        let config = OrchestratorConfig {
-            parallel_mode: Some(true),
-            ..Default::default()
-        };
-        assert!(config.get_parallel_mode());
+    fn test_retired_parallel_mode_key_is_rejected_with_migration_guidance() {
+        for document in [
+            r#"{"parallel_mode": true}"#,
+            r#"{"parallel_mode": false}"#,
+            r#"{
+                // still selecting a mode that no longer exists
+                "parallel_mode": true,
+                "max_concurrent_workspaces": 6,
+            }"#,
+        ] {
+            let error = OrchestratorConfig::parse_jsonc(document)
+                .expect_err("a retired key must fail configuration loading");
+            let message = error.to_string();
+            assert!(
+                message.contains("parallel_mode"),
+                "the error must name the retired key, got: {message}"
+            );
+            assert!(
+                message.contains("remove"),
+                "the error must tell the operator to remove it, got: {message}"
+            );
+        }
     }
 
+    /// Removal is limited to the known retired key: unrelated configuration is
+    /// unaffected, and a string that merely mentions the key is not a match.
     #[test]
-    fn test_resolve_parallel_mode_prefers_cli_override() {
-        let config = OrchestratorConfig {
-            parallel_mode: Some(false),
-            ..Default::default()
-        };
-        assert!(config.resolve_parallel_mode(true, false));
+    fn test_unrelated_configuration_is_not_rejected_as_retired() {
+        let config = OrchestratorConfig::parse_jsonc(
+            r#"{
+                "apply_command": "echo parallel_mode",
+                "max_concurrent_workspaces": 6
+            }"#,
+        )
+        .expect("unrelated configuration must still load");
+        assert_eq!(config.get_max_concurrent_workspaces(), 6);
     }
 
+    /// A retired key inside a nested object is not the top-level retired key.
     #[test]
-    fn test_resolve_parallel_mode_defaults_to_git_detection() {
-        let config = OrchestratorConfig::default();
-        assert!(!config.resolve_parallel_mode(false, false));
-        assert!(config.resolve_parallel_mode(false, true));
-    }
-
-    #[test]
-    fn test_resolve_parallel_mode_uses_config_value() {
-        let enabled = OrchestratorConfig {
-            parallel_mode: Some(true),
-            ..Default::default()
-        };
-        let disabled = OrchestratorConfig {
-            parallel_mode: Some(false),
-            ..Default::default()
-        };
-
-        assert!(enabled.resolve_parallel_mode(false, false));
-        assert!(!disabled.resolve_parallel_mode(false, true));
+    fn test_nested_parallel_mode_key_is_not_treated_as_retired() {
+        let config = OrchestratorConfig::parse_jsonc(
+            r#"{
+                "envs": { "parallel_mode": "1" }
+            }"#,
+        )
+        .expect("a nested key must not be mistaken for the retired top-level key");
+        assert_eq!(
+            config.envs.as_ref().and_then(|e| e.get("parallel_mode")),
+            Some(&"1".to_string())
+        );
     }
 
     #[test]
@@ -1106,7 +1122,6 @@ mod tests {
     #[test]
     fn test_parse_jsonc_parallel_config() {
         let jsonc = r#"{
-            "parallel_mode": true,
             "max_concurrent_workspaces": 6,
             "workspace_base_dir": "/custom/path",
             "vcs_backend": "git",
@@ -1114,7 +1129,6 @@ mod tests {
         }"#;
         let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
 
-        assert!(config.get_parallel_mode());
         assert_eq!(config.get_max_concurrent_workspaces(), 6);
         assert_eq!(config.get_workspace_base_dir(), Some("/custom/path"));
         assert_eq!(config.get_vcs_backend(), VcsBackend::Git);
@@ -2045,7 +2059,6 @@ mod tests {
         let mut base = OrchestratorConfig {
             apply_command: Some("base-apply".to_string()),
             max_iterations: Some(10),
-            parallel_mode: Some(false),
             max_concurrent_workspaces: Some(2),
             vcs_backend: Some(VcsBackend::Auto),
             ..Default::default()
@@ -2054,7 +2067,6 @@ mod tests {
         base.merge(OrchestratorConfig {
             apply_command: Some("override-apply".to_string()),
             max_iterations: Some(20),
-            parallel_mode: Some(true),
             max_concurrent_workspaces: Some(4),
             vcs_backend: Some(VcsBackend::Git),
             ..Default::default()
@@ -2062,7 +2074,6 @@ mod tests {
 
         assert_eq!(base.apply_command.as_deref(), Some("override-apply"));
         assert_eq!(base.max_iterations, Some(20));
-        assert_eq!(base.parallel_mode, Some(true));
         assert_eq!(base.max_concurrent_workspaces, Some(4));
         assert_eq!(base.vcs_backend, Some(VcsBackend::Git));
     }
@@ -2124,7 +2135,6 @@ mod tests {
         assert_eq!(config.get_command_inactivity_kill_grace_secs(), 5);
         assert_eq!(config.get_command_inactivity_timeout_max_retries(), 3);
         assert!(config.use_llm_analysis());
-        assert!(!config.get_parallel_mode());
         assert!(config.get_stream_json_textify());
         assert!(config.get_command_strict_process_cleanup());
         assert_eq!(config.get_vcs_backend(), VcsBackend::Auto);
@@ -2178,10 +2188,8 @@ mod tests {
         assert!(config.logging.is_none());
         assert!(config.stall_detection.is_none());
         assert!(config.max_iterations.is_none());
-        assert!(config.parallel_mode.is_none());
 
         // But getters resolve to their defaults
         assert_eq!(config.get_max_iterations(), 50);
-        assert!(!config.get_parallel_mode());
     }
 }

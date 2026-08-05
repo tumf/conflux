@@ -1,6 +1,6 @@
 //! Common type definitions for execution operations.
 //!
-//! Provides shared types used across serial and parallel execution modes.
+//! Provides shared types used by managed-worktree orchestration.
 
 // Allow dead_code since this is a foundation module - types will be used
 // by subsequent changes (refactor-archive-common, refactor-apply-common).
@@ -14,19 +14,16 @@ use tokio::sync::mpsc;
 
 /// Execution context containing all information needed to execute operations.
 ///
-/// This context is passed to common execution functions (archive, apply, etc.)
-/// and provides a unified interface for both serial and parallel modes.
+/// This context is passed to common execution functions (archive, apply, etc.).
+/// Change-level execution always happens in a managed worktree, so the
+/// workspace path and group identity are required construction inputs: there is
+/// no constructor that can produce a workspace-free change execution context.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// // Serial mode: no workspace path, hooks available
-/// let ctx = ExecutionContext::new("add-feature", &config)
-///     .with_hooks(&hook_runner);
-///
-/// // Parallel mode: workspace path specified, event channel for streaming
-/// let ctx = ExecutionContext::new("add-feature", &config)
-///     .with_workspace(workspace_path)
+/// let ctx = ExecutionContext::new("add-feature", &config, workspace_path, 0)
+///     .with_hooks(&hook_runner)
 ///     .with_event_tx(tx.clone());
 /// ```
 #[derive(Debug)]
@@ -34,42 +31,40 @@ pub struct ExecutionContext<'a> {
     /// The change ID being processed
     pub change_id: &'a str,
 
-    /// Path to the workspace directory.
-    /// - `None` for serial mode (operates in main workspace)
-    /// - `Some(path)` for parallel mode (operates in isolated workspace)
-    pub workspace_path: Option<&'a Path>,
+    /// Path to the managed workspace this change executes in.
+    pub workspace_path: &'a Path,
+
+    /// Group identity this change was scheduled in.
+    pub group_index: usize,
 
     /// Reference to the orchestrator configuration
     pub config: &'a OrchestratorConfig,
 
     /// Hook runner for executing lifecycle hooks.
-    /// - `Some` when hooks are configured (typically serial mode)
-    /// - `None` when hooks are not available (parallel mode, for now)
+    /// - `Some` when hooks are configured
+    /// - `None` when hooks are not available
     pub hooks: Option<&'a HookRunner>,
 
     /// Event channel for streaming progress updates.
-    /// - `Some` for parallel mode (sends events to TUI)
-    /// - `None` for serial mode (uses direct output)
     pub event_tx: Option<mpsc::Sender<ParallelEvent>>,
 }
 
 impl<'a> ExecutionContext<'a> {
-    /// Create a new execution context with required fields.
-    pub fn new(change_id: &'a str, config: &'a OrchestratorConfig) -> Self {
+    /// Create a change-level execution context.
+    pub fn new(
+        change_id: &'a str,
+        config: &'a OrchestratorConfig,
+        workspace_path: &'a Path,
+        group_index: usize,
+    ) -> Self {
         Self {
             change_id,
-            workspace_path: None,
+            workspace_path,
+            group_index,
             config,
             hooks: None,
             event_tx: None,
         }
-    }
-
-    /// Set the workspace path for parallel mode execution.
-    #[allow(dead_code)]
-    pub fn with_workspace(mut self, path: &'a Path) -> Self {
-        self.workspace_path = Some(path);
-        self
     }
 
     /// Set the hook runner for lifecycle hooks.
@@ -86,14 +81,8 @@ impl<'a> ExecutionContext<'a> {
         self
     }
 
-    /// Check if this context is for parallel mode execution.
-    pub fn is_parallel(&self) -> bool {
-        self.workspace_path.is_some()
-    }
-
-    /// Get the working directory for this execution.
-    /// Returns the workspace path if set, otherwise returns None (main workspace).
-    pub fn working_dir(&self) -> Option<&Path> {
+    /// The managed workspace this execution runs in.
+    pub fn working_dir(&self) -> &Path {
         self.workspace_path
     }
 }
@@ -199,37 +188,21 @@ mod tests {
 
     // === ExecutionContext tests ===
 
+    /// A change-level context always carries managed-worktree identity: the
+    /// workspace path and the group are construction inputs, not options a
+    /// caller can leave unset.
     #[test]
-    fn test_execution_context_new() {
+    fn a_change_execution_context_carries_workspace_and_group_identity() {
         let config = OrchestratorConfig::default();
-        let ctx = ExecutionContext::new("test-change", &config);
+        let workspace = std::path::PathBuf::from("/tmp/ws/test-change");
+        let ctx = ExecutionContext::new("test-change", &config, &workspace, 3);
 
         assert_eq!(ctx.change_id, "test-change");
-        assert!(ctx.workspace_path.is_none());
+        assert_eq!(ctx.workspace_path, workspace.as_path());
+        assert_eq!(ctx.working_dir(), workspace.as_path());
+        assert_eq!(ctx.group_index, 3);
         assert!(ctx.hooks.is_none());
         assert!(ctx.event_tx.is_none());
-    }
-
-    #[test]
-    fn test_execution_context_is_parallel() {
-        let config = OrchestratorConfig::default();
-        let ctx = ExecutionContext::new("test-change", &config);
-        assert!(!ctx.is_parallel());
-
-        let workspace = std::path::PathBuf::from("/tmp/ws");
-        let ctx_parallel = ExecutionContext::new("test-change", &config).with_workspace(&workspace);
-        assert!(ctx_parallel.is_parallel());
-    }
-
-    #[test]
-    fn test_execution_context_working_dir() {
-        let config = OrchestratorConfig::default();
-        let ctx = ExecutionContext::new("test-change", &config);
-        assert!(ctx.working_dir().is_none());
-
-        let workspace = std::path::PathBuf::from("/tmp/ws");
-        let ctx_with_ws = ExecutionContext::new("test-change", &config).with_workspace(&workspace);
-        assert_eq!(ctx_with_ws.working_dir(), Some(workspace.as_path()));
     }
 
     // === ExecutionResult tests ===

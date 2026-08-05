@@ -357,9 +357,9 @@ pub struct HookContext {
     pub error: Option<String>,
     /// Whether running in dry-run mode
     pub dry_run: bool,
-    /// Workspace path (for parallel mode)
+    /// Managed workspace path (change-level hooks)
     pub workspace_path: Option<String>,
-    /// Group index (for parallel mode)
+    /// Group index (change-level hooks)
     pub group_index: Option<u32>,
 }
 
@@ -453,7 +453,7 @@ impl HookContext {
         }
         vars.insert("OPENSPEC_DRY_RUN".to_string(), self.dry_run.to_string());
 
-        // Parallel mode specific variables
+        // Managed-workspace variables
         if let Some(ref workspace_path) = self.workspace_path {
             vars.insert(
                 "OPENSPEC_WORKSPACE_PATH".to_string(),
@@ -550,7 +550,7 @@ pub struct HookRunner {
     config: HooksConfig,
     /// Repository root directory for hook execution (working directory for commands)
     repo_root: PathBuf,
-    /// Optional event sender for hook logs (TUI/parallel mode)
+    /// Optional event sender for hook logs
     event_tx: Option<mpsc::Sender<ExecutionEvent>>,
     /// Optional output handler for CLI-visible hook logs
     output_handler: Option<Arc<dyn OutputHandler>>,
@@ -1568,7 +1568,7 @@ mod tests {
         assert!(runner.has_hook(HookType::OnQueueRemove));
     }
 
-    // === Tests for parallel mode context (add-parallel-hooks spec) ===
+    // === Tests for managed-workspace hook context (add-parallel-hooks spec) ===
 
     #[test]
     fn test_hook_context_with_parallel_context() {

@@ -290,11 +290,6 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub max_iterations: Option<u32>,
 
-    /// Enable parallel execution mode (requires git).
-    /// Default: false (off by default)
-    #[serde(default)]
-    pub parallel_mode: Option<bool>,
-
     /// Maximum number of concurrent workspaces for parallel execution.
     /// Default: 3
     #[serde(default)]
@@ -590,7 +585,6 @@ impl OrchestratorConfig {
             completion_check_delay_ms,
             completion_check_max_retries,
             max_iterations,
-            parallel_mode,
             max_concurrent_workspaces,
             workspace_base_dir,
             resolve_command,
@@ -662,7 +656,6 @@ impl OrchestratorConfig {
         );
         overwrite_if_some(&mut self.max_iterations, max_iterations);
 
-        overwrite_if_some(&mut self.parallel_mode, parallel_mode);
         overwrite_if_some(
             &mut self.max_concurrent_workspaces,
             max_concurrent_workspaces,
@@ -885,36 +878,12 @@ impl OrchestratorConfig {
         self.stall_detection.clone().unwrap_or_default()
     }
 
-    /// Get error circuit breaker configuration, returning defaults if not set.
-    pub fn get_error_circuit_breaker(&self) -> ErrorCircuitBreakerConfig {
-        self.error_circuit_breaker.clone().unwrap_or_default()
-    }
 
     /// Get the maximum iterations limit.
     /// Returns 0 if explicitly set to 0 (disabled), otherwise returns configured or default value.
     /// A value of 0 means no limit.
     pub fn get_max_iterations(&self) -> u32 {
         self.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS)
-    }
-
-    /// Get whether parallel mode is explicitly enabled in config.
-    /// Default: false (unset)
-    #[allow(dead_code)]
-    pub fn get_parallel_mode(&self) -> bool {
-        self.parallel_mode.unwrap_or(false)
-    }
-
-    /// Resolve parallel mode based on CLI override and git detection.
-    /// Priority: CLI --parallel > config.parallel_mode > git detection default.
-    pub fn resolve_parallel_mode(&self, cli_parallel: bool, git_repo_detected: bool) -> bool {
-        if cli_parallel {
-            return true;
-        }
-
-        match self.parallel_mode {
-            Some(value) => value,
-            None => git_repo_detected,
-        }
     }
 
     /// Get the maximum concurrent workspaces limit.

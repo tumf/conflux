@@ -291,7 +291,7 @@ impl AcceptanceCommandDiagnostic {
 /// Classify a permission/tool-policy denial from one failed Acceptance
 /// invocation's bounded transport evidence.
 ///
-/// Shared by the serial acceptance runner and its retry loop so both decide
+/// Shared by the acceptance runner and its retry loop so both decide
 /// "is this a policy denial?" from exactly the same bytes and the same
 /// classifier parallel acceptance uses.
 pub fn classify_acceptance_command_denial(
@@ -402,7 +402,7 @@ pub fn acceptance_command_exhausted_error(
     )
 }
 
-/// What serial and parallel execution must do next after an Acceptance command
+/// What execution must do next after an Acceptance command
 /// failure.
 ///
 /// One shared decision so both frontends apply the same bound, the same
@@ -416,7 +416,7 @@ pub enum AcceptanceCommandRecovery {
     Exhausted { attempts: u32, error: String },
 }
 
-/// Shared Acceptance command-failure policy used by serial and parallel
+/// Shared Acceptance command-failure policy used by every
 /// execution.
 ///
 /// Records the failure against `counter`, stores the latest-only bounded
@@ -488,7 +488,7 @@ pub enum MissingVerdictRetryStep {
 
 /// Mode-independent driver for acceptance protocol-retry sequences.
 ///
-/// Serial and parallel orchestration share this driver so equivalent
+/// Every frontend shares this driver so equivalent
 /// observations produce equivalent routing. Each acceptance invocation reads its
 /// continuation marker from [`Self::take_protocol_retry`] and reports the result
 /// back through [`Self::observe_missing_verdict`],
@@ -611,7 +611,7 @@ impl AcceptanceProtocolDriver {
 /// Shared, mode-independent routing for an acceptance result that carries (or
 /// claims to carry) an external blocker.
 ///
-/// This is the single decision API serial and parallel orchestration use so
+/// This is the single decision API every frontend uses so
 /// equivalent observations produce equivalent retry, stall, and terminal
 /// protocol-error outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1149,7 +1149,7 @@ impl FindingRepairLedger {
 
 /// Structured, mode-independent diagnostics for a repair stop.
 ///
-/// Serial and parallel build this from the same inputs so equivalent
+/// Every frontend builds this from the same inputs so equivalent
 /// observations produce equivalent operator evidence. It is in-memory state for
 /// one process lifetime and controls only stalled presentation, dispatch
 /// suppression, and explicit-retry eligibility: it never proves implementation
@@ -1244,7 +1244,7 @@ pub enum RepairGateDecision {
 
 /// Validate a repair delta against every open structured finding.
 ///
-/// Pure over `changed_files` and `remediation_evidence` so serial and parallel
+/// Pure over `changed_files` and `remediation_evidence` so every frontend
 /// share one decision and it stays unit-testable without a real repository.
 pub fn decide_repair_gate(
     change_id: &str,
@@ -2392,7 +2392,7 @@ mod tests {
     }
 
     /// Replay an acceptance verdict sequence through the shared driver exactly
-    /// as serial and parallel orchestration do, and report what each invocation
+    /// as orchestration does, and report what each invocation
     /// received plus how the sequence terminated.
     fn replay_missing_verdict_sequence(
         sequence: &[AcceptanceResult],
@@ -2771,10 +2771,10 @@ mod tests {
         }
     }
 
-    /// Serial and parallel drive the same API, so identical observation
+    /// Every caller drives the same API, so identical observation
     /// sequences must produce identical decisions.
     #[test]
-    fn bare_blocker_decisions_have_serial_and_parallel_parity() {
+    fn bare_blocker_decisions_have_caller_parity() {
         let sequences: [Vec<AcceptanceResult>; 3] = [
             vec![bare_blocker(), bare_blocker(), AcceptanceResult::Pass],
             vec![bare_blocker(), bare_blocker(), bare_blocker()],
@@ -2788,10 +2788,10 @@ mod tests {
         ];
 
         for sequence in sequences {
-            let serial = drive_blockers(&sequence);
+            let first = drive_blockers(&sequence);
             let parallel = drive_blockers(&sequence);
             assert_eq!(
-                serial, parallel,
+                first, parallel,
                 "equivalent observations must produce equivalent decisions for {sequence:?}"
             );
         }
@@ -2887,10 +2887,10 @@ mod tests {
         ));
     }
 
-    /// Serial and parallel call the same driver; equivalent observations must
+    /// Every caller uses the same driver; equivalent observations must
     /// produce equivalent routing.
     #[test]
-    fn missing_verdict_driver_has_serial_and_parallel_routing_parity() {
+    fn missing_verdict_driver_has_caller_routing_parity() {
         let sequence = [
             missing_verdict("waiting"),
             missing_verdict("waiting"),
@@ -2899,12 +2899,12 @@ mod tests {
             },
         ];
 
-        let serial = replay_missing_verdict_sequence(&sequence);
+        let first = replay_missing_verdict_sequence(&sequence);
         let parallel = replay_missing_verdict_sequence(&sequence);
-        assert_eq!(serial, parallel);
-        assert_eq!(serial.0.len(), 3);
-        assert!(matches!(serial.1, Some(AcceptanceResult::Fail { .. })));
-        assert!(serial.2.is_none());
+        assert_eq!(first, parallel);
+        assert_eq!(first.0.len(), 3);
+        assert!(matches!(first.1, Some(AcceptanceResult::Fail { .. })));
+        assert!(first.2.is_none());
     }
 
     #[test]
@@ -3071,7 +3071,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_and_parallel_same_inputs_have_retry_outcome_parity() {
+    fn identical_inputs_have_retry_outcome_parity() {
         let findings = normalize_findings(&[
             "src/lib.rs:10 missing regression coverage".into(),
             "external non-mockable prerequisite unavailable".into(),
@@ -3083,11 +3083,11 @@ mod tests {
 
         // Both execution modes call this shared pure decision with checkpoint
         // state. Keep an explicit parity fixture for their common boundary.
-        let serial = decide_acceptance_retry(&previous, Some("same"), &findings, "same", 2);
+        let first = decide_acceptance_retry(&previous, Some("same"), &findings, "same", 2);
         let parallel = decide_acceptance_retry(&previous, Some("same"), &findings, "same", 2);
-        assert_eq!(serial, parallel);
+        assert_eq!(first, parallel);
         assert!(matches!(
-            serial,
+            first,
             AcceptanceRetryDecision::Stall {
                 reason: "repeated_acceptance_findings",
                 ref external_blockers

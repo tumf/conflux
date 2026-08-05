@@ -20,7 +20,7 @@ use crate::analyzer::{AnalysisOutcome, AnalysisProvenance, AnalysisResult};
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
-use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+use crate::orchestration::state::{OrchestratorState, ReducerCommand};
 use crate::parallel::queue_state::QueuedWorkClass;
 use crate::parallel::{ParallelEvent, ParallelExecutor, SchedulerLifetime, SchedulerRunReport};
 use crate::tui::queue::DynamicQueue;
@@ -143,11 +143,9 @@ fn archive_to_base(repo_root: &std::path::Path, archive_leaf: &str, change_id: &
 /// reconciliation revokes it — which is a different code path from the one
 /// under test.
 async fn reducer_state(known: &[&str], queued_ids: &[&str]) -> Arc<RwLock<OrchestratorState>> {
-    let state = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let state = Arc::new(RwLock::new(OrchestratorState::new(
         known.iter().map(|id| id.to_string()).collect(),
-        10,
-        ExecutionMode::Parallel,
-    )));
+        10)));
     {
         let mut guard = state.write().await;
         for id in queued_ids {

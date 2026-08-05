@@ -240,7 +240,7 @@ impl WorkspaceStatus {
     /// Active workspaces are those currently being worked on (apply/archive/acceptance/resolve).
     /// Inactive workspaces are those that are done, merged, cleaned up, or errored.
     ///
-    /// This is used for calculating available execution slots in parallel mode.
+    /// This is used for calculating available execution slots.
     /// Per spec line 7: "apply / acceptance / archive / resolve が進行中の change"
     pub fn is_active(&self) -> bool {
         match self {
@@ -345,7 +345,7 @@ pub trait WorkspaceManager: Send + Sync {
     /// Get the count of active workspaces (those currently being worked on).
     ///
     /// Active workspaces are those with status Created, Applying, or Applied.
-    /// This is used to calculate available execution slots in parallel mode.
+    /// This is used to calculate available execution slots.
     fn active_workspace_count(&self) -> usize {
         self.workspaces()
             .iter()

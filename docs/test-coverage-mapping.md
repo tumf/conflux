@@ -215,12 +215,11 @@ This document maps specification scenarios to their corresponding test implement
 | NoBackend エラー | `src/vcs/mod.rs::test_vcs_error_no_backend` | ✅ NEW |
 | IO エラー変換 | `src/vcs/mod.rs::test_vcs_error_io` | ✅ NEW |
 
-### Requirement: Parallel Mode Configuration
+### Requirement: Parallel Execution Configuration
 
 | Scenario | Test | Status |
 |----------|------|--------|
-| parallel_mode デフォルト false | `src/config/mod.rs::test_parallel_mode_defaults_to_false` | ✅ NEW |
-| parallel_mode 有効化 | `src/config/mod.rs::test_parallel_mode_can_be_enabled` | ✅ NEW |
+| 廃止された parallel_mode キーの拒否 | `src/config/mod.rs::test_retired_parallel_mode_key_is_rejected_with_migration_guidance` | ✅ NEW |
 | max_concurrent_workspaces デフォルト | `src/config/mod.rs::test_max_concurrent_workspaces_default` | ✅ NEW |
 | max_concurrent_workspaces 設定 | `src/config/mod.rs::test_max_concurrent_workspaces_can_be_configured` | ✅ NEW |
 | workspace_base_dir デフォルト None | `src/config/mod.rs::test_workspace_base_dir_default_is_none` | ✅ NEW |
@@ -350,11 +349,10 @@ This document maps specification scenarios to their corresponding test implement
 | 空リストでのカーソル移動 | `src/tui/state/mod.rs::test_cursor_navigation_with_empty_list` | ✅ NEW |
 | 空リストでの選択トグル | `src/tui/state/mod.rs::test_toggle_selection_with_empty_list` | ✅ NEW |
 
-### Requirement: Parallel Mode State
+### Requirement: Worktree Execution State
 
 | Scenario | Test | Status |
 |----------|------|--------|
-| parallel_mode デフォルト false | `src/tui/state/mod.rs::test_parallel_mode_default_false` | ✅ NEW |
 | max_concurrent デフォルト | `src/tui/state/mod.rs::test_max_concurrent_default` | ✅ NEW |
 
 ### Requirement: Log State
@@ -515,8 +513,7 @@ This document maps specification scenarios to their corresponding test implement
 - `test_hooks_config_can_be_parsed_from_jsonc` - hooks in config
 - `test_hooks_config_with_all_hook_types` - all hook types
 - `test_get_hooks_returns_default_when_not_configured` - default hooks
-- `test_parallel_mode_defaults_to_false` - parallel mode default
-- `test_parallel_mode_can_be_enabled` - parallel mode enable
+- `test_retired_parallel_mode_key_is_rejected_with_migration_guidance` - retired key rejection
 - `test_max_concurrent_workspaces_default` - max_concurrent default
 - `test_max_concurrent_workspaces_can_be_configured` - max_concurrent config
 - `test_workspace_base_dir_default_is_none` - workspace_base_dir default
@@ -570,7 +567,6 @@ This document maps specification scenarios to their corresponding test implement
 - `test_approval_toggle_blocked_for_processing_change` - processing block
 - `test_orchestration_started_at_set_on_start` - start time
 - `test_orchestration_elapsed_initially_none` - elapsed initial
-- `test_parallel_mode_default_false` - parallel mode default
 - `test_max_concurrent_default` - max concurrent default
 - `test_log_auto_scroll_enabled_by_default` - log scroll default
 - `test_stop_mode_initially_none` - stop mode initial
