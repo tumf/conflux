@@ -137,6 +137,14 @@ impl ApplyOrchestrationFeedback {
     /// Feedback kind for a final Apply commit rejected by repository hooks.
     pub const FINAL_COMMIT_REJECTED: &'static str = "final_commit_rejected";
 
+    /// Feedback kind for a task-complete workspace that still holds unstaged or
+    /// untracked entries, so finalization could not start.
+    pub const INCOMPLETE_STAGE: &'static str = "incomplete_stage";
+
+    /// Feedback kind for a successful Apply iteration that moved neither task
+    /// progress nor the workspace.
+    pub const EMPTY_APPLY_ITERATION: &'static str = "empty_apply_iteration";
+
     /// Render the feedback as untrusted diagnostic context.
     ///
     /// Hook output is repository/tool output, so the wrapper states plainly

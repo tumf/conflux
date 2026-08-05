@@ -166,6 +166,11 @@ pub struct ChangeState {
     pub elapsed_time: Option<Duration>,
     /// Current iteration number (for apply/archive/acceptance operations)
     pub iteration_number: Option<u32>,
+    /// Ephemeral Apply-lane operation label: `"apply"` or `"commit"`.
+    ///
+    /// Purely rendering state. `display_status_cache` stays `"applying"` for the
+    /// whole finalization sequence, and nothing routes on this field.
+    pub apply_operation_cache: String,
 }
 
 /// Main application state for the TUI
@@ -331,7 +336,16 @@ impl ChangeState {
             started_at: None,
             elapsed_time: None,
             iteration_number: None,
+            apply_operation_cache: "apply".to_string(),
         }
+    }
+
+    /// Operation label the Apply lane renders for this row.
+    pub fn apply_operation(&self) -> &str {
+        if self.apply_operation_cache.is_empty() {
+            return "apply";
+        }
+        &self.apply_operation_cache
     }
 
     /// Whether this change may take part in parallel execution.
@@ -1505,6 +1519,24 @@ impl AppState {
         for change in &mut self.changes {
             let sanitized = change.id.replace(['/', '\\', ' '], "-");
             change.has_worktree = worktree_change_ids.contains(&sanitized);
+        }
+    }
+
+    /// Sync the Apply-lane operation label from the reducer.
+    ///
+    /// The commit subphase already arrives as an event, so this is a
+    /// self-healing refresh rather than the only writer: a frontend that missed
+    /// one event still converges on the reducer's view instead of rendering
+    /// `[commit]` forever. It cannot change any row's status, color, or
+    /// lifecycle — only which word the Apply lane prints.
+    pub fn apply_operation_labels_from_reducer(
+        &mut self,
+        operation_map: &HashMap<String, &'static str>,
+    ) {
+        for change in &mut self.changes {
+            if let Some(&label) = operation_map.get(&change.id) {
+                change.apply_operation_cache = label.to_string();
+            }
         }
     }
 
@@ -2990,6 +3022,7 @@ mod tests {
             started_at: None,
             elapsed_time: None,
             iteration_number: None,
+            apply_operation_cache: "apply".to_string(),
         };
 
         assert_eq!(change.progress_percent(), 50.0);
@@ -4414,6 +4447,7 @@ mod tests {
             started_at: None,
             elapsed_time: None,
             iteration_number: None,
+            apply_operation_cache: "apply".to_string(),
         };
 
         // First iteration should be accepted
@@ -4443,6 +4477,7 @@ mod tests {
             started_at: None,
             elapsed_time: None,
             iteration_number: Some(3),
+            apply_operation_cache: "apply".to_string(),
         };
 
         // Lower iteration should be ignored
@@ -4476,6 +4511,7 @@ mod tests {
             started_at: None,
             elapsed_time: None,
             iteration_number: Some(2),
+            apply_operation_cache: "apply".to_string(),
         };
 
         // None should be ignored

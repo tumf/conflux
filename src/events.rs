@@ -358,6 +358,57 @@ impl StalledBlocker {
     }
 }
 
+/// Ephemeral presentation phase of the final Apply commit sequence.
+///
+/// This is *not* a lifecycle state. The canonical activity stays `applying` for
+/// the whole sequence; the phase exists so an operator can tell "the agent is
+/// working" apart from "repository hooks are running and nothing will move
+/// until they finish". It is process-local, never persisted, and never read by
+/// scheduling, resume, acceptance, archive, or merge decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyCommitPhase {
+    /// The finalization sequence began: stage gate, WIP snapshot, hooks, commit.
+    Started,
+    /// The verified commit exists and the workspace is clean.
+    Completed,
+    /// Finalization stopped without a usable commit (stage gate, hook
+    /// rejection, dirty post-commit workspace, or a terminal VCS failure).
+    Failed,
+}
+
+impl ApplyCommitPhase {
+    /// Stable machine-readable label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Whether this phase leaves commit presentation active.
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Started)
+    }
+}
+
+/// Which standard stream one streamed final-commit line came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl CommitOutputStream {
+    /// Stable machine-readable label carried into logs and events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
     // Lifecycle events
@@ -387,6 +438,28 @@ pub enum ExecutionEvent {
         change_id: String,
         output: String,
         iteration: Option<u32>,
+    },
+    /// Ephemeral final-commit presentation phase for one change.
+    ///
+    /// Carries the finalization attempt so retries stay distinguishable. The
+    /// reducer keeps it in process memory for rendering only; the canonical
+    /// lifecycle remains `applying` throughout.
+    ApplyCommitPhase {
+        change_id: String,
+        phase: ApplyCommitPhase,
+        attempt: u32,
+    },
+    /// One streamed line of final Apply commit output.
+    ///
+    /// Emitted while the commit process is still running so long-running
+    /// repository hooks stay observable. The complete raw streams and exit
+    /// status are preserved separately for rejection and lock classification;
+    /// these lines are presentation only.
+    ApplyCommitOutput {
+        change_id: String,
+        attempt: u32,
+        stream: CommitOutputStream,
+        line: String,
     },
 
     // Archive events
@@ -746,6 +819,10 @@ pub fn classify_event(event: &ExecutionEvent) -> (&'static str, EventOwnership) 
         E::ApplyCompleted { .. } => ("ApplyCompleted", State),
         E::ApplyFailed { .. } => ("ApplyFailed", State),
         E::ApplyOutput { .. } => ("ApplyOutput", State),
+        // The reducer keeps the commit phase in process memory for rendering,
+        // so this event owns a state transition even though it never touches
+        // the canonical lifecycle.
+        E::ApplyCommitPhase { .. } => ("ApplyCommitPhase", State),
         E::ArchiveStarted { .. } => ("ArchiveStarted", State),
         E::ArchiveResumed { .. } => ("ArchiveResumed", State),
         E::ArchiveRetryScheduled { .. } => ("ArchiveRetryScheduled", State),
@@ -805,6 +882,9 @@ pub fn classify_event(event: &ExecutionEvent) -> (&'static str, EventOwnership) 
         E::ConflictResolutionStarted => ("ConflictResolutionStarted", Presentation),
         E::ConflictResolutionCompleted => ("ConflictResolutionCompleted", Presentation),
         E::ConflictResolutionFailed { .. } => ("ConflictResolutionFailed", Presentation),
+        // Streamed commit lines are log detail: they carry no field the
+        // operator snapshot is built from, and they arrive at hook volume.
+        E::ApplyCommitOutput { .. } => ("ApplyCommitOutput", Presentation),
         E::AnalysisStarted { .. } => ("AnalysisStarted", Presentation),
         E::AnalysisOutput { .. } => ("AnalysisOutput", Presentation),
         E::AnalysisCompleted { .. } => ("AnalysisCompleted", Presentation),
@@ -1206,6 +1286,17 @@ pub(crate) mod ownership_fixtures {
                 output: "chunk".to_string(),
                 iteration: Some(2),
             },
+            E::ApplyCommitPhase {
+                change_id: "change-a".to_string(),
+                phase: ApplyCommitPhase::Started,
+                attempt: 2,
+            },
+            E::ApplyCommitOutput {
+                change_id: "change-a".to_string(),
+                attempt: 2,
+                stream: CommitOutputStream::Stderr,
+                line: "pre-commit running".to_string(),
+            },
             E::ArchiveStarted {
                 change_id: "change-a".to_string(),
                 command: "archive".to_string(),
@@ -1454,7 +1545,7 @@ mod ownership_tests {
     /// `classify_event` at compile time; this constant then forces the fixture
     /// table — and therefore every ownership and projection assertion below —
     /// to grow with it instead of silently skipping the new variant.
-    const EXECUTION_EVENT_VARIANTS: usize = 69;
+    const EXECUTION_EVENT_VARIANTS: usize = 71;
 
     #[test]
     fn ownership_table_names_every_variant_exactly_once() {

@@ -24,7 +24,11 @@ Implement the approved change fully, updating `tasks.md` as progress is made, an
 - **ESCALATE BLOCKERS** - If implementation is impossible, record an Implementation Blocker for acceptance review
 - **NO CHECKLIST-ONLY COMPLETION** - Do not mark implementation tasks complete based only on proposal/spec/tasks edits when the task requires code, tests, or runtime wiring
 - **TASK COMPLETION RESPONSIBILITY** - Marking every task `[x]` in tasks.md constitutes apply completion responsibility
-- **COMMIT WHEN INSTRUCTED** - If an explicit commit instruction exists in context or current task, perform the commit to finalize completion
+- **STAGE ONLY CHANGE-OWNED FILES** - Before declaring completion, `git add` exactly the files this change owns. File selection is yours; Conflux never picks it for you
+- **NEVER CREATE THE FINAL COMMIT** - Conflux owns WIP preservation, repository-hook execution, and the final Apply commit. Do not run `git commit`, `git commit --amend`, or any equivalent for this change
+- **COMMIT WHEN INSTRUCTED** - If an explicit commit instruction exists in context or current task, perform *that* commit. This never authorizes the final Apply commit, which Conflux alone creates
+- **FINISH WITH A CLEAN WORKSPACE** - `git status --porcelain` must report no unstaged changes and no untracked files when you return. Staged entries are expected; a dirty worktree column or a `??` entry is not
+- **WAIT FOR VERIFICATION IN THE FOREGROUND** - Never return a final response while a verification command is still running in the background. Wait for it, or record a valid blocker under the rules below
 - **NO UNCHECKED TASKS** - Apply MUST NOT declare completion or exit while any `[ ]` unchecked tasks remain in tasks.md; all must be `[x]` or moved to Future Work before finishing
 - **PRESERVE ACCEPTANCE FOLLOW-UP** - The runtime-owned acceptance follow-up is the authoritative retry checklist. Do not delete or move it. Its finding text is immutable identity metadata and is exempt from the general task-description refinement rule: do not rewrite, split, or refine it. Inside that section, only change an existing finding checkbox and add separate indented lines in the exact form `  evidence: <one-line evidence>`. Do not add ordinary paragraphs, headings, fenced blocks, unindented `Evidence:` labels, or any other notes inside the runtime-owned section. Put longer notes outside it in a non-checkbox notes section. After each finding is fixed and verified, immediately mark each existing finding `[x]`; the runtime clears the section only after acceptance PASS.
 - **ACCEPTANCE REPAIR MODE IS THE PRIMARY SCOPE** - When the prompt carries `<acceptance_findings_json>`, the open findings in that block are your work, ranked above completed proposal tasks, prior implementation narrative, and other context. Completed proposal tasks are constraints, not new work candidates: do not re-open or re-explore them.
@@ -234,6 +238,47 @@ Recoverable infrastructure blockers MUST NOT be escalated as terminal rejection 
    For a recoverable external prerequisite the same block MUST carry the same facts as the tasks.md section — `category`, `evidence`, `prerequisite_owner`, `unblock_condition`, `next_action`, and `resumable` — and MUST return the compatible machine-readable `BLOCKED` outcome without creating `REJECTED.md`.
 5. Keep evidence concrete and actionable so acceptance can judge whether loop stop is warranted. Conflux compares the workspace-visible `## Implementation Blocker #<n>` section against the stdout block, so evidence that exists only in narrative output is not evidence.
 
+## Staging and Commit Ownership
+
+The boundary is explicit: **you select files, Conflux creates commits.**
+
+| Step | Owner |
+| --- | --- |
+| Deciding which files belong to this change | Apply agent |
+| `git add` of those files | Apply agent |
+| WIP snapshot commits between iterations | Conflux |
+| Repository hook execution | Conflux |
+| The final `Apply: <change-id>` commit | Conflux |
+
+Before you return:
+
+1. `git add` every file this change owns, including new files.
+2. Run `git status --porcelain`.
+3. It must print no line whose second column is non-blank and no `??` line.
+   A staged-then-re-edited file shows `MM`; that is a dirty worktree column and
+   fails the check. Stage the newer content or revert it.
+4. Do not commit. Conflux runs the hook-enabled final commit itself and streams
+   its output back to the operator.
+
+If the workspace is not clean when tasks are complete, Conflux does not create a
+WIP snapshot or a final commit. It leaves the workspace exactly as you left it,
+records `incomplete_stage` feedback naming the affected paths, and runs another
+Apply iteration whose only job is to finish the staging. That iteration spends
+the same bounded budget as any other, so leaving stray files behind costs real
+retries.
+
+### Background Verification Is Never Complete Work
+
+A verification command that is still running when you return has produced no
+evidence. Conflux terminates the process group at the finalization barrier, so a
+repository-wide test you backgrounded is killed, not finished, and the next
+iteration sees unchanged tasks with no result to consume.
+
+- Run verification in the foreground and wait for its exit status.
+- Never end a response with "tests are running" or an equivalent claim.
+- If a required command genuinely cannot complete inside one iteration, record an
+  Implementation Blocker with concrete evidence instead of returning early.
+
 ## Apply Completion Criteria
 
 - All tasks marked `[x]` or moved to Future Work (without checkboxes)
@@ -241,6 +286,9 @@ Recoverable infrastructure blockers MUST NOT be escalated as terminal rejection 
 - Tests pass
 - Lint passes
 - Integration points verified
+- Every intended file is staged, and `git status --porcelain` reports no unstaged or untracked entries
+- No final Apply commit was created by the agent
+- No verification command is still running in the background
 - Any task that claims implementation, runtime behavior, or entrypoint wiring has corresponding non-OpenSpec evidence in the repo
 - Changes that are spec-only MUST leave implementation tasks unchecked or blocked; they must not be represented as completed implementation
 

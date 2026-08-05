@@ -145,6 +145,17 @@ impl AppState {
                 output,
                 iteration,
             } => self.handle_apply_output(change_id, output, iteration),
+            OrchestratorEvent::ApplyCommitPhase {
+                change_id,
+                phase,
+                attempt,
+            } => self.handle_apply_commit_phase(change_id, phase, attempt),
+            OrchestratorEvent::ApplyCommitOutput {
+                change_id,
+                attempt,
+                stream,
+                line,
+            } => self.handle_apply_commit_output(change_id, attempt, stream, line),
             OrchestratorEvent::ArchiveOutput {
                 change_id,
                 output,

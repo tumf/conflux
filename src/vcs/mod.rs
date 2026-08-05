@@ -381,6 +381,22 @@ pub trait WorkspaceManager: Send + Sync {
         message: &str,
     ) -> VcsResult<VerifiedCommitOutcome>;
 
+    /// [`Self::create_verified_commit`] with a presentation sink for streamed
+    /// output.
+    ///
+    /// The default ignores the sink and delegates, so a backend that cannot
+    /// stream keeps exactly its existing behavior rather than losing the
+    /// commit. Streaming is observability: it must never decide whether a
+    /// commit happens.
+    async fn create_verified_commit_streamed(
+        &self,
+        workspace_path: &Path,
+        message: &str,
+        _sink: crate::vcs::git::commands::commit::CommitOutputSink<'_>,
+    ) -> VcsResult<VerifiedCommitOutcome> {
+        self.create_verified_commit(workspace_path, message).await
+    }
+
     /// Create an iteration snapshot with WIP commit message.
     ///
     /// For Git: Stage all changes and create a new WIP commit with iteration number.

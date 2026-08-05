@@ -1150,4 +1150,116 @@ mod tests {
             );
         }
     }
+
+    /// Return the raw embedded bytes of one bundled skill.
+    ///
+    /// Asserting against the registered skill rather than the `include_str!`
+    /// constant keeps these contracts honest about what actually ships in the
+    /// binary.
+    fn embedded_skill_content(name: &str) -> String {
+        let skills = get_cflx_embedded_skills().expect("embedded skills must register");
+        skills
+            .iter()
+            .find(|skill| skill.name == name)
+            .unwrap_or_else(|| panic!("{name} must be embedded"))
+            .raw_content
+            .clone()
+    }
+
+    /// The proposal skill must require tracked-hook evidence before it omits a
+    /// repository-wide verification checkbox, and must keep staged-file-only
+    /// hooks out of that delegation.
+    #[test]
+    fn proposal_skill_requires_tracked_unconditional_hook_evidence() {
+        let content = embedded_skill_content("cflx-proposal");
+
+        for required in [
+            "Hook-Owned Repository-Wide Verification",
+            "Inspect the tracked hook configuration before delegating anything",
+            ".pre-commit-config.yaml",
+            "core.hooksPath",
+            "always_run: true",
+            "pass_filenames: false",
+            "clean-tree amend path",
+            "staged-file-only hooks",
+            "lint-staged",
+        ] {
+            assert!(
+                content.contains(required),
+                "cflx-proposal must document `{required}`"
+            );
+        }
+
+        assert!(
+            content.contains("Untracked local hooks and developer machine setup are not evidence."),
+            "cflx-proposal must reject untracked hook evidence"
+        );
+        assert!(
+            content.contains(
+                "Requirement-specific test implementation and its verification note. These stay"
+            ),
+            "cflx-proposal must keep requirement-specific tests on implementation tasks"
+        );
+        assert!(
+            content.contains(
+                "Heavy, E2E, networked, credentialed, long-running, and post-integration"
+            ),
+            "cflx-proposal must keep heavy/E2E verification explicitly owned outside pre-commit"
+        );
+        assert!(
+            content.contains("Do not add a checkbox whose only work is rerunning a repository-wide check that a tracked, unconditional commit hook already runs"),
+            "the task-breakdown guidelines must carry the hook-ownership rule"
+        );
+    }
+
+    /// The apply skill must separate agent staging from Conflux commit
+    /// ownership, demand a clean workspace, and forbid returning with
+    /// background verification still running.
+    #[test]
+    fn apply_skill_separates_staging_from_commit_ownership() {
+        let content = embedded_skill_content("cflx-apply");
+
+        for required in [
+            "**STAGE ONLY CHANGE-OWNED FILES**",
+            "**NEVER CREATE THE FINAL COMMIT**",
+            "**FINISH WITH A CLEAN WORKSPACE**",
+            "**WAIT FOR VERIFICATION IN THE FOREGROUND**",
+            "## Staging and Commit Ownership",
+            "### Background Verification Is Never Complete Work",
+            "incomplete_stage",
+            "git status --porcelain",
+        ] {
+            assert!(
+                content.contains(required),
+                "cflx-apply must document `{required}`"
+            );
+        }
+
+        // The pre-existing commit rule must stay scoped so it can never be read
+        // as authorization for the final Apply commit.
+        assert!(
+            content.contains(
+                "**COMMIT WHEN INSTRUCTED** - If an explicit commit instruction exists in context \
+                 or current task, perform *that* commit. This never authorizes the final Apply \
+                 commit, which Conflux alone creates"
+            ),
+            "cflx-apply must rescope COMMIT WHEN INSTRUCTED away from final-commit ownership"
+        );
+        assert!(
+            !content.contains("perform the commit to finalize completion"),
+            "the unscoped finalize-by-committing instruction must be gone"
+        );
+        assert!(
+            content.contains("Every intended file is staged, and `git status --porcelain` reports no unstaged or untracked entries"),
+            "cflx-apply completion criteria must require a clean staged workspace"
+        );
+        assert!(
+            content.contains("No final Apply commit was created by the agent"),
+            "cflx-apply completion criteria must forbid an agent-created final commit"
+        );
+        assert!(
+            content.contains("No verification command is still running in the background"),
+            "cflx-apply completion criteria must forbid background verification at return"
+        );
+    }
 }

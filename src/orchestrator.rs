@@ -1640,6 +1640,39 @@ impl Orchestrator {
                             println!("[{} apply {}] {}", change_id, iter, output);
                         }
                     }
+                    ParallelEvent::ApplyCommitPhase {
+                        change_id,
+                        phase,
+                        attempt,
+                    } => {
+                        // Headless runs have no `[commit]` row to update, so the
+                        // subphase is reported as a line like any other Apply
+                        // progress. It stays presentation only.
+                        info!(
+                            "Apply commit phase for {} (attempt {}): {}",
+                            change_id,
+                            attempt,
+                            phase.as_str()
+                        );
+                        println!("[{} commit #{}] {}", change_id, attempt, phase.as_str());
+                    }
+                    ParallelEvent::ApplyCommitOutput {
+                        change_id,
+                        attempt,
+                        stream,
+                        line,
+                    } => {
+                        // Mirrors the `ApplyOutput` arm: streamed repository-hook
+                        // output must be visible while the commit runs, not only
+                        // after it is classified.
+                        println!(
+                            "[{} commit #{} {}] {}",
+                            change_id,
+                            attempt,
+                            stream.as_str(),
+                            line
+                        );
+                    }
                     ParallelEvent::ProgressUpdated {
                         change_id,
                         completed,

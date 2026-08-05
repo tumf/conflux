@@ -788,6 +788,15 @@ impl WorkspaceManager for GitWorkspaceManager {
         commands::create_verified_commit(workspace_path, message).await
     }
 
+    async fn create_verified_commit_streamed(
+        &self,
+        workspace_path: &Path,
+        message: &str,
+        sink: commands::commit::CommitOutputSink<'_>,
+    ) -> VcsResult<VerifiedCommitOutcome> {
+        commands::commit::create_verified_commit_streamed(workspace_path, message, Some(sink)).await
+    }
+
     async fn create_iteration_snapshot(
         &self,
         workspace_path: &Path,

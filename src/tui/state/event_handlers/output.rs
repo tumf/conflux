@@ -1,3 +1,4 @@
+use crate::events::{ApplyCommitPhase, CommitOutputStream};
 use crate::tui::events::LogEntry;
 
 use super::AppState;
@@ -9,17 +10,61 @@ impl AppState {
         output: String,
         iteration: Option<u32>,
     ) {
+        let mut operation = "apply".to_string();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if matches!(change.display_status_cache.as_str(), "applying") {
                 change.update_iteration_monotonic(iteration);
             }
+            // While finalization owns the lane, everything it prints is labeled
+            // `[commit]` so the operator can tell hook work from agent work.
+            operation = change.apply_operation().to_string();
         }
 
         self.add_log(
             LogEntry::info(output)
                 .with_change_id(change_id)
-                .with_operation("apply")
+                .with_operation(operation)
                 .with_iteration(iteration.unwrap_or(1)),
+        );
+    }
+
+    /// Switch the Apply lane between `[apply]` and `[commit]` presentation.
+    ///
+    /// Only the rendered operation label changes. The row keeps its `applying`
+    /// status and color, and no scheduling or routing state is touched.
+    pub(crate) fn handle_apply_commit_phase(
+        &mut self,
+        change_id: String,
+        phase: ApplyCommitPhase,
+        _attempt: u32,
+    ) {
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            change.apply_operation_cache =
+                if phase.is_active() { "commit" } else { "apply" }.to_string();
+        }
+    }
+
+    /// Log one streamed line of final-commit output.
+    ///
+    /// Labeled by attempt rather than deduplicated, so an index-lock retry's
+    /// repeated hook output stays attributable to the attempt that produced it.
+    pub(crate) fn handle_apply_commit_output(
+        &mut self,
+        change_id: String,
+        attempt: u32,
+        stream: CommitOutputStream,
+        line: String,
+    ) {
+        // Hooks routinely report progress on stderr, so the stream is
+        // attribution, not severity: every streamed line is logged at info and
+        // rejection is classified from the exit status alone. The stream name
+        // is carried in the message because that is what makes each line
+        // self-identifying without changing the published log schema.
+        self.add_log(
+            LogEntry::info(format!("{}: {}", stream.as_str(), line))
+                .with_change_id(change_id)
+                .with_operation("commit")
+                .with_iteration(attempt),
         );
     }
 
@@ -535,5 +580,165 @@ mod tests {
 
         assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert_eq!(app.changes[1].display_status_cache, "queued");
+    }
+
+    // === Apply-lane operation presentation ===
+
+    /// Build an app with one row already rendering the Apply lane.
+    fn applying_app(change_id: &str) -> AppState {
+        let mut app = AppState::new(vec![create_test_change(change_id, 0, 1)]);
+        app.changes[0].set_display_status_cache("applying");
+        app
+    }
+
+    /// The rendered log header must follow the commit subphase: `[apply]` while
+    /// the agent runs, `[commit]` while finalization does, `[apply]` again for a
+    /// repair iteration. The row's status word never changes.
+    #[test]
+    fn the_apply_lane_label_follows_the_commit_subphase() {
+        let mut app = applying_app("change-a");
+
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyOutput {
+            change_id: "change-a".to_string(),
+            output: "agent working".to_string(),
+            iteration: Some(2),
+        });
+        assert_eq!(app.logs.last().unwrap().operation.as_deref(), Some("apply"));
+
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyCommitPhase {
+            change_id: "change-a".to_string(),
+            phase: ApplyCommitPhase::Started,
+            attempt: 2,
+        });
+        assert_eq!(app.changes[0].apply_operation(), "commit");
+        assert_eq!(
+            app.changes[0].display_status_cache, "applying",
+            "the canonical status stays `applying` throughout finalization"
+        );
+
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyOutput {
+            change_id: "change-a".to_string(),
+            output: "still in finalization".to_string(),
+            iteration: Some(2),
+        });
+        assert_eq!(
+            app.logs.last().unwrap().operation.as_deref(),
+            Some("commit")
+        );
+
+        // A repair iteration restores apply presentation.
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyCommitPhase {
+            change_id: "change-a".to_string(),
+            phase: ApplyCommitPhase::Failed,
+            attempt: 2,
+        });
+        assert_eq!(app.changes[0].apply_operation(), "apply");
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyOutput {
+            change_id: "change-a".to_string(),
+            output: "repair working".to_string(),
+            iteration: Some(3),
+        });
+        assert_eq!(app.logs.last().unwrap().operation.as_deref(), Some("apply"));
+    }
+
+    /// Completion must also clear the subphase, so no row keeps rendering
+    /// `[commit]` after finalization ends.
+    #[test]
+    fn a_completed_commit_phase_clears_the_commit_label() {
+        let mut app = applying_app("change-a");
+
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyCommitPhase {
+            change_id: "change-a".to_string(),
+            phase: ApplyCommitPhase::Started,
+            attempt: 1,
+        });
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyCommitPhase {
+            change_id: "change-a".to_string(),
+            phase: ApplyCommitPhase::Completed,
+            attempt: 1,
+        });
+
+        assert_eq!(app.changes[0].apply_operation(), "apply");
+    }
+
+    /// Streamed commit lines must be self-identifying: change, `commit`
+    /// operation, source stream, and finalization attempt.
+    #[test]
+    fn streamed_commit_lines_carry_change_stream_and_attempt() {
+        let mut app = applying_app("change-a");
+
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyCommitOutput {
+            change_id: "change-a".to_string(),
+            attempt: 2,
+            stream: CommitOutputStream::Stderr,
+            line: "pre-commit: running clippy".to_string(),
+        });
+
+        let entry = app
+            .logs
+            .last()
+            .expect("a streamed line becomes a log entry");
+        assert_eq!(entry.change_id.as_deref(), Some("change-a"));
+        assert_eq!(entry.operation.as_deref(), Some("commit"));
+        assert_eq!(entry.iteration, Some(2));
+        assert!(
+            entry.message.contains("stderr: pre-commit: running clippy"),
+            "the source stream must be identifiable: {}",
+            entry.message
+        );
+        assert_eq!(
+            entry.level,
+            LogLevel::Info,
+            "a stderr hook line is progress, not a failure verdict"
+        );
+    }
+
+    /// Contention retries re-run the same hooks and produce the same text. Those
+    /// lines must stay separate entries labelled by their own attempt rather
+    /// than being collapsed into one.
+    #[test]
+    fn repeated_lines_from_separate_attempts_are_not_deduplicated() {
+        let mut app = applying_app("change-a");
+
+        for attempt in 1..=2 {
+            app.handle_orchestrator_event(OrchestratorEvent::ApplyCommitOutput {
+                change_id: "change-a".to_string(),
+                attempt,
+                stream: CommitOutputStream::Stdout,
+                line: "running repository verification".to_string(),
+            });
+        }
+
+        let commit_entries: Vec<_> = app
+            .logs
+            .iter()
+            .filter(|entry| entry.operation.as_deref() == Some("commit"))
+            .collect();
+        assert_eq!(
+            commit_entries.len(),
+            2,
+            "identical lines from two attempts must both survive"
+        );
+        assert_eq!(commit_entries[0].iteration, Some(1));
+        assert_eq!(commit_entries[1].iteration, Some(2));
+    }
+
+    /// The reducer refresh is a self-healing backstop: a frontend that missed a
+    /// phase event must still converge instead of rendering `[commit]` forever.
+    #[test]
+    fn the_reducer_refresh_converges_a_frontend_that_missed_an_event() {
+        let mut app = applying_app("change-a");
+        app.handle_orchestrator_event(OrchestratorEvent::ApplyCommitPhase {
+            change_id: "change-a".to_string(),
+            phase: ApplyCommitPhase::Started,
+            attempt: 1,
+        });
+        assert_eq!(app.changes[0].apply_operation(), "commit");
+
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("change-a".to_string(), "apply");
+        app.apply_operation_labels_from_reducer(&labels);
+
+        assert_eq!(app.changes[0].apply_operation(), "apply");
     }
 }

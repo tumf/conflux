@@ -17,7 +17,7 @@ pub use basic::{
     branch_delete, branch_delete_at_oid, branch_delete_if_merged, branch_exists, branch_ref_oid,
     check_git_repo, checkout, generate_unique_branch_name, get_changed_files,
     get_changed_files_since, get_conflict_files, get_current_branch, get_current_commit,
-    get_ref_revision, get_status, has_uncommitted_changes, is_head_empty_commit,
+    get_ref_revision, get_status, has_uncommitted_changes, is_head_empty_commit, porcelain_status,
     push_same_named_branch, run_git,
 };
 pub use commit::{

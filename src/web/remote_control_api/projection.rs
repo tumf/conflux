@@ -704,6 +704,38 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
             Some(change_id.clone()),
             json!({ "iteration": iteration }),
         ),
+        E::ApplyCommitPhase {
+            change_id,
+            phase,
+            attempt,
+        } => (
+            "apply_commit_phase",
+            Some(change_id.clone()),
+            json!({ "phase": phase.as_str(), "attempt": attempt }),
+        ),
+        // Streamed hook output is high volume and untrusted repository text, so
+        // the remote event carries only its attribution; the line itself stays
+        // in the operator log.
+        //
+        // The attribution rides in the payload rather than the addressed-change
+        // slot: this event is presentation-only, and a change-addressed event
+        // feeds the snapshot's timing, activity, and attention. Hook lines must
+        // not alter workflow-control state — `ApplyCommitPhase` is the
+        // change-addressed event that makes a running commit visible.
+        E::ApplyCommitOutput {
+            change_id,
+            attempt,
+            stream,
+            ..
+        } => (
+            "apply_commit_output",
+            None,
+            json!({
+                "change_id": change_id,
+                "attempt": attempt,
+                "stream": stream.as_str(),
+            }),
+        ),
         E::ArchiveStarted { change_id, command } => (
             "archive_started",
             Some(change_id.clone()),
