@@ -129,7 +129,7 @@ cargo install cflx
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Guide de contribution |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | Guide de développement |
 | [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | Guide de publication |
-| [docs/openapi.yaml](docs/openapi.yaml) | Contrat canonique `/api/v2` (généré) |
+| `cflx openapi` / `GET /api/v2/openapi.yaml` | Contrat canonique `/api/v2` (généré à l'exécution, non suivi dans le dépôt) |
 
 ## Licence
 

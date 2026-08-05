@@ -23,7 +23,7 @@
 // the binary crate are allowed here.
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -163,6 +163,81 @@ pub fn classify_mark_route(mode: OperatorMode, display_status: &str) -> MarkRout
     }
 }
 
+/// Why parallel mode refuses a change, or that it does not.
+///
+/// Parallel eligibility is two independent workspace observations, and a
+/// frontend has to keep them apart: dirty proposal content is something the
+/// operator can commit, while a proposal that is simply absent from `HEAD` — an
+/// archived change whose managed worktree is still around, for example — has no
+/// uncommitted content to commit. Collapsing both into one boolean is what makes
+/// a clean row claim a Git working-tree condition it does not have.
+///
+/// Admission is unchanged by the distinction: every non-[`Eligible`] variant is
+/// refused by parallel queueing exactly as before.
+///
+/// Distinct from [`crate::web::remote_control_api::dto::ParallelEligibility`],
+/// which is the wire projection of this same observation.
+///
+/// [`Eligible`]: ParallelEligibility::Eligible
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParallelEligibility {
+    /// The proposal is present in `HEAD` and its directory is clean.
+    #[default]
+    Eligible,
+    /// The proposal directory is absent from the current `HEAD` tree.
+    ProposalAbsentFromHead,
+    /// Uncommitted or untracked files exist under `openspec/changes/<id>/`.
+    UncommittedProposalFiles,
+}
+
+impl ParallelEligibility {
+    /// Classify one change from a single workspace refresh observation.
+    ///
+    /// Dirty content wins over absence on purpose: a brand-new proposal is both
+    /// untracked and absent from `HEAD`, and committing it is the one action
+    /// that resolves both.
+    pub fn observe(
+        change_id: &str,
+        committed_change_ids: &HashSet<String>,
+        uncommitted_file_change_ids: &HashSet<String>,
+    ) -> Self {
+        if uncommitted_file_change_ids.contains(change_id) {
+            Self::UncommittedProposalFiles
+        } else if !committed_change_ids.contains(change_id) {
+            Self::ProposalAbsentFromHead
+        } else {
+            Self::Eligible
+        }
+    }
+
+    /// True when the change may take part in parallel execution.
+    pub fn is_eligible(self) -> bool {
+        matches!(self, Self::Eligible)
+    }
+
+    /// True when uncommitted or untracked proposal files were actually observed.
+    ///
+    /// This is the only condition that may be presented as uncommitted state.
+    pub fn has_uncommitted_proposal_files(self) -> bool {
+        matches!(self, Self::UncommittedProposalFiles)
+    }
+
+    /// The bulk-mark exclusion this reason produces; `None` when eligible.
+    pub fn mark_exclusion(self) -> Option<MarkExclusion> {
+        match self {
+            Self::Eligible => None,
+            Self::ProposalAbsentFromHead => Some(MarkExclusion::ParallelProposalAbsent),
+            Self::UncommittedProposalFiles => Some(MarkExclusion::ParallelIneligible),
+        }
+    }
+}
+
+/// Reason text for intent cleared because parallel mode refuses a change.
+///
+/// Deliberately reason-agnostic: the cleanup pass clears every ineligible row,
+/// so naming one specific cause would mislabel the others.
+pub const PARALLEL_INELIGIBLE_CLEANUP_REASON: &str = "not eligible for parallel execution";
+
 /// Why a change is excluded from a bulk execution-mark mutation.
 ///
 /// Every variant is a stable token a frontend branches on rather than prose, so
@@ -179,15 +254,18 @@ pub enum MarkExclusion {
     ChangeActive,
     /// The mode/status pair refuses this mutation.
     StatusImmutable,
-    /// Parallel mode cannot queue a change that is not committed yet.
+    /// Parallel mode cannot queue a change with uncommitted proposal files.
     ParallelIneligible,
+    /// Parallel mode cannot queue a change whose proposal is absent from `HEAD`.
+    ParallelProposalAbsent,
 }
 
 impl MarkExclusion {
     /// Every exclusion, in the order used when grouping reasons for display.
-    pub const ALL: [MarkExclusion; 6] = [
+    pub const ALL: [MarkExclusion; 7] = [
         MarkExclusion::ChangeActive,
         MarkExclusion::ParallelIneligible,
+        MarkExclusion::ParallelProposalAbsent,
         MarkExclusion::FinalStatus,
         MarkExclusion::RetryRequired,
         MarkExclusion::StopPending,
@@ -203,6 +281,7 @@ impl MarkExclusion {
             Self::ChangeActive => "change_active",
             Self::StatusImmutable => "status_immutable",
             Self::ParallelIneligible => "parallel_ineligible",
+            Self::ParallelProposalAbsent => "parallel_proposal_absent",
         }
     }
 
@@ -215,6 +294,7 @@ impl MarkExclusion {
             Self::ChangeActive => "in progress (use K to stop)",
             Self::StatusImmutable => "not mutable in this mode",
             Self::ParallelIneligible => "uncommitted in parallel mode (commit first)",
+            Self::ParallelProposalAbsent => "not present in HEAD (cannot queue in parallel mode)",
         }
     }
 }
@@ -231,8 +311,8 @@ pub struct MarkTargetRow<'a> {
     pub change_id: &'a str,
     /// Reducer-derived display status.
     pub display_status: &'a str,
-    /// True when the change may take part in parallel execution.
-    pub parallel_eligible: bool,
+    /// Server-observed parallel eligibility, with its reason.
+    pub parallel_eligibility: ParallelEligibility,
     /// Current execution mark.
     pub marked: bool,
 }
@@ -295,10 +375,14 @@ pub fn classify_bulk_mark_row(
     mode: OperatorMode,
     parallel_mode: bool,
     display_status: &str,
-    parallel_eligible: bool,
+    parallel_eligibility: ParallelEligibility,
 ) -> Option<MarkExclusion> {
-    if parallel_mode && !parallel_eligible && !is_final_status(display_status) {
-        return Some(MarkExclusion::ParallelIneligible);
+    if parallel_mode && !is_final_status(display_status) {
+        // The refusal is identical for every ineligible reason; only the reason
+        // reported back to the operator differs.
+        if let Some(exclusion) = parallel_eligibility.mark_exclusion() {
+            return Some(exclusion);
+        }
     }
 
     match classify_mark_route(mode, display_status) {
@@ -343,7 +427,7 @@ pub fn plan_bulk_marks(
             mode,
             parallel_mode,
             row.display_status,
-            row.parallel_eligible,
+            row.parallel_eligibility,
         ) {
             Some(reason) => excluded.push((row.change_id.to_string(), reason)),
             None => {
@@ -423,7 +507,11 @@ struct ParallelRuntimeInner {
     available: bool,
     max_concurrent: usize,
     vcs_backend: String,
-    ineligible: HashSet<String>,
+    /// Ineligible changes only, each mapped to the reason it is refused.
+    ///
+    /// Absence means eligible, so the map is the reason set and the membership
+    /// set at once and the two can never disagree.
+    ineligible: HashMap<String, ParallelEligibility>,
 }
 
 /// A coherent read of the parallel runtime facts.
@@ -474,9 +562,19 @@ impl ParallelRuntime {
         self.lock().vcs_backend = backend.into();
     }
 
-    /// Publish the set of changes parallel mode refuses to start.
-    pub fn set_parallel_ineligible(&self, ids: impl IntoIterator<Item = String>) {
-        self.lock().ineligible = ids.into_iter().collect();
+    /// Publish the changes parallel mode refuses to start, each with its reason.
+    ///
+    /// [`ParallelEligibility::Eligible`] entries are dropped rather than stored:
+    /// an "ineligible" entry that claims eligibility would be a contradiction the
+    /// readers below would have to re-check.
+    pub fn set_parallel_ineligible(
+        &self,
+        entries: impl IntoIterator<Item = (String, ParallelEligibility)>,
+    ) {
+        self.lock().ineligible = entries
+            .into_iter()
+            .filter(|(_, eligibility)| !eligibility.is_eligible())
+            .collect();
     }
 
     /// True when parallel execution is the active mode.
@@ -491,12 +589,21 @@ impl ParallelRuntime {
 
     /// True when the change may take part in parallel execution.
     pub fn is_eligible(&self, change_id: &str) -> bool {
-        !self.lock().ineligible.contains(change_id)
+        !self.lock().ineligible.contains_key(change_id)
+    }
+
+    /// The observed eligibility of one change, including why it is refused.
+    pub fn eligibility(&self, change_id: &str) -> ParallelEligibility {
+        self.lock()
+            .ineligible
+            .get(change_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Every change parallel mode refuses, sorted for deterministic output.
     pub fn ineligible_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.lock().ineligible.iter().cloned().collect();
+        let mut ids: Vec<String> = self.lock().ineligible.keys().cloned().collect();
         ids.sort();
         ids
     }
@@ -532,7 +639,7 @@ impl ParallelRuntime {
         }
         targets
             .iter()
-            .filter(|id| guard.ineligible.contains(*id))
+            .filter(|id| guard.ineligible.contains_key(*id))
             .cloned()
             .collect()
     }
@@ -1244,16 +1351,16 @@ impl OperatorCommandService {
         let parallel_mode = self.parallel.parallel_mode();
         // One read, one classification: re-reading per row could observe two
         // different instants and derive a target state from neither.
-        let observed: Vec<(String, String, bool, bool)> = {
+        let observed: Vec<(String, String, ParallelEligibility, bool)> = {
             let guard = self.state.read().await;
             guard
                 .tracked_change_ids()
                 .into_iter()
                 .map(|change_id| {
                     let display_status = guard.display_status(&change_id).to_string();
-                    let eligible = self.parallel.is_eligible(&change_id);
+                    let eligibility = self.parallel.eligibility(&change_id);
                     let marked = self.marks.is_marked(&change_id);
-                    (change_id, display_status, eligible, marked)
+                    (change_id, display_status, eligibility, marked)
                 })
                 .collect()
         };
@@ -1261,10 +1368,10 @@ impl OperatorCommandService {
         let rows: Vec<MarkTargetRow<'_>> = observed
             .iter()
             .map(
-                |(change_id, display_status, parallel_eligible, marked)| MarkTargetRow {
+                |(change_id, display_status, parallel_eligibility, marked)| MarkTargetRow {
                     change_id,
                     display_status,
-                    parallel_eligible: *parallel_eligible,
+                    parallel_eligibility: *parallel_eligibility,
                     marked: *marked,
                 },
             )

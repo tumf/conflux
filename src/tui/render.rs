@@ -537,6 +537,12 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
 /// Minimum remaining row width a preview needs before it is worth showing.
 const MIN_PREVIEW_WIDTH: usize = 10;
 
+/// Badge for a change with observed uncommitted or untracked proposal files.
+///
+/// Shared by both list layouts so the rendered text and the width reserved for
+/// it can never disagree.
+const UNCOMMITTED_BADGE: &str = " UNCOMMITTED";
+
 /// Preview text for one change row, before width truncation.
 ///
 /// An `error` row explains itself from the retained final diagnostic, which is
@@ -629,14 +635,18 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 // Note: 'selected' field indicates selection for next run
                 let is_archived =
                     matches!(change.display_status_cache.as_str(), "archived" | "merged");
-                let show_uncommitted_badge = app.parallel_mode
-                    && !change.is_parallel_eligible
+                // Every parallel-ineligible reason still blocks the row; only the
+                // badge narrows to the one reason that is actually a Git
+                // working-tree condition.
+                let is_parallel_blocked = app.parallel_mode
+                    && !change.is_parallel_eligible()
                     && !is_archived
                     && matches!(
                         change.display_status_cache.as_str(),
                         "not queued" | "queued"
                     );
-                let is_parallel_blocked = show_uncommitted_badge;
+                let show_uncommitted_badge =
+                    is_parallel_blocked && change.has_uncommitted_proposal_files();
                 // Determine if this is the focused/cursor row before computing colors.
                 let is_selected_row = i == app.cursor_index;
                 // When a blocked row is focused its foreground must remain readable against the
@@ -665,7 +675,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                     ""
                 };
                 let uncommitted_badge = if show_uncommitted_badge {
-                    " UNCOMMITED"
+                    UNCOMMITTED_BADGE
                 } else {
                     ""
                 };
@@ -743,7 +753,11 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                     let id_width = id_text.len();
                     let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
                     let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
-                    let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
+                    let uncommitted_badge_width = if show_uncommitted_badge {
+                        UNCOMMITTED_BADGE.len()
+                    } else {
+                        0
+                    };
                     let status_text = format!("[{}]", change.display_status_cache.as_str());
                     let status_width = format!(" {:>18}", status_text).len();
                     let tasks_text =
@@ -803,7 +817,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     if let Some(item) = current_item {
         // Show "K: kill" for active changes, otherwise describe the mark action.
         // In parallel mode, don't show Space hints for uncommitted changes.
-        let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
+        let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible();
         if matches!(
             item.display_status_cache.as_str(),
             "preparing" | "applying" | "accepting" | "archiving" | "resolving"
@@ -922,14 +936,18 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 //   - Stopped: shows execution mark (selected=true, display_status_cache=NotQueued)
                 let is_archived =
                     matches!(change.display_status_cache.as_str(), "archived" | "merged");
-                let show_uncommitted_badge = app.parallel_mode
-                    && !change.is_parallel_eligible
+                // Every parallel-ineligible reason still blocks the row; only the
+                // badge narrows to the one reason that is actually a Git
+                // working-tree condition.
+                let is_parallel_blocked = app.parallel_mode
+                    && !change.is_parallel_eligible()
                     && !is_archived
                     && matches!(
                         change.display_status_cache.as_str(),
                         "not queued" | "queued"
                     );
-                let is_parallel_blocked = show_uncommitted_badge;
+                let show_uncommitted_badge =
+                    is_parallel_blocked && change.has_uncommitted_proposal_files();
                 // Determine if this is the focused/cursor row before computing colors.
                 let is_selected_row = i == app.cursor_index;
                 // When a blocked row is focused its foreground must remain readable against the
@@ -958,7 +976,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     ""
                 };
                 let uncommitted_badge = if show_uncommitted_badge {
-                    " UNCOMMITED"
+                    UNCOMMITTED_BADGE
                 } else {
                     ""
                 };
@@ -1097,7 +1115,11 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     let id_width = id_text.len();
                     let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
                     let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
-                    let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
+                    let uncommitted_badge_width = if show_uncommitted_badge {
+                        UNCOMMITTED_BADGE.len()
+                    } else {
+                        0
+                    };
 
                     // Use the actual tasks_text that was already formatted above
                     let tasks_width = tasks_text.len();
@@ -1151,7 +1173,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     if let Some(item) = current_item {
         // Show "K: kill" for active changes, otherwise describe the mark action.
         // In parallel mode, don't show Space hints for uncommitted changes.
-        let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
+        let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible();
         if matches!(
             item.display_status_cache.as_str(),
             "preparing" | "applying" | "accepting" | "archiving" | "resolving"
@@ -2342,6 +2364,7 @@ mod tests {
     use super::*;
     use crate::openspec::Change;
     use crate::openspec::ProposalMetadata;
+    use crate::orchestration::operator_command::ParallelEligibility;
     use crate::tui::config::TuiConfig;
     use crate::tui::events::LogEntry;
     use crate::tui::types::{ViewMode, WorktreeInfo};
@@ -3085,30 +3108,186 @@ mod tests {
     }
 
     #[test]
-    fn test_render_parallel_archived_row_does_not_show_uncommited_badge() {
+    fn test_render_parallel_archived_row_does_not_show_uncommitted_badge() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.parallel_mode = true;
         app.changes[0].display_status_cache = "archived".to_string();
-        app.changes[0].is_parallel_eligible = false;
+        app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
 
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
 
-        assert!(!content.contains("UNCOMMITED"));
+        assert!(!content.contains("UNCOMMITTED"));
         assert!(content.contains("[x]"));
     }
 
     #[test]
-    fn test_render_parallel_uncommitted_queueable_row_shows_uncommited_badge() {
+    fn test_render_parallel_uncommitted_queueable_row_shows_uncommitted_badge() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
-        app.changes[0].is_parallel_eligible = false;
+        app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
 
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
 
-        assert!(content.contains("UNCOMMITED"));
+        assert!(content.contains("UNCOMMITTED"));
+    }
+
+    #[test]
+    fn the_badge_uses_the_correct_spelling_and_reserves_its_own_width() {
+        assert_eq!(UNCOMMITTED_BADGE, " UNCOMMITTED");
+        assert_eq!(
+            UNCOMMITTED_BADGE.len(),
+            12,
+            "the reserved width is taken from the badge itself, so the two cannot drift"
+        );
+    }
+
+    // ========================================================================
+    // Parallel-ineligibility reasons are rendered apart
+    //
+    // Every case below is parallel-ineligible and must stay non-actionable.
+    // What differs is whether the row may claim a Git working-tree condition.
+    // ========================================================================
+
+    /// One parallel-ineligible row, arranged for both list layouts.
+    fn parallel_ineligible_app(
+        mode: AppExecutionMode,
+        display_status: &str,
+        eligibility: ParallelEligibility,
+        has_worktree: bool,
+    ) -> AppState {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.execution_mode = mode;
+        app.parallel_available = true;
+        app.parallel_mode = true;
+        app.changes[0].display_status_cache = display_status.to_string();
+        app.changes[0].parallel_eligibility = eligibility;
+        app.changes[0].has_worktree = has_worktree;
+        app.cursor_index = 0;
+        app
+    }
+
+    #[test]
+    fn a_clean_proposal_absent_from_head_is_blocked_without_claiming_dirty_state() {
+        for mode in [AppExecutionMode::Select, AppExecutionMode::Running] {
+            for status in ["not queued", "queued"] {
+                let mut app = parallel_ineligible_app(
+                    mode,
+                    status,
+                    ParallelEligibility::ProposalAbsentFromHead,
+                    false,
+                );
+
+                let buffer = render_buffer(&mut app, 120, 24);
+                let content = buffer_to_string(&buffer);
+
+                assert!(
+                    !content.contains("UNCOMMITTED"),
+                    "{mode:?}/{status}: an absent proposal has no uncommitted files to report"
+                );
+                assert!(
+                    !content.contains("Space: queue") && !content.contains("Space: unqueue"),
+                    "{mode:?}/{status}: a blocked row must keep its queue affordances hidden"
+                );
+                assert!(
+                    content.contains("[ ]"),
+                    "{mode:?}/{status}: a blocked row must render as non-markable"
+                );
+                assert_eq!(
+                    buffer
+                        .cell((CHANGE_ID_X, SELECT_FIRST_ROW_Y))
+                        .unwrap()
+                        .style()
+                        .fg,
+                    Some(Color::Gray),
+                    "{mode:?}/{status}: the focused blocked row stays grayed out"
+                );
+
+                // The badge is the only thing that changed: admission still refuses
+                // the row, and the refusal names the condition that was observed.
+                assert!(!app.changes[0].is_parallel_eligible());
+                assert!(app.toggle_selection().is_none());
+                let warning = app.warning_message.clone().expect("a refusal is reported");
+                assert!(
+                    warning.contains("not present in HEAD"),
+                    "{mode:?}/{status}: the refusal must name proposal absence: {warning}"
+                );
+                assert!(
+                    !warning.to_lowercase().contains("uncommitted"),
+                    "{mode:?}/{status}: the refusal must not ask for a commit: {warning}"
+                );
+                assert!(!app.changes[0].selected);
+            }
+        }
+    }
+
+    /// An archived or failed-merge change whose managed worktree is still around
+    /// keeps `WT` but is not dirty: the worktree marker and the badge are
+    /// independent observations.
+    #[test]
+    fn a_retained_clean_worktree_keeps_wt_without_the_uncommitted_badge() {
+        for mode in [AppExecutionMode::Select, AppExecutionMode::Running] {
+            for status in ["not queued", "queued"] {
+                let mut app = parallel_ineligible_app(
+                    mode,
+                    status,
+                    ParallelEligibility::ProposalAbsentFromHead,
+                    true,
+                );
+
+                let buffer = render_buffer(&mut app, 120, 24);
+                let content = buffer_to_string(&buffer);
+
+                assert!(
+                    content.contains("WT"),
+                    "{mode:?}/{status}: a retained worktree is still reported"
+                );
+                assert!(
+                    !content.contains("UNCOMMITTED"),
+                    "{mode:?}/{status}: a retained clean worktree is not dirty proposal content"
+                );
+                assert!(
+                    content.contains("[ ]"),
+                    "{mode:?}/{status}: the row stays non-actionable"
+                );
+                assert!(!app.changes[0].is_parallel_eligible());
+            }
+        }
+    }
+
+    #[test]
+    fn a_dirty_proposal_is_the_only_row_that_claims_uncommitted_state() {
+        for mode in [AppExecutionMode::Select, AppExecutionMode::Running] {
+            for status in ["not queued", "queued"] {
+                let mut app = parallel_ineligible_app(
+                    mode,
+                    status,
+                    ParallelEligibility::UncommittedProposalFiles,
+                    false,
+                );
+
+                let buffer = render_buffer(&mut app, 120, 24);
+                let content = buffer_to_string(&buffer);
+
+                assert!(
+                    content.contains("UNCOMMITTED"),
+                    "{mode:?}/{status}: observed dirty proposal files must be reported"
+                );
+                assert!(
+                    content.contains("[ ]") && !content.contains("Space: queue"),
+                    "{mode:?}/{status}: the dirty row is non-actionable too"
+                );
+
+                assert!(app.toggle_selection().is_none());
+                let warning = app.warning_message.clone().expect("a refusal is reported");
+                assert!(
+                    warning.contains("Commit it first"),
+                    "{mode:?}/{status}: dirty content keeps its actionable instruction: {warning}"
+                );
+            }
+        }
     }
 
     // Select-mode layout: header=3 rows, list starts at y=3 (border), first item at y=4.
@@ -3124,7 +3303,7 @@ mod tests {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
-        app.changes[0].is_parallel_eligible = false;
+        app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
         app.cursor_index = 0; // cursor on the blocked row
 
         let buffer = render_buffer(&mut app, 80, 24);
@@ -3145,7 +3324,7 @@ mod tests {
         ]);
         app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
-        app.changes[0].is_parallel_eligible = false;
+        app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
         app.cursor_index = 1; // cursor on change-b, not on the blocked row
 
         let buffer = render_buffer(&mut app, 80, 24);
@@ -3164,7 +3343,7 @@ mod tests {
         app.execution_mode = AppExecutionMode::Running;
         app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
-        app.changes[0].is_parallel_eligible = false;
+        app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
         app.cursor_index = 0;
 
         let buffer = render_buffer(&mut app, 80, 24);
@@ -3185,7 +3364,7 @@ mod tests {
         app.execution_mode = AppExecutionMode::Running;
         app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
-        app.changes[0].is_parallel_eligible = false;
+        app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
         app.cursor_index = 1;
 
         let buffer = render_buffer(&mut app, 80, 24);
@@ -3255,11 +3434,14 @@ mod tests {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.parallel_available = true;
         app.parallel_mode = true;
-        app.apply_parallel_eligibility(&HashSet::new(), &HashSet::new());
+        app.apply_parallel_eligibility(
+            &HashSet::from(["change-a".to_string()]),
+            &HashSet::from(["change-a".to_string()]),
+        );
 
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
-        assert!(content.contains("UNCOMMITED"));
+        assert!(content.contains("UNCOMMITTED"));
     }
 
     #[test]
@@ -4171,7 +4353,7 @@ mod tests {
         app.parallel_available = true;
 
         // Mark the change as uncommitted (not parallel eligible)
-        app.changes[0].is_parallel_eligible = false;
+        app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
         app.changes[0].selected = false;
         app.changes[0].display_status_cache = "not queued".to_string();
 
@@ -4201,10 +4383,10 @@ mod tests {
             "Space: unqueue should not be shown for uncommitted changes in parallel mode"
         );
 
-        // Verify that UNCOMMITED badge is shown
+        // Verify that UNCOMMITTED badge is shown
         assert!(
-            content.contains("UNCOMMITED"),
-            "UNCOMMITED badge should be shown"
+            content.contains("UNCOMMITTED"),
+            "UNCOMMITTED badge should be shown"
         );
     }
 
@@ -4232,7 +4414,7 @@ mod tests {
         app.parallel_available = true;
 
         // Mark the change as committed (parallel eligible) - this is the default
-        app.changes[0].is_parallel_eligible = true;
+        app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
         app.changes[0].selected = false;
         app.changes[0].display_status_cache = "not queued".to_string();
 
@@ -4495,7 +4677,7 @@ mod tests {
             error_message_cache: None,
             selected: false,
             is_new: false,
-            is_parallel_eligible: true,
+            parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: false,
             started_at: None,
             elapsed_time: None,

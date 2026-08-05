@@ -13,8 +13,7 @@ tag-name = "v{{version}}"
 tag-message = "Release v{{version}}"
 pre-release-commit-message = "chore(release): release v{{version}}"
 
-[[pre-release-replacements]]
-file = "docs/openapi.yaml"
-search = "  version: .*"
-replace = "  version: {{version}}"
-min = 0
+# No pre-release replacements: the manifest and lockfile are the only
+# release-owned files. The API contract is generated at runtime from
+# src/web/openapi.rs, so there is no version string in a tracked schema to
+# rewrite here.

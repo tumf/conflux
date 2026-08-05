@@ -1,6 +1,6 @@
 [package]
 name = "cflx"
-version = "0.6.236"
+version = "0.6.239"
 edition = "2021"
 default-run = "cflx"
 description = "Conflux – a spec-driven parallel coding orchestrator that runs AI agents on git worktrees"
@@ -30,11 +30,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "cflx"
 path = "src/main.rs"
-
-[[bin]]
-name = "openapi-gen"
-path = "src/bin/openapi_gen.rs"
-required-features = ["web-monitoring"]
 
 [features]
 default = ["web-monitoring"]

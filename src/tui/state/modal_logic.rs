@@ -239,6 +239,7 @@ fn worktree_change_is_active(worktree: &WorktreeInfo, changes: &[ChangeState]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::operator_command::ParallelEligibility;
     use ratatui::style::Color;
 
     fn change(id: &str, status: &str) -> ChangeState {
@@ -253,7 +254,7 @@ mod tests {
             error_message_cache: None,
             selected: false,
             is_new: false,
-            is_parallel_eligible: true,
+            parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: false,
             started_at: None,
             elapsed_time: None,

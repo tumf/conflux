@@ -48,6 +48,7 @@ pub(super) fn next_worktree_cursor_index(current: usize, worktree_len: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::operator_command::ParallelEligibility;
 
     #[test]
     fn detect_active_change_statuses_for_worktree_guard() {
@@ -62,7 +63,7 @@ mod tests {
             error_message_cache: None,
             selected: false,
             is_new: false,
-            is_parallel_eligible: true,
+            parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
@@ -83,7 +84,7 @@ mod tests {
             error_message_cache: None,
             selected: false,
             is_new: false,
-            is_parallel_eligible: true,
+            parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
@@ -109,7 +110,7 @@ mod tests {
             error_message_cache: None,
             selected: false,
             is_new: false,
-            is_parallel_eligible: true,
+            parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: true,
             started_at: None,
             elapsed_time: None,

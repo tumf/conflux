@@ -707,6 +707,41 @@ Register-ArgumentCompleter -Native -CommandName 'cflx' -ScriptBlock {
 # cflx openspec validate/archive -> active. Candidate command: cflx __complete change-ids
 "#;
 
+/// Write the generated `/api/v2` OpenAPI document to stdout and nothing else.
+///
+/// The bytes come from the same function that serves `GET /api/v2/openapi.yaml`,
+/// so `cflx openapi > openapi.yaml` and the live endpoint cannot disagree. A
+/// build without the feature that declares the contract has no complete document
+/// to emit, so it refuses instead of writing a partial one: a truncated schema
+/// would be believed by a generated client.
+fn run_openapi_subcommand() {
+    #[cfg(feature = "web-monitoring")]
+    {
+        use std::io::Write;
+
+        let document = web::openapi::document_yaml();
+        let mut stdout = std::io::stdout();
+        // A closed or full stdout must fail loudly rather than silently emit a
+        // truncated document that still looks like a schema.
+        if let Err(e) = stdout
+            .write_all(document.as_bytes())
+            .and_then(|()| stdout.flush())
+        {
+            eprintln!("Error: failed to write the OpenAPI document to stdout: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    #[cfg(not(feature = "web-monitoring"))]
+    {
+        eprintln!(
+            "Error: OpenAPI support is unavailable in this build. \
+             Rebuild with `--features web-monitoring` to export the /api/v2 schema."
+        );
+        std::process::exit(1);
+    }
+}
+
 fn run_logs_subcommand(args: LogsArgs) {
     let options = log_viewer::LogViewerOptions {
         print_path: args.path,
@@ -749,6 +784,12 @@ async fn main() -> Result<()> {
         // Hidden candidate command intentionally runs before logging/config/orchestration paths.
         Some(Commands::Complete(args)) => {
             run_internal_complete_subcommand(args);
+        }
+
+        // Schema export is a pure read of a compiled-in document, so it runs
+        // before logging/config/orchestration and never needs a repository.
+        Some(Commands::Openapi) => {
+            run_openapi_subcommand();
         }
 
         // No subcommand: launch TUI (default behavior)
