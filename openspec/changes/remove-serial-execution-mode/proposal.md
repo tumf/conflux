@@ -11,6 +11,8 @@ references:
   - openspec/specs/orchestration-state/spec.md
   - openspec/specs/configuration/spec.md
   - openspec/specs/remote-control-api/spec.md
+  - openspec/specs/operator-command-execution/spec.md
+  - openspec/specs/explicit-target-resume/spec.md
   - openspec/specs/parallel-execution/spec.md
   - src/orchestrator.rs
   - src/orchestration/state.rs

@@ -25,3 +25,14 @@
 **Then**: The service selects one target state from eligible rows only
 **And**: It updates eligible marks and Running queue intent atomically
 **And**: It returns changed IDs and stable exclusion reasons
+
+### Requirement: Remote parallel execution discovery
+
+Capabilities and state MUST expose maximum concurrency, VCS backend, and per-change worktree eligibility with machine-readable blocked reasons. They MUST NOT expose an active execution-mode dimension or distinguish serial from parallel modes.
+
+#### Scenario: Client discovers worktree execution state
+
+**Given**: A single cflx process has web monitoring enabled
+**When**: A client reads capabilities and state
+**Then**: It can read concurrency, VCS, and eligibility without an execution-mode field
+**And**: It can explain why each non-final change is or is not eligible without inspecting Git itself

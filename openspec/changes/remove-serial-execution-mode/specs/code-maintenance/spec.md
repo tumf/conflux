@@ -66,3 +66,21 @@ The system SHALL manage repeated apply commands through the common apply loop us
 - **WHEN** CLIまたはTUI固有の出力やイベント送信を実装する
 - **THEN** 共有関数は実行フローのみを扱う
 - **AND** 出力と表示の責務はfrontend adapterへ分離される
+
+### Requirement: Obsolete selection implementation is not retained as an active module
+
+到達不能な旧change selection実装と`SerialRunService`はactive orchestration moduleとして保持してはならない。削除後もcumulative worktree analyzerとorder-based dispatchのselection contractを変更してはならない。
+
+#### Scenario: Removed selection modules have no remaining references
+
+**Given**: 旧serial selection moduleと`SerialRunService`がproduction executionから到達不能である
+**When**: module、module登録、constructor、adapterを削除する
+**Then**: all-feature compilationは成功する
+**And**: orphaned import、module declaration、dead-code suppressionは残らない
+
+#### Scenario: Worktree selection remains unchanged
+
+**Given**: cumulative worktree executionがmetadata dependenciesまたはLLM analysisでorderを決定する
+**When**: 旧serial selection経路が削除される
+**Then**: analyzerとorder-based dispatchの実装は変更されない
+**And**: execution-mode選択を除くselection結果は削除前と同等である
