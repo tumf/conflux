@@ -38,10 +38,36 @@ enum DeleteWorktreeTestOutcome {
 #[cfg(test)]
 #[derive(Clone, Debug)]
 struct DeleteWorktreeTestState {
+    /// Branch `observe()` reports for this path.
+    ///
+    /// Per-path rather than fixed so a test that scripts a *branch*-keyed
+    /// outcome can claim a name of its own instead of one every other
+    /// concurrently running test also observes.
+    branch: String,
     /// Dirty state `observe()` reports for this path.
     dirty: crate::worktree_ops::service::DirtyState,
+    /// Commits-ahead state `observe()` reports for this path.
+    has_commits_ahead: crate::worktree_ops::service::SafetyFact,
     /// What `remove_worktree()` replays.
     removal: DeleteWorktreeTestOutcome,
+}
+
+/// Branches whose deletion fails, keyed by branch name.
+///
+/// Separate from [`DELETE_WORKTREE_TEST_OUTCOMES`] because branch cleanup runs
+/// *after* `remove_worktree` has already retired the worktree's entry — which is
+/// the whole state the partial-success path exists to describe.
+#[cfg(test)]
+static DELETE_BRANCH_TEST_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn set_delete_branch_test_failure(branch: &str, message: &str) {
+    DELETE_BRANCH_TEST_FAILURES
+        .lock()
+        .expect("delete branch test failures lock")
+        .insert(branch.to_string(), message.to_string());
 }
 
 #[cfg(test)]
@@ -57,24 +83,54 @@ fn set_delete_worktree_test_outcome(path: PathBuf, outcome: DeleteWorktreeTestOu
         .insert(
             path,
             DeleteWorktreeTestState {
-                dirty: crate::worktree_ops::service::DirtyState::Clean,
                 removal: outcome,
+                ..delete_worktree_test_state()
             },
         );
 }
 
+/// A registered worktree that is observable, clean, at base, and removable.
+#[cfg(test)]
+fn delete_worktree_test_state() -> DeleteWorktreeTestState {
+    DeleteWorktreeTestState {
+        branch: "feature-a".to_string(),
+        dirty: crate::worktree_ops::service::DirtyState::Clean,
+        has_commits_ahead: crate::worktree_ops::service::SafetyFact::No,
+        removal: DeleteWorktreeTestOutcome::Success,
+    }
+}
+
+#[cfg(test)]
+fn set_delete_worktree_test_branch(path: PathBuf, branch: &str) {
+    DELETE_WORKTREE_TEST_OUTCOMES
+        .lock()
+        .expect("delete worktree test outcomes lock")
+        .entry(path)
+        .or_insert_with(delete_worktree_test_state)
+        .branch = branch.to_string();
+}
+
 #[cfg(test)]
 fn set_delete_worktree_test_dirty(path: PathBuf, dirty: crate::worktree_ops::service::DirtyState) {
-    let mut outcomes = DELETE_WORKTREE_TEST_OUTCOMES
+    DELETE_WORKTREE_TEST_OUTCOMES
         .lock()
-        .expect("delete worktree test outcomes lock");
-    let entry = outcomes
+        .expect("delete worktree test outcomes lock")
         .entry(path)
-        .or_insert_with(|| DeleteWorktreeTestState {
-            dirty,
-            removal: DeleteWorktreeTestOutcome::Success,
-        });
-    entry.dirty = dirty;
+        .or_insert_with(delete_worktree_test_state)
+        .dirty = dirty;
+}
+
+#[cfg(test)]
+fn set_delete_worktree_test_ahead(
+    path: PathBuf,
+    has_commits_ahead: crate::worktree_ops::service::SafetyFact,
+) {
+    DELETE_WORKTREE_TEST_OUTCOMES
+        .lock()
+        .expect("delete worktree test outcomes lock")
+        .entry(path)
+        .or_insert_with(delete_worktree_test_state)
+        .has_commits_ahead = has_commits_ahead;
 }
 
 use super::worktrees::load_worktrees_with_conflict_check;
@@ -292,7 +348,9 @@ async fn handle_delete_worktree_command(intent: DeleteIntent, ctx: &mut TuiComma
         expected = expected.with_head(head);
     }
 
-    let options = if intent.allow_known_dirty {
+    let options = if intent.allow_commits_ahead {
+        DeleteOptions::local_discarding_ahead(intent.skip_teardown, intent.allow_known_dirty)
+    } else if intent.allow_known_dirty {
         DeleteOptions::local_discarding_dirty(intent.skip_teardown)
     } else {
         DeleteOptions::local(intent.skip_teardown)
@@ -305,6 +363,21 @@ async fn handle_delete_worktree_command(intent: DeleteIntent, ctx: &mut TuiComma
     ctx.app.clear_worktree_deleting(&intent.path);
 
     match delete_result {
+        // The worktree is gone but its branch is not. That is a success with a
+        // resource still outstanding, not a plain success: reporting it as one
+        // would leave the operator believing a branch they still own was cleaned
+        // up.
+        Ok(outcome) if outcome.branch_retained => {
+            warn!(
+                "Worktree deleted but its branch was retained: {}",
+                intent.path.display()
+            );
+            ctx.app.add_log(LogEntry::warn(format!(
+                "Partially deleted worktree: {} ({})",
+                intent.path.display(),
+                outcome.detail
+            )));
+        }
         Ok(outcome) => {
             info!("Worktree deleted successfully: {}", intent.path.display());
             ctx.app.add_log(LogEntry::success(format!(
@@ -321,6 +394,12 @@ async fn handle_delete_worktree_command(intent: DeleteIntent, ctx: &mut TuiComma
         Err(WorktreeOpError::Dirty { target, .. }) if !intent.allow_known_dirty => {
             ctx.app
                 .open_dirty_discard_confirmation(&target, intent.skip_teardown);
+        }
+        // The second escalation, on the same terms: a known-ahead refusal opens
+        // the confirmation that names the branch and its unmerged commits.
+        Err(WorktreeOpError::CommitsAhead { target, .. }) if !intent.allow_commits_ahead => {
+            ctx.app
+                .open_ahead_discard_confirmation(&target, intent.skip_teardown);
         }
         Err(e) => {
             ctx.app.show_warning_popup(
@@ -691,6 +770,18 @@ mod tests {
     /// HEAD every stub-observed worktree reports.
     pub(super) const STUB_HEAD: &str = "stubhead00000000";
 
+    /// Replay whatever [`set_delete_branch_test_failure`] scripted for a branch.
+    fn scripted_branch_failure(branch: &str) -> WorktreeOpResult<()> {
+        match DELETE_BRANCH_TEST_FAILURES
+            .lock()
+            .expect("delete branch test failures lock")
+            .get(branch)
+        {
+            Some(message) => Err(WorktreeOpError::Internal(message.clone())),
+            None => Ok(()),
+        }
+    }
+
     /// Backend the TUI command handlers are unit-tested against.
     ///
     /// Every worktree registered through [`set_delete_worktree_test_outcome`] is
@@ -707,10 +798,11 @@ mod tests {
                 .expect("delete worktree test outcomes lock")
                 .iter()
                 .map(|(path, state)| {
-                    let mut facts = WorktreeFacts::new(path.clone(), "feature-a");
+                    let mut facts = WorktreeFacts::new(path.clone(), state.branch.clone());
                     facts.identity = format!("gitdir: {}/.git", path.display());
                     facts.head = STUB_HEAD.to_string();
                     facts.dirty = state.dirty;
+                    facts.has_commits_ahead = state.has_commits_ahead;
                     facts
                 })
                 .collect())
@@ -752,8 +844,20 @@ mod tests {
             Ok(Some(STUB_HEAD.to_string()))
         }
 
-        async fn delete_branch_if_merged(&self, _branch: &str) -> WorktreeOpResult<()> {
-            Ok(())
+        async fn delete_branch_if_merged(&self, branch: &str) -> WorktreeOpResult<()> {
+            scripted_branch_failure(branch)
+        }
+
+        async fn delete_branch_at(&self, branch: &str, expected_oid: &str) -> WorktreeOpResult<()> {
+            // The real backend compares inside the ref transaction; the stub
+            // makes the same comparison explicit so a test handing over the
+            // wrong OID sees the branch survive for the right reason.
+            if expected_oid != STUB_HEAD {
+                return Err(WorktreeOpError::Internal(format!(
+                    "stubbed ref mismatch: expected {STUB_HEAD}, got {expected_oid}"
+                )));
+            }
+            scripted_branch_failure(branch)
         }
 
         async fn merge_into_base(
@@ -1121,6 +1225,7 @@ mod tests {
                     head: Some(STUB_HEAD.to_string()),
                     skip_teardown: false,
                     allow_known_dirty: true,
+                    allow_commits_ahead: false,
                 }),
             )
             .await;
@@ -1178,6 +1283,222 @@ mod tests {
             .logs
             .iter()
             .any(|entry| entry.message.contains("Worktree delete failed")));
+        assert!(
+            DELETE_WORKTREE_TEST_OUTCOMES
+                .lock()
+                .expect("delete worktree test outcomes lock")
+                .contains_key(&path),
+            "a refused delete must never reach the backend removal"
+        );
+    }
+
+    // ── Explicit ahead discard ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_escalates_the_services_refusal_into_a_confirmation() {
+        for (name, dirty, expect_dirty) in [
+            (
+                "clean",
+                crate::worktree_ops::service::DirtyState::Clean,
+                false,
+            ),
+            (
+                "dirty",
+                crate::worktree_ops::service::DirtyState::Dirty,
+                true,
+            ),
+        ] {
+            for skip_teardown in [false, true] {
+                let harness = AdapterHarness::new(&["change-a"]);
+                let mut app = harness.app(&["change-a"]);
+                let path = PathBuf::from(format!("/tmp/worktree-ahead-{name}-{skip_teardown}"));
+                set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+                set_delete_worktree_test_dirty(path.clone(), dirty);
+                set_delete_worktree_test_ahead(
+                    path.clone(),
+                    crate::worktree_ops::service::SafetyFact::Yes,
+                );
+                app.worktrees = vec![create_test_worktree(path.to_str().unwrap())];
+                app.mark_worktree_deleting(path.clone());
+
+                harness
+                    .run(
+                        &mut app,
+                        TuiCommand::DeleteWorktree(DeleteIntent::ordinary(
+                            path.clone(),
+                            "feature-a".to_string(),
+                            skip_teardown,
+                        )),
+                    )
+                    .await;
+
+                assert!(
+                    app.warning_popup.is_none(),
+                    "{name}: an ahead refusal must not be reported as a delete failure"
+                );
+                assert_eq!(
+                    app.modal,
+                    Some(crate::tui::types::ModalState::ConfirmAheadDiscard {
+                        path: path.clone(),
+                        identity: format!("gitdir: {}/.git", path.display()),
+                        branch: "feature-a".to_string(),
+                        head: STUB_HEAD.to_string(),
+                        dirty: expect_dirty,
+                        skip_teardown,
+                    }),
+                    "{name}: the confirmation must carry the service's own observation"
+                );
+                assert!(
+                    DELETE_WORKTREE_TEST_OUTCOMES
+                        .lock()
+                        .expect("delete worktree test outcomes lock")
+                        .contains_key(&path),
+                    "{name}: a refused delete must never reach the backend removal"
+                );
+                assert!(!app.is_worktree_deleting(&path));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_removes_worktree_and_branch_once_discard_is_granted() {
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        let path = PathBuf::from("/tmp/worktree-ahead-confirmed");
+        set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+        set_delete_worktree_test_dirty(
+            path.clone(),
+            crate::worktree_ops::service::DirtyState::Dirty,
+        );
+        set_delete_worktree_test_ahead(path.clone(), crate::worktree_ops::service::SafetyFact::Yes);
+        app.worktrees = vec![create_test_worktree(path.to_str().unwrap())];
+        app.mark_worktree_deleting(path.clone());
+
+        harness
+            .run(
+                &mut app,
+                TuiCommand::DeleteWorktree(DeleteIntent {
+                    path: path.clone(),
+                    branch: "feature-a".to_string(),
+                    identity: Some(format!("gitdir: {}/.git", path.display())),
+                    head: Some(STUB_HEAD.to_string()),
+                    skip_teardown: false,
+                    // Both permissions, from the one confirmation that named
+                    // both losses.
+                    allow_known_dirty: true,
+                    allow_commits_ahead: true,
+                }),
+            )
+            .await;
+
+        assert!(
+            app.modal.is_none(),
+            "a granted discard must not re-escalate"
+        );
+        assert!(!app.is_worktree_deleting(&path));
+        assert!(
+            !DELETE_WORKTREE_TEST_OUTCOMES
+                .lock()
+                .expect("delete worktree test outcomes lock")
+                .contains_key(&path),
+            "the removal must actually have reached the backend"
+        );
+        assert!(
+            app.logs
+                .iter()
+                .any(|entry| entry.message.contains("unmerged commits were deleted")),
+            "the branch deletion must be reported: {:?}",
+            app.logs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_reports_a_retained_branch_as_partial_success() {
+        // The branch ref can still move in the window between the pre-removal
+        // confirmation and the compare-and-delete. The worktree is gone by then
+        // and is not reconstructed, so the operator has to be told plainly that
+        // a branch they still own survived.
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        let path = PathBuf::from("/tmp/worktree-ahead-ref-drift");
+        let branch = "feature-ahead-drift";
+        set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+        set_delete_worktree_test_branch(path.clone(), branch);
+        set_delete_worktree_test_ahead(path.clone(), crate::worktree_ops::service::SafetyFact::Yes);
+        set_delete_branch_test_failure(branch, "update-ref: reference already exists");
+        app.worktrees = vec![create_test_worktree(path.to_str().unwrap())];
+        app.mark_worktree_deleting(path.clone());
+
+        harness
+            .run(
+                &mut app,
+                TuiCommand::DeleteWorktree(DeleteIntent {
+                    path: path.clone(),
+                    branch: branch.to_string(),
+                    identity: Some(format!("gitdir: {}/.git", path.display())),
+                    head: Some(STUB_HEAD.to_string()),
+                    skip_teardown: false,
+                    allow_known_dirty: false,
+                    allow_commits_ahead: true,
+                }),
+            )
+            .await;
+
+        // Removal and branch deletion are distinct outcomes: the worktree is
+        // gone even though the branch survived.
+        assert!(
+            !DELETE_WORKTREE_TEST_OUTCOMES
+                .lock()
+                .expect("delete worktree test outcomes lock")
+                .contains_key(&path),
+            "the worktree removal itself must still have happened"
+        );
+        assert!(
+            app.warning_popup.is_none(),
+            "a partial success is not a failed delete"
+        );
+        assert!(
+            app.logs
+                .iter()
+                .any(|entry| entry.message.contains("Partially deleted worktree")
+                    && entry.message.contains("was retained")),
+            "the retained branch must be reported, not folded into a success: {:?}",
+            app.logs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(!app.is_worktree_deleting(&path));
+    }
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_reports_unwaivable_refusals_as_failures() {
+        // An unobservable ahead state carries no confirmable evidence, so it is
+        // a refusal to read rather than a confirmation to press through.
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        let path = PathBuf::from("/tmp/worktree-unknown-ahead");
+        set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+        set_delete_worktree_test_ahead(
+            path.clone(),
+            crate::worktree_ops::service::SafetyFact::Unknown,
+        );
+        app.worktrees = vec![create_test_worktree(path.to_str().unwrap())];
+        app.mark_worktree_deleting(path.clone());
+
+        harness
+            .run(
+                &mut app,
+                TuiCommand::DeleteWorktree(DeleteIntent::ordinary(
+                    path.clone(),
+                    "feature-a".to_string(),
+                    false,
+                )),
+            )
+            .await;
+
+        assert!(
+            app.modal.is_none(),
+            "an unobservable ahead state must never offer a discard confirmation"
+        );
+        assert!(app.warning_popup.is_some());
         assert!(
             DELETE_WORKTREE_TEST_OUTCOMES
                 .lock()

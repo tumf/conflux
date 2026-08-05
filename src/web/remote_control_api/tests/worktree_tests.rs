@@ -805,6 +805,13 @@ async fn remote_worktree_adapters_share_one_service_implementation() {
             self.calls.lock().unwrap().push("delete_branch".to_string());
             Ok(())
         }
+        async fn delete_branch_at(&self, _branch: &str, _oid: &str) -> WorktreeOpResult<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("delete_branch_at".to_string());
+            Ok(())
+        }
         async fn merge_into_base(
             &self,
             _branch: &str,
@@ -1082,6 +1089,13 @@ async fn remote_worktree_dirty_discard_is_never_granted_by_the_remote_port() {
                 .push("delete_branch".to_string());
             Ok(())
         }
+        async fn delete_branch_at(&self, _branch: &str, _oid: &str) -> WorktreeOpResult<()> {
+            self.removals
+                .lock()
+                .unwrap()
+                .push("delete_branch_at".to_string());
+            Ok(())
+        }
         async fn merge_into_base(
             &self,
             _branch: &str,
@@ -1156,6 +1170,8 @@ fn remote_worktree_dirty_discard_capabilities_advertise_no_bypass() {
         "dirty_discard",
         "allow_dirty",
         "allow_known_dirty",
+        "allow_commits_ahead",
+        "ahead_discard",
         "force",
         "discard",
     ] {
@@ -1164,4 +1180,236 @@ fn remote_worktree_dirty_discard_capabilities_advertise_no_bypass() {
             "worktree capabilities must not advertise '{forbidden}': {json}"
         );
     }
+}
+
+// ============================================================================
+// Explicit ahead discard is a local-only permission
+// ============================================================================
+
+/// A worktree ahead of base, at an absolute path outside the repository root.
+fn ahead_facts(path: &str, branch: &str) -> WorktreeFacts {
+    let mut facts = facts(path, branch);
+    facts.has_commits_ahead = crate::worktree_ops::service::SafetyFact::Yes;
+    facts
+}
+
+#[test]
+fn remote_worktree_ahead_refusal_maps_onto_the_existing_ineligible_class() {
+    // The refusal became typed so the *local* TUI could escalate it. Remotely it
+    // must look exactly as it did before: one more ineligible target, not a new
+    // error code hinting at an override that does not exist.
+    let failure = map_worktree_error(&WorktreeOpError::CommitsAhead {
+        message: "the worktree has unmerged commits ahead of base".to_string(),
+        target: Box::new(crate::worktree_ops::service::AheadTarget::from_facts(
+            &ahead_facts("/srv/workspaces/change-a", "change-a"),
+        )),
+    });
+
+    assert_eq!(failure.error_code, ErrorCode::TargetIneligible);
+    assert!(
+        !failure.message.contains("/srv/"),
+        "a v2 failure message must not carry an absolute path: {}",
+        failure.message
+    );
+}
+
+#[test]
+fn remote_worktree_ahead_projection_stays_undeletable_without_leaking_its_path() {
+    let resource = WorktreeResource::project(
+        "id-a".to_string(),
+        repository_correlation_id(Path::new(REPO)),
+        Path::new(REPO),
+        &ahead_facts("/srv/workspaces/change-a", "change-a"),
+    );
+
+    assert!(resource.has_commits_ahead);
+    assert!(
+        !resource.operations.deletable,
+        "an ahead worktree stays undeletable for remote clients"
+    );
+    let reason = resource
+        .operations
+        .delete_blocked_reason
+        .expect("an undeletable worktree must say why");
+    assert!(
+        reason.contains("unmerged commits ahead of base"),
+        "the reason must name the actual blocker: {reason}"
+    );
+    // The typed refusal now carries a freshly observed absolute path. That
+    // payload exists for the local confirmation, and it must not ride along into
+    // a server-provided reason string.
+    for leaked in ["/srv/workspaces", "/srv/repo", "change-a/.git"] {
+        assert!(
+            !reason.contains(leaked),
+            "the blocked reason must not disclose '{leaked}': {reason}"
+        );
+    }
+}
+
+#[test]
+fn remote_worktree_ahead_discard_command_shapes_are_rejected_wholesale() {
+    // The same closed-schema property the dirty escalation relies on, for every
+    // name a client might reach for to ask for the new local permission.
+    let smuggled = [
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"allow_commits_ahead":true}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"ahead_discard":true}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"allow_ahead":true}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a"},"params":{"delete_branch":true}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a","allow_commits_ahead":true},"params":{}}"#,
+        r#"{"type":"delete_worktree","target":{"worktree_id":"a","head":"0123456789abcdef"},"params":{}}"#,
+        r#"{"type":"discard_worktree_commits","target":{"worktree_id":"a"},"params":{}}"#,
+        r#"{"type":"delete_worktree_and_branch","target":{"worktree_id":"a"},"params":{}}"#,
+    ];
+
+    for body in smuggled {
+        assert!(
+            serde_json::from_str::<CommandSpec>(body).is_err(),
+            "a remote ahead-discard request must fail typed validation: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn remote_worktree_ahead_discard_request_is_a_422_with_no_delegation() {
+    for params in [
+        r#"{"allow_commits_ahead":true}"#,
+        r#"{"ahead_discard":true}"#,
+        r#"{"allow_ahead":true}"#,
+        r#"{"delete_branch":true}"#,
+    ] {
+        let harness = harness(Some(TOKEN), &[]);
+        let body = command_body(
+            &format!(
+                r#"{{"type":"delete_worktree","target":{{"worktree_id":"id-a"}},"params":{params}}}"#
+            ),
+            0,
+            "k1",
+        );
+
+        let (status, _json) = status_and_json(
+            send(
+                &harness.router,
+                post_json("/api/v2/commands", Some(TOKEN), &body),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "params {params} must be refused as a schema violation"
+        );
+        assert!(
+            harness.worktrees.deletes().is_empty(),
+            "params {params} must not reach the worktree service at all"
+        );
+    }
+}
+
+#[tokio::test]
+async fn remote_worktree_ahead_discard_is_never_granted_by_the_remote_port() {
+    use crate::worktree_ops::service::{
+        ConflictPolicy, MergeAttempt, WorktreeBackend, WorktreeEventSink, WorktreeOpResult,
+        WorktreeOperationEvent, WorktreeService,
+    };
+
+    /// A backend whose only worktree is ahead of base and also dirty.
+    ///
+    /// Both destructive permissions would be needed to get through, and the
+    /// remote port can express neither. Every mutating call is recorded so
+    /// "no delegation" is proved rather than assumed.
+    #[derive(Default)]
+    struct AheadBackend {
+        mutations: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl WorktreeBackend for AheadBackend {
+        async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
+            let mut wt = ahead_facts("/srv/workspaces/change-a", "change-a");
+            wt.dirty = DirtyState::Dirty;
+            Ok(vec![wt])
+        }
+        async fn base_head(&self) -> WorktreeOpResult<String> {
+            Ok("head".to_string())
+        }
+        async fn create(&self, _p: &Path, _b: &str, _c: &str) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+        async fn teardown(&self, _path: &Path) -> WorktreeOpResult<()> {
+            self.mutations.lock().unwrap().push("teardown".to_string());
+            Ok(())
+        }
+        async fn remove_worktree(&self, _path: &Path) -> WorktreeOpResult<()> {
+            self.mutations.lock().unwrap().push("remove".to_string());
+            Ok(())
+        }
+        async fn branch_ref(&self, _branch: &str) -> WorktreeOpResult<Option<String>> {
+            Ok(Some("0123456789abcdef".to_string()))
+        }
+        async fn delete_branch_if_merged(&self, _branch: &str) -> WorktreeOpResult<()> {
+            self.mutations
+                .lock()
+                .unwrap()
+                .push("delete_branch".to_string());
+            Ok(())
+        }
+        async fn delete_branch_at(&self, _branch: &str, _oid: &str) -> WorktreeOpResult<()> {
+            self.mutations
+                .lock()
+                .unwrap()
+                .push("delete_branch_at".to_string());
+            Ok(())
+        }
+        async fn merge_into_base(
+            &self,
+            _branch: &str,
+            _policy: ConflictPolicy,
+        ) -> WorktreeOpResult<MergeAttempt> {
+            Ok(MergeAttempt::Merged)
+        }
+        async fn run_on_merged(&self, _c: &str, _p: &Path) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+        async fn change_is_eligible(&self, _change_id: &str) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+    }
+
+    struct NullSink;
+
+    #[async_trait]
+    impl WorktreeEventSink for NullSink {
+        async fn emit(&self, _event: WorktreeOperationEvent) {}
+    }
+
+    let backend = Arc::new(AheadBackend::default());
+    let service = Arc::new(WorktreeService::new(
+        backend.clone(),
+        Arc::new(NullSink),
+        PathBuf::from("/srv/workspaces"),
+    ));
+    let port = crate::web::remote_control_api::worktrees::RemoteWorktreeOperations::new(
+        service,
+        Arc::new(WorktreeRegistry::new()),
+        PathBuf::from(REPO),
+    );
+
+    let listing = port.list().await.expect("listed");
+    let worktree_id = listing.worktrees[0].worktree_id.clone();
+    assert!(listing.worktrees[0].has_commits_ahead);
+    assert!(!listing.worktrees[0].operations.deletable);
+
+    let failure = port
+        .delete(&worktree_id)
+        .await
+        .expect_err("an ahead worktree must refuse remote deletion");
+    assert_eq!(failure.error_code, ErrorCode::TargetIneligible);
+
+    assert!(
+        backend.mutations.lock().unwrap().is_empty(),
+        "a remote delete must not delegate teardown, removal, or branch deletion: {:?}",
+        backend.mutations.lock().unwrap()
+    );
 }

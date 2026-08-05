@@ -442,7 +442,13 @@ pub fn map_worktree_error(error: &WorktreeOpError) -> CommandFailure {
         WorktreeOpError::Exists(_) => ErrorCode::WorktreeExists,
         WorktreeOpError::Dirty { .. } => ErrorCode::WorktreeDirty,
         WorktreeOpError::DirtyUnknown(_) => ErrorCode::WorktreeDirtyUnknown,
-        WorktreeOpError::Ineligible(_) => ErrorCode::TargetIneligible,
+        // Deliberately the same code an ahead worktree already produced before
+        // the refusal became typed. The type exists so the *local* TUI can open
+        // a confirmation; a remote client has no such path, and a new code would
+        // advertise one.
+        WorktreeOpError::CommitsAhead { .. } | WorktreeOpError::Ineligible(_) => {
+            ErrorCode::TargetIneligible
+        }
         WorktreeOpError::RootBusy(_) => ErrorCode::RootBusy,
         WorktreeOpError::MergeConflict { .. } => ErrorCode::MergeConflict,
         WorktreeOpError::Internal(_) => ErrorCode::InternalError,

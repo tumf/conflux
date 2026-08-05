@@ -98,6 +98,50 @@ cflx run
 cflx run --no-resume
 ```
 
+## Deleting a Worktree from the TUI
+
+`Tab` switches to the Worktrees view; `D` opens the delete confirmation for the
+worktree under the cursor. A worktree with no branch to name — a detached
+HEAD — cannot be confirmed against anything later and is refused up front.
+
+**Ordinary deletion.** `Y` runs `.wt/teardown` and then removes the worktree;
+`S` skips teardown and removes it. Both delete the directory including generated
+and ignored contents. Neither grants permission to destroy work: if the shared
+service observes uncommitted changes or commits ahead of base, it refuses and
+the TUI opens a second confirmation instead of deleting.
+
+**Discarding uncommitted changes.** The `Discard Uncommitted Changes`
+confirmation names the branch, the path, and the teardown choice already made.
+Only uppercase `X` proceeds — `Y`, `S`, and lowercase `x` are inert — and `N` or
+`Esc` keeps everything. Tracked, staged, and reported untracked files are lost;
+nothing is stashed, committed, or backed up.
+
+**Discarding unmerged commits.** The `Discard Unmerged Commits` confirmation
+appears when the branch carries commits base does not have. It names the path,
+the branch, the exact commit the deletion is authorized from, and the teardown
+choice. Uppercase `X` deletes the worktree *and* force-deletes the local branch;
+the commits become unreachable and are not recoverable. Nothing is merged,
+pushed, tagged, stashed, or backed up first.
+
+**When both apply.** A worktree that is dirty *and* ahead gets one confirmation
+that states both losses, and the single `X` authorizes both. There is no way to
+grant one from a confirmation that named only the other, and skipping teardown
+stays a separate decision from either.
+
+**Partial results.** Removing the worktree and deleting the branch are distinct
+outcomes. The branch is deleted only if its ref still points at the confirmed
+commit, through an atomic compare-and-delete. If the ref moved or could not be
+deleted, the worktree is still gone, the branch is kept, and the log says
+`Partially deleted worktree: … was retained because …`. Every safety fact is
+re-observed after teardown and immediately before removal; anything that changed
+or could not be determined refuses and leaves both the worktree and the branch
+in place.
+
+**Remote clients cannot do any of this.** `/api/v2` and the Web UI are
+fail-closed: teardown is mandatory, and a dirty or ahead worktree is reported as
+undeletable with a reason. There is no force flag, no discard parameter, and no
+remote equivalent of the `X` confirmation.
+
 ## Web Monitoring
 
 Enable the web monitoring server alongside the TUI or headless run:

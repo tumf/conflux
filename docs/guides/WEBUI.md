@@ -127,6 +127,21 @@ or `/ws` surface.
 See [USAGE.md](USAGE.md#remote-control-api-apiv2) for authentication, revisions,
 and idempotency.
 
+### Worktree deletion is fail-closed here
+
+`delete_worktree` always runs managed teardown and refuses any worktree that has
+uncommitted changes, has commits ahead of base, or whose safety state could not
+be observed. Such a worktree is listed with `operations.deletable: false` and a
+`delete_blocked_reason`, and the reason never discloses an absolute path.
+
+The command object accepts no parameters at all: `force`, `skip_teardown`,
+`allow_known_dirty`, `allow_commits_ahead`, `path`, and `branch` are schema
+violations (HTTP 422) rather than ignored fields, and no request ever reaches the
+service. Discarding uncommitted changes or unmerged commits is a local decision
+taken at the TUI's uppercase-`X` confirmation — see
+[USAGE.md](USAGE.md#deleting-a-worktree-from-the-tui). Neither this API nor the
+operator console exposes an equivalent.
+
 For complete API details, see [../openapi.yaml](../openapi.yaml).
 
 ### The state resource is authoritative

@@ -134,15 +134,18 @@ pub(crate) fn evaluate_worktree_delete(
     Ok(())
 }
 
-/// Whether a dirty-discard confirmation still targets the worktree it was opened over.
+/// Whether a destructive discard confirmation still targets the worktree it was
+/// opened over.
 ///
 /// This is the ordinary delete policy plus one more anchor: the destructive
 /// confirmation was escalated from a specific observed commit, so a target that
 /// moved its HEAD in the meantime is no longer the thing the operator agreed to
-/// discard. The check is necessary but not sufficient — the shared service
-/// revalidates the same identity under its own mutation guard, where an
-/// active-state transition after this point is still visible.
-pub(crate) fn evaluate_dirty_discard(
+/// discard. That anchor matters even more for an ahead discard, where the
+/// confirmed commit is also the OID the branch is deleted at. The check is
+/// necessary but not sufficient — the shared service revalidates the same
+/// identity under its own mutation guard, where an active-state transition after
+/// this point is still visible.
+pub(crate) fn evaluate_discard(
     path: &Path,
     branch: &str,
     head: &str,
@@ -207,7 +210,10 @@ pub(crate) fn evaluate(
         }
         ModalState::ConfirmDirtyDiscard {
             path, branch, head, ..
-        } => evaluate_dirty_discard(path, branch, head, ctx),
+        }
+        | ModalState::ConfirmAheadDiscard {
+            path, branch, head, ..
+        } => evaluate_discard(path, branch, head, ctx),
         ModalState::ConfirmForceKill { change_id } => evaluate_force_kill(change_id, ctx),
     }
 }
