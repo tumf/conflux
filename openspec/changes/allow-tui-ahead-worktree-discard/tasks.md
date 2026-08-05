@@ -19,9 +19,9 @@ Status of those gates on this branch:
 
 - `cargo fmt` — applied; tree is formatted.
 - `cargo clippy --all-targets --all-features -- -D warnings` — passes with exit code 0.
-- `cargo test --all-features` — 3362 passed, 6 failed, 7 ignored. Every test added by this change passes. Of the 6 failures, `serial_run_service::tests::serial_restart_reruns_acceptance_after_missing_verdict_exhaustion` passes in isolation (it fails only under parallel execution, with `Unable to read current working directory` — cross-test working-directory pollution), and the remaining 5 are the pre-existing `parallel::tests::executor::test_merge_*` cases described under "Pre-existing failures" below.
+- `cargo test --all-features` — 3362 passed, 6 failed, 7 ignored. Every test added by this change passes. Of the 6 failures, `serial_run_service::tests::serial_restart_reruns_acceptance_after_missing_verdict_exhaustion` passes in isolation (it fails only under parallel execution, with `Unable to read current working directory` — cross-test working-directory pollution), and the remaining 5 are the pre-existing `parallel::tests::executor::test_merge_*` cases described under "Notes: Pre-existing failures" below.
 
-## Pre-existing failures
+## Notes: Pre-existing failures
 
 The 5 `parallel::tests::executor::test_merge_*` failures are pre-existing on this branch and are not caused by this change. This was confirmed by reproduction on a clean baseline rather than by inspection: a detached worktree was created at this branch's HEAD (`e08431b3`), which contains none of this change's work, and built against its own target directory. `cargo test --all-features --lib -- --test-threads=1 parallel::tests::executor::test_merge` there produced `4 passed; 5 failed` with exactly the same five test names and the same underlying errors:
 
