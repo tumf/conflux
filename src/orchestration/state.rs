@@ -4151,9 +4151,12 @@ mod tests {
     fn startup_refresh_does_not_regress_stronger_reducer_state_to_merge_wait() {
         use crate::events::ExecutionEvent;
 
+        // Drives a fresh state through the reducer transitions a case needs.
+        type CaseSetup = Box<dyn Fn(&mut OrchestratorState)>;
+
         // Each case is set up through the same reducer transitions production uses,
         // then re-observed with the change still reported as archived-but-not-merged.
-        let cases: Vec<(&str, &str, Box<dyn Fn(&mut OrchestratorState)>)> = vec![
+        let cases: Vec<(&str, &str, CaseSetup)> = vec![
             (
                 "resolving",
                 "resolving",
