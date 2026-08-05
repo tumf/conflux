@@ -1,0 +1,67 @@
+## Implementation Tasks
+
+- [x] Update `skills/cflx-proposal/SKILL.md` to inspect tracked hook configuration before omitting repository-wide verification tasks, delegate only unconditional amend-safe hook checks, and keep requirement-specific plus heavy/E2E verification ownership explicit (verification: integration - inspect skill fixtures or tests that assert hook-owned checks are excluded only when tracked unconditional hook evidence exists; runnable command: `cargo test --lib`; verification-id: apply-finalization-tests)
+- [x] Update `skills/cflx-apply/SKILL.md` so Apply agents explicitly stage only change-owned files, never create the final commit, rescope the existing `COMMIT WHEN INSTRUCTED` rule so it cannot authorize final Apply commit ownership, require zero unstaged/untracked entries before completion, and wait for foreground verification commands instead of returning with background work active (verification: integration - skill contract tests or repository assertions cover stage ownership, commit prohibition, clean completion, and foreground waiting; runnable command: `cargo test --lib`; verification-id: apply-finalization-tests)
+- [x] Add bounded workspace-stage classification and `incomplete_stage` feedback in `src/execution/apply.rs` before every task-complete final-commit entry point, including loop-entry/resume short circuits; retain complete status evidence in persistent logs and leave failed-gate workspace/index state untouched without creating a WIP snapshot (verification: unit - Rust tests cover clean, unstaged, untracked, bounded-path, repair, and existing WIP recovery paths; runnable command: `cargo test --lib`; verification-id: apply-finalization-tests)
+- [x] Record `empty_apply_iteration` orchestration feedback for eligible successful iterations with no task or workspace progress, reuse existing ApplyHistory tails, and retain current stall, escalation, handoff, denial, blocker, and rejection behavior (verification: unit - Rust Apply loop tests distinguish eligible empty iterations from excluded outcomes and prove stall counters remain authoritative; runnable command: `cargo test --lib`; verification-id: apply-finalization-tests)
+- [x] Add post-commit workspace cleanliness enforcement and Applied-state resume routing so a hook that exits successfully but leaves changes returns to `incomplete_stage` Apply repair before Acceptance, including restart derivation from workspace cleanliness (verification: integration - final commit tests simulate an exit-zero mutating hook and prove Acceptance remains undispatched until the workspace is repaired and recommitted; runnable command: `cargo test --lib`; verification-id: apply-finalization-tests)
+- [x] Add an ephemeral Apply commit subphase event and reducer projection without changing the canonical `applying` lifecycle or restart routing (verification: unit - execution event and reducer tests cover Started, Completed, Failed, ApplyStarted reset, and non-persistence; runnable command: `cargo test --lib`; verification-id: apply-finalization-tests)
+- [x] Render `[commit]` in the TUI during stage checking, hook execution, verified commit, and index-lock retry, then restore `[apply]` for repair and clear the subphase on completion (verification: unit - TUI rendering and output bridge tests cover phase transitions and lock retry continuity; runnable command: `cargo test --lib`; verification-id: apply-finalization-tests)
+- [x] Add tee-based streamed final-commit execution that emits line-level stdout/stderr with change and attempt context while retaining complete raw streams and exit status for repository rejection and index-lock classification (verification: unit - VCS tests compare streamed result capture, ANSI-preserving raw buffers, line events, fatal status, hook rejection, and lock diagnostics; runnable command: `cargo test --lib`; verification-id: apply-finalization-tests)
+- [x] Route streamed commit lines to normal TUI and persistent logs, label retries by attempt instead of deduplicating them, and keep prompt feedback bounded while persistent logs retain complete output (verification: integration - event/log sink tests cover stdout, stderr, successful hooks, rejection, retry labels, and bounded feedback; runnable command: `cargo test --lib`; verification-id: apply-finalization-tests)
+
+## Final Validation
+
+Archive validation itself is the authoritative final OpenSpec validation gate.
+Expected archive gate: `cflx openspec validate harden-apply-finalization --archive-gate`
+
+## Repair Notes
+
+Baseline state found at the start of this repair attempt: `cargo test --lib` did not
+terminate at the reviewed commit. Two tests hung indefinitely
+(`parallel_repeated_acceptance_failure_stops_without_a_change_directory_marker`,
+`parallel_restart_ignores_generated_acceptance_state_when_deciding_retries`), and once
+they were excluded the suite reported 32 failures. Both conditions were reproduced
+against the reviewed commit with every repair change stashed, so neither was introduced
+by this repair attempt; the failing test names were byte-identical with and without the
+repair changes.
+
+Root causes, both consequences of the task 3 stage gate and of the task 6/9 commit
+events, and both blocking the `cargo test --lib` verification declared for every task
+above (including the three findings' verification entries):
+
+1. Test fixtures whose scripted apply command edits `tasks.md` without staging it. The
+   gate correctly refuses to finalize, apply re-enters repair for the whole iteration
+   budget, and each iteration emits events into the test's bounded 128-slot channel that
+   nothing drains until the workspace task joins — so the executor blocks forever on
+   `send`. Fixed by making those fixtures stage their own work, which is what the
+   `apply-commit-recovery` spec requires of the Apply agent. Touched
+   `src/parallel/tests/executor.rs` and `src/serial_run_service.rs`. The stale-checkpoint
+   variant additionally needed `.cflx/` excluded from Git, since Conflux's own runtime
+   directory is otherwise classified as untracked agent work.
+2. `src/events.rs` `EXECUTION_EVENT_VARIANTS` was still 69 after `ApplyCommitPhase` and
+   `ApplyCommitOutput` were added, and `ApplyCommitOutput` was classified
+   presentation-only while `describe_event` addressed a change, violating the
+   "presentation events are never change-addressed" invariant. Fixed by bumping the
+   constant to 71 and moving the attribution into the payload, keeping hook lines out of
+   the snapshot's timing/activity/attention inputs while `ApplyCommitPhase` stays the
+   change-addressed event that makes a running commit visible.
+
+Result: after the acceptance repair iteration the suite terminates in ~37s with
+3409 passed, 0 failed, 14 ignored. The one failure that earlier
+repair attempts left unfixed, `parallel_apply_runs_configured_hooks_across_command_failure_recovery`,
+had the same root cause as the other fixture failures after all: its scripted apply
+command edited `tasks.md` without staging it, so the stage gate refused finalization and
+the loop spent the whole iteration budget in stage repair (5 `pre_apply` runs instead
+of 2). The earlier note claiming "staging the fixture's edit does not change its hook
+log" did not reproduce; adding `git add -A` to the fixture's second attempt makes the
+test pass. Fixed in `src/parallel/tests/executor.rs` during the acceptance repair
+iteration that also addressed the three findings; the file is already related to the
+findings through their shared `cargo test --lib` verification, which this failure
+blocked.
+
+Two further tests are order- and load-dependent rather than deterministic: under a full
+parallel suite run `staging_hook_generated_content_lets_finalization_complete` can fail
+with an `EPERM` process-group cleanup error and
+`agent::tests::test_with_runner_paths_preserve_prompt_and_output` can fail resolving a
+relative working directory. Both pass when run in isolation.
