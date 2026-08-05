@@ -61,7 +61,7 @@ Conflux MUST NOT bypass repository verification hooks when retrying the final Ap
 
 ### Requirement: Task-complete Apply finalization MUST require explicit staging
 
-Before a task-complete Apply iteration creates its final WIP snapshot, Conflux MUST require the managed workspace to contain no unstaged changes and no untracked files. The Apply agent MUST select change-owned files by staging them and MUST NOT create the final commit. Conflux MUST provide bounded repair feedback when the gate fails and MUST preserve work through the existing WIP snapshot without dispatching Acceptance.
+Before every task-complete final-commit entry point, Conflux MUST require the managed workspace to contain no unstaged changes and no untracked files. The gate applies to post-agent finalization and to a task-complete loop entry or resume where no agent iteration or WIP snapshot precedes the attempt. The Apply agent MUST select change-owned files by staging them and MUST NOT create the final commit. When the gate fails, Conflux MUST provide bounded repair feedback, retain the complete captured porcelain status in persistent logs, leave the workspace and index untouched as restart-visible repair evidence, and MUST NOT create a WIP snapshot, final commit, or Acceptance dispatch.
 
 #### Scenario: Fully staged task-complete workspace reaches final commit
 
@@ -76,10 +76,11 @@ Before a task-complete Apply iteration creates its final WIP snapshot, Conflux M
 
 **Given**: all tasks are complete
 **And**: the managed workspace contains unstaged or untracked entries
-**When**: Conflux evaluates finalization eligibility after process-group quiescence and before the WIP snapshot
+**When**: Conflux evaluates any final-commit entry point before WIP snapshot or finalization staging
 **Then**: final commit does not start
 **And**: bounded `incomplete_stage` feedback identifies affected paths and required repair
-**And**: the existing WIP snapshot preserves the workspace
+**And**: persistent logs retain the complete captured porcelain status
+**And**: Conflux leaves the workspace and index unchanged and creates no WIP snapshot
 **And**: the next Apply iteration runs within existing iteration and stall limits
 
 #### Scenario: Successful hook leaves workspace changes
@@ -88,7 +89,22 @@ Before a task-complete Apply iteration creates its final WIP snapshot, Conflux M
 **But**: a hook leaves unstaged or untracked workspace content
 **When**: Conflux checks post-commit cleanliness
 **Then**: Acceptance is not dispatched
-**And**: Conflux returns to bounded Apply repair with actionable stage diagnostics
+**And**: Conflux returns to bounded Apply repair with `incomplete_stage` diagnostics
+
+#### Scenario: Restart after a dirty successful commit resumes into Apply repair
+
+**Given**: a verified final Apply commit exists for the change
+**And**: the managed workspace still contains unstaged or untracked entries
+**When**: Conflux restarts and derives the next action from the workspace alone
+**Then**: the change resumes into Apply repair rather than Acceptance
+
+#### Scenario: Task-complete loop entry applies the same gate
+
+**Given**: all tasks are already complete when the Apply loop starts or resumes
+**And**: no agent iteration or WIP snapshot precedes the final-commit attempt
+**When**: the workspace contains unstaged or untracked entries
+**Then**: Conflux applies the same stage gate before finalization staging
+**And**: final commit and Acceptance remain undispatched
 
 ### Requirement: Empty successful Apply iterations MUST receive structured retry feedback
 

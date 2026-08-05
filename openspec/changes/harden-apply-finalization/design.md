@@ -12,25 +12,29 @@ The completion boundary is not “Conflux can stage whatever remains.” It is �
 2. Wait for process-group quiescence.
 3. Read task progress and workspace status.
 4. If tasks are incomplete, retain the existing WIP snapshot and retry/stall behavior.
-5. If tasks are complete but unstaged or untracked entries exist:
+5. If tasks are complete, enter the ephemeral commit presentation phase and evaluate the stage gate before any WIP snapshot or finalization staging.
+6. If unstaged or untracked entries exist:
    - record bounded `incomplete_stage` feedback,
-   - preserve all work through the existing WIP snapshot,
-   - do not enter final commit,
+   - retain the complete captured status in persistent logs,
+   - leave the workspace and index untouched so restart can re-derive Apply repair,
+   - clear commit presentation,
+   - do not create a WIP snapshot or enter final commit,
    - run the next bounded Apply repair iteration.
-6. If tasks are complete and the stage gate is clean:
-   - enter the ephemeral commit presentation phase,
+7. If the stage gate is clean:
    - create the existing WIP snapshot; its `git add -A` is expected to add nothing,
    - run the hook-enabled final commit/amend with existing bounded index-lock recovery,
    - stream commit output while preserving complete classification data.
-7. If a hook rejects the commit, clear commit presentation and use existing commit-repair feedback.
-8. If commit succeeds but the hook left workspace changes, clear commit presentation and return to Apply repair.
-9. Only a verified final commit with a clean workspace may dispatch Acceptance.
+8. If a hook rejects the commit, clear commit presentation and use existing commit-repair feedback.
+9. If commit succeeds but the hook left workspace changes, clear commit presentation and return to Apply repair.
+10. Only a verified final commit with a clean workspace may dispatch Acceptance.
+
+Steps 5–10 also apply when the loop starts or resumes with tasks already complete and no agent iteration or WIP snapshot precedes the final-commit attempt.
 
 ## Why WIP `git add -A` Remains
 
 The WIP snapshot is a crash-recovery boundary and the evidence source for empty-WIP stall detection. Restricting it to the current index would lose unstaged intermediate work and turn agent staging omissions into false empty-progress signals.
 
-The stage gate prevents finalization from using `git add -A` as file selection. In a valid completion path, the workspace already matches the agent-selected index, so WIP staging is a no-op retained for recovery compatibility.
+The stage gate prevents finalization from using `git add -A` as file selection. In a valid completion path, the workspace already matches the agent-selected index, so WIP staging is a no-op retained for recovery compatibility. The gate rejects an unstaged worktree column and `??` entries from porcelain status; staged entries are expected, while a staged file modified again (`MM`) fails because its worktree column is dirty.
 
 ## Hook-Owned Verification
 
@@ -72,5 +76,6 @@ Final commit execution uses a tee:
 - Agent noncompliance consumes existing bounded Apply/stall budgets.
 - Hook rejection remains repository-fixable Apply feedback.
 - Fatal Git and unrelated VCS errors remain terminal.
-- Hook-created post-commit changes prevent Acceptance.
+- Hook-created post-commit changes prevent Acceptance, including after restart because dirty workspace evidence routes an otherwise Applied change back to Apply repair.
+- A failed stage gate never snapshots the dirty content, so later repair cannot accidentally pass merely because Conflux swept the files into WIP.
 - Restart behavior remains derived from workspace files and Git state.

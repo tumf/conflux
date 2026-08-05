@@ -8,16 +8,19 @@ references:
   - src/execution/apply.rs
   - src/vcs/git/commands/commit.rs
   - src/execution/final_commit_lock_retry.rs
+  - src/events.rs
+  - src/orchestration/state.rs
+  - src/parallel/dispatch.rs
   - src/parallel/output_bridge.rs
 verifications:
   - id: apply-finalization-tests
     requirement: Apply completion, retry feedback, commit phase projection, and streamed commit diagnostics remain repository-verifiable
     phase: pre-integration
     owner: conflux-acceptance
-    trigger: change-implementation
-    automation: scripts/test-time-top10.sh
+    trigger: pull-request-validation
+    automation: Makefile
     evidence: Rust unit and integration test output for apply finalization, VCS streaming, reducer projection, and TUI rendering
-    rerun: cargo test --lib execution::apply vcs::git orchestration::state parallel::output_bridge tui
+    rerun: cargo test --lib execution::apply && cargo test --lib vcs::git && cargo test --lib orchestration::state && cargo test --lib parallel::output_bridge && cargo test --lib tui
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -47,8 +50,8 @@ Finally, hook-enabled commit output is captured only after the process exits. Du
 
 1. Update bundled proposal guidance so repository-wide format, lint, test, and generated-artifact checks are not independent checkbox tasks when a tracked, unconditional pre-commit hook already executes them. Requirement-specific tests remain attached to implementation tasks; heavy and E2E checks remain explicitly owned outside pre-commit.
 2. Update Apply guidance so the agent stages only change-owned files, does not commit, leaves no unstaged or untracked entries before completion, and never returns while a background verification command remains active.
-3. Add an Apply completion gate after process-group quiescence and before the final WIP snapshot. If a task-complete workspace has unstaged or untracked entries, record bounded `incomplete_stage` feedback, preserve work with the existing WIP snapshot, and return to Apply instead of final commit.
-4. Preserve existing WIP `git add -A`, final verified-commit, and index-lock recovery semantics. A successful completion gate makes the normal WIP staging operation an expected no-op; it is retained as the crash-recovery boundary.
+3. Add an Apply completion gate before every final-commit entry point, including the task-complete loop-entry/resume short circuit. If a task-complete workspace has unstaged or untracked entries, record bounded `incomplete_stage` feedback, retain the complete status evidence in persistent logs, leave the dirty workspace untouched as restart-visible repair evidence, and return to Apply instead of creating a WIP snapshot or final commit.
+4. Preserve existing WIP `git add -A`, final verified-commit, and index-lock recovery semantics for ordinary incomplete iterations and clean task-complete finalization. A successful completion gate makes finalization staging an expected no-op; a failed gate never invokes WIP `git add -A`.
 5. Record structured `empty_apply_iteration` feedback when an eligible successful Apply iteration produces neither task progress nor workspace progress. Reuse the existing Apply history output tail rather than duplicating it.
 6. Expose an ephemeral commit subphase while the Apply finalization gate, verified commit, repository hooks, and lock retries run. TUI renders `[commit]`; the public lifecycle remains `applying`, and restart routing never depends on the subphase.
 7. Stream final `git commit` stdout and stderr through a tee that both emits line-level operator events/logs and preserves complete raw streams plus the exit code for existing rejection and index-lock classification.
@@ -57,8 +60,9 @@ Finally, hook-enabled commit output is captured only after the process exits. Du
 ## Acceptance Criteria
 
 - A task-complete Apply iteration cannot reach final commit while `git status --porcelain` reports unstaged or untracked entries.
-- Stage-gate diagnostics identify a bounded set of affected paths and return to the same workspace for repair without bypassing existing iteration or stall limits.
-- WIP snapshots continue to preserve all workspace work and continue to support existing empty-WIP stall semantics and crash recovery.
+- Stage-gate diagnostics identify a bounded set of affected paths, retain the complete captured status in persistent logs, leave the failed-gate workspace unchanged, and return to the same workspace for repair without bypassing existing iteration or stall limits.
+- The gate protects both post-agent finalization and task-complete loop-entry/resume finalization; neither path may use `git add -A` as file selection.
+- WIP snapshots continue to preserve ordinary incomplete-iteration work and continue to support existing empty-WIP stall semantics and crash recovery.
 - An eligible empty Apply iteration adds structured guidance telling the next agent to inspect unfinished tasks and prior output and not to return with background verification still active.
 - Proposal guidance delegates a repository-wide gate only when tracked hook configuration proves that the gate runs unconditionally, including on amend; staged-file-only hooks do not qualify.
 - Heavy and E2E verification is not moved into pre-commit solely by this change.
