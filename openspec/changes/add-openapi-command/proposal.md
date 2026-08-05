@@ -17,9 +17,9 @@ verifications:
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
-    automation: Makefile
-    evidence: cargo test output covering CLI parsing, schema output, live endpoint parity, and contract completeness
-    rerun: cargo test --features web-monitoring --test openapi_contract_tests && cargo test --all-features cli
+    automation: .github/workflows/ci.yml
+    evidence: cargo test output covering CLI parsing, feature-disabled rejection, schema output, live endpoint parity, and contract completeness
+    rerun: cargo test --features web-monitoring --test openapi_contract_tests && cargo test --no-default-features --bin cflx openapi
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -44,7 +44,7 @@ Maintaining `docs/openapi.yaml` creates a second representation of the API contr
 
 Add `cflx openapi`, which writes the generated OpenAPI 3.1 YAML to standard output using the same serialization function as `GET /api/v2/openapi.yaml`. The command must be read-only, bypass repository orchestration locking and startup side effects, and emit no non-schema text to standard output.
 
-Remove `docs/openapi.yaml`, the `openapi-gen` binary, `make openapi`, `make check-openapi`, the static-artifact pre-commit hook, and release logic that owns or rewrites the file. Rewrite contract tests to validate the generated document and parity between CLI and live API instead of comparing a tracked artifact. Update canonical specs and documentation to make generated runtime/CLI output authoritative.
+Remove `docs/openapi.yaml`, the `openapi-gen` binary, `make openapi`, `make check-openapi`, the static-artifact pre-commit hook, and release logic that owns or rewrites the file. Rewrite contract tests to validate the generated document and parity between CLI and live API instead of comparing a tracked artifact, and run those artifact-free contract tests in pull-request CI. Update canonical specs, generated-document banners, workflow comments, and documentation to make generated runtime/CLI output authoritative.
 
 ## Acceptance Criteria
 
@@ -60,9 +60,10 @@ Remove `docs/openapi.yaml`, the `openapi-gen` binary, `make openapi`, `make chec
 
 - CLI parsing and dispatch include `cflx openapi`, and command help documents stdout behavior.
 - A runnable integration test parses CLI output as OpenAPI YAML and proves it matches the live endpoint output.
-- Contract tests fail if a supported route or required published schema element is missing or if a removed route reappears.
-- Repository search finds no active ownership, generation, release, or documentation dependency on `docs/openapi.yaml`, `make openapi`, or `make check-openapi` outside archived historical changes.
-- `cargo test --features web-monitoring --test openapi_contract_tests` and relevant CLI tests pass.
+- Contract tests fail if a supported route or required published schema element is missing or if a removed route reappears, and pull-request CI runs those tests without regenerating a tracked artifact.
+- A feature-disabled test proves `cflx openapi` rejects unavailable OpenAPI support clearly without schema output.
+- Repository search finds no active ownership, generation, release, workflow-comment, generated-banner, or documentation dependency on `docs/openapi.yaml`, `make openapi`, or `make check-openapi` outside archived historical changes.
+- `cargo test --features web-monitoring --test openapi_contract_tests` and `cargo test --no-default-features --bin cflx openapi` pass.
 
 ## Split Rationale
 
