@@ -58,14 +58,37 @@ Common commands:
 # Run all hooks on all files
 prek run --all-files
 
-# Run selected hooks
-prek run rustfmt clippy
+# Run selected hooks (--all-files, because rustfmt and clippy are path-scoped)
+prek run rustfmt clippy --all-files
 
 # List available hooks
 prek list
 ```
 
 Hook configuration lives in `.pre-commit-config.yaml`. See [The API contract](#the-api-contract) for how the `/api/v2` schema is verified.
+
+### Path-scoped Rust hooks vs. full validation
+
+The `rustfmt` and `clippy` hooks are **path-scoped at commit time**. They are
+selected only when the staged paths can affect Rust compilation:
+
+```
+^(src|tests)/.*\.rs$|^Cargo\.(toml|lock)$|^build\.rs$
+```
+
+A proposal-only or docs-only commit — anything under `openspec/`, Markdown,
+`web/`, `skills/` — does not select them, so it does not pay the full Rust hook
+cost. Only *selection* is narrowed: as soon as one Rust-impacting file is
+staged, both hooks still run `cargo fmt --all` and
+`cargo clippy --locked --all-targets --all-features -- -D warnings` over the
+whole workspace, not just the staged files.
+
+Because selection is path-based, `prek run rustfmt` with no file arguments
+checks nothing. Pass `--all-files` for an explicit manual run.
+
+Commit-time scoping never replaces full validation. `make check`
+(`fmt` + `lint` + `test` + hooks + `audit`) and CI validate the whole
+repository regardless of which paths changed.
 
 ## The API contract
 

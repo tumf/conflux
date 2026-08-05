@@ -17,15 +17,20 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      # Commit-time selection is path-scoped: a commit that cannot change Rust
+      # compilation (proposal-only, docs-only) does not pay the full Rust hook
+      # cost. Selection is the only thing narrowed — once selected, each hook
+      # still validates the whole workspace, so `pass_filenames: false` stays.
+      # `make check` and CI remain the unconditional full validation path.
       - id: rustfmt
         name: rustfmt
         entry: cargo fmt --all
         language: system
         pass_filenames: false
-        always_run: true
+        files: ^(src|tests)/.*\.rs$|^Cargo\.(toml|lock)$|^build\.rs$
       - id: clippy
         name: clippy
         entry: cargo clippy --locked --all-targets --all-features -- -D warnings
         language: system
         pass_filenames: false
-        always_run: true
+        files: ^(src|tests)/.*\.rs$|^Cargo\.(toml|lock)$|^build\.rs$

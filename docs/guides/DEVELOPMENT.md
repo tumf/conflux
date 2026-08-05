@@ -75,7 +75,7 @@ cargo install cargo-audit
 
 ### Validation by phase
 
-- **Pre-commit hook**: `cargo fmt --all` + `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- **Pre-commit hook**: `cargo fmt --all` + `cargo clippy --locked --all-targets --all-features -- -D warnings`, path-scoped to Rust-impacting staged paths (see [Pre-commit checks](#pre-commit-checks))
 - **Local developer loop**: `cargo test`
 - **Acceptance baseline**: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
 - **Full local validation**: `make check` (includes `cargo audit`)
@@ -226,6 +226,42 @@ cargo clippy
 ```bash
 cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
+
+#### Path-scoped commit-time Rust checks
+
+The `rustfmt` and `clippy` hooks are **path-scoped**: at commit time they are
+selected only when a staged path can affect Rust compilation.
+
+```
+^(src|tests)/.*\.rs$|^Cargo\.(toml|lock)$|^build\.rs$
+```
+
+- A proposal-only commit (`openspec/**`) or a docs-only commit does not select
+  them, so it does not pay the full Rust hook cost.
+- Staging any `src/**/*.rs`, `tests/**/*.rs`, `Cargo.toml`, `Cargo.lock`, or the
+  root `build.rs` selects both hooks.
+- Selection is the only thing narrowed. Once selected, each hook still runs its
+  full workspace command (`cargo fmt --all`,
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`) and
+  receives no staged filenames.
+- The generic hygiene hooks, the beads hook, and the OpenAPI contract hook are
+  unaffected and keep running as before.
+
+Because the Rust hooks match on paths, a manual `prek run rustfmt` with no file
+arguments selects nothing. Use `--all-files` for an explicit full run:
+
+```bash
+prek run rustfmt clippy --all-files
+```
+
+#### Explicit full validation
+
+Path scoping applies to commit-time selection only; it never narrows explicit
+validation. `make check` (`fmt` + `lint` + `test` + all hooks on all files +
+`audit`) and CI validate the whole repository regardless of which paths changed.
+`tests/precommit_hook_scope_tests.rs` runs in `make test` and fails if the
+shared selector, the hook commands, `pass_filenames`, or the absence of
+`always_run` ever drifts.
 
 Archive 前チェックでは、通常 commit 時の hook と同等の検証として `prek run --all-files` を実行する。
 `pre-commit` コマンドが未導入の場合は `prek` を標準手段とし、以下のセットアップ後に同じコマンドを実行する。
