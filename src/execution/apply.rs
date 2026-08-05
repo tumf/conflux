@@ -16,9 +16,11 @@
 use crate::agent::{AgentRunner, OutputLine};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::events::{ApplyCommitPhase, CommitOutputStream};
 use crate::execution::final_commit_lock_retry::{
     run_final_commit_with_retry, FinalCommitEnvironment, GitFinalCommitEnvironment,
 };
+use crate::execution::stage_gate::{classify_porcelain_status, WorkspaceStageStatus};
 use crate::execution::wip_lock_retry::{
     run_wip_snapshot_with_retry, GitWipSnapshotEnvironment, WipSnapshotEnvironment,
 };
@@ -712,6 +714,7 @@ pub async fn create_final_commit<W: WorkspaceManager + ?Sized>(
         change_id,
         None,
         &GitFinalCommitEnvironment,
+        None,
     )
     .await
 }
@@ -732,6 +735,7 @@ pub async fn create_final_commit_with_environment<W: WorkspaceManager + ?Sized>(
     change_id: &str,
     cancel_token: Option<&CancellationToken>,
     environment: &dyn FinalCommitEnvironment,
+    sink: Option<FinalCommitSink<'_>>,
 ) -> VcsResult<VerifiedCommitOutcome> {
     let commit_message = format!("Apply: {}", change_id);
     let commit_message_ref = commit_message.as_str();
@@ -742,15 +746,33 @@ pub async fn create_final_commit_with_environment<W: WorkspaceManager + ?Sized>(
     );
 
     let outcome = run_final_commit_with_retry(
-        move || async move {
+        move |attempt| async move {
             // Snapshot working copy changes first to capture workspace state.
             workspace_manager
                 .snapshot_working_copy(workspace_path)
                 .await?;
 
-            workspace_manager
-                .create_verified_commit(workspace_path, commit_message_ref)
-                .await
+            // Each retry attempt streams under its own attempt label rather
+            // than being deduplicated against the previous one, so a hook
+            // transcript repeated by contention stays attributable.
+            match sink {
+                Some(sink) => {
+                    let attempt_sink =
+                        move |stream: CommitOutputStream, line: &str| sink(attempt, stream, line);
+                    workspace_manager
+                        .create_verified_commit_streamed(
+                            workspace_path,
+                            commit_message_ref,
+                            &attempt_sink,
+                        )
+                        .await
+                }
+                None => {
+                    workspace_manager
+                        .create_verified_commit(workspace_path, commit_message_ref)
+                        .await
+                }
+            }
         },
         environment,
         workspace_path,
@@ -801,28 +823,169 @@ fn final_commit_rejection_feedback(rejection: &CommitRejection) -> ApplyOrchestr
     }
 }
 
-/// Outcome of one final-commit attempt as seen by the shared apply loop.
+/// Presentation sink for the streamed final Apply commit.
+///
+/// The first argument is the 1-based finalization attempt, so output produced
+/// again by an `index.lock` retry stays attributable to the attempt that
+/// produced it rather than looking like duplicated text.
+pub type FinalCommitSink<'a> = &'a (dyn Fn(u32, CommitOutputStream, &str) + Send + Sync);
+
+/// The porcelain query the finalization stage gate reads, rendered exactly the
+/// way [`crate::vcs::git::commands::has_uncommitted_changes`] issues it.
+const STAGE_GATE_STATUS_COMMAND: &str =
+    "git status --porcelain --untracked-files=normal --ignored=no";
+
+/// Where a failed stage gate was observed.
+///
+/// The two origins need different repair instructions: one says "you did not
+/// finish staging", the other says "a repository hook edited files after its
+/// own commit succeeded".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageGateOrigin {
+    /// Checked before any WIP snapshot or finalization staging.
+    BeforeFinalization,
+    /// Checked after a verified commit that exited successfully.
+    AfterSuccessfulCommit,
+}
+
+/// Read the managed workspace's staging state for the finalization gate.
+///
+/// Non-Git backends have no staging model at all, so they are reported clean:
+/// the gate exists to stop `git add -A` from acting as file selection, and
+/// there is no such staging step to stop.
+///
+/// An unreadable status degrades to "clean" with a warning rather than wedging
+/// the loop. It cannot silently pass a dirty workspace through: finalization
+/// immediately re-runs the same `git status` to choose its commit mode, so a
+/// genuinely unreadable repository still fails there, terminally, with the Git
+/// error attached.
+async fn read_workspace_stage_status(
+    is_git: bool,
+    workspace_path: &Path,
+    change_id: &str,
+) -> (WorkspaceStageStatus, String) {
+    if !is_git {
+        return (WorkspaceStageStatus::default(), String::new());
+    }
+
+    // The untrimmed reader is required: the trimmed one drops the leading
+    // space that separates an unstaged worktree change from a staged one.
+    match crate::vcs::git::commands::porcelain_status(workspace_path).await {
+        Ok(porcelain) => (classify_porcelain_status(&porcelain), porcelain),
+        Err(error) => {
+            warn!(
+                change_id = change_id,
+                workspace = %workspace_path.display(),
+                error = %error,
+                "Could not read workspace status for the Apply finalization stage gate; \
+                 finalization will re-read it and fail there if the repository is unreadable"
+            );
+            (WorkspaceStageStatus::default(), String::new())
+        }
+    }
+}
+
+/// Build bounded apply feedback for a workspace that is not fully staged.
+///
+/// Only the bounded path report enters the prompt. The complete captured
+/// porcelain status stays in the persistent log written by the caller, so a
+/// workspace with hundreds of stray files cannot displace the rest of the Apply
+/// context.
+fn incomplete_stage_feedback(
+    status: &WorkspaceStageStatus,
+    origin: StageGateOrigin,
+) -> ApplyOrchestrationFeedback {
+    let summary = match origin {
+        StageGateOrigin::BeforeFinalization => format!(
+            "All tasks are complete but the workspace is not fully staged ({}), so no WIP \
+             snapshot and no final Apply commit were created and acceptance has not started.",
+            status.summary()
+        ),
+        StageGateOrigin::AfterSuccessfulCommit => format!(
+            "The final Apply commit succeeded but a repository hook left the workspace dirty \
+             ({}), so acceptance has not started.",
+            status.summary()
+        ),
+    };
+
+    ApplyOrchestrationFeedback {
+        kind: ApplyOrchestrationFeedback::INCOMPLETE_STAGE,
+        summary,
+        command: Some(STAGE_GATE_STATUS_COMMAND.to_string()),
+        exit_code: Some(0),
+        stdout_tail: Some(status.bounded_paths_report()),
+        stderr_tail: None,
+        required_action:
+            "Decide what each listed path should be, then make the workspace clean: stage the \
+             content this change owns with `git add`, and revert or delete anything it does not. \
+             Do not create the final Apply commit yourself and do not work around this by \
+             running `git add -A` blindly. When you return, `git status --porcelain` must report \
+             no unstaged changes and no untracked files."
+                .to_string(),
+    }
+}
+
+/// Build apply feedback for a successful iteration that changed nothing.
+///
+/// The prior attempt's output is already in [`crate::history::ApplyHistory`], so
+/// this records only the structured fact and the required action instead of
+/// duplicating that tail.
+fn empty_apply_iteration_feedback() -> ApplyOrchestrationFeedback {
+    ApplyOrchestrationFeedback {
+        kind: ApplyOrchestrationFeedback::EMPTY_APPLY_ITERATION,
+        summary: "The previous Apply iteration exited successfully but changed neither task \
+                  progress nor the workspace."
+            .to_string(),
+        command: None,
+        exit_code: None,
+        stdout_tail: None,
+        stderr_tail: None,
+        required_action:
+            "Read the unchecked tasks in tasks.md and the previous attempt's output above before \
+             acting, and inspect any stage or hook diagnostics recorded with it. Then make a \
+             concrete repository change. Run verification commands in the foreground and wait for \
+             them: do not return while a verification command is still running in the background, \
+             because Conflux terminates the process group at finalization and that work is lost."
+                .to_string(),
+    }
+}
+
+/// Outcome of one task-complete finalization attempt as seen by the shared
+/// apply loop.
 #[derive(Debug)]
 enum FinalCommitAttempt {
-    /// The verified commit exists, or the backend has no final-commit step.
+    /// The verified commit exists and the workspace is clean, or the backend
+    /// has no final-commit step.
     Committed,
+    /// The workspace was not fully staged, so finalization never started.
+    StageIncomplete(WorkspaceStageStatus),
     /// A repository hook rejected the commit; apply must repair and retry.
     Rejected(CommitRejection),
+    /// The commit succeeded but a hook left workspace content behind.
+    HookLeftWorkspaceDirty(WorkspaceStageStatus),
 }
 
 /// Attempt the verified final Apply commit for the current loop state.
+///
+/// The stage gate runs first, before any WIP snapshot or finalization staging,
+/// and a failed gate returns without touching the workspace or the index: the
+/// dirty content is left exactly where the agent left it, so restart re-derives
+/// Apply repair from the workspace alone and a later repair cannot pass merely
+/// because Conflux swept the files into a snapshot.
 ///
 /// Terminal VCS failures propagate as `Err` and are never converted into agent
 /// feedback. That includes exhausted `index.lock` contention: the bounded
 /// retry lives inside the finalization boundary, so it never spends an
 /// Apply-agent hook-repair iteration.
-async fn attempt_final_commit(
+#[allow(clippy::too_many_arguments)]
+async fn attempt_final_commit<E: ApplyEventHandler>(
     workspace_manager: Option<&dyn WorkspaceManager>,
     is_git: bool,
     workspace_path: &Path,
     change_id: &str,
     iteration: u32,
     cancel_token: Option<&CancellationToken>,
+    event_handler: &E,
 ) -> Result<FinalCommitAttempt> {
     if !is_git {
         return Ok(FinalCommitAttempt::Committed);
@@ -831,10 +994,66 @@ async fn attempt_final_commit(
         return Ok(FinalCommitAttempt::Committed);
     };
 
+    // Commit presentation covers the whole sequence, starting with the gate:
+    // stage checking is finalization work, and an operator watching a stalled
+    // row needs to see that too.
+    event_handler.on_apply_commit_phase(change_id, ApplyCommitPhase::Started, iteration);
+    let outcome = finalize_apply(
+        ws_mgr,
+        workspace_path,
+        change_id,
+        iteration,
+        cancel_token,
+        event_handler,
+    )
+    .await;
+
+    let phase = match &outcome {
+        Ok(FinalCommitAttempt::Committed) => ApplyCommitPhase::Completed,
+        _ => ApplyCommitPhase::Failed,
+    };
+    event_handler.on_apply_commit_phase(change_id, phase, iteration);
+
+    outcome
+}
+
+/// The Git finalization sequence itself, with commit presentation owned by the
+/// caller so every exit path clears it exactly once.
+async fn finalize_apply<E: ApplyEventHandler>(
+    ws_mgr: &dyn WorkspaceManager,
+    workspace_path: &Path,
+    change_id: &str,
+    iteration: u32,
+    cancel_token: Option<&CancellationToken>,
+    event_handler: &E,
+) -> Result<FinalCommitAttempt> {
+    let (stage_status, porcelain) =
+        read_workspace_stage_status(true, workspace_path, change_id).await;
+    if !stage_status.is_clean() {
+        // The complete captured status goes to persistent logs; only the
+        // bounded path report reaches the next prompt.
+        warn!(
+            change_id = change_id,
+            iteration = iteration,
+            workspace = %workspace_path.display(),
+            unstaged = stage_status.unstaged_paths().len(),
+            untracked = stage_status.untracked_paths().len(),
+            status = %porcelain,
+            "Apply finalization stage gate failed; leaving the workspace untouched and returning to Apply repair"
+        );
+        return Ok(FinalCommitAttempt::StageIncomplete(stage_status));
+    }
+
     info!(
         "Creating final Apply commit for {} after {} iterations",
         change_id, iteration
     );
+
+    // The sink is presentation only: it observes lines while hooks run and
+    // cannot change the classified outcome.
+    let sink = |attempt: u32, stream: CommitOutputStream, line: &str| {
+        event_handler.on_apply_commit_output(change_id, attempt, stream, line);
+    };
 
     match create_final_commit_with_environment(
         ws_mgr,
@@ -842,10 +1061,27 @@ async fn attempt_final_commit(
         change_id,
         cancel_token,
         &GitFinalCommitEnvironment,
+        Some(&sink),
     )
     .await?
     {
-        VerifiedCommitOutcome::Committed => Ok(FinalCommitAttempt::Committed),
+        VerifiedCommitOutcome::Committed => {
+            // A hook may edit or generate files and still exit zero. That
+            // content is not in the commit, so acceptance must not start.
+            let (after_commit, after_porcelain) =
+                read_workspace_stage_status(true, workspace_path, change_id).await;
+            if !after_commit.is_clean() {
+                warn!(
+                    change_id = change_id,
+                    iteration = iteration,
+                    workspace = %workspace_path.display(),
+                    status = %after_porcelain,
+                    "Final Apply commit succeeded but repository hooks left workspace changes; returning to Apply repair"
+                );
+                return Ok(FinalCommitAttempt::HookLeftWorkspaceDirty(after_commit));
+            }
+            Ok(FinalCommitAttempt::Committed)
+        }
         VerifiedCommitOutcome::RepositoryRejected(rejection) => {
             Ok(FinalCommitAttempt::Rejected(rejection))
         }
@@ -1003,7 +1239,9 @@ pub fn summarize_output(output: &str, max_lines: usize) -> String {
 ///
 /// This trait allows the apply loop to send events to different handlers
 /// (e.g., TUI event channel, CLI logger, parallel event bus).
-pub trait ApplyEventHandler {
+/// `Sync` is required because the streamed final-commit sink borrows the
+/// handler across `await` points inside a `Send` future.
+pub trait ApplyEventHandler: Sync {
     /// Called when apply iteration starts
     fn on_apply_started(&self, change_id: &str, command: &str);
     /// Called when progress is updated
@@ -1022,6 +1260,29 @@ pub trait ApplyEventHandler {
     /// Defaulted so existing handlers keep the plain `tracing` warning without
     /// having to opt in to a frontend event.
     fn on_apply_warning(&self, _change_id: &str, _message: &str) {}
+
+    /// Called when the ephemeral final-commit presentation phase changes.
+    ///
+    /// Presentation only: the canonical activity stays `applying`, nothing is
+    /// persisted, and no routing decision may read it. Defaulted so handlers
+    /// that do not render a commit phase are unaffected.
+    fn on_apply_commit_phase(&self, _change_id: &str, _phase: ApplyCommitPhase, _attempt: u32) {}
+
+    /// Called for each streamed line of final-commit output.
+    ///
+    /// `attempt` is the 1-based finalization attempt, which distinguishes
+    /// output an `index.lock` retry produced again from the original run.
+    /// Defaulted for the same reason as above: a handler that does not render
+    /// commit output simply drops it, and the complete raw streams remain
+    /// available to classification regardless.
+    fn on_apply_commit_output(
+        &self,
+        _change_id: &str,
+        _attempt: u32,
+        _stream: CommitOutputStream,
+        _line: &str,
+    ) {
+    }
 }
 
 /// No-op event handler for cases where events are not needed
@@ -1352,6 +1613,12 @@ where
     // hook. While it is set the task-complete short circuit is bypassed so a
     // real repair iteration always runs before the commit is retried.
     let mut pending_commit_repair: Option<CommitRejection> = None;
+    // Set when a task-complete finalization attempt was refused because the
+    // workspace was not fully staged, or because a hook left it dirty after a
+    // successful commit. Like `pending_commit_repair` it bypasses the
+    // task-complete short circuit so a real repair iteration always runs before
+    // finalization is retried.
+    let mut pending_stage_repair = false;
     let mut change_complete_hook_fired = false;
     // Latest bounded actionable failure observed by this loop. It travels into
     // the typed `iteration_limit` outcome so budget exhaustion never surfaces as
@@ -1412,13 +1679,20 @@ where
         // A pending final-commit repair bypasses this short circuit entirely:
         // the tasks are complete but the verified commit is not, so one repair
         // agent must run before the commit is retried.
-        if pending_commit_repair.is_none() && is_progress_complete(&progress) {
+        if pending_commit_repair.is_none()
+            && !pending_stage_repair
+            && is_progress_complete(&progress)
+        {
             let task_format_findings = task_format_blocks_acceptance(workspace_path, change_id);
             if task_format_findings.is_empty() {
                 info!(
                     "Change {} is already complete ({}/{})",
                     change_id, progress.completed, progress.total
                 );
+                // The same stage gate protects this loop-entry/resume path: no
+                // agent iteration and no WIP snapshot precede it, so without the
+                // gate here a restart into a task-complete dirty workspace would
+                // reach `git add -A` as file selection.
                 match attempt_final_commit(
                     workspace_manager,
                     is_git,
@@ -1426,6 +1700,7 @@ where
                     change_id,
                     attempts_so_far,
                     cancel_token,
+                    event_handler,
                 )
                 .await?
                 {
@@ -1436,6 +1711,25 @@ where
                             final_commit_rejection_feedback(&rejection),
                         );
                         pending_commit_repair = Some(rejection);
+                        // Fall through to dispatch a repair iteration.
+                    }
+                    FinalCommitAttempt::StageIncomplete(status) => {
+                        agent.record_apply_orchestration_feedback(
+                            change_id,
+                            incomplete_stage_feedback(&status, StageGateOrigin::BeforeFinalization),
+                        );
+                        pending_stage_repair = true;
+                        // Fall through to dispatch a repair iteration.
+                    }
+                    FinalCommitAttempt::HookLeftWorkspaceDirty(status) => {
+                        agent.record_apply_orchestration_feedback(
+                            change_id,
+                            incomplete_stage_feedback(
+                                &status,
+                                StageGateOrigin::AfterSuccessfulCommit,
+                            ),
+                        );
+                        pending_stage_repair = true;
                         // Fall through to dispatch a repair iteration.
                     }
                 }
@@ -1919,6 +2213,8 @@ where
             break false;
         }
 
+        let had_permission_denial = permission_denial.is_some();
+
         if let Some(denial) = permission_denial {
             let task_state_changed =
                 new_progress.completed > progress.completed || new_progress.total != progress.total;
@@ -1987,8 +2283,49 @@ where
             }
         }
 
+        // Task-complete finalization stage gate.
+        //
+        // It runs here, ahead of the WIP snapshot, because the snapshot's
+        // `git add -A` would otherwise absorb whatever the agent failed to
+        // stage and turn a staging omission into a silently-finalized commit.
+        // A failed gate leaves the workspace and index exactly as the agent
+        // left them, so a restart re-derives Apply repair from the workspace
+        // alone and the next iteration cannot pass merely because Conflux swept
+        // the files into a snapshot.
+        let finalization_ready = is_progress_complete(&new_progress)
+            && task_format_blocks_acceptance(workspace_path, change_id).is_empty();
+        if finalization_ready {
+            event_handler.on_apply_commit_phase(change_id, ApplyCommitPhase::Started, iteration);
+            let (stage_status, porcelain) =
+                read_workspace_stage_status(is_git, workspace_path, change_id).await;
+            if !stage_status.is_clean() {
+                // Complete evidence to persistent logs, bounded evidence to the
+                // next prompt.
+                warn!(
+                    change_id = change_id,
+                    iteration = iteration,
+                    workspace = %workspace_path.display(),
+                    unstaged = stage_status.unstaged_paths().len(),
+                    untracked = stage_status.untracked_paths().len(),
+                    status = %porcelain,
+                    "Apply finalization stage gate failed after the agent iteration; \
+                     no WIP snapshot and no final commit were created"
+                );
+                event_handler.on_apply_commit_phase(change_id, ApplyCommitPhase::Failed, iteration);
+                agent.record_apply_orchestration_feedback(
+                    change_id,
+                    incomplete_stage_feedback(&stage_status, StageGateOrigin::BeforeFinalization),
+                );
+                pending_stage_repair = true;
+                continue;
+            }
+        }
+
         // Create iteration snapshot (Git-only)
         let wip_stall_accounting_ran = is_git && workspace_manager.is_some();
+        // Set when this iteration exited successfully, took a WIP snapshot, and
+        // that snapshot proved neither task nor workspace progress.
+        let mut empty_iteration_candidate = false;
         if is_git {
             if let Some(ws_mgr) = workspace_manager {
                 match create_progress_commit(
@@ -2002,14 +2339,20 @@ where
                 .await
                 {
                     Ok(()) => {
-                        // Check for stall (Git-only)
-                        let is_empty = if new_progress.completed <= progress.completed {
-                            true
-                        } else {
+                        // Check for stall (Git-only).
+                        //
+                        // The snapshot's emptiness is read unconditionally, not
+                        // only when tasks advanced: it is the workspace half of
+                        // the empty-iteration signal below. `is_empty` keeps its
+                        // existing meaning — no task progress, or a snapshot
+                        // that recorded nothing.
+                        let task_progressed = new_progress.completed > progress.completed;
+                        let wip_snapshot_empty =
                             crate::vcs::git::commands::is_head_empty_commit(workspace_path)
                                 .await
-                                .unwrap_or(false)
-                        };
+                                .unwrap_or(false);
+                        let is_empty = !task_progressed || wip_snapshot_empty;
+                        empty_iteration_candidate = !task_progressed && wip_snapshot_empty;
                         // A checkbox-complete but format-invalid tasks.md is not an
                         // acceptance-ready state, so it must stay subject to stall
                         // detection instead of looping until max iterations.
@@ -2148,6 +2491,28 @@ where
             }
         }
 
+        // An eligible successful iteration that moved neither task progress nor
+        // the workspace tells the next agent something its raw output tail
+        // cannot: the previous attempt produced nothing at all, most often
+        // because it returned while a verification command was still running.
+        //
+        // This is additive context only. Stall accounting above stays
+        // authoritative, and terminal, handoff, denial, blocker, and rejection
+        // outcomes have already left the loop or been classified by this point.
+        if empty_iteration_candidate
+            && !ordinary_command_failure
+            && !had_permission_denial
+            && !is_progress_complete(&new_progress)
+        {
+            info!(
+                change_id = change_id,
+                iteration = iteration,
+                "Apply iteration exited successfully with no task or workspace progress; \
+                 recording empty_apply_iteration feedback for the next attempt"
+            );
+            agent.record_apply_orchestration_feedback(change_id, empty_apply_iteration_feedback());
+        }
+
         // Check if complete. A completed checkbox set with an invalid active-section
         // bullet must not proceed to acceptance: keep the change in apply so the
         // next attempt repairs the format without consuming an acceptance cycle.
@@ -2201,6 +2566,7 @@ where
                 change_id,
                 iteration,
                 cancel_token,
+                event_handler,
             )
             .await?
             {
@@ -2221,6 +2587,32 @@ where
                         change_id = change_id,
                         iteration = iteration,
                         "Final Apply commit rejected; re-entering apply for repair"
+                    );
+                    continue;
+                }
+                FinalCommitAttempt::StageIncomplete(status) => {
+                    // The pre-snapshot gate above already passed, so reaching
+                    // here means the workspace changed under us between the two
+                    // reads. Treat it exactly the same way: repair, never
+                    // finalize.
+                    agent.record_apply_orchestration_feedback(
+                        change_id,
+                        incomplete_stage_feedback(&status, StageGateOrigin::BeforeFinalization),
+                    );
+                    pending_stage_repair = true;
+                    continue;
+                }
+                FinalCommitAttempt::HookLeftWorkspaceDirty(status) => {
+                    agent.record_apply_orchestration_feedback(
+                        change_id,
+                        incomplete_stage_feedback(&status, StageGateOrigin::AfterSuccessfulCommit),
+                    );
+                    pending_stage_repair = true;
+                    info!(
+                        change_id = change_id,
+                        iteration = iteration,
+                        "Final Apply commit succeeded but hooks left workspace changes; \
+                         re-entering apply for repair before acceptance"
                     );
                     continue;
                 }
@@ -2982,6 +3374,25 @@ mod tests {
         );
     }
 
+    /// Stage everything currently in the worktree.
+    ///
+    /// Loop tests that write change files directly need this: the Apply
+    /// finalization stage gate refuses to finalize a workspace that still has
+    /// unstaged or untracked entries, and an unstaged `openspec/` directory is
+    /// exactly that.
+    pub(super) fn stage_all(workspace: &Path) {
+        let output = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(workspace)
+            .output()
+            .expect("git add -A should run");
+        assert!(
+            output.status.success(),
+            "git add -A failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg_attr(windows, ignore)]
     #[tokio::test]
     async fn test_apply_loop_uses_escalation_command_on_late_empty_wip_retries() {
@@ -3094,7 +3505,10 @@ mod tests {
         let config = OrchestratorConfig {
             apply_command: Some("true".to_string()),
             apply_stall_diagnose_command: Some(
-                "sh -c 'printf \"## Implementation Tasks\\n- [x] pending\\n\" > openspec/changes/{change_id}/tasks.md'"
+                // Staged as well as written: the finalization stage gate
+                // refuses to finalize a workspace with unstaged content, and
+                // diagnosis output is no exception.
+                "sh -c 'printf \"## Implementation Tasks\\n- [x] pending\\n\" > openspec/changes/{change_id}/tasks.md && git add -A'"
                     .to_string(),
             ),
             stall_detection: Some(crate::config::StallDetectionConfig {
@@ -4007,12 +4421,13 @@ mod tests {
         init_git_repo(workspace);
         let change_id = "format-repair";
         write_tasks(workspace, change_id, COMPLETED_BUT_MALFORMED_TASKS);
+        stage_all(workspace);
 
         let config = OrchestratorConfig {
             // Apply repairs the malformed bullet while keeping the completed
             // implementation evidence.
             apply_command: Some(
-                "sh -c 'printf \"## Implementation Tasks\\n- [x] Implement the gate\\n\\n## Notes\\n- evidence: cargo test passed\\n\" > openspec/changes/{change_id}/tasks.md'"
+                "sh -c 'printf \"## Implementation Tasks\\n- [x] Implement the gate\\n\\n## Notes\\n- evidence: cargo test passed\\n\" > openspec/changes/{change_id}/tasks.md && git add -A'"
                     .to_string(),
             ),
             stall_detection: Some(crate::config::StallDetectionConfig {
@@ -4075,6 +4490,7 @@ mod tests {
         init_git_repo(workspace);
         let change_id = "format-valid";
         write_tasks(workspace, change_id, COMPLETED_AND_VALID_TASKS);
+        stage_all(workspace);
 
         let config = OrchestratorConfig {
             // Any apply invocation would mean the gate cost an extra agent cycle.
@@ -4342,8 +4758,10 @@ mod apply_commit_recovery {
     /// Path to the one `pre-commit` hook shared by every recovery test.
     ///
     /// The hook is data-driven off the worktree, so a single script serves all
-    /// tests: it fails while `blocker.txt` exists and appends one line per run
-    /// to `.git/hook.log` (inside `.git` so `git add -A` never stages it).
+    /// tests: it fails while `.git/blocker.txt` exists and appends one line per
+    /// run to `.git/hook.log`. Both live inside `.git` so neither is visible to
+    /// `git status`, which keeps these hook-rejection tests about the hook
+    /// rather than about the finalization stage gate that runs before it.
     /// Sharing one script also keeps the tests from re-paying per-file
     /// first-execution costs on every case.
     fn shared_hooks_dir() -> &'static Path {
@@ -4351,7 +4769,7 @@ mod apply_commit_recovery {
         HOOKS_DIR.get_or_init(|| {
             const HOOK: &str = "#!/bin/sh\n\
                                 echo ran >> \"$(git rev-parse --git-dir)/hook.log\"\n\
-                                if [ -f blocker.txt ]; then\n\
+                                if [ -f \"$(git rev-parse --git-dir)/blocker.txt\" ]; then\n\
                                 echo 'repository verification failed: blocker.txt is present' >&2\n\
                                 exit 1\n\
                                 fi\n\
@@ -4374,8 +4792,8 @@ mod apply_commit_recovery {
         })
     }
 
-    /// Build a repository whose `pre-commit` hook fails while `blocker.txt`
-    /// exists, and which records every hook invocation.
+    /// Build a repository whose `pre-commit` hook fails while
+    /// `.git/blocker.txt` exists, and which records every hook invocation.
     fn recovery_repo(change_id: &str, tasks: &str) -> RecoveryRepo {
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path().join("repo");
@@ -4443,17 +4861,21 @@ mod apply_commit_recovery {
         }
 
         fn block_commits(&self) {
-            std::fs::write(self.workspace.join("blocker.txt"), "bad\n").unwrap();
+            std::fs::write(self.workspace.join(".git").join("blocker.txt"), "bad\n").unwrap();
         }
     }
 
     const COMPLETE_TASKS: &str = "## Implementation Tasks\n- [x] Implement the change\n";
+    const INCOMPLETE_TASKS: &str = "## Implementation Tasks\n- [ ] Implement the change\n";
 
     #[cfg_attr(windows, ignore)]
     #[tokio::test]
     async fn add_and_commit_path_propagates_repository_rejection() {
         let repo = recovery_repo("dirty-reject", COMPLETE_TASKS);
         repo.block_commits();
+        // The blocker lives inside `.git`, so the worktree needs its own
+        // content to select the add-and-commit path rather than the amend path.
+        std::fs::write(repo.workspace.join("dirty.txt"), "worktree content\n").unwrap();
         let config = OrchestratorConfig::default();
         let ws_mgr = repo.workspace_manager(&config);
         let before = repo.head_subject();
@@ -4495,6 +4917,9 @@ mod apply_commit_recovery {
             .args([
                 "commit",
                 "--no-verify",
+                // The blocker no longer sits in the worktree, so the snapshot
+                // records nothing — exactly as a real WIP snapshot may.
+                "--allow-empty",
                 "-m",
                 "WIP: clean-reject (1/1 tasks, apply#1)",
             ])
@@ -4575,6 +5000,657 @@ mod apply_commit_recovery {
         run_recovery_loop_as(repo, change_id, config, true).await
     }
 
+    /// `run_recovery_loop` that also hands back the agent, so the orchestration
+    /// feedback recorded for the next prompt can be inspected.
+    async fn run_recovery_loop_capturing_history<E: ApplyEventHandler>(
+        repo: &RecoveryRepo,
+        change_id: &str,
+        config: &OrchestratorConfig,
+        event_handler: &E,
+    ) -> (Result<ApplyLoopResult>, String) {
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let ws_mgr = repo.workspace_manager(config);
+
+        let result = scoped_apply_completion_check_interval_ms_for_test(
+            20,
+            scoped_apply_completion_grace_ms_for_test(
+                50,
+                execute_apply_loop(
+                    change_id,
+                    &repo.workspace,
+                    config,
+                    &mut agent,
+                    VcsBackend::Git,
+                    Some(&ws_mgr),
+                    None,
+                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    event_handler,
+                    None,
+                    &ai_runner,
+                    &ApplyBudget::new(),
+                    |_line| async move {},
+                ),
+            ),
+        )
+        .await;
+
+        let history = agent.format_apply_history(change_id);
+        (result, history)
+    }
+
+    /// Records every commit-presentation transition and streamed commit line.
+    #[derive(Default)]
+    struct CommitPresentationRecorder {
+        phases: std::sync::Mutex<Vec<(String, u32)>>,
+        lines: std::sync::Mutex<Vec<(String, u32, String)>>,
+    }
+
+    impl CommitPresentationRecorder {
+        fn phases(&self) -> Vec<(String, u32)> {
+            self.phases.lock().unwrap().clone()
+        }
+
+        fn lines(&self) -> Vec<(String, u32, String)> {
+            self.lines.lock().unwrap().clone()
+        }
+    }
+
+    impl ApplyEventHandler for CommitPresentationRecorder {
+        fn on_apply_started(&self, _change_id: &str, _command: &str) {}
+        fn on_progress_updated(&self, _change_id: &str, _completed: u32, _total: u32) {}
+        fn on_hook_started(&self, _change_id: &str, _hook_type: &str) {}
+        fn on_hook_completed(&self, _change_id: &str, _hook_type: &str) {}
+        fn on_hook_failed(&self, _change_id: &str, _hook_type: &str, _error: &str) {}
+        fn on_apply_output(&self, _change_id: &str, _line: &OutputLine, _iteration: u32) {}
+        fn on_apply_commit_phase(&self, _change_id: &str, phase: ApplyCommitPhase, attempt: u32) {
+            self.phases
+                .lock()
+                .unwrap()
+                .push((phase.as_str().to_string(), attempt));
+        }
+        fn on_apply_commit_output(
+            &self,
+            _change_id: &str,
+            attempt: u32,
+            stream: CommitOutputStream,
+            line: &str,
+        ) {
+            self.lines.lock().unwrap().push((
+                stream.as_str().to_string(),
+                attempt,
+                line.to_string(),
+            ));
+        }
+    }
+
+    /// Every subject currently in the workspace's history.
+    fn history_subjects(workspace: &Path) -> Vec<String> {
+        let output = std::process::Command::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(workspace)
+            .output()
+            .expect("git log should run");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The workspace's porcelain status, exactly as the stage gate reads it.
+    fn porcelain_status(workspace: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args([
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+                "--ignored=no",
+            ])
+            .current_dir(workspace)
+            .output()
+            .expect("git status should run");
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    // === Task-complete finalization stage gate (integration) ===
+
+    /// An untracked file the agent never selected must stop finalization dead:
+    /// no WIP snapshot, no commit attempt, and no acceptance handoff.
+    ///
+    /// The tasks are already complete when the loop starts, so this is also the
+    /// loop-entry/resume path, where nothing precedes the final-commit attempt.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn untracked_content_stops_task_complete_finalization_at_loop_entry() {
+        let repo = recovery_repo("stage-untracked", COMPLETE_TASKS);
+        std::fs::write(repo.workspace.join("stray.txt"), "unselected\n").unwrap();
+        let status_before = porcelain_status(&repo.workspace);
+        let subjects_before = history_subjects(&repo.workspace);
+
+        let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+        let config = OrchestratorConfig {
+            // The agent never stages anything, so every attempt fails the gate.
+            apply_command: Some(format!("sh -c 'echo attempt >> {}'", apply_log.display())),
+            max_iterations: Some(2),
+            ..Default::default()
+        };
+
+        let (result, history) = run_recovery_loop_capturing_history(
+            &repo,
+            "stage-untracked",
+            &config,
+            &NoOpEventHandler,
+        )
+        .await;
+
+        assert_eq!(
+            count_acceptance_dispatch(&result),
+            0,
+            "an unstaged workspace must not reach acceptance"
+        );
+        assert_eq!(
+            repo.hook_runs(),
+            0,
+            "the commit must never start, so repository hooks never run"
+        );
+        assert_eq!(
+            history_subjects(&repo.workspace),
+            subjects_before,
+            "a failed gate must create neither a WIP snapshot nor a final commit"
+        );
+        assert_eq!(
+            porcelain_status(&repo.workspace),
+            status_before,
+            "a failed gate must leave the workspace and index untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.workspace.join("stray.txt")).unwrap(),
+            "unselected\n",
+            "the dirty content stays as restart-visible repair evidence"
+        );
+        assert!(
+            history.contains("incomplete_stage"),
+            "the next prompt must carry structured stage feedback: {history}"
+        );
+        assert!(
+            history.contains("untracked: stray.txt"),
+            "the feedback must name the affected path: {history}"
+        );
+    }
+
+    /// Build a task-complete repo whose tracked edit was never staged. That is
+    /// exactly the content `git add -A` used to absorb silently.
+    fn unstaged_edit_case(change_id: &str) -> (RecoveryRepo, String) {
+        let repo = recovery_repo(change_id, COMPLETE_TASKS);
+        std::fs::write(repo.workspace.join("README.md"), "edited but not staged\n").unwrap();
+        let status = porcelain_status(&repo.workspace);
+        (repo, status)
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn an_unstaged_modification_blocks_finalization_until_the_agent_stages_it() {
+        let (repo, status_before) = unstaged_edit_case("stage-unstaged");
+        assert!(
+            status_before.contains(" M README.md"),
+            "precondition: an unstaged tracked edit ({status_before:?})"
+        );
+
+        let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+        let config = OrchestratorConfig {
+            // The repair iteration does what the gate asks: it stages the file.
+            apply_command: Some(format!(
+                "sh -c 'echo repair >> {}; git add README.md'",
+                apply_log.display()
+            )),
+            max_iterations: Some(3),
+            ..Default::default()
+        };
+
+        let (result, history) = run_recovery_loop_capturing_history(
+            &repo,
+            "stage-unstaged",
+            &config,
+            &NoOpEventHandler,
+        )
+        .await;
+
+        let loop_result = result.expect("a staged workspace must finalize");
+        assert!(loop_result.completed);
+        assert_eq!(
+            std::fs::read_to_string(&apply_log).unwrap().lines().count(),
+            1,
+            "exactly one repair iteration was needed"
+        );
+        assert_eq!(repo.head_subject(), "Apply: stage-unstaged");
+        assert!(
+            repo.hook_runs() >= 1,
+            "the finalization that followed the clean gate ran repository hooks"
+        );
+        assert!(
+            history.contains("incomplete_stage"),
+            "the repair iteration was told why it ran: {history}"
+        );
+    }
+
+    /// Staged entries are what a compliant agent leaves behind, so the gate must
+    /// pass them straight through to the existing finalization path.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_fully_staged_workspace_finalizes_without_a_repair_iteration() {
+        let repo = recovery_repo("stage-clean", COMPLETE_TASKS);
+        std::fs::write(repo.workspace.join("feature.rs"), "fn feature() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "feature.rs"])
+            .current_dir(&repo.workspace)
+            .output()
+            .expect("git add should run");
+
+        let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh -c 'echo attempt >> {}'", apply_log.display())),
+            max_iterations: Some(3),
+            ..Default::default()
+        };
+        let recorder = CommitPresentationRecorder::default();
+
+        let (result, _) =
+            run_recovery_loop_capturing_history(&repo, "stage-clean", &config, &recorder).await;
+
+        assert!(
+            result.expect("a staged workspace finalizes").completed,
+            "a clean gate hands off to the existing commit path"
+        );
+        assert!(
+            !apply_log.exists(),
+            "no repair agent runs when the gate passes at loop entry"
+        );
+        assert_eq!(repo.head_subject(), "Apply: stage-clean");
+        assert_eq!(
+            recorder.phases(),
+            vec![("started".to_string(), 0), ("completed".to_string(), 0)],
+            "commit presentation opens once and is cleared on success"
+        );
+    }
+
+    /// Path to a `pre-commit` hook that succeeds while writing a file into the
+    /// worktree, reproducing a generator hook that exits zero and leaves
+    /// content outside its own commit.
+    fn mutating_hooks_dir() -> &'static Path {
+        static HOOKS_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        HOOKS_DIR.get_or_init(|| {
+            const HOOK: &str = "#!/bin/sh\n\
+                                echo ran >> \"$(git rev-parse --git-dir)/hook.log\"\n\
+                                echo 'regenerating artifact'\n\
+                                echo 'hook progress on stderr' >&2\n\
+                                echo generated > generated.txt\n\
+                                exit 0\n";
+
+            let dir = std::env::temp_dir().join("cflx-apply-mutating-hooks");
+            std::fs::create_dir_all(&dir).unwrap();
+            let hook = dir.join("pre-commit");
+            if std::fs::read_to_string(&hook).ok().as_deref() != Some(HOOK) {
+                std::fs::write(&hook, HOOK).unwrap();
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            dir
+        })
+    }
+
+    /// Point a recovery repo at the exit-zero mutating hook.
+    fn use_mutating_hook(repo: &RecoveryRepo) {
+        std::process::Command::new("git")
+            .args([
+                "config",
+                "core.hooksPath",
+                &mutating_hooks_dir().display().to_string(),
+            ])
+            .current_dir(&repo.workspace)
+            .output()
+            .expect("git config core.hooksPath should run");
+    }
+
+    /// A hook that exits zero but leaves workspace content has produced changes
+    /// that are not in its own commit. Acceptance must not start on them.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn an_exit_zero_mutating_hook_blocks_acceptance_until_the_workspace_is_repaired() {
+        let repo = recovery_repo("hook-mutates", COMPLETE_TASKS);
+        use_mutating_hook(&repo);
+        let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+        let config = OrchestratorConfig {
+            // The agent never stages what the hook generated, so the workspace
+            // keeps coming back dirty and finalization never sticks.
+            apply_command: Some(format!("sh -c 'echo attempt >> {}'", apply_log.display())),
+            max_iterations: Some(2),
+            ..Default::default()
+        };
+
+        let (result, history) =
+            run_recovery_loop_capturing_history(&repo, "hook-mutates", &config, &NoOpEventHandler)
+                .await;
+
+        assert_eq!(
+            count_acceptance_dispatch(&result),
+            0,
+            "a hook that dirtied the workspace must keep acceptance undispatched"
+        );
+        assert!(
+            repo.workspace.join("generated.txt").exists(),
+            "precondition: the hook really did write into the worktree"
+        );
+        assert!(
+            history.contains("incomplete_stage"),
+            "the repair prompt must carry stage diagnostics: {history}"
+        );
+        assert!(
+            history.contains("untracked: generated.txt"),
+            "the diagnostics must name what the hook left behind: {history}"
+        );
+
+        // Restart derives the same route from the workspace alone: a verified
+        // Apply commit exists, yet the worktree is not clean. The routing
+        // decision itself is covered by
+        // `decide_resume_action_routes_applied_to_apply_when_workspace_is_not_clean`;
+        // what this asserts is that the workspace really presents that input.
+        assert!(
+            history_subjects(&repo.workspace).contains(&"Apply: hook-mutates".to_string()),
+            "the hook's own commit did land, so restart sees an Applied workspace"
+        );
+        assert!(
+            !classify_porcelain_status(&porcelain_status(&repo.workspace)).is_clean(),
+            "restart's routing input is a dirty applied workspace"
+        );
+    }
+
+    /// A repair iteration that stages the hook's output finalizes normally.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn staging_hook_generated_content_lets_finalization_complete() {
+        let repo = recovery_repo("hook-repaired", COMPLETE_TASKS);
+        use_mutating_hook(&repo);
+        let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'echo repair >> {}; git add -A generated.txt'",
+                apply_log.display()
+            )),
+            max_iterations: Some(4),
+            ..Default::default()
+        };
+
+        let (result, _) =
+            run_recovery_loop_capturing_history(&repo, "hook-repaired", &config, &NoOpEventHandler)
+                .await;
+
+        assert!(
+            result
+                .expect("a repaired workspace must finalize")
+                .completed,
+            "acceptance may be dispatched only once the workspace is clean"
+        );
+        assert_eq!(repo.head_subject(), "Apply: hook-repaired");
+        assert_eq!(
+            porcelain_status(&repo.workspace),
+            "",
+            "finalization completes only on a clean workspace"
+        );
+    }
+
+    // === Streamed final-commit output ===
+
+    /// Hook output must reach the operator sink line by line, with the change,
+    /// the source stream, and the finalization attempt attached — while the
+    /// classified outcome stays exactly what the captured path produced.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn final_commit_output_streams_with_stream_and_attempt_context() {
+        let repo = recovery_repo("stream-hook", COMPLETE_TASKS);
+        use_mutating_hook(&repo);
+        let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'echo repair >> {}; git add -A generated.txt'",
+                apply_log.display()
+            )),
+            max_iterations: Some(4),
+            ..Default::default()
+        };
+        let recorder = CommitPresentationRecorder::default();
+
+        let (result, _) =
+            run_recovery_loop_capturing_history(&repo, "stream-hook", &config, &recorder).await;
+
+        assert!(result.expect("the repaired workspace finalizes").completed);
+
+        let lines = recorder.lines();
+        // Git redirects a hook's stdout onto the commit process's stderr, so
+        // both hook lines legitimately arrive labelled `stderr`. What matters is
+        // that each line is attributed to the stream it actually came from and
+        // to the finalization attempt that produced it.
+        for hook_line in ["regenerating artifact", "hook progress on stderr"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|(stream, attempt, line)| stream == "stderr"
+                        && *attempt == 1
+                        && line == hook_line),
+                "hook progress must stream with its attempt: {lines:?}"
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|(stream, attempt, line)| stream == "stdout"
+                    && *attempt == 1
+                    && line.contains("Apply: stream-hook")),
+            "git's own commit summary must stream on stdout: {lines:?}"
+        );
+    }
+
+    /// A rejection must keep its complete captured evidence in the typed result
+    /// while the prompt receives only the bounded tail — and the same lines must
+    /// still have been visible while the hook was running.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn hook_rejection_streams_output_and_keeps_bounded_prompt_evidence() {
+        let repo = recovery_repo("stream-reject", COMPLETE_TASKS);
+        repo.block_commits();
+        let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh -c 'echo attempt >> {}'", apply_log.display())),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let recorder = CommitPresentationRecorder::default();
+
+        let (result, history) =
+            run_recovery_loop_capturing_history(&repo, "stream-reject", &config, &recorder).await;
+
+        assert_eq!(count_acceptance_dispatch(&result), 0);
+        let lines = recorder.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|(stream, attempt, line)| stream == "stderr"
+                    && *attempt == 1
+                    && line.contains("blocker.txt is present")),
+            "the rejecting hook's diagnostics must have streamed: {lines:?}"
+        );
+        assert!(
+            history.contains("final_commit_rejected"),
+            "the prompt keeps the typed rejection feedback: {history}"
+        );
+        assert!(
+            history.contains("blocker.txt is present"),
+            "the bounded tail carries the actionable text: {history}"
+        );
+        let phases = recorder.phases();
+        assert!(
+            phases.iter().any(|(phase, _)| phase == "failed"),
+            "a rejected finalization clears commit presentation: {phases:?}"
+        );
+        assert_eq!(
+            phases.last().map(|(phase, _)| phase.as_str()),
+            Some("failed"),
+            "no stale `[commit]` may outlive the last finalization: {phases:?}"
+        );
+    }
+
+    /// Commit presentation must reopen for the repair finalization and clear
+    /// again, never leaving a stale `[commit]` behind.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn commit_presentation_reopens_for_repair_and_clears_on_success() {
+        let repo = recovery_repo("presentation-cycle", COMPLETE_TASKS);
+        repo.block_commits();
+        let config = OrchestratorConfig {
+            apply_command: Some("sh -c 'rm -f .git/blocker.txt'".to_string()),
+            max_iterations: Some(3),
+            ..Default::default()
+        };
+        let recorder = CommitPresentationRecorder::default();
+
+        let (result, _) =
+            run_recovery_loop_capturing_history(&repo, "presentation-cycle", &config, &recorder)
+                .await;
+
+        assert!(result.expect("the repair removes the blocker").completed);
+        let phases: Vec<String> = recorder
+            .phases()
+            .into_iter()
+            .map(|(phase, _)| phase)
+            .collect();
+        assert_eq!(
+            phases.first().map(String::as_str),
+            Some("started"),
+            "presentation opens on the first finalization: {phases:?}"
+        );
+        assert_eq!(
+            phases.last().map(String::as_str),
+            Some("completed"),
+            "presentation is cleared by the successful finalization: {phases:?}"
+        );
+        assert!(
+            phases.iter().any(|phase| phase == "failed"),
+            "the rejected finalization cleared presentation before the repair: {phases:?}"
+        );
+    }
+
+    // === Empty successful iteration feedback ===
+
+    /// A successful iteration that changed nothing gets structured guidance for
+    /// the next attempt, without displacing stall accounting.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn an_empty_successful_iteration_records_structured_retry_feedback() {
+        let repo = recovery_repo("empty-iteration", INCOMPLETE_TASKS);
+        let config = OrchestratorConfig {
+            // Exits zero, touches nothing: the WIP snapshot is empty and no
+            // task is ticked.
+            apply_command: Some("true".to_string()),
+            max_iterations: Some(2),
+            ..Default::default()
+        };
+
+        let (result, history) = run_recovery_loop_capturing_history(
+            &repo,
+            "empty-iteration",
+            &config,
+            &NoOpEventHandler,
+        )
+        .await;
+
+        assert_eq!(count_acceptance_dispatch(&result), 0);
+        assert!(
+            history.contains("empty_apply_iteration"),
+            "an empty successful iteration must inform the next attempt: {history}"
+        );
+        assert!(
+            history.contains("changed neither task progress nor the workspace"),
+            "{history}"
+        );
+        assert!(
+            history.contains("still running in the background"),
+            "the feedback must forbid returning with background verification active: {history}"
+        );
+    }
+
+    /// A failing attempt is already represented by its own recorded exit status
+    /// and output tail, so it must not also be labelled an empty iteration.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_failed_iteration_is_not_reported_as_an_empty_iteration() {
+        let repo = recovery_repo("failed-iteration", INCOMPLETE_TASKS);
+        let config = OrchestratorConfig {
+            apply_command: Some("sh -c 'echo boom >&2; exit 3'".to_string()),
+            max_iterations: Some(2),
+            ..Default::default()
+        };
+
+        let (_, history) = run_recovery_loop_capturing_history(
+            &repo,
+            "failed-iteration",
+            &config,
+            &NoOpEventHandler,
+        )
+        .await;
+
+        assert!(
+            history.contains("exit_code: 3"),
+            "the failure itself is still recorded: {history}"
+        );
+        assert!(
+            !history.contains("empty_apply_iteration"),
+            "a non-zero exit is classified as a failure, not an empty iteration: {history}"
+        );
+    }
+
+    /// A blocker handoff leaves the loop before any empty-iteration accounting,
+    /// so its classification must survive untouched.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_blocked_handoff_is_not_reported_as_an_empty_iteration() {
+        let repo = recovery_repo("blocked-iteration", INCOMPLETE_TASKS);
+        let marker_dir = repo
+            .workspace
+            .join("openspec")
+            .join("changes")
+            .join("blocked-iteration")
+            .join("APPLY_BLOCKED");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'mkdir -p {dir} && printf \"# APPLY_BLOCKED\\n\\n- change_id: blocked-iteration\\n- reason: external\\n\" > {dir}/marker.md'",
+                dir = marker_dir.display()
+            )),
+            max_iterations: Some(3),
+            ..Default::default()
+        };
+
+        let (result, history) = run_recovery_loop_capturing_history(
+            &repo,
+            "blocked-iteration",
+            &config,
+            &NoOpEventHandler,
+        )
+        .await;
+
+        let loop_result = result.expect("a blocker handoff is not a loop error");
+        assert!(!loop_result.completed);
+        assert!(
+            loop_result.blocked_handoff.is_some(),
+            "the handoff classification must be preserved"
+        );
+        assert!(
+            !history.contains("empty_apply_iteration"),
+            "empty feedback must not override a handoff outcome: {history}"
+        );
+    }
+
     /// Stand-in for the failure mapping both callers apply to a loop error:
     /// serial returns it unchanged, parallel renders it as `Apply failed: {e}`.
     fn caller_visible_failure(result: &Result<ApplyLoopResult>) -> Option<String> {
@@ -4592,7 +5668,7 @@ mod apply_commit_recovery {
         let apply_log = repo.workspace.parent().unwrap().join("apply.log");
         let config = OrchestratorConfig {
             apply_command: Some(format!(
-                "sh -c 'echo repair >> {}; rm -f blocker.txt'",
+                "sh -c 'echo repair >> {}; rm -f .git/blocker.txt'",
                 apply_log.display()
             )),
             max_iterations: Some(5),
@@ -4664,9 +5740,19 @@ mod apply_commit_recovery {
         let repo = recovery_repo("terminal-vcs", COMPLETE_TASKS);
         // A forbidden temporary path fails staged-snapshot validation before
         // the commit runs: a pre-commit setup failure, not a hook rejection.
+        //
+        // It is staged rather than left untracked because the finalization
+        // stage gate now runs first: an unstaged forbidden path is an agent
+        // staging omission, while a *staged* one is exactly the case
+        // snapshot validation exists to refuse.
         let forbidden = repo.workspace.join(".agent-target");
         std::fs::create_dir_all(&forbidden).unwrap();
         std::fs::write(forbidden.join("artifact"), "x").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-f", ".agent-target"])
+            .current_dir(&repo.workspace)
+            .output()
+            .expect("git add should run");
         let apply_log = repo.workspace.parent().unwrap().join("apply.log");
         let config = OrchestratorConfig {
             apply_command: Some(format!("sh -c 'echo attempt >> {}'", apply_log.display())),
@@ -4736,7 +5822,7 @@ mod apply_commit_recovery {
         let apply_log = parallel_repo.workspace.parent().unwrap().join("apply.log");
         let parallel_config = OrchestratorConfig {
             apply_command: Some(format!(
-                "sh -c 'echo repair >> {}; rm -f blocker.txt'",
+                "sh -c 'echo repair >> {}; rm -f .git/blocker.txt'",
                 apply_log.display()
             )),
             max_iterations: Some(3),
@@ -4787,6 +5873,7 @@ mod apply_commit_recovery {
             "lock-then-commit",
             None,
             &environment,
+            None,
         )
         .await
         .expect("transient contention must not fail finalization");
@@ -4881,7 +5968,7 @@ mod apply_commit_recovery {
 /// whole verification set declared by the change proposal.
 #[cfg(test)]
 mod apply_budget_recovery {
-    use super::tests::{init_git_repo, make_test_ai_runner};
+    use super::tests::{init_git_repo, make_test_ai_runner, stage_all};
     use super::*;
     use tempfile::TempDir;
 
@@ -5199,6 +6286,9 @@ mod apply_budget_recovery {
         let workspace = temp_dir.path();
         init_git_repo(workspace);
         write_tasks(workspace, "change-a", PENDING_TASKS);
+        // The finalization stage gate refuses an unstaged workspace, so the
+        // change files start staged and the agent stages what it writes.
+        stage_all(workspace);
         let tasks_path = workspace
             .join("openspec")
             .join("changes")
@@ -5212,7 +6302,7 @@ mod apply_budget_recovery {
         let config = OrchestratorConfig {
             apply_command: Some(format!(
                 "sh -c 'echo run >> {log}; \
-                 if [ $(wc -l < {log}) -ge 2 ]; then printf \"## Implementation Tasks\\n- [x] implement\\n\" > {tasks}; exit 0; fi; \
+                 if [ $(wc -l < {log}) -ge 2 ]; then printf \"## Implementation Tasks\\n- [x] implement\\n\" > {tasks}; git add -A; exit 0; fi; \
                  echo partial-progress >&2; exit 7'",
                 log = attempts_log.display(),
                 tasks = tasks_path.display(),

@@ -4,7 +4,7 @@
 //! traits, forwarding all output to a ParallelEvent channel for the TUI to display.
 
 use crate::agent::OutputLine;
-use crate::events::ExecutionEvent as ParallelEvent;
+use crate::events::{ApplyCommitPhase, CommitOutputStream, ExecutionEvent as ParallelEvent};
 use crate::execution::apply::ApplyEventHandler;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -129,6 +129,47 @@ impl ApplyEventHandler for ParallelApplyEventHandler {
             });
         }
     }
+
+    fn on_apply_commit_phase(&self, change_id: &str, phase: ApplyCommitPhase, attempt: u32) {
+        debug!(
+            "Apply commit phase for {}: {} (attempt {})",
+            change_id,
+            phase.as_str(),
+            attempt
+        );
+        if let Some(ref tx) = self.event_tx {
+            let tx = tx.clone();
+            let event = ParallelEvent::ApplyCommitPhase {
+                change_id: change_id.to_string(),
+                phase,
+                attempt,
+            };
+            tokio::spawn(async move {
+                let _ = tx.send(event).await;
+            });
+        }
+    }
+
+    fn on_apply_commit_output(
+        &self,
+        change_id: &str,
+        attempt: u32,
+        stream: CommitOutputStream,
+        line: &str,
+    ) {
+        if let Some(ref tx) = self.event_tx {
+            let tx = tx.clone();
+            let event = ParallelEvent::ApplyCommitOutput {
+                change_id: change_id.to_string(),
+                attempt,
+                stream,
+                line: line.to_string(),
+            };
+            tokio::spawn(async move {
+                let _ = tx.send(event).await;
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +206,81 @@ mod tests {
         handler.on_hook_started("test-change", "pre_apply");
         handler.on_hook_completed("test-change", "pre_apply");
         handler.on_hook_failed("test-change", "pre_apply", "test error");
+        handler.on_apply_commit_phase("test-change", ApplyCommitPhase::Started, 1);
+        handler.on_apply_commit_output("test-change", 1, CommitOutputStream::Stdout, "line");
+    }
+
+    /// Collect the next `count` events, in order.
+    async fn drain(rx: &mut mpsc::Receiver<ParallelEvent>, count: usize) -> Vec<ParallelEvent> {
+        let mut events = Vec::new();
+        for _ in 0..count {
+            events.push(
+                timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("timeout waiting for event")
+                    .expect("channel closed unexpectedly"),
+            );
+        }
+        events
+    }
+
+    /// The bridge must forward finalization presentation to the frontend
+    /// channel, with the change, phase, and attempt intact.
+    #[tokio::test]
+    async fn commit_phase_transitions_reach_the_event_channel() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let handler = ParallelApplyEventHandler::new("change-a".to_string(), Some(tx));
+
+        handler.on_apply_commit_phase("change-a", ApplyCommitPhase::Started, 3);
+        handler.on_apply_commit_phase("change-a", ApplyCommitPhase::Failed, 3);
+
+        let mut observed: Vec<(String, u32)> = drain(&mut rx, 2)
+            .await
+            .into_iter()
+            .map(|event| match event {
+                ParallelEvent::ApplyCommitPhase {
+                    change_id,
+                    phase,
+                    attempt,
+                } => {
+                    assert_eq!(change_id, "change-a");
+                    (phase.as_str().to_string(), attempt)
+                }
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
+        // The bridge sends each event from its own task, so ordering between
+        // two independent sends is not guaranteed; the set is what matters.
+        observed.sort();
+        assert_eq!(
+            observed,
+            vec![("failed".to_string(), 3), ("started".to_string(), 3)]
+        );
+    }
+
+    /// Streamed commit lines must arrive with their stream and attempt so the
+    /// frontend can label them; nothing here may collapse duplicates.
+    #[tokio::test]
+    async fn streamed_commit_lines_reach_the_event_channel_with_attribution() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let handler = ParallelApplyEventHandler::new("change-a".to_string(), Some(tx));
+
+        handler.on_apply_commit_output("change-a", 2, CommitOutputStream::Stderr, "hook says hi");
+
+        let events = drain(&mut rx, 1).await;
+        match &events[0] {
+            ParallelEvent::ApplyCommitOutput {
+                change_id,
+                attempt,
+                stream,
+                line,
+            } => {
+                assert_eq!(change_id, "change-a");
+                assert_eq!(*attempt, 2);
+                assert_eq!(*stream, CommitOutputStream::Stderr);
+                assert_eq!(line, "hook says hi");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

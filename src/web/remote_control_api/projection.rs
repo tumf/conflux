@@ -704,6 +704,28 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
             Some(change_id.clone()),
             json!({ "iteration": iteration }),
         ),
+        E::ApplyCommitPhase {
+            change_id,
+            phase,
+            attempt,
+        } => (
+            "apply_commit_phase",
+            Some(change_id.clone()),
+            json!({ "phase": phase.as_str(), "attempt": attempt }),
+        ),
+        // Streamed hook output is high volume and untrusted repository text, so
+        // the remote event carries only its attribution; the line itself stays
+        // in the operator log.
+        E::ApplyCommitOutput {
+            change_id,
+            attempt,
+            stream,
+            ..
+        } => (
+            "apply_commit_output",
+            Some(change_id.clone()),
+            json!({ "attempt": attempt, "stream": stream.as_str() }),
+        ),
         E::ArchiveStarted { change_id, command } => (
             "archive_started",
             Some(change_id.clone()),

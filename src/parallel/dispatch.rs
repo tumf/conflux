@@ -18,6 +18,7 @@ use tracing::{debug, error, info, warn};
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
+use crate::execution::stage_gate::WorkspaceStageStatus;
 use crate::execution::state::{detect_workspace_state, is_merged_to_base, WorkspaceState};
 use crate::orchestration::acceptance::{
     decide_acceptance_blocker, decide_acceptance_retry, normalize_findings,
@@ -218,6 +219,7 @@ mod tests {
         archived_dirty_repair_candidate_from_unmerged_workspace, decide_resume_action,
         resume_cycle_flags, should_run_apply, ResumeAction,
     };
+    use crate::execution::stage_gate::{classify_porcelain_status, WorkspaceStageStatus};
     use crate::execution::state::WorkspaceState;
     use crate::parallel::acceptance_state::{
         AcceptanceRetryContext, BlockedMarker, BlockedMarkerOrigin,
@@ -424,8 +426,12 @@ mod tests {
         )
         .unwrap();
 
-        let action =
-            decide_resume_action("change-incomplete", tmp.path(), &WorkspaceState::Applied);
+        let action = decide_resume_action(
+            "change-incomplete",
+            tmp.path(),
+            &WorkspaceState::Applied,
+            &WorkspaceStageStatus::default(),
+        );
         assert_eq!(action, ResumeAction::Acceptance);
     }
 
@@ -452,13 +458,82 @@ mod tests {
         fs::create_dir_all(stale_checkpoint.parent().unwrap()).unwrap();
         fs::write(&stale_checkpoint, "{\"state\":\"passed\"}\n").unwrap();
 
-        let action = decide_resume_action("change-complete", tmp.path(), &WorkspaceState::Applied);
+        let action = decide_resume_action(
+            "change-complete",
+            tmp.path(),
+            &WorkspaceState::Applied,
+            &WorkspaceStageStatus::default(),
+        );
         assert_eq!(action, ResumeAction::Acceptance);
         assert_eq!(
             fs::read_to_string(&stale_checkpoint).unwrap(),
             "{\"state\":\"passed\"}\n",
             "resume routing must neither consume nor rewrite generated acceptance state"
         );
+    }
+
+    /// A verified Apply commit plus a dirty worktree is the signature of a hook
+    /// that mutated files after its own commit succeeded. That content is not in
+    /// the commit, so restart must resume into Apply repair rather than
+    /// Acceptance — and it must reach that conclusion from the workspace alone.
+    #[test]
+    fn decide_resume_action_routes_applied_to_apply_when_workspace_is_not_clean() {
+        let tmp = TempDir::new().unwrap();
+        init_git_workspace(tmp.path());
+        let change_dir = tmp.path().join("openspec/changes/change-dirty");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nchange_type: implementation\n---\n# Change\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n",
+        )
+        .unwrap();
+
+        for porcelain in [" M src/generated.rs\n", "?? docs/openapi.yaml\n"] {
+            let action = decide_resume_action(
+                "change-dirty",
+                tmp.path(),
+                &WorkspaceState::Applied,
+                &classify_porcelain_status(porcelain),
+            );
+            assert_eq!(
+                action,
+                ResumeAction::Apply,
+                "a dirty applied workspace must resume into repair for {porcelain:?}"
+            );
+        }
+    }
+
+    /// Staged-but-uncommitted content is not the hook-mutation signature: the
+    /// gate accepts a staged index, so routing must not treat it as dirty.
+    #[test]
+    fn decide_resume_action_keeps_acceptance_for_a_staged_applied_workspace() {
+        let tmp = TempDir::new().unwrap();
+        init_git_workspace(tmp.path());
+        let change_dir = tmp.path().join("openspec/changes/change-staged");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nchange_type: implementation\n---\n# Change\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n",
+        )
+        .unwrap();
+
+        let action = decide_resume_action(
+            "change-staged",
+            tmp.path(),
+            &WorkspaceState::Applied,
+            &classify_porcelain_status("M  src/lib.rs\n"),
+        );
+        assert_eq!(action, ResumeAction::Acceptance);
     }
 
     #[test]
@@ -478,8 +553,12 @@ mod tests {
         )
         .unwrap();
 
-        let action =
-            decide_resume_action("change-incomplete", tmp.path(), &WorkspaceState::Applied);
+        let action = decide_resume_action(
+            "change-incomplete",
+            tmp.path(),
+            &WorkspaceState::Applied,
+            &WorkspaceStageStatus::default(),
+        );
         assert_eq!(action, ResumeAction::Apply);
     }
 
@@ -500,7 +579,12 @@ mod tests {
         )
         .unwrap();
 
-        let action = decide_resume_action("change-follow-up", tmp.path(), &WorkspaceState::Applied);
+        let action = decide_resume_action(
+            "change-follow-up",
+            tmp.path(),
+            &WorkspaceState::Applied,
+            &WorkspaceStageStatus::default(),
+        );
         assert_eq!(action, ResumeAction::Apply);
     }
 
@@ -547,7 +631,12 @@ mod tests {
             crate::task_parser::TaskProgress::with_counts(1, 3)
         );
         assert_eq!(
-            decide_resume_action(change_id, tmp.path(), &WorkspaceState::Applied),
+            decide_resume_action(
+                change_id,
+                tmp.path(),
+                &WorkspaceState::Applied,
+                &WorkspaceStageStatus::default()
+            ),
             ResumeAction::Apply
         );
     }
@@ -555,7 +644,12 @@ mod tests {
     #[test]
     fn decide_resume_action_keeps_archived_as_terminal() {
         let tmp = TempDir::new().unwrap();
-        let action = decide_resume_action("change-archived", tmp.path(), &WorkspaceState::Archived);
+        let action = decide_resume_action(
+            "change-archived",
+            tmp.path(),
+            &WorkspaceState::Archived,
+            &WorkspaceStageStatus::default(),
+        );
         assert_eq!(action, ResumeAction::Terminal);
     }
 
@@ -1070,10 +1164,17 @@ pub(super) enum ResumeAction {
     Rejecting,
 }
 
+/// Decide what a resumed workspace should do next, from workspace evidence only.
+///
+/// `workspace_stage` is the current `git status --porcelain` classification.
+/// It is passed in rather than read here so this stays a pure decision the
+/// caller can exercise without a repository, and so the same status read
+/// serves both this router and the logging around it.
 pub(super) fn decide_resume_action(
     change_id: &str,
     workspace_path: &Path,
     state: &WorkspaceState,
+    workspace_stage: &WorkspaceStageStatus,
 ) -> ResumeAction {
     match state {
         WorkspaceState::Merged => ResumeAction::Terminal,
@@ -1084,6 +1185,23 @@ pub(super) fn decide_resume_action(
             {
                 info!(
                     "Resume route for '{}' forcing apply because implementation tasks are incomplete",
+                    change_id
+                );
+                return ResumeAction::Apply;
+            }
+
+            // A verified Apply commit exists, yet the worktree still holds
+            // content that is not in it — most often because a repository hook
+            // edited or generated files after its own commit succeeded. That
+            // content has never been reviewed or committed, so Acceptance must
+            // not start on it. The evidence is the workspace itself, so a
+            // restart reaches the same conclusion with no retained state.
+            if !workspace_stage.is_clean() {
+                info!(
+                    change_id = change_id,
+                    unstaged = workspace_stage.unstaged_paths().len(),
+                    untracked = workspace_stage.untracked_paths().len(),
+                    "Resume route for '{}' forcing apply repair because the applied workspace is not clean",
                     change_id
                 );
                 return ResumeAction::Apply;
@@ -1576,7 +1694,31 @@ impl ParallelExecutor {
             // Apply revision, so `decide_resume_action` selects Acceptance
             // without rerunning Apply — the same route a restart takes.
             let resume_action = if was_resumed {
-                decide_resume_action(&change_id, &workspace.path, &effective_state)
+                // Read once, here, so the router sees the same workspace status
+                // the resume log reports. An unreadable status degrades to
+                // "clean", which is exactly the pre-existing routing.
+                let workspace_stage =
+                    match crate::vcs::git::commands::porcelain_status(&workspace.path).await {
+                        Ok(porcelain) => {
+                            crate::execution::stage_gate::classify_porcelain_status(&porcelain)
+                        }
+                        Err(error) => {
+                            warn!(
+                                change_id = %change_id,
+                                workspace = %workspace.path.display(),
+                                error = %error,
+                                "Could not read workspace status for resume routing; \
+                                 treating the workspace as clean"
+                            );
+                            WorkspaceStageStatus::default()
+                        }
+                    };
+                decide_resume_action(
+                    &change_id,
+                    &workspace.path,
+                    &effective_state,
+                    &workspace_stage,
+                )
             } else {
                 ResumeAction::Apply
             };

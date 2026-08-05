@@ -280,6 +280,15 @@ pub struct ChangeRuntimeState {
     /// True when a change was explicitly force-stopped and dequeued.
     /// While true, stale in-flight execution events must not re-activate this change.
     pub dequeued: bool,
+    /// Ephemeral final-commit presentation: the finalization attempt currently
+    /// running, if any.
+    ///
+    /// Presentation only, and process-local by construction. It never changes
+    /// [`Self::display_status`], is never persisted, and must never be read by
+    /// scheduler eligibility, resume routing, acceptance, archive, merge, or any
+    /// other next-action decision — those are re-derived from the workspace
+    /// after a restart, which is exactly when this field is gone.
+    pub commit_phase_attempt: Option<u32>,
 }
 
 impl ChangeRuntimeState {
@@ -510,11 +519,33 @@ impl ChangeRuntimeState {
         true
     }
 
+    /// Operation label the Apply lane renders for this change.
+    ///
+    /// `"commit"` while the ephemeral finalization subphase is active, `"apply"`
+    /// otherwise. This is a *rendering* projection layered on top of the
+    /// canonical `applying` status, which [`Self::display_status`] keeps
+    /// returning unchanged throughout finalization.
+    pub fn apply_operation_label(&self) -> &'static str {
+        match self.commit_phase_attempt {
+            Some(_) => "commit",
+            None => "apply",
+        }
+    }
+
+    /// The finalization attempt currently being presented, if any.
+    pub fn commit_phase_attempt(&self) -> Option<u32> {
+        self.commit_phase_attempt
+    }
+
     /// Derive the display status string used by TUI and Web.
     ///
     /// Returns one of: "not queued", "queued", "blocked", "stalled", "preparing",
     /// "applying", "accepting", "rejecting", "archiving", "resolving", "merge wait",
     /// "resolve pending", "reject pending", "archived", "merged", "error", "stopped".
+    ///
+    /// The ephemeral commit subphase deliberately does not appear here: it is
+    /// presentation detail, and the canonical lifecycle stays `applying` for the
+    /// whole finalization sequence.
     pub fn display_status(&self) -> &'static str {
         // Terminal states take precedence.
         match &self.terminal {
@@ -1386,6 +1417,18 @@ impl OrchestratorState {
             .collect()
     }
 
+    /// Ephemeral Apply-lane operation label for every known change.
+    ///
+    /// `"commit"` only while a finalization subphase is active. Frontends read
+    /// this for rendering; nothing in the scheduler, resume router, or gating
+    /// logic may consult it.
+    pub fn all_apply_operation_labels(&self) -> HashMap<String, &'static str> {
+        self.change_runtime
+            .iter()
+            .map(|(id, rt)| (id.clone(), rt.apply_operation_label()))
+            .collect()
+    }
+
     /// Reducer-retained final diagnostics for every change in
     /// [`TerminalState::Error`].
     ///
@@ -1865,6 +1908,10 @@ impl OrchestratorState {
                 rt.clear_blocked_metadata();
                 should_start = true;
             }
+            // A repair iteration always restores apply presentation, including
+            // on a row this reducer declined to reactivate: stale `[commit]`
+            // must never outlive the finalization that set it.
+            rt.commit_phase_attempt = None;
         }
         if should_start {
             self.set_current_change(Some(change_id.to_string()));
@@ -1874,9 +1921,29 @@ impl OrchestratorState {
     fn on_apply_completed(&mut self, change_id: &str) {
         self.increment_apply_count(change_id);
         let rt = self.runtime_entry(change_id);
+        rt.commit_phase_attempt = None;
         if matches!(rt.activity, ActivityState::Applying) {
             rt.activity = ActivityState::Idle;
         }
+    }
+
+    /// Record the ephemeral final-commit presentation phase.
+    ///
+    /// Nothing about the canonical lifecycle moves here: the change stays in
+    /// whatever activity it was already in. Only a `Started` phase leaves
+    /// presentation active, so completion, failure, and cancellation all clear
+    /// it, and a terminal or dequeued row never adopts it at all.
+    fn on_apply_commit_phase(
+        &mut self,
+        change_id: &str,
+        phase: crate::events::ApplyCommitPhase,
+        attempt: u32,
+    ) {
+        let rt = self.runtime_entry(change_id);
+        rt.commit_phase_attempt = match phase.is_active() && !rt.is_terminal() && !rt.dequeued {
+            true => Some(attempt),
+            false => None,
+        };
     }
 
     fn on_acceptance_started(&mut self, change_id: &str) {
@@ -2073,9 +2140,15 @@ impl OrchestratorState {
             ExecutionEvent::ApplyStarted { change_id, .. } => self.on_apply_started(change_id),
             ExecutionEvent::ApplyCompleted { change_id, .. } => self.on_apply_completed(change_id),
             ExecutionEvent::ApplyFailed { change_id, error } => {
+                self.runtime_entry(change_id).commit_phase_attempt = None;
                 self.remove_from_pending(change_id);
                 self.transition_change_to_error(change_id, error.clone());
             }
+            ExecutionEvent::ApplyCommitPhase {
+                change_id,
+                phase,
+                attempt,
+            } => self.on_apply_commit_phase(change_id, *phase, *attempt),
 
             // Acceptance events
             ExecutionEvent::AcceptanceStarted { change_id, .. } => {
@@ -3404,6 +3477,160 @@ mod tests {
     // -----------------------------------------------------------------------
     // Phase 2.3: apply_execution_event transitions
     // -----------------------------------------------------------------------
+
+    // === Ephemeral Apply commit subphase ===
+
+    /// The commit subphase is presentation only: it changes the Apply lane's
+    /// rendered operation and nothing else. The canonical lifecycle, the queue
+    /// intent, and every routing input stay exactly where they were.
+    #[test]
+    fn commit_presentation_never_changes_the_canonical_lifecycle() {
+        use crate::events::{ApplyCommitPhase, ExecutionEvent};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "c".to_string(),
+            command: "cmd".to_string(),
+        });
+        let before = state.change_runtime("c").cloned().expect("runtime");
+
+        state.apply_execution_event(&ExecutionEvent::ApplyCommitPhase {
+            change_id: "c".to_string(),
+            phase: ApplyCommitPhase::Started,
+            attempt: 4,
+        });
+
+        let during = state.change_runtime("c").expect("runtime");
+        assert_eq!(
+            state.display_status("c"),
+            "applying",
+            "the canonical status must not become a commit state"
+        );
+        assert_eq!(during.apply_operation_label(), "commit");
+        assert_eq!(during.commit_phase_attempt(), Some(4));
+        assert_eq!(during.activity, before.activity);
+        assert_eq!(during.wait_state, before.wait_state);
+        assert_eq!(during.queue_intent, before.queue_intent);
+        assert!(state.global_invariants_hold());
+    }
+
+    /// Completion, failure, and a repair `ApplyStarted` all clear presentation,
+    /// so no row can be left rendering a `[commit]` that is no longer running.
+    #[test]
+    fn every_terminal_commit_phase_clears_presentation() {
+        use crate::events::{ApplyCommitPhase, ExecutionEvent};
+
+        for closing in [ApplyCommitPhase::Completed, ApplyCommitPhase::Failed] {
+            let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+            state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+                change_id: "c".to_string(),
+                command: "cmd".to_string(),
+            });
+            state.apply_execution_event(&ExecutionEvent::ApplyCommitPhase {
+                change_id: "c".to_string(),
+                phase: ApplyCommitPhase::Started,
+                attempt: 1,
+            });
+            state.apply_execution_event(&ExecutionEvent::ApplyCommitPhase {
+                change_id: "c".to_string(),
+                phase: closing,
+                attempt: 1,
+            });
+
+            let runtime = state.change_runtime("c").expect("runtime");
+            assert_eq!(
+                runtime.commit_phase_attempt(),
+                None,
+                "{closing:?} must clear commit presentation"
+            );
+            assert_eq!(runtime.apply_operation_label(), "apply");
+            assert_eq!(state.display_status("c"), "applying");
+        }
+    }
+
+    /// A repair iteration restores `[apply]` even if the closing phase event was
+    /// never observed.
+    #[test]
+    fn a_repair_iteration_restores_apply_presentation() {
+        use crate::events::{ApplyCommitPhase, ExecutionEvent};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::ApplyCommitPhase {
+            change_id: "c".to_string(),
+            phase: ApplyCommitPhase::Started,
+            attempt: 2,
+        });
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "c".to_string(),
+            command: "cmd".to_string(),
+        });
+
+        assert_eq!(
+            state
+                .change_runtime("c")
+                .expect("runtime")
+                .commit_phase_attempt(),
+            None,
+            "ApplyStarted always clears commit presentation"
+        );
+        assert_eq!(
+            state.all_apply_operation_labels().get("c").copied(),
+            Some("apply")
+        );
+    }
+
+    /// A terminal or dequeued row must not adopt commit presentation from a
+    /// late in-flight event.
+    #[test]
+    fn a_terminal_row_never_adopts_commit_presentation() {
+        use crate::events::{ApplyCommitPhase, ExecutionEvent};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::ApplyFailed {
+            change_id: "c".to_string(),
+            error: "boom".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ApplyCommitPhase {
+            change_id: "c".to_string(),
+            phase: ApplyCommitPhase::Started,
+            attempt: 1,
+        });
+
+        assert_eq!(state.display_status("c"), "error");
+        assert_eq!(
+            state
+                .change_runtime("c")
+                .expect("runtime")
+                .commit_phase_attempt(),
+            None
+        );
+    }
+
+    /// Constitutional law 1: a restart re-derives routing from the workspace, so
+    /// commit presentation must simply be absent in a fresh reducer and must not
+    /// be reachable from any persisted input.
+    #[test]
+    fn a_fresh_reducer_has_no_commit_presentation() {
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        assert_eq!(
+            state.all_apply_operation_labels().get("c").copied(),
+            Some("apply"),
+            "a fresh reducer presents the Apply lane, never a commit subphase"
+        );
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
+            change_id: "c".to_string(),
+            command: "cmd".to_string(),
+        });
+        assert_eq!(
+            state
+                .change_runtime("c")
+                .expect("runtime")
+                .commit_phase_attempt(),
+            None,
+            "process-local commit presentation starts empty"
+        );
+    }
 
     #[test]
     fn test_apply_execution_event_transitions() {

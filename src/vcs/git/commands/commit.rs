@@ -3,10 +3,19 @@
 //! This module provides functions for creating, managing, and querying Git commits.
 
 use super::basic::run_git;
-use crate::vcs::commands::{run_vcs_command_captured, VcsCommandOutput};
+use crate::events::CommitOutputStream;
+use crate::vcs::commands::{run_vcs_command_captured, run_vcs_command_streamed, VcsCommandOutput};
 use crate::vcs::{CommitRejection, VcsBackend, VcsError, VcsResult, VerifiedCommitOutcome};
 use std::path::Path;
 use tracing::debug;
+
+/// Presentation sink for streamed verified-commit output.
+///
+/// The sink observes lines only. Everything classification depends on — command
+/// line, exit code, complete raw stdout and stderr — travels in the returned
+/// [`VcsCommandOutput`], so a sink can never influence whether a commit is
+/// treated as rejected, retryable, or fatal.
+pub type CommitOutputSink<'a> = &'a (dyn Fn(CommitOutputStream, &str) + Send + Sync);
 
 /// Exit status `git commit` reports when the repository itself rejects the
 /// commit, most importantly a non-zero `pre-commit` or `commit-msg` hook.
@@ -92,6 +101,7 @@ pub fn classify_verified_commit_output(
 async fn run_verified_commit<P: AsRef<Path>>(
     cwd: P,
     args: &[String],
+    sink: Option<CommitOutputSink<'_>>,
 ) -> VcsResult<VerifiedCommitOutcome> {
     debug_assert!(
         !args.iter().any(|arg| arg == "--no-verify"),
@@ -99,7 +109,21 @@ async fn run_verified_commit<P: AsRef<Path>>(
     );
 
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let output = run_vcs_command_captured("git", &arg_refs, cwd.as_ref(), VcsBackend::Git).await?;
+    // Both paths produce the same `VcsCommandOutput` contract, so the
+    // classification below is identical whether or not an operator is watching.
+    let output = match sink {
+        Some(sink) => {
+            run_vcs_command_streamed(
+                "git",
+                &arg_refs,
+                cwd.as_ref(),
+                VcsBackend::Git,
+                |stream, line| sink(stream, line),
+            )
+            .await?
+        }
+        None => run_vcs_command_captured("git", &arg_refs, cwd.as_ref(), VcsBackend::Git).await?,
+    };
 
     classify_verified_commit_output(output, cwd.as_ref())
 }
@@ -112,6 +136,20 @@ pub async fn create_verified_commit<P: AsRef<Path>>(
     cwd: P,
     message: &str,
 ) -> VcsResult<VerifiedCommitOutcome> {
+    create_verified_commit_streamed(cwd, message, None).await
+}
+
+/// `create_verified_commit` with an optional presentation sink.
+///
+/// A long pre-commit hook is otherwise invisible until the process exits, which
+/// is exactly the window an operator most needs to see. Streaming changes when
+/// the output is observed, never what it is: the returned outcome is classified
+/// from the same preserved command, exit status, and raw streams either way.
+pub async fn create_verified_commit_streamed<P: AsRef<Path>>(
+    cwd: P,
+    message: &str,
+    sink: Option<CommitOutputSink<'_>>,
+) -> VcsResult<VerifiedCommitOutcome> {
     let mode = if has_changes_to_commit(&cwd).await? {
         run_git(&["add", "-A"], &cwd).await?;
         validate_staged_snapshot(&cwd).await?;
@@ -120,7 +158,7 @@ pub async fn create_verified_commit<P: AsRef<Path>>(
         VerifiedCommitMode::Amend
     };
 
-    run_verified_commit(&cwd, &verified_commit_args(mode, message)).await
+    run_verified_commit(&cwd, &verified_commit_args(mode, message), sink).await
 }
 
 fn staged_snapshot_anomaly<'a>(paths: impl Iterator<Item = &'a str>) -> Option<String> {

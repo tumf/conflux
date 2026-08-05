@@ -423,6 +423,11 @@ async fn final_commit_recorded(
 /// contention at any stage is covered by one policy and no stale mode decision
 /// is replayed after another actor changed repository state.
 ///
+/// It receives the 1-based attempt number. Contention retries re-run the same
+/// hooks and therefore reproduce the same output; labelling each attempt is
+/// what keeps two identical transcripts attributable to the attempts that
+/// produced them instead of looking like one duplicated block.
+///
 /// `Ok(VerifiedCommitOutcome::RepositoryRejected(_))` is returned immediately:
 /// a hook rejection is repository-fixable apply feedback, not contention, and
 /// must not consume this budget.
@@ -434,7 +439,7 @@ pub async fn run_final_commit_with_retry<F, Fut>(
     cancel_token: Option<&CancellationToken>,
 ) -> VcsResult<VerifiedCommitOutcome>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(u32) -> Fut,
     Fut: Future<Output = VcsResult<VerifiedCommitOutcome>>,
 {
     let mut identity: Option<FinalCommitIdentity> = None;
@@ -453,7 +458,7 @@ where
             }
         };
 
-        let error = match attempt_finalization().await {
+        let error = match attempt_finalization(attempt).await {
             // A repository rejection is a typed apply-repair outcome, not a
             // VCS failure: it leaves this policy untouched.
             Ok(outcome) => return Ok(outcome),
@@ -1132,7 +1137,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let outcome = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 let mut attempts = attempts.lock().unwrap();
                 *attempts += 1;
                 if *attempts == 1 {
@@ -1165,7 +1170,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 let mut attempts = attempts.lock().unwrap();
                 *attempts += 1;
                 if *attempts == 1 {
@@ -1195,7 +1200,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let error = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 Err(add_and_commit_lock_error())
             },
@@ -1245,7 +1250,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let error = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 Err(git_command_error(
                     &rendered_verified_commit(VerifiedCommitMode::Amend, COMMIT_MESSAGE),
@@ -1276,7 +1281,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let error = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 Err(amend_lock_error())
             },
@@ -1299,7 +1304,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let outcome = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 Ok(VerifiedCommitOutcome::RepositoryRejected(rejection()))
             },
@@ -1332,7 +1337,7 @@ mod tests {
         let observed_dirty = Mutex::new(Vec::<bool>::new());
 
         run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 let dirty = environment.repo.lock().unwrap().pending_tree.is_some();
                 observed_dirty.lock().unwrap().push(dirty);
                 if observed_dirty.lock().unwrap().len() == 1 {
@@ -1378,7 +1383,7 @@ mod tests {
         cancel_token.cancel();
 
         let error = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 Err(amend_lock_error())
             },
@@ -1407,7 +1412,7 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let error = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 // Cancellation arrives while the retry delay is in progress.
                 cancel_token.cancel();
@@ -1432,7 +1437,7 @@ mod tests {
         cancel_token.cancel();
 
         let outcome = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 environment.repo.lock().unwrap().finalize(COMMIT_MESSAGE);
                 Ok(VerifiedCommitOutcome::Committed)
             },
@@ -1455,7 +1460,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let outcome = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 // The amend landed, but the command still reported contention.
                 environment.repo.lock().unwrap().finalize(COMMIT_MESSAGE);
@@ -1485,7 +1490,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 environment.repo.lock().unwrap().finalize(COMMIT_MESSAGE);
                 Err(add_and_commit_lock_error())
@@ -1518,7 +1523,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let error = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 Err(amend_lock_error())
             },
@@ -1540,7 +1545,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let error = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 if *attempts.lock().unwrap() == 1 {
                     // A commit with the right subject and lineage lands, but it
@@ -1569,7 +1574,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let error = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 if *attempts.lock().unwrap() == 1 {
                     // Another actor commits on top of the captured HEAD with
@@ -1601,7 +1606,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let error = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 if *attempts.lock().unwrap() == 1 {
                     // Two commits land, so the new HEAD is a grandchild rather
@@ -1631,7 +1636,7 @@ mod tests {
         let attempts = Mutex::new(0_u32);
 
         let error = run_final_commit_with_retry(
-            || async {
+            |_attempt| async {
                 *attempts.lock().unwrap() += 1;
                 if *attempts.lock().unwrap() == 1 {
                     // The commit landed but part of the workspace was left out.

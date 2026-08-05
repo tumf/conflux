@@ -92,6 +92,46 @@ pub async fn has_uncommitted_changes<P: AsRef<Path>>(cwd: P) -> VcsResult<(bool,
     Ok((has_changes, output))
 }
 
+/// `git status --porcelain` with its two status columns intact.
+///
+/// [`has_uncommitted_changes`] trims its output, which removes the leading
+/// space that is the *only* difference between an unstaged worktree change
+/// (` M path`) and a staged one (`M  path`) on the first line. Anything that
+/// reads the worktree column — most importantly the Apply finalization stage
+/// gate — must read the untrimmed bytes instead.
+///
+/// The untracked and ignored modes are passed explicitly for the same reason
+/// they are on [`has_uncommitted_changes`]: repository or user configuration
+/// must not be able to make unselected work report as clean.
+pub async fn porcelain_status<P: AsRef<Path>>(cwd: P) -> VcsResult<String> {
+    let cwd = cwd.as_ref();
+    let output = crate::vcs::commands::run_vcs_command_captured(
+        "git",
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignored=no",
+        ],
+        cwd,
+        VcsBackend::Git,
+    )
+    .await?;
+
+    if !output.success {
+        return Err(VcsError::Command {
+            backend: VcsBackend::Git,
+            message: format!("{} failed: {}", output.command, output.stderr),
+            command: Some(output.command),
+            working_dir: Some(cwd.to_path_buf()),
+            stderr: Some(output.stderr),
+            stdout: Some(output.stdout),
+        });
+    }
+
+    Ok(output.stdout)
+}
+
 /// Push a local branch to the same-named branch on the selected remote.
 pub async fn push_same_named_branch<P: AsRef<Path>>(
     remote: &str,

@@ -344,6 +344,7 @@ Create `openspec/changes/<id>/tasks.md`:
 **Guidelines**:
 
 - Break into small, verifiable steps
+- Do not add a checkbox whose only work is rerunning a repository-wide check that a tracked, unconditional commit hook already runs; see [Hook-Owned Repository-Wide Verification](#hook-owned-repository-wide-verification)
 - Include verification methods
 - Ensure the task list is complete enough that Conflux can choose execution order without depending on unstated human intent
 - Represent every required implementation, integration, migration, verification, and documentation step needed to fully satisfy the request
@@ -482,6 +483,47 @@ When designing tasks, follow mock-first approach:
 - Deferring mockable dependencies
 
 **Discuss with user**: "For the external API integration, should we use mocks for testing, or do you have test credentials available?"
+
+## Hook-Owned Repository-Wide Verification
+
+Conflux creates the final Apply commit itself, with repository hooks enabled. A
+repository-wide format, lint, fast-test, or generated-artifact check that a
+tracked commit hook already runs therefore executes on every change with no task
+of its own. Adding a checkbox whose only work is rerunning that same command
+duplicates it, and it pushes the Apply agent into starting a long validation
+command it may return from before it finishes.
+
+**Inspect the tracked hook configuration before delegating anything.** Read the
+repository's own committed hook definition — for example `.pre-commit-config.yaml`,
+`lefthook.yml`, `.husky/`, or the tracked directory named by `core.hooksPath`.
+Untracked local hooks and developer machine setup are not evidence.
+
+**Delegate a repository-wide gate to the hook only when the tracked definition
+proves it runs unconditionally**, including on the clean-tree amend path. Normal
+Apply finalization amends a WIP commit whose staged diff can be empty, so a hook
+that only receives or filters staged filenames may observe nothing and skip
+validation entirely.
+
+- Qualifies: a pre-commit entry with `always_run: true` and
+  `pass_filenames: false`, or an equivalent hook script that runs the whole
+  repository command regardless of what is staged.
+- Does not qualify: `lint-staged`, `pass_filenames: true`, `--staged`,
+  changed-file globs, `files:`/`types:` filters, or any hook whose command line
+  is built from the staged file list. Treat these as **staged-file-only hooks**
+  and keep an explicit executable verification path in the proposal.
+
+**What never moves into the hook**:
+
+- Requirement-specific test implementation and its verification note. These stay
+  attached to the implementation task that introduces the behavior.
+- Heavy, E2E, networked, credentialed, long-running, and post-integration
+  checks. These keep an explicit verification owner (`verifications:` entry with
+  its own `phase`, `owner`, and `rerun`) outside pre-commit. Do not silently move
+  them into pre-commit, and do not omit them because pre-commit exists.
+
+When a gate is delegated, say so once in the proposal (for example under
+`Out of Scope` or the verification plan) naming the tracked hook that owns it,
+so a reviewer can check the same evidence.
 
 ## Task Classification
 

@@ -108,8 +108,14 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         | ExecutionEvent::ChangeStopped { .. }
         | ExecutionEvent::ChangesRefreshed { .. } => true,
 
+        // The reducer holds the ephemeral commit subphase, so the TUI must
+        // re-read it to switch a row's rendered operation between apply and
+        // commit. It never changes the canonical `applying` display status.
+        ExecutionEvent::ApplyCommitPhase { .. } => true,
+
         // Presentation-only or unrelated TUI events do not affect reducer display state.
-        ExecutionEvent::ApplyOutput { .. }
+        ExecutionEvent::ApplyCommitOutput { .. }
+        | ExecutionEvent::ApplyOutput { .. }
         | ExecutionEvent::ArchiveOutput { .. }
         | ExecutionEvent::AcceptanceOutput { .. }
         | ExecutionEvent::ProgressUpdated { .. }
@@ -164,16 +170,20 @@ async fn sync_reducer_display_caches(
     if !should_apply_event_to_tui_reducer(event) {
         return;
     }
-    let (display_map, blocker_views, error_details) = {
+    let (display_map, blocker_views, error_details, apply_operations) = {
         let state = shared_state.read().await;
         (
             state.all_display_statuses(),
             state.all_blocker_views(),
             state.all_error_details(),
+            state.all_apply_operation_labels(),
         )
     };
     app.apply_display_statuses_from_reducer(&display_map);
     app.apply_blocker_views_from_reducer(&blocker_views);
+    // Rendering-only refresh: the reducer's ephemeral commit subphase decides
+    // whether the Apply lane prints `[apply]` or `[commit]`.
+    app.apply_operation_labels_from_reducer(&apply_operations);
     // Error rows adopt the reducer's retained diagnostic even when this frontend
     // never observed the failure event itself, so the row can still name its
     // failure after the matching log entry has been evicted.

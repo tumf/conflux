@@ -201,6 +201,7 @@ async fn final_apply_commit_lock_recovers_add_and_commit_when_contention_clears(
         CHANGE_ID,
         None,
         &environment,
+        None,
     )
     .await
     .expect("finalization must recover once contention clears");
@@ -253,6 +254,7 @@ async fn final_apply_commit_lock_recovers_amend_when_contention_clears() {
         CHANGE_ID,
         None,
         &environment,
+        None,
     )
     .await
     .expect("amend finalization must recover once contention clears");
@@ -349,6 +351,7 @@ async fn final_apply_commit_lock_cancellation_stops_retrying() {
         CHANGE_ID,
         Some(&cancel_token),
         &GitFinalCommitEnvironment,
+        None,
     )
     .await
     .expect_err("a cancelled retry must fail");
@@ -373,7 +376,7 @@ async fn final_apply_commit_lock_does_not_retry_another_worktrees_lock() {
     let mut attempts = 0_u32;
 
     let error = run_final_commit_with_retry(
-        || {
+        |_attempt| {
             attempts += 1;
             let repo_path = repo.path.clone();
             let other_git_dir = other.path.join(".git");
@@ -426,7 +429,7 @@ async fn final_apply_commit_lock_does_not_retry_malformed_or_permission_lock_out
     ] {
         let mut attempts = 0_u32;
         let error = run_final_commit_with_retry(
-            || {
+            |_attempt| {
                 attempts += 1;
                 let repo_path = repo.path.clone();
                 let stderr = stderr.clone();
@@ -493,7 +496,7 @@ async fn final_apply_commit_lock_ambiguous_success_is_not_duplicated_on_the_add_
     let mut attempts = 0_u32;
 
     let outcome = run_final_commit_with_retry(
-        || {
+        |_attempt| {
             attempts += 1;
             let repo_path = repo.path.clone();
             let message = message.clone();
@@ -531,7 +534,7 @@ async fn final_apply_commit_lock_ambiguous_success_is_not_duplicated_on_the_amen
     let mut attempts = 0_u32;
 
     run_final_commit_with_retry(
-        || {
+        |_attempt| {
             attempts += 1;
             let repo_path = repo.path.clone();
             let message = message.clone();
@@ -574,7 +577,7 @@ async fn final_apply_commit_lock_ambiguous_success_rejects_historical_commit() {
     let mut attempts = 0_u32;
 
     let error = run_final_commit_with_retry(
-        || {
+        |_attempt| {
             attempts += 1;
             let repo_path = repo.path.clone();
             async move { Err(fabricated_lock_error(&repo_path, "git add -A").await) }
@@ -605,7 +608,7 @@ async fn final_apply_commit_lock_ambiguous_success_rejects_mismatched_tree() {
     let mut attempts = 0_u32;
 
     let error = run_final_commit_with_retry(
-        || {
+        |_attempt| {
             attempts += 1;
             let repo_path = repo.path.clone();
             let message = message.clone();
@@ -645,7 +648,7 @@ async fn final_apply_commit_lock_ambiguous_success_rejects_mismatched_tree_on_th
     let mut attempts = 0_u32;
 
     let error = run_final_commit_with_retry(
-        || {
+        |_attempt| {
             attempts += 1;
             let repo_path = repo.path.clone();
             let message = message.clone();
