@@ -213,7 +213,9 @@ Notes for client authors:
 - Errors carry a stable `error_code` to branch on — `stale_revision` and
   `idempotency_mismatch` are both HTTP 409 but mean different things.
 
-The full schema is generated into [`docs/openapi.yaml`](../openapi.yaml).
+The full schema is generated at runtime rather than tracked in the repository.
+Export it with `cflx openapi > openapi.yaml`, or fetch it from a running
+instance at `GET /api/v2/openapi.yaml`; both return the same document.
 
 ## Workflow Examples
 

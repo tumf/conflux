@@ -1,12 +1,16 @@
 //! The single source of truth for the `/api/v2` contract.
 //!
-//! `docs/openapi.yaml` is the canonical tracked artifact, and it is *generated*
-//! from this module by `make openapi`. Nothing else in the repository is allowed
-//! to describe the API: a hand-written second file cannot be kept honest, and a
-//! stale one is worse than none because a generated consumer will believe it.
-//! `make check-openapi` regenerates into a temporary file and fails on any diff,
-//! so a route, DTO field, command variant, error code, event envelope, or
-//! security declaration cannot change without the artifact changing with it.
+//! The contract is generated from this module and never tracked as a file.
+//! `cflx openapi` writes it to stdout and `GET /api/v2/openapi.yaml` serves it,
+//! both through [`document_yaml`], so a consumer reading either one is reading
+//! this module. Nothing in the repository is allowed to describe the API
+//! separately: a hand-written second copy cannot be kept honest, and a stale one
+//! is worse than none because a generated consumer will believe it.
+//!
+//! `tests/openapi_contract_tests.rs` holds the generated document against the
+//! executable surface, so a route, DTO field, command variant, error code, event
+//! envelope, or security declaration cannot change without the contract
+//! assertions changing with it.
 
 use utoipa::openapi::path::{HttpMethod, OperationBuilder};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -19,7 +23,7 @@ pub const BEARER_SCHEME: &str = "bearer_token";
 /// Every path this process serves under `/api/v2`.
 ///
 /// This is the enumerated route surface the contract tests hold the router and
-/// the generated artifact against, so a route can never exist in only two of the
+/// the generated document against, so a route can never exist in only two of the
 /// three places. Keep it in the order the paths are registered in
 /// [`crate::web::remote_control_api::router`].
 pub const SUPPORTED_V2_PATHS: &[&str] = &[
@@ -271,8 +275,8 @@ impl Modify for ContractRoutesAddon {
 ///
 /// The debug assertion is the cheapest place to catch a route added to the
 /// router and the `paths(...)` list but not to [`SUPPORTED_V2_PATHS`]: it fires
-/// during `make openapi` and in every test build, before a half-declared surface
-/// can reach a tracked artifact.
+/// in every test build and in a debug `cflx openapi`, before a half-declared
+/// surface can reach a consumer.
 pub fn document() -> utoipa::openapi::OpenApi {
     let document = ApiDoc::openapi();
     debug_assert_eq!(
@@ -291,20 +295,21 @@ pub fn document() -> utoipa::openapi::OpenApi {
     document
 }
 
-/// Banner carried by both the tracked artifact and the live `/api/v2/openapi.yaml`
-/// body, so an editor and a consumer are told the same ownership rule.
+/// Banner carried by every copy of the document — the `cflx openapi` export and
+/// the live `/api/v2/openapi.yaml` body alike — so whoever holds an exported
+/// file is told the same ownership rule as whoever fetched it from a server.
 pub const GENERATED_BANNER: &str = "\
-# GENERATED FILE — DO NOT EDIT.
+# GENERATED DOCUMENT — DO NOT EDIT, DO NOT COMMIT.
 # Source of truth: src/web/openapi.rs and the #[utoipa::path] attributes it names.
-# Regenerate: make openapi   Verify: make check-openapi
-# docs/openapi.yaml is the one canonical /api/v2 contract in this repository.
+# Export: cflx openapi   Live: GET /api/v2/openapi.yaml
+# This repository tracks no OpenAPI file; regenerate instead of editing a copy.
 ";
 
-/// The canonical artifact's exact bytes.
+/// The canonical contract's exact bytes.
 ///
-/// `make openapi` writes this, `make check-openapi` compares against it, and
-/// `GET /api/v2/openapi.yaml` returns it. One function so the file on disk and
-/// the document a running instance serves cannot disagree.
+/// `cflx openapi` writes this to stdout and `GET /api/v2/openapi.yaml` returns
+/// it. One function so an exported copy and the document a running instance
+/// serves cannot disagree.
 pub fn document_yaml() -> String {
     let body = serde_yaml::to_string(&document()).expect("OpenAPI document must serialize as YAML");
     format!("{GENERATED_BANNER}{}\n", body.trim_end())

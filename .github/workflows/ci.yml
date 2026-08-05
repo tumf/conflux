@@ -8,16 +8,16 @@ on:
     branches: [main, master]
     paths-ignore:
       - "**/*.md"
-      # Not "docs/**": docs/openapi.yaml is the canonical API contract, so a
-      # hand-edit of it must still run the drift check.
+      # Not "docs/**": docs/ still holds executable material whose checks must
+      # run. Only the image assets are inert.
       - "docs/images/**"
       - "openspec/**"
   pull_request:
     branches: [main, master]
     paths-ignore:
       - "**/*.md"
-      # Not "docs/**": docs/openapi.yaml is the canonical API contract, so a
-      # hand-edit of it must still run the drift check.
+      # Not "docs/**": docs/ still holds executable material whose checks must
+      # run. Only the image assets are inert.
       - "docs/images/**"
       - "openspec/**"
 
@@ -58,3 +58,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pre-commit
           pre-commit run --all-files || pre-commit run --all-files
+
+      # The API contract is generated, not tracked, so there is no artifact to
+      # diff. These assertions are what keeps the generated document honest
+      # against the executable surface, and they must run on every pull request.
+      - name: Run OpenAPI contract tests
+        run: cargo test --features web-monitoring --test openapi_contract_tests

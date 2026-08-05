@@ -129,7 +129,7 @@ cargo install cflx
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 기여 가이드 |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | 개발 가이드 |
 | [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | 릴리스 가이드 |
-| [docs/openapi.yaml](docs/openapi.yaml) | 정식 `/api/v2` 계약 (자동 생성) |
+| `cflx openapi` / `GET /api/v2/openapi.yaml` | 정식 `/api/v2` 계약 (런타임 생성, 저장소에서 추적하지 않음) |
 
 ## 라이선스
 

@@ -58,7 +58,9 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 認証・リビジョン・冪等性の詳細は
 [USAGE.md](USAGE.md#remote-control-api-apiv2) を参照してください。
 
-完全な API 仕様は [../openapi.yaml](../openapi.yaml) を参照してください。
+完全な API 仕様は `cflx openapi > openapi.yaml` で書き出すか、実行中インスタンスの
+`GET /api/v2/openapi.yaml` から取得してください。どちらも同じドキュメントを返し、
+リポジトリはスキーマファイルを追跡しません。
 
 ### state リソースは権威的なスナップショット
 
