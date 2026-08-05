@@ -13,8 +13,8 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: .pre-commit-config.yaml
-    evidence: prek hook-selection output asserting Skipped for stable non-Rust files and Passed for a Rust source file
-    rerun: prek run rustfmt --files README.md | grep -q Skipped && prek run clippy --files openspec/AGENTS.md | grep -q Skipped && prek run rustfmt --files src/main.rs | grep -q Passed && prek run clippy --files src/main.rs | grep -q Passed
+    evidence: prek hook-selection output asserting Skipped for stable non-Rust files and Passed for a Rust source file, plus tests/precommit_hook_scope_tests.rs
+    rerun: prek run rustfmt --files README.md | grep -q Skipped && prek run clippy --files openspec/CONSTITUTION.md | grep -q Skipped && prek run rustfmt --files src/main.rs | grep -q Passed && prek run clippy --files src/main.rs | grep -q Passed && cargo test --test precommit_hook_scope_tests
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
