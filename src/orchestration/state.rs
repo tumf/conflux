@@ -1618,6 +1618,11 @@ impl OrchestratorState {
         rt.clear_activity_wait_and_blocker();
         rt.queue_intent = QueueIntent::NotQueued;
         rt.dequeued = true;
+        // Cancellation can arrive anywhere inside finalization, including
+        // before any terminal commit-phase event exists to observe, so the
+        // ephemeral `[commit]` presentation is cleared here rather than being
+        // left for a sequence that may never complete.
+        rt.commit_phase_attempt = None;
         self.clear_base_mutating_wait_queues(change_id);
     }
 
@@ -1625,6 +1630,7 @@ impl OrchestratorState {
         let rt = self.runtime_entry(change_id);
         rt.transition_to_terminal(TerminalState::Stopped);
         rt.queue_intent = QueueIntent::NotQueued;
+        rt.commit_phase_attempt = None;
         self.clear_base_mutating_wait_queues(change_id);
     }
 
@@ -1633,6 +1639,9 @@ impl OrchestratorState {
         if !rt.is_terminal() {
             rt.transition_to_terminal(TerminalState::Error(error));
         }
+        // Unconditional: a row that was already terminal must not keep
+        // rendering a commit subphase either.
+        rt.commit_phase_attempt = None;
         self.clear_base_mutating_wait_queues(change_id);
     }
 
@@ -1860,6 +1869,11 @@ impl OrchestratorState {
     fn on_processing_error(&mut self, change_id: &str, error: String) {
         self.remove_from_pending(change_id);
         let rt = self.runtime_entry(change_id);
+        // A failure raised between `ApplyCommitPhase::Started` and any terminal
+        // commit-phase event — a WIP snapshot error, for instance — surfaces
+        // only as a processing error, so this is the only place that can clear
+        // the presentation it left behind.
+        rt.commit_phase_attempt = None;
         if !rt.is_terminal() && !rt.dequeued {
             rt.transition_to_terminal(TerminalState::Error(error));
         }
@@ -3540,6 +3554,89 @@ mod tests {
             assert_eq!(runtime.apply_operation_label(), "apply");
             assert_eq!(state.display_status("c"), "applying");
         }
+    }
+
+    /// Cancellation can land anywhere inside finalization, including before any
+    /// terminal commit-phase event was emitted — a WIP snapshot failure between
+    /// `Started` and the commit surfaces only as a processing error. Every one
+    /// of those routes must clear the ephemeral presentation, or the row keeps
+    /// rendering `[commit]` for a sequence that is no longer running.
+    #[test]
+    fn cancelling_outside_the_commit_sequence_clears_commit_presentation() {
+        use crate::events::{ApplyCommitPhase, ExecutionEvent};
+
+        /// Put a change into an active commit phase, then cancel it the way the
+        /// named route does.
+        fn active_commit_then(cancel: impl Fn(&mut OrchestratorState)) -> Option<u32> {
+            let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+            state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+                change_id: "c".to_string(),
+                command: "cmd".to_string(),
+            });
+            state.apply_execution_event(&ExecutionEvent::ApplyCommitPhase {
+                change_id: "c".to_string(),
+                phase: ApplyCommitPhase::Started,
+                attempt: 3,
+            });
+            assert_eq!(
+                state
+                    .change_runtime("c")
+                    .expect("runtime")
+                    .commit_phase_attempt,
+                Some(3),
+                "precondition: the row is presenting an active commit phase"
+            );
+
+            cancel(&mut state);
+            assert!(state.global_invariants_hold());
+            state
+                .change_runtime("c")
+                .expect("runtime")
+                .commit_phase_attempt
+        }
+
+        assert_eq!(
+            active_commit_then(|state| {
+                state.apply_execution_event(&ExecutionEvent::ChangeDequeued {
+                    change_id: "c".to_string(),
+                });
+            }),
+            None,
+            "ChangeDequeued must clear commit presentation"
+        );
+        assert_eq!(
+            active_commit_then(|state| {
+                state.apply_execution_event(&ExecutionEvent::ChangeStopped {
+                    change_id: "c".to_string(),
+                });
+            }),
+            None,
+            "ChangeStopped must clear commit presentation"
+        );
+        assert_eq!(
+            active_commit_then(|state| {
+                state.apply_command(ReducerCommand::DequeueChange("c".to_string()));
+            }),
+            None,
+            "the DequeueChange command must clear commit presentation"
+        );
+        assert_eq!(
+            active_commit_then(|state| {
+                state.apply_command(ReducerCommand::StopChange("c".to_string()));
+            }),
+            None,
+            "the StopChange command must clear commit presentation"
+        );
+        assert_eq!(
+            active_commit_then(|state| {
+                state.apply_execution_event(&ExecutionEvent::ProcessingError {
+                    id: "c".to_string(),
+                    error: "WIP snapshot failed".to_string(),
+                });
+            }),
+            None,
+            "a processing error must clear commit presentation"
+        );
     }
 
     /// A repair iteration restores `[apply]` even if the closing phase event was

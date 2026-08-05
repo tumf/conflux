@@ -848,39 +848,62 @@ enum StageGateOrigin {
     AfterSuccessfulCommit,
 }
 
+/// What one stage-gate status read produced.
+#[derive(Debug)]
+enum StageStatusReading {
+    /// Status was read. `porcelain` is the complete captured text kept for the
+    /// persistent log; `status` is its gate classification.
+    Read {
+        status: WorkspaceStageStatus,
+        porcelain: String,
+    },
+    /// The status query itself failed, so nothing about staging is known.
+    Unreadable { error: String },
+}
+
 /// Read the managed workspace's staging state for the finalization gate.
 ///
 /// Non-Git backends have no staging model at all, so they are reported clean:
 /// the gate exists to stop `git add -A` from acting as file selection, and
 /// there is no such staging step to stop.
 ///
-/// An unreadable status degrades to "clean" with a warning rather than wedging
-/// the loop. It cannot silently pass a dirty workspace through: finalization
-/// immediately re-runs the same `git status` to choose its commit mode, so a
-/// genuinely unreadable repository still fails there, terminally, with the Git
-/// error attached.
+/// An unreadable status is never reported as clean. A failed read is not
+/// evidence of a staged workspace, and the WIP snapshot's `git add -A` runs
+/// immediately after a passing gate — so a transient `git status` failure that
+/// degraded to "clean" would let the snapshot absorb unstaged or untracked
+/// content, and the re-read inside finalization would then observe the
+/// absorbed, clean workspace instead of failing. The gate therefore fails
+/// closed and routes to Apply stage repair.
 async fn read_workspace_stage_status(
     is_git: bool,
     workspace_path: &Path,
     change_id: &str,
-) -> (WorkspaceStageStatus, String) {
+) -> StageStatusReading {
     if !is_git {
-        return (WorkspaceStageStatus::default(), String::new());
+        return StageStatusReading::Read {
+            status: WorkspaceStageStatus::default(),
+            porcelain: String::new(),
+        };
     }
 
     // The untrimmed reader is required: the trimmed one drops the leading
     // space that separates an unstaged worktree change from a staged one.
     match crate::vcs::git::commands::porcelain_status(workspace_path).await {
-        Ok(porcelain) => (classify_porcelain_status(&porcelain), porcelain),
+        Ok(porcelain) => StageStatusReading::Read {
+            status: classify_porcelain_status(&porcelain),
+            porcelain,
+        },
         Err(error) => {
             warn!(
                 change_id = change_id,
                 workspace = %workspace_path.display(),
                 error = %error,
                 "Could not read workspace status for the Apply finalization stage gate; \
-                 finalization will re-read it and fail there if the repository is unreadable"
+                 failing the gate closed without a WIP snapshot or final commit"
             );
-            (WorkspaceStageStatus::default(), String::new())
+            StageStatusReading::Unreadable {
+                error: error.to_string(),
+            }
         }
     }
 }
@@ -925,6 +948,46 @@ fn incomplete_stage_feedback(
     }
 }
 
+/// Build bounded apply feedback for a stage gate whose status read failed.
+///
+/// It reuses the `incomplete_stage` kind on purpose: from the loop's point of
+/// view this is the same route — the workspace could not be proven fully
+/// staged, so no snapshot and no final commit were created and one repair
+/// iteration must run. The Git error is untrusted output, so it is bounded the
+/// same way a hook transcript is; the complete error is in the persistent log.
+fn unreadable_stage_feedback(error: &str, origin: StageGateOrigin) -> ApplyOrchestrationFeedback {
+    let summary = match origin {
+        StageGateOrigin::BeforeFinalization => {
+            "All tasks are complete but the workspace status could not be read, so the workspace \
+             could not be proven fully staged: no WIP snapshot and no final Apply commit were \
+             created and acceptance has not started."
+        }
+        StageGateOrigin::AfterSuccessfulCommit => {
+            "The final Apply commit succeeded but the workspace status could not be read \
+             afterwards, so it could not be proven that repository hooks left the workspace \
+             clean, and acceptance has not started."
+        }
+    };
+
+    ApplyOrchestrationFeedback {
+        kind: ApplyOrchestrationFeedback::INCOMPLETE_STAGE,
+        summary: summary.to_string(),
+        command: Some(STAGE_GATE_STATUS_COMMAND.to_string()),
+        exit_code: None,
+        stdout_tail: None,
+        stderr_tail: bounded_output_tail(error),
+        required_action:
+            "Find out why `git status --porcelain` failed in this workspace and fix that first \
+             (for example a stale index lock left by another process, or a corrupted index). \
+             Then make the workspace clean: stage the content this change owns with `git add`, \
+             and revert or delete anything it does not. Do not create the final Apply commit \
+             yourself and do not work around this by running `git add -A` blindly. When you \
+             return, `git status --porcelain` must succeed and report no unstaged changes and no \
+             untracked files."
+                .to_string(),
+    }
+}
+
 /// Build apply feedback for a successful iteration that changed nothing.
 ///
 /// The prior attempt's output is already in [`crate::history::ApplyHistory`], so
@@ -959,6 +1022,14 @@ enum FinalCommitAttempt {
     Committed,
     /// The workspace was not fully staged, so finalization never started.
     StageIncomplete(WorkspaceStageStatus),
+    /// The stage gate could not read the workspace status, so staging could not
+    /// be proven and the gate failed closed.
+    StageUnreadable {
+        /// Where the failed read was observed.
+        origin: StageGateOrigin,
+        /// The Git error, carried bounded into the next prompt.
+        error: String,
+    },
     /// A repository hook rejected the commit; apply must repair and retry.
     Rejected(CommitRejection),
     /// The commit succeeded but a hook left workspace content behind.
@@ -1027,21 +1098,28 @@ async fn finalize_apply<E: ApplyEventHandler>(
     cancel_token: Option<&CancellationToken>,
     event_handler: &E,
 ) -> Result<FinalCommitAttempt> {
-    let (stage_status, porcelain) =
-        read_workspace_stage_status(true, workspace_path, change_id).await;
-    if !stage_status.is_clean() {
-        // The complete captured status goes to persistent logs; only the
-        // bounded path report reaches the next prompt.
-        warn!(
-            change_id = change_id,
-            iteration = iteration,
-            workspace = %workspace_path.display(),
-            unstaged = stage_status.unstaged_paths().len(),
-            untracked = stage_status.untracked_paths().len(),
-            status = %porcelain,
-            "Apply finalization stage gate failed; leaving the workspace untouched and returning to Apply repair"
-        );
-        return Ok(FinalCommitAttempt::StageIncomplete(stage_status));
+    match read_workspace_stage_status(true, workspace_path, change_id).await {
+        StageStatusReading::Unreadable { error } => {
+            return Ok(FinalCommitAttempt::StageUnreadable {
+                origin: StageGateOrigin::BeforeFinalization,
+                error,
+            });
+        }
+        StageStatusReading::Read { status, porcelain } if !status.is_clean() => {
+            // The complete captured status goes to persistent logs; only the
+            // bounded path report reaches the next prompt.
+            warn!(
+                change_id = change_id,
+                iteration = iteration,
+                workspace = %workspace_path.display(),
+                unstaged = status.unstaged_paths().len(),
+                untracked = status.untracked_paths().len(),
+                status = %porcelain,
+                "Apply finalization stage gate failed; leaving the workspace untouched and returning to Apply repair"
+            );
+            return Ok(FinalCommitAttempt::StageIncomplete(status));
+        }
+        StageStatusReading::Read { .. } => {}
     }
 
     info!(
@@ -1049,9 +1127,20 @@ async fn finalize_apply<E: ApplyEventHandler>(
         change_id, iteration
     );
 
-    // The sink is presentation only: it observes lines while hooks run and
-    // cannot change the classified outcome.
+    // The sink observes lines while hooks run and cannot change the classified
+    // outcome. Retention happens here, at the source, rather than in a
+    // frontend: the tracing record is written before the presentation event is
+    // forwarded, so the complete hook transcript reaches persistent logs on
+    // every finalization — success or rejection — including a headless
+    // `cflx run` with no TUI attached. Only prompt diagnostics are bounded.
     let sink = |attempt: u32, stream: CommitOutputStream, line: &str| {
+        info!(
+            change_id = change_id,
+            attempt = attempt,
+            stream = stream.as_str(),
+            line = line,
+            "Final Apply commit output"
+        );
         event_handler.on_apply_commit_output(change_id, attempt, stream, line);
     };
 
@@ -1067,20 +1156,28 @@ async fn finalize_apply<E: ApplyEventHandler>(
     {
         VerifiedCommitOutcome::Committed => {
             // A hook may edit or generate files and still exit zero. That
-            // content is not in the commit, so acceptance must not start.
-            let (after_commit, after_porcelain) =
-                read_workspace_stage_status(true, workspace_path, change_id).await;
-            if !after_commit.is_clean() {
-                warn!(
-                    change_id = change_id,
-                    iteration = iteration,
-                    workspace = %workspace_path.display(),
-                    status = %after_porcelain,
-                    "Final Apply commit succeeded but repository hooks left workspace changes; returning to Apply repair"
-                );
-                return Ok(FinalCommitAttempt::HookLeftWorkspaceDirty(after_commit));
+            // content is not in the commit, so acceptance must not start. An
+            // unreadable status here proves nothing about cleanliness either,
+            // so it fails closed the same way.
+            match read_workspace_stage_status(true, workspace_path, change_id).await {
+                StageStatusReading::Unreadable { error } => {
+                    Ok(FinalCommitAttempt::StageUnreadable {
+                        origin: StageGateOrigin::AfterSuccessfulCommit,
+                        error,
+                    })
+                }
+                StageStatusReading::Read { status, porcelain } if !status.is_clean() => {
+                    warn!(
+                        change_id = change_id,
+                        iteration = iteration,
+                        workspace = %workspace_path.display(),
+                        status = %porcelain,
+                        "Final Apply commit succeeded but repository hooks left workspace changes; returning to Apply repair"
+                    );
+                    Ok(FinalCommitAttempt::HookLeftWorkspaceDirty(status))
+                }
+                StageStatusReading::Read { .. } => Ok(FinalCommitAttempt::Committed),
             }
-            Ok(FinalCommitAttempt::Committed)
         }
         VerifiedCommitOutcome::RepositoryRejected(rejection) => {
             Ok(FinalCommitAttempt::Rejected(rejection))
@@ -1721,6 +1818,14 @@ where
                         pending_stage_repair = true;
                         // Fall through to dispatch a repair iteration.
                     }
+                    FinalCommitAttempt::StageUnreadable { origin, error } => {
+                        agent.record_apply_orchestration_feedback(
+                            change_id,
+                            unreadable_stage_feedback(&error, origin),
+                        );
+                        pending_stage_repair = true;
+                        // Fall through to dispatch a repair iteration.
+                    }
                     FinalCommitAttempt::HookLeftWorkspaceDirty(status) => {
                         agent.record_apply_orchestration_feedback(
                             change_id,
@@ -2296,26 +2401,38 @@ where
             && task_format_blocks_acceptance(workspace_path, change_id).is_empty();
         if finalization_ready {
             event_handler.on_apply_commit_phase(change_id, ApplyCommitPhase::Started, iteration);
-            let (stage_status, porcelain) =
-                read_workspace_stage_status(is_git, workspace_path, change_id).await;
-            if !stage_status.is_clean() {
-                // Complete evidence to persistent logs, bounded evidence to the
-                // next prompt.
-                warn!(
-                    change_id = change_id,
-                    iteration = iteration,
-                    workspace = %workspace_path.display(),
-                    unstaged = stage_status.unstaged_paths().len(),
-                    untracked = stage_status.untracked_paths().len(),
-                    status = %porcelain,
-                    "Apply finalization stage gate failed after the agent iteration; \
-                     no WIP snapshot and no final commit were created"
-                );
+            // A status read that failed proves nothing about staging, so it
+            // fails the gate closed rather than falling through to the WIP
+            // snapshot's `git add -A`.
+            let gate_failure =
+                match read_workspace_stage_status(is_git, workspace_path, change_id).await {
+                    StageStatusReading::Unreadable { error } => Some(unreadable_stage_feedback(
+                        &error,
+                        StageGateOrigin::BeforeFinalization,
+                    )),
+                    StageStatusReading::Read { status, porcelain } if !status.is_clean() => {
+                        // Complete evidence to persistent logs, bounded evidence to
+                        // the next prompt.
+                        warn!(
+                            change_id = change_id,
+                            iteration = iteration,
+                            workspace = %workspace_path.display(),
+                            unstaged = status.unstaged_paths().len(),
+                            untracked = status.untracked_paths().len(),
+                            status = %porcelain,
+                            "Apply finalization stage gate failed after the agent iteration; \
+                             no WIP snapshot and no final commit were created"
+                        );
+                        Some(incomplete_stage_feedback(
+                            &status,
+                            StageGateOrigin::BeforeFinalization,
+                        ))
+                    }
+                    StageStatusReading::Read { .. } => None,
+                };
+            if let Some(feedback) = gate_failure {
                 event_handler.on_apply_commit_phase(change_id, ApplyCommitPhase::Failed, iteration);
-                agent.record_apply_orchestration_feedback(
-                    change_id,
-                    incomplete_stage_feedback(&stage_status, StageGateOrigin::BeforeFinalization),
-                );
+                agent.record_apply_orchestration_feedback(change_id, feedback);
                 pending_stage_repair = true;
                 continue;
             }
@@ -2600,6 +2717,20 @@ where
                         incomplete_stage_feedback(&status, StageGateOrigin::BeforeFinalization),
                     );
                     pending_stage_repair = true;
+                    continue;
+                }
+                FinalCommitAttempt::StageUnreadable { origin, error } => {
+                    agent.record_apply_orchestration_feedback(
+                        change_id,
+                        unreadable_stage_feedback(&error, origin),
+                    );
+                    pending_stage_repair = true;
+                    info!(
+                        change_id = change_id,
+                        iteration = iteration,
+                        "Apply finalization stage gate could not read workspace status; \
+                         re-entering apply for repair"
+                    );
                     continue;
                 }
                 FinalCommitAttempt::HookLeftWorkspaceDirty(status) => {
@@ -5273,6 +5404,101 @@ mod apply_commit_recovery {
         );
     }
 
+    // === An unreadable stage status fails the gate closed (integration) ===
+
+    /// Break the index so `git status --porcelain` exits non-zero, the way a
+    /// transient repository fault does.
+    fn make_status_unreadable(repo: &RecoveryRepo) {
+        std::fs::write(repo.workspace.join(".git").join("index"), "not an index").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&repo.workspace)
+            .output()
+            .expect("git status should run");
+        assert!(
+            !status.status.success(),
+            "precondition: the stage gate's status query must fail"
+        );
+    }
+
+    /// A failed status read is not evidence of a staged workspace. If it
+    /// degraded to "clean", the WIP snapshot's `git add -A` would run next and
+    /// absorb whatever the agent left unstaged — and the re-read inside
+    /// finalization would then see the absorbed, clean workspace. So the gate
+    /// fails closed: nothing is staged, snapshotted, or committed.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn an_unreadable_stage_status_creates_no_snapshot_and_no_final_commit() {
+        let repo = recovery_repo("stage-unreadable", COMPLETE_TASKS);
+        // Content the agent never staged: exactly what `git add -A` would have
+        // absorbed if the failed read had been treated as clean.
+        std::fs::write(repo.workspace.join("stray.txt"), "unselected\n").unwrap();
+        let subjects_before = history_subjects(&repo.workspace);
+        make_status_unreadable(&repo);
+
+        let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+        let config = OrchestratorConfig {
+            // The repair iteration does not fix the repository, so every
+            // finalization boundary keeps failing the same way.
+            apply_command: Some(format!("sh -c 'echo attempt >> {}'", apply_log.display())),
+            max_iterations: Some(2),
+            ..Default::default()
+        };
+
+        let (result, history) = run_recovery_loop_capturing_history(
+            &repo,
+            "stage-unreadable",
+            &config,
+            &NoOpEventHandler,
+        )
+        .await;
+
+        assert_eq!(
+            count_acceptance_dispatch(&result),
+            0,
+            "a workspace that cannot be proven staged must not reach acceptance"
+        );
+        assert_eq!(
+            history_subjects(&repo.workspace),
+            subjects_before,
+            "a failed-closed gate must create neither a WIP snapshot nor a final commit"
+        );
+        assert_eq!(
+            repo.hook_runs(),
+            0,
+            "the commit must never start, so repository hooks never run"
+        );
+        assert!(
+            repo.workspace.join("stray.txt").exists(),
+            "the unstaged content stays where the agent left it"
+        );
+        assert!(
+            history.contains("incomplete_stage"),
+            "the failed read must route to stage repair: {history}"
+        );
+        assert!(
+            history.contains("workspace status could not be read"),
+            "the repair prompt must say why the gate failed: {history}"
+        );
+        assert!(
+            history.contains("git status --porcelain"),
+            "the repair prompt must name the query that failed: {history}"
+        );
+    }
+
+    /// The reader itself never reports an unreadable repository as clean.
+    #[tokio::test]
+    async fn a_failed_status_read_is_never_classified_as_a_clean_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let reading = read_workspace_stage_status(true, temp_dir.path(), "not-a-repo").await;
+
+        assert!(
+            matches!(reading, StageStatusReading::Unreadable { .. }),
+            "a directory that is not a Git repository cannot be proven staged: {reading:?}"
+        );
+    }
+
     /// Path to a `pre-commit` hook that succeeds while writing a file into the
     /// worktree, reproducing a generator hook that exits zero and leaves
     /// content outside its own commit.
@@ -5498,6 +5724,220 @@ mod apply_commit_recovery {
             phases.last().map(|(phase, _)| phase.as_str()),
             Some("failed"),
             "no stale `[commit]` may outlive the last finalization: {phases:?}"
+        );
+    }
+
+    // === Persistent-log retention of streamed commit output ===
+
+    /// Number of lines the flooding hook prints, chosen to exceed the shared
+    /// prompt tail budget so "complete" and "bounded" are distinguishable.
+    const FLOOD_LINES: usize = 120;
+
+    /// Path to a `pre-commit` hook that prints more output than any prompt tail
+    /// keeps, and that rejects while `.git/blocker.txt` exists.
+    fn flooding_hooks_dir() -> &'static Path {
+        static HOOKS_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        HOOKS_DIR.get_or_init(|| {
+            let hook = format!(
+                "#!/bin/sh\n\
+                 echo ran >> \"$(git rev-parse --git-dir)/hook.log\"\n\
+                 i=0\n\
+                 while [ \"$i\" -lt {lines} ]; do\n\
+                 echo \"hook transcript line $i\"\n\
+                 i=$((i + 1))\n\
+                 done\n\
+                 if [ -f \"$(git rev-parse --git-dir)/blocker.txt\" ]; then\n\
+                 echo 'flooding hook rejected the commit' >&2\n\
+                 exit 1\n\
+                 fi\n\
+                 exit 0\n",
+                lines = FLOOD_LINES
+            );
+
+            let dir = std::env::temp_dir().join("cflx-apply-flooding-hooks");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("pre-commit");
+            if std::fs::read_to_string(&path).ok().as_deref() != Some(hook.as_str()) {
+                std::fs::write(&path, &hook).unwrap();
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            dir
+        })
+    }
+
+    /// Point a recovery repo at the flooding hook.
+    fn use_flooding_hook(repo: &RecoveryRepo) {
+        std::process::Command::new("git")
+            .args([
+                "config",
+                "core.hooksPath",
+                &flooding_hooks_dir().display().to_string(),
+            ])
+            .current_dir(&repo.workspace)
+            .output()
+            .expect("git config core.hooksPath should run");
+    }
+
+    /// Collects everything the tracing subscriber writes, so a test can read
+    /// what a persistent log file would have received.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured log buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured log buffer poisoned").clone())
+                .expect("tracing output should be valid UTF-8")
+        }
+    }
+
+    /// Install a tracing subscriber that captures what the persistent log gets.
+    fn capture_persistent_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(captured.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
+
+    /// Assert every flooded hook line reached the persistent log.
+    fn assert_flood_is_complete_in(log: &str) {
+        for index in [0, FLOOD_LINES / 2, FLOOD_LINES - 1] {
+            let line = format!("hook transcript line {index}");
+            assert!(
+                log.contains(&line),
+                "the persistent log must retain the complete hook transcript, missing {line:?}"
+            );
+        }
+    }
+
+    /// Retention must not depend on a frontend: with no TUI attached, the
+    /// complete streamed transcript of a *successful* final commit still has to
+    /// reach the persistent log.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn successful_final_commit_output_is_persisted_in_full_without_a_frontend() {
+        let (captured, guard) = capture_persistent_logs();
+
+        let repo = recovery_repo("log-flood-commit", COMPLETE_TASKS);
+        use_flooding_hook(&repo);
+        std::fs::write(repo.workspace.join("feature.rs"), "fn feature() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "feature.rs"])
+            .current_dir(&repo.workspace)
+            .output()
+            .expect("git add should run");
+        let config = OrchestratorConfig {
+            apply_command: Some("true".to_string()),
+            max_iterations: Some(2),
+            ..Default::default()
+        };
+
+        // `NoOpEventHandler` is the whole point: nothing renders or stores the
+        // streamed lines except the log written at the source.
+        let (result, _) = run_recovery_loop_capturing_history(
+            &repo,
+            "log-flood-commit",
+            &config,
+            &NoOpEventHandler,
+        )
+        .await;
+
+        assert!(result.expect("the staged workspace finalizes").completed);
+        drop(guard);
+
+        let log = captured.text();
+        assert!(
+            log.contains("Final Apply commit output"),
+            "streamed commit output must be recorded at the source: {log}"
+        );
+        assert_flood_is_complete_in(&log);
+        assert!(
+            log.contains("stream=\"stderr\""),
+            "each record must name the stream it came from: {log}"
+        );
+        assert!(
+            log.contains("attempt=1"),
+            "each record must name the finalization attempt: {log}"
+        );
+    }
+
+    /// The same must hold for a rejected commit, and the split has to be
+    /// visible: complete in the log, bounded in the next prompt.
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn rejected_final_commit_output_is_persisted_in_full_while_the_prompt_stays_bounded() {
+        let (captured, guard) = capture_persistent_logs();
+
+        let repo = recovery_repo("log-flood-reject", COMPLETE_TASKS);
+        use_flooding_hook(&repo);
+        repo.block_commits();
+        let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh -c 'echo attempt >> {}'", apply_log.display())),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+
+        let (result, history) = run_recovery_loop_capturing_history(
+            &repo,
+            "log-flood-reject",
+            &config,
+            &NoOpEventHandler,
+        )
+        .await;
+
+        assert_eq!(count_acceptance_dispatch(&result), 0);
+        drop(guard);
+
+        let log = captured.text();
+        assert_flood_is_complete_in(&log);
+        assert!(
+            log.contains("flooding hook rejected the commit"),
+            "the rejection diagnostic itself must be persisted: {log}"
+        );
+        assert!(
+            history.contains("final_commit_rejected"),
+            "the prompt keeps the typed rejection feedback: {history}"
+        );
+        assert!(
+            history.contains(&format!("hook transcript line {}", FLOOD_LINES - 1)),
+            "the bounded tail keeps the newest hook output: {history}"
+        );
+        assert!(
+            !history.contains("hook transcript line 0"),
+            "the prompt stays bounded while the log keeps everything: {history}"
         );
     }
 

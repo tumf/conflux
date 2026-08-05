@@ -7438,6 +7438,18 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
 
     let checkpoint_path = workspace_path.join(".cflx/acceptance-state.json");
     if stale_checkpoint {
+        // Conflux's own runtime directory is excluded from Git the way a real
+        // workspace carrying it must be. Without this the Apply finalization
+        // stage gate would classify the checkpoint below as untracked agent
+        // work and spend the whole iteration budget on stage repair, which is
+        // a different scenario from the one under test.
+        // `info/exclude` lives in the common Git directory, so writing it once
+        // in the base repository also covers the linked worktree.
+        let exclude_path = repo_dir.path().join(".git/info/exclude");
+        std::fs::create_dir_all(exclude_path.parent().or_fail("exclude parent"))
+            .or_fail("create Git info dir");
+        std::fs::write(&exclude_path, ".cflx/\n").or_fail("exclude the Conflux runtime directory");
+
         // A checkpoint left behind by an older Conflux version claims an almost
         // exhausted retry budget for this exact change. Dispatch must ignore it.
         let finding_identity =
@@ -7464,10 +7476,17 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
         // Apply only checks off the acceptance follow-up boxes, so the
         // semantic fingerprint (which ignores follow-up sections) stays
         // unchanged and only repeated findings drive the stall decision.
+        //
+        // It stages what it edits because the Apply finalization stage gate
+        // requires the agent to select change-owned files itself. Leaving the
+        // edit unstaged would fail the gate on every task-complete boundary and
+        // spend the whole iteration budget on stage repair, which is not the
+        // behavior under test here.
         apply_command: Some(format!(
             "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
              > openspec/changes/{change_id}/tasks.next \
-             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md\""
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md \
+             && git add openspec/changes/{change_id}/tasks.md\""
         )),
         acceptance_command: Some(
             "sh -c 'echo ACCEPTANCE: FAIL; echo FINDINGS:; echo - repeated finding'".to_string(),
@@ -7668,10 +7687,13 @@ async fn dispatch_gated_run(
 
     let config = create_test_config_with(OrchestratorConfig {
         workspace_base_dir: Some(workspace_base_dir.to_string_lossy().to_string()),
+        // Stages its own edit: the finalization stage gate requires the Apply
+        // agent to select change-owned files itself.
         apply_command: Some(format!(
             "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
              > openspec/changes/{change_id}/tasks.next \
-             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md\""
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md \
+             && git add -A\""
         )),
         acceptance_command: Some(format!(
             "sh -c 'n=$(cat \"{counter_display}\" 2>/dev/null || echo 0); n=$((n+1)); \
@@ -8262,10 +8284,13 @@ async fn dispatch_missing_verdict_run(
 
     let config = create_test_config_with(OrchestratorConfig {
         workspace_base_dir: Some(workspace_base.to_string_lossy().to_string()),
+        // Stages its own edit: the finalization stage gate requires the Apply
+        // agent to select change-owned files itself.
         apply_command: Some(format!(
             "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
              > openspec/changes/{change_id}/tasks.next \
-             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md\""
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md \
+             && git add -A\""
         )),
         acceptance_command: Some(format!(
             "sh -c 'n=$(cat \"{counter_display}\" 2>/dev/null || echo 0); n=$((n+1)); \
@@ -12323,11 +12348,14 @@ async fn dispatch_scripted_repair_cycle(
 
     let config = create_test_config_with(OrchestratorConfig {
         workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        // Stages everything it produced, including `apply_extra`'s repair
+        // files: the finalization stage gate requires the Apply agent to
+        // select change-owned files itself.
         apply_command: Some(format!(
             "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
              > openspec/changes/{change_id}/tasks.next \
              && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md; \
-             {apply_extra}\""
+             {apply_extra}; git add -A\""
         )),
         acceptance_command: Some(format!(
             "sh -c 'n=$(cat \"{counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
@@ -12473,10 +12501,13 @@ async fn dispatch_scripted_acceptance_failure_cycle(
 
     let config = create_test_config_with(OrchestratorConfig {
         workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        // Stages its own edit: the finalization stage gate requires the Apply
+        // agent to select change-owned files itself.
         apply_command: Some(format!(
             "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
              > openspec/changes/{change_id}/tasks.next \
-             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md\""
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md \
+             && git add -A\""
         )),
         acceptance_command: Some(format!(
             "sh -c 'n=$(cat \"{counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
@@ -12886,11 +12917,14 @@ async fn run_serial_repeated_cycle(change_id: &str, verdict: &str, apply_extra: 
     let verdict_path = verdict_path.display().to_string();
 
     let config = create_test_config_with(OrchestratorConfig {
+        // Stages everything it produced, including `apply_extra`'s repair
+        // files: the finalization stage gate requires the Apply agent to
+        // select change-owned files itself.
         apply_command: Some(format!(
             "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
              > openspec/changes/{change_id}/tasks.next \
              && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md; \
-             {apply_extra}\""
+             {apply_extra}; git add -A\""
         )),
         acceptance_command: Some(format!("sh -c 'cat \"{verdict_path}\"'")),
         command_queue_stagger_delay_ms: Some(0),
@@ -13158,13 +13192,15 @@ async fn parallel_apply_runs_configured_hooks_across_command_failure_recovery() 
     let state_dir = TempDir::new().or_fail("create apply state dir");
     let counter = state_dir.path().join("apply-attempts");
 
-    // Attempt 1 fails without touching tasks; attempt 2 completes them. The
-    // failure must reach `on_error` and must not reach `post_apply`.
+    // Attempt 1 fails without touching tasks; attempt 2 completes them and
+    // stages its own edit, because the Apply finalization stage gate requires
+    // the agent to select change-owned files itself. The failure must reach
+    // `on_error` and must not reach `post_apply`.
     let apply_body = format!(
         "sh -c 'n=$(cat {counter} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {counter}; \
          if [ $n = 1 ]; then echo apply-crash >&2; exit 3; fi; \
          sed \"s/- \\[ \\]/- [x]/g\" openspec/changes/{change_id}/tasks.md > tasks.next \
-         && mv tasks.next openspec/changes/{change_id}/tasks.md'",
+         && mv tasks.next openspec/changes/{change_id}/tasks.md && git add -A'",
         counter = counter.display(),
         change_id = change_id,
     );

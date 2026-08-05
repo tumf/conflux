@@ -716,6 +716,12 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
         // Streamed hook output is high volume and untrusted repository text, so
         // the remote event carries only its attribution; the line itself stays
         // in the operator log.
+        //
+        // The attribution rides in the payload rather than the addressed-change
+        // slot: this event is presentation-only, and a change-addressed event
+        // feeds the snapshot's timing, activity, and attention. Hook lines must
+        // not alter workflow-control state — `ApplyCommitPhase` is the
+        // change-addressed event that makes a running commit visible.
         E::ApplyCommitOutput {
             change_id,
             attempt,
@@ -723,8 +729,12 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
             ..
         } => (
             "apply_commit_output",
-            Some(change_id.clone()),
-            json!({ "attempt": attempt, "stream": stream.as_str() }),
+            None,
+            json!({
+                "change_id": change_id,
+                "attempt": attempt,
+                "stream": stream.as_str(),
+            }),
         ),
         E::ArchiveStarted { change_id, command } => (
             "archive_started",

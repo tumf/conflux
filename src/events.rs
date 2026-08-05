@@ -1545,7 +1545,7 @@ mod ownership_tests {
     /// `classify_event` at compile time; this constant then forces the fixture
     /// table — and therefore every ownership and projection assertion below —
     /// to grow with it instead of silently skipping the new variant.
-    const EXECUTION_EVENT_VARIANTS: usize = 69;
+    const EXECUTION_EVENT_VARIANTS: usize = 71;
 
     #[test]
     fn ownership_table_names_every_variant_exactly_once() {

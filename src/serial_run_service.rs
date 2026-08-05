@@ -1787,10 +1787,13 @@ mod tests {
             // Apply checks off every open box, including acceptance follow-up
             // entries, so repeated cycles converge instead of exhausting the
             // apply iteration budget.
+            // It stages its own edit because the Apply finalization stage gate
+            // requires the agent to select change-owned files itself.
             apply_command: Some(format!(
                 "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
                  > openspec/changes/{change_id}/tasks.next \
-                 && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md\""
+                 && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md \
+                 && git add -A\""
             )),
             acceptance_command: Some(
                 "sh -c 'echo ACCEPTANCE: FAIL; echo FINDINGS:; echo - repeated serial finding'"
@@ -4064,13 +4067,16 @@ mod tests {
         let verdict_dir = verdict_dir.display().to_string();
 
         OrchestratorConfig {
+            // It stages everything it produced, including `apply_extra`'s
+            // repair files, because the Apply finalization stage gate requires
+            // the agent to select change-owned files itself.
             apply_command: Some(format!(
                 "sh -c 'n=$(cat \"{apply_counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
                  echo $n > \"{apply_counter}\"; \
                  sed \"s/- \\[ \\]/- [x]/g\" openspec/changes/{change_id}/tasks.md \
                  > openspec/changes/{change_id}/tasks.next \
                  && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md; \
-                 {apply_extra}'"
+                 {apply_extra}; git add -A'"
             )),
             acceptance_command: Some(format!(
                 "sh -c 'n=$(cat \"{acceptance_counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
