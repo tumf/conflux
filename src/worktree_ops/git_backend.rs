@@ -150,6 +150,16 @@ impl WorktreeBackend for GitWorktreeBackend {
             .map_err(|e| WorktreeOpError::Internal(format!("failed to delete branch: {e}")))
     }
 
+    async fn delete_branch_at(&self, branch: &str, expected_oid: &str) -> WorktreeOpResult<()> {
+        commands::branch_delete_at_oid(&self.repo_root, branch, expected_oid)
+            .await
+            .map_err(|e| {
+                WorktreeOpError::Internal(format!(
+                    "failed to delete branch at the confirmed commit: {e}"
+                ))
+            })
+    }
+
     async fn merge_into_base(
         &self,
         branch: &str,

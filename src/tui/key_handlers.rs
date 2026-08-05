@@ -761,6 +761,20 @@ pub(crate) async fn handle_modal_key(key: KeyEvent, ctx: &mut KeyEventContext<'_
             }
             _ => {}
         },
+        // Same fail-safe key set, for the heavier decision: `X` here also
+        // deletes an unmerged branch, so `Y`, `S`, and lowercase `x` stay just
+        // as inert as they are in the dirty confirmation.
+        ModalState::ConfirmAheadDiscard { .. } => match (key.code, key.modifiers) {
+            (KeyCode::Char('X'), _) => {
+                if let Some(cmd) = ctx.app.confirm_ahead_discard() {
+                    let _ = ctx.cmd_tx.send(cmd).await;
+                }
+            }
+            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
+                ctx.app.cancel_worktree_action();
+            }
+            _ => {}
+        },
     }
 
     true
@@ -2358,6 +2372,142 @@ mod tests {
                 .warning_message
                 .as_ref()
                 .is_some_and(|msg| msg.contains("Dirty worktree discard canceled")));
+        }
+    }
+
+    /// An app in the destructive ahead-discard confirmation over `/tmp/wt-a`.
+    fn tui_ahead_worktree_delete_app(skip_teardown: bool, dirty: bool) -> AppState {
+        let mut app = tui_dirty_worktree_delete_app(skip_teardown);
+        app.modal = Some(ModalState::ConfirmAheadDiscard {
+            path: PathBuf::from("/tmp/wt-a"),
+            identity: "gitdir: /tmp/wt-a/.git".to_string(),
+            branch: "change-b".to_string(),
+            head: "abc1234".to_string(),
+            dirty,
+            skip_teardown,
+        });
+        app
+    }
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_uppercase_x_is_the_only_key_that_discards() {
+        for dirty in [false, true] {
+            for skip_teardown in [false, true] {
+                let mut app = tui_ahead_worktree_delete_app(skip_teardown, dirty);
+
+                let commands = route_key(&mut app, KeyCode::Char('X')).await;
+
+                let [TuiCommand::DeleteWorktree(intent)] = commands.as_slice() else {
+                    panic!("expected a single delete command, got {commands:?}");
+                };
+                assert!(intent.allow_commits_ahead);
+                assert_eq!(
+                    intent.allow_known_dirty, dirty,
+                    "the one keypress grants dirty discard only where the modal disclosed it"
+                );
+                assert_eq!(intent.skip_teardown, skip_teardown);
+                assert_eq!(intent.path, PathBuf::from("/tmp/wt-a"));
+                assert_eq!(intent.branch, "change-b");
+                assert_eq!(intent.identity.as_deref(), Some("gitdir: /tmp/wt-a/.git"));
+                assert_eq!(intent.head.as_deref(), Some("abc1234"));
+                assert!(app.modal.is_none());
+                assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/wt-a")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_confirmation_ignores_every_other_key() {
+        // The keys that got the operator here, the bulk-mark key, and the
+        // lowercase twin of the one destructive key: all inert. This modal
+        // authorizes deleting commits, so a slipped shift may not decide it.
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Char('Y'),
+            KeyCode::Char('s'),
+            KeyCode::Char('S'),
+            KeyCode::Char('x'),
+            KeyCode::Char('d'),
+            KeyCode::Char('D'),
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Tab,
+            KeyCode::F(5),
+        ] {
+            let mut app = tui_ahead_worktree_delete_app(false, true);
+            let before = app.modal.clone();
+
+            let commands = route_key(&mut app, code).await;
+
+            assert!(
+                commands.is_empty(),
+                "{code:?} must not dispatch anything from the ahead confirmation"
+            );
+            assert_eq!(
+                app.modal, before,
+                "{code:?} must leave the ahead confirmation exactly as it was"
+            );
+            assert!(
+                !app.is_worktree_deleting(&PathBuf::from("/tmp/wt-a")),
+                "{code:?} must not start a deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_n_and_esc_cancel_and_retain_both_resources() {
+        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            let mut app = tui_ahead_worktree_delete_app(false, false);
+
+            let commands = route_key(&mut app, code).await;
+
+            assert!(commands.is_empty(), "{code:?} must dispatch nothing");
+            assert!(app.modal.is_none(), "{code:?} must close the confirmation");
+            assert!(
+                !app.is_worktree_deleting(&PathBuf::from("/tmp/wt-a")),
+                "{code:?} must retain the worktree, its content, and its branch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_refuses_a_target_that_drifted_before_dispatch() {
+        let cases: [DriftCase; 6] = [
+            ("absent", |app: &mut AppState| app.worktrees.clear()),
+            ("main", |app: &mut AppState| app.worktrees[0].is_main = true),
+            ("rebranded", |app: &mut AppState| {
+                app.worktrees[0].branch = "change-z".to_string()
+            }),
+            ("head-moved", |app: &mut AppState| {
+                app.worktrees[0].head = "def5678".to_string()
+            }),
+            ("active", |app: &mut AppState| {
+                app.changes[1].set_display_status_cache("applying")
+            }),
+            ("deleting", |app: &mut AppState| {
+                app.mark_worktree_deleting(PathBuf::from("/tmp/wt-a"))
+            }),
+        ];
+
+        for (name, mutate) in cases {
+            let mut app = tui_ahead_worktree_delete_app(false, false);
+            mutate(&mut app);
+
+            let commands = route_key(&mut app, KeyCode::Char('X')).await;
+
+            assert!(
+                commands.is_empty(),
+                "{name}: a drifted target must not be discarded"
+            );
+            assert!(
+                app.modal.is_none(),
+                "{name}: the stale confirmation must be cleared"
+            );
+            assert!(app
+                .warning_message
+                .as_ref()
+                .is_some_and(|msg| msg.contains("Ahead worktree discard canceled")));
         }
     }
 

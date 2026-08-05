@@ -132,6 +132,31 @@ pub enum ModalState {
         /// other.
         skip_teardown: bool,
     },
+    /// Second, explicitly destructive confirmation for a worktree whose branch
+    /// carries commits base does not have.
+    ///
+    /// Opened only from the shared service's own fresh commits-ahead refusal, on
+    /// the same terms as [`Self::ConfirmDirtyDiscard`]. What makes it a separate
+    /// overlay rather than a flag on that one is what it authorizes: deleting an
+    /// unmerged branch, which no dirty-discard confirmation ever named.
+    ConfirmAheadDiscard {
+        /// Path the service observed ahead of base.
+        path: PathBuf,
+        /// Git worktree identity at observation time.
+        identity: String,
+        /// Branch at observation time.
+        branch: String,
+        /// HEAD commit at observation time. The branch is deleted only at this OID.
+        head: String,
+        /// Whether the same observation also reported uncommitted changes.
+        ///
+        /// The two losses are disclosed together because one keypress authorizes
+        /// both; a confirmation that hid this would be granting dirty discard
+        /// implicitly.
+        dirty: bool,
+        /// Teardown choice captured from the ordinary confirmation.
+        skip_teardown: bool,
+    },
     /// Force-kill confirmation for a single active change.
     ConfirmForceKill {
         /// The change ID being confirmed for force-kill
@@ -146,6 +171,7 @@ impl ModalState {
             ModalState::QrPopup => "QR Code",
             ModalState::ConfirmWorktreeDelete { .. } => "Confirm Delete",
             ModalState::ConfirmDirtyDiscard { .. } => "Discard Changes",
+            ModalState::ConfirmAheadDiscard { .. } => "Discard Commits",
             ModalState::ConfirmForceKill { .. } => "Confirm Kill",
         }
     }
@@ -160,9 +186,10 @@ impl ModalState {
 
 /// One confirmed worktree deletion, with every permission it was granted.
 ///
-/// The two permissions are deliberately separate values rather than one "force"
-/// flag: skipping teardown and discarding uncommitted work are different
-/// decisions, taken by different keypresses, and one must never imply the other.
+/// The three permissions are deliberately separate values rather than one
+/// "force" flag: skipping teardown, discarding uncommitted work, and discarding
+/// unmerged commits are different decisions, taken from different
+/// confirmations, and one must never imply another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteIntent {
     /// Worktree the confirmation targets.
@@ -175,13 +202,16 @@ pub struct DeleteIntent {
     pub head: Option<String>,
     /// Skip `.wt/teardown`. Chosen with `S` in the ordinary confirmation.
     pub skip_teardown: bool,
-    /// Discard known uncommitted work. Granted only by `X` in the destructive
-    /// confirmation, and never by `Y` or `S`.
+    /// Discard known uncommitted work. Granted only by `X` in a destructive
+    /// confirmation that named that loss, and never by `Y` or `S`.
     pub allow_known_dirty: bool,
+    /// Discard known commits ahead of base and delete the confirmed branch.
+    /// Granted only by `X` in the ahead-discard confirmation.
+    pub allow_commits_ahead: bool,
 }
 
 impl DeleteIntent {
-    /// The ordinary intent: no dirty discard, whatever teardown was chosen.
+    /// The ordinary intent: no discard of any kind, whatever teardown was chosen.
     pub fn ordinary(path: PathBuf, branch: String, skip_teardown: bool) -> Self {
         Self {
             path,
@@ -190,6 +220,7 @@ impl DeleteIntent {
             head: None,
             skip_teardown,
             allow_known_dirty: false,
+            allow_commits_ahead: false,
         }
     }
 }

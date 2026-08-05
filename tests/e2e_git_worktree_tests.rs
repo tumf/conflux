@@ -3213,8 +3213,9 @@ mod tui_dirty_worktree_delete_tests {
         std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
         git(&worktree, &["add", "-A"]);
         git(&worktree, &["commit", "-m", "Unmerged work"]);
-        // Dirty *and* ahead: discard could waive the first but never the second,
-        // so the refusal must be the one no keypress can answer.
+        // Dirty *and* ahead: dirty discard could waive the first but never the
+        // second, so the refusal must be the ahead one — and it must arrive
+        // carrying the dirty fact, so the confirmation it opens can name both.
         std::fs::write(worktree.join("README.md"), "# edited\n").unwrap();
 
         for options in [
@@ -3230,13 +3231,132 @@ mod tui_dirty_worktree_delete_tests {
                 )
                 .await
                 .expect_err("unmerged commits must refuse deletion");
+            let WorktreeOpError::CommitsAhead { target, .. } = refusal else {
+                panic!("{options:?} must refuse with the typed ahead refusal: {refusal:?}");
+            };
+            assert_eq!(target.branch, "change-ahead");
+            assert_eq!(target.head, git(&worktree, &["rev-parse", "HEAD"]));
             assert!(
-                matches!(refusal, WorktreeOpError::Ineligible(_)),
-                "{options:?} must refuse without offering a discard: {refusal:?}"
+                target.dirty,
+                "{options:?}: the ahead target must report the uncommitted work Git sees"
             );
         }
 
         assert!(worktree.is_dir());
         assert!(fx.branch_exists("change-ahead"));
+    }
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_e2e_removes_the_worktree_and_its_unmerged_branch() {
+        let Some(fx) = dirty_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        let worktree = fx.add_worktree("change-ahead-discard");
+        std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-m", "Unmerged work"]);
+        // Also dirty, so the one authorization has to cover both losses.
+        std::fs::write(worktree.join("README.md"), "# edited\n").unwrap();
+        let head = git(&worktree, &["rev-parse", "HEAD"]);
+
+        let outcome = fx
+            .service
+            .delete_worktree(
+                &worktree,
+                &ExpectedTarget::on_branch("change-ahead-discard").with_head(head),
+                DeleteOptions::local_discarding_ahead(false, true),
+            )
+            .await
+            .expect("an explicitly authorized ahead discard must delete");
+
+        assert!(!worktree.exists(), "the worktree directory must be gone");
+        assert!(
+            !fx.branch_exists("change-ahead-discard"),
+            "the unmerged branch must be gone too: {}",
+            outcome.detail
+        );
+        assert!(!outcome.branch_retained);
+    }
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_e2e_refuses_a_confirmation_naming_a_stale_commit() {
+        // The branch ref is the thing the whole authorization is anchored to, so
+        // a real repository is where that anchor has to hold: a confirmation
+        // taken at one commit may not delete a branch that has since moved on.
+        // The post-removal half of that anchor — the compare-and-delete refusing
+        // once the worktree is already gone — is unit-covered against a scripted
+        // backend, because a real repository cannot move the ref inside that
+        // window on demand.
+        let Some(fx) = dirty_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        // Teardown is operator code that runs between the two observations, but
+        // it may not move the very facts the deletion was authorized from. What
+        // *can* move afterwards is the branch ref, so drive that directly by
+        // authorizing from a stale HEAD.
+        let worktree = fx.add_worktree("change-ahead-moved");
+        std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-m", "First unmerged commit"]);
+        let stale_head = git(&worktree, &["rev-parse", "HEAD"]);
+        std::fs::write(worktree.join("work.txt"), "more work\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-m", "Second unmerged commit"]);
+
+        let refusal = fx
+            .service
+            .delete_worktree(
+                &worktree,
+                &ExpectedTarget::on_branch("change-ahead-moved").with_head(stale_head),
+                DeleteOptions::local_discarding_ahead(false, false),
+            )
+            .await
+            .expect_err("a confirmation naming a commit the branch left must refuse");
+
+        assert!(
+            matches!(refusal, WorktreeOpError::NotFound(_)),
+            "the stale confirmation must be refused: {refusal:?}"
+        );
+        assert!(worktree.is_dir(), "nothing may be removed");
+        assert!(
+            fx.branch_exists("change-ahead-moved"),
+            "and the branch keeps its unmerged commits"
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_ahead_worktree_delete_e2e_ordinary_cleanup_still_only_deletes_merged_branches() {
+        // The destructive operation must not have weakened the ordinary path:
+        // an ahead branch reached without the explicit permission still refuses,
+        // and a merged one is still cleaned up.
+        let Some(fx) = dirty_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        let worktree = fx.add_worktree("change-merged");
+        std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-m", "Work to merge"]);
+        git(
+            &fx.repo,
+            &["merge", "--no-ff", "-m", "Merge", "change-merged"],
+        );
+
+        fx.service
+            .delete_worktree(
+                &worktree,
+                &ExpectedTarget::on_branch("change-merged"),
+                DeleteOptions::local(false),
+            )
+            .await
+            .expect("a merged worktree deletes under the ordinary policy");
+
+        assert!(!worktree.exists());
+        assert!(
+            !fx.branch_exists("change-merged"),
+            "merged-only cleanup still deletes a reachable branch"
+        );
     }
 }
