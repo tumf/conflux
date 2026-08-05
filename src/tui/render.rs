@@ -241,6 +241,9 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
         Some(ModalState::ConfirmDirtyDiscard { .. }) => {
             worktree_view::render_dirty_discard_confirm(frame, app, area)
         }
+        Some(ModalState::ConfirmAheadDiscard { .. }) => {
+            worktree_view::render_ahead_discard_confirm(frame, app, area)
+        }
         // Force-kill confirmation keeps its existing in-list presentation (the
         // `Y: confirm kill` / `N: cancel` hints and the header label); it has no
         // separate popup widget, and this change does not add one.
@@ -406,6 +409,10 @@ mod worktree_view {
     pub(super) fn render_dirty_discard_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
         super::render_worktree_dirty_discard_confirm(frame, app, area);
     }
+
+    pub(super) fn render_ahead_discard_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
+        super::render_worktree_ahead_discard_confirm(frame, app, area);
+    }
 }
 
 mod popups {
@@ -450,9 +457,10 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         Some(modal @ ModalState::ConfirmWorktreeDelete { .. }) => {
             (modal.title_label().to_string(), Color::Yellow, true)
         }
-        Some(modal @ ModalState::ConfirmDirtyDiscard { .. }) => {
-            (modal.title_label().to_string(), Color::Red, true)
-        }
+        Some(
+            modal @ (ModalState::ConfirmDirtyDiscard { .. }
+            | ModalState::ConfirmAheadDiscard { .. }),
+        ) => (modal.title_label().to_string(), Color::Red, true),
         Some(modal @ ModalState::ConfirmForceKill { .. }) => {
             (modal.title_label().to_string(), Color::Red, true)
         }
@@ -2031,6 +2039,102 @@ fn render_worktree_dirty_discard_confirm(frame: &mut Frame, app: &AppState, area
     frame.render_widget(body, inner_area);
 }
 
+/// Render the destructive confirmation for a worktree ahead of base.
+///
+/// This is the only confirmation in the TUI that authorizes deleting an unmerged
+/// branch, so it names every resource that goes: the worktree, the branch, and
+/// the commits only that branch reaches. When the same observation also found
+/// uncommitted work, that loss is stated here too — one keypress grants both
+/// permissions, and it may only do so over a disclosure that covered both.
+fn render_worktree_ahead_discard_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
+    let Some(ModalState::ConfirmAheadDiscard {
+        path,
+        branch,
+        head,
+        dirty,
+        skip_teardown,
+        ..
+    }) = &app.modal
+    else {
+        return;
+    };
+
+    let modal_width = (area.width * 70 / 100).clamp(46, 100);
+    // Thirteen body lines plus borders, one more than the dirty confirmation:
+    // the branch/HEAD line and the conditional dirty line are what make this
+    // disclosure complete, and a clipped modal would be an incomplete one.
+    let modal_height = (area.height * 45 / 100).clamp(15, 18).min(area.height);
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(" Discard Unmerged Commits ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+
+    let inner_area = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let teardown_line = if *skip_teardown {
+        "Teardown will be skipped (S was pressed)."
+    } else {
+        "Teardown will run before removal (Y was pressed)."
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("'{}' has commits that base does not have.", branch),
+            Style::default().fg(Color::Red),
+        )),
+        Line::from(Span::styled(
+            format!("{} at {}", path.display(), head),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "The worktree, the local branch, and every unmerged commit on it",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "will be permanently deleted. Nothing is merged, pushed, tagged,",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "stashed, or backed up first, and the commits are not recoverable.",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+
+    if *dirty {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "This worktree also has uncommitted changes. They are discarded",
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(Span::styled(
+            "by the same keypress.",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        teardown_line,
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press uppercase X to discard and delete, N or Esc to keep it.",
+        Style::default().fg(Color::White),
+    )));
+
+    let body = Paragraph::new(lines);
+    frame.render_widget(body, inner_area);
+}
+
 fn warning_popup_modal_area(area: Rect) -> Rect {
     let modal_width = (area.width.saturating_mul(85) / 100)
         .max(40)
@@ -2553,6 +2657,88 @@ mod tests {
         // The `S` the operator pressed is still in force here; `X` grants the
         // other permission, not this one.
         assert!(content.contains("Teardown will be skipped"));
+    }
+
+    fn ahead_discard_modal(dirty: bool, skip_teardown: bool) -> ModalState {
+        ModalState::ConfirmAheadDiscard {
+            path: std::path::PathBuf::from("/tmp/worktree-a"),
+            identity: "gitdir: /tmp/worktree-a/.git".to_string(),
+            branch: "feature-a".to_string(),
+            head: "abc1234".to_string(),
+            dirty,
+            skip_teardown,
+        }
+    }
+
+    #[test]
+    fn tui_ahead_worktree_delete_destructive_modal_states_every_resource_it_deletes() {
+        let mut app = create_test_app(vec![]);
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a")];
+        app.modal = Some(ahead_discard_modal(false, false));
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("Discard Unmerged Commits"));
+        assert!(content.contains("feature-a"));
+        assert!(content.contains("/tmp/worktree-a"));
+        assert!(
+            content.contains("abc1234"),
+            "the confirmed commit is what the branch is deleted at: {content}"
+        );
+        assert!(
+            content.contains("the local branch, and every unmerged commit"),
+            "the modal must name the branch and the commits, not only the worktree: {content}"
+        );
+        assert!(
+            content.contains("Nothing is merged, pushed, tagged"),
+            "the modal must not imply the commits are preserved somewhere: {content}"
+        );
+        assert!(content.contains("not recoverable"));
+        assert!(content.contains("Press uppercase X to discard and delete"));
+        assert!(content.contains("Teardown will run before removal"));
+        assert!(
+            !content.contains("uncommitted changes"),
+            "a clean worktree must not be told it is losing uncommitted work: {content}"
+        );
+    }
+
+    #[test]
+    fn tui_ahead_worktree_delete_destructive_modal_discloses_both_losses_when_dirty() {
+        let mut app = create_test_app(vec![]);
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a")];
+        app.modal = Some(ahead_discard_modal(true, true));
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let content = buffer_to_string(&buffer);
+
+        // One keypress, two permissions — so one modal, both disclosures.
+        assert!(content.contains("every unmerged commit"));
+        assert!(content.contains("also has uncommitted changes"));
+        assert!(
+            content.contains("by the same keypress"),
+            "the operator must be told X covers both losses: {content}"
+        );
+        assert!(content.contains("Teardown will be skipped"));
+    }
+
+    #[test]
+    fn ahead_discard_overlay_renders_above_every_execution_mode() {
+        for mode in ALL_EXECUTION_MODES {
+            let mut app = overlay_app();
+            app.execution_mode = mode;
+            app.modal = Some(ahead_discard_modal(true, false));
+
+            let content = buffer_to_string(&render_buffer(&mut app, 100, 40));
+
+            assert!(
+                content.contains("Discard Unmerged Commits"),
+                "the ahead confirmation must render above {mode:?}"
+            );
+            assert!(content.contains("[Discard Commits]"));
+        }
     }
 
     #[test]

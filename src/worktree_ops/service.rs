@@ -189,6 +189,43 @@ impl DirtyTarget {
     }
 }
 
+/// The freshly observed target of a commits-ahead refusal.
+///
+/// Same contract as [`DirtyTarget`] — the confirmation may only name what the
+/// service itself just observed — plus one extra fact. Discarding an ahead
+/// worktree that is *also* dirty destroys two different kinds of work, and a
+/// confirmation that named only one of them would be authorizing the other
+/// silently. [`Self::dirty`] is what lets a single modal disclose both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AheadTarget {
+    /// Absolute path the observation was taken at.
+    pub path: PathBuf,
+    /// Git worktree identity at observation time.
+    pub identity: String,
+    /// Branch at observation time, empty when detached.
+    pub branch: String,
+    /// HEAD commit at observation time. The branch is deleted only at this OID.
+    pub head: String,
+    /// True when the same observation also classified the worktree `Dirty`.
+    ///
+    /// Only a *known* dirty state reaches here: an unobservable one fails closed
+    /// before the escalation exists at all.
+    pub dirty: bool,
+}
+
+impl AheadTarget {
+    /// Capture the escalation identity from an observation.
+    pub fn from_facts(facts: &WorktreeFacts) -> Self {
+        Self {
+            path: facts.path.clone(),
+            identity: facts.identity.clone(),
+            branch: facts.branch.clone(),
+            head: facts.head.clone(),
+            dirty: facts.dirty == DirtyState::Dirty,
+        }
+    }
+}
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -214,6 +251,19 @@ pub enum WorktreeOpError {
     },
     /// Dirty state could not be determined, so the operation fails closed.
     DirtyUnknown(String),
+    /// The worktree's branch carries commits the base does not have.
+    ///
+    /// Like [`Self::Dirty`], every other safety check already passed, so this is
+    /// the second — and only other — refusal a local frontend may escalate into
+    /// an explicitly destructive confirmation. The boxed target is the
+    /// observation that confirmation must be revalidated against, and it carries
+    /// the known dirty fact so one confirmation can disclose both losses.
+    CommitsAhead {
+        /// Operator-facing refusal text.
+        message: String,
+        /// Identity of the worktree as the service just observed it.
+        target: Box<AheadTarget>,
+    },
     /// The worktree is present but cannot accept this operation.
     Ineligible(String),
     /// The repository root is occupied by another operation or an unresolved merge.
@@ -236,6 +286,7 @@ impl fmt::Display for WorktreeOpError {
             | Self::Exists(message)
             | Self::Dirty { message, .. }
             | Self::DirtyUnknown(message)
+            | Self::CommitsAhead { message, .. }
             | Self::Ineligible(message)
             | Self::RootBusy(message)
             | Self::Internal(message) => write!(f, "{message}"),
@@ -278,6 +329,15 @@ pub struct DeleteOptions {
     /// identity mismatch, and only the local TUI's second, explicitly
     /// destructive confirmation may set it.
     pub allow_known_dirty: bool,
+    /// Permission to discard *known* commits ahead of base, and to delete the
+    /// confirmed branch that carries them.
+    ///
+    /// A third, independent permission, not a stronger form of the second. It
+    /// waives [`SafetyFact::Yes`] on [`WorktreeFacts::has_commits_ahead`] and
+    /// nothing else — not an unobservable ahead state, not uncommitted work, not
+    /// teardown — and only the local TUI's dedicated uppercase-`X` confirmation
+    /// may set it.
+    pub allow_commits_ahead: bool,
 }
 
 impl DeleteOptions {
@@ -286,26 +346,42 @@ impl DeleteOptions {
         Self {
             skip_teardown: false,
             allow_known_dirty: false,
+            allow_commits_ahead: false,
         }
     }
 
     /// The ordinary local policy: teardown is the operator's choice, discard is not.
     ///
-    /// `Y` and `S` both land here. Neither grants dirty discard, so a known-dirty
-    /// target refuses and the TUI escalates that refusal into its destructive
-    /// confirmation instead of deleting.
+    /// `Y` and `S` both land here. Neither grants dirty nor ahead discard, so a
+    /// known-dirty or known-ahead target refuses and the TUI escalates that
+    /// refusal into the matching destructive confirmation instead of deleting.
     pub fn local(skip_teardown: bool) -> Self {
         Self {
             skip_teardown,
             allow_known_dirty: false,
+            allow_commits_ahead: false,
         }
     }
 
-    /// The local policy after an explicit destructive confirmation.
+    /// The local policy after an explicit dirty-discard confirmation.
     pub fn local_discarding_dirty(skip_teardown: bool) -> Self {
         Self {
             skip_teardown,
             allow_known_dirty: true,
+            allow_commits_ahead: false,
+        }
+    }
+
+    /// The local policy after an explicit ahead-discard confirmation.
+    ///
+    /// `discard_known_dirty` is granted separately and only when the typed ahead
+    /// target reported the worktree dirty, so the confirmation that named both
+    /// losses is the only thing that can authorize both.
+    pub fn local_discarding_ahead(skip_teardown: bool, discard_known_dirty: bool) -> Self {
+        Self {
+            skip_teardown,
+            allow_known_dirty: discard_known_dirty,
+            allow_commits_ahead: true,
         }
     }
 }
@@ -316,11 +392,14 @@ impl DeleteOptions {
 
 /// Decide whether a worktree may be deleted under the caller's policy.
 ///
-/// Dirty is checked *last* on purpose. [`WorktreeOpError::Dirty`] is the one
-/// refusal a frontend may escalate into a destructive confirmation, so it must
-/// mean "nothing but uncommitted work stands in the way". A worktree that is
-/// both dirty and ahead of base reports the ahead refusal, which explicit
-/// discard cannot waive, and therefore never reaches that confirmation.
+/// Dirty is checked *last* on purpose. [`WorktreeOpError::Dirty`] must mean
+/// "nothing but uncommitted work stands in the way", so a worktree that is also
+/// ahead of base reports the ahead refusal instead. That refusal is not a dead
+/// end: it carries the known dirty fact, and the confirmation it opens names
+/// both losses before one keypress authorizes both. What never escalates is an
+/// *unobservable* dirty state — there the ahead check hands over to the
+/// fail-closed dirty refusal rather than offering a confirmation whose
+/// disclosure would be a guess.
 pub fn classify_delete_eligibility(
     facts: &WorktreeFacts,
     options: DeleteOptions,
@@ -344,17 +423,26 @@ pub fn classify_delete_eligibility(
         SafetyFact::No => {}
     }
     match facts.has_commits_ahead {
-        SafetyFact::Yes => {
-            return Err(WorktreeOpError::Ineligible(
-                "the worktree has unmerged commits ahead of base".to_string(),
+        // An unobservable dirty state is not something a destructive
+        // confirmation can disclose, so it fails closed here rather than
+        // escalating with a fact the modal would have to invent.
+        SafetyFact::Yes if !options.allow_commits_ahead && facts.dirty == DirtyState::Unknown => {
+            return Err(WorktreeOpError::DirtyUnknown(
+                "the worktree's uncommitted-change state could not be determined".to_string(),
             ))
+        }
+        SafetyFact::Yes if !options.allow_commits_ahead => {
+            return Err(WorktreeOpError::CommitsAhead {
+                message: "the worktree has unmerged commits ahead of base".to_string(),
+                target: Box::new(AheadTarget::from_facts(facts)),
+            })
         }
         SafetyFact::Unknown => {
             return Err(WorktreeOpError::Ineligible(
                 "the worktree's commits-ahead state could not be determined".to_string(),
             ))
         }
-        SafetyFact::No => {}
+        SafetyFact::Yes | SafetyFact::No => {}
     }
     match facts.dirty {
         DirtyState::Dirty if !options.allow_known_dirty => {
@@ -461,10 +549,24 @@ pub fn classify_delete_identity(
 /// Taken across the teardown boundary: teardown is arbitrary operator code, and
 /// the mutation guard only excludes Conflux's own operations, so the facts the
 /// deletion was authorized from are re-derived rather than assumed.
+///
+/// Every fact the authorization rested on is compared, not just the ones that
+/// name the worktree. Re-running [`classify_delete_eligibility`] on the second
+/// observation catches a fact that drifted into a *refusal*; this catches one
+/// that drifted at all. With an explicit destructive permission in hand the two
+/// are no longer the same question — a waived fact would re-pass eligibility no
+/// matter which way it moved.
 pub fn classify_delete_drift(
     before: &WorktreeFacts,
     after: &WorktreeFacts,
 ) -> WorktreeOpResult<()> {
+    if !same_path(&before.path, &after.path) {
+        return Err(WorktreeOpError::NotFound(format!(
+            "the worktree moved from '{}' to '{}' while it was being torn down; nothing was removed",
+            before.path.display(),
+            after.path.display()
+        )));
+    }
     if before.identity != after.identity {
         return Err(WorktreeOpError::NotFound(
             "the worktree's Git identity changed while it was being torn down; nothing was removed"
@@ -483,7 +585,72 @@ pub fn classify_delete_drift(
             before.head, after.head
         )));
     }
+    for (fact, before, after) in [
+        (
+            "uncommitted-change",
+            DriftFact::from(before.dirty),
+            DriftFact::from(after.dirty),
+        ),
+        (
+            "commits-ahead",
+            DriftFact::from(before.has_commits_ahead),
+            DriftFact::from(after.has_commits_ahead),
+        ),
+        (
+            "base merge",
+            DriftFact::from(before.base_merge_in_progress),
+            DriftFact::from(after.base_merge_in_progress),
+        ),
+    ] {
+        if before != after {
+            return Err(WorktreeOpError::Ineligible(format!(
+                "the worktree's {fact} state changed from {before} to {after} while it was being torn down; nothing was removed"
+            )));
+        }
+    }
     Ok(())
+}
+
+/// One safety fact's value, for drift comparison and its diagnostic.
+///
+/// [`DirtyState`] and [`SafetyFact`] are separate types with the same three
+/// answers; folding both into one comparable value is what lets the drift check
+/// treat every fact identically instead of once per type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriftFact {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl From<DirtyState> for DriftFact {
+    fn from(value: DirtyState) -> Self {
+        match value {
+            DirtyState::Dirty => Self::Yes,
+            DirtyState::Clean => Self::No,
+            DirtyState::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<SafetyFact> for DriftFact {
+    fn from(value: SafetyFact) -> Self {
+        match value {
+            SafetyFact::Yes => Self::Yes,
+            SafetyFact::No => Self::No,
+            SafetyFact::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl fmt::Display for DriftFact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Yes => "yes",
+            Self::No => "no",
+            Self::Unknown => "unknown",
+        })
+    }
 }
 
 /// Decide whether a worktree may be merged into base under the caller's policy.
@@ -599,6 +766,15 @@ pub trait WorktreeBackend: Send + Sync {
     ///
     /// Best-effort: a refusal retains the branch and is reported, not fatal.
     async fn delete_branch_if_merged(&self, branch: &str) -> WorktreeOpResult<()>;
+    /// Delete a branch whose commits are *not* reachable from elsewhere, in one
+    /// atomic compare-and-delete against `expected_oid`.
+    ///
+    /// The comparison is the safety property, and it must happen inside the ref
+    /// transaction: reading the ref and then force-deleting it is two steps with
+    /// a window between them, and this operation exists precisely for the case
+    /// where losing that race means losing commits. Any failure — a moved,
+    /// missing, or unreadable ref included — retains the branch.
+    async fn delete_branch_at(&self, branch: &str, expected_oid: &str) -> WorktreeOpResult<()>;
     /// Merge `branch` into base under the given conflict policy.
     async fn merge_into_base(
         &self,
@@ -676,6 +852,13 @@ pub struct WorktreeOpOutcome {
     pub path: PathBuf,
     /// Human-readable summary.
     pub detail: String,
+    /// True when the worktree was removed but its branch was deliberately kept.
+    ///
+    /// The operation still succeeded — the worktree is gone — but it did not do
+    /// everything it was asked to, and a frontend that reported it as an
+    /// unqualified success would be hiding a resource the operator still owns.
+    /// `detail` carries the reason.
+    pub branch_retained: bool,
 }
 
 /// The shared operation service.
@@ -802,10 +985,28 @@ impl WorktreeService {
                 "discarding known uncommitted changes: forcing removal of a dirty worktree on explicit operator confirmation"
             );
         }
+        if options.allow_commits_ahead {
+            warn!(
+                path = %after.path.display(),
+                branch = %after.branch,
+                head = %after.head,
+                ahead_discard = true,
+                dirty_discard = options.allow_known_dirty,
+                skip_teardown = options.skip_teardown,
+                "discarding known commits ahead of base: removing the worktree and deleting its unmerged branch on explicit operator confirmation"
+            );
+        }
 
         self.backend.remove_worktree(&after.path).await?;
 
-        let branch_note = self.cleanup_branch(&after).await;
+        // Which cleanup runs is decided by the *permission*, not by the observed
+        // ahead state: an unmerged branch is deleted only where an operator
+        // explicitly confirmed losing it.
+        let (branch_note, branch_retained) = if options.allow_commits_ahead {
+            self.discard_ahead_branch(&after).await
+        } else {
+            self.cleanup_branch(&after).await
+        };
 
         self.events
             .emit(WorktreeOperationEvent::Deleted {
@@ -826,6 +1027,7 @@ impl WorktreeService {
             ),
             branch: after.branch,
             path: after.path,
+            branch_retained,
         })
     }
 
@@ -875,17 +1077,18 @@ impl WorktreeService {
     /// before removal. This reads it again rather than trusting that answer: the
     /// removal itself is a window in which the ref can still move.
     ///
-    /// Returns the operator-facing suffix for the outcome detail.
-    async fn cleanup_branch(&self, facts: &WorktreeFacts) -> String {
+    /// Returns the operator-facing suffix for the outcome detail, and whether a
+    /// branch survived the deletion it was part of.
+    async fn cleanup_branch(&self, facts: &WorktreeFacts) -> (String, bool) {
         if facts.branch.is_empty() {
-            return String::new();
+            return (String::new(), false);
         }
 
         let retained = match self.backend.branch_ref(&facts.branch).await {
-            Ok(None) => return String::new(),
+            Ok(None) => return (String::new(), false),
             Ok(Some(oid)) if oid == facts.head => {
                 match self.backend.delete_branch_if_merged(&facts.branch).await {
-                    Ok(()) => return format!("; branch '{}' was deleted", facts.branch),
+                    Ok(()) => return (format!("; branch '{}' was deleted", facts.branch), false),
                     Err(error) => {
                         format!("its commits are not reachable from elsewhere ({error})")
                     }
@@ -902,10 +1105,59 @@ impl WorktreeService {
             branch = %facts.branch,
             "branch was retained after worktree removal: {retained}"
         );
-        format!(
-            "; branch '{}' was retained because {retained}",
-            facts.branch
+        (
+            format!(
+                "; branch '{}' was retained because {retained}",
+                facts.branch
+            ),
+            true,
         )
+    }
+
+    /// Delete the explicitly confirmed ahead branch after worktree removal.
+    ///
+    /// This is the one path that makes commits unreachable, so it never asks
+    /// whether the branch *looks* like the confirmed one and then deletes it:
+    /// the OID the operator confirmed is handed to an atomic compare-and-delete,
+    /// and Git either deletes exactly that ref or does nothing. A moved,
+    /// missing, or unreadable ref therefore fails the same way — the branch
+    /// stays, and the outcome says the deletion was only partly done.
+    ///
+    /// The worktree is already gone by this point and is deliberately not
+    /// reconstructed: removal and branch deletion are distinct outcomes, and a
+    /// retained branch is the recoverable half of a partial failure.
+    async fn discard_ahead_branch(&self, facts: &WorktreeFacts) -> (String, bool) {
+        if facts.branch.is_empty() {
+            return (String::new(), false);
+        }
+
+        match self
+            .backend
+            .delete_branch_at(&facts.branch, &facts.head)
+            .await
+        {
+            Ok(()) => (
+                format!(
+                    "; branch '{}' and its unmerged commits were deleted",
+                    facts.branch
+                ),
+                false,
+            ),
+            Err(error) => {
+                warn!(
+                    branch = %facts.branch,
+                    head = %facts.head,
+                    "explicitly confirmed ahead branch was retained after worktree removal: {error}"
+                );
+                (
+                    format!(
+                        "; branch '{}' was retained because its ref no longer matched the confirmed commit '{}' or could not be deleted ({error})",
+                        facts.branch, facts.head
+                    ),
+                    true,
+                )
+            }
+        }
     }
 
     /// Merge a managed worktree's branch into base.
@@ -1000,6 +1252,7 @@ impl WorktreeService {
             detail: format!("branch '{}' was merged into base", facts.branch),
             branch: facts.branch,
             path: facts.path,
+            branch_retained: false,
         })
     }
 

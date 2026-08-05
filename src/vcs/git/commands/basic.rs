@@ -265,6 +265,37 @@ pub async fn branch_delete_if_merged<P: AsRef<Path>>(cwd: P, branch_name: &str) 
     Ok(())
 }
 
+/// Delete a local branch only if its ref still points at `expected_oid`.
+///
+/// `git update-ref -d <ref> <oldvalue>` compares and deletes inside one ref
+/// transaction, so nothing can move the branch between the check and the
+/// deletion. That matters here and not in [`branch_delete_if_merged`]: this is
+/// the path used for commits Git cannot reach from anywhere else, where losing
+/// the race would mean deleting a ref the caller never confirmed.
+///
+/// A mismatched, missing, or unreadable ref fails and leaves the branch alone.
+pub async fn branch_delete_at_oid<P: AsRef<Path>>(
+    cwd: P,
+    branch_name: &str,
+    expected_oid: &str,
+) -> VcsResult<()> {
+    debug!(
+        "Deleting branch {} at expected commit {}",
+        branch_name, expected_oid
+    );
+    run_git(
+        &[
+            "update-ref",
+            "-d",
+            &format!("refs/heads/{}", branch_name),
+            expected_oid,
+        ],
+        cwd,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Current commit a local branch ref points at.
 ///
 /// `Ok(None)` means the ref does not exist; `Err` means the ref state could not
