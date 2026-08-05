@@ -17,7 +17,7 @@ use serde_yaml::Value;
 /// The one selector both Rust hooks must share.
 const RUST_SELECTOR: &str = r"^(src|tests)/.*\.rs$|^Cargo\.(toml|lock)$|^build\.rs$";
 
-const RUSTFMT_ENTRY: &str = "cargo fmt --all";
+const RUSTFMT_ENTRY: &str = "cargo fmt --all -- --check";
 const CLIPPY_ENTRY: &str = "cargo clippy --locked --all-targets --all-features -- -D warnings";
 
 fn config() -> Value {

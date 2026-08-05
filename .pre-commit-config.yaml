@@ -24,7 +24,7 @@ repos:
       # `make check` and CI remain the unconditional full validation path.
       - id: rustfmt
         name: rustfmt
-        entry: cargo fmt --all
+        entry: cargo fmt --all -- --check
         language: system
         pass_filenames: false
         files: ^(src|tests)/.*\.rs$|^Cargo\.(toml|lock)$|^build\.rs$
