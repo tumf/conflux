@@ -1,0 +1,12 @@
+## Implementation Tasks
+
+- [ ] Add the `cflx openapi` parser and dispatch path so it bypasses orchestration startup and writes only generated YAML to stdout, with clear non-zero failure behavior when unavailable. (verification: integration - CLI tests in `tests/openapi_contract_tests.rs` execute `cflx openapi` outside a Git repository, parse stdout as OpenAPI YAML, and assert diagnostics stay on stderr; verification-id: openapi-local-tests)
+- [ ] Reuse one serialization path for `cflx openapi` and `GET /api/v2/openapi.yaml`, preserving deterministic output and current authentication behavior. (verification: integration - `tests/openapi_contract_tests.rs` compares CLI output with the live router response byte-for-byte; verification-id: openapi-local-tests)
+- [ ] Remove `docs/openapi.yaml`, the `openapi-gen` binary target/source, static generation/check Make targets, and the OpenAPI drift pre-commit hook. (verification: integration - `tests/openapi_contract_tests.rs` and `rg 'docs/openapi\.yaml|check-openapi|openapi-gen' Cargo.toml Makefile .pre-commit-config.yaml scripts release.toml` prove no active build or hook invokes the removed artifact workflow; verification-id: openapi-local-tests)
+- [ ] Remove static OpenAPI ownership and version rewriting from release configuration, release scripts, and release scope tests while preserving manifest/lockfile release isolation. (verification: integration - `cargo test --test release_bump_scope_tests` proves releases remain scoped and no longer expect `docs/openapi.yaml`; verification-id: openapi-local-tests)
+- [ ] Convert static-artifact contract assertions into generated-document and executable-surface assertions covering routes, schemas, commands, errors, events, security, removed paths, and deterministic serialization. (verification: integration - `cargo test --features web-monitoring --test openapi_contract_tests` fails on intentionally incomplete generated contracts and passes on the complete implementation; verification-id: openapi-local-tests)
+- [ ] Update README variants, contributor/development/API/release guides, and active source documentation to point to `cflx openapi` and `GET /api/v2/openapi.yaml`. (verification: integration - documentation/reference checks find no active link or instruction for the deleted tracked artifact or removed Make targets; verification-id: openapi-local-tests)
+
+## Final Validation
+
+Archive validation is the authoritative final OpenSpec gate. Expected archive gate: `cflx openspec validate add-openapi-command --archive-gate`.

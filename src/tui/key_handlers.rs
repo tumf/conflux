@@ -95,7 +95,11 @@ impl WorktreePlusRuntime for ProductionWorktreePlusRuntime {
     }
 
     async fn run_worktree_setup(&self, repo_root: &Path, worktree_path: &Path) -> VcsResult<()> {
-        crate::vcs::git::commands::run_worktree_setup(repo_root, worktree_path).await
+        // The TUI-created worktree path only needs success or the actionable
+        // failure; the setup report's diagnostics are already logged.
+        crate::vcs::git::commands::run_worktree_setup(repo_root, worktree_path)
+            .await
+            .map(|_report| ())
     }
 
     async fn worktree_remove_after_setup_failure(

@@ -458,6 +458,24 @@ pub enum ExecutionEvent {
     },
 
     // Workspace events (parallel mode)
+    /// Managed workspace preparation started for a scheduler-admitted change.
+    ///
+    /// Emitted after the execution-slot permit is acquired and the stop/terminal
+    /// gates pass, immediately before force-recreate cleanup, worktree
+    /// creation/recreation, or `.wt/setup` — the work that would otherwise leave
+    /// the change rendered as `queued` for minutes.
+    ///
+    /// Purely a process-local observability/orchestration transition: it is
+    /// never persisted and never participates in resume routing, which stays
+    /// derived from workspace files, Git state, and base-tree comparison.
+    WorkspacePreparationStarted { change_id: String },
+    /// Managed workspace preparation ended without a next-phase event.
+    ///
+    /// Clears an in-memory `preparing` activity so a dispatch that leaves before
+    /// any `*Started` event — global cancellation, a terminal resume route, a
+    /// pre-spawn early return — cannot leave the change displayed as `preparing`
+    /// forever. A no-op once another transition already moved the change on.
+    WorkspacePreparationEnded { change_id: String },
     /// A workspace was created
     #[allow(dead_code)]
     WorkspaceCreated {
@@ -742,6 +760,8 @@ pub fn classify_event(event: &ExecutionEvent) -> (&'static str, EventOwnership) 
         E::RejectionReviewFailed { .. } => ("RejectionReviewFailed", State),
         E::AcceptanceOutput { .. } => ("AcceptanceOutput", State),
         E::ProgressUpdated { .. } => ("ProgressUpdated", State),
+        E::WorkspacePreparationStarted { .. } => ("WorkspacePreparationStarted", State),
+        E::WorkspacePreparationEnded { .. } => ("WorkspacePreparationEnded", State),
         E::WorkspaceCreated { .. } => ("WorkspaceCreated", State),
         E::WorkspaceStatusUpdated { .. } => ("WorkspaceStatusUpdated", State),
         E::WorkspaceResumed { .. } => ("WorkspaceResumed", State),
@@ -1010,7 +1030,10 @@ pub fn lifecycle_event_for_execution_event(
     let (state, change_id) = match event {
         // Work is executing.
         ExecutionEvent::ProcessingStarted(id) => (LifecycleState::Working, Some(id.as_str())),
-        ExecutionEvent::ApplyStarted { change_id, .. }
+        // Workspace preparation is real admitted work, so the external lifecycle
+        // reports it as working rather than waiting for the first agent command.
+        ExecutionEvent::WorkspacePreparationStarted { change_id }
+        | ExecutionEvent::ApplyStarted { change_id, .. }
         | ExecutionEvent::ArchiveStarted { change_id, .. }
         | ExecutionEvent::AcceptanceStarted { change_id, .. }
         | ExecutionEvent::ResolveStarted { change_id, .. } => {
@@ -1244,6 +1267,12 @@ pub(crate) mod ownership_fixtures {
                 completed: 3,
                 total: 7,
             },
+            E::WorkspacePreparationStarted {
+                change_id: "change-a".to_string(),
+            },
+            E::WorkspacePreparationEnded {
+                change_id: "change-a".to_string(),
+            },
             E::WorkspaceCreated {
                 change_id: "change-a".to_string(),
                 workspace: "ws-a".to_string(),
@@ -1425,7 +1454,7 @@ mod ownership_tests {
     /// `classify_event` at compile time; this constant then forces the fixture
     /// table — and therefore every ownership and projection assertion below —
     /// to grow with it instead of silently skipping the new variant.
-    const EXECUTION_EVENT_VARIANTS: usize = 67;
+    const EXECUTION_EVENT_VARIANTS: usize = 69;
 
     #[test]
     fn ownership_table_names_every_variant_exactly_once() {

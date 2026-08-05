@@ -37,6 +37,7 @@ pub use worktree::{
     run_worktree_setup, run_worktree_teardown, validate_worktree_command_cwd,
     validate_worktree_command_cwd_facts, validate_worktree_identity, worktree_add,
     worktree_records, worktree_remove, worktree_remove_forced, worktree_remove_with_options,
-    RegisteredWorktreePath, WorktreeCommandCwdFacts, WorktreeCommandCwdValidationError,
-    WorktreeIdentity, WorktreeRecord, WorktreeRemoveOptions,
+    worktree_setup_completed_diagnostic, worktree_setup_start_diagnostic, RegisteredWorktreePath,
+    WorktreeCommandCwdFacts, WorktreeCommandCwdValidationError, WorktreeIdentity, WorktreeRecord,
+    WorktreeRemoveOptions, WorktreeSetupReport,
 };

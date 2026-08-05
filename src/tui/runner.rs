@@ -90,6 +90,8 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         | ExecutionEvent::RejectionReviewCompleted { .. }
         | ExecutionEvent::RejectionReviewFailed { .. }
         | ExecutionEvent::WorkspaceStatusUpdated { .. }
+        | ExecutionEvent::WorkspacePreparationStarted { .. }
+        | ExecutionEvent::WorkspacePreparationEnded { .. }
         | ExecutionEvent::PushStarted { .. }
         | ExecutionEvent::PushCompleted { .. }
         | ExecutionEvent::PushFailed { .. }

@@ -344,6 +344,7 @@ impl ChangeState {
             "queued" => Color::Yellow,
             "blocked" => Color::Gray,
             "stalled" => Color::LightYellow,
+            "preparing" => Color::Green,
             "applying" => Color::Cyan,
             "accepting" => Color::LightGreen,
             "archiving" => Color::Magenta,
@@ -2044,7 +2045,7 @@ mod guards {
             && !is_parallel_eligible
             && !matches!(
                 display_status_cache,
-                "applying" | "accepting" | "archiving" | "resolving"
+                "preparing" | "applying" | "accepting" | "archiving" | "resolving"
             )
         {
             return Some(ToggleBlockReason::ParallelUncommitted);

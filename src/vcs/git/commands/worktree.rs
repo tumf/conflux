@@ -1089,6 +1089,64 @@ pub async fn run_worktree_teardown<P1: AsRef<Path>, P2: AsRef<Path>>(
     Ok(())
 }
 
+/// Bounded observability record for one `.wt/setup` invocation.
+///
+/// Deliberately observability only: nothing in it is a workflow-control input.
+/// Preparation routing is decided by the setup command's exit status, never by
+/// how long it took or what it printed, so an elapsed time that looks slow can
+/// never change which phase runs next.
+///
+/// It exists as a return value rather than as tracing output alone so the
+/// start/completion contract is assertable instead of grep-able.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorktreeSetupReport {
+    /// True when a `.wt/setup` script existed and was executed.
+    pub ran: bool,
+    /// Ordered diagnostics emitted for this invocation.
+    ///
+    /// Bounded to one start diagnostic plus one completion diagnostic; a
+    /// failure reports its single diagnostic through the returned error
+    /// instead, so no invocation can emit a duplicate lifecycle line.
+    pub diagnostics: Vec<String>,
+    /// Wall-clock duration of the setup command, when it ran to completion.
+    pub elapsed: Option<std::time::Duration>,
+}
+
+/// The single start diagnostic for one `.wt/setup` invocation.
+pub fn worktree_setup_start_diagnostic(worktree_path: &Path) -> String {
+    format!("Worktree setup started: .wt/setup in {:?}", worktree_path)
+}
+
+/// The single completion diagnostic, carrying elapsed duration.
+pub fn worktree_setup_completed_diagnostic(
+    worktree_path: &Path,
+    elapsed: std::time::Duration,
+) -> String {
+    format!(
+        "Worktree setup completed in {:.1}s: .wt/setup in {:?}",
+        elapsed.as_secs_f64(),
+        worktree_path
+    )
+}
+
+/// The single failure diagnostic, naming the failed preparation step.
+fn worktree_setup_failed_diagnostic(
+    worktree_path: &Path,
+    elapsed: std::time::Duration,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    format!(
+        "Worktree setup failed after {:.1}s: .wt/setup in {:?} exited with code {}\nstdout: {}\nstderr: {}",
+        elapsed.as_secs_f64(),
+        worktree_path,
+        exit_code,
+        stdout,
+        stderr
+    )
+}
+
 /// Execute the worktree setup script if it exists.
 ///
 /// Checks for `.wt/setup` in the repository root and executes it in the worktree directory.
@@ -1099,11 +1157,12 @@ pub async fn run_worktree_teardown<P1: AsRef<Path>, P2: AsRef<Path>>(
 /// * `worktree_path` - Path to the newly created worktree directory
 ///
 /// # Returns
-/// Ok(()) if setup script doesn't exist or executes successfully, Err() if setup script fails.
+/// The invocation's [`WorktreeSetupReport`] when the script is absent or
+/// succeeds; `Err` carrying the actionable failure diagnostic when it fails.
 pub async fn run_worktree_setup<P1: AsRef<Path>, P2: AsRef<Path>>(
     repo_root: P1,
     worktree_path: P2,
-) -> VcsResult<()> {
+) -> VcsResult<WorktreeSetupReport> {
     let repo_root = repo_root.as_ref();
     let worktree_path = worktree_path.as_ref();
 
@@ -1115,7 +1174,7 @@ pub async fn run_worktree_setup<P1: AsRef<Path>, P2: AsRef<Path>>(
             "Setup script not found at {:?}, skipping setup",
             setup_script
         );
-        return Ok(());
+        return Ok(WorktreeSetupReport::default());
     }
 
     info!(
@@ -1147,6 +1206,13 @@ pub async fn run_worktree_setup<P1: AsRef<Path>, P2: AsRef<Path>>(
         repo_root
     );
 
+    // The start diagnostic is emitted before the command so a setup that runs
+    // for minutes is visibly alive from its first moment rather than only once
+    // it returns.
+    let start_diagnostic = worktree_setup_start_diagnostic(worktree_path);
+    info!("{}", start_diagnostic);
+
+    let started_at = std::time::Instant::now();
     let output = Command::new(&setup_script)
         .current_dir(worktree_path)
         .env("ROOT_WORKTREE_PATH", repo_root)
@@ -1154,20 +1220,26 @@ pub async fn run_worktree_setup<P1: AsRef<Path>, P2: AsRef<Path>>(
         .output()
         .await
         .map_err(|e| VcsError::git_command(format!("Failed to execute setup script: {}", e)))?;
+    let elapsed = started_at.elapsed();
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let exit_code = output.status.code().unwrap_or(-1);
-
-        return Err(VcsError::git_command(format!(
-            "Setup script failed with exit code {}\nstdout: {}\nstderr: {}",
-            exit_code, stdout, stderr
-        )));
+        let failure_diagnostic =
+            worktree_setup_failed_diagnostic(worktree_path, elapsed, exit_code, &stdout, &stderr);
+        warn!("{}", failure_diagnostic);
+        return Err(VcsError::git_command(failure_diagnostic));
     }
 
-    info!("Setup script completed successfully");
-    Ok(())
+    let completed_diagnostic = worktree_setup_completed_diagnostic(worktree_path, elapsed);
+    info!("{}", completed_diagnostic);
+
+    Ok(WorktreeSetupReport {
+        ran: true,
+        diagnostics: vec![start_diagnostic, completed_diagnostic],
+        elapsed: Some(elapsed),
+    })
 }
 
 #[cfg(test)]
@@ -2454,5 +2526,101 @@ mod tests {
             }
             other => panic!("expected unsafe identity, got {:?}", other),
         }
+    }
+
+    // ── `.wt/setup` observability ──────────────────────────────────────────
+    //
+    // Integration evidence: these drive a real `.wt/setup` script through a real
+    // OS process in a real temporary directory, which is exactly the boundary
+    // the diagnostics describe.
+
+    /// Write an executable `.wt/setup` test double into `repo_root`.
+    fn write_setup_script(repo_root: &Path, body: &str) {
+        let wt_dir = repo_root.join(".wt");
+        std::fs::create_dir_all(&wt_dir).expect("create .wt");
+        let script = wt_dir.join("setup");
+        std::fs::write(&script, format!("#!/bin/sh\n{}\n", body)).expect("write setup");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod setup");
+        }
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_preparing_reports_start_then_completion_with_elapsed_time() {
+        let repo = TempDir::new().expect("repo tempdir");
+        let worktree = TempDir::new().expect("worktree tempdir");
+        write_setup_script(repo.path(), "printf 'ready\\n' > setup-marker");
+
+        let report = run_worktree_setup(repo.path(), worktree.path())
+            .await
+            .expect("setup script should succeed");
+
+        assert!(report.ran, "an existing .wt/setup must be reported as run");
+        assert!(
+            worktree.path().join("setup-marker").exists(),
+            "setup must run inside the worktree directory"
+        );
+
+        // Exactly one start diagnostic then exactly one completion diagnostic:
+        // repeated polling must not multiply lifecycle lines.
+        assert_eq!(report.diagnostics.len(), 2, "{:?}", report.diagnostics);
+        assert_eq!(
+            report.diagnostics[0],
+            worktree_setup_start_diagnostic(worktree.path())
+        );
+        let elapsed = report
+            .elapsed
+            .expect("a completed run reports elapsed time");
+        assert_eq!(
+            report.diagnostics[1],
+            worktree_setup_completed_diagnostic(worktree.path(), elapsed)
+        );
+        assert!(
+            report.diagnostics[1].contains("completed in"),
+            "the completion diagnostic must carry elapsed duration: {}",
+            report.diagnostics[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_preparing_absent_script_emits_no_diagnostics() {
+        let repo = TempDir::new().expect("repo tempdir");
+        let worktree = TempDir::new().expect("worktree tempdir");
+
+        let report = run_worktree_setup(repo.path(), worktree.path())
+            .await
+            .expect("a missing setup script is not a failure");
+
+        assert!(!report.ran);
+        assert!(report.diagnostics.is_empty());
+        assert!(report.elapsed.is_none());
+    }
+
+    #[tokio::test]
+    async fn worktree_setup_preparing_failure_is_actionable() {
+        let repo = TempDir::new().expect("repo tempdir");
+        let worktree = TempDir::new().expect("worktree tempdir");
+        write_setup_script(repo.path(), "echo 'missing toolchain' >&2; exit 3");
+
+        let error = run_worktree_setup(repo.path(), worktree.path())
+            .await
+            .expect_err("a non-zero setup exit must fail preparation");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Worktree setup failed"),
+            "failure must name the preparation step: {message}"
+        );
+        assert!(
+            message.contains("exited with code 3"),
+            "failure must carry the exit code: {message}"
+        );
+        assert!(
+            message.contains("missing toolchain"),
+            "failure must carry the script's own diagnosis: {message}"
+        );
     }
 }

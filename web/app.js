@@ -54,6 +54,9 @@ export const ATTENTION_STATUSES = new Set([
 
 /** Display statuses that mean work is executing right now. */
 export const ACTIVE_STATUSES = new Set([
+  // Admitted to a slot and preparing its worktree — active work, even though
+  // no operation agent has started yet.
+  'preparing',
   'applying',
   'accepting',
   'rejecting',

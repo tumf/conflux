@@ -24,6 +24,10 @@ describe('operator priority classification', () => {
     expect(classifyChange({ display_status: 'blocked' })).toBe('attention');
     expect(classifyChange({ display_status: 'merge wait' })).toBe('attention');
     expect(classifyChange({ display_status: 'rejected' })).toBe('attention');
+    // Workspace preparation is admitted work, not a queue wait: an operator
+    // watching the Active group must see the change that is currently building
+    // its worktree.
+    expect(classifyChange({ display_status: 'preparing' })).toBe('active');
     expect(classifyChange({ display_status: 'applying' })).toBe('active');
     expect(classifyChange({ display_status: 'archiving' })).toBe('active');
     expect(classifyChange({ display_status: 'queued' })).toBe('waiting');
@@ -125,6 +129,42 @@ describe('first viewport', () => {
 
     expect(doc.getElementById('attention-summary').hidden).toBe(true);
     expect(doc.getElementById('status-attention').textContent).toBe('Nothing');
+  });
+
+  it('renders a preparing change inside the Active group', async () => {
+    const { doc } = await connected({
+      snapshot: sampleSnapshot({
+        changes: [
+          {
+            id: 'preparing-change',
+            display_status: 'preparing',
+            progress_status: 'pending',
+            completed_tasks: 0,
+            total_tasks: 4,
+            progress_percent: 0,
+            dependencies: [],
+          },
+          {
+            id: 'queued-change',
+            display_status: 'queued',
+            progress_status: 'pending',
+            completed_tasks: 0,
+            total_tasks: 4,
+            progress_percent: 0,
+            dependencies: [],
+          },
+        ],
+        totals: { total: 2, completed: 0, in_progress: 1, pending: 1 },
+      }),
+    });
+
+    const active = doc.querySelector('#changes-groups .change-group[data-group="active"]');
+    expect(active).not.toBeNull();
+    expect(active.querySelector('[data-change-id="preparing-change"]')).not.toBeNull();
+
+    const waiting = doc.querySelector('#changes-groups .change-group[data-group="waiting"]');
+    expect(waiting.querySelector('[data-change-id="queued-change"]')).not.toBeNull();
+    expect(waiting.querySelector('[data-change-id="preparing-change"]')).toBeNull();
   });
 
   it('says so when the instance tracks no changes', async () => {
