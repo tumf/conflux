@@ -890,7 +890,8 @@ mod tests {
         pub(super) fn with_config(change_ids: &[&str], config: OrchestratorConfig) -> Self {
             let state = Arc::new(RwLock::new(OrchestratorState::new(
                 change_ids.iter().map(|id| id.to_string()).collect(),
-                10)));
+                10,
+            )));
             Self::over(state, DynamicQueue::new(), config)
         }
 
@@ -2509,8 +2510,7 @@ mod run_supervisor_tests {
     async fn per_change_upstream_failed_publication_state() -> Arc<RwLock<OrchestratorState>> {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("alpha".to_string()));
         state.apply_execution_event(&ExecutionEvent::PushStarted {
             change_id: "alpha".to_string(),
@@ -2659,5 +2659,4 @@ mod run_supervisor_tests {
             std::fs::read_to_string(&dispatched).unwrap_or_default()
         );
     }
-
 }

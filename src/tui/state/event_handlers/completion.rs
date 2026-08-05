@@ -574,14 +574,15 @@ mod tests {
             ResolveReservation, ResolveReservations, RunControlOutcome, RunControlService,
             StartEligibility,
         };
-        use crate::orchestration::state::{OrchestratorState};
+        use crate::orchestration::state::OrchestratorState;
         use crate::tui::queue::DynamicQueue;
         use std::sync::Arc;
         use tokio::sync::RwLock;
 
         let state = Arc::new(RwLock::new(OrchestratorState::new(
             vec!["change-a".to_string(), "change-b".to_string()],
-            10)));
+            10,
+        )));
         {
             let mut guard = state.write().await;
             for id in ["change-a", "change-b"] {

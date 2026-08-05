@@ -145,7 +145,8 @@ fn archive_to_base(repo_root: &std::path::Path, archive_leaf: &str, change_id: &
 async fn reducer_state(known: &[&str], queued_ids: &[&str]) -> Arc<RwLock<OrchestratorState>> {
     let state = Arc::new(RwLock::new(OrchestratorState::new(
         known.iter().map(|id| id.to_string()).collect(),
-        10)));
+        10,
+    )));
     {
         let mut guard = state.write().await;
         for id in queued_ids {

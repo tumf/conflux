@@ -1168,7 +1168,6 @@ impl AgentRunner {
         context
     }
 
-
     /// Reset acceptance tail injection flag for a change.
     /// This should be called when a new acceptance attempt is recorded,
     /// so the next apply retry can receive the new acceptance output.

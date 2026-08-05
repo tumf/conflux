@@ -67,7 +67,8 @@ impl Harness {
     fn new(change_ids: &[&str]) -> Self {
         let state = Arc::new(RwLock::new(OrchestratorState::new(
             change_ids.iter().map(|id| id.to_string()).collect(),
-            10)));
+            10,
+        )));
         let marks = Arc::new(ExecutionMarkStore::new());
         let operator = Arc::new(OperatorCommandService::new(
             state.clone(),
@@ -351,7 +352,9 @@ async fn start_is_refused_while_a_run_owns_the_lifecycle() {
 async fn start_reports_a_runtime_launch_failure_instead_of_claiming_success() {
     let harness = Harness::new(&["a"]);
     harness.mark(&["a"]);
-    harness.scheduler.fail_launch("the scheduler refused this launch");
+    harness
+        .scheduler
+        .fail_launch("the scheduler refused this launch");
 
     let error = harness
         .service

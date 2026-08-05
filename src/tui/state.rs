@@ -3739,10 +3739,8 @@ mod tests {
 
     #[test]
     fn test_toggle_all_marks_in_error_mode_reports_retry_ownership() {
-        let (app, commands) = run_bulk_toggle_case(
-            AppExecutionMode::Error,
-            &[("a", "error", true, false)],
-        );
+        let (app, commands) =
+            run_bulk_toggle_case(AppExecutionMode::Error, &[("a", "error", true, false)]);
 
         assert!(commands.is_empty());
         assert!(!app.changes[0].selected);
@@ -3775,8 +3773,7 @@ mod tests {
     #[test]
     fn bulk_mark_rejection_never_describes_a_modal_as_an_execution_mode() {
         for mode in [AppExecutionMode::Stopping, AppExecutionMode::Error] {
-            let (app, commands) =
-                run_bulk_toggle_case(mode, &[("a", "not queued", true, false)]);
+            let (app, commands) = run_bulk_toggle_case(mode, &[("a", "not queued", true, false)]);
 
             assert!(commands.is_empty());
             let message = app.warning_message.clone().expect("rejection is reported");
@@ -5234,9 +5231,7 @@ mod tests {
         // Without the fix this would clear queue_intent back to NotQueued.
         {
             let mut guard = shared.blocking_write();
-            *guard = OrchestratorState::new(
-                vec!["change-a".to_string()],
-                0);
+            *guard = OrchestratorState::new(vec!["change-a".to_string()], 0);
             // The fix: re-apply AddToQueue after the state reset.
             guard.apply_command(ReducerCommand::AddToQueue("change-a".to_string()));
         }

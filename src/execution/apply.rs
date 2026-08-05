@@ -2834,9 +2834,7 @@ mod tests {
         #[test]
         fn a_change_level_context_publishes_workspace_and_group_identity() {
             let ctx = ApplyLoopHookContext::new(1, 3, 2, "/tmp/ws/change-a".to_string(), 4);
-            let vars = ctx
-                .build_hook_context("change-a", 2, 5, 7)
-                .to_env_vars();
+            let vars = ctx.build_hook_context("change-a", 2, 5, 7).to_env_vars();
 
             assert_eq!(
                 vars.get("OPENSPEC_WORKSPACE_PATH"),
@@ -2844,7 +2842,10 @@ mod tests {
                 "change-level apply always runs in a managed worktree"
             );
             assert_eq!(vars.get("OPENSPEC_GROUP_INDEX"), Some(&"4".to_string()));
-            assert_eq!(vars.get("OPENSPEC_CHANGE_ID"), Some(&"change-a".to_string()));
+            assert_eq!(
+                vars.get("OPENSPEC_CHANGE_ID"),
+                Some(&"change-a".to_string())
+            );
             assert_eq!(vars.get("OPENSPEC_APPLY_COUNT"), Some(&"7".to_string()));
         }
 
@@ -6261,8 +6262,13 @@ mod apply_commit_recovery {
         };
         let unmanaged_head_before = unmanaged_repo.head_subject();
 
-        let unmanaged_result =
-            run_recovery_loop_as(&unmanaged_repo, "caller-no-manager", &unmanaged_config, false).await;
+        let unmanaged_result = run_recovery_loop_as(
+            &unmanaged_repo,
+            "caller-no-manager",
+            &unmanaged_config,
+            false,
+        )
+        .await;
 
         assert_eq!(caller_visible_failure(&unmanaged_result), None);
         assert!(

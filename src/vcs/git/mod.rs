@@ -126,9 +126,11 @@ impl GitWorkspaceManager {
         if branch_guard.is_none() {
             *branch_guard = match commands::get_current_branch(&self.repo_root).await? {
                 Some(branch) => Some(branch),
-                None => return Err(VcsError::git_command(
-                    "Detached HEAD state detected. Checkout a branch before running.",
-                )),
+                None => {
+                    return Err(VcsError::git_command(
+                        "Detached HEAD state detected. Checkout a branch before running.",
+                    ))
+                }
             };
         }
 

@@ -4,8 +4,8 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
-use crate::openspec::Change;
 use crate::events::{EventDispatcher, EventSink};
+use crate::openspec::Change;
 use crate::parallel::PostArchiveAction;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -174,7 +174,6 @@ pub(crate) fn classify_parallel_terminal_report(
     ParallelTerminalReport::Completed
 }
 
-
 /// Buffer for the dispatch bridge handed to `mpsc`-only producers.
 ///
 /// Matches the TUI event channel it ultimately feeds, so bridging cannot make a
@@ -226,7 +225,8 @@ async fn initialize_parallel_shared_state(
     } else {
         *state = crate::orchestration::state::OrchestratorState::new(
             change_ids.to_vec(),
-            max_iterations);
+            max_iterations,
+        );
         // Re-apply queue intent for each selected change so that the initial
         // ChangesRefreshed display sync (apply_display_statuses_from_reducer) does
         // not regress these rows from Queued back to NotQueued before analysis starts.
@@ -609,7 +609,8 @@ mod tests {
         ) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
             Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
                 vec![change_id.to_string()],
-                max_iterations)))
+                max_iterations,
+            )))
         }
 
         #[cfg_attr(windows, ignore)]
@@ -660,9 +661,7 @@ mod tests {
         /// frontend can never report a different finish status for one run.
         #[tokio::test]
         async fn tui_and_run_derive_the_same_report_from_one_observation() {
-            let mut state = OrchestratorState::new(
-                vec!["change-a".to_string()],
-                7);
+            let mut state = OrchestratorState::new(vec!["change-a".to_string()], 7);
             assert_eq!(state.parallel_finish_report(), ("completed", 0));
             state.record_apply_iteration_limit("change-a", 7, 7);
             assert_eq!(state.parallel_finish_report(), ("iteration_limit", 7));
@@ -839,9 +838,10 @@ mod tests {
             OrchestratorState, ReducerCommand, WorkspaceObservation,
         };
 
-        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
-            OrchestratorState::new(vec!["alpha".to_string()], 3),
-        ));
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["alpha".to_string()],
+            3,
+        )));
         {
             let mut state = shared_state.write().await;
             state.apply_observation("alpha", WorkspaceObservation::WorkspaceArchived);
@@ -865,9 +865,10 @@ mod tests {
             OrchestratorState, ReducerCommand, WorkspaceObservation,
         };
 
-        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
-            OrchestratorState::new(vec!["stale".to_string()], 3),
-        ));
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["stale".to_string()],
+            3,
+        )));
         {
             let mut state = shared_state.write().await;
             state.apply_observation("stale", WorkspaceObservation::WorkspaceArchived);
@@ -890,9 +891,10 @@ mod tests {
     async fn test_parallel_startup_empty_without_resolve_wait_resets_to_noop_state() {
         use crate::orchestration::state::OrchestratorState;
 
-        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
-            OrchestratorState::new(vec!["old".to_string()], 3),
-        ));
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["old".to_string()],
+            3,
+        )));
 
         let preserved = super::initialize_parallel_shared_state(&shared_state, &[], 7).await;
 
@@ -1166,7 +1168,8 @@ mod tests {
 
         let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
             vec!["fresh".to_string(), "stale".to_string()],
-            1)));
+            1,
+        )));
 
         let preserved = super::initialize_parallel_shared_state(
             &shared,

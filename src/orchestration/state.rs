@@ -2739,8 +2739,7 @@ mod tests {
 
     #[test]
     fn pushed_terminal_status_is_distinct_from_merged() {
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 1);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 1);
         state.apply_execution_event(&crate::events::ExecutionEvent::PushCompleted {
             change_id: "c".to_string(),
             remote: "origin".to_string(),
@@ -2877,7 +2876,8 @@ mod tests {
                 "rejected".to_string(),
                 "error".to_string(),
             ],
-            0);
+            0,
+        );
         state.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
             change_id: "merged".to_string(),
             revision: "rev".to_string(),
@@ -2995,8 +2995,7 @@ mod tests {
 
     #[test]
     fn retry_terminal_error_clears_error_gate_and_stale_retry_metadata() {
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         state.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
             change_id: "c".to_string(),
@@ -3035,8 +3034,7 @@ mod tests {
 
     #[test]
     fn late_success_supersedes_recoverable_error_without_requeueing_apply() {
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
         state.apply_execution_event(&crate::events::ExecutionEvent::ApplyFailed {
             change_id: "c".to_string(),
             error: "boom".to_string(),
@@ -3058,8 +3056,7 @@ mod tests {
     fn archive_resumed_clears_recoverable_archive_error_and_restores_archiving_activity() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
         state.apply_execution_event(&ExecutionEvent::ArchiveFailed {
             change_id: "c".to_string(),
             error: "Archive commit finalization failed".to_string(),
@@ -3084,9 +3081,7 @@ mod tests {
     fn test_base_mutating_lane_is_single_occupant_across_resolving_and_rejecting() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::new(
-            vec!["a".to_string(), "b".to_string()],
-            0);
+        let mut state = OrchestratorState::new(vec!["a".to_string(), "b".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("a".to_string()));
         assert_eq!(state.display_status("a"), "resolving");
@@ -3105,8 +3100,7 @@ mod tests {
 
     #[test]
     fn release_base_mutating_lane_after_retry_restores_resolve_wait_uniquely() {
-        let mut state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
             change_id: "alpha".to_string(),
@@ -3134,9 +3128,7 @@ mod tests {
 
     #[test]
     fn abandon_base_mutating_lane_occupant_releases_resolve_without_requeueing() {
-        let mut state = OrchestratorState::new(
-            vec!["alpha".to_string(), "beta".to_string()],
-            0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string(), "beta".to_string()], 0);
 
         state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
             change_id: "alpha".to_string(),
@@ -3191,7 +3183,8 @@ mod tests {
                 "reject".to_string(),
                 "terminal".to_string(),
             ],
-            0);
+            0,
+        );
 
         state.apply_execution_event(&crate::events::ExecutionEvent::ChangeArchived(
             "lane".to_string(),
@@ -3225,9 +3218,7 @@ mod tests {
 
     #[test]
     fn release_base_mutating_lane_after_retry_restores_reject_wait_and_noops_terminal() {
-        let mut state = OrchestratorState::new(
-            vec!["lane".to_string(), "reject".to_string()],
-            0);
+        let mut state = OrchestratorState::new(vec!["lane".to_string(), "reject".to_string()], 0);
 
         state.apply_execution_event(&crate::events::ExecutionEvent::ChangeArchived(
             "lane".to_string(),
@@ -3261,9 +3252,7 @@ mod tests {
     fn test_reject_wait_queue_membership_and_clear_on_start_completion() {
         use crate::events::{ExecutionEvent, RejectionOutcome};
 
-        let mut state = OrchestratorState::new(
-            vec!["a".to_string(), "b".to_string()],
-            0);
+        let mut state = OrchestratorState::new(vec!["a".to_string(), "b".to_string()], 0);
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("a".to_string()));
         state.mark_reject_wait("b");
 
@@ -3290,9 +3279,7 @@ mod tests {
 
     #[test]
     fn command_side_effects_update_terminal_wait_and_base_lane_queues() {
-        let mut state = OrchestratorState::new(
-            vec!["c".to_string(), "d".to_string()],
-            0);
+        let mut state = OrchestratorState::new(vec!["c".to_string(), "d".to_string()], 0);
 
         state.resolve_wait_queue.push("c".to_string());
         state.reject_wait_queue.push("c".to_string());
@@ -3351,7 +3338,8 @@ mod tests {
                 "archived".to_string(),
                 "reject".to_string(),
             ],
-            0);
+            0,
+        );
 
         state.apply_execution_event(&ExecutionEvent::ResolveStarted {
             change_id: "resolving".to_string(),
@@ -4341,8 +4329,7 @@ mod tests {
 
     #[test]
     fn startup_refresh_restores_merge_wait_for_a_fresh_idle_change() {
-        let mut state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
         assert_eq!(state.display_status("alpha"), "not queued");
 
         state.apply_execution_event(&startup_refresh(&["alpha"]));
@@ -4361,8 +4348,7 @@ mod tests {
 
     #[test]
     fn startup_refresh_merge_wait_restoration_is_idempotent() {
-        let mut state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&startup_refresh(&["alpha"]));
         state.apply_execution_event(&startup_refresh(&["alpha"]));
@@ -4483,9 +4469,7 @@ mod tests {
 
         for (label, expected, setup) in cases {
             // `lane` exists only so a case can occupy the single base-mutating lane.
-            let mut state = OrchestratorState::new(
-                vec!["x".to_string(), "lane".to_string()],
-                0);
+            let mut state = OrchestratorState::new(vec!["x".to_string(), "lane".to_string()], 0);
             setup(&mut state);
             assert_eq!(state.display_status("x"), expected, "setup for {}", label);
             let resolve_wait_before = state.resolve_wait_change_ids();
@@ -4583,7 +4567,8 @@ mod tests {
                 "rejecting-b".to_string(),
                 "archive-c".to_string(),
             ],
-            0);
+            0,
+        );
 
         state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
             change_id: "resolving-a".to_string(),
@@ -4625,7 +4610,8 @@ mod tests {
                 "resolve-b".to_string(),
                 "reject-c".to_string(),
             ],
-            0);
+            0,
+        );
 
         state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
             change_id: "lane-a".to_string(),
@@ -4685,8 +4671,7 @@ mod tests {
     fn test_parallel_change_archived_no_blocker_enters_resolving_not_merge_wait() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
 
@@ -4705,8 +4690,7 @@ mod tests {
     fn test_no_blocker_merge_wait_to_merged_vibration_regression() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
         assert_eq!(state.display_status("c"), "resolving");
@@ -4738,8 +4722,7 @@ mod tests {
     fn test_merged_archived_vibration_regression() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
         state.apply_execution_event(&ExecutionEvent::MergeCompleted {
@@ -4768,8 +4751,7 @@ mod tests {
     fn test_manual_merge_deferred_clears_normal_queue_intent() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert_eq!(state.queued_change_ids(), vec!["c".to_string()]);
@@ -4795,8 +4777,7 @@ mod tests {
     fn test_manual_merge_deferred_clears_existing_resolve_wait_queue_membership() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "c".to_string(),
@@ -4822,8 +4803,7 @@ mod tests {
     fn test_manual_merge_deferred_resolve_merge_explicit_retry_sets_resolve_wait() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
@@ -4891,8 +4871,7 @@ mod tests {
 
     #[test]
     fn test_merged_manual_retry_remains_noop() {
-        let mut state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
             change_id: "alpha".to_string(),
@@ -4910,8 +4889,7 @@ mod tests {
     fn test_auto_resumable_merge_deferred_keeps_scheduler_retry_intent() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
@@ -4929,9 +4907,7 @@ mod tests {
     fn test_archive_merge_defers_to_resolve_pending_when_rejecting_active() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::new(
-            vec!["a".to_string(), "b".to_string()],
-            0);
+        let mut state = OrchestratorState::new(vec!["a".to_string(), "b".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
             change_id: "a".to_string(),
@@ -4951,9 +4927,7 @@ mod tests {
     fn test_active_applying_does_not_create_resolve_pending_on_archive() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::new(
-            vec!["a".to_string(), "b".to_string()],
-            0);
+        let mut state = OrchestratorState::new(vec!["a".to_string(), "b".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::ApplyStarted {
             change_id: "a".to_string(),
@@ -5022,8 +4996,7 @@ mod tests {
     fn test_merge_completed_ignores_later_stale_manual_merge_deferred() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::MergeCompleted {
             change_id: "alpha".to_string(),
@@ -5044,8 +5017,7 @@ mod tests {
     fn test_merge_completed_clears_resolve_wait_intent() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "alpha".to_string(),
@@ -5070,8 +5042,7 @@ mod tests {
     fn test_clear_resolve_wait_intent_removes_retry_without_terminal_transition() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "alpha".to_string(),
@@ -5091,9 +5062,7 @@ mod tests {
     fn test_resolve_completed_clears_resolve_wait_and_survives_refresh() {
         use crate::events::ExecutionEvent;
 
-
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         // Step 1: concrete manual merge blocker -> enters MergeWait.
         // A bare ChangeArchived event now truthfully enters active post-archive
@@ -5159,8 +5128,7 @@ mod tests {
     fn test_resolve_wait_manual_merge_deferred_demotes_to_merge_wait() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["change-a".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["change-a".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "change-a".to_string(),
@@ -5193,9 +5161,7 @@ mod tests {
     fn test_resolve_wait_clean_lane_promotion_promotes_exactly_one_waiter() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::new(
-            vec!["alpha".to_string(), "beta".to_string()],
-            0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string(), "beta".to_string()], 0);
 
         for change_id in ["alpha", "beta"] {
             state.apply_execution_event(&ExecutionEvent::MergeDeferred {
@@ -5472,8 +5438,7 @@ mod tests {
     fn test_parallel_mode_archive_success_clears_prior_acceptance_error() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::AcceptanceFailed {
             change_id: "alpha".to_string(),
@@ -5502,9 +5467,7 @@ mod tests {
     fn test_parallel_mode_acceptance_error_archive_then_merge_finishes_merged() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::new(
-            vec!["add-skill-secret-ingestion".to_string()],
-            0);
+        let mut state = OrchestratorState::new(vec!["add-skill-secret-ingestion".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::AcceptanceFailed {
             change_id: "add-skill-secret-ingestion".to_string(),
@@ -5530,8 +5493,7 @@ mod tests {
     fn test_merge_and_resolve_success_clear_prior_processing_error_but_not_rejected() {
         use crate::events::ExecutionEvent;
 
-        let mut merge_state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut merge_state = OrchestratorState::new(vec!["alpha".to_string()], 0);
         merge_state.apply_execution_event(&ExecutionEvent::ProcessingError {
             id: "alpha".to_string(),
             error: "recoverable process failure".to_string(),
@@ -5543,8 +5505,7 @@ mod tests {
         });
         assert_eq!(merge_state.display_status("alpha"), "merged");
 
-        let mut resolve_state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut resolve_state = OrchestratorState::new(vec!["alpha".to_string()], 0);
         resolve_state.apply_execution_event(&ExecutionEvent::ProcessingError {
             id: "alpha".to_string(),
             error: "recoverable process failure".to_string(),
@@ -5556,8 +5517,7 @@ mod tests {
         });
         assert_eq!(resolve_state.display_status("alpha"), "merged");
 
-        let mut rejected_state =
-            OrchestratorState::new(vec!["alpha".to_string()], 0);
+        let mut rejected_state = OrchestratorState::new(vec!["alpha".to_string()], 0);
         rejected_state.apply_execution_event(&ExecutionEvent::ChangeRejected {
             change_id: "alpha".to_string(),
             reason: "final rejection".to_string(),
@@ -5578,9 +5538,8 @@ mod tests {
     fn test_parallel_mode_change_archived_uses_resolve_pending_when_other_change_is_resolving() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::new(
-            vec!["resolving".to_string(), "archived".to_string()],
-            0);
+        let mut state =
+            OrchestratorState::new(vec!["resolving".to_string(), "archived".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::ResolveStarted {
             change_id: "resolving".to_string(),
@@ -5602,9 +5561,8 @@ mod tests {
         use crate::events::ExecutionEvent;
         use crate::vcs::WorkspaceStatus;
 
-        let mut state = OrchestratorState::new(
-            vec!["rejecting".to_string(), "archived".to_string()],
-            0);
+        let mut state =
+            OrchestratorState::new(vec!["rejecting".to_string(), "archived".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
             change_id: "rejecting".to_string(),
@@ -5626,9 +5584,8 @@ mod tests {
     fn test_parallel_mode_change_archived_enters_resolving_when_other_change_is_accepting() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::new(
-            vec!["accepting".to_string(), "archived".to_string()],
-            0);
+        let mut state =
+            OrchestratorState::new(vec!["accepting".to_string(), "archived".to_string()], 0);
 
         state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
             change_id: "accepting".to_string(),
@@ -5648,9 +5605,7 @@ mod tests {
     fn test_parallel_mode_full_lifecycle() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::new(
-            vec!["a".to_string(), "b".to_string()],
-            0);
+        let mut state = OrchestratorState::new(vec!["a".to_string(), "b".to_string()], 0);
 
         // Queue and process 'a'
         state.apply_command(ReducerCommand::AddToQueue("a".to_string()));
@@ -5685,8 +5640,7 @@ mod tests {
     fn test_parallel_mode_merge_deferred_then_completed() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         // Archive completion without a concrete blocker enters active merge handling.
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
@@ -5718,8 +5672,7 @@ mod tests {
     fn test_parallel_mode_late_events_do_not_regress_merged() {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         // Full lifecycle to merged
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
@@ -6167,8 +6120,7 @@ mod tests {
     fn per_change_upstream_state(change_id: &str) -> OrchestratorState {
         use crate::events::ExecutionEvent;
 
-        let mut state =
-            OrchestratorState::new(vec![change_id.to_string()], 0);
+        let mut state = OrchestratorState::new(vec![change_id.to_string()], 0);
         state.apply_execution_event(&ExecutionEvent::ChangeArchived(change_id.to_string()));
         state
     }
@@ -6426,8 +6378,7 @@ mod tests {
         use crate::events::ExecutionEvent;
         use std::collections::{HashMap, HashSet};
 
-        let mut state =
-            OrchestratorState::new(vec!["fresh".to_string()], 1);
+        let mut state = OrchestratorState::new(vec!["fresh".to_string()], 1);
         state.apply_command(ReducerCommand::AddToQueue("fresh".to_string()));
 
         let change = |id: &str| crate::openspec::Change {
@@ -6479,8 +6430,7 @@ mod tests {
         use crate::events::ExecutionEvent;
         use std::collections::{HashMap, HashSet};
 
-        let mut state =
-            OrchestratorState::new(vec!["alpha".to_string()], 1);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 1);
         state.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
         assert!(state.is_ordinary_queue_eligible("alpha"));
 

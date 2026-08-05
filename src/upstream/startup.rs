@@ -111,8 +111,7 @@ pub async fn prepare_upstream_integration(
     dry_run: bool,
 ) -> Result<UpstreamRuntime, UpstreamStartupError> {
     let git = GitUpstreamOps::new(repo_root);
-    let facts =
-        observe_static_preconditions(&git, &config, push_remote, is_git_repository).await?;
+    let facts = observe_static_preconditions(&git, &config, push_remote, is_git_repository).await?;
     let branch = validate_static_preconditions(&config, &facts)?;
 
     if dry_run {

@@ -878,7 +878,6 @@ impl OrchestratorConfig {
         self.stall_detection.clone().unwrap_or_default()
     }
 
-
     /// Get the maximum iterations limit.
     /// Returns 0 if explicitly set to 0 (disabled), otherwise returns configured or default value.
     /// A value of 0 means no limit.

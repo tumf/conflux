@@ -387,7 +387,8 @@ async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action()
 
     let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_observation(

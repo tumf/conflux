@@ -728,9 +728,7 @@ async fn run_fatal_outcome_stops_dispatch_and_fails_the_scheduler() {
 fn reducer_keeps_exhausted_change_in_merge_wait() {
     use crate::orchestration::state::{OrchestratorState, WorkspaceObservation};
 
-    let mut state = OrchestratorState::new(
-        vec!["alpha".to_string(), "beta".to_string()],
-        3);
+    let mut state = OrchestratorState::new(vec!["alpha".to_string(), "beta".to_string()], 3);
     state.apply_observation("alpha", WorkspaceObservation::WorkspaceArchived);
 
     let detail = crate::parallel::resolve_failure_detail(

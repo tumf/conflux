@@ -1056,13 +1056,8 @@ mod tests {
 
     #[test]
     fn upstream_integration_rejects_invalid_remote_value() {
-        let err = Cli::try_parse_from([
-            "cflx",
-            "run",
-            "--all",
-            "--integrate-upstream=origin:main",
-        ])
-        .unwrap_err();
+        let err = Cli::try_parse_from(["cflx", "run", "--all", "--integrate-upstream=origin:main"])
+            .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
@@ -1383,8 +1378,7 @@ mod tests {
             .expect("bare invocation parses");
         assert_eq!(bare.validate_upstream_option_placement(), Ok(()));
 
-        let plain_subcommand =
-            Cli::try_parse_from(["cflx", "run", "--all"]).expect("run parses");
+        let plain_subcommand = Cli::try_parse_from(["cflx", "run", "--all"]).expect("run parses");
         assert_eq!(
             plain_subcommand.validate_upstream_option_placement(),
             Ok(())
@@ -1917,14 +1911,8 @@ mod tests {
 
     #[test]
     fn cli_push_rejects_branch_selection() {
-        let err = Cli::try_parse_from([
-            "cflx",
-            "run",
-            "--all",
-            "--push",
-            "origin:main",
-        ])
-        .unwrap_err();
+        let err =
+            Cli::try_parse_from(["cflx", "run", "--all", "--push", "origin:main"]).unwrap_err();
         assert!(err
             .to_string()
             .contains("branch selection is not supported"));
@@ -1932,13 +1920,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_max_concurrent() {
-        let cli = Cli::parse_from([
-            "cflx",
-            "run",
-            "--all",
-            "--max-concurrent",
-            "5",
-        ]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--max-concurrent", "5"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {

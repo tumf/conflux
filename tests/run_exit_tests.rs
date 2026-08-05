@@ -282,7 +282,10 @@ fn test_dry_run_uses_explicit_targets() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // A single explicit target takes the same cumulative worktree planning path
     // a multi-change run takes; there is no mode flag involved.
-    assert!(stdout.contains("Parallel Execution Plan"), "stdout={stdout}");
+    assert!(
+        stdout.contains("Parallel Execution Plan"),
+        "stdout={stdout}"
+    );
     assert!(stdout.contains("Total changes: 1"));
     assert!(stdout.contains("  - a"));
     assert!(!stdout.contains("  - c"));
@@ -1014,7 +1017,11 @@ fn outside_git_every_executable_run_is_refused_before_side_effects() {
         let mut args = vec!["run", "--all"];
         let explicit = explicit_path.to_str().unwrap();
         for arg in &socket_args {
-            args.push(if *arg == "explicit.sock" { explicit } else { arg });
+            args.push(if *arg == "explicit.sock" {
+                explicit
+            } else {
+                arg
+            });
         }
 
         let output = cflx_output_bounded(tmp.path(), &args, Duration::from_secs(30));

@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::events::{ExecutionEvent, StalledBlocker};
-use crate::orchestration::state::{OrchestratorState};
+use crate::orchestration::state::OrchestratorState;
 use crate::tui::queue::DynamicQueue;
 use std::sync::Mutex as StdMutex;
 
@@ -17,7 +17,8 @@ use std::sync::Mutex as StdMutex;
 fn shared_state(ids: &[&str]) -> Arc<RwLock<OrchestratorState>> {
     Arc::new(RwLock::new(OrchestratorState::new(
         ids.iter().map(|id| id.to_string()).collect(),
-        10)))
+        10,
+    )))
 }
 
 fn acceptance_blocker() -> StalledBlocker {
@@ -1569,10 +1570,7 @@ fn bulk_mark_names_the_eligibility_reason_it_actually_observed() {
     );
 
     let summary = plan.exclusion_summary();
-    assert!(
-        summary.contains("uncommitted (commit first)"),
-        "{summary}"
-    );
+    assert!(summary.contains("uncommitted (commit first)"), "{summary}");
     assert!(
         summary.contains("not present in HEAD (cannot queue)"),
         "{summary}"
@@ -1584,7 +1582,6 @@ fn bulk_mark_names_the_eligibility_reason_it_actually_observed() {
             .contains("uncommit"),
         "an absent proposal must never be described as uncommitted"
     );
-
 }
 
 /// Observation precedence and the store round-trip, in one place.

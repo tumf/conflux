@@ -210,7 +210,8 @@ mod tests {
     fn shared_state(change_ids: &[&str]) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
         Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
             change_ids.iter().map(|id| id.to_string()).collect(),
-            10)))
+            10,
+        )))
     }
 
     fn supervisor(

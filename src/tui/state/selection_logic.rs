@@ -373,14 +373,8 @@ mod tests {
     fn running_mode_excludes_active_rows_from_bulk_toggle() {
         let change = make_change_state("active", "applying", true);
 
-        assert!(!can_bulk_toggle_change(
-            AppExecutionMode::Running,
-            &change
-        ));
-        assert!(can_bulk_toggle_change(
-            AppExecutionMode::Select,
-            &change
-        ));
+        assert!(!can_bulk_toggle_change(AppExecutionMode::Running, &change));
+        assert!(can_bulk_toggle_change(AppExecutionMode::Select, &change));
     }
 
     /// Worktree eligibility is an unconditional input, so an uncommitted row is

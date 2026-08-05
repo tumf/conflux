@@ -833,11 +833,11 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::openspec::ProposalMetadata;
     use crate::orchestration::target_resolution::{
         BaseCompletionEvidence, BaseEvidenceErrorKind, TargetEvidence, WorkspaceResumeEvidence,
     };
+    use std::collections::HashMap;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {

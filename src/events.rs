@@ -1810,12 +1810,8 @@ mod dispatch_tests {
         ];
 
         for event in preapplied {
-            let mut once = OrchestratorState::new(
-                vec!["change-a".to_string()],
-                10);
-            let mut twice = OrchestratorState::new(
-                vec!["change-a".to_string()],
-                10);
+            let mut once = OrchestratorState::new(vec!["change-a".to_string()], 10);
+            let mut twice = OrchestratorState::new(vec!["change-a".to_string()], 10);
 
             once.apply_execution_event(&event);
             twice.apply_execution_event(&event);

@@ -65,9 +65,7 @@ impl ParallelRunService {
             AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
 
         let shared_orchestrator_state = Arc::new(tokio::sync::RwLock::new(
-            crate::orchestration::state::OrchestratorState::new(
-                Vec::new(),
-                1),
+            crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
         ));
 
         Self {
@@ -94,9 +92,7 @@ impl ParallelRunService {
             AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
 
         let shared_orchestrator_state = Arc::new(tokio::sync::RwLock::new(
-            crate::orchestration::state::OrchestratorState::new(
-                Vec::new(),
-                1),
+            crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
         ));
 
         Self {
@@ -272,10 +268,7 @@ impl ParallelRunService {
 
         // Send warning event BEFORE any state update to maintain event order
         if !skipped.is_empty() {
-            let message = format!(
-                "Skipping uncommitted changes: {}",
-                skipped.join(", ")
-            );
+            let message = format!("Skipping uncommitted changes: {}", skipped.join(", "));
             warn!("{}", message);
             let _ = event_tx
                 .send(ParallelEvent::Warning {
@@ -1760,7 +1753,8 @@ mod tests {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
         let shared = Arc::new(RwLock::new(OrchestratorState::new(
             vec!["alpha".to_string()],
-            3)));
+            3,
+        )));
         {
             let mut state = shared.write().await;
             state.apply_observation("alpha", WorkspaceObservation::WorkspaceArchived);

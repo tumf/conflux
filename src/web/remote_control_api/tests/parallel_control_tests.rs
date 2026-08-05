@@ -88,7 +88,8 @@ impl Wired {
     async fn with_queue(change_ids: &[&str], queue: Arc<dyn QueuePort>) -> Self {
         let reducer = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
             change_ids.iter().map(|id| id.to_string()).collect(),
-            10)));
+            10,
+        )));
         let marks = Arc::new(ExecutionMarkStore::new());
         let parallel = Arc::new(ParallelRuntime::new());
         parallel.set_max_concurrent(4);

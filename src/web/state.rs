@@ -8,8 +8,7 @@ use crate::tui::types::WorktreeInfo;
 use crate::web::operator_facts::OperatorFactsStore;
 use crate::web::remote_control_api::dto::{
     AttentionState, BlockerKind as RemoteBlockerKind, ChangeActivity, ChangeBlocker, ChangeTiming,
-    ChangeWorktree, ParallelEligibility, ParallelRuntimeState,
-    QueueIntent as RemoteQueueIntent,
+    ChangeWorktree, ParallelEligibility, ParallelRuntimeState, QueueIntent as RemoteQueueIntent,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -2037,7 +2036,7 @@ mod tests {
     #[test]
     fn pushed_status_web_snapshot_exposes_post_archive_statuses_from_reducer() {
         use crate::events::ExecutionEvent;
-        use crate::orchestration::state::{OrchestratorState};
+        use crate::orchestration::state::OrchestratorState;
 
         let mut shared = OrchestratorState::new(
             vec![
@@ -2046,7 +2045,8 @@ mod tests {
                 "merge-c".to_string(),
                 "push-d".to_string(),
             ],
-            0);
+            0,
+        );
         let changes = vec![
             create_test_change("resolving-a", 0, 1),
             create_test_change("resolve-b", 0, 1),
@@ -2092,9 +2092,8 @@ mod tests {
     fn test_web_snapshot_exposes_reject_pending_from_reducer() {
         use crate::orchestration::state::OrchestratorState;
 
-        let mut shared = OrchestratorState::new(
-            vec!["lane-a".to_string(), "reject-b".to_string()],
-            0);
+        let mut shared =
+            OrchestratorState::new(vec!["lane-a".to_string(), "reject-b".to_string()], 0);
         let changes = vec![
             create_test_change("lane-a", 0, 1),
             create_test_change("reject-b", 0, 1),

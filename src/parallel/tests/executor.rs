@@ -501,7 +501,8 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
             "dependent".to_string(),
             "unrelated".to_string(),
         ],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         // Production start records queue intent for its targets before the
@@ -640,7 +641,8 @@ async fn resolving_dependency_diagnostic_dedupes_and_reemits_after_signature_cha
     );
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["resolving-a".to_string(), "dependent".to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         // Production start records queue intent for its targets before the
@@ -811,7 +813,8 @@ async fn test_terminal_error_change_is_not_selected_until_explicit_retry() {
     );
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
@@ -858,7 +861,8 @@ async fn test_dependency_on_terminal_error_is_blocked_until_retry_and_success() 
     );
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string(), "beta".to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
@@ -986,9 +990,7 @@ async fn test_queue_reconciliation_skips_archived_dirty_candidate_when_post_arch
     // Explicit queue intent, so the post-archive-merge gate is what stops the
     // candidate rather than the absence of ordinary intent.
     let shared = Arc::new(tokio::sync::RwLock::new(
-        crate::orchestration::state::OrchestratorState::new(
-            vec!["gamma".to_string()],
-            0),
+        crate::orchestration::state::OrchestratorState::new(vec!["gamma".to_string()], 0),
     ));
     shared
         .write()
@@ -3013,7 +3015,8 @@ async fn test_blocked_only_classifier_distinguishes_scheduler_work_classes() {
             "dependency-blocked".to_string(),
             "candidate-missing".to_string(),
         ],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue("candidate-missing".to_string()));
@@ -3084,7 +3087,8 @@ async fn queue_reconciliation_defers_missing_verdict_only_after_retry_exhaustion
     let queued = vec![make_test_change(change_id)];
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
@@ -3187,7 +3191,8 @@ async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal
     init_git_repo(repo_dir.path()).await;
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["manual-merge".to_string(), "terminal-error".to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
@@ -3668,7 +3673,8 @@ async fn dynamic_queue_ingestion_skips_final_terminal_merged_change() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
-        1)));
+        1,
+    )));
     shared
         .write()
         .await
@@ -3708,7 +3714,8 @@ async fn final_terminal_dispatch_preflight_skips_before_workspace_execution() {
     init_git_repo(repo_dir.path()).await;
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
-        1)));
+        1,
+    )));
     shared
         .write()
         .await
@@ -5587,7 +5594,8 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
     // intent rather than the catalog.
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.clone()],
-        1)));
+        1,
+    )));
     shared
         .write()
         .await
@@ -5919,7 +5927,8 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_observation(
@@ -5959,7 +5968,8 @@ async fn handle_merge_result_releases_resolve_wait_retry_lane_on_auto_deferred()
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_observation(
@@ -6007,7 +6017,8 @@ async fn handle_merge_result_releases_reject_wait_retry_lane_and_suppresses_dupl
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["lane".to_string(), "reject-a".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&ExecutionEvent::ChangeArchived("lane".to_string()));
@@ -6097,7 +6108,8 @@ async fn resolve_retry_workspace_lookup_failure_is_operator_visible() {
     executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["missing-ws".to_string(), "next-ws".to_string()],
-        0)));
+        0,
+    )));
     {
         let mut guard = shared.write().await;
         for change_id in ["missing-ws", "next-ws"] {
@@ -6182,7 +6194,8 @@ async fn reject_retry_workspace_lookup_failure_is_operator_visible() {
             "missing-reject-ws".to_string(),
             "next-reject-ws".to_string(),
         ],
-        0)));
+        0,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&ExecutionEvent::ChangeArchived("lane".to_string()));
@@ -6258,7 +6271,8 @@ async fn resolve_give_up_promotes_next_waiter_without_user_action() {
     let (merge_result_tx, mut merge_result_rx) = mpsc::channel(8);
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["first".to_string(), "second".to_string()],
-        0)));
+        0,
+    )));
     {
         let mut guard = shared.write().await;
         for change_id in ["first", "second"] {
@@ -6330,7 +6344,8 @@ async fn retry_lane_busy_release_allows_subsequent_repromotion() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_observation(
@@ -6414,7 +6429,8 @@ async fn deferred_retry_lane_repromotes_after_merge_completion_trigger() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_observation(
@@ -6480,7 +6496,8 @@ async fn finite_scheduler_does_not_drain_while_spawned_retry_is_pending() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["retry-a".to_string(), "retry-b".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         for change_id in ["retry-a", "retry-b"] {
@@ -6587,7 +6604,8 @@ async fn test_manual_resolve_wait_retries_after_in_flight_apply_completes() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["applying-change".to_string(), "change-a".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_observation(
@@ -6664,7 +6682,8 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_observation(
@@ -6787,7 +6806,8 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
             missing_change_id.to_string(),
             loadable_change_id.to_string(),
         ],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue(missing_change_id.to_string()));
@@ -6875,7 +6895,8 @@ async fn test_reducer_visible_queue_addition_marks_reanalysis_timestamp_and_enqu
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, None);
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
@@ -6921,7 +6942,8 @@ async fn test_reducer_visible_queue_addition_preserves_existing_reanalysis_times
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
@@ -6994,7 +7016,8 @@ async fn test_archived_dirty_reconciliation_skips_workspace_already_merged_to_ba
     // intent instead of relying on the absence of intent.
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
@@ -7085,7 +7108,8 @@ async fn test_archived_dirty_reconciliation_skips_manual_merge_wait() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
-        1)));
+        1,
+    )));
     // Explicit queue intent that survives into manual merge wait. A resolve
     // failure restores `MergeWait` without clearing `QueueIntent::Queued`, so
     // this change really does reach candidate evaluation and is stopped by the
@@ -7218,7 +7242,8 @@ async fn test_archived_dirty_reconciliation_keeps_terminal_error_stopped_until_r
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
@@ -7593,7 +7618,8 @@ struct GatedDispatch {
 fn new_process_state(change_id: &str) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
     Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
-        10)))
+        10,
+    )))
 }
 
 /// Dispatch one change against a gated-then-final acceptance fixture.
@@ -9062,7 +9088,8 @@ async fn test_missing_workspace_retry_clears_resolve_wait_in_reducer() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
@@ -9127,7 +9154,8 @@ async fn test_stale_workspace_retry_clears_resolve_wait_in_reducer() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
@@ -9237,7 +9265,8 @@ async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_on
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
-        0)));
+        0,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
@@ -9387,7 +9416,8 @@ async fn test_stale_already_merged_resolve_wait_skips_merge_and_hook() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
-        0)));
+        0,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
@@ -9510,7 +9540,8 @@ async fn test_resumed_archived_dispatch_clears_reducer_queue_intent() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
@@ -9860,7 +9891,8 @@ async fn test_reject_wait_lane_clear_promotion_starts_rejection_review() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["lane-owner".to_string(), change_id.to_string()],
-        2)));
+        2,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
@@ -9958,7 +9990,8 @@ async fn test_reject_wait_lane_clear_promotes_only_one_waiter() {
             first_id.to_string(),
             second_id.to_string(),
         ],
-        2)));
+        2,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
@@ -10043,7 +10076,8 @@ async fn deferred_confirm_rejection_flow_failure_is_already_reported_not_merged(
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["lane-owner".to_string(), change_id.to_string()],
-        2)));
+        2,
+    )));
     {
         let mut guard = shared.write().await;
         // The change only enters RejectWait while another change holds the
@@ -10199,7 +10233,8 @@ async fn deferred_confirm_base_identity_failure_is_run_fatal_without_mutation() 
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["lane-owner".to_string(), change_id.to_string()],
-        2)));
+        2,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&ExecutionEvent::ChangeArchived("lane-owner".to_string()));
@@ -10305,7 +10340,8 @@ async fn test_scheduler_does_not_busy_retry_unchanged_resolve_wait() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_observation(
@@ -10351,7 +10387,8 @@ async fn test_dirty_to_clean_resolve_wait_wakes_retry_without_new_trigger() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
-        3)));
+        3,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
@@ -12895,7 +12932,8 @@ async fn dispatch_with_hooks(
     ));
     let shared_state = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
-        max_iterations)));
+        max_iterations,
+    )));
     executor.set_shared_orchestrator_state(shared_state.clone());
 
     let semaphore = Arc::new(Semaphore::new(1));
@@ -13232,7 +13270,8 @@ async fn unselected_archived_dirty_worktree_never_reaches_analysis_execution_or_
     // targets only, and each selected target gets explicit queue intent.
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["fresh".to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue("fresh".to_string()));
@@ -13396,7 +13435,8 @@ async fn explicit_start_target_recovers_its_archived_dirty_workspace() {
     // boundary: the resolved targets become reducer queue intent.
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["stale".to_string()],
-        1)));
+        1,
+    )));
     shared
         .write()
         .await
@@ -13451,7 +13491,8 @@ async fn queue_revocation_blocks_worktree_and_dynamic_reacquisition_until_explic
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["stale".to_string()],
-        1)));
+        1,
+    )));
     shared
         .write()
         .await
@@ -13575,7 +13616,8 @@ async fn revoked_queue_intent_stops_an_already_added_candidate_before_analysis_a
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["keeper".to_string(), "revoked".to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue("keeper".to_string()));
@@ -13789,7 +13831,8 @@ async fn reducer_unknown_dynamic_hint_never_enters_analysis_or_dispatch() {
 
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["selected".to_string()],
-        1)));
+        1,
+    )));
     shared
         .write()
         .await
@@ -13918,7 +13961,8 @@ async fn dynamic_hint_and_classification_fail_closed_under_reducer_lock_contenti
             "queued-elsewhere".to_string(),
             "merge-waiting".to_string(),
         ],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         // `revoked` was queued and then stopped-and-dequeued, which leaves the
@@ -14055,7 +14099,8 @@ async fn empty_ordinary_queue_still_exposes_resolve_and_reject_lane_intent() {
             "resolver".to_string(),
             "rejector".to_string(),
         ],
-        1)));
+        1,
+    )));
     {
         let mut guard = shared.write().await;
         // One change owns the single base-mutating lane, so both retry lanes park.
@@ -14308,7 +14353,8 @@ async fn preparing_is_visible_during_setup_and_a_retained_stop_prevents_agent_st
     let (tx, rx) = mpsc::channel(256);
     let reducer = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["admitted".to_string(), "waiting".to_string()],
-        1)));
+        1,
+    )));
     {
         let mut guard = reducer.write().await;
         guard.apply_command(ReducerCommand::AddToQueue("admitted".to_string()));
@@ -14434,7 +14480,8 @@ async fn preparing_is_not_announced_for_a_change_stopped_before_dispatch() {
     let (tx, rx) = mpsc::channel(64);
     let reducer = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["stopped-early".to_string()],
-        1)));
+        1,
+    )));
     reducer
         .write()
         .await
@@ -14660,7 +14707,8 @@ fn assert_no_preparation_happened(outcome: &WaitedDispatch, change_id: &str) {
 async fn preparing_is_not_announced_for_a_change_stopped_while_waiting_for_a_slot() {
     let reducer = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["stopped-late".to_string()],
-        1)));
+        1,
+    )));
     reducer
         .write()
         .await
@@ -14704,7 +14752,8 @@ async fn preparing_is_not_announced_for_a_change_stopped_while_waiting_for_a_slo
 async fn preparing_is_not_announced_for_a_change_made_terminal_while_waiting_for_a_slot() {
     let reducer = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["failed-late".to_string()],
-        1)));
+        1,
+    )));
     reducer
         .write()
         .await
