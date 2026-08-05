@@ -83,18 +83,26 @@ The AGENTS.md SHALL accurately document the current project structure and module
 - **AND** each dependency has its purpose described
 
 ### Requirement: OpenAPI YAML generation
-ドキュメントは Web 監視 API の OpenAPI 3.1 形式の YAML をコードから自動生成し、`docs/openapi.yaml` として提供しなければならない（SHALL）。OpenAPI YAML は手動編集してはならない（MUST NOT）。
 
-#### Scenario: 生成コマンドで更新する
-- **WHEN** 開発者が `make openapi` を実行する
-- **THEN** `docs/openapi.yaml` が最新の仕様で生成される
-- **AND** `GET /api/health`, `GET /api/state`, `GET /api/changes`, `GET /api/changes/{id}` の仕様が含まれる
-- **AND** 変更の承認 API と WebSocket `/ws` が記載される
+ドキュメントは Web 監視 API の OpenAPI 3.1 YAML をコードから動的に生成し、`cflx openapi` および `GET /api/v2/openapi.yaml` で提供しなければならない（SHALL）。リポジトリは生成済み OpenAPI YAML/JSON を追跡してはならない（MUST NOT）。
 
-#### Scenario: 生成差分を検知する
-- **WHEN** API 実装が変更され、生成結果がリポジトリと一致しない
-- **THEN** `make check-openapi` は失敗する
-- **AND** CI は差分を検知して失敗する
+#### Scenario: CLIでスキーマを出力する
+
+- **WHEN** 開発者が `cflx openapi` を実行する
+- **THEN** 標準出力に最新の `/api/v2` OpenAPI YAML が出力される
+- **AND** 出力はファイルへリダイレクトして利用できる
+
+#### Scenario: ライブAPIからスキーマを取得する
+
+- **WHEN** クライアントが `GET /api/v2/openapi.yaml` を要求する
+- **THEN** `cflx openapi` と同じ生成元の最新仕様が返される
+- **AND** 生成済みスキーマファイルをリポジトリへ保存する必要がない
+
+#### Scenario: 生成契約を検証する
+
+- **WHEN** API実装または公開スキーマが変更される
+- **THEN** repository-local contract tests は生成ドキュメントのルート・スキーマ・セキュリティ宣言を検証する
+- **AND** CLI出力とライブAPI出力の不一致を検知して失敗する
 
 ### Requirement: Git hooks ツールの案内
 README.md、README.ja.md、DEVELOPMENT.md は Git hooks 管理に prek を使用することを明示し、インストール/フック導入/実行方法を記載しなければならない（SHALL）。
@@ -177,3 +185,33 @@ The bundled `cflx-run` skill documentation SHALL describe `cflx run` as requirin
 - **WHEN** a reader reviews `skills/README.md`
 - **THEN** the `cflx-run` purpose and installation summary describe explicit target execution
 - **AND** the summary does not imply bare `cflx run` processes changes by default
+
+### Requirement: Path-scoped Rust commit hooks
+
+The repository's commit-time `rustfmt` and `clippy` hooks MUST be selected only when staged paths can affect Rust formatting or compilation. Both hooks MUST use `^(src|tests)/.*\.rs$|^Cargo\.(toml|lock)$|^build\.rs$` as their staged-file selector, MUST NOT run unconditionally, and MUST continue to execute their full configured workspace commands once selected. Non-Rust hygiene hooks and explicit full repository validation MUST remain available.
+
+#### Scenario: Proposal-only commit skips Rust hooks
+
+**Given**: the staged paths contain only files below `openspec/changes/`
+**When**: commit-time hooks are selected
+**Then**: `rustfmt` and `clippy` are skipped
+**And**: applicable generic hygiene and beads hooks retain their configured behavior
+
+#### Scenario: Rust source selects full Rust hooks
+
+**Given**: a staged path matches `src/**/*.rs` or `tests/**/*.rs`
+**When**: commit-time hooks are selected
+**Then**: both `rustfmt` and `clippy` run
+**And**: they execute their full configured commands without receiving staged filenames
+
+#### Scenario: Rust build metadata selects full Rust hooks
+
+**Given**: `Cargo.toml`, `Cargo.lock`, or root `build.rs` is staged
+**When**: commit-time hooks are selected
+**Then**: both `rustfmt` and `clippy` run
+
+#### Scenario: Full validation remains explicit
+
+**Given**: a developer needs repository-wide validation regardless of staged paths
+**When**: the documented full-check command is run
+**Then**: formatting, linting, tests, hooks, and the other configured full checks execute independently of commit-time path selection

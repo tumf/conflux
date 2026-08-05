@@ -40,7 +40,7 @@ make bump-major
 
 On `main`/`master` this will:
 1. Validate that the release-owned paths are clean (see below)
-2. Update version in `Cargo.toml`, `Cargo.lock`, and `docs/openapi.yaml` when present
+2. Update version in `Cargo.toml` and `Cargo.lock`
 3. Create a commit with message `chore(release): release vX.Y.Z` containing only those paths
 4. Create annotated git tag `vX.Y.Z`
 5. Push commit and tag to origin
@@ -51,8 +51,11 @@ A `main`/`master` release owns exactly these paths:
 
 - `Cargo.toml`
 - `Cargo.lock`
-- `docs/openapi.yaml` (only when it exists in the worktree, in the index, or in
-  `HEAD` — so deleting a tracked one does not remove it from the owned set)
+
+That is the whole set. Nothing generated is tracked, so a release rewrites no
+other file — in particular the `/api/v2` OpenAPI contract is generated at
+runtime by `cflx openapi` and `GET /api/v2/openapi.yaml` and carries no version
+string a release has to bump.
 
 The whole worktree does **not** need to be clean. The bump only requires the
 release-owned paths to match `HEAD` in both the index and the worktree; if any
@@ -194,15 +197,15 @@ Pre-release tags will create draft releases and skip Homebrew publishing.
 
 **Problem**: "Release-owned paths must match HEAD before a release"
 
-The bump prints the offending paths. Only `Cargo.toml`, `Cargo.lock`, and
-`docs/openapi.yaml` matter here; unrelated dirty files are fine.
+The bump prints the offending paths. Only `Cargo.toml` and `Cargo.lock` matter
+here; unrelated dirty files are fine.
 
 ```bash
 # Inspect only the release-owned paths
-git status --porcelain -- Cargo.toml Cargo.lock docs/openapi.yaml
+git status --porcelain -- Cargo.toml Cargo.lock
 
 # Commit them, or restore them to HEAD
-git restore --staged --worktree -- Cargo.toml Cargo.lock docs/openapi.yaml
+git restore --staged --worktree -- Cargo.toml Cargo.lock
 ```
 
 **Problem**: "No release changes produced for vX.Y.Z"

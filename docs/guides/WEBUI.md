@@ -142,7 +142,9 @@ taken at the TUI's uppercase-`X` confirmation — see
 [USAGE.md](USAGE.md#deleting-a-worktree-from-the-tui). Neither this API nor the
 operator console exposes an equivalent.
 
-For complete API details, see [../openapi.yaml](../openapi.yaml).
+For complete API details, export the generated schema with
+`cflx openapi > openapi.yaml` or read it live at `GET /api/v2/openapi.yaml`.
+Both return the same document; the repository tracks no schema file.
 
 ### The state resource is authoritative
 

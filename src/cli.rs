@@ -41,6 +41,7 @@ SUBCOMMANDS:
   run      Execute orchestration loop (non-interactive)
   tui      Launch interactive TUI dashboard (default)
   init     Generate configuration template
+  openapi  Print the generated /api/v2 OpenAPI 3.1 schema to stdout
 
 KEY OPTIONS:
   --parallel            Enable parallel execution using git worktrees
@@ -187,6 +188,7 @@ impl Cli {
             Commands::InstallSkills(_) => Some("install-skills"),
             Commands::Logs(_) => Some("logs"),
             Commands::Openspec(_) => Some("openspec"),
+            Commands::Openapi => Some("openapi"),
             Commands::Completion(_) => Some("completion"),
             Commands::Complete(_) => Some("__complete"),
         }
@@ -265,6 +267,19 @@ pub enum Commands {
     ///   cflx openspec validate --strict             # Validate all changes
     ///   cflx openspec archive my-change --yes       # Archive a change
     Openspec(OpenspecArgs),
+
+    /// Print the generated /api/v2 OpenAPI 3.1 schema to standard output
+    ///
+    /// Read-only export of the same document `GET /api/v2/openapi.yaml` serves.
+    /// It needs no Git repository and starts no logging, listeners, lifecycle
+    /// adapters, AI subprocesses, or orchestration. Standard output carries only
+    /// the schema, so redirecting it produces a valid standalone document;
+    /// diagnostics go to standard error and failures exit non-zero.
+    ///
+    /// EXAMPLES:
+    ///   cflx openapi                   # Print the schema
+    ///   cflx openapi > openapi.yaml    # Export it for client generation
+    Openapi,
 
     /// Generate shell completion scripts
     Completion(CompletionArgs),

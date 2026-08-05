@@ -75,7 +75,7 @@ cargo install cargo-audit
 
 ### Validation by phase
 
-- **Pre-commit hook**: `cargo fmt --all` + `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- **Pre-commit hook**: `cargo fmt --all` + `cargo clippy --locked --all-targets --all-features -- -D warnings`, path-scoped to Rust-impacting staged paths (see [Pre-commit checks](#pre-commit-checks))
 - **Local developer loop**: `cargo test`
 - **Acceptance baseline**: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
 - **Full local validation**: `make check` (includes `cargo audit`)
@@ -227,6 +227,42 @@ cargo clippy
 cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
 
+#### Path-scoped commit-time Rust checks
+
+The `rustfmt` and `clippy` hooks are **path-scoped**: at commit time they are
+selected only when a staged path can affect Rust compilation.
+
+```
+^(src|tests)/.*\.rs$|^Cargo\.(toml|lock)$|^build\.rs$
+```
+
+- A proposal-only commit (`openspec/**`) or a docs-only commit does not select
+  them, so it does not pay the full Rust hook cost.
+- Staging any `src/**/*.rs`, `tests/**/*.rs`, `Cargo.toml`, `Cargo.lock`, or the
+  root `build.rs` selects both hooks.
+- Selection is the only thing narrowed. Once selected, each hook still runs its
+  full workspace command (`cargo fmt --all`,
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`) and
+  receives no staged filenames.
+- The generic hygiene hooks, the beads hook, and the OpenAPI contract hook are
+  unaffected and keep running as before.
+
+Because the Rust hooks match on paths, a manual `prek run rustfmt` with no file
+arguments selects nothing. Use `--all-files` for an explicit full run:
+
+```bash
+prek run rustfmt clippy --all-files
+```
+
+#### Explicit full validation
+
+Path scoping applies to commit-time selection only; it never narrows explicit
+validation. `make check` (`fmt` + `lint` + `test` + all hooks on all files +
+`audit`) and CI validate the whole repository regardless of which paths changed.
+`tests/precommit_hook_scope_tests.rs` runs in `make test` and fails if the
+shared selector, the hook commands, `pass_filenames`, or the absence of
+`always_run` ever drifts.
+
 Archive 前チェックでは、通常 commit 時の hook と同等の検証として `prek run --all-files` を実行する。
 `pre-commit` コマンドが未導入の場合は `prek` を標準手段とし、以下のセットアップ後に同じコマンドを実行する。
 
@@ -250,28 +286,35 @@ brew install prek
 prek install
 ```
 
-The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format). When you run `prek run --all-files`, it also runs `make check-openapi`.
+The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format).
 
 ## The API contract
 
-`docs/openapi.yaml` is the one canonical description of `/api/v2` in this
-repository. It is generated from `src/web/openapi.rs` and the `#[utoipa::path]`
-attributes that module names, and it is never hand-edited — the file opens with a
-generated-file banner saying so. No second OpenAPI artifact is allowed to exist.
+`src/web/openapi.rs` and the `#[utoipa::path]` attributes that module names are
+the one canonical description of `/api/v2`. The document is generated from them
+and is **not tracked in this repository** — there is no file to regenerate and
+nothing to commit. Every copy opens with a banner saying so.
 
 ```bash
-make openapi        # regenerate docs/openapi.yaml
-make check-openapi  # fail on drift; writes nothing to the working tree
+cflx openapi                 # print the schema to stdout
+cflx openapi > openapi.yaml  # export it for client generation (do not commit)
+curl http://127.0.0.1:PORT/api/v2/openapi.yaml   # same document, live
 ```
 
-`make check-openapi` regenerates into a temporary file, prints a unified diff
-when the tracked artifact disagrees, and then runs
-`tests/openapi_contract_tests.rs`. Those assertions cover what a diff alone
-cannot: every published path is bound by the router and enforces the
-authentication it declares, the command union matches the advertised command
-set, the error-code and event-category vocabularies are complete, no removed
-legacy path has reappeared, no schema is dangling or unreachable, and real
-serialized DTOs satisfy their published schemas.
+Because there is no artifact to diff, `tests/openapi_contract_tests.rs` is what
+keeps the generated document honest, and CI runs it on every pull request:
+
+```bash
+cargo test --features web-monitoring --test openapi_contract_tests
+```
+
+Those assertions cover what a diff alone never could: every published path is
+bound by the router and enforces the authentication it declares, the command
+union matches the advertised command set, the error-code and event-category
+vocabularies are complete, no removed legacy path has reappeared, no schema is
+dangling or unreachable, real serialized DTOs satisfy their published schemas,
+`cflx openapi` and the live endpoint emit identical bytes, and the checks
+themselves are proven to fail on a deliberately incomplete document.
 
 Anything that changes a route, a published DTO field, a command variant, an
 error code, an event envelope, or a security declaration must be committed
