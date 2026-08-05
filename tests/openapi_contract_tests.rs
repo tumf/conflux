@@ -770,6 +770,10 @@ fn protected_router() -> axum::Router {
 // The completeness check would notice
 // ============================================================================
 
+/// One incompleteness fixture: what it does to the document, the substring the
+/// resulting failure must name, and the mutation that removes the contract element.
+type IncompleteCase = (&'static str, &'static str, Box<dyn Fn(&mut Value)>);
+
 /// Everything above proves the document is *currently* complete. This proves the
 /// check would notice if it stopped being complete — the one property a suite of
 /// positive assertions can never establish about itself.
@@ -780,7 +784,7 @@ fn protected_router() -> axum::Router {
 /// message. The real document is never written to or mutated.
 #[test]
 fn incomplete_contracts_are_rejected_and_the_failure_names_what_is_missing() {
-    let cases: Vec<(&str, &str, Box<dyn Fn(&mut Value)>)> = vec![
+    let cases: Vec<IncompleteCase> = vec![
         (
             "a supported route is dropped",
             "/api/v2/state",
