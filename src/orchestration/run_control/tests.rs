@@ -12,7 +12,8 @@ use super::testing::{RecordingScheduler, SchedulerCall};
 use super::*;
 use crate::events::{ExecutionEvent, StalledBlocker};
 use crate::orchestration::operator_command::{
-    ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, QueuePort, TerminationWaiter,
+    ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, ParallelEligibility, QueuePort,
+    TerminationWaiter,
 };
 use crate::orchestration::state::ExecutionMode;
 
@@ -249,9 +250,10 @@ async fn start_refuses_parallel_ineligible_targets() {
     let harness = Harness::new(&["a"]);
     harness.mark(&["a"]);
     harness.eligibility.set_parallel_mode(true);
-    harness
-        .eligibility
-        .set_parallel_ineligible(["a".to_string()]);
+    harness.eligibility.set_parallel_ineligible([(
+        "a".to_string(),
+        ParallelEligibility::UncommittedProposalFiles,
+    )]);
 
     let error = harness
         .service
@@ -275,9 +277,10 @@ async fn one_ineligible_mark_refuses_the_whole_parallel_start() {
         let harness = Harness::new(&["eligible", "ineligible"]);
         harness.mark(&["eligible", "ineligible"]);
         harness.eligibility.set_parallel_mode(true);
-        harness
-            .eligibility
-            .set_parallel_ineligible(["ineligible".to_string()]);
+        harness.eligibility.set_parallel_ineligible([(
+            "ineligible".to_string(),
+            ParallelEligibility::UncommittedProposalFiles,
+        )]);
         if arrange_ineligible_as_unstartable {
             harness.to_merge_wait("ineligible").await;
         }
@@ -885,7 +888,10 @@ fn marking_an_active_resolver_removes_it_from_the_waiting_queue() {
 #[test]
 fn start_eligibility_only_rejects_in_parallel_mode() {
     let eligibility = StartEligibility::new();
-    eligibility.set_parallel_ineligible(["a".to_string()]);
+    eligibility.set_parallel_ineligible([(
+        "a".to_string(),
+        ParallelEligibility::UncommittedProposalFiles,
+    )]);
     let targets = vec!["a".to_string(), "b".to_string()];
 
     assert!(

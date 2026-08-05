@@ -721,7 +721,9 @@ impl ActionBlockedReason {
             E::StopPending => Self::StopPending,
             E::ChangeActive => Self::ChangeActive,
             E::StatusImmutable => Self::StatusImmutable,
-            E::ParallelIneligible => Self::ParallelIneligible,
+            // Both parallel refusals block the same actions; the reason they
+            // differ on is published per change in `parallel.blocked_reason`.
+            E::ParallelIneligible | E::ParallelProposalAbsent => Self::ParallelIneligible,
         }
     }
 }

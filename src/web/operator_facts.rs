@@ -175,20 +175,23 @@ impl OperatorFactsStore {
         committed_change_ids: &HashSet<String>,
         uncommitted_file_change_ids: &HashSet<String>,
     ) {
+        // One shared classification, so the wire projection and the TUI badge
+        // can never disagree about which observation a change actually made.
+        use crate::orchestration::operator_command::ParallelEligibility as Observed;
+
         for (id, facts) in &mut self.facts {
-            facts.parallel = if !committed_change_ids.contains(id) {
-                ParallelEligibility {
-                    eligible: false,
-                    blocked_reason: Some(ParallelBlockedReason::NotCommitted),
-                }
-            } else if uncommitted_file_change_ids.contains(id) {
-                ParallelEligibility {
-                    eligible: false,
-                    blocked_reason: Some(ParallelBlockedReason::UncommittedChanges),
-                }
-            } else {
-                ParallelEligibility::default()
-            };
+            facts.parallel =
+                match Observed::observe(id, committed_change_ids, uncommitted_file_change_ids) {
+                    Observed::Eligible => ParallelEligibility::default(),
+                    Observed::ProposalAbsentFromHead => ParallelEligibility {
+                        eligible: false,
+                        blocked_reason: Some(ParallelBlockedReason::NotCommitted),
+                    },
+                    Observed::UncommittedProposalFiles => ParallelEligibility {
+                        eligible: false,
+                        blocked_reason: Some(ParallelBlockedReason::UncommittedChanges),
+                    },
+                };
         }
     }
 

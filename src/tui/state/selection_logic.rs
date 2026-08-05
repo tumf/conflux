@@ -111,7 +111,7 @@ pub(super) fn classify_bulk_toggle_change(
         mode.operator_mode(),
         parallel_mode,
         &change.display_status_cache,
-        change.is_parallel_eligible,
+        change.parallel_eligibility,
     )
 }
 
@@ -126,7 +126,7 @@ pub(super) fn build_bulk_toggle_snapshot(
         .map(|change| MarkTargetRow {
             change_id: &change.id,
             display_status: &change.display_status_cache,
-            parallel_eligible: change.is_parallel_eligible,
+            parallel_eligibility: change.parallel_eligibility,
             marked: change.selected,
         })
         .collect();
@@ -272,7 +272,7 @@ pub(super) fn toggle_selection(state: &mut AppState) -> Option<TuiCommand> {
     {
         let change = &state.changes[state.cursor_index];
         if let guards::ToggleGuardResult::Blocked(msg) = guards::validate_change_toggleable(
-            change.is_parallel_eligible,
+            change.parallel_eligibility,
             state.parallel_mode,
             &change.display_status_cache,
             &change.id,
@@ -333,12 +333,30 @@ fn dispatch_toggle_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::operator_command::ParallelEligibility;
     use ratatui::style::Color;
 
+    /// A row whose ineligibility, when any, is observed dirty proposal content.
     fn make_change_state(
         id: &str,
         display_status_cache: &str,
         is_parallel_eligible: bool,
+    ) -> ChangeState {
+        make_change_state_with_eligibility(
+            id,
+            display_status_cache,
+            if is_parallel_eligible {
+                ParallelEligibility::Eligible
+            } else {
+                ParallelEligibility::UncommittedProposalFiles
+            },
+        )
+    }
+
+    fn make_change_state_with_eligibility(
+        id: &str,
+        display_status_cache: &str,
+        parallel_eligibility: ParallelEligibility,
     ) -> ChangeState {
         ChangeState {
             id: id.to_string(),
@@ -351,7 +369,7 @@ mod tests {
             error_message_cache: None,
             selected: false,
             is_new: false,
-            is_parallel_eligible,
+            parallel_eligibility,
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
@@ -420,6 +438,50 @@ mod tests {
             assert!(!reason.reason().is_empty());
             assert!(!reason.as_str().is_empty());
         }
+    }
+
+    /// A clean proposal absent from `HEAD` is excluded, but for its own reason.
+    ///
+    /// Both rows are refused identically; reporting the absent one as
+    /// uncommitted would send the operator looking for changes to commit.
+    #[test]
+    fn bulk_toggle_excludes_an_absent_proposal_without_calling_it_uncommitted() {
+        let absent = make_change_state_with_eligibility(
+            "absent",
+            "not queued",
+            ParallelEligibility::ProposalAbsentFromHead,
+        );
+        let dirty = make_change_state_with_eligibility(
+            "dirty",
+            "queued",
+            ParallelEligibility::UncommittedProposalFiles,
+        );
+
+        assert_eq!(
+            classify_bulk_toggle_change(AppExecutionMode::Select, true, &absent),
+            Some(BulkToggleExclusion::ParallelProposalAbsent)
+        );
+        assert_eq!(
+            classify_bulk_toggle_change(AppExecutionMode::Select, true, &dirty),
+            Some(BulkToggleExclusion::ParallelIneligible)
+        );
+        assert!(!can_bulk_toggle_change(
+            AppExecutionMode::Select,
+            true,
+            &absent
+        ));
+        assert!(
+            can_bulk_toggle_change(AppExecutionMode::Select, false, &absent),
+            "proposal absence is a parallel-mode constraint only"
+        );
+
+        let summary = build_bulk_toggle_snapshot(AppExecutionMode::Select, true, &[absent, dirty])
+            .exclusion_summary();
+        assert!(
+            summary.contains("not present in HEAD (cannot queue in parallel mode)")
+                && summary.contains("uncommitted in parallel mode (commit first)"),
+            "each excluded row is explained by what was observed: {summary}"
+        );
     }
 
     #[test]

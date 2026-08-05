@@ -1375,6 +1375,9 @@ async fn externally_blocked_change_does_not_block_unrelated_or_dependent_kinds()
 // ============================================================================
 
 /// Build a bulk-mark row without repeating the struct literal per case.
+///
+/// An ineligible row is spelled as dirty proposal content; the reason-specific
+/// cases build their rows directly.
 fn row<'a>(
     change_id: &'a str,
     display_status: &'a str,
@@ -1384,8 +1387,17 @@ fn row<'a>(
     MarkTargetRow {
         change_id,
         display_status,
-        parallel_eligible,
+        parallel_eligibility: eligibility(parallel_eligible),
         marked,
+    }
+}
+
+/// Bool-to-reason shorthand for cases where only admission is under test.
+fn eligibility(parallel_eligible: bool) -> ParallelEligibility {
+    if parallel_eligible {
+        ParallelEligibility::Eligible
+    } else {
+        ParallelEligibility::UncommittedProposalFiles
     }
 }
 
@@ -1478,7 +1490,7 @@ fn bulk_mark_classification_reports_one_stable_reason_per_mode_and_status() {
 
     for (mode, parallel_mode, status, eligible, expected) in cases {
         assert_eq!(
-            classify_bulk_mark_row(mode, parallel_mode, status, eligible),
+            classify_bulk_mark_row(mode, parallel_mode, status, eligibility(eligible)),
             expected,
             "mode {mode:?}, parallel {parallel_mode}, status '{status}', eligible {eligible}"
         );
@@ -1531,6 +1543,105 @@ fn bulk_mark_exclusion_summary_groups_reasons_with_counts() {
     assert_eq!(tokens.len(), MarkExclusion::ALL.len());
 }
 
+/// The two parallel refusals block identically and are reported apart.
+///
+/// A row absent from `HEAD` has no uncommitted content, so telling the operator
+/// to commit it names work that does not exist.
+#[test]
+fn bulk_mark_names_the_parallel_reason_it_actually_observed() {
+    let rows = [
+        MarkTargetRow {
+            change_id: "dirty",
+            display_status: "not queued",
+            parallel_eligibility: ParallelEligibility::UncommittedProposalFiles,
+            marked: false,
+        },
+        MarkTargetRow {
+            change_id: "absent",
+            display_status: "queued",
+            parallel_eligibility: ParallelEligibility::ProposalAbsentFromHead,
+            marked: false,
+        },
+        row("eligible", "not queued", true, false),
+    ];
+
+    let plan = plan_bulk_marks(OperatorMode::Running, true, &rows);
+
+    assert_eq!(plan.eligible, vec!["eligible"]);
+    assert_eq!(
+        plan.excluded,
+        vec![
+            ("dirty".to_string(), MarkExclusion::ParallelIneligible),
+            ("absent".to_string(), MarkExclusion::ParallelProposalAbsent),
+        ]
+    );
+
+    let summary = plan.exclusion_summary();
+    assert!(
+        summary.contains("uncommitted in parallel mode (commit first)"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("not present in HEAD (cannot queue in parallel mode)"),
+        "{summary}"
+    );
+    assert!(
+        !MarkExclusion::ParallelProposalAbsent
+            .reason()
+            .to_lowercase()
+            .contains("uncommit"),
+        "an absent proposal must never be described as uncommitted"
+    );
+
+    // Sequential mode does not apply either refusal.
+    let sequential = plan_bulk_marks(OperatorMode::Running, false, &rows);
+    assert!(sequential.excluded.is_empty());
+}
+
+/// Observation precedence and the store round-trip, in one place.
+#[test]
+fn parallel_eligibility_observation_prefers_the_actionable_reason() {
+    let committed = HashSet::from(["clean".to_string(), "dirty".to_string()]);
+    let uncommitted = HashSet::from(["dirty".to_string(), "brand-new".to_string()]);
+
+    assert_eq!(
+        ParallelEligibility::observe("clean", &committed, &uncommitted),
+        ParallelEligibility::Eligible
+    );
+    assert_eq!(
+        ParallelEligibility::observe("absent", &committed, &uncommitted),
+        ParallelEligibility::ProposalAbsentFromHead
+    );
+    assert_eq!(
+        ParallelEligibility::observe("dirty", &committed, &uncommitted),
+        ParallelEligibility::UncommittedProposalFiles
+    );
+    // Untracked and absent at once: it is reported as the condition a commit fixes.
+    assert_eq!(
+        ParallelEligibility::observe("brand-new", &committed, &uncommitted),
+        ParallelEligibility::UncommittedProposalFiles
+    );
+
+    let runtime = ParallelRuntime::new();
+    runtime.set_parallel_ineligible([
+        ("clean".to_string(), ParallelEligibility::Eligible),
+        (
+            "absent".to_string(),
+            ParallelEligibility::ProposalAbsentFromHead,
+        ),
+    ]);
+
+    // An "ineligible" entry that claims eligibility is dropped rather than stored.
+    assert_eq!(runtime.ineligible_ids(), vec!["absent".to_string()]);
+    assert!(runtime.is_eligible("clean"));
+    assert!(!runtime.is_eligible("absent"));
+    assert_eq!(runtime.eligibility("clean"), ParallelEligibility::Eligible);
+    assert_eq!(
+        runtime.eligibility("absent"),
+        ParallelEligibility::ProposalAbsentFromHead
+    );
+}
+
 #[test]
 fn parallel_cleanup_targets_only_names_ineligible_rows_carrying_intent() {
     let rows = [
@@ -1578,7 +1689,12 @@ fn parallel_fixture(ids: &[&str], ineligible: &[&str]) -> Fixture {
     parallel.set_available(true);
     parallel.set_max_concurrent(4);
     parallel.set_vcs_backend("git");
-    parallel.set_parallel_ineligible(ineligible.iter().map(|id| id.to_string()));
+    parallel.set_parallel_ineligible(ineligible.iter().map(|id| {
+        (
+            id.to_string(),
+            ParallelEligibility::UncommittedProposalFiles,
+        )
+    }));
     fixture
 }
 
@@ -1894,7 +2010,12 @@ fn preparing_is_active_in_the_shared_lifecycle_matrix() {
         MarkRoute::Immutable
     );
     assert_eq!(
-        classify_bulk_mark_row(OperatorMode::Running, true, "preparing", true),
+        classify_bulk_mark_row(
+            OperatorMode::Running,
+            true,
+            "preparing",
+            ParallelEligibility::Eligible
+        ),
         Some(MarkExclusion::ChangeActive)
     );
 }

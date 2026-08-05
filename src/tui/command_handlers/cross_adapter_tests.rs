@@ -22,6 +22,7 @@ use super::tests::{create_test_change, AdapterHarness};
 use super::*;
 
 use crate::events::ExecutionEvent;
+use crate::orchestration::operator_command::ParallelEligibility;
 use crate::orchestration::run_control::testing::SchedulerCall;
 use crate::tui::types::AppExecutionMode;
 use crate::web::remote_control_api::dto::{CommandSpec, ErrorCode};
@@ -174,7 +175,10 @@ async fn arrange(harness: &AdapterHarness, setup: Setup) {
                     ));
                 }
             }
-            harness.parallel.set_parallel_ineligible(["c2".to_string()]);
+            harness.parallel.set_parallel_ineligible([(
+                "c2".to_string(),
+                ParallelEligibility::UncommittedProposalFiles,
+            )]);
         }
         Setup::ParallelAlreadyEnabled => {
             harness.parallel.set_parallel_mode(true);
@@ -226,7 +230,11 @@ async fn through_tui(
     let mut app = harness.app(&CHANGES);
     app.execution_mode = mode;
     for change in &mut app.changes {
-        change.is_parallel_eligible = !ineligible.contains(&change.id);
+        change.parallel_eligibility = if ineligible.contains(&change.id) {
+            ParallelEligibility::UncommittedProposalFiles
+        } else {
+            ParallelEligibility::Eligible
+        };
     }
     app.publish_parallel_runtime();
     app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
@@ -569,11 +577,14 @@ type BulkRow = (&'static str, &'static str, bool);
 /// Arrange one bulk-mark case on a fresh harness.
 async fn arrange_bulk(harness: &AdapterHarness, rows: &[BulkRow], marked: &[&str], parallel: bool) {
     harness.parallel.set_parallel_mode(parallel);
-    harness.parallel.set_parallel_ineligible(
-        rows.iter()
-            .filter(|(_, _, ok)| !ok)
-            .map(|(id, ..)| id.to_string()),
-    );
+    harness
+        .parallel
+        .set_parallel_ineligible(rows.iter().filter(|(_, _, ok)| !ok).map(|(id, ..)| {
+            (
+                id.to_string(),
+                ParallelEligibility::UncommittedProposalFiles,
+            )
+        }));
     harness
         .marks
         .replace(marked.iter().map(|id| id.to_string()));
@@ -614,7 +625,11 @@ async fn bulk_through_tui(
     app.execution_mode = mode;
     app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
     for (index, (_, _, eligible)) in rows.iter().enumerate() {
-        app.changes[index].is_parallel_eligible = *eligible;
+        app.changes[index].parallel_eligibility = if *eligible {
+            ParallelEligibility::Eligible
+        } else {
+            ParallelEligibility::UncommittedProposalFiles
+        };
         app.changes[index].selected = marked.contains(&app.changes[index].id.as_str());
     }
     app.publish_parallel_runtime();

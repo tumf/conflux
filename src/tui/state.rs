@@ -15,6 +15,7 @@
 //! Both TUI and Web states are updated via `ExecutionEvent` messages, ensuring consistency.
 
 use crate::openspec::Change;
+use crate::orchestration::operator_command::ParallelEligibility;
 use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
 use crate::tui::config::TuiConfig;
 use crate::tui::events::{LogEntry, LogLevel, TuiCommand};
@@ -151,8 +152,12 @@ pub struct ChangeState {
     pub selected: bool,
     /// Whether this is a newly detected change
     pub is_new: bool,
-    /// Whether this change is eligible for parallel execution
-    pub is_parallel_eligible: bool,
+    /// Whether this change is eligible for parallel execution, and why not.
+    ///
+    /// The reason is carried rather than collapsed into a boolean because the
+    /// two ineligible cases look identical to admission but not to an operator:
+    /// only dirty proposal content may be presented as uncommitted state.
+    pub parallel_eligibility: ParallelEligibility,
     /// Whether a worktree exists for this change
     pub has_worktree: bool,
     /// When processing started for this change
@@ -321,12 +326,29 @@ impl ChangeState {
             blocker_detail_cache: None,
             display_color_cache: Color::DarkGray,
             error_message_cache: None,
-            is_parallel_eligible: true,
+            parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
             iteration_number: None,
         }
+    }
+
+    /// Whether this change may take part in parallel execution.
+    ///
+    /// Every ineligible reason answers `false` here: this is the admission
+    /// guard, and narrowing it is never what distinguishing reasons is for.
+    pub fn is_parallel_eligible(&self) -> bool {
+        self.parallel_eligibility.is_eligible()
+    }
+
+    /// Whether uncommitted or untracked proposal files were actually observed.
+    ///
+    /// The `UNCOMMITTED` badge and the commit instruction key off this rather
+    /// than off [`ChangeState::is_parallel_eligible`], so a clean proposal that
+    /// is merely absent from `HEAD` is never described as dirty.
+    pub fn has_uncommitted_proposal_files(&self) -> bool {
+        self.parallel_eligibility.has_uncommitted_proposal_files()
     }
 
     /// Calculate progress percentage
@@ -541,8 +563,8 @@ impl AppState {
         self.parallel_runtime.set_parallel_ineligible(
             self.changes
                 .iter()
-                .filter(|change| !change.is_parallel_eligible)
-                .map(|change| change.id.clone()),
+                .filter(|change| !change.is_parallel_eligible())
+                .map(|change| (change.id.clone(), change.parallel_eligibility)),
         );
     }
 
@@ -577,7 +599,7 @@ impl AppState {
             .iter()
             .map(|change| ParallelCleanupRow {
                 change_id: &change.id,
-                parallel_eligible: change.is_parallel_eligible,
+                parallel_eligible: change.is_parallel_eligible(),
                 marked: change.selected,
                 queued: change.display_status_cache == "queued",
             })
@@ -1447,15 +1469,21 @@ impl AppState {
     /// A change is eligible for parallel execution if:
     /// 1. It exists in HEAD's commit tree (committed_change_ids), AND
     /// 2. It has no uncommitted or untracked files under openspec/changes/<change_id>/
+    ///
+    /// Both failures keep the change out of parallel queueing; they are recorded
+    /// as distinct reasons so rendering and refusal messages can stay truthful
+    /// about which one was actually observed.
     pub fn apply_parallel_eligibility(
         &mut self,
         committed_change_ids: &HashSet<String>,
         uncommitted_file_change_ids: &HashSet<String>,
     ) {
         for change in &mut self.changes {
-            // Eligible if committed AND no uncommitted files
-            change.is_parallel_eligible = committed_change_ids.contains(&change.id)
-                && !uncommitted_file_change_ids.contains(&change.id);
+            change.parallel_eligibility = ParallelEligibility::observe(
+                &change.id,
+                committed_change_ids,
+                uncommitted_file_change_ids,
+            );
         }
 
         if self.parallel_mode
@@ -1911,7 +1939,7 @@ impl AppState {
 // ============================================================================
 
 mod guards {
-    use super::{ChangeState, TuiCommand, ViewMode, WorktreeInfo};
+    use super::{ChangeState, ParallelEligibility, TuiCommand, ViewMode, WorktreeInfo};
     use crate::orchestration::operator_command::{classify_mark_route, MarkRoute, OperatorMode};
 
     /// Result type for merge validation
@@ -2021,8 +2049,10 @@ mod guards {
     /// groups rows by reason to explain what was excluded.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ToggleBlockReason {
-        /// Parallel mode cannot queue a change that is not committed yet.
+        /// Parallel mode cannot queue a change with uncommitted proposal files.
         ParallelUncommitted,
+        /// Parallel mode cannot queue a change absent from the `HEAD` tree.
+        ParallelProposalAbsent,
         /// Rejected proposals are read-only.
         Rejected,
     }
@@ -2032,7 +2062,7 @@ mod guards {
     /// This is the single source of truth shared by the single-row guard and
     /// the bulk toggle classification, so both paths stay consistent.
     pub fn classify_toggle_block(
-        is_parallel_eligible: bool,
+        parallel_eligibility: ParallelEligibility,
         parallel_mode: bool,
         display_status_cache: &str,
     ) -> Option<ToggleBlockReason> {
@@ -2040,15 +2070,23 @@ mod guards {
         // This is allowed and handled by handle_toggle_running_mode
         // No need to block here
 
-        // Cannot select uncommitted changes in parallel mode (only applies to non-active states)
+        // Parallel mode refuses every ineligible change (only applies to
+        // non-active states); the reason only decides what the operator is told.
         if parallel_mode
-            && !is_parallel_eligible
             && !matches!(
                 display_status_cache,
                 "preparing" | "applying" | "accepting" | "archiving" | "resolving"
             )
         {
-            return Some(ToggleBlockReason::ParallelUncommitted);
+            match parallel_eligibility {
+                ParallelEligibility::UncommittedProposalFiles => {
+                    return Some(ToggleBlockReason::ParallelUncommitted)
+                }
+                ParallelEligibility::ProposalAbsentFromHead => {
+                    return Some(ToggleBlockReason::ParallelProposalAbsent)
+                }
+                ParallelEligibility::Eligible => {}
+            }
         }
 
         if display_status_cache == "rejected" {
@@ -2063,14 +2101,20 @@ mod guards {
 
     /// Validates that a change can be toggled for selection
     pub fn validate_change_toggleable(
-        is_parallel_eligible: bool,
+        parallel_eligibility: ParallelEligibility,
         parallel_mode: bool,
         display_status_cache: &str,
         change_id: &str,
     ) -> ToggleGuardResult {
-        match classify_toggle_block(is_parallel_eligible, parallel_mode, display_status_cache) {
+        match classify_toggle_block(parallel_eligibility, parallel_mode, display_status_cache) {
             Some(ToggleBlockReason::ParallelUncommitted) => ToggleGuardResult::Blocked(format!(
                 "Cannot queue uncommitted change '{}' in parallel mode. Commit it first.",
+                change_id
+            )),
+            // No dirty content exists to commit here, so the message names the
+            // condition that is actually observable instead of asking for one.
+            Some(ToggleBlockReason::ParallelProposalAbsent) => ToggleGuardResult::Blocked(format!(
+                "Cannot queue change '{}' in parallel mode: it is not present in HEAD.",
                 change_id
             )),
             Some(ToggleBlockReason::Rejected) => ToggleGuardResult::Blocked(format!(
@@ -2941,7 +2985,7 @@ mod tests {
             error_message_cache: None,
             selected: false,
             is_new: false,
-            is_parallel_eligible: true,
+            parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
@@ -3093,8 +3137,8 @@ mod tests {
         app.parallel_available = true;
 
         // Mark first as committed, second as uncommitted
-        app.changes[0].is_parallel_eligible = true;
-        app.changes[1].is_parallel_eligible = false;
+        app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
+        app.changes[1].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
 
         // Toggle all should only mark the committed change
         app.toggle_all_marks();
@@ -3105,6 +3149,180 @@ mod tests {
         app.toggle_all_marks();
         assert!(!app.changes[0].selected);
         assert!(!app.changes[1].selected);
+    }
+
+    /// Eligibility observation keeps the two Git facts apart.
+    ///
+    /// Both answers still refuse parallel admission; only the reason differs,
+    /// and only one of them is a working-tree condition.
+    #[test]
+    fn parallel_eligibility_records_why_a_change_is_refused() {
+        let changes = vec![
+            create_test_change("clean", 0, 1),
+            create_test_change("absent", 0, 1),
+            create_test_change("dirty", 0, 1),
+            create_test_change("brand-new", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        let committed = HashSet::from(["clean".to_string(), "dirty".to_string()]);
+        let uncommitted = HashSet::from(["dirty".to_string(), "brand-new".to_string()]);
+        app.apply_parallel_eligibility(&committed, &uncommitted);
+
+        let by_id = |id: &str| {
+            app.changes
+                .iter()
+                .find(|change| change.id == id)
+                .unwrap_or_else(|| panic!("'{id}' must be tracked"))
+                .clone()
+        };
+
+        assert_eq!(
+            by_id("clean").parallel_eligibility,
+            ParallelEligibility::Eligible
+        );
+        assert_eq!(
+            by_id("absent").parallel_eligibility,
+            ParallelEligibility::ProposalAbsentFromHead
+        );
+        assert_eq!(
+            by_id("dirty").parallel_eligibility,
+            ParallelEligibility::UncommittedProposalFiles
+        );
+        // Untracked and absent at once: committing it is what fixes both, so it
+        // is reported as the condition the operator can act on.
+        assert_eq!(
+            by_id("brand-new").parallel_eligibility,
+            ParallelEligibility::UncommittedProposalFiles
+        );
+
+        // The admission guard is unchanged: every non-eligible reason is false.
+        assert!(by_id("clean").is_parallel_eligible());
+        for refused in ["absent", "dirty", "brand-new"] {
+            assert!(
+                !by_id(refused).is_parallel_eligible(),
+                "'{refused}' must stay out of parallel queueing"
+            );
+        }
+
+        // Only observed dirty content may be presented as uncommitted state.
+        assert!(!by_id("absent").has_uncommitted_proposal_files());
+        assert!(by_id("dirty").has_uncommitted_proposal_files());
+
+        // The shared runtime store carries the same reasons, not just the set.
+        let runtime = app.parallel_runtime();
+        assert_eq!(
+            runtime.ineligible_ids(),
+            vec![
+                "absent".to_string(),
+                "brand-new".to_string(),
+                "dirty".to_string()
+            ]
+        );
+        assert_eq!(
+            runtime.eligibility("absent"),
+            ParallelEligibility::ProposalAbsentFromHead
+        );
+        assert_eq!(
+            runtime.eligibility("dirty"),
+            ParallelEligibility::UncommittedProposalFiles
+        );
+        assert_eq!(runtime.eligibility("clean"), ParallelEligibility::Eligible);
+    }
+
+    /// Both refusals block the toggle; each one names what was observed.
+    #[test]
+    fn single_row_toggle_refusals_distinguish_dirty_content_from_absence() {
+        let cases = [
+            (
+                ParallelEligibility::UncommittedProposalFiles,
+                guards::ToggleBlockReason::ParallelUncommitted,
+                "Commit it first",
+            ),
+            (
+                ParallelEligibility::ProposalAbsentFromHead,
+                guards::ToggleBlockReason::ParallelProposalAbsent,
+                "not present in HEAD",
+            ),
+        ];
+
+        for (eligibility, expected_reason, expected_text) in cases {
+            assert_eq!(
+                guards::classify_toggle_block(eligibility, true, "not queued"),
+                Some(expected_reason),
+                "{eligibility:?} must block the toggle"
+            );
+
+            let guards::ToggleGuardResult::Blocked(message) =
+                guards::validate_change_toggleable(eligibility, true, "not queued", "change-a")
+            else {
+                panic!("{eligibility:?} must be refused");
+            };
+            assert!(
+                message.contains(expected_text),
+                "{eligibility:?} must be explained as '{expected_text}': {message}"
+            );
+        }
+
+        // An absent proposal has nothing to commit, so it is never described as
+        // uncommitted.
+        let guards::ToggleGuardResult::Blocked(absent) = guards::validate_change_toggleable(
+            ParallelEligibility::ProposalAbsentFromHead,
+            true,
+            "not queued",
+            "change-a",
+        ) else {
+            panic!("an absent proposal must be refused");
+        };
+        assert!(!absent.to_lowercase().contains("uncommitted"), "{absent}");
+
+        // Sequential mode is unaffected by either reason.
+        for eligibility in [
+            ParallelEligibility::UncommittedProposalFiles,
+            ParallelEligibility::ProposalAbsentFromHead,
+        ] {
+            assert_eq!(
+                guards::classify_toggle_block(eligibility, false, "not queued"),
+                None
+            );
+        }
+    }
+
+    /// A bulk toggle reports each excluded row with the reason it was observed.
+    #[test]
+    fn bulk_toggle_exclusion_summary_names_each_parallel_reason() {
+        let changes = vec![
+            create_test_change("eligible", 0, 1),
+            create_test_change("dirty", 0, 1),
+            create_test_change("absent", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+        app.execution_mode = AppExecutionMode::Select;
+        app.parallel_available = true;
+        app.parallel_mode = true;
+        app.apply_parallel_eligibility(
+            &HashSet::from(["eligible".to_string(), "dirty".to_string()]),
+            &HashSet::from(["dirty".to_string()]),
+        );
+
+        app.toggle_all_marks();
+
+        assert!(app.changes[0].selected);
+        assert!(!app.changes[1].selected, "a dirty proposal is excluded");
+        assert!(!app.changes[2].selected, "an absent proposal is excluded");
+
+        let summary = app
+            .warning_message
+            .clone()
+            .expect("excluded rows are reported");
+        assert!(
+            summary.contains("uncommitted in parallel mode (commit first)"),
+            "the dirty row keeps its actionable instruction: {summary}"
+        );
+        assert!(
+            summary.contains("not present in HEAD (cannot queue in parallel mode)"),
+            "the absent row is named for what it is: {summary}"
+        );
     }
 
     #[test]
@@ -3366,7 +3584,11 @@ mod tests {
         app.parallel_available = parallel_mode;
         for (index, (_, status, parallel_eligible, selected)) in rows.iter().enumerate() {
             app.changes[index].display_status_cache = status.to_string();
-            app.changes[index].is_parallel_eligible = *parallel_eligible;
+            app.changes[index].parallel_eligibility = if *parallel_eligible {
+                ParallelEligibility::Eligible
+            } else {
+                ParallelEligibility::UncommittedProposalFiles
+            };
             app.changes[index].selected = *selected;
         }
 
@@ -4187,7 +4409,7 @@ mod tests {
             error_message_cache: None,
             selected: false,
             is_new: false,
-            is_parallel_eligible: true,
+            parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
@@ -4216,7 +4438,7 @@ mod tests {
             error_message_cache: None,
             selected: false,
             is_new: false,
-            is_parallel_eligible: true,
+            parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
@@ -4249,7 +4471,7 @@ mod tests {
             error_message_cache: None,
             selected: false,
             is_new: false,
-            is_parallel_eligible: true,
+            parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: false,
             started_at: None,
             elapsed_time: None,
@@ -4989,7 +5211,7 @@ mod tests {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
         app.changes[0].selected = true;
-        app.changes[0].is_parallel_eligible = true;
+        app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
         app.parallel_mode = true;
 
         let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
@@ -5041,7 +5263,7 @@ mod tests {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
         app.changes[0].selected = true;
-        app.changes[0].is_parallel_eligible = true;
+        app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
         app.parallel_mode = true;
 
         let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
@@ -5112,7 +5334,7 @@ mod tests {
 
         // Simulate the start path (queues change in both TUI and reducer).
         app.changes[0].selected = true;
-        app.changes[0].is_parallel_eligible = true;
+        app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
         shared.blocking_write().apply_command(
             crate::orchestration::state::ReducerCommand::AddToQueue("change-a".to_string()),
         );
@@ -5150,7 +5372,7 @@ mod tests {
         app.set_shared_state(shared.clone());
 
         app.changes[0].selected = true;
-        app.changes[0].is_parallel_eligible = true;
+        app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
         shared.blocking_write().apply_command(
             crate::orchestration::state::ReducerCommand::AddToQueue("change-a".to_string()),
         );
