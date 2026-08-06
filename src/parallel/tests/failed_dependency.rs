@@ -364,6 +364,7 @@ impl EpochProbe {
                     semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
                     join_set: &mut join_set,
                     cleanup_guard: &mut cleanup_guard,
+                    work_snapshot: None,
                 },
                 &mut reanalysis_reason,
             )

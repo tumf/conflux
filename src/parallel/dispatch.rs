@@ -1436,7 +1436,13 @@ impl ParallelExecutor {
         }
 
         if let Some(shared) = &self.shared_orchestrator_state {
-            let terminal_gate = shared.try_read().ok().and_then(|guard| {
+            // Awaited, not attempted. This is a dispatch *stop* gate: a failed
+            // `try_read` used to leave `terminal_gate` empty, which reads as "no
+            // terminal state is blocking" and lets a merged, pushed, rejected, or
+            // error change be dispatched purely because a reducer write was in
+            // progress. Incomplete evidence must never authorize dispatch.
+            let terminal_gate = {
+                let guard = shared.read().await;
                 if guard.is_final_terminal_dispatch_stop(change_id) {
                     Some((
                         "final_terminal",
@@ -1456,7 +1462,7 @@ impl ParallelExecutor {
                 } else {
                     None
                 }
-            });
+            };
 
             if let Some((gate, message)) = terminal_gate {
                 info!(

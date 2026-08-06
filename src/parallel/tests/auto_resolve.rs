@@ -315,6 +315,7 @@ async fn test_auto_resolve_zero_capacity_runs_analysis_but_suppresses_apply_disp
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .expect("re-analysis should not fail");
