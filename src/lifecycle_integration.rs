@@ -745,8 +745,8 @@ mod tests {
         let mut tracker = LifecycleStateTracker::default();
         let mut emitted: Vec<LifecycleState> = Vec::new();
         let publish_frames = |snapshot: &TuiLifecycleSnapshot,
-                                  tracker: &mut LifecycleStateTracker,
-                                  emitted: &mut Vec<LifecycleState>| {
+                              tracker: &mut LifecycleStateTracker,
+                              emitted: &mut Vec<LifecycleState>| {
             for _ in 0..5 {
                 let state = snapshot.lifecycle_state();
                 if tracker.should_emit(state, &snapshot.lifecycle_context("/repo")) {

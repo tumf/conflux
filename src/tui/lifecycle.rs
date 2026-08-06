@@ -353,11 +353,7 @@ mod tests {
                 &["blocked", "stalled"],
                 LifecycleState::Working,
             ),
-            (
-                AppExecutionMode::Select,
-                &["blocked"],
-                LifecycleState::Idle,
-            ),
+            (AppExecutionMode::Select, &["blocked"], LifecycleState::Idle),
             (
                 AppExecutionMode::Stopped,
                 &["stalled"],
@@ -458,8 +454,8 @@ mod tests {
         let mut emitted = Vec::new();
 
         let publish_frames = |app: &AppState,
-                                  tracker: &mut LifecycleStateTracker,
-                                  emitted: &mut Vec<LifecycleState>| {
+                              tracker: &mut LifecycleStateTracker,
+                              emitted: &mut Vec<LifecycleState>| {
             for _ in 0..5 {
                 let snapshot = TuiLifecycleSnapshot::from_app(app);
                 let state = snapshot.lifecycle_state();
