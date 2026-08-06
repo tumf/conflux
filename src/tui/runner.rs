@@ -107,6 +107,12 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         | ExecutionEvent::ChangeStopped { .. }
         | ExecutionEvent::ChangesRefreshed { .. } => true,
 
+        // A process-level stop is a reducer-owned run boundary: it returns every
+        // interrupted row to `not queued` and guards it against late lifecycle
+        // events. The TUI reads that one transition instead of maintaining a
+        // second string-matching reset that a new status variant could miss.
+        ExecutionEvent::Stopped => true,
+
         // The reducer holds the ephemeral commit subphase, so the TUI must
         // re-read it to switch a row's rendered operation between apply and
         // commit. It never changes the canonical `applying` display status.
@@ -140,7 +146,6 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         | ExecutionEvent::ParallelStartRejected { .. }
         | ExecutionEvent::Log(_)
         | ExecutionEvent::Stopping
-        | ExecutionEvent::Stopped
         | ExecutionEvent::AllCompleted
         | ExecutionEvent::Error { .. }
         | ExecutionEvent::WorktreesRefreshed { .. }
@@ -1224,6 +1229,81 @@ mod tests {
         );
     }
 
+    /// The exact observed force-stop order must leave `accepting` behind.
+    ///
+    /// `AcceptanceStarted` → authoritative `Stopped` dispatch → reducer-cache
+    /// synchronization → local stopped handling → a later `ChangesRefreshed`.
+    /// Before the reducer owned the stop, step three re-read an untouched
+    /// `accepting`, and step five could restore it even after the agent process
+    /// and the scheduler had already stopped.
+    #[tokio::test]
+    async fn stopped_reducer_sync_prevents_accepting_resurrection() {
+        use crate::events::EventSink;
+        use crate::orchestration::state::OrchestratorState;
+        use crate::tui::types::AppExecutionMode;
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let sinks: Vec<Arc<dyn EventSink>> = Vec::new();
+        let mut app = AppState::new(vec![sample_change()]);
+        app.set_shared_state(shared_state.clone());
+        app.execution_mode = AppExecutionMode::Running;
+        // The operator marked this change for execution; a stop must not clear
+        // the mark, because F5 resume is what converts it back into intent.
+        app.changes[0].selected = true;
+
+        let accepting = ExecutionEvent::AcceptanceStarted {
+            change_id: "change-a".to_string(),
+            command: "accept".to_string(),
+        };
+        crate::events::dispatch_event(&shared_state, &sinks, accepting.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &accepting).await;
+        assert_eq!(app.changes[0].display_status_cache, "accepting");
+
+        let stopped = ExecutionEvent::Stopped;
+        crate::events::dispatch_event(&shared_state, &sinks, stopped.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &stopped).await;
+        app.handle_orchestrator_event(stopped);
+
+        assert_eq!(
+            app.changes[0].display_status_cache, "not queued",
+            "the reducer-derived stop did not reach the TUI row"
+        );
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
+
+        // The refresh scan still sees the workspace the stopped run left behind.
+        let refresh = ExecutionEvent::ChangesRefreshed {
+            changes: vec![sample_change()],
+            rejected_changes: Vec::new(),
+            // Committed and clean, so the row stays parallel-eligible and the
+            // separate ineligibility cleanup cannot be what clears its mark.
+            committed_change_ids: HashSet::from(["change-a".to_string()]),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::from(["change-a".to_string()]),
+            worktree_paths: HashMap::<String, PathBuf>::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::from(["change-a".to_string()]),
+        };
+        crate::events::dispatch_event(&shared_state, &sinks, refresh.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &refresh).await;
+        app.handle_orchestrator_event(refresh);
+
+        assert_eq!(
+            app.changes[0].display_status_cache, "not queued",
+            "a later refresh restored an interrupted status after the run stopped"
+        );
+        assert_eq!(
+            shared_state.read().await.display_status("change-a"),
+            "not queued"
+        );
+        assert!(
+            app.changes[0].selected,
+            "the execution mark must survive so the row stays resumable"
+        );
+    }
+
     #[test]
     fn tui_reducer_sync_includes_running_lifecycle_display_events() {
         let reducer_visible_events = vec![
@@ -1333,6 +1413,7 @@ mod tests {
             ExecutionEvent::ChangeStopped {
                 change_id: "change-a".to_string(),
             },
+            ExecutionEvent::Stopped,
             empty_changes_refreshed_event(),
         ];
 
