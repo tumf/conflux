@@ -79,6 +79,8 @@ struct Wired {
     service: Arc<OperatorCommandService>,
     /// The same run-lifecycle service the TUI command handlers drive.
     run_control: Arc<RunControlService>,
+    /// The admission authority the shared transaction validates against.
+    core_mode: Arc<crate::orchestration::operator_coordinator::CoreMode>,
 }
 
 impl Wired {
@@ -127,12 +129,12 @@ impl Wired {
             Arc::new(ResolveReservations::new()),
             parallel.clone(),
         ));
-        let projection = web_state.remote_control().projection();
-        let executor = SharedServiceExecutor::new(
-            service.clone(),
+        let core_mode = Arc::new(crate::orchestration::operator_coordinator::CoreMode::new());
+        let (executor, _application) = crate::web::remote_control_api::executor::wired_for_test(
+            reducer.clone(),
             run_control.clone(),
             web_state.clone(),
-            projection,
+            core_mode.clone(),
         );
 
         Self {
@@ -144,6 +146,7 @@ impl Wired {
             executor,
             service,
             run_control,
+            core_mode,
         }
     }
 
@@ -164,6 +167,11 @@ impl Wired {
             .apply_execution_event(&changes_refreshed(changes.clone(), committed, uncommitted))
             .await;
         self.web_state.update_with_mode(&changes, app_mode).await;
+        // Command admission validates against Core, not against the published
+        // snapshot, so an arrangement that moved only the snapshot would be
+        // describing a process that cannot exist.
+        self.core_mode
+            .set(crate::orchestration::operator_command::OperatorMode::from_app_mode(app_mode));
 
         // The same shared classification the refresh loop uses, so the store's
         // reason and the projected per-change reason cannot disagree.

@@ -437,6 +437,57 @@ pub struct WebState {
     /// sequence, a doubled revision, and a doubled retained log. Remembering the
     /// identity makes that repeat a no-op instead.
     projected_dispatches: Mutex<RecentDispatchIds>,
+    /// The projection revision each recent dispatch produced.
+    ///
+    /// A `std::sync::Mutex` rather than the async one every other field uses,
+    /// because [`crate::events::OutcomeRevisions`] is a synchronous lookup: a
+    /// coordinator asking "which revision did *my* dispatch produce" must not
+    /// have to await anything that could reorder it against another command.
+    dispatch_revisions: std::sync::Mutex<DispatchRevisions>,
+}
+
+/// Bounded map from dispatch identity to the revision that dispatch produced.
+///
+/// Bounded for the same reason [`RecentDispatchIds`] is: identities are
+/// unbounded and the process is long-lived. The window only has to outlive the
+/// gap between a command dispatching its outcome and settling its record, which
+/// is a few statements.
+#[derive(Default)]
+struct DispatchRevisions {
+    order: std::collections::VecDeque<u64>,
+    revisions: std::collections::HashMap<u64, u64>,
+}
+
+impl DispatchRevisions {
+    const CAPACITY: usize = 256;
+
+    fn record(&mut self, dispatch_id: u64, revision: u64) {
+        if self.revisions.insert(dispatch_id, revision).is_none() {
+            self.order.push_back(dispatch_id);
+        }
+        while self.order.len() > Self::CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.revisions.remove(&evicted);
+            }
+        }
+    }
+
+    fn get(&self, dispatch_id: u64) -> Option<u64> {
+        self.revisions.get(&dispatch_id).copied()
+    }
+}
+
+impl crate::events::OutcomeRevisions for WebState {
+    fn revision_for_dispatch(&self, dispatch_id: u64) -> Option<u64> {
+        self.dispatch_revisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(dispatch_id)
+    }
+
+    fn current_revision(&self) -> u64 {
+        self.remote_control.projection().revision()
+    }
 }
 
 /// Bounded set of recently projected dispatch identities.
@@ -482,6 +533,7 @@ impl WebState {
             run_boundary: tokio::sync::RwLock::new(None),
             operator_facts: tokio::sync::RwLock::new(OperatorFactsStore::new()),
             projected_dispatches: Mutex::new(RecentDispatchIds::default()),
+            dispatch_revisions: std::sync::Mutex::new(DispatchRevisions::default()),
         }
     }
 
@@ -1126,6 +1178,36 @@ impl WebState {
                     state.app_mode = "error".to_string();
                 }
 
+                // One accepted operator command's decision facts. The reducer
+                // transitions this command implied were already applied by the
+                // shared services; what is projected here is the process-level
+                // state no reducer owns — admission mode and resolver ownership
+                // — so the snapshot a client reads at `result_revision` really
+                // contains the command's synchronous effect.
+                ExecutionEvent::OperatorCommandApplied { effect } => {
+                    use crate::events::OperatorCommandEffect as Effect;
+                    match effect {
+                        Effect::RunDispatched { .. } | Effect::StopCancelled => {
+                            state.app_mode = "running".to_string();
+                        }
+                        Effect::ForceStopAwaitingBoundary { .. } => {
+                            state.app_mode = "stopping".to_string();
+                        }
+                        Effect::ResolveReserved { active, .. } => {
+                            if *active {
+                                state.is_resolving = true;
+                                state.app_mode = "running".to_string();
+                            }
+                        }
+                        // Orthogonal to the run lifecycle: the reducer-derived
+                        // statuses re-read below carry the queue delta, and the
+                        // mark delta is read from the shared store when the
+                        // snapshot is built.
+                        Effect::MarkDelta { .. } | Effect::QueueDelta { .. } => {}
+                    }
+                    updated = true;
+                }
+
                 _ => {}
             }
 
@@ -1155,6 +1237,15 @@ impl WebState {
         // against is the one this event just produced.
         self.project_execution_event(event, dispatch.ownership, dispatch.state)
             .await;
+
+        // Bind the revision this dispatch produced to its identity. A command
+        // coordinator settles its record from *this* value rather than from a
+        // later read of `state_revision`, which is what stops unrelated
+        // scheduler progress from becoming a command's `result_revision`.
+        self.dispatch_revisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(dispatch.id, self.remote_control.projection().revision());
     }
 
     /// Update the process-local operator facts from one execution event.

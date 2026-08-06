@@ -3,6 +3,7 @@
 //! Split by concern so a failure names the property that broke rather than just
 //! "the API". Shared fixtures live here.
 
+mod accepted_command_tests;
 mod auth_tests;
 mod command_tests;
 mod compatibility_tests;

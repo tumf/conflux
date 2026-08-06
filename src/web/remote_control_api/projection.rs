@@ -342,7 +342,41 @@ impl Projection {
             IdempotencyLookup::Mismatch => return Admission::IdempotencyMismatch,
             IdempotencyLookup::Unknown => {}
         }
+        self.reserve_admitted(&mut inner, request, &identity, correlation_id, now)
+    }
 
+    /// Resolve an already-known idempotency key without reserving anything.
+    ///
+    /// The fast path in front of the application gate: an exact replay must
+    /// return the original record even while another command holds the gate, and
+    /// a mismatched key must be refused without waiting for one. A *new* key
+    /// resolves to `None` here and is admitted under the gate instead, which is
+    /// what stops two new commands from consuming one revision.
+    pub fn resolve_replay(
+        &self,
+        request: &CommandRequest,
+        now: DateTime<Utc>,
+    ) -> Option<Admission> {
+        let identity = request.identity();
+        let mut inner = self.lock();
+        match inner
+            .registry
+            .lookup(&request.idempotency_key, &identity, now)
+        {
+            IdempotencyLookup::Replay(record) => Some(Admission::Replay(record)),
+            IdempotencyLookup::Mismatch => Some(Admission::IdempotencyMismatch),
+            IdempotencyLookup::Unknown => None,
+        }
+    }
+
+    fn reserve_admitted(
+        &self,
+        inner: &mut MutexGuard<'_, Inner>,
+        request: &CommandRequest,
+        identity: &super::dto::CommandIdentity,
+        correlation_id: &str,
+        now: DateTime<Utc>,
+    ) -> Admission {
         if request.expected_revision != inner.state_revision {
             return Admission::Stale(inner.state_revision);
         }
@@ -362,25 +396,43 @@ impl Projection {
             error_code: None,
         };
 
-        match inner
-            .registry
-            .reserve(&request.idempotency_key, identity, record.clone(), now)
-        {
+        match inner.registry.reserve(
+            &request.idempotency_key,
+            identity.clone(),
+            record.clone(),
+            now,
+        ) {
             Ok(()) => Admission::Admitted(Box::new(record)),
             Err(ReserveError::Capacity) => Admission::Capacity,
         }
     }
 
-    /// Settle a reserved command record with the revision observed afterwards.
+    /// Settle a reserved command record at an explicitly supplied revision.
+    ///
+    /// The revision is a parameter rather than a read of `state_revision`
+    /// precisely because those two are not the same fact. `state_revision` is
+    /// whatever the process has reached by now, including progress from
+    /// unrelated commands and from scheduler activity this command merely
+    /// enabled; `result_revision` must identify the one snapshot containing this
+    /// command's own synchronous decision fields.
+    ///
+    /// `None` means "this command dispatched no outcome", which settles at the
+    /// unchanged revision it was admitted against.
     pub fn complete_command(
         &self,
         command_id: &str,
         state: CommandState,
         detail: Option<String>,
         error_code: Option<super::dto::ErrorCode>,
+        result_revision: Option<u64>,
     ) -> Option<CommandRecord> {
         let mut inner = self.lock();
-        let result_revision = inner.state_revision;
+        let admitted = inner
+            .registry
+            .get(command_id)
+            .map(|record| record.expected_revision);
+        let result_revision =
+            result_revision.unwrap_or_else(|| admitted.unwrap_or(inner.state_revision));
         inner.registry.complete(
             command_id,
             CommandOutcome {
@@ -1048,6 +1100,15 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
             json!({ "hook_type": detail(hook_type), "detail": detail(error) }),
         ),
 
+        // Accepted operator command decision facts. Published as one event so a
+        // controller reads the accepted mode, marks, queue intent, and resolver
+        // ownership at the same revision the command's record settles at.
+        E::OperatorCommandApplied { effect } => (
+            "operator_command_applied",
+            effect.change_id().map(str::to_string),
+            describe_operator_effect(effect),
+        ),
+
         // Single-change stop lane.
         E::ChangeDequeued { change_id } => ("change_dequeued", Some(change_id.clone()), json!({})),
         E::ChangeStopped { change_id } => ("change_stopped", Some(change_id.clone()), json!({})),
@@ -1140,6 +1201,51 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
             json!({ "branch": detail(branch_name), "detail": detail(error) }),
         ),
     }
+}
+
+/// Publish the decision facts one accepted operator command produced.
+///
+/// The `effect` token is the stable branch key; the remaining members are the
+/// facts a controller would otherwise have to re-derive by diffing snapshots.
+fn describe_operator_effect(
+    effect: &crate::events::OperatorCommandEffect,
+) -> serde_json::Value {
+    use crate::events::OperatorCommandEffect as Effect;
+
+    let mut payload = json!({ "effect": effect.as_str() });
+    let object = payload
+        .as_object_mut()
+        .expect("a json object literal is an object");
+    match effect {
+        Effect::RunDispatched {
+            change_ids,
+            explicit_retry,
+        } => {
+            object.insert("change_ids".to_string(), json!(change_ids));
+            object.insert("explicit_retry".to_string(), json!(explicit_retry));
+        }
+        Effect::StopCancelled => {}
+        Effect::ForceStopAwaitingBoundary { force_stop } => {
+            object.insert("force_stop".to_string(), json!(force_stop));
+            object.insert("awaiting_safe_boundary".to_string(), json!(true));
+        }
+        Effect::MarkDelta {
+            change_ids,
+            marked,
+        } => {
+            object.insert("change_ids".to_string(), json!(change_ids));
+            object.insert("marked".to_string(), json!(marked));
+        }
+        Effect::QueueDelta { change_id, queued } => {
+            object.insert("change_id".to_string(), json!(change_id));
+            object.insert("queued".to_string(), json!(queued));
+        }
+        Effect::ResolveReserved { change_id, active } => {
+            object.insert("change_id".to_string(), json!(change_id));
+            object.insert("active".to_string(), json!(active));
+        }
+    }
+    payload
 }
 
 fn rejection_outcome_name(outcome: crate::events::RejectionOutcome) -> &'static str {

@@ -26,7 +26,7 @@ use crate::orchestration::operator_command::ParallelEligibility;
 use crate::orchestration::run_control::testing::SchedulerCall;
 use crate::tui::types::AppExecutionMode;
 use crate::web::remote_control_api::dto::{CommandSpec, ErrorCode};
-use crate::web::remote_control_api::executor::{RemoteControlExecutor, SharedServiceExecutor};
+use crate::web::remote_control_api::executor::RemoteControlExecutor;
 use crate::web::state::WebState;
 
 /// The two changes every row is arranged over.
@@ -53,6 +53,8 @@ struct Effects {
     queued_resolves: Vec<String>,
     /// The authoritative marked target set.
     marks: Vec<String>,
+    /// The one process lifecycle mode both frontends project.
+    mode: crate::orchestration::operator_command::OperatorMode,
 }
 
 async fn effects(harness: &AdapterHarness) -> Effects {
@@ -69,6 +71,7 @@ async fn effects(harness: &AdapterHarness) -> Effects {
         active_resolver: harness.resolves.active(),
         queued_resolves: harness.resolves.waiting(),
         marks: harness.marks.marked_ids(),
+        mode: harness.core_mode.get(),
     }
 }
 
@@ -119,6 +122,13 @@ enum Setup {
     MergeWaitAlreadyReserved,
     /// Both changes are marked and queued; `c2` is not parallel-eligible.
     MarkedWithIneligible,
+    /// A live scheduler with in-flight agent execution and pending cleanup.
+    ///
+    /// The force-stop class that must *not* publish a terminal stop yet: the
+    /// scheduler owns the cancellation-safe boundary.
+    LiveSchedulerWithInFlightExecution,
+    /// `c1` is queued in a live run, so a dequeue has something to cancel.
+    QueuedInLiveRun,
 }
 
 async fn arrange(harness: &AdapterHarness, setup: Setup) {
@@ -159,6 +169,24 @@ async fn arrange(harness: &AdapterHarness, setup: Setup) {
                 .resolve_merge("c1")
                 .await
                 .expect("the first resolve of a merge-wait change is accepted");
+        }
+        Setup::LiveSchedulerWithInFlightExecution => {
+            use crate::tui::stop_classification::{ExecutionEvidence, ShutdownWorkEvidence};
+            harness.scheduler.set_running(true);
+            harness
+                .scheduler
+                .set_activity(crate::tui::stop_classification::StopActivitySnapshot {
+                    execution_handles: ExecutionEvidence::Known { registered: 1 },
+                    reducer_agent_execution_active: true,
+                    shutdown_work: ShutdownWorkEvidence::Known { pending: true },
+                });
+        }
+        Setup::QueuedInLiveRun => {
+            harness.scheduler.set_running(true);
+            let mut guard = harness.state.write().await;
+            guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                "c1".to_string(),
+            ));
         }
         Setup::MarkedWithIneligible => {
             mark_all();
@@ -232,7 +260,16 @@ async fn through_tui(
     app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
     app.warning_message = None;
 
+    let is_two_phase = matches!(command, TuiCommand::DequeueChange(_));
     harness.run(&mut app, command).await;
+    if is_two_phase {
+        // Stop-and-dequeue deliberately runs off the ordered submission queue so
+        // a stuck termination cannot hold later keypresses; joining it here is
+        // what the runner's next frames would do.
+        harness
+            .await_feedback(&mut app, std::time::Duration::from_secs(5))
+            .await;
+    }
 
     (effects(&harness).await, app.warning_message.clone())
 }
@@ -261,12 +298,17 @@ async fn through_v2(
         .await;
     web_state.sync_remote_control_projection().await;
 
-    let executor = SharedServiceExecutor::new(
-        harness.run_control.operator(),
+    // Wired the way production wires it: the remote adapter submits typed intent
+    // to a coordinator over the *same* reducer, services, and scheduler the TUI
+    // harness drives, so the two sides of this comparison differ only in which
+    // adapter translated the operator's intent.
+    let (executor, _application) = crate::web::remote_control_api::executor::wired_for_test(
+        harness.state.clone(),
         harness.run_control.clone(),
         web_state.clone(),
-        web_state.remote_control().projection(),
+        harness.core_mode.clone(),
     );
+    harness.core_mode.set(mode.operator_mode());
 
     let (settlement, detail) = match executor.execute(&command).await {
         Ok(summary) if summary.changed => (Settlement::Changed, summary.detail),
@@ -455,6 +497,53 @@ fn rows() -> Vec<Row> {
             expect: Settlement::NoOp,
             notice: None,
         },
+        // ── force stop safe-boundary classes ────────────────────────────────
+        Row {
+            name: "force stop with in-flight execution waits for the safe boundary",
+            setup: Setup::LiveSchedulerWithInFlightExecution,
+            mode: AppExecutionMode::Running,
+            tui: TuiCommand::ForceStop,
+            v2: CommandSpec::ForceStop,
+            expect: Settlement::Changed,
+            notice: None,
+        },
+        // ── queue intent ────────────────────────────────────────────────────
+        Row {
+            name: "queue add in a live run commits the same intent on both adapters",
+            setup: Setup::LiveScheduler,
+            mode: AppExecutionMode::Running,
+            tui: TuiCommand::AddToQueue("c1".to_string()),
+            v2: CommandSpec::SetQueueIntent {
+                change_id: "c1".to_string(),
+                queued: true,
+            },
+            expect: Settlement::Changed,
+            notice: None,
+        },
+        Row {
+            name: "queue remove takes the same intent back out on both adapters",
+            setup: Setup::QueuedInLiveRun,
+            mode: AppExecutionMode::Running,
+            tui: TuiCommand::RemoveFromQueue("c1".to_string()),
+            v2: CommandSpec::SetQueueIntent {
+                change_id: "c1".to_string(),
+                queued: false,
+            },
+            expect: Settlement::Changed,
+            notice: None,
+        },
+        // ── stop and dequeue ────────────────────────────────────────────────
+        Row {
+            name: "stop-and-dequeue clears exactly its target on both adapters",
+            setup: Setup::QueuedInLiveRun,
+            mode: AppExecutionMode::Running,
+            tui: TuiCommand::DequeueChange("c1".to_string()),
+            v2: CommandSpec::StopAndDequeue {
+                change_id: "c1".to_string(),
+            },
+            expect: Settlement::Changed,
+            notice: None,
+        },
         Row {
             name: "resolve of a stale target is refused without a reservation",
             setup: Setup::Bare,
@@ -623,12 +712,13 @@ async fn bulk_through_v2(
         .await;
     web_state.sync_remote_control_projection().await;
 
-    let executor = SharedServiceExecutor::new(
-        harness.run_control.operator(),
+    let (executor, _application) = crate::web::remote_control_api::executor::wired_for_test(
+        harness.state.clone(),
         harness.run_control.clone(),
         web_state.clone(),
-        web_state.remote_control().projection(),
+        harness.core_mode.clone(),
     );
+    harness.core_mode.set(mode.operator_mode());
     let settlement = match executor
         .execute(&CommandSpec::SetAllExecutionMarks {})
         .await

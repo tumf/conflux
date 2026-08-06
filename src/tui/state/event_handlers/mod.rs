@@ -5,6 +5,7 @@ mod completion;
 mod errors;
 #[cfg(test)]
 mod modal_tests;
+mod operator_commands;
 mod output;
 mod processing;
 mod refresh;
@@ -190,6 +191,10 @@ impl AppState {
                 self.handle_parallel_start_rejected(change_ids, reason)
             }
             OrchestratorEvent::Error { message } => self.handle_error(message),
+            OrchestratorEvent::OperatorCommandApplied { effect } => {
+                self.handle_operator_command_applied(effect)
+            }
+            OrchestratorEvent::Stopping => self.handle_stopping(),
             _ => {}
         }
     }

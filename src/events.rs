@@ -409,10 +409,103 @@ impl CommitOutputStream {
     }
 }
 
+/// A process-level decision fact one accepted operator command produced.
+///
+/// This vocabulary exists only for accepted effects that no *existing* execution
+/// event already describes exactly. Graceful stop is still `Stopping`, a settled
+/// force stop is still `Stopped`, and a successful target dequeue is still
+/// `ChangeDequeued`; adding a second spelling for any of those would give the
+/// same fact two authorities.
+///
+/// It deliberately carries no change lifecycle: the reducer owns that, and
+/// [`crate::orchestration::state::OrchestratorState::apply_execution_event`]
+/// applies nothing for this event. What travels here is the process-level
+/// decision — mode, marks, queue intent, resolver ownership — that a frontend
+/// would otherwise have to re-derive from its own cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorCommandEffect {
+    /// A run was dispatched over exactly these targets.
+    RunDispatched {
+        /// Accepted targets, in request order.
+        change_ids: Vec<String>,
+        /// True when the run consumes reconciled holds instead of rerunning apply.
+        explicit_retry: bool,
+    },
+    /// A pending graceful stop was withdrawn.
+    StopCancelled,
+    /// Force stop was accepted and the scheduler owns the terminal stop.
+    ///
+    /// The settled case emits `Stopped` instead; this variant is only the
+    /// interval during which in-flight work must still reach its
+    /// cancellation-safe boundary.
+    ForceStopAwaitingBoundary {
+        /// True when the activity snapshot justified reporting a *force* stop.
+        force_stop: bool,
+    },
+    /// Execution marks changed for exactly these IDs, all to `marked`.
+    MarkDelta {
+        /// Only the IDs this command actually wrote.
+        change_ids: Vec<String>,
+        /// The value every named ID now carries.
+        marked: bool,
+    },
+    /// Queue intent changed for one target.
+    QueueDelta {
+        /// Target change.
+        change_id: String,
+        /// True when the target is now queued.
+        queued: bool,
+    },
+    /// A resolve reservation was taken.
+    ResolveReserved {
+        /// Target change.
+        change_id: String,
+        /// True when the change became the single active resolver.
+        active: bool,
+    },
+}
+
+impl OperatorCommandEffect {
+    /// The single change this effect addresses, when it addresses one.
+    ///
+    /// A multi-target effect is deliberately process-addressed: naming one of
+    /// several targets would make the remote stream's `change_id` slot describe
+    /// an arbitrary member of the set.
+    pub fn change_id(&self) -> Option<&str> {
+        match self {
+            Self::QueueDelta { change_id, .. } | Self::ResolveReserved { change_id, .. } => {
+                Some(change_id)
+            }
+            Self::MarkDelta { change_ids, .. } if change_ids.len() == 1 => {
+                Some(change_ids[0].as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Stable machine-readable label for logs and the remote payload.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RunDispatched { .. } => "run_dispatched",
+            Self::StopCancelled => "stop_cancelled",
+            Self::ForceStopAwaitingBoundary { .. } => "force_stop_awaiting_boundary",
+            Self::MarkDelta { .. } => "mark_delta",
+            Self::QueueDelta { .. } => "queue_delta",
+            Self::ResolveReserved { .. } => "resolve_reserved",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
     // Lifecycle events
-    /// Processing started for a change
+    /// Processing started for a change.
+    ///
+    /// Consumed, not synthesized: a frontend must never fabricate this to signal
+    /// that a command was accepted, because it would set a current change and
+    /// activity before the scheduler actually started that target. Core mode and
+    /// every projection still classify it, so a real producer needs no new wiring.
+    #[allow(dead_code)]
     ProcessingStarted(String),
     /// Error occurred for a change
     ProcessingError { id: String, error: String },
@@ -766,6 +859,15 @@ pub enum ExecutionEvent {
     BranchMergeCompleted { branch_name: String },
     /// Branch merge failed (TUI worktree view)
     BranchMergeFailed { branch_name: String, error: String },
+    /// One accepted operator command's process-level decision facts.
+    ///
+    /// Dispatched inside the same critical section that commits the command's
+    /// staged reducer, mark, queue, resolve, and stop effects, which is what
+    /// makes the accepted mode and the accepted decision state one revision.
+    OperatorCommandApplied {
+        /// What the command actually decided.
+        effect: OperatorCommandEffect,
+    },
     /// Change force-stopped and dequeued successfully (single-change stop-and-dequeue)
     ChangeDequeued { change_id: String },
     /// Legacy single-change stop event (kept for compatibility)
@@ -863,6 +965,7 @@ pub fn classify_event(event: &ExecutionEvent) -> (&'static str, EventOwnership) 
         E::Error { .. } => ("Error", State),
         E::ChangesRefreshed { .. } => ("ChangesRefreshed", State),
         E::WorktreesRefreshed { .. } => ("WorktreesRefreshed", State),
+        E::OperatorCommandApplied { .. } => ("OperatorCommandApplied", State),
         E::ChangeDequeued { .. } => ("ChangeDequeued", State),
         E::ChangeStopped { .. } => ("ChangeStopped", State),
         E::ChangeStopFailed { .. } => ("ChangeStopFailed", State),
@@ -1021,6 +1124,24 @@ pub async fn dispatch_event(
     dispatch_event_with_marks(state, sinks, event, None).await;
 }
 
+/// What one authoritative dispatch produced, for a caller that must bind a
+/// command record to it.
+///
+/// The identity is the join key: a frontend that projects the dispatch records
+/// the revision it allocated under the same identity, so the coordinator can ask
+/// for *that* revision instead of sampling whatever the global state happens to
+/// be afterwards.
+pub trait OutcomeRevisions: Send + Sync {
+    /// The projection revision the dispatch with this identity produced.
+    ///
+    /// `None` when the dispatch was never projected (a frontend that skipped it,
+    /// or a window that has already been evicted).
+    fn revision_for_dispatch(&self, dispatch_id: u64) -> Option<u64>;
+
+    /// The current projection revision.
+    fn current_revision(&self) -> u64;
+}
+
 /// The authoritative dispatch owner, with the shared execution-mark store bound.
 ///
 /// The ordering is the whole point, and it is one operation under the shared
@@ -1039,12 +1160,32 @@ pub async fn dispatch_event(
 ///
 /// `reconciler` is `None` for dispatchers with no operator mark store — CLI runs
 /// and tests. That is an explicit no-mark binding, not a second store.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn dispatch_event_with_marks(
     state: &tokio::sync::RwLock<OrchestratorState>,
     sinks: &[std::sync::Arc<dyn EventSink>],
     event: ExecutionEvent,
     reconciler: Option<&crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
-) {
+) -> u64 {
+    dispatch_event_fully(state, sinks, event, reconciler, None).await
+}
+
+/// The authoritative dispatch owner, with the process lifecycle mode bound.
+///
+/// Returns the dispatch identity so a caller that must bind a command record to
+/// this exact dispatch can look its revision up through [`OutcomeRevisions`]
+/// instead of reading global state back afterwards.
+///
+/// `mode` is applied *before* the sinks run: every frontend's projection of a
+/// lifecycle event and the admission mode the next command is validated against
+/// are then the same transition, rather than a frontend cache racing the core.
+pub async fn dispatch_event_fully(
+    state: &tokio::sync::RwLock<OrchestratorState>,
+    sinks: &[std::sync::Arc<dyn EventSink>],
+    event: ExecutionEvent,
+    reconciler: Option<&crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
+    mode: Option<&crate::orchestration::operator_coordinator::CoreMode>,
+) -> u64 {
     let ownership = event_ownership(&event);
     let id = next_dispatch_id();
 
@@ -1054,6 +1195,13 @@ pub async fn dispatch_event_with_marks(
         Some(reconciler) => Some(reconciler.lock_mutations().await),
         None => None,
     };
+
+    // The core lifecycle transition belongs to the same critical section as the
+    // reducer transition: a frontend must never be able to observe the new
+    // reducer state alongside the old admission mode.
+    if let Some(mode) = mode {
+        mode.apply_event(&event);
+    }
 
     let state_snapshot = {
         let mut guard = state.write().await;
@@ -1088,19 +1236,32 @@ pub async fn dispatch_event_with_marks(
     for sink in sinks {
         sink.on_dispatch(&dispatch).await;
     }
+
+    id
 }
 
-/// The dispatch owner for one orchestration boundary run.
+/// The process-lifetime authoritative dispatch owner.
 ///
-/// Bundles the reducer state and the frontend sinks so every producer in a run
-/// emits through the same path, including producers that can only speak
+/// Bundles the reducer state and the frontend sinks so every producer emits
+/// through the same path, including producers that can only speak
 /// `mpsc::Sender` (see [`EventDispatcher::bridge`]).
+///
+/// There is exactly one of these per command-capable process. Runner-local
+/// producers, accepted operator-command outcomes, and every orchestration run
+/// share it, which is what makes "one internal event, one reducer transition,
+/// one core mode transition, one delivery per frontend" hold no matter which
+/// producer raised the event.
 pub struct EventDispatcher {
     state: std::sync::Arc<tokio::sync::RwLock<OrchestratorState>>,
     sinks: Vec<std::sync::Arc<dyn EventSink>>,
     /// The shared execution-mark store this boundary reconciles, when the
     /// process has one. `None` is an explicit no-mark binding.
     marks: Option<crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
+    /// The process lifecycle mode authoritative lifecycle events transition.
+    ///
+    /// `None` for a dispatcher with no command-capable core — a headless run,
+    /// or a test that only observes the reducer.
+    mode: Option<std::sync::Arc<crate::orchestration::operator_coordinator::CoreMode>>,
 }
 
 impl EventDispatcher {
@@ -1113,6 +1274,7 @@ impl EventDispatcher {
             state,
             sinks,
             marks: None,
+            mode: None,
         }
     }
 
@@ -1129,9 +1291,25 @@ impl EventDispatcher {
         self
     }
 
-    /// Apply one event and fan it out.
-    pub async fn dispatch(&self, event: ExecutionEvent) {
-        dispatch_event_with_marks(&self.state, &self.sinks, event, self.marks.as_ref()).await;
+    /// Bind the process lifecycle mode this boundary transitions.
+    pub fn with_core_mode(
+        mut self,
+        mode: Option<std::sync::Arc<crate::orchestration::operator_coordinator::CoreMode>>,
+    ) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Apply one event and fan it out, reporting its dispatch identity.
+    pub async fn dispatch(&self, event: ExecutionEvent) -> u64 {
+        dispatch_event_fully(
+            &self.state,
+            &self.sinks,
+            event,
+            self.marks.as_ref(),
+            self.mode.as_deref(),
+        )
+        .await
     }
 
     /// A channel whose receiver forwards into this dispatch owner.

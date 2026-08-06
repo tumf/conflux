@@ -73,6 +73,24 @@ impl AppExecutionMode {
         }
     }
 
+    /// Adopt the Core process lifecycle mode.
+    ///
+    /// The exact inverse of [`Self::operator_mode`]. It is total for the same
+    /// reason: this frontend's mode is a *projection* of the Core value, so
+    /// there is no Core state it could refuse to render.
+    pub fn from_operator_mode(
+        mode: crate::orchestration::operator_command::OperatorMode,
+    ) -> Self {
+        use crate::orchestration::operator_command::OperatorMode;
+        match mode {
+            OperatorMode::Select => AppExecutionMode::Select,
+            OperatorMode::Running => AppExecutionMode::Running,
+            OperatorMode::Stopping => AppExecutionMode::Stopping,
+            OperatorMode::Stopped => AppExecutionMode::Stopped,
+            OperatorMode::Error => AppExecutionMode::Error,
+        }
+    }
+
     /// Canonical `app_mode` token shared with the Web/API surface.
     ///
     /// Production reads this vocabulary in the other direction — the monitoring

@@ -6,13 +6,29 @@
 //! 1. typed schema validation — an unknown command type dies here, before any
 //!    service call exists;
 //! 2. idempotency lookup — an exact replay resolves even after the revision
-//!    moved on, which is what makes a client-side retry safe;
-//! 3. revision validation — only for a *new* key, so a stale command cannot
+//!    moved on, and without waiting for the gate, which is what makes a
+//!    client-side retry safe *and* non-blocking;
+//! 3. acquisition of the process-local application gate;
+//! 4. revision validation — only for a *new* key, so a stale command cannot
 //!    sneak in behind a reused key;
-//! 4. atomic reservation of both records — capacity pressure fails here, before
+//! 5. atomic reservation of both records — capacity pressure fails here, before
 //!    any effect;
-//! 5. delegation to the shared service, which revalidates lifecycle and target
-//!    immediately before it acts.
+//! 6. delegation to the shared application transaction, which revalidates
+//!    lifecycle and target immediately before it acts;
+//! 7. settlement at the exact revision that command's outcome dispatch produced.
+//!
+//! Steps 3 through 7 are one critical section, and that is the difference from
+//! the previous shape. Optimistic revisions alone were not enough: admission was
+//! atomic for the *record*, but the effect that consumes the revision landed
+//! after the lock was released, so two new commands carrying the same
+//! `expected_revision` could both pass validation and both execute. Holding the
+//! gate until the record is settled makes the second one observe the revision
+//! the first consumed, and fail stale without ever reaching a service.
+//!
+//! `stop_and_dequeue` is the one exception, and it is explicit: it holds the
+//! gate only for admission and cancellation issuance, then releases it and
+//! settles from a spawned continuation. Its confirmation wait must not
+//! monopolize operator admission, block force stop, or stall event fan-out.
 
 use std::time::Duration;
 
@@ -27,7 +43,8 @@ use super::auth::CorrelationId;
 use super::dto::{
     is_valid_correlation_id, ApiError, CommandRecord, CommandRequest, CommandState, ErrorCode,
 };
-use super::projection::Admission;
+use super::executor::{Applied, CommandFailure, ExecutionSummary, PendingCommand};
+use super::projection::{Admission, Projection};
 use super::RemoteControlState;
 
 /// How long the endpoint waits for a command to settle before answering `202`.
@@ -101,9 +118,30 @@ pub async fn submit_command(
     }
     let correlation_id = request.correlation_id.clone().unwrap_or(correlation_id);
 
-    // 2-4. Lookup, revision validation, and reservation happen atomically inside
-    //      the projection owner, so two concurrent submissions of the same key
-    //      cannot both reserve.
+    // 2. Exact replay resolves without the gate. A retry of a command that is
+    //    still executing must return the original record rather than queue
+    //    behind it, and a mismatched key must be refused without waiting at all.
+    match state.projection.resolve_replay(&request, Utc::now()) {
+        Some(Admission::Replay(record)) => return record_response(&record),
+        Some(Admission::IdempotencyMismatch) => {
+            return ApiError::new(
+                ErrorCode::IdempotencyMismatch,
+                "idempotency_key is already bound to a different command identity",
+                &correlation_id,
+            )
+            .with_revision(state.projection.revision())
+            .into_response()
+        }
+        _ => {}
+    }
+
+    // 3. From here to settlement is one critical section.
+    let gate = state.gate.hold().await;
+
+    // 4-5. Revision validation and reservation happen atomically inside the
+    //      projection owner, and now under the gate, so the revision a command
+    //      is validated against is one no other command can still be about to
+    //      consume.
     let record = match state
         .projection
         .admit(&request, &correlation_id, Utc::now())
@@ -139,36 +177,87 @@ pub async fn submit_command(
         Admission::Admitted(record) => *record,
     };
 
-    // 5. Delegate. The command runs on its own task so a long-running one (a
-    //    stop that waits for confirmed termination) reports through its record
-    //    instead of pinning the connection.
+    // 6-7. Delegate under the gate and settle at the revision the outcome
+    //      dispatch produced.
     let command_id = record.command_id.clone();
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    let executor = state.executor.clone();
     let projection = state.projection.clone();
-    let spec = request.command.clone();
-    let settle_id = command_id.clone();
-    tokio::spawn(async move {
-        let (command_state, detail, error_code) = match executor.execute(&spec).await {
-            Ok(summary) if summary.changed => (CommandState::Succeeded, summary.detail, None),
-            Ok(summary) => (CommandState::NoOp, summary.detail, None),
-            Err(failure) => (
-                CommandState::Failed,
-                Some(failure.message),
-                Some(failure.error_code),
-            ),
-        };
-        projection.complete_command(&settle_id, command_state, detail, error_code);
-        let _ = done_tx.send(());
-    });
+    // The guard is *moved* into the executor: an ordinary command holds it
+    // through settlement, while a two-phase one drops it before waiting. Keeping
+    // a copy here and re-entering the coordinator would deadlock on a lock this
+    // request already owns.
+    let settlement: Option<PendingCommand> = match state.executor.begin(&request.command, gate).await
+    {
+        // The gate travels into the spawned task, so an ordinary command is
+        // serialized through settlement while still reporting through its record
+        // rather than pinning the connection.
+        Applied::Ordinary(gate) => {
+            let executor = state.executor.clone();
+            let spec = request.command.clone();
+            Some(Box::pin(
+                async move { executor.execute_held(&spec, gate).await },
+            ))
+        }
+        // A two-phase command keeps its record Running while confirmation is
+        // pending; the executor already released the gate.
+        Applied::Pending(pending) => Some(pending),
+        // Refused before any effect: nothing to run.
+        Applied::Settled(result) => {
+            settle(&projection, &command_id, result);
+            None
+        }
+    };
 
-    let _ = tokio::time::timeout(SYNCHRONOUS_GRACE, done_rx).await;
+    if let Some(pending) = settlement {
+        let settle_id = command_id.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = pending.await;
+            settle(&projection, &settle_id, result);
+            let _ = done_tx.send(());
+        });
+        let _ = tokio::time::timeout(SYNCHRONOUS_GRACE, done_rx).await;
+    }
+
     match state.projection.command(&command_id) {
         Some(settled) => record_response(&settled),
         // The record was reserved, so this cannot normally happen; report it as
         // still running rather than inventing an outcome.
         None => record_response(&record),
     }
+}
+
+/// Settle one command record from the actual outcome of its execution.
+///
+/// `result_revision` travels with the outcome rather than being read here: a
+/// command's recorded revision must identify the snapshot containing *its*
+/// decision fields, and by the time this runs, later progress may already have
+/// advanced the projection.
+fn settle(
+    projection: &Projection,
+    command_id: &str,
+    result: Result<ExecutionSummary, CommandFailure>,
+) {
+    let (command_state, detail, error_code, revision) = match result {
+        Ok(summary) if summary.changed => (
+            CommandState::Succeeded,
+            summary.detail,
+            None,
+            summary.result_revision,
+        ),
+        Ok(summary) => (
+            CommandState::NoOp,
+            summary.detail,
+            None,
+            summary.result_revision,
+        ),
+        Err(failure) => (
+            CommandState::Failed,
+            Some(failure.message),
+            Some(failure.error_code),
+            failure.result_revision,
+        ),
+    };
+    projection.complete_command(command_id, command_state, detail, error_code, revision);
 }
 
 /// Look up a previously submitted command.

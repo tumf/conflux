@@ -184,6 +184,20 @@ impl OperatorMode {
             _ => Self::Select,
         }
     }
+
+    /// The canonical `app_mode` token for this lifecycle mode.
+    ///
+    /// The exact inverse of [`Self::from_app_mode`], so a mode projected into
+    /// the monitoring snapshot and parsed back out is the same value.
+    pub fn as_app_mode(self) -> &'static str {
+        match self {
+            Self::Select => "select",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::Error => "error",
+        }
+    }
 }
 
 /// How an execution-mark request must be routed for a mode/status pair.
@@ -1084,6 +1098,40 @@ impl TerminationWaiter {
     }
 }
 
+/// An issued cancellation whose confirmed termination has not been awaited yet.
+///
+/// Kept as a value so the wait happens *outside* whatever serialization gate
+/// admitted the command. A never-completing waiter then blocks only its own
+/// command: force stop, unrelated operator commands, event fan-out, and TUI
+/// rendering all stay live.
+#[derive(Clone, Debug)]
+pub struct PendingTermination {
+    change_id: String,
+    waiter: TerminationWaiter,
+    timeout: Duration,
+}
+
+impl PendingTermination {
+    /// The change whose termination is pending.
+    pub fn change_id(&self) -> &str {
+        &self.change_id
+    }
+
+    /// Await confirmed termination within the configured bound.
+    pub async fn confirm_termination(&self) -> OperatorResult<()> {
+        if tokio::time::timeout(self.timeout, self.waiter.wait())
+            .await
+            .is_err()
+        {
+            return Err(OperatorCommandError::TerminationTimeout {
+                change_id: self.change_id.clone(),
+                waited: self.timeout,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Runtime queue operations the service coordinates.
 #[async_trait]
 pub trait QueuePort: Send + Sync {
@@ -1579,6 +1627,30 @@ impl OperatorCommandService {
     /// cancellation, or a confirmation timeout leaves the active reducer state
     /// untouched.
     pub async fn stop_and_dequeue(&self, change_id: &str) -> OperatorResult<OperatorOutcome> {
+        let pending = self.begin_stop_and_dequeue(change_id).await?;
+        pending.confirm_termination().await?;
+        self.commit_stop_and_dequeue(change_id).await
+    }
+
+    /// The bound this service waits for confirmed task termination within.
+    pub fn cancellation_timeout(&self) -> Duration {
+        self.cancellation_timeout
+    }
+
+    /// Phase one of a stop-and-dequeue: validate and issue cancellation.
+    ///
+    /// Cancellation is an intentional runtime request, not a rollbackable
+    /// decision-state mutation: once it has been issued, a later timeout or
+    /// refusal must commit no dequeue state rather than pretend the request
+    /// never happened.
+    ///
+    /// The returned waiter is deliberately *not* awaited here. A caller holding a
+    /// serialization gate must release it before confirmation, or one slow
+    /// termination would monopolize operator admission.
+    pub async fn begin_stop_and_dequeue(
+        &self,
+        change_id: &str,
+    ) -> OperatorResult<PendingTermination> {
         let display_status = self.display_status(change_id).await;
         let was_active = is_active_status(&display_status);
 
@@ -1601,16 +1673,23 @@ impl OperatorCommandService {
             Ok(None) => TerminationWaiter::already_terminated(),
         };
 
-        if tokio::time::timeout(self.cancellation_timeout, waiter.wait())
-            .await
-            .is_err()
-        {
-            return Err(OperatorCommandError::TerminationTimeout {
-                change_id: change_id.to_string(),
-                waited: self.cancellation_timeout,
-            });
-        }
+        Ok(PendingTermination {
+            change_id: change_id.to_string(),
+            waiter,
+            timeout: self.cancellation_timeout,
+        })
+    }
 
+    /// Phase two of a stop-and-dequeue: commit after confirmed termination.
+    ///
+    /// Revalidates through the reducer rather than through the revision the
+    /// command was admitted at: unrelated commands may legitimately advance the
+    /// projection while termination is pending, but the target's own runtime
+    /// state is what decides whether a dequeue is still correct.
+    pub async fn commit_stop_and_dequeue(
+        &self,
+        change_id: &str,
+    ) -> OperatorResult<OperatorOutcome> {
         // Commit the dequeue and its mark revocation as one indivisible mutation:
         // the same guard event reconciliation takes, so the `ChangeDequeued` edge
         // this produces cannot land between the two halves.
@@ -1657,6 +1736,23 @@ impl OperatorCommandService {
 
     /// Route a retry request for one change.
     pub async fn retry_change(&self, change_id: &str) -> OperatorResult<RetryPlan> {
+        let routes = match self.plan_retry_change(change_id).await? {
+            Some(route) => vec![(change_id.to_string(), route)],
+            None => Vec::new(),
+        };
+        Ok(self.commit_retry_routes(&routes).await)
+    }
+
+    /// Classify one change's retry route without mutating anything.
+    ///
+    /// Read-only by construction, which is what lets a caller reserve every
+    /// fallible runtime capability *before* any retry effect exists: a
+    /// preparation failure then has nothing to roll back.
+    ///
+    /// `Ok(None)` is an accepted-but-empty classification — a hold whose blocker
+    /// evidence must survive rather than be consumed — and is distinct from the
+    /// typed refusal an unsupported status produces.
+    pub async fn plan_retry_change(&self, change_id: &str) -> OperatorResult<Option<RetryRoute>> {
         // Ahead of route classification, and therefore ahead of every reducer,
         // mark, queue, hook, explicit-retry, and scheduler effect a route implies.
         self.admit_past_apply_iteration_limit(change_id).await?;
@@ -1668,8 +1764,76 @@ impl OperatorCommandService {
                 display_status,
             });
         };
-        let plan = self.apply_retry_route(change_id, route).await;
-        Ok(plan)
+        Ok(self.route_is_committable(change_id, route).await.then_some(route))
+    }
+
+    /// Classify every retryable change in `change_ids`, skipping the rest.
+    ///
+    /// The bulk counterpart of [`Self::plan_retry_change`], and read-only for the
+    /// same reason.
+    pub async fn plan_retry_errors(&self, change_ids: &[String]) -> Vec<(String, RetryRoute)> {
+        // One coherent eligibility snapshot for the whole request: a boundary
+        // that closes mid-loop must not make the request partly gated.
+        let limited = self.active_apply_iteration_limited_ids().await;
+        let mut routes = Vec::new();
+        for change_id in change_ids {
+            if limited.contains(change_id) {
+                continue;
+            }
+            let display_status = self.display_status(change_id).await;
+            let blocker_kind = self.blocker_kind(change_id).await;
+            let Some(route) = classify_retry_route(&display_status, blocker_kind) else {
+                continue;
+            };
+            if self.route_is_committable(change_id, route).await {
+                routes.push((change_id.clone(), route));
+            }
+        }
+        routes
+    }
+
+    /// Whether an already-classified route may actually be consumed.
+    ///
+    /// A non-resumable acceptance hold is refused so its blocker evidence
+    /// survives and no ambiguous work is dispatched.
+    async fn route_is_committable(&self, change_id: &str, route: RetryRoute) -> bool {
+        if !matches!(route, RetryRoute::AcceptanceStall) {
+            return true;
+        }
+        let refuse = {
+            let guard = self.state.read().await;
+            guard
+                .change_runtime(change_id)
+                .is_some_and(|rt| rt.is_acceptance_stalled() && !rt.is_resumable_acceptance_stall())
+        };
+        if refuse {
+            tracing::warn!(
+                change_id = %change_id,
+                "Explicit retry refused: the acceptance stall is not resumable, so its \
+                 blocker evidence is retained"
+            );
+        }
+        !refuse
+    }
+
+    /// Commit already-classified retry routes.
+    ///
+    /// The mutating half of the split: every guard the routes had to pass has
+    /// already passed, so this only applies reducer intent, publishes the
+    /// explicit-retry edges the accepted routes imply, and restores marks.
+    pub async fn commit_retry_routes(&self, routes: &[(String, RetryRoute)]) -> RetryPlan {
+        let mut plan = RetryPlan {
+            change_ids: Vec::new(),
+            routes: Vec::new(),
+            explicit_retry: false,
+        };
+        for (change_id, route) in routes {
+            let accepted = self.apply_retry_route(change_id, *route).await;
+            plan.change_ids.extend(accepted.change_ids);
+            plan.routes.extend(accepted.routes);
+            plan.explicit_retry |= accepted.explicit_retry;
+        }
+        plan
     }
 
     /// Route a bulk retry request.
@@ -1680,59 +1844,18 @@ impl OperatorCommandService {
     /// per-change ceiling is not a reason to refuse every unrelated candidate,
     /// and a skipped target is never reported as accepted.
     pub async fn retry_errors(&self, change_ids: &[String]) -> RetryPlan {
-        let mut plan = RetryPlan {
-            change_ids: Vec::new(),
-            routes: Vec::new(),
-            explicit_retry: false,
-        };
-        // One coherent eligibility snapshot for the whole request: a boundary
-        // that closes mid-loop must not make the request partly gated.
-        let limited = self.active_apply_iteration_limited_ids().await;
-        for change_id in change_ids {
-            if limited.contains(change_id) {
-                continue;
-            }
-            let display_status = self.display_status(change_id).await;
-            let blocker_kind = self.blocker_kind(change_id).await;
-            let Some(route) = classify_retry_route(&display_status, blocker_kind) else {
-                continue;
-            };
-            let accepted = self.apply_retry_route(change_id, route).await;
-            plan.change_ids.extend(accepted.change_ids);
-            plan.routes.extend(accepted.routes);
-            plan.explicit_retry |= accepted.explicit_retry;
-        }
-        plan
+        let routes = self.plan_retry_errors(change_ids).await;
+        self.commit_retry_routes(&routes).await
     }
 
     async fn apply_retry_route(&self, change_id: &str, route: RetryRoute) -> RetryPlan {
         let command = match route {
             RetryRoute::TerminalError => ReducerCommand::RetryError(change_id.to_string()),
             // An in-memory acceptance hold resumes through the explicit-retry run
-            // path; the reducer only has to restore ordinary queue intent. A
-            // non-resumable hold is refused so its blocker evidence survives and
-            // no ambiguous work is dispatched.
-            RetryRoute::AcceptanceStall => {
-                let refuse = {
-                    let guard = self.state.read().await;
-                    guard.change_runtime(change_id).is_some_and(|rt| {
-                        rt.is_acceptance_stalled() && !rt.is_resumable_acceptance_stall()
-                    })
-                };
-                if refuse {
-                    tracing::warn!(
-                        change_id = %change_id,
-                        "Explicit retry refused: the acceptance stall is not resumable, so its \
-                         blocker evidence is retained"
-                    );
-                    return RetryPlan {
-                        change_ids: Vec::new(),
-                        routes: Vec::new(),
-                        explicit_retry: false,
-                    };
-                }
-                ReducerCommand::AddToQueue(change_id.to_string())
-            }
+            // path; the reducer only has to restore ordinary queue intent.
+            // Whether the hold may be consumed at all was already decided by
+            // [`Self::route_is_committable`] during classification.
+            RetryRoute::AcceptanceStall => ReducerCommand::AddToQueue(change_id.to_string()),
         };
         let is_error_retry = matches!(command, ReducerCommand::RetryError(_));
         // Retry restores fresh execution intent, so it is a mark mutation and

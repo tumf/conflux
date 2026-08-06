@@ -113,6 +113,13 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         // second string-matching reset that a new status variant could miss.
         ExecutionEvent::Stopped => true,
 
+        // An accepted operator command commits reducer queue intent, retry
+        // edges, and resolve intent before it publishes this event, so the row
+        // statuses it produced have to be re-read here. Not re-reading them is
+        // exactly how a remote queue or retry command used to reach `/api/v2`
+        // without ever reaching the next TUI render.
+        ExecutionEvent::OperatorCommandApplied { .. } => true,
+
         // The reducer holds the ephemeral commit subphase, so the TUI must
         // re-read it to switch a row's rendered operation between apply and
         // commit. It never changes the canonical `applying` display status.
@@ -188,7 +195,7 @@ async fn apply_pending_mark_writes(
 /// Status, blocker view, and error detail come from the same snapshot so a row's
 /// `blocked`/`stalled` word, its blocker kind, and its final diagnostic can never
 /// disagree.
-async fn sync_reducer_display_caches(
+pub(crate) async fn sync_reducer_display_caches(
     app: &mut AppState,
     shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     event: &crate::events::ExecutionEvent,
@@ -493,18 +500,6 @@ async fn run_tui_loop(
         ws.set_repo_root(repo_root.clone()).await;
     }
 
-    // The other frontends of the TUI-local producer boundary.
-    //
-    // This frontend is not in the list: the event is already in hand when this
-    // loop dispatches it, so adding a `TuiEventSink` here would only route it
-    // back into the same loop.
-    #[allow(unused_mut)]
-    let mut local_event_sinks: Vec<Arc<dyn crate::events::EventSink>> = Vec::new();
-    #[cfg(feature = "web-monitoring")]
-    if let Some(ref ws) = web_state {
-        local_event_sinks.push(Arc::new(crate::web::state::WebEventSink::new(ws.clone())));
-    }
-
     // Dynamic queue for runtime change additions
     let dynamic_queue = DynamicQueue::new();
 
@@ -515,14 +510,6 @@ async fn run_tui_loop(
     // Shared flag for graceful stop (signaling orchestrator to stop after current change)
     let graceful_stop_flag = Arc::new(AtomicBool::new(false));
 
-    // One run supervisor owns the local orchestrator task for this invocation.
-    // The TUI adapter and the `/api/v2` adapter drive it through the same
-    // run-control service, so neither can start or cancel a run the other
-    // cannot see.
-    //
-    // It gets `frontend_tx`, not `tx`: a spawned run is an orchestration
-    // boundary that dispatches its own events, so it must reach this frontend
-    // through the delivery side.
     // One reconciler for this process: the shared mark store plus the shared
     // operator mutation guard. Every production dispatch path binds *this* value,
     // so a mark revoked by an event and a mark set by a command are the same fact
@@ -532,19 +519,63 @@ async fn run_tui_loop(
         app.parallel_runtime(),
     );
 
+    // The one ephemeral process lifecycle mode. TUI `execution_mode` and Web
+    // `app_mode` are projections of it; command admission is validated against
+    // it rather than against whichever frontend happened to submit the command.
+    // It is process-local and starts fresh here, so a restart recomputes the next
+    // action from the workspace alone.
+    let core_mode = Arc::new(crate::orchestration::operator_coordinator::CoreMode::new());
+
+    // *The* dispatch owner for this process. Runner-local producers, accepted
+    // operator-command outcomes, and every orchestration run publish through it,
+    // which is what makes one internal event produce exactly one reducer
+    // transition, one core mode transition, one mark reconciliation, and one
+    // delivery per frontend — no matter which producer raised it.
+    //
+    // Its TUI sink is `frontend_tx`, the delivery side. Wiring the producer
+    // channel here instead would route every dispatched event back into the
+    // producer boundary and apply it to the reducer a second time.
+    let dispatcher = Arc::new(
+        crate::events::EventDispatcher::new(
+            shared_state.clone(),
+            crate::tui::orchestrator::process_event_sinks(
+                &frontend_tx,
+                #[cfg(feature = "web-monitoring")]
+                web_state.as_ref(),
+            ),
+        )
+        .with_mark_reconciler(Some(mark_reconciler.clone()))
+        .with_core_mode(Some(core_mode.clone())),
+    );
+
+    // TUI-local producers (key handlers, hooks, worktree operations, the
+    // auto-refresh) reach that owner through this forwarder rather than through
+    // the render loop. Forwarding off the loop is what stops a burst of local
+    // events from filling the delivery channel while the only task that drains
+    // it is blocked publishing into it.
+    {
+        let producer_dispatcher = dispatcher.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                producer_dispatcher.dispatch(event).await;
+            }
+        });
+    }
+
+    // One run supervisor owns the local orchestrator task for this invocation.
+    // The TUI adapter and the `/api/v2` adapter drive it through the same
+    // run-control service, so neither can start or cancel a run the other
+    // cannot see.
     let supervisor = Arc::new(crate::tui::run_supervisor::TuiRunSupervisor::new(
         repo_root.clone(),
         config.clone(),
-        frontend_tx.clone(),
+        dispatcher.clone(),
         dynamic_queue.clone(),
         shared_state.clone(),
         manual_resolve_counter.clone(),
         post_archive_action.clone(),
         upstream_runtime.clone(),
         graceful_stop_flag.clone(),
-        Some(mark_reconciler.clone()),
-        #[cfg(feature = "web-monitoring")]
-        web_state.clone(),
     ));
 
     // The single process-local application services every frontend commands
@@ -584,6 +615,45 @@ async fn run_tui_loop(
         app.resolve_reservations(),
         start_eligibility.clone(),
     ));
+
+    // The one application transaction. Both adapters submit typed intent to it,
+    // so equivalent TUI and `/api/v2` intent cannot take different paths through
+    // validation, commit ordering, outcome dispatch, or scheduler activation.
+    #[allow(unused_mut)]
+    let mut application = crate::orchestration::operator_coordinator::OperatorApplication::new(
+        core_mode.clone(),
+        run_control.clone(),
+        dispatcher.clone(),
+    );
+    #[cfg(feature = "web-monitoring")]
+    if let Some(ref ws) = web_state {
+        // Where an outcome dispatch's exact revision is read back from. Without
+        // it the coordinator still runs the same transaction; it just has no
+        // command record to bind a revision to.
+        let revisions: Arc<dyn crate::events::OutcomeRevisions> = ws.clone();
+        application = application.with_revisions(Some(revisions));
+    }
+    let application = Arc::new(application);
+
+    // The TUI's ordered submission path. One worker drains it, so keypresses
+    // reach the coordinator in the order the operator made them, while the event
+    // loop below never awaits the application gate itself.
+    let (submission_tx, mut submission_rx) =
+        mpsc::channel::<crate::tui::command_handlers::Submission>(256);
+    let (feedback_tx, mut feedback_rx) =
+        mpsc::channel::<crate::tui::command_handlers::CommandFeedback>(256);
+    {
+        let worker_application = application.clone();
+        let worker_feedback = feedback_tx.clone();
+        tokio::spawn(async move {
+            while let Some(submission) = submission_rx.recv().await {
+                let settled = submission.run(&worker_application).await;
+                if worker_feedback.send(settled).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
     // One worktree service for this repository, for the same reason: it owns the
     // repository mutation guard, and two instances would be two guards that
     // cannot see each other's in-flight deletion.
@@ -598,7 +668,6 @@ async fn run_tui_loop(
     // identical paths through lifecycle validation and side effects.
     #[cfg(feature = "web-monitoring")]
     if let Some(ref ws) = web_state {
-        let service = operator_service.clone();
         // The remote worktree port is built once and bound to both halves of v2:
         // the read routes and the command executor must agree about which
         // worktrees exist and which opaque IDs address them. It is wired to the
@@ -617,15 +686,17 @@ async fn run_tui_loop(
         runtime
             .bind(Arc::new(
                 crate::web::remote_control_api::executor::SharedServiceExecutor::new(
-                    service,
-                    run_control.clone(),
+                    application.clone(),
                     ws.clone(),
-                    runtime.projection(),
                 )
                 .with_worktrees(worktree_port.clone()),
             ))
             .await;
         runtime.bind_worktrees(worktree_port).await;
+        // The same gate a keypress takes. Binding it is what turns `/api/v2`
+        // admission from "atomic for the record" into "serialized through
+        // settlement", so two new commands cannot consume one revision.
+        runtime.bind_gate(application.gate()).await;
         // Same handle, same decision: the snapshot cannot advertise a retry the
         // services would refuse, and cannot keep advertising the block once the
         // owning scheduler task exits.
@@ -916,56 +987,50 @@ async fn run_tui_loop(
             }
         }
 
-        // Events raised by TUI-local producers (key handlers, hooks, worktree
-        // operations, the auto-refresh). This loop is their dispatch owner: one
-        // reducer transition, one delivery to every other frontend, then this
-        // frontend's own state — not a second reducer write per frontend and not
-        // a hand-picked subset forwarded to the web projection.
-        while let Ok(event) = rx.try_recv() {
-            crate::events::dispatch_event_with_marks(
-                &shared_state,
-                &local_event_sinks,
-                event.clone(),
-                Some(&mark_reconciler),
-            )
-            .await;
-            sync_reducer_display_caches(&mut app, &shared_state, &event).await;
-
-            // Painting only: an orchestrator event never produces a command. The
-            // scheduler dispatches every transition it implies from the
-            // reducer-owned intent the same event already recorded.
-            app.handle_orchestrator_event(event);
-        }
-
-        // Authoritative deliveries from the orchestration boundary's dispatch
-        // owner. The reducer transition and the `/api/v2` projection already
-        // happened; this frontend only reads the result and renders it.
+        // Authoritative deliveries from the process-lifetime dispatch owner —
+        // runner-local producers, accepted command outcomes, and orchestration
+        // runs alike. The reducer transition, the core mode transition, and the
+        // `/api/v2` projection already happened; this frontend reads the result
+        // and renders it.
+        //
+        // Painting only: an orchestrator event never produces a command. Every
+        // transition an event implies is dispatched by the scheduler from the
+        // reducer-owned intent the same event already recorded.
         while let Ok(event) = frontend_rx.try_recv() {
             sync_reducer_display_caches(&mut app, &shared_state, &event).await;
-
-            // Painting only, for the same reason as the producer loop above: the
-            // scheduler dispatches every transition the event implies from the
-            // reducer-owned intent it already recorded.
             app.handle_orchestrator_event(event);
         }
 
-        // Handle dynamic queue additions and removals
+        // TUI command submissions. The coordinator work runs off this loop, so
+        // neither the application gate nor a termination waiter is ever awaited
+        // inside event processing or rendering; accepted outcomes return through
+        // the authoritative dispatch above.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            // Create context for TuiCommand handling
             let mut cmd_ctx = TuiCommandContext {
                 app: &mut app,
                 tx: &tx,
-                run_control: &run_control,
+                application: &application,
+                submissions: &submission_tx,
+                feedback: &feedback_tx,
                 worktree_service: &worktree_service,
-                #[cfg(feature = "web-monitoring")]
-                web_state: &web_state,
             };
 
-            // Handle TuiCommand using helper
             if let Err(e) = handle_tui_command(cmd, &mut cmd_ctx, &shared_state).await {
                 app.add_log(LogEntry::error(format!("Command handling error: {}", e)));
             }
         }
+
+        // Wording for commands the worker settled since the last frame. The
+        // accepted state itself already arrived through the dispatch above.
+        while let Ok(settled) = feedback_rx.try_recv() {
+            crate::tui::command_handlers::apply_command_feedback(&mut app, settled);
+        }
+
+        // The mode every frontend projects, read back once per frame. Commands
+        // and lifecycle events both move it inside the dispatch boundary, so the
+        // TUI adopts it rather than maintaining a second opinion about whether
+        // this process is running.
+        app.adopt_core_mode(core_mode.get());
 
         // The eligibility set is a TUI observation, so it is republished once
         // per frame instead of at every place the TUI can change it.

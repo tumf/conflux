@@ -30,7 +30,8 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::orchestration::operator_command::{
-    OperatorCommandError, OperatorCommandService, OperatorMode, RetryPlan, RunBoundaryLiveness,
+    OperatorCommandError, OperatorCommandService, OperatorMode, RetryPlan, RetryRoute,
+    RunBoundaryLiveness,
 };
 use crate::orchestration::state::{OrchestratorState, ReduceOutcome, ReducerCommand};
 use crate::tui::stop_classification::{StopActivitySnapshot, StopClassification};
@@ -382,20 +383,79 @@ pub use crate::orchestration::operator_command::ParallelRuntime as StartEligibil
 // Ports
 // ============================================================================
 
+/// A scheduler launch that has been validated but is not yet allowed to run.
+///
+/// Everything that can fail about a launch happens while the permit is being
+/// *made*; [`RunPermit::activate`] cannot fail and cannot be interrupted. That
+/// split is what lets the coordinator commit an accepted command's decision
+/// state and dispatch its outcome *before* any scheduler activity exists to
+/// overtake it.
+///
+/// Dropping a permit without activating it rolls the launch back. Nothing has
+/// been spawned, no event has been emitted, and no scheduler call has been
+/// recorded, so a rollback is the absence of an effect rather than the undoing
+/// of one.
+pub struct RunPermit {
+    activate: Box<dyn FnOnce() + Send>,
+}
+
+impl std::fmt::Debug for RunPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RunPermit")
+    }
+}
+
+impl RunPermit {
+    /// Build a permit whose activation runs `activate`.
+    ///
+    /// `activate` must be infallible: a launch step that can still fail belongs
+    /// in preparation, before the command's decision state was committed.
+    pub fn new(activate: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            activate: Box::new(activate),
+        }
+    }
+
+    /// Release the launch. Infallible by construction.
+    pub fn activate(self) {
+        (self.activate)();
+    }
+}
+
 /// The run-scheduling runtime the service drives.
 ///
-/// Every method reports what really happened. `start_run` returning `Ok` means a
-/// scheduler task exists; a runtime refusal is an `Err`, never a silent success.
+/// Every method reports what really happened. `prepare_run` returning `Ok` means
+/// a launch is guaranteed to be possible; a runtime refusal is an `Err`, never a
+/// silent success.
 #[async_trait]
 pub trait RunSchedulerPort: Send + Sync {
     /// True when a scheduler task is currently alive.
     fn is_running(&self) -> bool;
 
-    /// Spawn a scheduler run over `targets`.
+    /// Validate and reserve a scheduler launch over `targets` without starting it.
     ///
     /// An empty `targets` list is a scheduler-owned run that consumes
     /// reducer-owned intent (a manual resolve, for example).
-    async fn start_run(&self, targets: Vec<String>, explicit_retry: bool) -> Result<(), String>;
+    ///
+    /// No event may be emitted and no run may become observable until the
+    /// returned permit is activated.
+    async fn prepare_run(
+        &self,
+        targets: Vec<String>,
+        explicit_retry: bool,
+    ) -> Result<RunPermit, String>;
+
+    /// Prepare and immediately activate a launch.
+    ///
+    /// The unordered shorthand, for a caller with no decision state to commit
+    /// between the two halves. Production never uses it: the whole point of the
+    /// split is that an accepted command's outcome is published in the gap.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn start_run(&self, targets: Vec<String>, explicit_retry: bool) -> Result<(), String> {
+        self.prepare_run(targets, explicit_retry)
+            .await
+            .map(RunPermit::activate)
+    }
 
     /// Wake a scheduler that is already alive.
     async fn notify_scheduler(&self);
@@ -426,6 +486,85 @@ impl<T: RunSchedulerPort + ?Sized> RunBoundaryLiveness for T {
 // ============================================================================
 // Service
 // ============================================================================
+
+/// A scheduler dispatch that has been reserved but not yet issued.
+///
+/// Holding one is the promise that activation cannot fail; issuing it is what
+/// establishes the causal order between an accepted command's outcome and the
+/// scheduler activity that command enabled.
+#[derive(Debug)]
+pub enum PreparedDispatch {
+    /// A new scheduler run is reserved and waiting for its permit.
+    Start(RunPermit),
+    /// A scheduler that is already alive will be woken.
+    Wake,
+    /// Nothing will be dispatched.
+    None,
+}
+
+impl PreparedDispatch {
+    /// The scheduler effect this dispatch will report once issued.
+    pub fn effect(&self) -> SchedulerEffect {
+        match self {
+            Self::Start(_) => SchedulerEffect::Started,
+            Self::Wake => SchedulerEffect::Notified,
+            Self::None => SchedulerEffect::None,
+        }
+    }
+
+    /// Issue the prepared dispatch. Infallible by construction.
+    pub async fn activate(self, scheduler: &dyn RunSchedulerPort) {
+        match self {
+            Self::Start(permit) => permit.activate(),
+            Self::Wake => scheduler.notify_scheduler().await,
+            Self::None => {}
+        }
+    }
+}
+
+/// What a prepared run-lifecycle command will commit once its gate allows it.
+#[derive(Debug)]
+enum PreparedIntent {
+    /// Start or resume the run over exactly these targets.
+    Start { targets: Vec<String> },
+    /// Consume these already-classified retry routes.
+    Retry { routes: Vec<(String, RetryRoute)> },
+    /// Reserve the single resolver for this change.
+    Resolve { change_id: String },
+}
+
+/// A validated run-lifecycle command holding every fallible runtime capability
+/// it needs, with nothing committed yet.
+///
+/// Preparation reads state; it never writes it. A preparation failure therefore
+/// leaves no reducer, mark, queue, retry-edge, resolve-reservation, mode, hook,
+/// scheduler, or event effect to undo — the absence of an effect, rather than a
+/// rollback that has to be trusted.
+#[derive(Debug)]
+pub struct PreparedRunCommand {
+    intent: PreparedIntent,
+    dispatch: PreparedDispatch,
+}
+
+/// A committed run-lifecycle command whose scheduler dispatch is still pending.
+///
+/// The caller must dispatch the accepted outcome first and only then call
+/// [`CommittedRunCommand::activate`], which is the ordering the whole
+/// transaction exists to establish.
+#[derive(Debug)]
+#[must_use = "a committed command holds a scheduler dispatch that must be activated"]
+pub struct CommittedRunCommand {
+    /// The typed outcome to dispatch.
+    pub outcome: RunControlOutcome,
+    dispatch: PreparedDispatch,
+}
+
+impl CommittedRunCommand {
+    /// Issue the prepared scheduler dispatch.
+    pub async fn activate(self, scheduler: &dyn RunSchedulerPort) {
+        self.dispatch.activate(scheduler).await;
+    }
+}
 
 /// Process-local application service for run-lifecycle commands.
 pub struct RunControlService {
@@ -467,22 +606,47 @@ impl RunControlService {
             .to_string()
     }
 
+    /// The scheduler port this service drives.
+    ///
+    /// The coordinator needs it to activate a prepared dispatch *after* the
+    /// accepted outcome has been published, which is deliberately outside this
+    /// service's own critical section.
+    pub fn scheduler(&self) -> Arc<dyn RunSchedulerPort> {
+        self.scheduler.clone()
+    }
+
+    /// Reserve a scheduler dispatch without issuing it.
+    ///
+    /// This is the only fallible step of a run-dispatching command, and it runs
+    /// before anything is mutated.
+    async fn prepare_dispatch(
+        &self,
+        command: RunCommandKind,
+        targets: Vec<String>,
+        explicit_retry: bool,
+    ) -> RunControlResult<PreparedDispatch> {
+        if self.scheduler.is_running() {
+            return Ok(PreparedDispatch::Wake);
+        }
+        self.scheduler
+            .prepare_run(targets, explicit_retry)
+            .await
+            .map(PreparedDispatch::Start)
+            .map_err(|message| RunControlError::DispatchFailed { command, message })
+    }
+
     /// Dispatch work to the scheduler and report what actually happened.
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn dispatch(
         &self,
         command: RunCommandKind,
         targets: Vec<String>,
         explicit_retry: bool,
     ) -> RunControlResult<SchedulerEffect> {
-        if self.scheduler.is_running() {
-            self.scheduler.notify_scheduler().await;
-            return Ok(SchedulerEffect::Notified);
-        }
-        self.scheduler
-            .start_run(targets, explicit_retry)
-            .await
-            .map(|()| SchedulerEffect::Started)
-            .map_err(|message| RunControlError::DispatchFailed { command, message })
+        let prepared = self.prepare_dispatch(command, targets, explicit_retry).await?;
+        let effect = prepared.effect();
+        prepared.activate(self.scheduler.as_ref()).await;
+        Ok(effect)
     }
 
     // ------------------------------------------------------------------
@@ -495,6 +659,7 @@ impl RunControlService {
     /// `Error` routes the marked rows through retry classification instead, so a
     /// reconciled acceptance hold resumes rather than rerunning apply. A mode
     /// with a live run owns its own queue mutation and refuses start outright.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn start(&self, mode: OperatorMode) -> RunControlResult<RunControlOutcome> {
         match mode {
             OperatorMode::Running | OperatorMode::Stopping => Err(RunControlError::InvalidMode {
@@ -519,6 +684,7 @@ impl RunControlService {
             .collect()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn start_marked(&self) -> RunControlResult<RunControlOutcome> {
         let marked = self.operator.marks().marked_ids();
         if marked.is_empty() {
@@ -574,6 +740,7 @@ impl RunControlService {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn start_retry(&self) -> RunControlResult<RunControlOutcome> {
         let marked = self.operator.marks().marked_ids();
         if marked.is_empty() {
@@ -596,6 +763,7 @@ impl RunControlService {
     /// Apply ceiling is still owned by a live boundary returns the typed refusal
     /// here, so no reducer transition, no explicit-retry edge, and no scheduler
     /// notify or start ever happens for it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn retry_change(&self, change_id: &str) -> RunControlResult<RunControlOutcome> {
         let plan = self.operator.retry_change(change_id).await?;
         self.dispatch_retry(plan).await
@@ -609,11 +777,13 @@ impl RunControlService {
     /// which keeps the request partial rather than global: when every candidate
     /// is skipped the plan is empty and the scheduler is neither woken nor
     /// started.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn retry_errors(&self, change_ids: &[String]) -> RunControlResult<RunControlOutcome> {
         let plan = self.operator.retry_errors(change_ids).await;
         self.dispatch_retry(plan).await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn dispatch_retry(&self, plan: RetryPlan) -> RunControlResult<RunControlOutcome> {
         if plan.is_empty() {
             return Ok(RunControlOutcome::NoOp {
@@ -699,6 +869,7 @@ impl RunControlService {
     /// first valid request becomes the active resolver and dispatches the
     /// scheduler, later ones queue in FIFO order, and a duplicate request is a
     /// no-op that never creates a second entry.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn resolve_merge(&self, change_id: &str) -> RunControlResult<RunControlOutcome> {
         if self.resolves.is_reserved(change_id) {
             return Ok(RunControlOutcome::NoOp {
@@ -757,6 +928,262 @@ impl RunControlService {
             scheduler,
         })
     }
+
+    // ------------------------------------------------------------------
+    // Prepare / commit
+    // ------------------------------------------------------------------
+    //
+    // The composed methods above stay the unordered shorthand. These are the
+    // halves the application coordinator drives, so that a command's accepted
+    // decision state and its outcome event are published before any scheduler
+    // activity the command enabled can exist.
+
+    /// Validate a Start (or, in `Error` mode, a retry) and reserve its dispatch.
+    ///
+    /// Read-only: a refusal here has changed nothing.
+    pub async fn prepare_start(
+        &self,
+        mode: OperatorMode,
+    ) -> RunControlResult<PreparedRunCommand> {
+        match mode {
+            OperatorMode::Running | OperatorMode::Stopping => Err(RunControlError::InvalidMode {
+                command: RunCommandKind::Start,
+                mode,
+            }),
+            OperatorMode::Error => {
+                let marked = self.operator.marks().marked_ids();
+                if marked.is_empty() {
+                    return Err(RunControlError::NoEligibleTarget {
+                        command: RunCommandKind::Start,
+                        detail: "no change carries an execution mark".to_string(),
+                    });
+                }
+                self.prepare_retry_errors(&marked).await
+            }
+            OperatorMode::Select | OperatorMode::Stopped => self.prepare_start_marked().await,
+        }
+    }
+
+    async fn prepare_start_marked(&self) -> RunControlResult<PreparedRunCommand> {
+        let marked = self.operator.marks().marked_ids();
+        if marked.is_empty() {
+            return Err(RunControlError::NoEligibleTarget {
+                command: RunCommandKind::Start,
+                detail: "no change carries an execution mark".to_string(),
+            });
+        }
+
+        // The fence is applied to the *complete* marked set before anything is
+        // narrowed down, so start is all-or-nothing: one ineligible target
+        // refuses the whole operation instead of quietly starting the eligible
+        // remainder, which is a target set the operator never asked for.
+        let rejected = self.eligibility.rejected(&marked);
+        if !rejected.is_empty() {
+            return Err(RunControlError::NoEligibleTarget {
+                command: RunCommandKind::Start,
+                detail: format!(
+                    "worktree execution requires committed changes with no uncommitted \
+                     files; ineligible marked targets: {}",
+                    rejected.join(", ")
+                ),
+            });
+        }
+
+        let targets = self.start_targets().await;
+        if targets.is_empty() {
+            return Err(RunControlError::NoEligibleTarget {
+                command: RunCommandKind::Start,
+                detail: format!(
+                    "no marked change is startable ({} marked, none with status '{NOT_QUEUED_STATUS}')",
+                    marked.len()
+                ),
+            });
+        }
+
+        let dispatch = self
+            .prepare_dispatch(RunCommandKind::Start, targets.clone(), false)
+            .await?;
+        Ok(PreparedRunCommand {
+            intent: PreparedIntent::Start { targets },
+            dispatch,
+        })
+    }
+
+    /// Validate a single-change retry and reserve its dispatch.
+    pub async fn prepare_retry_change(
+        &self,
+        change_id: &str,
+    ) -> RunControlResult<PreparedRunCommand> {
+        let routes = match self.operator.plan_retry_change(change_id).await? {
+            Some(route) => vec![(change_id.to_string(), route)],
+            None => Vec::new(),
+        };
+        self.prepare_routes(routes).await
+    }
+
+    /// Validate a bulk retry and reserve its dispatch.
+    pub async fn prepare_retry_errors(
+        &self,
+        change_ids: &[String],
+    ) -> RunControlResult<PreparedRunCommand> {
+        let routes = self.operator.plan_retry_errors(change_ids).await;
+        self.prepare_routes(routes).await
+    }
+
+    async fn prepare_routes(
+        &self,
+        routes: Vec<(String, RetryRoute)>,
+    ) -> RunControlResult<PreparedRunCommand> {
+        if routes.is_empty() {
+            // Nothing retryable: no dispatch is reserved, so nothing has to be
+            // rolled back when the caller settles this as a no-op.
+            return Ok(PreparedRunCommand {
+                intent: PreparedIntent::Retry { routes },
+                dispatch: PreparedDispatch::None,
+            });
+        }
+        let targets: Vec<String> = routes.iter().map(|(id, _)| id.clone()).collect();
+        let dispatch = self
+            .prepare_dispatch(RunCommandKind::Retry, targets, true)
+            .await?;
+        Ok(PreparedRunCommand {
+            intent: PreparedIntent::Retry { routes },
+            dispatch,
+        })
+    }
+
+    /// Validate a resolve reservation and reserve its dispatch.
+    ///
+    /// Whether the reservation will be active or queued is decided from the
+    /// ledger before anything is written, so only a launch that will really be
+    /// consumed is reserved.
+    pub async fn prepare_resolve(
+        &self,
+        change_id: &str,
+    ) -> RunControlResult<Option<PreparedRunCommand>> {
+        if self.resolves.is_reserved(change_id) {
+            return Ok(None);
+        }
+
+        let display_status = self.display_status(change_id).await;
+        if display_status != MERGE_WAIT_STATUS {
+            return Err(RunControlError::TargetIneligible {
+                command: RunCommandKind::Resolve,
+                change_id: change_id.to_string(),
+                display_status,
+            });
+        }
+
+        // Only the active resolver dispatches. A queued reservation is consumed
+        // when the active resolve finishes, so reserving a launch for it now
+        // would claim work that cannot start.
+        let dispatch = if self.resolves.is_active() {
+            PreparedDispatch::None
+        } else {
+            self.prepare_dispatch(RunCommandKind::Resolve, Vec::new(), false)
+                .await?
+        };
+
+        Ok(Some(PreparedRunCommand {
+            intent: PreparedIntent::Resolve {
+                change_id: change_id.to_string(),
+            },
+            dispatch,
+        }))
+    }
+
+    /// Commit a prepared command's decision state without issuing its dispatch.
+    ///
+    /// The returned value still owns the reserved dispatch; the caller publishes
+    /// the accepted outcome first and only then activates it.
+    pub async fn commit(
+        &self,
+        prepared: PreparedRunCommand,
+    ) -> RunControlResult<CommittedRunCommand> {
+        let PreparedRunCommand { intent, dispatch } = prepared;
+        let scheduler = dispatch.effect();
+
+        match intent {
+            PreparedIntent::Start { targets } => {
+                {
+                    let mut guard = self.state.write().await;
+                    for id in &targets {
+                        guard.apply_command(ReducerCommand::AddToQueue(id.clone()));
+                    }
+                }
+                Ok(CommittedRunCommand {
+                    outcome: RunControlOutcome::RunDispatched {
+                        change_ids: targets,
+                        explicit_retry: false,
+                        scheduler,
+                    },
+                    dispatch,
+                })
+            }
+            PreparedIntent::Retry { routes } => {
+                let plan = self.operator.commit_retry_routes(&routes).await;
+                if plan.is_empty() {
+                    // Every classified route was refused by the reducer. The
+                    // reserved dispatch is dropped rather than issued, so no
+                    // scheduler effect survives a no-op.
+                    return Ok(CommittedRunCommand {
+                        outcome: RunControlOutcome::NoOp {
+                            reason: RunNoOpReason::NoRetryableTarget,
+                        },
+                        dispatch: PreparedDispatch::None,
+                    });
+                }
+                Ok(CommittedRunCommand {
+                    outcome: RunControlOutcome::RunDispatched {
+                        change_ids: plan.change_ids,
+                        explicit_retry: plan.explicit_retry,
+                        scheduler,
+                    },
+                    dispatch,
+                })
+            }
+            PreparedIntent::Resolve { change_id } => {
+                // Reducer first: it owns whether the wait state really accepts a
+                // resolve intent, so a stale target is refused before any
+                // reservation exists. Dropping `dispatch` on this path is the
+                // rollback — nothing was ever spawned.
+                let reduce_outcome = {
+                    let mut guard = self.state.write().await;
+                    guard.apply_command(ReducerCommand::ResolveMerge(change_id.clone()))
+                };
+                if matches!(reduce_outcome, ReduceOutcome::NoOp) {
+                    return Err(RunControlError::TargetIneligible {
+                        command: RunCommandKind::Resolve,
+                        change_id: change_id.clone(),
+                        display_status: self.display_status(&change_id).await,
+                    });
+                }
+                let Some(reservation) = self.resolves.reserve(&change_id) else {
+                    // Another caller reserved between preparation and here.
+                    return Ok(CommittedRunCommand {
+                        outcome: RunControlOutcome::NoOp {
+                            reason: RunNoOpReason::ResolveAlreadyReserved { change_id },
+                        },
+                        dispatch: PreparedDispatch::None,
+                    });
+                };
+                let (dispatch, scheduler) = match reservation {
+                    ResolveReservation::Active => (dispatch, scheduler),
+                    ResolveReservation::Queued { .. } => {
+                        (PreparedDispatch::None, SchedulerEffect::None)
+                    }
+                };
+                Ok(CommittedRunCommand {
+                    outcome: RunControlOutcome::ResolveReserved {
+                        change_id,
+                        reservation,
+                        scheduler,
+                    },
+                    dispatch,
+                })
+            }
+        }
+    }
 }
 
 /// Test doubles shared by the service, TUI adapter, and `/api/v2` adapter tests.
@@ -787,14 +1214,45 @@ pub(crate) mod testing {
         GracefulStop(bool),
     }
 
+    /// Everything an activated launch writes, shared so a permit can own a clone.
+    ///
+    /// A permit outlives the `&self` borrow that produced it, so the recorder
+    /// state a launch touches has to be reachable from an owned handle.
+    #[derive(Default)]
+    struct SchedulerRecorder {
+        calls: Mutex<Vec<SchedulerCall>>,
+        running: std::sync::atomic::AtomicBool,
+        /// Events an activated launch publishes, in activation order.
+        ///
+        /// This is how a test proves scheduler progress cannot precede the
+        /// accepted command outcome: the launch emits nothing until its permit
+        /// is activated, and the permit is activated only after the outcome has
+        /// already been dispatched.
+        on_activate: Mutex<Option<Arc<dyn Fn(Vec<String>, bool) + Send + Sync>>>,
+    }
+
+    impl std::fmt::Debug for SchedulerRecorder {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SchedulerRecorder")
+                .field("calls", &self.calls)
+                .field("running", &self.running)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl SchedulerRecorder {
+        fn record(&self, call: SchedulerCall) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
     /// A [`RunSchedulerPort`] that records calls instead of spawning work.
     ///
     /// No process, task, or repository is involved, so tests over it stay
     /// unit-scoped while still proving the side effect really happened.
     #[derive(Debug)]
     pub(crate) struct RecordingScheduler {
-        calls: Mutex<Vec<SchedulerCall>>,
-        running: std::sync::atomic::AtomicBool,
+        recorder: Arc<SchedulerRecorder>,
         activity: Mutex<StopActivitySnapshot>,
         launch_failure: Mutex<Option<String>>,
     }
@@ -810,8 +1268,7 @@ pub(crate) mod testing {
         pub(crate) fn new() -> Self {
             use crate::tui::stop_classification::{ExecutionEvidence, ShutdownWorkEvidence};
             Self {
-                calls: Mutex::new(Vec::new()),
-                running: std::sync::atomic::AtomicBool::new(false),
+                recorder: Arc::new(SchedulerRecorder::default()),
                 activity: Mutex::new(StopActivitySnapshot {
                     execution_handles: ExecutionEvidence::Known { registered: 0 },
                     reducer_agent_execution_active: false,
@@ -823,7 +1280,8 @@ pub(crate) mod testing {
 
         /// Report a live scheduler run.
         pub(crate) fn set_running(&self, running: bool) {
-            self.running
+            self.recorder
+                .running
                 .store(running, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -832,17 +1290,29 @@ pub(crate) mod testing {
             *self.activity.lock().unwrap() = activity;
         }
 
-        /// Make the next `start_run` fail with `message`.
+        /// Make the next launch preparation fail with `message`.
         pub(crate) fn fail_launch(&self, message: &str) {
             *self.launch_failure.lock().unwrap() = Some(message.to_string());
         }
 
-        /// Every recorded call, in order.
-        pub(crate) fn calls(&self) -> Vec<SchedulerCall> {
-            self.calls.lock().unwrap().clone()
+        /// Run `hook` when a prepared launch is actually activated.
+        ///
+        /// The hook stands in for the first progress a real scheduler would
+        /// publish, which is what makes activation ordering observable.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) fn on_activate(
+            &self,
+            hook: Arc<dyn Fn(Vec<String>, bool) + Send + Sync>,
+        ) {
+            *self.recorder.on_activate.lock().unwrap() = Some(hook);
         }
 
-        /// Targets of every `start_run`, in order.
+        /// Every recorded call, in order.
+        pub(crate) fn calls(&self) -> Vec<SchedulerCall> {
+            self.recorder.calls.lock().unwrap().clone()
+        }
+
+        /// Targets of every activated launch, in order.
         pub(crate) fn started_targets(&self) -> Vec<Vec<String>> {
             self.calls()
                 .into_iter()
@@ -852,44 +1322,54 @@ pub(crate) mod testing {
                 })
                 .collect()
         }
-
-        fn record(&self, call: SchedulerCall) {
-            self.calls.lock().unwrap().push(call);
-        }
     }
 
     #[async_trait]
     impl RunSchedulerPort for RecordingScheduler {
         fn is_running(&self) -> bool {
-            self.running.load(std::sync::atomic::Ordering::SeqCst)
+            self.recorder
+                .running
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        async fn start_run(
+        /// Reserve a launch, consuming any armed failure.
+        ///
+        /// Nothing is recorded here: a prepared-but-never-activated launch must
+        /// be indistinguishable from a launch that was never requested.
+        async fn prepare_run(
             &self,
             targets: Vec<String>,
             explicit_retry: bool,
-        ) -> std::result::Result<(), String> {
+        ) -> std::result::Result<RunPermit, String> {
             if let Some(message) = self.launch_failure.lock().unwrap().take() {
                 return Err(message);
             }
-            self.record(SchedulerCall::Started {
-                targets,
-                explicit_retry,
-            });
-            self.set_running(true);
-            Ok(())
+            let recorder = self.recorder.clone();
+            Ok(RunPermit::new(move || {
+                recorder.record(SchedulerCall::Started {
+                    targets: targets.clone(),
+                    explicit_retry,
+                });
+                recorder
+                    .running
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let hook = recorder.on_activate.lock().unwrap().clone();
+                if let Some(hook) = hook {
+                    hook(targets, explicit_retry);
+                }
+            }))
         }
 
         async fn notify_scheduler(&self) {
-            self.record(SchedulerCall::Notified);
+            self.recorder.record(SchedulerCall::Notified);
         }
 
         async fn cancel_run(&self) {
-            self.record(SchedulerCall::Cancelled);
+            self.recorder.record(SchedulerCall::Cancelled);
         }
 
         fn set_graceful_stop(&self, requested: bool) {
-            self.record(SchedulerCall::GracefulStop(requested));
+            self.recorder.record(SchedulerCall::GracefulStop(requested));
         }
 
         async fn stop_activity(&self) -> StopActivitySnapshot {

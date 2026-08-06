@@ -1773,8 +1773,23 @@ impl AppState {
     /// Modal popups live on a separate axis, so there is nothing to see through
     /// here: the execution mode is already the only thing the shared lifecycle
     /// matrix must see, and a popup can neither widen nor narrow it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn operator_mode(&self) -> crate::orchestration::operator_command::OperatorMode {
         self.execution_mode.operator_mode()
+    }
+
+    /// Adopt the Core process lifecycle mode.
+    ///
+    /// One direction only, and this is the direction. `execution_mode` used to
+    /// be command-admission authority as well as presentation, which is how the
+    /// live TUI and the `/api/v2` `app_mode` could describe the same process
+    /// differently after an accepted command. Core owns admission now; this
+    /// frontend renders it.
+    pub fn adopt_core_mode(
+        &mut self,
+        mode: crate::orchestration::operator_command::OperatorMode,
+    ) {
+        self.execution_mode = AppExecutionMode::from_operator_mode(mode);
     }
 
     /// Project an accepted run dispatch onto TUI presentation state.
