@@ -248,7 +248,6 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("not queued");
-            change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -362,6 +361,11 @@ mod tests {
                 change.set_display_status_cache(status);
                 change.selected = true;
             }
+            // Marks are the shared store's to decide, so the arranged rows only
+            // hold after the store agrees with them; otherwise the reconciliation
+            // every orchestrator event runs would clear them and the assertion
+            // below would be measuring the fixture rather than the transition.
+            app.publish_execution_marks();
             let before = row_facts(&app);
             let logs_before = app.logs.len();
 

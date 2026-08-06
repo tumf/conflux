@@ -17,6 +17,9 @@ use super::ports::{
     UpstreamPortError,
 };
 use super::spine::{CommitTreeEvidence, SpineCommit};
+use crate::vcs::git::commands::status_policy::{
+    read_only_status_argv, PORCELAIN_STATUS_ARGS, PORCELAIN_V2_STATUS_ARGS,
+};
 
 /// Record separator used to frame `git log` output deterministically.
 const RECORD_SEP: char = '\u{1e}';
@@ -330,14 +333,17 @@ impl UpstreamGit for GitUpstreamOps {
 
     async fn is_working_tree_clean(&self) -> PortResult<bool> {
         let stdout = self
-            .run_checked("git status", &["status", "--porcelain"])
+            .run_checked("git status", &read_only_status_argv(PORCELAIN_STATUS_ARGS))
             .await?;
         Ok(stdout.trim().is_empty())
     }
 
     async fn status_porcelain_v2(&self) -> PortResult<String> {
-        self.run_checked("git status", &["status", "--porcelain=v2"])
-            .await
+        self.run_checked(
+            "git status",
+            &read_only_status_argv(PORCELAIN_V2_STATUS_ARGS),
+        )
+        .await
     }
 
     async fn commit_message(&self, sha: &str) -> PortResult<String> {
@@ -676,5 +682,159 @@ mod tests {
             commits.len() * 2,
             "the evidence-bearing walk reads archive and active trees per commit"
         );
+    }
+}
+
+/// Regression coverage for the read-only `git status` optional-lock policy on
+/// the native upstream adapter.
+///
+/// The adapter runs Git directly rather than through the shared `run_git`
+/// helpers, so its argv is asserted here from the recorded command log: the
+/// policy has to hold for *this* construction path too, and its mutating
+/// commands must keep Git's normal lock behavior.
+#[cfg(test)]
+mod native_git_status_optional_locks {
+    use super::*;
+    use std::fs;
+    use std::process::Command as SyncCommand;
+    use tempfile::TempDir;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = SyncCommand::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "cflx")
+            .env("GIT_AUTHOR_EMAIL", "cflx@example.com")
+            .env("GIT_COMMITTER_NAME", "cflx")
+            .env("GIT_COMMITTER_EMAIL", "cflx@example.com")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A one-commit repository: enough for cleanliness and porcelain-v2 reads.
+    fn repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        fs::write(root.join("README.md"), "base\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-q", "-m", "root"]);
+        dir
+    }
+
+    /// Every recorded `status` invocation, as the adapter issued it.
+    fn recorded_status_commands(ops: &GitUpstreamOps) -> Vec<Vec<String>> {
+        ops.observed_commands()
+            .into_iter()
+            .filter(|args| args.iter().any(|arg| arg == "status"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn upstream_cleanliness_status_disables_optional_locks_before_the_subcommand() {
+        let dir = repo();
+        let ops = GitUpstreamOps::new(dir.path());
+
+        assert!(
+            ops.is_working_tree_clean().await.unwrap(),
+            "the fixture starts clean"
+        );
+        fs::write(dir.path().join("README.md"), "dirty\n").unwrap();
+        assert!(
+            !ops.is_working_tree_clean().await.unwrap(),
+            "a modified tracked file is still observed as dirty"
+        );
+
+        let recorded = recorded_status_commands(&ops);
+        assert_eq!(recorded.len(), 2, "{recorded:?}");
+        for argv in recorded {
+            assert_eq!(
+                argv,
+                vec!["--no-optional-locks", "status", "--porcelain"],
+                "the cleanliness observation must keep the global option before `status`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_porcelain_v2_status_keeps_v2_under_the_policy() {
+        let dir = repo();
+        let ops = GitUpstreamOps::new(dir.path());
+
+        fs::write(dir.path().join("README.md"), "dirty\n").unwrap();
+        let stdout = ops.status_porcelain_v2().await.unwrap();
+        assert!(
+            stdout.lines().any(|line| line.starts_with("1 ")),
+            "porcelain v2 must stay v2 (v1 has no `1 ` change records): {stdout:?}"
+        );
+
+        let recorded = recorded_status_commands(&ops);
+        assert_eq!(
+            recorded,
+            vec![vec![
+                "--no-optional-locks".to_string(),
+                "status".to_string(),
+                "--porcelain=v2".to_string()
+            ]],
+            "the porcelain-v2 observation must keep both the policy and `--porcelain=v2`"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_status_failure_still_maps_to_an_upstream_port_error() {
+        let dir = TempDir::new().unwrap();
+        let ops = GitUpstreamOps::new(dir.path());
+
+        // Not a repository at all: the adapter's own error mapping must survive
+        // the added global option rather than turning into a spawn failure.
+        let error = ops
+            .is_working_tree_clean()
+            .await
+            .expect_err("a non-repository status read must fail");
+        assert!(
+            format!("{error:?}").contains("git status"),
+            "UpstreamPortError must still name the failed operation: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_mutating_commands_never_receive_optional_lock_suppression() {
+        let dir = repo();
+        let ops = GitUpstreamOps::new(dir.path());
+
+        ops.commit_empty("checkpoint").await.unwrap();
+        // Fetch, push, and merge have no reachable remote or mergeable ref here.
+        // They still record their argv, which is the only thing this asserts.
+        let _ = ops.fetch("origin", "main").await;
+        let _ = ops.push_porcelain("origin", "main").await;
+        let _ = ops.merge_no_ff("HEAD", "irrelevant").await;
+
+        let mutating: Vec<Vec<String>> = ops
+            .observed_commands()
+            .into_iter()
+            .filter(|args| {
+                matches!(
+                    args.first().map(String::as_str),
+                    Some("commit" | "push" | "fetch" | "merge" | "add" | "reset" | "checkout")
+                )
+            })
+            .collect();
+        assert!(
+            !mutating.is_empty(),
+            "the adapter must have issued mutating commands to assert against"
+        );
+        for argv in mutating {
+            assert!(
+                !argv.iter().any(|arg| arg == "--no-optional-locks"),
+                "mutating commands must retain Git's normal lock behavior: {argv:?}"
+            );
+        }
     }
 }

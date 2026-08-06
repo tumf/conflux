@@ -995,9 +995,9 @@ pub fn is_admitted_work_start(event: &ExecutionEvent) -> bool {
 
 /// One authoritative dispatch of an execution event.
 ///
-/// Produced by [`dispatch_event`] after the reducer transition has already
-/// happened, so a sink receives the event and the state it produced together
-/// rather than reading the reducer back out on its own schedule.
+/// Produced by [`dispatch_event_with_marks`] after the reducer transition has
+/// already happened, so a sink receives the event and the state it produced
+/// together rather than reading the reducer back out on its own schedule.
 pub struct EventDispatch<'a> {
     /// Process-unique dispatch identity.
     ///
@@ -1076,21 +1076,76 @@ pub async fn send_event(tx: &Option<mpsc::Sender<ExecutionEvent>>, event: Execut
 ///
 /// The reducer write lock is released before any sink runs, so a sink is free
 /// to read shared state without deadlocking against this dispatch.
+///
+/// Test-only. Every production dispatch path binds the process-local mark
+/// reconciler and therefore calls [`dispatch_event_with_marks`]; keeping a
+/// mark-less shorthand reachable from production would be a second way to
+/// dispatch an event that silently skips mark reconciliation.
+#[cfg(test)]
 pub async fn dispatch_event(
     state: &tokio::sync::RwLock<OrchestratorState>,
     sinks: &[std::sync::Arc<dyn EventSink>],
     event: ExecutionEvent,
 ) {
+    dispatch_event_with_marks(state, sinks, event, None).await;
+}
+
+/// The authoritative dispatch owner, with the shared execution-mark store bound.
+///
+/// The ordering is the whole point, and it is one operation under the shared
+/// operator mutation guard:
+///
+/// 1. capture the target's reducer evidence *before* the event is applied;
+/// 2. apply the event to the reducer;
+/// 3. compare post-state and revoke only the affected change's shared mark;
+/// 4. build the authoritative snapshot;
+/// 5. release the guard and fan out to TUI, Web, and every other sink.
+///
+/// Reconciling before step 5 is what makes a failure event and
+/// `execution_marked: false` land in the *same* state revision: no frontend can
+/// observe the new reducer state alongside the stale mark, and no frontend has
+/// to publish a correction afterwards.
+///
+/// `reconciler` is `None` for dispatchers with no operator mark store — CLI runs
+/// and tests. That is an explicit no-mark binding, not a second store.
+pub async fn dispatch_event_with_marks(
+    state: &tokio::sync::RwLock<OrchestratorState>,
+    sinks: &[std::sync::Arc<dyn EventSink>],
+    event: ExecutionEvent,
+    reconciler: Option<&crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
+) {
     let ownership = event_ownership(&event);
     let id = next_dispatch_id();
 
+    // Held across pre-capture, application, and reconciliation so an operator
+    // mark action cannot land between the transition and its mark decision.
+    let mutation = match reconciler {
+        Some(reconciler) => Some(reconciler.lock_mutations().await),
+        None => None,
+    };
+
     let state_snapshot = {
         let mut guard = state.write().await;
+        let pre = reconciler.and_then(|reconciler| reconciler.capture(&event, &guard));
         guard.apply_execution_event(&event);
+        if let (Some(reconciler), Some(pre)) = (reconciler, pre.as_ref()) {
+            let revoked = reconciler.reconcile(&event, pre, &guard);
+            for change_id in revoked {
+                debug!(
+                    "Execution mark revoked for '{}' by {}",
+                    change_id,
+                    classify_event(&event).0
+                );
+            }
+        }
         // Only a state-owning event can change what a frontend publishes;
         // cloning the reducer for every log line would be pure waste.
         matches!(ownership, EventOwnership::State).then(|| guard.clone())
     };
+
+    // Sinks read the reconciled marks; they never take this guard, so releasing
+    // it here keeps a slow frontend from stalling operator commands.
+    drop(mutation);
 
     let dispatch = EventDispatch {
         id,
@@ -1112,6 +1167,9 @@ pub async fn dispatch_event(
 pub struct EventDispatcher {
     state: std::sync::Arc<tokio::sync::RwLock<OrchestratorState>>,
     sinks: Vec<std::sync::Arc<dyn EventSink>>,
+    /// The shared execution-mark store this boundary reconciles, when the
+    /// process has one. `None` is an explicit no-mark binding.
+    marks: Option<crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
 }
 
 impl EventDispatcher {
@@ -1120,12 +1178,29 @@ impl EventDispatcher {
         state: std::sync::Arc<tokio::sync::RwLock<OrchestratorState>>,
         sinks: Vec<std::sync::Arc<dyn EventSink>>,
     ) -> Self {
-        Self { state, sinks }
+        Self {
+            state,
+            sinks,
+            marks: None,
+        }
+    }
+
+    /// Bind the process-local execution-mark reconciler.
+    ///
+    /// Every production dispatcher that can reach a TUI or Web frontend takes
+    /// the *same* reconciler the operator command service mutates, so a mark
+    /// revoked by an event and a mark set by a command are one value.
+    pub fn with_mark_reconciler(
+        mut self,
+        marks: Option<crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
+    ) -> Self {
+        self.marks = marks;
+        self
     }
 
     /// Apply one event and fan it out.
     pub async fn dispatch(&self, event: ExecutionEvent) {
-        dispatch_event(&self.state, &self.sinks, event).await;
+        dispatch_event_with_marks(&self.state, &self.sinks, event, self.marks.as_ref()).await;
     }
 
     /// A channel whose receiver forwards into this dispatch owner.

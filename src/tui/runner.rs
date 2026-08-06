@@ -160,6 +160,28 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
     }
 }
 
+/// Apply the mark writes an operator interaction requested, then mirror the rows.
+///
+/// The write is deferred out of key handling for one reason: it has to take the
+/// same async operator mutation guard the authoritative dispatcher takes for
+/// mark reconciliation. Applying it here — one requested change at a time —
+/// keeps an interaction from ever replacing the shared store from this
+/// frontend's cached row set, so a mark a concurrent event revoked stays
+/// revoked and a mark another frontend set stays set.
+async fn apply_pending_mark_writes(
+    app: &mut AppState,
+    service: &Arc<crate::orchestration::operator_command::OperatorCommandService>,
+) {
+    let pending = app.take_pending_mark_writes();
+    if pending.is_empty() {
+        return;
+    }
+    for (change_id, marked) in pending {
+        service.apply_execution_mark(&change_id, marked).await;
+    }
+    app.sync_execution_marks_from_store();
+}
+
 /// Refresh the TUI's reducer-derived display caches after one event.
 ///
 /// The reducer is **read**, never written. By the time an event reaches this
@@ -505,6 +527,15 @@ async fn run_tui_loop(
     // It gets `frontend_tx`, not `tx`: a spawned run is an orchestration
     // boundary that dispatches its own events, so it must reach this frontend
     // through the delivery side.
+    // One reconciler for this process: the shared mark store plus the shared
+    // operator mutation guard. Every production dispatch path binds *this* value,
+    // so a mark revoked by an event and a mark set by a command are the same fact
+    // in the TUI, in `/api/v2`, and in Start target resolution.
+    let mark_reconciler = crate::orchestration::mark_reconciliation::ExecutionMarkReconciler::new(
+        app.execution_marks(),
+        app.parallel_runtime(),
+    );
+
     let supervisor = Arc::new(crate::tui::run_supervisor::TuiRunSupervisor::new(
         repo_root.clone(),
         config.clone(),
@@ -515,6 +546,7 @@ async fn run_tui_loop(
         post_archive_action.clone(),
         upstream_runtime.clone(),
         graceful_stop_flag.clone(),
+        Some(mark_reconciler.clone()),
         #[cfg(feature = "web-monitoring")]
         web_state.clone(),
     ));
@@ -539,7 +571,11 @@ async fn run_tui_loop(
                 Arc::new(HookRunnerQueueHooks::new(hook_runner)),
                 app.execution_marks(),
             )
-            .with_parallel(app.parallel_runtime()),
+            .with_parallel(app.parallel_runtime())
+            // The supervisor's own task handle is the active-limit gate's
+            // lifetime. Binding it here — the same handle run control dispatches
+            // through — is what makes admission and eligibility one decision.
+            .with_run_boundary(supervisor.clone()),
         )
     };
     // One store, three readers: the start guard, the operator service that
@@ -594,6 +630,10 @@ async fn run_tui_loop(
             ))
             .await;
         runtime.bind_worktrees(worktree_port).await;
+        // Same handle, same decision: the snapshot cannot advertise a retry the
+        // services would refuse, and cannot keep advertising the block once the
+        // owning scheduler task exits.
+        ws.set_run_boundary(supervisor.clone()).await;
     }
 
     // Cancellation token for graceful shutdown
@@ -851,6 +891,13 @@ async fn run_tui_loop(
                         }
                     }
 
+                    // The interaction expressed intent; the shared service owns
+                    // the write. Draining here — target-scoped, under the same
+                    // guard event reconciliation takes — is what stops a stale
+                    // cached row from resurrecting a mark a concurrent event
+                    // already revoked.
+                    apply_pending_mark_writes(&mut app, &operator_service).await;
+
                     // Check if app should quit (set by Ctrl+C)
                     if app.should_quit {
                         break;
@@ -879,7 +926,13 @@ async fn run_tui_loop(
         // frontend's own state — not a second reducer write per frontend and not
         // a hand-picked subset forwarded to the web projection.
         while let Ok(event) = rx.try_recv() {
-            crate::events::dispatch_event(&shared_state, &local_event_sinks, event.clone()).await;
+            crate::events::dispatch_event_with_marks(
+                &shared_state,
+                &local_event_sinks,
+                event.clone(),
+                Some(&mark_reconciler),
+            )
+            .await;
             sync_reducer_display_caches(&mut app, &shared_state, &event).await;
 
             // Painting only: an orchestrator event never produces a command. The
@@ -921,6 +974,25 @@ async fn run_tui_loop(
         // The eligibility set is a TUI observation, so it is republished once
         // per frame instead of at every place the TUI can change it.
         app.publish_parallel_runtime();
+
+        // Active Apply-ceiling eligibility, from the one shared query. The gate
+        // is retired by scheduler-task exit rather than by clearing the record,
+        // so this frame is where the TUI observes that liveness transition. Only
+        // a real change publishes, which makes it exactly one authoritative
+        // `/api/v2` revision instead of one per frame.
+        {
+            let limited =
+                crate::orchestration::operator_command::active_apply_iteration_limited_ids(
+                    &*shared_state.read().await,
+                    Some(supervisor.as_ref()),
+                );
+            if app.sync_active_apply_iteration_limits(&limited) {
+                #[cfg(feature = "web-monitoring")]
+                if let Some(ref ws) = web_state {
+                    ws.sync_remote_control_projection().await;
+                }
+            }
+        }
 
         publish_lifecycle_state(&app);
 
@@ -1257,6 +1329,7 @@ mod tests {
         // The operator marked this change for execution; a stop must not clear
         // the mark, because F5 resume is what converts it back into intent.
         app.changes[0].selected = true;
+        app.publish_execution_marks();
 
         let accepting = ExecutionEvent::AcceptanceStarted {
             change_id: "change-a".to_string(),

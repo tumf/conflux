@@ -10191,8 +10191,9 @@ async fn test_reject_wait_lane_clear_promotion_starts_rejection_review() {
 
     let mut saw_rejecting_status = false;
     let mut saw_review_completed = false;
+    let mut emitted = Vec::new();
     while let Ok(event) = rx.try_recv() {
-        match event {
+        match &event {
             ExecutionEvent::WorkspaceStatusUpdated {
                 change_id: id,
                 status: WorkspaceStatus::Rejecting,
@@ -10205,6 +10206,18 @@ async fn test_reject_wait_lane_clear_promotion_starts_rejection_review() {
                 saw_review_completed = true;
             }
             _ => {}
+        }
+        emitted.push(event);
+    }
+    // A rejection-review *failure* is a mark-revoking transition, so the producer
+    // no longer pre-applies it: only the authoritative dispatcher may, because
+    // only there is the reducer edge visible. Stand in for that dispatcher here.
+    {
+        let mut guard = shared.write().await;
+        for event in &emitted {
+            if matches!(event, ExecutionEvent::RejectionReviewFailed { .. }) {
+                guard.apply_execution_event(event);
+            }
         }
     }
 
@@ -10289,14 +10302,27 @@ async fn test_reject_wait_lane_clear_promotes_only_one_waiter() {
     executor.retry_deferred_base_lane_waiters().await;
 
     let mut rejecting_updates = Vec::new();
+    let mut emitted = Vec::new();
     while let Ok(event) = rx.try_recv() {
         if let ExecutionEvent::WorkspaceStatusUpdated {
             change_id,
             status: WorkspaceStatus::Rejecting,
             ..
-        } = event
+        } = &event
         {
-            rejecting_updates.push(change_id);
+            rejecting_updates.push(change_id.clone());
+        }
+        emitted.push(event);
+    }
+    // The authoritative dispatcher owns the `RejectionReviewFailed` transition;
+    // the producer must not pre-apply it, or the mark-revoking edge would be
+    // invisible where marks are reconciled.
+    {
+        let mut guard = shared.write().await;
+        for event in &emitted {
+            if matches!(event, ExecutionEvent::RejectionReviewFailed { .. }) {
+                guard.apply_execution_event(event);
+            }
         }
     }
 

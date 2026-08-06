@@ -56,7 +56,6 @@ pub(super) fn update_changes_with_rejected(
 
             if was_rejected && !rejected_ids.contains(&fetched.id) {
                 existing.set_display_status_cache("not queued");
-                existing.selected = false;
             }
 
             let (completed, total) = if let Some(shared_state) = &state.shared_orchestrator_state {
@@ -128,7 +127,6 @@ pub(super) fn update_changes_with_rejected(
                 existing.completed_tasks = completed;
                 existing.total_tasks = total;
             }
-            existing.selected = false;
             existing.set_display_status_cache("rejected");
         }
     }
@@ -144,7 +142,6 @@ pub(super) fn update_changes_with_rejected(
         if let Some(rejected) = rejected_changes.iter().find(|c| &c.id == id) {
             let mut rejected_state = ChangeState::from_change(rejected);
             rejected_state.is_new = false;
-            rejected_state.selected = false;
             rejected_state.set_display_status_cache("rejected");
             state.changes.push(rejected_state);
         }

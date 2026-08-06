@@ -69,6 +69,7 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
+            apply_iteration_limit_active: false,
         };
 
         assert!(is_change_in_active_state(&active));
@@ -90,6 +91,7 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
+            apply_iteration_limit_active: false,
         };
 
         assert!(!is_change_in_active_state(&inactive));
@@ -116,6 +118,7 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
+            apply_iteration_limit_active: false,
         };
 
         assert!(is_change_in_active_state(&preparing));

@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::ai_command_runner::RunCommandScope;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
+use crate::orchestration::mark_reconciliation::ExecutionMarkReconciler;
 use crate::orchestration::run_control::RunSchedulerPort;
 use crate::orchestration::state::OrchestratorState;
 use crate::parallel::PostArchiveAction;
@@ -46,6 +47,13 @@ struct LaunchContext {
     manual_resolve_counter: Arc<std::sync::atomic::AtomicUsize>,
     post_archive_action: PostArchiveAction,
     upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
+    /// The process-local execution-mark reconciler a spawned run's dispatch owner
+    /// binds.
+    ///
+    /// The *same* handle the operator command service mutates. A run that bound
+    /// its own store would give `/api/v2` and the TUI two different answers to
+    /// "which targets are marked".
+    marks: Option<ExecutionMarkReconciler>,
     #[cfg(feature = "web-monitoring")]
     web_state: Option<Arc<crate::web::WebState>>,
 }
@@ -79,6 +87,7 @@ impl TuiRunSupervisor {
         post_archive_action: PostArchiveAction,
         upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
         graceful_stop: Arc<AtomicBool>,
+        marks: Option<ExecutionMarkReconciler>,
         #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
     ) -> Self {
         Self {
@@ -91,6 +100,7 @@ impl TuiRunSupervisor {
                 manual_resolve_counter,
                 post_archive_action,
                 upstream_runtime,
+                marks,
                 #[cfg(feature = "web-monitoring")]
                 web_state,
             },
@@ -141,6 +151,7 @@ impl TuiRunSupervisor {
         let manual_resolve_counter = self.launch.manual_resolve_counter.clone();
         let post_archive_action = self.launch.post_archive_action.clone();
         let upstream_runtime = self.launch.upstream_runtime.clone();
+        let marks = self.launch.marks.clone();
         let graceful_stop = self.graceful_stop.clone();
         let run_cancel = cancel.clone();
         let run_scope = scope.clone();
@@ -162,6 +173,7 @@ impl TuiRunSupervisor {
                 manual_resolve_counter,
                 post_archive_action,
                 upstream_runtime,
+                marks,
                 #[cfg(feature = "web-monitoring")]
                 web_state,
             )
@@ -254,6 +266,7 @@ mod tests {
             PostArchiveAction::MergeToBase,
             upstream_runtime,
             Arc::new(AtomicBool::new(false)),
+            None,
             #[cfg(feature = "web-monitoring")]
             None,
         )

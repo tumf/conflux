@@ -21,6 +21,7 @@ use crate::archive_layout;
 use crate::error::{OrchestratorError, Result};
 use crate::task_parser;
 use crate::vcs::git::commands as git_commands;
+use crate::vcs::git::commands::status_policy::{read_only_status_argv, PORCELAIN_STATUS_ARGS};
 use crate::vcs::VcsBackend;
 
 /// Maximum number of archive retries after a verification failure.
@@ -123,7 +124,7 @@ pub async fn is_archive_commit_complete(change_id: &str, base_path: Option<&Path
 
     // Check if working tree is clean
     let status_output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(read_only_status_argv(PORCELAIN_STATUS_ARGS))
         .current_dir(repo_root)
         .output()
         .await
@@ -219,7 +220,7 @@ fn tail_text(text: &str, max_lines: usize) -> Option<String> {
 
 async fn git_status_porcelain(repo_root: &Path) -> Result<String> {
     let status_output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(read_only_status_argv(PORCELAIN_STATUS_ARGS))
         .current_dir(repo_root)
         .output()
         .await

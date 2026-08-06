@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::orchestration::operator_command::{
-    OperatorCommandError, OperatorCommandService, OperatorMode, RetryPlan,
+    OperatorCommandError, OperatorCommandService, OperatorMode, RetryPlan, RunBoundaryLiveness,
 };
 use crate::orchestration::state::{OrchestratorState, ReduceOutcome, ReducerCommand};
 use crate::tui::stop_classification::{StopActivitySnapshot, StopClassification};
@@ -410,6 +410,19 @@ pub trait RunSchedulerPort: Send + Sync {
     async fn stop_activity(&self) -> StopActivitySnapshot;
 }
 
+/// Every scheduler port is the liveness authority for its own boundary.
+///
+/// The active Apply-limit gate is retired by scheduler-task exit and by nothing
+/// else, so the handle that decides whether a dispatch notifies or starts is the
+/// same handle that decides whether a retry is admitted. Deriving the trait here
+/// rather than binding a second flag is what makes those two decisions incapable
+/// of disagreeing.
+impl<T: RunSchedulerPort + ?Sized> RunBoundaryLiveness for T {
+    fn boundary_running(&self) -> bool {
+        RunSchedulerPort::is_running(self)
+    }
+}
+
 // ============================================================================
 // Service
 // ============================================================================
@@ -577,6 +590,12 @@ impl RunControlService {
     // ------------------------------------------------------------------
 
     /// Retry one change and prove the scheduler picked the work up.
+    ///
+    /// Admission happens inside the per-change service and therefore *before*
+    /// this method can reach [`Self::dispatch_retry`]: a target whose exhausted
+    /// Apply ceiling is still owned by a live boundary returns the typed refusal
+    /// here, so no reducer transition, no explicit-retry edge, and no scheduler
+    /// notify or start ever happens for it.
     pub async fn retry_change(&self, change_id: &str) -> RunControlResult<RunControlOutcome> {
         let plan = self.operator.retry_change(change_id).await?;
         self.dispatch_retry(plan).await
@@ -585,7 +604,11 @@ impl RunControlService {
     /// Retry every change in `change_ids` that carries retryable evidence.
     ///
     /// Changes without retryable evidence are skipped, so a bulk retry never
-    /// consumes an unsupported hold or destroys its blocker evidence.
+    /// consumes an unsupported hold or destroys its blocker evidence. A target
+    /// whose active run owns its exhausted Apply ceiling is skipped the same way,
+    /// which keeps the request partial rather than global: when every candidate
+    /// is skipped the plan is empty and the scheduler is neither woken nor
+    /// started.
     pub async fn retry_errors(&self, change_ids: &[String]) -> RunControlResult<RunControlOutcome> {
         let plan = self.operator.retry_errors(change_ids).await;
         self.dispatch_retry(plan).await

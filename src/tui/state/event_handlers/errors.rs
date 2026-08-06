@@ -10,7 +10,6 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             change.set_error_message_cache(error.clone());
-            change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -24,7 +23,6 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_error_message_cache(error.clone());
-            change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -39,7 +37,6 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_error_message_cache(error.clone());
-            change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -94,7 +91,6 @@ impl AppState {
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                 if change.display_status_cache != "merged" {
                     change.set_display_status_cache("merge wait");
-                    change.selected = false;
                     if let Some(started) = change.started_at {
                         change.elapsed_time = Some(started.elapsed());
                     }
@@ -367,8 +363,16 @@ mod tests {
         app.execution_mode = AppExecutionMode::Running;
         app.current_change = Some("test-change".to_string());
         app.changes[0].selected = true;
+        app.publish_execution_marks();
 
-        app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
+        // The authoritative dispatcher revokes the mark before this frontend
+        // sees the event; the row follows the store rather than deciding for
+        // itself.
+        app.execution_marks().set("test-change", false);
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingError {
+            id: "test-change".to_string(),
+            error: "Test error message".to_string(),
+        });
 
         assert_eq!(app.execution_mode, AppExecutionMode::Running);
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
@@ -385,8 +389,13 @@ mod tests {
 
         app.execution_mode = AppExecutionMode::Select;
         app.changes[0].selected = true;
+        app.publish_execution_marks();
 
-        app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
+        app.execution_marks().set("test-change", false);
+        app.handle_orchestrator_event(OrchestratorEvent::ProcessingError {
+            id: "test-change".to_string(),
+            error: "Test error message".to_string(),
+        });
 
         assert_eq!(app.execution_mode, AppExecutionMode::Select);
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();

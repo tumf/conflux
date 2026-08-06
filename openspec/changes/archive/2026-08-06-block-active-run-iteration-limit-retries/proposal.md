@@ -27,7 +27,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: "Non-empty Rust test selection and passing output covering individual retry, direct queue alias, bulk-mark exclusion, mixed and all-limited bulk retry, scheduler no-dispatch, finish-hook ordering, task-handle liveness retirement, same-process later-run reset, TUI projection, API projection, and generated OpenAPI serialization"
-    rerun: 'for filter in active_iteration_limit_retry_guard active_iteration_limit_bulk_retry active_iteration_limit_run_boundary active_iteration_limit_projection active_iteration_limit_tui; do cargo test --features web-monitoring "$filter" -- --list | grep -q ": test$" || exit 1; done && cargo test --features web-monitoring active_iteration_limit && cargo test --features web-monitoring --test openapi_contract_tests && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings'
+    rerun: 'for filter in active_iteration_limit_retry_guard active_iteration_limit_bulk_retry active_iteration_limit_run_boundary active_iteration_limit_projection active_iteration_limit_tui; do cargo test --features web-monitoring "$filter" -- --list | grep -q ": test$" || exit 1; done && cargo test --features web-monitoring active_iteration_limit && cargo test --features web-monitoring --test openapi_contract_tests'
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking

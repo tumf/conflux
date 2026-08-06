@@ -4,6 +4,7 @@
 //! and managing merge-related operations.
 
 use super::basic::{get_conflict_files, is_working_directory_clean, run_git};
+use super::status_policy::{read_only_status_argv, PORCELAIN_UNTRACKED_STATUS_ARGS};
 use crate::vcs::{VcsError, VcsResult};
 use std::path::Path;
 use std::process::Stdio;
@@ -629,8 +630,11 @@ pub async fn commit_diff_entries<P: AsRef<Path>>(
 
 /// Check whether the index and working tree exactly match `HEAD`, untracked
 /// files included.
+///
+/// Read-only, so it runs under the shared optional-lock policy: see
+/// [`crate::vcs::git::commands::status_policy`].
 pub async fn is_clean_including_untracked<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
-    let output = run_git(&["status", "--porcelain", "--untracked-files=normal"], cwd).await?;
+    let output = run_git(&read_only_status_argv(PORCELAIN_UNTRACKED_STATUS_ARGS), cwd).await?;
     Ok(output.trim().is_empty())
 }
 

@@ -101,6 +101,13 @@ impl BulkToggleSnapshot {
     }
 }
 
+/// Operator-facing explanation shown wherever retry guidance is suppressed.
+///
+/// Stable text: it names the condition and what ends it, and never promises a
+/// key the service would refuse.
+pub(crate) const ACTIVE_APPLY_LIMIT_EXPLANATION: &str =
+    "at the active run's Apply iteration limit; retry becomes available after that run closes";
+
 /// Classifies a single change for bulk toggle; `None` means eligible.
 pub(super) fn classify_bulk_toggle_change(
     mode: AppExecutionMode,
@@ -110,6 +117,7 @@ pub(super) fn classify_bulk_toggle_change(
         mode.operator_mode(),
         &change.display_status_cache,
         change.parallel_eligibility,
+        change.apply_iteration_limit_active,
     )
 }
 
@@ -124,6 +132,7 @@ pub(super) fn build_bulk_toggle_snapshot(
             change_id: &change.id,
             display_status: &change.display_status_cache,
             parallel_eligibility: change.parallel_eligibility,
+            apply_iteration_limit_active: change.apply_iteration_limit_active,
             marked: change.selected,
         })
         .collect();
@@ -197,6 +206,11 @@ pub(super) fn toggle_all_marks(state: &mut AppState) -> Vec<TuiCommand> {
         }
 
         state.changes[index].selected = snapshot.target_state;
+        // One target, one write. The whole-row publish this replaced derived the
+        // store from every cached row, so a row a concurrent event had already
+        // invalidated came back marked.
+        let toggled_id = state.changes[index].id.clone();
+        state.request_mark_write(&toggled_id, snapshot.target_state);
         // Clear NEW flag when user interacts with the change
         if state.changes[index].is_new {
             state.changes[index].is_new = false;
@@ -244,9 +258,6 @@ pub(super) fn toggle_all_marks(state: &mut AppState) -> Vec<TuiCommand> {
     }
     state.add_log(LogEntry::info(summary));
 
-    // Keep the shared process-local mark store in sync with the TUI projection.
-    state.publish_execution_marks();
-
     commands
 }
 
@@ -263,6 +274,18 @@ pub(super) fn toggle_selection(state: &mut AppState) -> Option<TuiCommand> {
 
     {
         let change = &state.changes[state.cursor_index];
+        // Ahead of the optimistic mark flip below: in Running mode this row's
+        // mark *is* the terminal-error queue alias the shared service refuses,
+        // and in every mode a retry mark for it promises work that cannot
+        // dispatch. Clearing is suppressed too, so the row's intent stays exactly
+        // as the limited run left it.
+        if change.apply_iteration_limit_active {
+            state.warning_message = Some(format!(
+                "'{}' is {ACTIVE_APPLY_LIMIT_EXPLANATION}",
+                change.id
+            ));
+            return None;
+        }
         if let guards::ToggleGuardResult::Blocked(msg) = guards::validate_change_toggleable(
             change.parallel_eligibility,
             &change.display_status_cache,
@@ -274,6 +297,8 @@ pub(super) fn toggle_selection(state: &mut AppState) -> Option<TuiCommand> {
     }
 
     let mode = state.execution_mode;
+    let target_id = state.changes[state.cursor_index].id.clone();
+    let was_marked = state.changes[state.cursor_index].selected;
     let mut new_change_count = state.new_change_count;
     let result = {
         let change = &mut state.changes[state.cursor_index];
@@ -294,9 +319,13 @@ pub(super) fn toggle_selection(state: &mut AppState) -> Option<TuiCommand> {
     state.new_change_count = new_change_count;
 
     let command = dispatch_toggle_result(state, result);
-    // Keep the shared process-local mark store in sync with the TUI projection so
-    // other operator frontends observe the same intent.
-    state.publish_execution_marks();
+    // Target-scoped, and only when this row's mark actually moved: the shared
+    // store belongs to every frontend, so one interaction must never republish
+    // this frontend's whole cached row set over it.
+    let now_marked = state.changes[state.cursor_index].selected;
+    if now_marked != was_marked {
+        state.request_mark_write(&target_id, now_marked);
+    }
     command
 }
 
@@ -366,6 +395,7 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
+            apply_iteration_limit_active: false,
         }
     }
 
@@ -540,6 +570,134 @@ mod tests {
         assert!(snapshot.excluded.is_empty());
         assert!(!snapshot.target_state);
         assert_eq!(snapshot.exclusion_summary(), "");
+    }
+
+    /// A row already gated by the active run's Apply ceiling.
+    fn limited_error_row(id: &str) -> ChangeState {
+        let mut change = make_change_state(id, "error", true);
+        change.apply_iteration_limit_active = true;
+        change
+    }
+
+    /// Unit: the limited row is excluded before any eligible row is mutated, so
+    /// the terminal-error alias guard can never abort a partially applied bulk
+    /// operation.
+    #[test]
+    fn active_iteration_limit_tui_bulk_selection_excludes_the_limited_row() {
+        let changes = vec![
+            limited_error_row("limited"),
+            make_change_state("eligible", "not queued", true),
+        ];
+
+        let snapshot = build_bulk_toggle_snapshot(AppExecutionMode::Running, &changes);
+
+        assert_eq!(
+            snapshot.eligible,
+            vec![1],
+            "only the eligible row is a target"
+        );
+        assert_eq!(
+            snapshot.excluded,
+            vec![(
+                "limited".to_string(),
+                BulkToggleExclusion::ApplyIterationLimitActive
+            )]
+        );
+        assert_eq!(
+            BulkToggleExclusion::ApplyIterationLimitActive.as_str(),
+            "apply_iteration_limit_active"
+        );
+        assert!(snapshot
+            .exclusion_summary()
+            .contains("Apply iteration limit"));
+    }
+
+    /// Unit: `x` mutates the eligible rows and leaves the limited row's mark and
+    /// queue intent exactly as the run left them.
+    #[test]
+    fn active_iteration_limit_tui_bulk_toggle_leaves_the_limited_row_untouched() {
+        let mut state = AppState::new(Vec::new());
+        state.execution_mode = AppExecutionMode::Running;
+        state.changes = vec![
+            limited_error_row("limited"),
+            make_change_state("eligible", "not queued", true),
+        ];
+
+        let commands = toggle_all_marks(&mut state);
+
+        assert!(
+            !state.changes[0].selected,
+            "the limited row is never marked"
+        );
+        assert!(state.changes[1].selected, "eligible rows still apply");
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [TuiCommand::AddToQueue(id)] if id == "eligible"
+            ),
+            "no queue command is emitted for the limited row: {commands:?}"
+        );
+    }
+
+    /// Unit: row `Space` produces no optimistic flip and no command, in either
+    /// direction, for a limited row.
+    #[test]
+    fn active_iteration_limit_tui_space_produces_no_mark_and_no_command() {
+        for already_marked in [false, true] {
+            let mut state = AppState::new(Vec::new());
+            state.execution_mode = AppExecutionMode::Running;
+            let mut row = limited_error_row("limited");
+            row.selected = already_marked;
+            state.changes = vec![row];
+            state.cursor_index = 0;
+
+            let command = toggle_selection(&mut state);
+
+            assert!(
+                command.is_none(),
+                "no queue or retry command may be emitted"
+            );
+            assert_eq!(
+                state.changes[0].selected, already_marked,
+                "the mark is neither created nor cleared"
+            );
+            let warning = state
+                .warning_message
+                .as_deref()
+                .expect("the refusal is never silent");
+            assert!(
+                warning.contains("Apply iteration limit"),
+                "the operator gets the stable condition: {warning}"
+            );
+        }
+    }
+
+    /// Unit: eligibility returns once the owning scheduler task exits.
+    #[test]
+    fn active_iteration_limit_tui_eligibility_returns_after_task_exit() {
+        let mut state = AppState::new(Vec::new());
+        state.execution_mode = AppExecutionMode::Running;
+        state.changes = vec![limited_error_row("limited")];
+        state.cursor_index = 0;
+
+        let limited: std::collections::HashSet<String> =
+            std::iter::once("limited".to_string()).collect();
+        assert!(
+            !state.sync_active_apply_iteration_limits(&limited),
+            "an unchanged eligibility set publishes nothing"
+        );
+        assert!(
+            state.sync_active_apply_iteration_limits(&std::collections::HashSet::new()),
+            "the liveness transition is reported exactly once"
+        );
+        assert!(!state.has_active_apply_iteration_limit());
+
+        let command = toggle_selection(&mut state);
+        assert!(
+            matches!(&command, Some(TuiCommand::AddToQueue(id)) if id == "limited"),
+            "the ordinary queue-intent route returns: {command:?}"
+        );
+        assert!(state.changes[0].selected);
     }
 
     #[test]

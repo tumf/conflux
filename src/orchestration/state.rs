@@ -865,6 +865,19 @@ impl OrchestratorState {
         &self.apply_iteration_limits
     }
 
+    /// The typed Apply-dispatch ceiling record for one change, if it has one.
+    ///
+    /// Record presence alone is *not* the retry gate: this reducer is active-run
+    /// memory that outlives the boundary which wrote it, so the caller must pair
+    /// this with the owning scheduler task's liveness. See
+    /// [`crate::orchestration::operator_command::active_apply_iteration_limit`],
+    /// the one query every admission and projection path goes through.
+    pub fn apply_iteration_limit(&self, change_id: &str) -> Option<&ApplyIterationLimit> {
+        self.apply_iteration_limits
+            .iter()
+            .find(|record| record.change_id == change_id)
+    }
+
     /// Finish status and Apply count a parallel run reports to `on_finish`.
     ///
     /// Parallel execution has no `LoopControl` return path, so this reducer is
@@ -2531,6 +2544,26 @@ impl OrchestratorState {
                             );
                         }
                     }
+                }
+            }
+
+            // The `on_merged` hook owns the merged transition: while it fails the
+            // change is not merged, so the reducer records the merge-wait
+            // recovery state an operator has to act on. Recording it here is
+            // also what makes the recovery an *edge* — a replayed hook failure
+            // finds the row already in merge wait and changes nothing, so it
+            // cannot revoke an execution mark the operator set in the meantime.
+            ExecutionEvent::HookFailed {
+                change_id,
+                hook_type,
+                ..
+            } if hook_type == crate::hooks::HookType::OnMerged.config_key() => {
+                let rt = self.runtime_entry(change_id);
+                if !rt.is_terminal() && !rt.dequeued {
+                    rt.activity = ActivityState::Idle;
+                    rt.wait_state = WaitState::MergeWait;
+                    rt.queue_intent = QueueIntent::NotQueued;
+                    self.remove_from_resolve_wait_queue(change_id);
                 }
             }
 

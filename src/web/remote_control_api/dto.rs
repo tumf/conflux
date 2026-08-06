@@ -693,6 +693,12 @@ pub enum ActionBlockedReason {
     NotMergeWaiting,
     /// Worktree execution refuses a change that is not committed cleanly yet.
     ParallelIneligible,
+    /// The active run owns this change's exhausted Apply-dispatch ceiling.
+    ///
+    /// Process-local and ephemeral: it is published only while typed
+    /// iteration-limit evidence exists *and* the owning scheduler task is live,
+    /// and it disappears when that task exits even though the record remains.
+    ApplyIterationLimitActive,
 }
 
 impl ActionBlockedReason {
@@ -713,6 +719,7 @@ impl ActionBlockedReason {
             // Both parallel refusals block the same actions; the reason they
             // differ on is published per change in `parallel.blocked_reason`.
             E::ParallelIneligible | E::ParallelProposalAbsent => Self::ParallelIneligible,
+            E::ApplyIterationLimitActive => Self::ApplyIterationLimitActive,
         }
     }
 }

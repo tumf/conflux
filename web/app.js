@@ -1822,7 +1822,13 @@ export class OperatorConsole {
   changeActions(change, groupKey) {
     const status = String(change.display_status ?? '').toLowerCase();
     const actions = [];
-    if (status === 'error' || status === 'stalled') {
+    // Retry is rendered from the server's per-change eligibility and from
+    // nothing else. `display_status`, the retained diagnostic, the log stream,
+    // and `iteration_number` are presentation: only the snapshot's `actions`
+    // block knows whether the shared service would admit the command, so an
+    // `error` row blocked by `apply_iteration_limit_active` gets no control at
+    // all rather than a control that would be refused.
+    if (change.actions?.retry_change?.allowed === true) {
       actions.push({
         id: `retry-${change.id}`,
         label: 'Retry',

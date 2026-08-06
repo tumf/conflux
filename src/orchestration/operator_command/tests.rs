@@ -174,6 +174,35 @@ impl QueuePort for FakeQueue {
     }
 }
 
+/// Scheduler-task liveness double.
+///
+/// Liveness is driven explicitly rather than by spawning a task, which is what
+/// keeps the boundary-ordering assertions deterministic and unit-scoped: no
+/// process, no timer, no join handle.
+#[derive(Debug, Default)]
+struct FakeBoundary {
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl FakeBoundary {
+    fn live() -> Self {
+        let boundary = Self::default();
+        boundary.set_running(true);
+        boundary
+    }
+
+    fn set_running(&self, running: bool) {
+        self.running
+            .store(running, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl RunBoundaryLiveness for FakeBoundary {
+    fn boundary_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 struct Fixture {
     service: OperatorCommandService,
     state: Arc<RwLock<OrchestratorState>>,
@@ -1549,6 +1578,7 @@ fn row<'a>(
         change_id,
         display_status,
         parallel_eligibility: eligibility(parallel_eligible),
+        apply_iteration_limit_active: false,
         marked,
     }
 }
@@ -1645,7 +1675,7 @@ fn bulk_mark_classification_reports_one_stable_reason_per_mode_and_status() {
 
     for (mode, status, eligible, expected) in cases {
         assert_eq!(
-            classify_bulk_mark_row(mode, status, eligibility(eligible)),
+            classify_bulk_mark_row(mode, status, eligibility(eligible), false),
             expected,
             "mode {mode:?}, status '{status}', eligible {eligible}"
         );
@@ -1709,12 +1739,14 @@ fn bulk_mark_names_the_eligibility_reason_it_actually_observed() {
             change_id: "dirty",
             display_status: "not queued",
             parallel_eligibility: ParallelEligibility::UncommittedProposalFiles,
+            apply_iteration_limit_active: false,
             marked: false,
         },
         MarkTargetRow {
             change_id: "absent",
             display_status: "queued",
             parallel_eligibility: ParallelEligibility::ProposalAbsentFromHead,
+            apply_iteration_limit_active: false,
             marked: false,
         },
         row("eligible", "not queued", true, false),
@@ -2033,7 +2065,8 @@ fn preparing_is_active_in_the_shared_lifecycle_matrix() {
         classify_bulk_mark_row(
             OperatorMode::Running,
             "preparing",
-            ParallelEligibility::Eligible
+            ParallelEligibility::Eligible,
+            false
         ),
         Some(MarkExclusion::ChangeActive)
     );
@@ -2088,4 +2121,380 @@ async fn preparing_is_active_and_a_refused_stop_retains_the_stop_mark() {
         queue.is_stopped("change-a").await,
         "the stop mark must survive the refusal so preparation cannot hand off to an agent"
     );
+}
+
+// ============================================================================
+// Active-run Apply iteration limit: admission guard (unit)
+// ============================================================================
+//
+// Every test here drives an in-memory reducer, an in-memory queue double, a
+// recording hook port, and an explicitly driven liveness flag. Nothing touches a
+// process, repository, clock, or network, so the whole family is unit evidence.
+
+/// Every mutation the retry paths can perform, captured at one instant.
+///
+/// Comparing the whole record before and after a refusal is what makes "no side
+/// effects" checkable rather than asserted one field at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MutationSnapshot {
+    display_status: String,
+    error_detail: Option<String>,
+    queue_intent_queued: bool,
+    marks: Vec<String>,
+    queue_contents: Vec<String>,
+    explicit_retries: Vec<String>,
+    hook_adds: Vec<String>,
+    hook_removes: Vec<String>,
+    notifications: usize,
+}
+
+/// Build a limited fixture: one terminal-error change at its Apply ceiling.
+async fn limited_fixture(ids: &[&str], limited: &[&str]) -> (Fixture, Arc<FakeBoundary>) {
+    let state = shared_state(ids);
+    let hooks = Arc::new(RecordingHooks::default());
+    let queue = Arc::new(FakeQueue::new(CancellationBehavior::ConfirmedImmediately));
+    let marks = Arc::new(ExecutionMarkStore::new());
+    let boundary = Arc::new(FakeBoundary::live());
+    let service =
+        OperatorCommandService::new(state.clone(), queue.clone(), hooks.clone(), marks.clone())
+            .with_cancellation_timeout(Duration::from_millis(50))
+            .with_run_boundary(boundary.clone());
+    {
+        let mut guard = state.write().await;
+        for change_id in limited {
+            guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+                id: (*change_id).to_string(),
+                error: "max iterations reached".to_string(),
+            });
+            guard.record_apply_iteration_limit(change_id, 50, 50);
+        }
+    }
+    (
+        Fixture {
+            service,
+            state,
+            hooks,
+            queue,
+            marks,
+        },
+        boundary,
+    )
+}
+
+impl Fixture {
+    async fn snapshot(&self, change_id: &str) -> MutationSnapshot {
+        let guard = self.state.read().await;
+        MutationSnapshot {
+            display_status: guard.display_status(change_id).to_string(),
+            error_detail: guard
+                .change_runtime(change_id)
+                .and_then(crate::orchestration::state::ChangeRuntimeState::error_message)
+                .map(str::to_string),
+            queue_intent_queued: matches!(
+                guard.change_runtime(change_id).map(|rt| &rt.queue_intent),
+                Some(crate::orchestration::state::QueueIntent::Queued)
+            ),
+            marks: self.marks.marked_ids(),
+            queue_contents: self.queue.contents.lock().expect("contents lock").clone(),
+            explicit_retries: self.queue.explicit_retries(),
+            hook_adds: self.hooks.adds(),
+            hook_removes: self.hooks.removes(),
+            notifications: *self.queue.notified.lock().expect("notified lock"),
+        }
+    }
+
+    async fn to_error(&self, change_id: &str) {
+        self.state
+            .write()
+            .await
+            .apply_execution_event(&ExecutionEvent::ProcessingError {
+                id: change_id.to_string(),
+                error: "boom".to_string(),
+            });
+    }
+}
+
+#[tokio::test]
+async fn active_iteration_limit_retry_guard_refuses_individual_retry_without_mutation() {
+    let (fixture, _boundary) = limited_fixture(&["limited"], &["limited"]).await;
+    let before = fixture.snapshot("limited").await;
+
+    let error = fixture
+        .service
+        .retry_change("limited")
+        .await
+        .expect_err("an active run owns the exhausted ceiling");
+
+    assert_eq!(
+        error,
+        OperatorCommandError::ApplyIterationLimitActive {
+            change_id: "limited".to_string(),
+            attempts: 50,
+            max: 50,
+        },
+        "the refusal carries the exact typed evidence, not prose"
+    );
+    assert!(
+        error.to_string().contains("50/50"),
+        "the operator-facing message names the exhausted count: {error}"
+    );
+    assert_eq!(
+        fixture.snapshot("limited").await,
+        before,
+        "a refused retry must leave every mutation axis byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
+async fn active_iteration_limit_retry_guard_blocks_the_terminal_error_queue_alias() {
+    let (fixture, _boundary) = limited_fixture(&["limited"], &["limited"]).await;
+    let before = fixture.snapshot("limited").await;
+
+    let error = fixture
+        .service
+        .add_to_queue("limited")
+        .await
+        .expect_err("queue addition may not alias a refused retry");
+    assert!(matches!(
+        error,
+        OperatorCommandError::ApplyIterationLimitActive { .. }
+    ));
+
+    // `set_queue_intent=true` reaches the service through the mark route in
+    // Running mode; it must be refused by the same guard.
+    let mark_error = fixture
+        .service
+        .set_execution_mark(OperatorMode::Running, "limited", true)
+        .await
+        .expect_err("the mark route must not become a bypass");
+    assert!(matches!(
+        mark_error,
+        OperatorCommandError::ApplyIterationLimitActive { .. }
+    ));
+
+    assert_eq!(
+        fixture.snapshot("limited").await,
+        before,
+        "neither alias may release the failed classification or touch the queue"
+    );
+}
+
+#[tokio::test]
+async fn active_iteration_limit_retry_guard_leaves_ordinary_retry_unchanged() {
+    let (fixture, _boundary) = limited_fixture(&["limited", "ordinary"], &["limited"]).await;
+    fixture.to_error("ordinary").await;
+
+    let plan = fixture
+        .service
+        .retry_change("ordinary")
+        .await
+        .expect("an unrelated terminal error is still retryable");
+
+    assert_eq!(plan.change_ids, vec!["ordinary".to_string()]);
+    assert_eq!(plan.routes, vec![RetryRoute::TerminalError]);
+    assert_eq!(
+        fixture.queue.explicit_retries(),
+        vec!["ordinary".to_string()],
+        "only the admitted target releases its failed classification"
+    );
+}
+
+#[tokio::test]
+async fn active_iteration_limit_retry_guard_excludes_limited_rows_from_bulk_marks() {
+    let (fixture, _boundary) = limited_fixture(&["limited", "ordinary"], &["limited"]).await;
+    let before = fixture.snapshot("limited").await;
+
+    let outcome = fixture
+        .service
+        .set_all_execution_marks(OperatorMode::Running)
+        .await
+        .expect("Running mode admits bulk marks");
+
+    match outcome {
+        OperatorOutcome::BulkMarks {
+            marked,
+            changed,
+            excluded,
+        } => {
+            assert!(marked, "an unmarked eligible row means mark-all");
+            assert!(
+                changed.contains(&"ordinary".to_string()),
+                "eligible rows still apply atomically: {changed:?}"
+            );
+            assert!(
+                !changed.contains(&"limited".to_string()),
+                "the limited row is never mutated: {changed:?}"
+            );
+            assert_eq!(
+                excluded,
+                vec![(
+                    "limited".to_string(),
+                    MarkExclusion::ApplyIterationLimitActive
+                )],
+                "the exclusion carries the stable token"
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+
+    let after = fixture.snapshot("limited").await;
+    assert_eq!(after.display_status, before.display_status);
+    assert_eq!(after.error_detail, before.error_detail);
+    assert_eq!(after.queue_intent_queued, before.queue_intent_queued);
+    assert_eq!(
+        after.explicit_retries, before.explicit_retries,
+        "a bulk mark must not publish an explicit-retry edge for a limited row"
+    );
+    assert!(
+        !after.marks.contains(&"limited".to_string()),
+        "the limited row keeps its mark exactly as the run left it"
+    );
+    assert_eq!(
+        MarkExclusion::ApplyIterationLimitActive.as_str(),
+        APPLY_ITERATION_LIMIT_ACTIVE
+    );
+}
+
+#[tokio::test]
+async fn active_iteration_limit_run_boundary_retires_the_gate_without_clearing_the_record() {
+    let (fixture, boundary) = limited_fixture(&["limited"], &["limited"]).await;
+
+    assert!(
+        fixture
+            .service
+            .active_apply_iteration_limit("limited")
+            .await
+            .is_some(),
+        "a live boundary owning typed evidence is an active gate"
+    );
+
+    // Task exit: the record deliberately stays, because the finish hook still
+    // has to be able to read it.
+    boundary.set_running(false);
+
+    assert_eq!(
+        fixture
+            .service
+            .active_apply_iteration_limit("limited")
+            .await,
+        None,
+        "scheduler-task exit retires the gate"
+    );
+    assert_eq!(
+        fixture.state.read().await.apply_iteration_limit("limited"),
+        Some(&crate::orchestration::state::ApplyIterationLimit {
+            change_id: "limited".to_string(),
+            attempts: 50,
+            max: 50,
+        }),
+        "retirement must not clear the typed record"
+    );
+    assert_eq!(
+        fixture.state.read().await.parallel_finish_report(),
+        ("iteration_limit", 50),
+        "the sole finish-hook owner still observes the exact cumulative count"
+    );
+
+    let plan = fixture
+        .service
+        .retry_change("limited")
+        .await
+        .expect("a closed boundary admits the ordinary retry route");
+    assert_eq!(plan.change_ids, vec!["limited".to_string()]);
+}
+
+#[tokio::test]
+async fn active_iteration_limit_run_boundary_is_absent_without_a_bound_boundary() {
+    // Headless `cflx run`: typed evidence exists, no command-capable boundary is
+    // bound, so record presence alone is never an active gate.
+    let fixture = fixture(&["limited"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "limited".to_string(),
+            error: "max iterations reached".to_string(),
+        });
+        guard.record_apply_iteration_limit("limited", 50, 50);
+    }
+
+    assert_eq!(
+        fixture
+            .service
+            .active_apply_iteration_limit("limited")
+            .await,
+        None
+    );
+    assert!(fixture
+        .service
+        .active_apply_iteration_limited_ids()
+        .await
+        .is_empty());
+    assert_eq!(
+        fixture.state.read().await.parallel_finish_report(),
+        ("iteration_limit", 50),
+        "the headless finish-hook owner keeps its typed evidence regardless"
+    );
+}
+
+#[tokio::test]
+async fn active_iteration_limit_bulk_retry_is_partial() {
+    let (fixture, _boundary) =
+        limited_fixture(&["limited", "ordinary", "held"], &["limited"]).await;
+    fixture.to_error("ordinary").await;
+    fixture
+        .state
+        .write()
+        .await
+        .apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "held".to_string(),
+            blocker: acceptance_blocker(),
+        });
+    let before = fixture.snapshot("limited").await;
+
+    let plan = fixture
+        .service
+        .retry_errors(&[
+            "limited".to_string(),
+            "ordinary".to_string(),
+            "held".to_string(),
+        ])
+        .await;
+
+    assert_eq!(
+        plan.change_ids,
+        vec!["ordinary".to_string(), "held".to_string()],
+        "only the admitted targets are reported as accepted"
+    );
+    assert!(
+        !plan.change_ids.contains(&"limited".to_string()),
+        "a limited target is never claimed accepted"
+    );
+    assert_eq!(
+        fixture.queue.explicit_retries(),
+        vec!["ordinary".to_string()],
+        "each admitted terminal error is dispatched exactly once"
+    );
+
+    let after = fixture.snapshot("limited").await;
+    assert_eq!(after.display_status, before.display_status);
+    assert_eq!(after.error_detail, before.error_detail);
+    assert_eq!(after.queue_intent_queued, before.queue_intent_queued);
+    assert!(!after.marks.contains(&"limited".to_string()));
+}
+
+#[tokio::test]
+async fn active_iteration_limit_bulk_retry_is_a_no_op_when_every_candidate_is_limited() {
+    let (fixture, _boundary) = limited_fixture(&["a", "b"], &["a", "b"]).await;
+    let before_a = fixture.snapshot("a").await;
+    let before_b = fixture.snapshot("b").await;
+
+    let plan = fixture
+        .service
+        .retry_errors(&["a".to_string(), "b".to_string()])
+        .await;
+
+    assert!(plan.is_empty(), "an all-limited request accepts nothing");
+    assert!(!plan.explicit_retry);
+    assert_eq!(fixture.snapshot("a").await, before_a);
+    assert_eq!(fixture.snapshot("b").await, before_b);
 }

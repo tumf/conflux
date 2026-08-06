@@ -6,10 +6,13 @@
 //! - `commit`: Commit-related operations
 //! - `worktree`: Worktree management
 //! - `merge`: Merge operations and conflict detection
+//! - `status_policy`: the read-only `git status` optional-lock policy every
+//!   Conflux-owned status observation is built from
 
 pub mod basic;
 pub mod commit;
 pub mod merge;
+pub mod status_policy;
 pub mod worktree;
 
 // Re-export all public functions from submodules for backward compatibility

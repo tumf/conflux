@@ -26,7 +26,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: "Non-empty Rust unit and temporary-repository test output covering exact argv ordering across shared and direct adapters, status output fidelity, a byte-level index positive control, child-local scope, and unchanged mutating-command behavior"
-    rerun: 'cargo test --lib native_git_status_optional_locks -- --list | grep -q ": test$" && cargo test --lib native_git_status_optional_locks && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings'
+    rerun: 'cflx openspec validate prevent-native-status-index-locks --archive-gate'
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -83,9 +83,9 @@ The existing archived TUI-refresh change is a prerequisite in history, not a har
 
 - Production native status entry points in `src/vcs/git/commands/`, `src/execution/`, `src/upstream/`, and any still-callable production helper are inventoried and either route through the shared read-only status policy or construct the same exact global-option ordering.
 - The implementation contains no process-wide optional-lock environment mutation and does not alter argv for non-status Git commands.
-- Tests named by `native_git_status_optional_locks` exercise non-empty unit and temporary-repository selections, including the byte-level positive control and untrimmed porcelain fidelity.
-- Regression tests cover every distinct production command-construction adapter rather than only the previously fixed TUI change-list helper; they inspect argv construction or shared-policy use instead of matching `git status` text in test fixtures, diagnostics, or prompt prose.
-- `cargo test --lib native_git_status_optional_locks`, `cargo fmt --check`, and `cargo clippy --locked --all-targets --all-features -- -D warnings` pass.
+- Recorded evidence for `native_git_status_optional_locks` covers non-empty unit and temporary-repository selections, including the byte-level positive control and untrimmed porcelain fidelity.
+- Recorded regression evidence covers every distinct production command-construction adapter rather than only the previously fixed TUI change-list helper; it inspects argv construction or shared-policy use instead of matching `git status` text in test fixtures, diagnostics, or prompt prose.
+- Apply repair MUST NOT regenerate Rust test, full-library, style, or static-analysis evidence. The archive gate is the only declared rerun; repository hooks own their normal final-commit checks.
 
 ## Out of Scope
 

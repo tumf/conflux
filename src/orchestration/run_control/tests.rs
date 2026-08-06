@@ -70,13 +70,19 @@ impl Harness {
             10,
         )));
         let marks = Arc::new(ExecutionMarkStore::new());
-        let operator = Arc::new(OperatorCommandService::new(
-            state.clone(),
-            Arc::new(FakeQueue::default()),
-            Arc::new(NoopQueueHooks),
-            marks.clone(),
-        ));
         let scheduler = Arc::new(RecordingScheduler::new());
+        // The scheduler is the liveness authority for the active Apply-limit
+        // gate, so the service the run-control path composes with observes the
+        // *same* handle the dispatch decision reads.
+        let operator = Arc::new(
+            OperatorCommandService::new(
+                state.clone(),
+                Arc::new(FakeQueue::default()),
+                Arc::new(NoopQueueHooks),
+                marks.clone(),
+            )
+            .with_run_boundary(scheduler.clone()),
+        );
         let resolves = Arc::new(ResolveReservations::new());
         let eligibility = Arc::new(StartEligibility::new());
         Self {
@@ -1049,4 +1055,209 @@ async fn queue_removal_and_dequeue_revoke_eligibility_until_explicit_requeue() {
             .is_ordinary_queue_eligible("alpha"),
         "explicit requeue is the ordinary way back"
     );
+}
+
+// ============================================================================
+// Active-run Apply iteration limit: boundary ordering and cross-adapter parity
+// ============================================================================
+//
+// Integration evidence for the *service composition*: the reducer, the operator
+// service, and the run-control dispatch path are wired together as production
+// wires them, and scheduler liveness is driven deterministically instead of by a
+// real task. No process, repository, network, or timer is involved.
+
+impl Harness {
+    /// Record a terminal error plus the typed Apply-ceiling evidence for it.
+    async fn to_iteration_limit(&self, change_id: &str, attempts: u32, max: u32) {
+        self.to_error(change_id).await;
+        self.state
+            .write()
+            .await
+            .record_apply_iteration_limit(change_id, attempts, max);
+    }
+}
+
+#[tokio::test]
+async fn active_iteration_limit_run_boundary_refuses_retry_while_the_task_is_live() {
+    let harness = Harness::new(&["limited"]);
+    harness.to_iteration_limit("limited", 50, 50).await;
+    harness.scheduler.set_running(true);
+
+    let error = harness
+        .service
+        .retry_change("limited")
+        .await
+        .expect_err("the owning scheduler task is still live");
+
+    assert!(
+        matches!(
+            error,
+            RunControlError::Operator(OperatorCommandError::ApplyIterationLimitActive { .. })
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(harness.status("limited").await, "error");
+    assert!(
+        harness.marks.marked_ids().is_empty(),
+        "a refused retry marks nothing"
+    );
+    assert!(
+        !harness.scheduler.calls().iter().any(|call| matches!(
+            call,
+            SchedulerCall::Notified | SchedulerCall::Started { .. }
+        )),
+        "no accepted retry may be notified into the exhausted scheduler: {:?}",
+        harness.scheduler.calls()
+    );
+}
+
+/// Task exit retires the gate, and a later admission *starts* a boundary rather
+/// than waking the one that exited.
+#[tokio::test]
+async fn active_iteration_limit_run_boundary_admits_a_later_run_after_task_exit() {
+    let harness = Harness::new(&["limited"]);
+    harness.to_iteration_limit("limited", 50, 50).await;
+    harness.scheduler.set_running(true);
+    assert!(harness.service.retry_change("limited").await.is_err());
+
+    // The run task returned; its record is deliberately still in shared state.
+    harness.scheduler.set_running(false);
+
+    let outcome = harness
+        .service
+        .retry_change("limited")
+        .await
+        .expect("a closed boundary admits the ordinary retry route");
+
+    assert_eq!(
+        outcome,
+        RunControlOutcome::RunDispatched {
+            change_ids: vec!["limited".to_string()],
+            explicit_retry: true,
+            scheduler: SchedulerEffect::Started,
+        },
+        "a later boundary is started, never a wake-up of the exited scheduler"
+    );
+    assert_eq!(
+        harness.scheduler.started_targets(),
+        vec![vec!["limited".to_string()]]
+    );
+    assert!(
+        !harness
+            .scheduler
+            .calls()
+            .iter()
+            .any(|call| matches!(call, SchedulerCall::Notified)),
+        "the exited scheduler is never notified: {:?}",
+        harness.scheduler.calls()
+    );
+    assert!(
+        harness
+            .state
+            .read()
+            .await
+            .apply_iteration_limit("limited")
+            .is_some(),
+        "admission does not clear the record; only a later boundary replaces this state"
+    );
+}
+
+/// A same-process later boundary owns fresh active-run state and a fresh budget,
+/// derived from the preserved workspace rather than from the old counter.
+#[tokio::test]
+async fn active_iteration_limit_run_boundary_later_state_starts_with_a_fresh_budget() {
+    let harness = Harness::new(&["limited"]);
+    harness.to_iteration_limit("limited", 50, 50).await;
+
+    // What a later scheduler boundary installs: new active-run state over the
+    // same workspace-derived change set.
+    let later = OrchestratorState::new(vec!["limited".to_string()], 50);
+
+    assert!(
+        later.apply_iteration_limit("limited").is_none(),
+        "the ephemeral gate never crosses into a later boundary"
+    );
+    assert_eq!(later.apply_count("limited"), 0, "the budget starts fresh");
+    assert_eq!(later.parallel_finish_report(), ("completed", 0));
+}
+
+#[tokio::test]
+async fn active_iteration_limit_bulk_retry_dispatches_only_the_admitted_targets() {
+    let harness = Harness::new(&["limited", "ordinary"]);
+    harness.to_iteration_limit("limited", 50, 50).await;
+    harness.to_error("ordinary").await;
+    harness.scheduler.set_running(true);
+    harness.mark(&["limited", "ordinary"]);
+
+    let outcome = harness
+        .service
+        .retry_errors(&["limited".to_string(), "ordinary".to_string()])
+        .await
+        .expect("an unrelated retryable target keeps the bulk request useful");
+
+    assert_eq!(
+        outcome,
+        RunControlOutcome::RunDispatched {
+            change_ids: vec!["ordinary".to_string()],
+            explicit_retry: true,
+            scheduler: SchedulerEffect::Notified,
+        },
+        "the limited target is neither dispatched nor reported as accepted"
+    );
+    assert_eq!(harness.status("limited").await, "error");
+}
+
+#[tokio::test]
+async fn active_iteration_limit_bulk_retry_all_limited_produces_no_scheduler_effect() {
+    let harness = Harness::new(&["a", "b"]);
+    harness.to_iteration_limit("a", 50, 50).await;
+    harness.to_iteration_limit("b", 50, 50).await;
+    harness.scheduler.set_running(true);
+    let calls_before = harness.scheduler.calls();
+
+    let outcome = harness
+        .service
+        .retry_errors(&["a".to_string(), "b".to_string()])
+        .await
+        .expect("an all-limited request settles truthfully");
+
+    assert_eq!(
+        outcome,
+        RunControlOutcome::NoOp {
+            reason: RunNoOpReason::NoRetryableTarget
+        }
+    );
+    assert_eq!(
+        harness.scheduler.calls(),
+        calls_before,
+        "no notify and no start for an all-limited request"
+    );
+    assert_eq!(harness.status("a").await, "error");
+    assert_eq!(harness.status("b").await, "error");
+}
+
+/// `start` in Error mode routes through the same bulk retry, so the F5 path
+/// inherits the guard rather than reimplementing it.
+#[tokio::test]
+async fn active_iteration_limit_bulk_retry_error_mode_start_is_mutation_free() {
+    let harness = Harness::new(&["limited"]);
+    harness.to_iteration_limit("limited", 50, 50).await;
+    harness.scheduler.set_running(true);
+    harness.mark(&["limited"]);
+    let calls_before = harness.scheduler.calls();
+
+    let outcome = harness
+        .service
+        .start(OperatorMode::Error)
+        .await
+        .expect("Error-mode start settles as a no-op rather than failing");
+
+    assert_eq!(
+        outcome,
+        RunControlOutcome::NoOp {
+            reason: RunNoOpReason::NoRetryableTarget
+        }
+    );
+    assert_eq!(harness.scheduler.calls(), calls_before);
+    assert_eq!(harness.status("limited").await, "error");
 }

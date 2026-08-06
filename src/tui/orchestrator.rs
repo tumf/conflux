@@ -261,6 +261,7 @@ pub async fn run_orchestrator_parallel(
     manual_resolve_counter: Arc<std::sync::atomic::AtomicUsize>,
     post_archive_action: PostArchiveAction,
     upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
+    marks: Option<crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native_from;
@@ -272,14 +273,22 @@ pub async fn run_orchestrator_parallel(
     // different membership per event; routing the scheduler's event stream and
     // the boundary's own events through one owner is what makes every frontend
     // receive the same events.
-    let dispatcher = Arc::new(EventDispatcher::new(
-        shared_state.clone(),
-        boundary_event_sinks(
-            &tx,
-            #[cfg(feature = "web-monitoring")]
-            web_state.as_ref(),
-        ),
-    ));
+    // The boundary's dispatch owner also owns execution-mark reconciliation: it
+    // is the only place that sees the reducer immediately before and after each
+    // transition, which is what a mark-revoking *edge* is defined by. Binding the
+    // shared reconciler here — not a new store — is what keeps the TUI row, the
+    // `/api/v2` snapshot, and Start target resolution one value.
+    let dispatcher = Arc::new(
+        EventDispatcher::new(
+            shared_state.clone(),
+            boundary_event_sinks(
+                &tx,
+                #[cfg(feature = "web-monitoring")]
+                web_state.as_ref(),
+            ),
+        )
+        .with_mark_reconciler(marks),
+    );
 
     dispatcher
         .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
@@ -659,6 +668,79 @@ mod tests {
                 .expect("the finish hook must run");
 
             assert_eq!(lines(&log), vec!["completed 0".to_string()]);
+        }
+
+        /// A failing finish hook is a hook failure, not a permanent gate.
+        ///
+        /// The hook still observed the exact typed record before it ran, the
+        /// record survives the failure, and nothing durable is written — so the
+        /// gate is still retired by scheduler-task exit alone.
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn active_iteration_limit_run_boundary_survives_a_failing_finish_hook() {
+            use crate::orchestration::operator_command::{
+                active_apply_iteration_limit, RunBoundaryLiveness,
+            };
+
+            struct Boundary(bool);
+            impl RunBoundaryLiveness for Boundary {
+                fn boundary_running(&self) -> bool {
+                    self.0
+                }
+            }
+
+            let temp_dir = TempDir::new().unwrap();
+            let log = temp_dir.path().join("on-finish.log");
+            let hooks = HookRunner::new(
+                HooksConfig {
+                    on_finish: Some(HookConfigValue::Full(HookConfig {
+                        // Record the status it observed, then fail.
+                        command: format!(
+                            "sh -c 'echo \"$OPENSPEC_STATUS $OPENSPEC_APPLY_COUNT\" >> {}; exit 3'",
+                            log.display()
+                        ),
+                        continue_on_failure: false,
+                        timeout: 30,
+                        git_commit_no_verify: false,
+                        max_retries: 0,
+                        retry_delay_secs: 0,
+                    })),
+                    ..Default::default()
+                },
+                temp_dir.path(),
+            );
+            let shared_state = parallel_state("change-a", 7);
+            shared_state
+                .write()
+                .await
+                .record_apply_iteration_limit("change-a", 7, 7);
+
+            let result = super::super::run_tui_parallel_finish_hook(&hooks, &shared_state).await;
+
+            assert!(
+                result.is_err(),
+                "the hook failure is reported, not swallowed"
+            );
+            assert_eq!(
+                lines(&log),
+                vec!["iteration_limit 7".to_string()],
+                "the failing hook still observed the exact typed record"
+            );
+
+            let state = shared_state.read().await;
+            assert!(
+                state.apply_iteration_limit("change-a").is_some(),
+                "a hook failure never clears the record"
+            );
+            assert!(
+                active_apply_iteration_limit(&state, Some(&Boundary(true)), "change-a").is_some(),
+                "the gate is active while the owning task is live"
+            );
+            assert_eq!(
+                active_apply_iteration_limit(&state, Some(&Boundary(false)), "change-a"),
+                None,
+                "and scheduler-task exit retires it regardless of the hook outcome"
+            );
         }
 
         /// Both parallel boundaries read the same reducer observation, so a

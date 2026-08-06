@@ -40,6 +40,7 @@ use crate::execution::archive::is_archive_commit_complete;
 use crate::parallel::acceptance_state::{
     parse_blocked_marker, repository_identity, worktree_identity, WorkspaceFacts,
 };
+use crate::vcs::git::commands::status_policy::{read_only_status_argv, PORCELAIN_STATUS_ARGS};
 
 /// Workspace state for resume detection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,7 +390,7 @@ pub async fn get_latest_wip_snapshot(change_id: &str, repo_root: &Path) -> Resul
 pub async fn has_archive_files(change_id: &str, repo_root: &Path) -> Result<bool> {
     // Check if working tree is dirty
     let status_output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(read_only_status_argv(PORCELAIN_STATUS_ARGS))
         .current_dir(repo_root)
         .output()
         .await

@@ -31,12 +31,16 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
+#[cfg(test)]
+mod execution_mark_tests;
 mod log_logic;
 pub(crate) mod modal_logic;
 mod processing_logic;
 mod selection_logic;
 mod worktree_action_logic;
 mod worktree_logic;
+
+pub(crate) use selection_logic::ACTIVE_APPLY_LIMIT_EXPLANATION;
 
 // ============================================================================
 // Constants
@@ -171,6 +175,16 @@ pub struct ChangeState {
     /// Purely rendering state. `display_status_cache` stays `"applying"` for the
     /// whole finalization sequence, and nothing routes on this field.
     pub apply_operation_cache: String,
+    /// Whether the active run still owns this change's exhausted Apply ceiling.
+    ///
+    /// Synchronized from the one shared query
+    /// ([`crate::orchestration::operator_command::active_apply_iteration_limit`])
+    /// rather than derived from the diagnostic text or the iteration number. The
+    /// cache exists because row `Space` flips a mark optimistically *before* the
+    /// command reaches the service; without it the UI would briefly claim intent
+    /// the service is about to refuse. It is presentation state only — the
+    /// service guard stands on its own with no TUI attached.
+    pub apply_iteration_limit_active: bool,
 }
 
 /// Main application state for the TUI
@@ -308,6 +322,16 @@ pub struct AppState {
     /// One store, shared by every frontend, so a keypress and a remote command
     /// read the same concurrency, backend, and per-change eligibility.
     parallel_runtime: std::sync::Arc<crate::orchestration::operator_command::ParallelRuntime>,
+    /// Target-scoped mark writes an operator interaction requested but that the
+    /// shared service has not applied yet.
+    ///
+    /// Key handling is where the operator expresses intent, and it must not be
+    /// the place the shared store is written: the write has to take the same
+    /// mutation guard event reconciliation takes, and that guard is async. The
+    /// interaction records `(change_id, marked)` pairs here instead, the run loop
+    /// drains them through the shared service, and the rows are then mirrored
+    /// back from the store. Nothing outside one process lifetime sees this.
+    pending_mark_writes: Vec<(String, bool)>,
 }
 
 // ============================================================================
@@ -341,6 +365,7 @@ impl ChangeState {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
+            apply_iteration_limit_active: false,
         }
     }
 
@@ -538,6 +563,7 @@ impl AppState {
             parallel_runtime: std::sync::Arc::new(
                 crate::orchestration::operator_command::ParallelRuntime::new(),
             ),
+            pending_mark_writes: Vec::new(),
         }
     }
 
@@ -611,9 +637,10 @@ impl AppState {
             if change.display_status_cache == "queued" {
                 change.set_display_status_cache("not queued");
             }
-        }
-        if !cleared.is_empty() {
-            self.publish_execution_marks();
+            // Target-scoped, never a whole-store replace: an ineligible row loses
+            // its own mark, and a mark another frontend set on an unrelated row
+            // cannot be swept away by this frontend's cached row set.
+            self.execution_marks.set(&change.id, false);
         }
         cleared
     }
@@ -683,10 +710,63 @@ impl AppState {
         }
     }
 
-    /// Publish the current TUI mark projection into the shared store.
+    /// Mirror row marks from the shared store.
     ///
-    /// Called after every operator interaction that can change marks so other
-    /// frontends observe the same process-local intent.
+    /// One direction only, and this is the direction: the store decides, the row
+    /// renders. A system event can revoke a mark while this frontend still holds
+    /// a stale row, so a row that disagreed with the store used to be a second
+    /// authority — the one that let the TUI show `[ ]` while `/api/v2` still
+    /// reported `execution_marked: true`.
+    pub fn sync_execution_marks_from_store(&mut self) {
+        for change in &mut self.changes {
+            change.selected = self.execution_marks.is_marked(&change.id);
+        }
+    }
+
+    /// Record a target-scoped mark write for the run loop to apply.
+    ///
+    /// The interaction has already run the shared admission classification for
+    /// the row; what is deferred is only the *write*, because it must take the
+    /// same async mutation guard event reconciliation takes.
+    pub(crate) fn request_mark_write(&mut self, change_id: &str, marked: bool) {
+        if let Some(pending) = self
+            .pending_mark_writes
+            .iter_mut()
+            .find(|(id, _)| id == change_id)
+        {
+            pending.1 = marked;
+            return;
+        }
+        self.pending_mark_writes
+            .push((change_id.to_string(), marked));
+    }
+
+    /// Take the mark writes recorded since the last drain, in request order.
+    pub fn take_pending_mark_writes(&mut self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.pending_mark_writes)
+    }
+
+    /// Apply the pending mark writes straight to the store.
+    ///
+    /// Test-only: production drains them through `OperatorCommandService`, which
+    /// is what makes the write take the shared mutation guard. A test with no
+    /// service still needs the store to reach the state the run loop would have
+    /// produced before the next event arrives.
+    #[cfg(test)]
+    pub fn flush_pending_mark_writes(&mut self) {
+        for (change_id, marked) in self.take_pending_mark_writes() {
+            self.execution_marks.set(&change_id, marked);
+        }
+    }
+
+    /// Publish the current TUI row projection into the shared store.
+    ///
+    /// Test-only. Production never writes the store from a whole row set: a
+    /// cached row that a concurrent event already invalidated would resurrect
+    /// the mark that event revoked, and would overwrite marks this frontend
+    /// never observed. Operator interactions use target-scoped writes through
+    /// the shared service instead; tests use this to arrange a starting state.
+    #[cfg(test)]
     pub fn publish_execution_marks(&self) {
         self.execution_marks.replace(
             self.changes
@@ -694,6 +774,47 @@ impl AppState {
                 .filter(|change| change.selected)
                 .map(|change| change.id.clone()),
         );
+    }
+
+    /// Adopt the shared active Apply-iteration-limit eligibility set.
+    ///
+    /// Returns true when the projection actually changed. The run loop uses that
+    /// as the scheduler-liveness transition signal: on the frame where the owning
+    /// task exits, `limited` arrives empty, the rows are refreshed, and exactly
+    /// one authoritative `/api/v2` revision is published — without waiting for
+    /// unrelated repository activity to move the snapshot.
+    pub fn sync_active_apply_iteration_limits(&mut self, limited: &HashSet<String>) -> bool {
+        let mut changed = false;
+        for change in &mut self.changes {
+            let active = limited.contains(&change.id);
+            if change.apply_iteration_limit_active != active {
+                change.apply_iteration_limit_active = active;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// True when any visible row is gated by an active-run Apply ceiling.
+    pub fn has_active_apply_iteration_limit(&self) -> bool {
+        self.changes
+            .iter()
+            .any(|change| change.apply_iteration_limit_active)
+    }
+
+    /// True when at least one row carries retryable evidence the service admits.
+    ///
+    /// Route classification is the shared one, so guidance offers the retry key
+    /// only when some target really exists for it.
+    pub fn has_admissible_retry_target(&self) -> bool {
+        self.changes.iter().any(|change| {
+            !change.apply_iteration_limit_active
+                && crate::orchestration::operator_command::classify_retry_route(
+                    &change.display_status_cache,
+                    change.blocker_kind_cache,
+                )
+                .is_some()
+        })
     }
 
     pub fn set_tui_config(&mut self, tui_config: TuiConfig) {
@@ -1537,14 +1658,14 @@ impl AppState {
                 && !matches!(display_map.get(&change.id).copied(), Some("rejected"))
             {
                 // rejected rows are display-only and remain immutable until marker removal.
-                change.selected = false;
                 continue;
             }
 
-            if matches!(display_map.get(&change.id).copied(), Some("queued")) {
-                change.selected = true;
-            }
-
+            // Reducer `queued` is queue presentation, not an execution mark.
+            // Amplifying it into `selected = true` here used to invent operator
+            // intent the shared store never recorded, which is exactly the drift
+            // `/api/v2` would then report as `execution_marked` for a change no
+            // one marked.
             if let Some(&status_str) = display_map.get(&change.id) {
                 let normalized = match status_str {
                     "stopped" => "not queued",
@@ -1563,9 +1684,6 @@ impl AppState {
                     change.set_display_status_cache("error");
                 } else {
                     change.set_display_status_cache(normalized);
-                    if normalized == "rejected" {
-                        change.selected = false;
-                    }
                 }
             }
         }
@@ -1696,11 +1814,12 @@ impl AppState {
         for change in &mut self.changes {
             if change_ids.iter().any(|id| id == &change.id) {
                 change.set_display_status_cache("queued");
-                change.selected = true;
             }
         }
         self.reset_for_run();
-        self.publish_execution_marks();
+        // The service resolved these targets *from* the shared marks, so the row
+        // projection is read back from the store rather than written into it.
+        self.sync_execution_marks_from_store();
     }
 }
 
@@ -2985,6 +3104,7 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
+            apply_iteration_limit_active: false,
         };
 
         assert_eq!(change.progress_percent(), 50.0);
@@ -3990,6 +4110,9 @@ mod tests {
         let command = app.toggle_selection();
         assert!(matches!(command, Some(TuiCommand::AddToQueue(ref id)) if id == "dynamic-change"));
         assert!(app.changes[0].selected);
+        // The interaction records a target-scoped write; the run loop applies it
+        // through the shared service before the next event is projected.
+        app.flush_pending_mark_writes();
 
         app.apply_display_statuses_from_reducer(&HashMap::from([(
             "dynamic-change".to_string(),
@@ -4013,8 +4136,15 @@ mod tests {
         assert_eq!(app.changes[0].display_status_cache, "queued");
     }
 
+    /// Reducer `queued` is queue presentation, not an execution mark.
+    ///
+    /// Synthesizing a mark from queue status used to invent operator intent the
+    /// shared store never recorded, which `/api/v2` then published as
+    /// `execution_marked` for a change nobody marked. A queued row is unmarked
+    /// until the store says otherwise, and unqueueing a *marked* queued row still
+    /// takes the queue intent back out.
     #[test]
-    fn reducer_sync_marks_queued_rows_selected_for_running_unqueue() {
+    fn reducer_queued_status_never_synthesizes_an_execution_mark() {
         let changes = vec![create_test_change("queued-change", 0, 1)];
         let mut app = AppState::new(changes);
         app.execution_mode = AppExecutionMode::Running;
@@ -4024,15 +4154,29 @@ mod tests {
             "queued",
         )]));
 
+        assert_eq!(app.changes[0].display_status_cache, "queued");
         assert!(
-            app.changes[0].selected,
-            "queued reducer intent should show as marked"
+            !app.changes[0].selected,
+            "queue intent must not become an execution mark"
         );
+        assert!(
+            app.execution_marks().marked_ids().is_empty(),
+            "queue intent must not reach the shared mark store"
+        );
+
+        // An operator mark on the same row is a separate fact, and unmarking it
+        // still withdraws the queue intent.
+        app.execution_marks().set("queued-change", true);
+        app.sync_execution_marks_from_store();
+        assert!(app.changes[0].selected);
+
         let command = app.toggle_selection();
         assert!(
             matches!(command, Some(TuiCommand::RemoveFromQueue(ref id)) if id == "queued-change")
         );
         assert!(!app.changes[0].selected);
+        app.flush_pending_mark_writes();
+        assert!(app.execution_marks().marked_ids().is_empty());
     }
 
     #[test]
@@ -4042,6 +4186,7 @@ mod tests {
         app.execution_mode = AppExecutionMode::Running;
         app.changes[0].set_display_status_cache("queued");
         app.changes[0].selected = true;
+        app.publish_execution_marks();
 
         app.apply_display_statuses_from_reducer(&HashMap::from([(
             "active-change".to_string(),
@@ -4389,6 +4534,7 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
+            apply_iteration_limit_active: false,
         };
 
         // First iteration should be accepted
@@ -4419,6 +4565,7 @@ mod tests {
             elapsed_time: None,
             iteration_number: Some(3),
             apply_operation_cache: "apply".to_string(),
+            apply_iteration_limit_active: false,
         };
 
         // Lower iteration should be ignored
@@ -4453,6 +4600,7 @@ mod tests {
             elapsed_time: None,
             iteration_number: Some(2),
             apply_operation_cache: "apply".to_string(),
+            apply_iteration_limit_active: false,
         };
 
         // None should be ignored
@@ -4831,6 +4979,7 @@ mod tests {
 
         app.changes[0].display_status_cache = "rejected".to_string();
         app.changes[0].selected = true;
+        app.publish_execution_marks();
 
         let mut display_map = std::collections::HashMap::new();
         display_map.insert("change-a".to_string(), "not queued");
@@ -4841,9 +4990,14 @@ mod tests {
             "rejected row must stay immutable during reducer display sync"
         );
         assert!(
-            !app.changes[0].selected,
-            "rejected row must remain unselected"
+            app.changes[0].selected,
+            "a display-status sync must not decide mark truth; only the shared store does"
         );
+
+        // The authoritative revocation is what clears it, and the row follows.
+        app.execution_marks().set("change-a", false);
+        app.sync_execution_marks_from_store();
+        assert!(!app.changes[0].selected);
     }
 
     #[test]
@@ -4851,7 +5005,6 @@ mod tests {
         let changes = vec![create_test_change("change-a", 1, 1)];
         let mut app = AppState::new(changes.clone());
         app.changes[0].display_status_cache = "rejected".to_string();
-        app.changes[0].selected = true;
 
         app.update_changes_with_rejected_for_test(changes, Vec::new());
 
@@ -4862,6 +5015,10 @@ mod tests {
         assert!(
             !app.changes[0].selected,
             "reactivated row must remain unselected until explicit user action"
+        );
+        assert!(
+            app.execution_marks().marked_ids().is_empty(),
+            "reactivation must not invent operator intent"
         );
     }
 
@@ -4933,17 +5090,27 @@ mod tests {
         );
     }
 
+    /// A rejection clears the mark through the authoritative store, not through
+    /// the display-status sync.
+    ///
+    /// The sync is presentation: it renders the reducer's word for the row. The
+    /// mark it renders alongside comes from `ExecutionMarkStore`, which the
+    /// dispatch boundary already reconciled for the same rejection event.
     #[test]
-    fn test_apply_display_statuses_rejected_clears_selection() {
+    fn test_apply_display_statuses_rejected_follows_the_shared_mark_store() {
         let changes = vec![create_test_change("change-a", 1, 1)];
         let mut app = AppState::new(changes);
         app.changes[0].selected = true;
+        app.publish_execution_marks();
 
         let mut display_map = std::collections::HashMap::new();
         display_map.insert("change-a".to_string(), "rejected");
         app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(app.changes[0].display_status_cache, "rejected");
+
+        app.execution_marks().set("change-a", false);
+        app.sync_execution_marks_from_store();
         assert!(
             !app.changes[0].selected,
             "rejected terminal row must not keep execution mark"

@@ -438,6 +438,13 @@ impl ParallelExecutor {
         }
     }
 
+    /// Pre-apply a *successful* rejection-review verdict to the shared reducer.
+    ///
+    /// Deliberately limited to the success variants. A `RejectionReviewFailed`
+    /// is a mark-revoking transition, and the authoritative dispatcher can only
+    /// see that edge if it is the one that applies the event: reducing it here
+    /// first would leave the dispatched copy with nothing to compare and the
+    /// stale execution mark in place.
     async fn apply_rejection_review_event_in_shared_state(&mut self, event: &ExecutionEvent) {
         if let Some(shared) = &self.shared_orchestrator_state {
             let mut guard = shared.write().await;
@@ -455,17 +462,6 @@ impl ParallelExecutor {
             guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
                 change_id: change_id.to_string(),
                 revision: revision.to_string(),
-            });
-        }
-    }
-
-    async fn mark_on_merged_failure_in_shared_state(&mut self, change_id: &str, error: &str) {
-        if let Some(shared) = &self.shared_orchestrator_state {
-            let mut guard = shared.write().await;
-            guard.apply_execution_event(&ExecutionEvent::HookFailed {
-                change_id: change_id.to_string(),
-                hook_type: crate::hooks::HookType::OnMerged.to_string(),
-                error: error.to_string(),
             });
         }
     }
@@ -1693,8 +1689,12 @@ impl ParallelExecutor {
                             let message = on_merged_failure_message(&change_id, &e);
                             error!("{}", message);
                             self.clear_resolve_wait_intent_for_outcome(&change_id).await;
-                            self.mark_on_merged_failure_in_shared_state(&change_id, &message)
-                                .await;
+                            // No producer-side pre-application: the authoritative
+                            // dispatcher applies this `HookFailed` itself, and only
+                            // there can it observe the merge-wait recovery *edge*
+                            // that revokes the change's execution mark. Reducing it
+                            // here first would make the dispatched copy a no-op and
+                            // leave the stale mark behind.
                             send_event(
                                 &self.event_tx,
                                 ParallelEvent::HookFailed {
@@ -1951,8 +1951,6 @@ impl ParallelExecutor {
                                 error
                             ),
                         };
-                        self.apply_rejection_review_event_in_shared_state(&failed_event)
-                            .await;
                         // `RejectionReviewFailed` is the typed change-scoped
                         // owner for this failure, so the outcome must cross the
                         // shared base-lane boundary as already-reported. Leaving
@@ -1994,8 +1992,6 @@ impl ParallelExecutor {
                             change_id: change_id.clone(),
                             error: error.to_string(),
                         };
-                        self.apply_rejection_review_event_in_shared_state(&failed_event)
-                            .await;
                         outcome = MergeTaskOutcome::already_reported(
                             &change_id,
                             AlreadyReportedFailureKind::RejectionReview,
@@ -2030,8 +2026,6 @@ impl ParallelExecutor {
                             change_id: change_id.clone(),
                             error: error.to_string(),
                         };
-                        self.apply_rejection_review_event_in_shared_state(&failed_event)
-                            .await;
                         outcome = MergeTaskOutcome::already_reported(
                             &change_id,
                             AlreadyReportedFailureKind::RejectionReview,
@@ -2050,8 +2044,6 @@ impl ParallelExecutor {
                     change_id: change_id.clone(),
                     error: format!("Rejecting review failed after deferred handoff: {}", error),
                 };
-                self.apply_rejection_review_event_in_shared_state(&failed_event)
-                    .await;
                 outcome = MergeTaskOutcome::already_reported(
                     &change_id,
                     AlreadyReportedFailureKind::RejectionReview,
