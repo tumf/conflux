@@ -12,6 +12,9 @@ references:
   - src/vcs/git/commands/basic.rs
   - src/vcs/git/commands/commit.rs
   - src/vcs/git/commands/merge.rs
+  - src/vcs/git/mod.rs
+  - src/parallel/conflict.rs
+  - src/execution/apply.rs
   - src/execution/state.rs
   - src/execution/archive.rs
   - src/upstream/git_ops.rs
@@ -36,7 +39,7 @@ verifications:
 ## Premise / Context
 
 - `prevent-tui-refresh-index-locks` already made `list_changes_with_uncommitted_files` run `git --no-optional-locks status --porcelain -u`.
-- Other Conflux-owned status paths still execute plain native `git status`, including the shared dirty-worktree helper, Apply/Archive phase classification, merge cleanliness checks, and upstream repository observations.
+- Other Conflux-owned status paths still execute plain native `git status`, including shared dirty-worktree and human-readable status helpers, conflict-resolution context capture, Apply/Archive phase classification, merge cleanliness checks, and upstream repository observations.
 - A running Conflux instance was observed executing root `git status --porcelain --untracked-files=normal --ignored=no` approximately once per second; `lsof` identified one such Git process holding the root `.git/index.lock`.
 - During the same run, `on_merged` waited for a pre-existing root lock to disappear, started `make bump-patch`, generated release files, and then failed when the release commit could not create `.git/index.lock`.
 - The failed release left `Cargo.toml` and `Cargo.lock` visibly staged at the next version, making the base repository dirty and preventing the pending resolve from progressing.
@@ -59,19 +62,19 @@ Add non-vacuous repository tests. A normal status positive control must demonstr
 
 ## Atomic Scope Rationale
 
-The shared dirty-state helpers, phase classifiers, merge checks, and upstream adapter all observe repositories that can be mutated by lifecycle work. Updating only one family leaves another Conflux-owned plain status command able to recreate the same root lock. They therefore form one safety invariant and must ship together.
+The shared dirty-state and human-readable status helpers, conflict-resolution context capture, phase classifiers, merge checks, and upstream adapter all observe repositories that can be mutated by lifecycle work. Updating only one family leaves another Conflux-owned plain status command able to recreate the same root or managed-worktree lock. They therefore form one safety invariant and must ship together.
 
 The existing archived TUI-refresh change is a prerequisite in history, not a hard proposal dependency: its command pattern and tests are already integrated into the base, and this change can be implemented and verified from current repository code.
 
 ## Acceptance Criteria
 
-1. Every Conflux-owned native read-only production `git status` command passes `--no-optional-locks` before `status`, including shared dirty/porcelain helpers, commit-mode observation, merge cleanliness, Apply/Archive state classification, upstream cleanliness, and porcelain-v2 failure classification.
+1. Every Conflux-owned native read-only production `git status` command passes `--no-optional-locks` before `status`, including shared dirty/porcelain helpers, human-readable plain status captured for conflict-resolution prompts, commit-mode observation, merge cleanliness, Apply/Archive state classification, upstream cleanliness, and porcelain-v2 failure classification.
 2. Existing already-compliant uncommitted-change monitoring remains compliant and uses the same child-local policy.
 3. No implementation sets or changes process-wide `GIT_OPTIONAL_LOCKS`; child processes running mutating Git commands retain default mandatory and optional lock behavior.
 4. Status results retain existing semantics: leading porcelain status columns are not trimmed where callers require them, untracked and ignored modes remain explicit where currently required, porcelain v2 remains v2, and path-scoped checks remain path-scoped.
 5. Clean, staged, unstaged, deleted, renamed, untracked, ignored, and conflicted fixture states retain their existing classifications.
 6. A temporary Git fixture proves a normal status command can persist an index refresh, then proves representative production status paths leave complete index bytes unchanged while returning current repository state.
-7. Command-shape tests cover shared helpers and adapters that execute Git directly, and fail if the global option is absent or follows the subcommand.
+7. Command-shape tests cover shared helpers and adapters that execute Git directly, and fail if the global option is absent or follows the subcommand; any user-visible command description that claims to show the exact stage-gate status command matches the changed argv.
 8. A hook/release-like mutating Git command is not rewritten with optional-lock suppression, and no lock file is deleted or bypassed.
 9. Existing `on_merged` diagnostics, timeout behavior, hook retry policy, release recovery, resolve queue state, and workspace-derived routing remain unchanged.
 10. Added default-suite tests complete in under one second each or are marked heavy under repository policy when a real Git boundary cannot meet that limit.
@@ -81,7 +84,7 @@ The existing archived TUI-refresh change is a prerequisite in history, not a har
 - Production native status entry points in `src/vcs/git/commands/`, `src/execution/`, `src/upstream/`, and any still-callable production helper are inventoried and either route through the shared read-only status policy or construct the same exact global-option ordering.
 - The implementation contains no process-wide optional-lock environment mutation and does not alter argv for non-status Git commands.
 - Tests named by `native_git_status_optional_locks` exercise non-empty unit and temporary-repository selections, including the byte-level positive control and untrimmed porcelain fidelity.
-- Regression tests cover every distinct production command-construction adapter rather than only the previously fixed TUI change-list helper.
+- Regression tests cover every distinct production command-construction adapter rather than only the previously fixed TUI change-list helper; they inspect argv construction or shared-policy use instead of matching `git status` text in test fixtures, diagnostics, or prompt prose.
 - `cargo test --lib native_git_status_optional_locks`, `cargo fmt --check`, and `cargo clippy --locked --all-targets --all-features -- -D warnings` pass.
 
 ## Out of Scope
@@ -94,3 +97,4 @@ The existing archived TUI-refresh change is a prerequisite in history, not a har
 - Retrying arbitrary release, merge, archive, or hook failures.
 - Changing status classification, workflow routing, release ownership, or repository mutation authorization.
 - Rewriting test-only Git fixture commands that are not used by production behavior.
+- Suppressing opportunistic index refreshes performed by non-status read-only Git commands such as worktree-scoped `git diff`; this status-specific policy does not claim that `--no-optional-locks` controls those paths, and any observed diff-path contention requires a separately scoped mechanism.
