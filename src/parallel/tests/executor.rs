@@ -555,6 +555,7 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("resolve-gated dispatch");
@@ -608,6 +609,7 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
             semaphore: Arc::new(Semaphore::new(2)),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("merged dependency dispatch");
@@ -2790,6 +2792,7 @@ async fn test_queue_notification_with_fresh_debounce_starts_analysis_after_initi
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("queue notification reanalysis should not fail");
@@ -3257,6 +3260,7 @@ async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -3335,7 +3339,7 @@ async fn test_resolve_wait_completion_unblocks_dependents() {
 
     assert!(
         !executor
-            .should_exit_when_idle(true, &queued, &in_flight)
+            .should_exit_when_idle(true, &queued, &in_flight, None)
             .await,
         "finite scheduler must not exit while a dependency blocker is waiting on resolve_wait completion"
     );
@@ -3350,6 +3354,7 @@ async fn test_resolve_wait_completion_unblocks_dependents() {
             semaphore: semaphore.clone(),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("blocked pre-completion reanalysis should not fail");
@@ -3392,6 +3397,7 @@ async fn test_resolve_wait_completion_unblocks_dependents() {
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("post-completion reanalysis should dispatch unblocked beta");
@@ -3808,6 +3814,7 @@ async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -4181,6 +4188,7 @@ async fn test_single_queued_active_dependency_does_not_emit_apply_started() {
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -4243,6 +4251,7 @@ async fn test_inflight_dependency_blocks_dispatch_until_resolved() {
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -4573,6 +4582,7 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
             semaphore: semaphore.clone(),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -4608,6 +4618,7 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -4678,6 +4689,7 @@ async fn test_resolve_wait_does_not_block_queue_reanalysis_dispatch() {
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -4735,6 +4747,7 @@ async fn test_resolving_with_free_slot_still_dispatches_queued_change() {
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -4795,6 +4808,7 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
             semaphore: semaphore.clone(),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -4815,6 +4829,7 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -4875,6 +4890,7 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -4945,6 +4961,7 @@ async fn test_repair_candidate_reanalysis_bypasses_debounce_and_dispatches_work(
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("unexpected error");
@@ -5412,7 +5429,7 @@ async fn test_scheduler_lifetime_controls_idle_exit_behavior() {
     let in_flight = HashSet::new();
     assert!(
         finite_executor
-            .should_exit_when_idle(true, &queued, &in_flight)
+            .should_exit_when_idle(true, &queued, &in_flight, None)
             .await,
         "finite scheduler must exit when all work is drained"
     );
@@ -5420,14 +5437,14 @@ async fn test_scheduler_lifetime_controls_idle_exit_behavior() {
     finite_executor.set_persistent_lifetime();
     assert!(
         !finite_executor
-            .should_exit_when_idle(true, &queued, &in_flight)
+            .should_exit_when_idle(true, &queued, &in_flight, None)
             .await,
         "persistent scheduler must remain alive while idle"
     );
 
     assert!(
         !finite_executor
-            .should_exit_when_idle(false, &queued, &in_flight)
+            .should_exit_when_idle(false, &queued, &in_flight, None)
             .await,
         "scheduler must not exit when active join tasks remain"
     );
@@ -5443,7 +5460,7 @@ async fn test_persistent_idle_wait_detection_requires_fully_drained_state() {
     let in_flight = HashSet::new();
     assert!(
         !executor
-            .should_enter_persistent_idle_wait(true, &queued, &in_flight)
+            .should_enter_persistent_idle_wait(true, &queued, &in_flight, None)
             .await,
         "finite scheduler must not enter persistent idle wait"
     );
@@ -5451,27 +5468,27 @@ async fn test_persistent_idle_wait_detection_requires_fully_drained_state() {
     executor.set_persistent_lifetime();
     assert!(
         executor
-            .should_enter_persistent_idle_wait(true, &queued, &in_flight)
+            .should_enter_persistent_idle_wait(true, &queued, &in_flight, None)
             .await,
         "persistent scheduler should enter event-driven idle wait only when fully drained"
     );
     assert!(
         !executor
-            .should_enter_persistent_idle_wait(false, &queued, &in_flight)
+            .should_enter_persistent_idle_wait(false, &queued, &in_flight, None)
             .await,
         "active join tasks must keep the scheduler on the normal event path"
     );
     let queued_work = vec![make_test_change("queued-work")];
     assert!(
         !executor
-            .should_enter_persistent_idle_wait(true, &queued_work, &in_flight)
+            .should_enter_persistent_idle_wait(true, &queued_work, &in_flight, None)
             .await,
         "dispatchable queued work must keep debounce/reanalysis behavior active"
     );
     let in_flight_work = HashSet::from(["in-flight-work".to_string()]);
     assert!(
         !executor
-            .should_enter_persistent_idle_wait(true, &queued, &in_flight_work)
+            .should_enter_persistent_idle_wait(true, &queued, &in_flight_work, None)
             .await,
         "in-flight work must keep completion handling active"
     );
@@ -5481,7 +5498,7 @@ async fn test_persistent_idle_wait_detection_requires_fully_drained_state() {
         .insert("needs-resolve".to_string());
     assert!(
         executor
-            .should_enter_persistent_idle_wait(true, &queued, &in_flight)
+            .should_enter_persistent_idle_wait(true, &queued, &in_flight, None)
             .await,
         "stable ResolveWait-only work should use event-driven persistent idle wait"
     );
@@ -5941,7 +5958,7 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
     executor.shared_orchestrator_state = Some(shared.clone());
     executor.resolve_wait_changes.clear();
 
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
 
     assert!(
         executor.resolve_wait_changes.contains("change-a"),
@@ -5951,7 +5968,7 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
     let queued = Vec::new();
     let in_flight = HashSet::new();
     let should_exit = executor
-        .should_exit_when_idle(true, &queued, &in_flight)
+        .should_exit_when_idle(true, &queued, &in_flight, None)
         .await;
     assert!(
         !should_exit,
@@ -6509,7 +6526,7 @@ async fn finite_scheduler_does_not_drain_while_spawned_retry_is_pending() {
         }
     }
     executor.set_shared_orchestrator_state(shared.clone());
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
 
     executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
     executor
@@ -6532,7 +6549,7 @@ async fn finite_scheduler_does_not_drain_while_spawned_retry_is_pending() {
     assert!(!executor.is_fully_drained(true, true, true));
     assert!(
         !executor
-            .should_exit_when_idle(true, &queued, &in_flight)
+            .should_exit_when_idle(true, &queued, &in_flight, None)
             .await,
         "finite scheduler must not exit while detached retry result is pending"
     );
@@ -6615,7 +6632,7 @@ async fn test_manual_resolve_wait_retries_after_in_flight_apply_completes() {
         guard.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
     }
     executor.set_shared_orchestrator_state(shared);
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
     executor.last_dispatched_resolve_wait_changes = executor.resolve_wait_changes.clone();
 
     assert!(
@@ -6694,7 +6711,7 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
     }
     executor.set_shared_orchestrator_state(shared);
 
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
     executor.trigger_resolve_wait_retry_dispatch();
 
     assert!(
@@ -9100,10 +9117,10 @@ async fn test_missing_workspace_retry_clears_resolve_wait_in_reducer() {
         guard.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
     }
     executor.set_shared_orchestrator_state(shared.clone());
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
 
     executor.retry_deferred_merges().await;
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
 
     assert!(
         executor.resolve_wait_changes.is_empty(),
@@ -9166,10 +9183,10 @@ async fn test_stale_workspace_retry_clears_resolve_wait_in_reducer() {
         guard.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
     }
     executor.set_shared_orchestrator_state(shared.clone());
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
 
     executor.retry_deferred_merges().await;
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
 
     assert!(executor.resolve_wait_changes.is_empty());
     assert!(shared.read().await.resolve_wait_change_ids().is_empty());
@@ -9315,10 +9332,10 @@ async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_on
             panic!("expected merge success, got deferred: {}", deferred.reason);
         }
     }
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
 
     assert!(executor.resolve_wait_changes.is_empty());
-    assert!(!executor.has_resolve_wait());
+    assert!(!executor.has_resolve_wait().await);
     assert!(shared.read().await.resolve_wait_change_ids().is_empty());
 
     executor.trigger_resolve_wait_retry_dispatch();
@@ -9434,10 +9451,10 @@ async fn test_stale_already_merged_resolve_wait_skips_merge_and_hook() {
     executor.set_hooks(hooks);
 
     executor.retry_deferred_merges().await;
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
 
     assert!(executor.resolve_wait_changes.is_empty());
-    assert!(!executor.has_resolve_wait());
+    assert!(!executor.has_resolve_wait().await);
     assert!(shared.read().await.resolve_wait_change_ids().is_empty());
     assert!(
         !hook_marker.exists(),
@@ -10352,7 +10369,7 @@ async fn test_scheduler_does_not_busy_retry_unchanged_resolve_wait() {
     }
     executor.set_shared_orchestrator_state(shared);
 
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
     executor.trigger_resolve_wait_retry_dispatch();
     executor.maybe_dispatch_resolve_wait_retry().await;
 
@@ -10399,7 +10416,7 @@ async fn test_dirty_to_clean_resolve_wait_wakes_retry_without_new_trigger() {
         guard.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
     }
     executor.set_shared_orchestrator_state(shared);
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
     executor.last_dispatched_resolve_wait_changes = executor.resolve_wait_changes.clone();
 
     executor.maybe_dispatch_resolve_wait_retry().await;
@@ -10419,27 +10436,27 @@ async fn test_dirty_to_clean_resolve_wait_wakes_retry_without_new_trigger() {
     assert!(!executor.resolve_wait_retry_triggered);
 }
 
-#[test]
-fn test_resolve_wait_helper_tracks_state() {
+#[tokio::test]
+async fn test_resolve_wait_helper_tracks_state() {
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
 
-    assert!(!executor.has_resolve_wait());
+    assert!(!executor.has_resolve_wait().await);
 
     executor
         .resolve_wait_changes
         .insert("test-change".to_string());
 
-    assert!(executor.has_resolve_wait());
+    assert!(executor.has_resolve_wait().await);
 
     executor.resolve_wait_changes.clear();
 
-    assert!(!executor.has_resolve_wait());
+    assert!(!executor.has_resolve_wait().await);
 }
 
-#[test]
-fn test_auto_resumable_deferral_uses_resolve_pending_not_manual_merge_wait() {
+#[tokio::test]
+async fn test_auto_resumable_deferral_uses_resolve_pending_not_manual_merge_wait() {
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
@@ -10449,11 +10466,11 @@ fn test_auto_resumable_deferral_uses_resolve_pending_not_manual_merge_wait() {
 
     assert!(executor.resolve_wait_changes.contains("change-a"));
     assert!(executor.merge_wait_changes.is_empty());
-    assert!(executor.has_resolve_wait());
+    assert!(executor.has_resolve_wait().await);
 }
 
-#[test]
-fn test_manual_deferral_uses_merge_wait_not_resolve_pending() {
+#[tokio::test]
+async fn test_manual_deferral_uses_merge_wait_not_resolve_pending() {
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
@@ -10464,14 +10481,14 @@ fn test_manual_deferral_uses_merge_wait_not_resolve_pending() {
 
     assert!(!executor.resolve_wait_changes.contains("change-a"));
     assert!(executor.merge_wait_changes.contains("change-a"));
-    assert!(!executor.has_resolve_wait());
+    assert!(!executor.has_resolve_wait().await);
 }
 
 /// Test that changes in MergeWait state are correctly filtered during loop iteration.
 /// This test validates the spec requirement:
 /// "The loop continues processing runnable changes and MergeWait is not treated as a terminal completion reason."
-#[test]
-fn test_merge_wait_does_not_block_runnable_changes() {
+#[tokio::test]
+async fn test_merge_wait_does_not_block_runnable_changes() {
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
@@ -10482,7 +10499,7 @@ fn test_merge_wait_does_not_block_runnable_changes() {
         .merge_wait_changes
         .insert("merge-wait-only".to_string());
     assert!(executor.resolve_wait_changes.is_empty());
-    assert!(!executor.has_resolve_wait());
+    assert!(!executor.has_resolve_wait().await);
 }
 
 /// Test concurrent re-analysis: verify that re-analysis reason is properly tracked
@@ -13350,6 +13367,7 @@ async fn unselected_archived_dirty_worktree_never_reaches_analysis_execution_or_
             semaphore: Arc::new(Semaphore::new(1)),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("analysis must succeed");
@@ -13404,7 +13422,7 @@ async fn unselected_archived_dirty_worktree_never_reaches_analysis_execution_or_
     );
     assert!(
         executor
-            .should_exit_when_idle(join_set.is_empty(), &queued, &in_flight)
+            .should_exit_when_idle(join_set.is_empty(), &queued, &in_flight, None)
             .await,
         "residue must not keep an otherwise drained run alive"
     );
@@ -13725,6 +13743,7 @@ async fn revoked_queue_intent_stops_an_already_added_candidate_before_analysis_a
             semaphore: Arc::new(Semaphore::new(1)),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("analysis must succeed");
@@ -13893,6 +13912,7 @@ async fn reducer_unknown_dynamic_hint_never_enters_analysis_or_dispatch() {
             semaphore: Arc::new(Semaphore::new(1)),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .or_fail("analysis must succeed");
@@ -13929,13 +13949,20 @@ async fn reducer_unknown_dynamic_hint_never_enters_analysis_or_dispatch() {
     );
 }
 
-/// The reducer is the only authority on ordinary queue intent, so a snapshot it
-/// cannot hand out right now must fail closed. A hint observed while the shared
-/// write lock is held may not be admitted, and classification may not read the
-/// resulting empty wait sets as "nothing is waiting" and dispatch.
+/// A reducer writer delays hint admission, reconciliation, and classification;
+/// it never turns any of them into scheduler-visible queue state.
+///
+/// The scheduler work is driven from a separate task, because the awaited
+/// snapshot contract makes the old same-task pattern — hold the write guard,
+/// then call the scheduler helpers inline — a self-deadlock rather than a
+/// contention test. While the writer is held nothing may be ingested, added, or
+/// classified; once it releases, the very same calls complete and produce the
+/// real reducer-owned answers, including the revocation that was always meant
+/// to be refused.
 #[tokio::test]
-async fn dynamic_hint_and_classification_fail_closed_under_reducer_lock_contention() {
+async fn reducer_snapshot_contention_defers_admission_and_classification_until_release() {
     use crate::tui::queue::DynamicQueue;
+    use std::time::Duration;
 
     let repo_dir = TempDir::new().or_fail("create temp repo");
     init_git_repo(repo_dir.path()).await;
@@ -13986,95 +14013,75 @@ async fn dynamic_hint_and_classification_fail_closed_under_reducer_lock_contenti
     assert!(dynamic_queue.push("revoked".to_string()).await);
     assert!(dynamic_queue.push("queued-elsewhere".to_string()).await);
 
-    let mut queued: Vec<crate::openspec::Change> = Vec::new();
-    let in_flight = HashSet::new();
-    let mut reason = ReanalysisReason::Initial;
-
-    {
-        // Hold the shared write lock for the whole ingestion and classification
-        // pass, so every `try_read` inside them fails.
-        let _contended = shared.write().await;
+    // Hold the writer, then run the whole scheduler-side pass in its own task.
+    let contended = shared.write().await;
+    let mut pass = tokio::spawn(async move {
+        let mut queued: Vec<crate::openspec::Change> = Vec::new();
+        let in_flight = HashSet::new();
+        let mut reason = ReanalysisReason::Initial;
 
         let ingested = executor
             .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reason)
             .await;
-        assert!(
-            !ingested,
-            "no hint may be ingested while reducer intent is unreadable"
-        );
-        assert!(
-            queued.is_empty(),
-            "contention must not admit hints from the catalog"
-        );
-        assert_eq!(reason, ReanalysisReason::Initial);
-
-        // Reconciliation is the other candidate source and already fails closed.
-        assert_eq!(
-            executor
-                .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
-                .await
-                .total_added(),
-            0,
-            "reconciliation must add nothing while the reducer is unreadable"
-        );
-
-        // Classification over an already-added candidate must not turn an
-        // unreadable snapshot into "no wait state, therefore dispatchable".
-        let contended_classification = executor
+        let reconciled = executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await;
+        let classification = executor
             .classify_queued_work(
                 std::slice::from_ref(&make_test_change("merge-waiting")),
                 &in_flight,
             )
             .await;
-        assert!(
-            contended_classification.dispatchable.is_empty(),
-            "an unreadable reducer snapshot must not produce dispatchable work"
-        );
-        assert_eq!(
-            contended_classification.class_for("merge-waiting"),
-            Some(crate::parallel::queue_state::QueuedWorkClass::CandidateUnavailable),
-            "a candidate whose intent cannot be read is waiting, never dispatchable"
-        );
-        assert!(
-            contended_classification.is_blocked_only(),
-            "a contended pass must be blocked-only so analysis is skipped"
-        );
-    }
+        (ingested, reconciled, classification, queued, reason)
+    });
 
-    // Failing closed costs at most one wake-up: once the reducer is readable,
-    // real intent still arrives through reconciliation, and the revoked hint
-    // stays out.
-    assert_eq!(
-        executor
-            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut pass)
             .await
-            .queued_added,
-        1,
-        "genuine reducer intent is recovered on the next readable pass"
+            .is_err(),
+        "the scheduler pass must suspend behind the writer, not resolve from partial evidence"
     );
+    assert_eq!(
+        dynamic_queue.len().await,
+        2,
+        "a hint the pass cannot yet judge keeps its wake edge instead of being consumed"
+    );
+
+    drop(contended);
+
+    let (ingested, reconciled, classification, queued, reason) =
+        tokio::time::timeout(Duration::from_secs(5), pass)
+            .await
+            .or_fail("the released writer must let the suspended pass finish")
+            .or_fail("scheduler pass task must not panic");
+
+    assert!(
+        ingested,
+        "the resumed pass ingests the hint that carries real reducer queue intent"
+    );
+    assert_eq!(reason, ReanalysisReason::QueueNotification);
     assert_eq!(
         queued
             .iter()
             .map(|change| change.id.as_str())
             .collect::<Vec<_>>(),
         vec!["queued-elsewhere"],
-        "only the change with current reducer queue intent comes back"
-    );
-
-    let readable_classification = executor
-        .classify_queued_work(
-            std::slice::from_ref(&make_test_change("merge-waiting")),
-            &in_flight,
-        )
-        .await;
-    assert!(
-        readable_classification.dispatchable.is_empty(),
-        "the reducer-owned merge wait is visible again and still blocks dispatch"
+        "only the change with current reducer queue intent is admitted; the revoked hint is \
+         still refused on its own merits"
     );
     assert_eq!(
-        readable_classification.class_for("merge-waiting"),
+        reconciled.total_added(),
+        0,
+        "reconciliation adds nothing beyond what admission already ingested"
+    );
+    assert!(
+        classification.dispatchable.is_empty(),
+        "the reducer-owned merge wait still blocks dispatch"
+    );
+    assert_eq!(
+        classification.class_for("merge-waiting"),
         Some(crate::parallel::queue_state::QueuedWorkClass::ManualMergeWait),
-        "a readable snapshot reports the real wait lane instead of contention"
+        "the resumed pass reports the real wait lane instead of a contention placeholder"
     );
 }
 
@@ -14140,9 +14147,9 @@ async fn empty_ordinary_queue_still_exposes_resolve_and_reject_lane_intent() {
         "lane intent is not ordinary queued work, and residue is not intent at all"
     );
 
-    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.sync_resolve_wait_from_shared_state().await;
     assert!(
-        executor.has_resolve_wait(),
+        executor.has_resolve_wait().await,
         "resolve-lane intent must remain independently consumable"
     );
     executor.retry_deferred_rejection_reviews().await;

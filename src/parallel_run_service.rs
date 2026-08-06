@@ -511,7 +511,7 @@ impl ParallelRunService {
         // so short-circuiting here would strand it unpublished with no way for
         // an operator retry to resume it.
         let allow_empty_queue = changes.is_empty()
-            && (executor.has_resolve_wait() || executor.has_upstream_integration());
+            && (executor.has_resolve_wait().await || executor.has_upstream_integration());
         let changes = match self
             .prepare_parallel_execution(changes, &event_tx, allow_empty_queue)
             .await?

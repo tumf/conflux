@@ -1193,6 +1193,8 @@ re-analysis の起動トリガは、キュー通知・デバウンスタイマ�
 
 利用可能スロットが 0 の場合でも、queued に ordinary dispatchable candidate が存在するなら、システムは queue classification、reducer-visible queued intent reconciliation、dependency analysis、operator-visible diagnostics を実行できなければならない（MUST）。ただし ordinary apply dispatch は、dispatch 直前に再計算した利用可能スロットが 1 以上になるまで開始してはならない（MUST NOT）。
 
+Reducer-dependent scheduler work detection は dynamic queue hint admission、reducer-visible queued intent reconciliation、lane wait synchronization、drain/idle decision、ordinary queue eligibility、terminal error、active/resolving membership、および Acceptance/external hold を同一の coherent reducer snapshot または disposition 前に完了する等価な awaited acquisition から評価しなければならない（MUST）。一時的な reducer lock contention は current dispatch attempt を fail-closed に保たなければならないが（MUST）、popped queue hint の最終拒否、empty reconciliation、stable candidate-unavailable、blocked-only、drained、finite scheduler termination、または indefinite persistent-idle state として確定してはならない（MUST NOT）。snapshot が利用可能になった時点で、追加の queue mutation または外部 wake notification を要求せず同じ scheduler evaluation を継続しなければならない（MUST）。不完全な reducer evidence の間は dependency analyzer、workspace preparation、ordinary dispatch を開始してはならない（MUST NOT）。reducer read guard は repository/VCS probe、dependency analysis、agent execution、dispatch の前に解放されなければならない（MUST）。
+
 resolve、workspace、merge completion、repair candidate addition、または slot recovery による即時 re-analysis trigger は、対応する state-transition event ごとに一度だけ利用されなければならない（MUST）。scheduler は queued work に対する re-analysis / dispatch evaluation をその trigger で実際に評価した後にのみ trigger を消費しなければならず（MUST）、evaluation を実行しなかった loop で未評価の trigger を破棄してはならない（MUST NOT）。
 
 一度消費した completion、repair candidate、または slot recovery trigger は、明示的な新しい state-transition event がない timer wake で再利用されてはならない（MUST NOT）。timer wake は有限時間 queue debounce policy に従わなければならず（MUST）、debounce 経過後も同一の completed analysis input を変更なしに反復実行してはならない（MUST NOT）。
@@ -1217,7 +1219,48 @@ analysis signature、completed record、および失敗再試行 deadline は ac
 
 TUI は distinct な re-analysis attempt を operator-visible に表示しなければならない（SHALL）。同じ attempt の重複 delivery は抑止してよいが、`remaining_changes` が同じという理由だけで別 attempt の analysis-started 表示を抑止してはならない（MUST NOT）。analyzer invocation 前に suppression された timer evaluation は distinct analysis attempt として表示してはならない（MUST NOT）。
 
-<!-- Expected canonical result after archive: ordinary timer suppression uses the same effective-base ref as dependency classification, unusable results cannot terminate queued work, and fail-open signature failures retry at a bounded cadence without restoring the 500 ms analyzer loop. -->
+<!-- Expected canonical result after archive: queue admission, reducer-intent reconciliation, queue/dependency classification, and termination/idle decisions consume one coherent reducer work view; transient lock contention resumes automatically without losing hints, terminating finite runs, becoming persistent idle, or reintroducing polling. -->
+
+#### Scenario: transient reducer writer delays but does not strand queued work
+
+- **GIVEN** scheduler-local queue は空であり、reducer-visible queued intent とその dynamic queue hint が ordinary candidate に存在する
+- **AND** a concurrent reducer writer temporarily owns the shared state lock
+- **WHEN** scheduler が hint admission と queue reconciliation を開始する
+- **THEN** hint は最終拒否または破棄されず、reconciliation は stable empty result として扱われない
+- **AND** no dependency analyzer, workspace preparation, or ordinary dispatch starts from incomplete evidence
+- **AND** releasing the writer automatically continues the same evaluation without an additional queue mutation or wake notification
+- **AND** candidate は scheduler-local queue にreconcileされ、coherent reducer snapshot に従って処理される
+
+#### Scenario: finite scheduler does not terminate on transient unreadability
+
+- **GIVEN** finite scheduler のlocal queueは空だが reducer-visible queued intent が存在する
+- **AND** reducer writer がscheduler work snapshotを一時的に利用不能にする
+- **WHEN** scheduler がdrainまたはblocked-only終了条件を評価する
+- **THEN** `DrainedSuccessfully` または `BlockedOrStalled` を返してはならない
+- **AND** writer release後に同じevaluationがqueued intentをreconcileする
+
+#### Scenario: contention release preserves a real hold
+
+- **GIVEN** a queued candidate is also covered by a reducer-owned Acceptance or external blocker hold
+- **AND** queue classification temporarily waits behind a reducer writer
+- **WHEN** the writer releases the lock
+- **THEN** the resumed evaluation classifies the candidate from the real held state
+- **AND** ordinary dispatch and repeated Acceptance remain suppressed
+- **AND** stable blocked-only handling may then enter event-driven persistent idle
+
+#### Scenario: reducer guard is released before long-running classification work
+
+- **GIVEN** scheduler work detection captured coherent reducer facts
+- **WHEN** repository probes or dependency analysis begin
+- **THEN** the reducer read guard is no longer held
+- **AND** reducer events and operator commands can acquire the write lock while analysis continues
+
+#### Scenario: stable persistent idle remains non-polling
+
+- **GIVEN** coherent reducer evidence proves the scheduler is fully drained or stably blocked-only
+- **WHEN** persistent idle begins
+- **THEN** no transient contention retry remains armed
+- **AND** worktree reconciliation and dependency analysis do not repeat without a scheduler-owned wake event
 
 #### Scenario: effective dependency base ref change invalidates suppression
 
