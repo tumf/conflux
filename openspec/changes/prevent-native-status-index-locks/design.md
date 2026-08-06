@@ -2,7 +2,7 @@
 
 ## Context
 
-Conflux already suppresses optional index writes for one periodic change-list query, but status execution remains distributed across shared Git helpers, Apply/Archive state modules, merge helpers, and the upstream adapter. These paths differ in output shape and error type, so replacing every call with one high-level boolean helper would lose required semantics.
+Conflux already suppresses optional index writes for one periodic change-list query, but status execution remains distributed across shared Git helpers, conflict-resolution context capture, Apply/Archive state modules, merge helpers, and the upstream adapter. These paths differ in output shape and error type, so replacing every call with one high-level boolean helper would lose required semantics.
 
 The incident confirms the missing invariant rather than a need for a new scheduler lock: a Conflux-owned status process was observed holding the root index lock while lifecycle work needed the same index. The lock can appear after `on_merged` preflight, so preflight waiting alone cannot exclude this race.
 
@@ -25,6 +25,7 @@ Use the smallest shared command-construction primitive that can preserve all cur
 Do not collapse these distinct observations:
 
 - trimmed boolean dirty/clean status;
+- human-readable plain status text captured for conflict-resolution prompt context;
 - untrimmed porcelain bytes used by the Apply stage gate;
 - explicit untracked and ignored modes;
 - pathspec-scoped residue status;
@@ -32,7 +33,9 @@ Do not collapse these distinct observations:
 
 ### Production inventory boundary
 
-The invariant covers native Git commands constructed by Conflux production code. It does not rewrite agent commands, user hooks, arbitrary configured shell commands, or test fixture commands. A source/argv inventory regression should detect future production plain-status additions without falsely requiring optional-lock suppression on mutating Git commands.
+The invariant covers native `git status` commands constructed by Conflux production code, whether they classify state or capture human-readable context. It does not rewrite agent commands, user hooks, arbitrary configured shell commands, or test fixture commands. The inventory regression must inspect production argv construction or shared-policy use rather than scan all source text, where test fixtures, display strings, diagnostics, and prompt prose legitimately mention `git status`.
+
+The invariant is status-specific. Worktree-scoped `git diff` may also refresh index stat data opportunistically, but this policy does not assume Git gates that path behind `--no-optional-locks`; diff-path contention requires a separately scoped mechanism and verification.
 
 ## Verification Strategy
 
