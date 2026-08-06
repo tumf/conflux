@@ -70,7 +70,16 @@ impl QueueReconciliationOutcome {
 #[derive(Debug)]
 enum DynamicQueueAdmission {
     Admit,
-    Refuse { reason: &'static str, log: String },
+    Refuse {
+        reason: &'static str,
+        log: String,
+    },
+    /// Disposition is unknown because reducer evidence is incomplete.
+    ///
+    /// This is not a refusal. A popped hint may be the only wake edge a queued
+    /// change has, so the caller puts it back untouched instead of consuming it,
+    /// and no scheduler-visible queue state is derived from the gap.
+    Retain,
 }
 
 #[cfg(test)]
@@ -159,14 +168,22 @@ use super::dispatch::archived_dirty_repair_candidate_from_workspace;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
 use super::merge::base_dirty_reason;
+use super::work_snapshot::ReducerWorkSnapshot;
 use super::{
     AlreadyReportedFailureKind, MergeResult, MergeResultDisposition, MergeResultOrigin,
     MergeTaskOutcome, ParallelEvent, ParallelExecutor, WorkspaceResult,
 };
 
-pub(crate) struct ReanalysisDispatchContext<'a, F> {
+pub(super) struct ReanalysisDispatchContext<'a, F> {
     pub queued: &'a mut Vec<crate::openspec::Change>,
     pub in_flight: &'a mut HashSet<String>,
+    /// The evaluation-scoped reducer view, when the caller already captured one.
+    ///
+    /// The scheduler loop captures exactly one view per pass and threads it
+    /// here, so admission, reconciliation, classification, and the drain/idle
+    /// decision all read the same reducer revision. `None` asks this evaluation
+    /// to await its own equivalent view; direct-call tests use that form.
+    pub work_snapshot: Option<&'a ReducerWorkSnapshot>,
     pub max_parallelism: usize,
     pub iteration: u32,
     pub reanalysis_reason: ReanalysisReason,
@@ -209,6 +226,21 @@ struct ReanalysisExecutionDecision {
 enum DependencyAnalysisAttempt {
     Completed(AnalysisOutcome),
     EmptyOrder(ReanalysisFlowDecision),
+}
+
+/// Everything the pre-analysis pipeline evaluates before the analyzer runs.
+///
+/// Grouped rather than passed positionally so the whole pipeline is visibly
+/// driven by one evaluation's inputs — including `work_snapshot`, the coherent
+/// reducer view every gate in it must agree on.
+struct DependencyAnalysisInputs<'a, F> {
+    queued: &'a mut [crate::openspec::Change],
+    in_flight: &'a HashSet<String>,
+    max_parallelism: usize,
+    iteration: u32,
+    reanalysis_reason: ReanalysisReason,
+    analyzer: &'a F,
+    work_snapshot: &'a ReducerWorkSnapshot,
 }
 
 /// One pass through the pre-analysis pipeline.
@@ -314,13 +346,65 @@ impl ParallelExecutor {
             .is_some_and(|token| token.is_cancelled())
     }
 
-    pub(super) fn sync_resolve_wait_from_shared_state_nonblocking(&mut self) {
-        if let Some(shared) = &self.shared_orchestrator_state {
-            if let Ok(guard) = shared.try_read() {
-                self.resolve_wait_changes = guard.resolve_wait_change_ids().into_iter().collect();
-                self.reject_wait_changes = guard.reject_wait_change_ids().into_iter().collect();
+    /// Capture one coherent reducer work view for this scheduler evaluation.
+    ///
+    /// The read is *awaited*, never attempted: a scheduler pass that collides
+    /// with a short reducer write suspends here and is woken by Tokio the moment
+    /// the writer releases, which continues the same evaluation without needing
+    /// another queue mutation or wake notification. Turning that collision into
+    /// queue state — a refused hint, an empty reconciliation, a
+    /// `candidate_unavailable` classification, a drained finite run, or a
+    /// persistent idle wait — is what stranded queued work.
+    ///
+    /// The guard is dropped before returning. Every repository probe, VCS call,
+    /// dependency analysis, and dispatch downstream of a capture therefore runs
+    /// with no reducer guard held, so reducer events and operator commands can
+    /// still take the write lock while classification continues.
+    ///
+    /// Cancellation stays responsive: when a cancel token is wired, it races the
+    /// acquisition and wins, yielding [`ReducerWorkSnapshot::incomplete`]. That
+    /// view withholds every candidate and, because it is not complete, cannot
+    /// authorize drain, finite termination, or idle either.
+    pub(super) async fn capture_reducer_work_snapshot(&self) -> ReducerWorkSnapshot {
+        let Some(shared) = &self.shared_orchestrator_state else {
+            return ReducerWorkSnapshot::absent();
+        };
+
+        match &self.cancel_token {
+            Some(token) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        debug!("Abandoned reducer work snapshot acquisition after cancellation");
+                        ReducerWorkSnapshot::incomplete()
+                    }
+                    guard = shared.read() => ReducerWorkSnapshot::from_state(&guard),
+                }
+            }
+            None => {
+                let guard = shared.read().await;
+                ReducerWorkSnapshot::from_state(&guard)
             }
         }
+    }
+
+    /// Await one coherent reducer view and sync the scheduler-local lane waits.
+    pub(super) async fn sync_resolve_wait_from_shared_state(&mut self) {
+        let snapshot = self.capture_reducer_work_snapshot().await;
+        self.sync_resolve_wait_from_snapshot(&snapshot);
+    }
+
+    /// Copy reducer-owned lane waits out of an already-captured view.
+    ///
+    /// An incomplete view carries no lane evidence, so the scheduler-local sets
+    /// are left exactly as they were rather than being cleared into a false
+    /// "no lane is waiting".
+    pub(super) fn sync_resolve_wait_from_snapshot(&mut self, snapshot: &ReducerWorkSnapshot) {
+        if !snapshot.reducer_present() || !snapshot.is_complete() {
+            return;
+        }
+        self.resolve_wait_changes = snapshot.resolve_wait_ids().clone();
+        self.reject_wait_changes = snapshot.reject_wait_ids().clone();
     }
 
     pub(super) async fn clear_resolve_wait_intent_for_outcome(&mut self, change_id: &str) {
@@ -455,12 +539,16 @@ impl ParallelExecutor {
         Ok(changed_to_clean)
     }
 
-    pub(crate) fn has_resolve_wait(&self) -> bool {
-        if let Some(shared) = &self.shared_orchestrator_state {
-            if let Ok(guard) = shared.try_read() {
-                return !guard.resolve_wait_change_ids().is_empty()
-                    || !guard.reject_wait_change_ids().is_empty();
-            }
+    /// Whether reducer-owned or scheduler-local base-lane retry intent exists.
+    ///
+    /// Awaited rather than attempted: a caller uses this to decide whether a run
+    /// has anything to do at all, and reporting "no lane wait" because a reducer
+    /// write was in progress would turn real retry intent into a skipped run.
+    pub(crate) async fn has_resolve_wait(&self) -> bool {
+        let snapshot = self.capture_reducer_work_snapshot().await;
+        if snapshot.reducer_present() && snapshot.is_complete() {
+            return !snapshot.resolve_wait_ids().is_empty()
+                || !snapshot.reject_wait_ids().is_empty();
         }
         !self.resolve_wait_changes.is_empty() || !self.reject_wait_changes.is_empty()
     }
@@ -566,7 +654,8 @@ impl ParallelExecutor {
     /// dependency base for dispatch decisions.
     async fn effective_dependency_base(&self) -> Result<String> {
         let mut dependency_context =
-            DependencyContext::from_executor(self, std::iter::empty::<&str>(), &HashSet::new());
+            DependencyContext::from_executor(self, std::iter::empty::<&str>(), &HashSet::new())
+                .await;
         dependency_context
             .effective_dependency_base(self.workspace_manager.as_ref())
             .await
@@ -582,7 +671,8 @@ impl ParallelExecutor {
         &self,
     ) -> Result<EffectiveDependencyBaseEvidence> {
         let mut dependency_context =
-            DependencyContext::from_executor(self, std::iter::empty::<&str>(), &HashSet::new());
+            DependencyContext::from_executor(self, std::iter::empty::<&str>(), &HashSet::new())
+                .await;
         dependency_context
             .effective_dependency_base_evidence(self.workspace_manager.as_ref())
             .await
@@ -602,7 +692,8 @@ impl ParallelExecutor {
 
     async fn is_dependency_resolved_with_base(&self, dep_id: &str) -> Result<(bool, String)> {
         let mut dependency_context =
-            DependencyContext::from_executor(self, std::iter::empty::<&str>(), &HashSet::new());
+            DependencyContext::from_executor(self, std::iter::empty::<&str>(), &HashSet::new())
+                .await;
         dependency_context
             .is_dependency_resolved_with_base(dep_id, self.workspace_manager.as_ref())
             .await
@@ -685,7 +776,8 @@ impl ParallelExecutor {
             self,
             analysis_result.order.iter().map(String::as_str),
             in_flight,
-        );
+        )
+        .await;
 
         for change_id in &analysis_result.order {
             if dependency_context.is_terminal_error_change(change_id) {
@@ -1113,7 +1205,7 @@ impl ParallelExecutor {
                 );
             }
         }
-        self.sync_resolve_wait_from_shared_state_nonblocking();
+        self.sync_resolve_wait_from_shared_state().await;
     }
 
     #[allow(dead_code)]
@@ -1274,7 +1366,7 @@ impl ParallelExecutor {
         };
 
         let Some((change_id, wait_state)) = promoted else {
-            self.sync_resolve_wait_from_shared_state_nonblocking();
+            self.sync_resolve_wait_from_shared_state().await;
             self.last_dispatched_resolve_wait_changes = self.resolve_wait_changes.clone();
             self.last_dispatched_reject_wait_changes = self.reject_wait_changes.clone();
             self.resolve_wait_retry_triggered = false;
@@ -2001,9 +2093,8 @@ impl ParallelExecutor {
     /// queues its resolved targets first), so the reducer is the only authority
     /// here and this check must fail closed:
     ///
-    /// - no reducer wired, or a reducer snapshot that cannot be read right now,
-    ///   means eligibility is unproven, so the hint is refused rather than
-    ///   admitted from the catalog;
+    /// - no reducer wired means eligibility is unproven, so the hint is refused
+    ///   rather than admitted from the catalog;
     /// - a reducer-unknown ID carries no intent at all;
     /// - `DequeueChange` does not drain the queue, so a stop-and-dequeue can
     ///   leave a revoked ID sitting in it.
@@ -2011,8 +2102,19 @@ impl ParallelExecutor {
     /// Refusing costs at most one wake-up: `reconcile_queued_candidates_from_shared_state`
     /// runs on the same scheduler pass and re-adds every genuinely reducer-queued
     /// ID from `queued_change_ids()`, so intent that really exists is never lost.
-    fn admit_dynamic_queue_hint(&self, dynamic_id: &str) -> DynamicQueueAdmission {
-        let Some(shared) = &self.shared_orchestrator_state else {
+    ///
+    /// Contention is deliberately *not* a refusal. Admission reads the
+    /// evaluation's awaited [`ReducerWorkSnapshot`], so a reducer writer can
+    /// only delay this decision. If the view is incomplete the hint is retained
+    /// rather than consumed, because a refused hint plus an equally
+    /// evidence-starved reconciliation is exactly how the only wake edge for
+    /// queued work went missing.
+    fn admit_dynamic_queue_hint(
+        &self,
+        snapshot: &ReducerWorkSnapshot,
+        dynamic_id: &str,
+    ) -> DynamicQueueAdmission {
+        if !snapshot.reducer_present() {
             return DynamicQueueAdmission::Refuse {
                 reason: "reducer_state_absent",
                 log: format!(
@@ -2020,17 +2122,11 @@ impl ParallelExecutor {
                     dynamic_id
                 ),
             };
-        };
-        let Ok(guard) = shared.try_read() else {
-            return DynamicQueueAdmission::Refuse {
-                reason: "reducer_state_unreadable",
-                log: format!(
-                    "Deferring queue entry until reducer queue intent is readable: {}",
-                    dynamic_id
-                ),
-            };
-        };
-        if guard.is_final_terminal_dispatch_stop(dynamic_id) {
+        }
+        if !snapshot.is_complete() {
+            return DynamicQueueAdmission::Retain;
+        }
+        if snapshot.is_final_terminal_dispatch_stop(dynamic_id) {
             return DynamicQueueAdmission::Refuse {
                 reason: "final_terminal",
                 log: format!(
@@ -2039,7 +2135,7 @@ impl ParallelExecutor {
                 ),
             };
         }
-        if !guard.is_ordinary_queue_eligible(dynamic_id) {
+        if !snapshot.is_ordinary_queue_eligible(dynamic_id) {
             return DynamicQueueAdmission::Refuse {
                 reason: "no_current_queue_intent",
                 log: format!(
@@ -2060,28 +2156,66 @@ impl ParallelExecutor {
     ///
     /// # Returns
     /// `true` if queue changed and reanalysis should be triggered
+    ///
+    /// Test-only convenience: the scheduler loop threads its evaluation-scoped
+    /// view into [`Self::check_dynamic_queue_and_add_changes_with_snapshot`],
+    /// so this awaits an equivalent one for direct callers.
+    #[cfg(test)]
     pub(super) async fn check_dynamic_queue_and_add_changes(
         &mut self,
         queued: &mut Vec<crate::openspec::Change>,
         in_flight: &HashSet<String>,
         reanalysis_reason: &mut ReanalysisReason,
     ) -> bool {
+        let snapshot = self.capture_reducer_work_snapshot().await;
+        self.check_dynamic_queue_and_add_changes_with_snapshot(
+            queued,
+            in_flight,
+            reanalysis_reason,
+            &snapshot,
+        )
+        .await
+    }
+
+    /// Ingest dynamic queue hints against an already-captured reducer view.
+    pub(super) async fn check_dynamic_queue_and_add_changes_with_snapshot(
+        &mut self,
+        queued: &mut Vec<crate::openspec::Change>,
+        in_flight: &HashSet<String>,
+        reanalysis_reason: &mut ReanalysisReason,
+        snapshot: &ReducerWorkSnapshot,
+    ) -> bool {
         if let Some(queue) = &self.dynamic_queue {
+            let queue = queue.clone();
             let mut queue_changed = false;
             while let Some(dynamic_id) = queue.pop().await {
                 if !queued.iter().any(|c| c.id == dynamic_id) && !in_flight.contains(&dynamic_id) {
                     // Reducer-owned intent is validated for every hint, before
                     // the catalog is consulted at all.
-                    if let DynamicQueueAdmission::Refuse { reason, log } =
-                        self.admit_dynamic_queue_hint(&dynamic_id)
-                    {
-                        info!(
-                            change_id = %dynamic_id,
-                            reason,
-                            "Skipping dynamic queue ingestion because reducer-owned queue intent does not admit it"
-                        );
-                        send_event(&self.event_tx, ParallelEvent::Log(LogEntry::info(log))).await;
-                        continue;
+                    match self.admit_dynamic_queue_hint(snapshot, &dynamic_id) {
+                        DynamicQueueAdmission::Admit => {}
+                        DynamicQueueAdmission::Refuse { reason, log } => {
+                            info!(
+                                change_id = %dynamic_id,
+                                reason,
+                                "Skipping dynamic queue ingestion because reducer-owned queue intent does not admit it"
+                            );
+                            send_event(&self.event_tx, ParallelEvent::Log(LogEntry::info(log)))
+                                .await;
+                            continue;
+                        }
+                        // Incomplete evidence disposes of nothing. The hint goes
+                        // back at the head of the queue with its wake edge
+                        // intact, and ingestion stops so the rest of the queue
+                        // is left for an evaluation that can actually judge it.
+                        DynamicQueueAdmission::Retain => {
+                            debug!(
+                                change_id = %dynamic_id,
+                                "Retaining dynamic queue hint because reducer evidence is incomplete"
+                            );
+                            queue.requeue_front(dynamic_id).await;
+                            break;
+                        }
                     }
 
                     match crate::openspec::list_changes_native_from(&self.repo_root) {
@@ -2271,49 +2405,57 @@ impl ParallelExecutor {
         true
     }
 
+    /// Test-only convenience: production reconciliation runs through
+    /// [`Self::reconcile_queued_candidates_with_snapshot`] on the evaluation's
+    /// own view. This awaits an equivalent one.
+    #[cfg(test)]
     pub(super) async fn reconcile_queued_candidates_from_shared_state(
         &mut self,
         queued: &mut Vec<crate::openspec::Change>,
         in_flight: &HashSet<String>,
     ) -> QueueReconciliationOutcome {
-        let Some(shared_state) = &self.shared_orchestrator_state else {
+        let snapshot = self.capture_reducer_work_snapshot().await;
+        self.reconcile_queued_candidates_with_snapshot(queued, in_flight, &snapshot)
+            .await
+    }
+
+    /// Reconcile reducer-visible queue intent from an already-captured view.
+    ///
+    /// An incomplete view returns an empty outcome, but that is *not* the same
+    /// empty outcome contention used to produce: the caller may not read it as
+    /// drain or blocked-only evidence, because
+    /// [`ReducerWorkSnapshot::is_complete`] independently withholds every
+    /// termination and idle decision for the same pass.
+    pub(super) async fn reconcile_queued_candidates_with_snapshot(
+        &mut self,
+        queued: &mut Vec<crate::openspec::Change>,
+        in_flight: &HashSet<String>,
+        snapshot: &ReducerWorkSnapshot,
+    ) -> QueueReconciliationOutcome {
+        if !snapshot.reducer_present() || !snapshot.is_complete() {
             return QueueReconciliationOutcome::default();
-        };
+        }
 
         // A terminal error is not filtered here: `queued_change_ids()` already
         // excludes every terminal state, so a terminal-error change carries no
         // ordinary queue intent until `RetryError` clears it. The terminal-error
         // stop gate itself stays where it can still be reached, in dispatch
         // selection.
-        let (
-            queued_intent_ids,
-            active_ids_from_reducer,
-            merge_wait_ids,
-            lane_wait_ids,
-            revoked_local_ids,
-        ) = match shared_state.try_read() {
-            Ok(state) => (
-                state.queued_change_ids(),
-                state.active_change_ids(),
-                state.merge_wait_change_ids(),
-                state
-                    .resolve_wait_change_ids()
-                    .into_iter()
-                    .chain(state.reject_wait_change_ids())
-                    .collect::<std::collections::HashSet<String>>(),
-                queued
-                    .iter()
-                    .filter(|change| !state.is_ordinary_queue_eligible(&change.id))
-                    .map(|change| change.id.clone())
-                    .collect::<Vec<String>>(),
-            ),
-            Err(_) => return QueueReconciliationOutcome::default(),
-        };
+        let queued_intent_ids = snapshot.queued_intent_ids().to_vec();
+        let lane_wait_ids: std::collections::HashSet<String> = snapshot
+            .resolve_wait_ids()
+            .iter()
+            .chain(snapshot.reject_wait_ids())
+            .cloned()
+            .collect();
+        let revoked_local_ids: Vec<String> = queued
+            .iter()
+            .filter(|change| !snapshot.is_ordinary_queue_eligible(&change.id))
+            .map(|change| change.id.clone())
+            .collect();
 
-        let reducer_active_set: std::collections::HashSet<String> =
-            active_ids_from_reducer.into_iter().collect();
-        let reducer_merge_wait_set: std::collections::HashSet<String> =
-            merge_wait_ids.into_iter().collect();
+        let reducer_active_set = snapshot.active_ids();
+        let reducer_merge_wait_set = snapshot.merge_wait_ids();
 
         let mut outcome = QueueReconciliationOutcome::default();
 
@@ -2550,76 +2692,51 @@ impl ParallelExecutor {
         outcome
     }
 
+    /// Test-only convenience: production classification runs through
+    /// [`Self::classify_queued_work_with_snapshot`] on the evaluation's own
+    /// view. This awaits an equivalent one.
+    #[cfg(test)]
     pub(super) async fn classify_queued_work(
         &self,
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
     ) -> BlockedOnlyQueueClassification {
+        let snapshot = self.capture_reducer_work_snapshot().await;
+        self.classify_queued_work_with_snapshot(queued, in_flight, &snapshot)
+            .await
+    }
+
+    /// Classify queued work from an already-captured coherent reducer view.
+    ///
+    /// Acceptance holds, validated external prerequisite waits, and every wait
+    /// lane come from the same view as ordinary eligibility, so no two of these
+    /// facts can be read from different reducer revisions. Nothing is loaded
+    /// from disk: after a restart the reducer holds neither hold kind, the
+    /// change is dispatched again, and workspace evidence routes a complete
+    /// unarchived apply revision back to acceptance.
+    pub(super) async fn classify_queued_work_with_snapshot(
+        &self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        snapshot: &ReducerWorkSnapshot,
+    ) -> BlockedOnlyQueueClassification {
         let mut classification = BlockedOnlyQueueClassification::default();
         let mut seen_ids: HashSet<String> = HashSet::new();
-        let mut dependency_context = DependencyContext::from_executor(
-            self,
+        let mut dependency_context = DependencyContext::from_snapshot(
+            self.repo_root.clone(),
             queued.iter().map(|change| change.id.as_str()),
             in_flight,
+            snapshot,
         );
 
-        // Acceptance holds and validated external prerequisite waits are both
-        // reducer-owned in-memory state, so they are read from the same snapshot
-        // as the other wait lanes. Nothing is loaded from disk: after a restart
-        // the reducer holds neither, the change is dispatched again, and
-        // workspace evidence routes a complete unarchived apply revision back to
-        // acceptance.
-        let reducer_snapshot = self
-            .shared_orchestrator_state
-            .as_ref()
-            .map(|state| state.try_read().ok());
-        let (
-            reducer_queued,
-            merge_wait_ids,
-            resolve_wait_ids,
-            reject_wait_ids,
-            acceptance_stalled,
-            externally_blocked,
-        ) = match reducer_snapshot {
-            Some(Some(state)) => (
-                state.queued_change_ids(),
-                state.merge_wait_change_ids(),
-                state.resolve_wait_change_ids(),
-                state.reject_wait_change_ids(),
-                state.acceptance_stalled_change_ids(),
-                state.externally_blocked_change_ids(),
-            ),
-            // A reducer that exists but cannot be read right now must fail
-            // closed. Falling through with empty wait sets would read as "no
-            // change is waiting" and could classify a `MergeWait`, lane-wait, or
-            // held candidate as dispatchable purely because of lock contention.
-            // Every candidate is instead reported as waiting-but-unavailable, so
-            // this pass dispatches nothing and the next pass reclassifies from a
-            // readable snapshot.
-            Some(None) => {
-                debug!(
-                    queued = queued.len(),
-                    "Deferring queue classification because reducer state is not readable"
-                );
-                classification.candidate_unavailable =
-                    queued.iter().map(|change| change.id.clone()).collect();
-                return classification;
-            }
-            // No reducer is wired at all: there is no reducer-owned wait state to
-            // consult, so scheduler-local candidates are classified on their own.
-            None => Default::default(),
-        };
+        let reducer_queued = snapshot.queued_intent_ids().to_vec();
         // An apply-origin external blocker suppresses dispatch exactly like an
         // acceptance-origin one; only the explanation differs.
-        let held: HashSet<String> = acceptance_stalled
-            .into_iter()
-            .chain(externally_blocked)
-            .collect();
-        let acceptance_stalled = held;
+        let acceptance_stalled = snapshot.held_ids();
 
-        let merge_wait_set: HashSet<String> = merge_wait_ids.into_iter().collect();
-        let resolve_wait_set: HashSet<String> = resolve_wait_ids.into_iter().collect();
-        let reject_wait_set: HashSet<String> = reject_wait_ids.into_iter().collect();
+        let merge_wait_set: HashSet<String> = snapshot.merge_wait_ids().clone();
+        let resolve_wait_set: HashSet<String> = snapshot.resolve_wait_ids().clone();
+        let reject_wait_set: HashSet<String> = snapshot.reject_wait_ids().clone();
 
         for change in queued {
             seen_ids.insert(change.id.clone());
@@ -2748,11 +2865,33 @@ impl ParallelExecutor {
         classification
     }
 
+    #[cfg(test)]
     pub(super) async fn is_blocked_only_scheduler_state(
         &self,
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
     ) -> bool {
+        let snapshot = self.capture_reducer_work_snapshot().await;
+        self.is_blocked_only_scheduler_state_with_snapshot(queued, in_flight, &snapshot)
+            .await
+    }
+
+    /// Whether every remaining candidate is stably held, judged from one
+    /// coherent reducer view.
+    ///
+    /// Incomplete evidence is never "stably blocked". Blocked-only is a
+    /// scheduler *conclusion* — it ends a finite run as `BlockedOrStalled` and
+    /// puts a persistent run into an event-driven idle wait with no timer — so
+    /// it requires evidence that actually exists.
+    pub(super) async fn is_blocked_only_scheduler_state_with_snapshot(
+        &self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        snapshot: &ReducerWorkSnapshot,
+    ) -> bool {
+        if !snapshot.is_complete() {
+            return false;
+        }
         if !self.resolve_wait_changes.is_empty() || !self.reject_wait_changes.is_empty() {
             return false;
         }
@@ -2761,7 +2900,7 @@ impl ParallelExecutor {
             && self.manual_resolve_active() == 0
             && self.pending_merge_count.load(Ordering::Relaxed) == 0
             && self
-                .classify_queued_work(queued, in_flight)
+                .classify_queued_work_with_snapshot(queued, in_flight, snapshot)
                 .await
                 .is_blocked_only()
     }
@@ -2828,7 +2967,10 @@ impl ParallelExecutor {
         (key, message)
     }
 
-    fn no_analysis_diagnostic(
+    /// Awaited rather than attempted: this diagnostic is the operator's only
+    /// notice that reducer-visible queued work produced no analysis, so losing it
+    /// to a concurrent reducer write is exactly the silence it exists to prevent.
+    async fn no_analysis_diagnostic(
         &self,
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
@@ -2836,11 +2978,10 @@ impl ParallelExecutor {
         reason: &str,
     ) -> Option<(DiagnosticDeduplicationKey, LogEntry)> {
         let reducer_queued = self
-            .shared_orchestrator_state
-            .as_ref()
-            .and_then(|state| state.try_read().ok())
-            .map(|state| state.queued_change_ids())
-            .unwrap_or_default();
+            .capture_reducer_work_snapshot()
+            .await
+            .queued_intent_ids()
+            .to_vec();
         if reducer_queued.is_empty() {
             return None;
         }
@@ -2916,8 +3057,9 @@ impl ParallelExecutor {
         max_parallelism: usize,
         reason: &str,
     ) {
-        if let Some((key, log_entry)) =
-            self.no_analysis_diagnostic(queued, in_flight, max_parallelism, reason)
+        if let Some((key, log_entry)) = self
+            .no_analysis_diagnostic(queued, in_flight, max_parallelism, reason)
+            .await
         {
             self.emit_log_diagnostic_once(
                 key,
@@ -2955,8 +3097,22 @@ impl ParallelExecutor {
         in_flight: &HashSet<String>,
         max_parallelism: usize,
         iteration: u32,
+        work_snapshot: &ReducerWorkSnapshot,
     ) -> ReanalysisFlowDecision {
-        let classification = self.classify_queued_work(queued, in_flight).await;
+        // Fail-closed: an incomplete view proves nothing about what is
+        // dispatchable, so no analyzer, workspace preparation, or dispatch may
+        // start from it. The pass ends without recording any classification.
+        if !work_snapshot.is_complete() {
+            debug!(
+                queued = queued.len(),
+                "Skipping dependency analysis because reducer evidence for this evaluation is incomplete"
+            );
+            return ReanalysisFlowDecision::done(false, iteration);
+        }
+
+        let classification = self
+            .classify_queued_work_with_snapshot(queued, in_flight, work_snapshot)
+            .await;
         if classification.is_blocked_only() {
             info!(
                 dispatchable = classification.dispatchable.len(),
@@ -3700,12 +3856,7 @@ impl ParallelExecutor {
 
     async fn before_dependency_analysis<F>(
         &mut self,
-        queued: &mut [crate::openspec::Change],
-        in_flight: &HashSet<String>,
-        max_parallelism: usize,
-        iteration: u32,
-        reanalysis_reason: ReanalysisReason,
-        analyzer: &F,
+        inputs: DependencyAnalysisInputs<'_, F>,
     ) -> Result<DependencyAnalysisPass>
     where
         for<'a> F: Fn(
@@ -3717,6 +3868,16 @@ impl ParallelExecutor {
             + Send
             + Sync,
     {
+        let DependencyAnalysisInputs {
+            queued,
+            in_flight,
+            max_parallelism,
+            iteration,
+            reanalysis_reason,
+            analyzer,
+            work_snapshot,
+        } = inputs;
+
         // Failed-dependency observation runs before classification and before
         // the debounce gate: it owns bounded, once-per-epoch operator
         // notification, so a blocked-only pass that stops at classification
@@ -3732,7 +3893,13 @@ impl ParallelExecutor {
         }
 
         if let Some((should_break, iteration)) = self
-            .prepare_dispatch_candidates(queued, in_flight, max_parallelism, iteration)
+            .prepare_dispatch_candidates(
+                queued,
+                in_flight,
+                max_parallelism,
+                iteration,
+                work_snapshot,
+            )
             .await
             .into_result()
         {
@@ -3823,6 +3990,7 @@ impl ParallelExecutor {
             semaphore,
             join_set,
             cleanup_guard,
+            work_snapshot,
         } = ctx;
 
         if self.is_cancelled() {
@@ -3832,15 +4000,29 @@ impl ParallelExecutor {
             return Ok((true, iteration));
         }
 
+        // The loop hands down the view it already captured for this pass; a
+        // direct caller gets an equivalent awaited one. Either way classification
+        // never re-derives reducer facts from a second, possibly different
+        // revision.
+        let captured_work_snapshot;
+        let work_snapshot = match work_snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                captured_work_snapshot = self.capture_reducer_work_snapshot().await;
+                &captured_work_snapshot
+            }
+        };
+
         let pass = self
-            .before_dependency_analysis(
+            .before_dependency_analysis(DependencyAnalysisInputs {
                 queued,
                 in_flight,
                 max_parallelism,
                 iteration,
                 reanalysis_reason,
                 analyzer,
-            )
+                work_snapshot,
+            })
             .await?;
         let captured_signature = pass.captured_signature;
         let analysis_outcome = match pass.attempt {
