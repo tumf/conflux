@@ -98,6 +98,7 @@ use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
 use super::queue_state::ReanalysisDispatchContext;
 use super::types::WorkspaceResult;
+use super::work_snapshot::ReducerWorkSnapshot;
 use super::ParallelEvent;
 use super::ParallelExecutor;
 use super::SchedulerLifetime;
@@ -133,28 +134,67 @@ impl ParallelExecutor {
             && self.pending_merge_count.load(Ordering::Relaxed) == 0
     }
 
+    /// Whether a finite run may stop here.
+    ///
+    /// Both halves — fully drained and blocked-only — are terminal claims about
+    /// reducer-owned work, so both require the evaluation's reducer view to be
+    /// complete. A run that could not read reducer evidence has not observed an
+    /// empty queue; it has observed nothing, and must loop instead of reporting
+    /// `DrainedSuccessfully` or `BlockedOrStalled`.
+    ///
+    /// `work_snapshot` is the evaluation-scoped view when the loop already
+    /// captured one, or `None` to await an equivalent view here.
     pub(super) async fn should_exit_when_idle(
         &self,
         join_set_empty: bool,
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
+        work_snapshot: Option<&ReducerWorkSnapshot>,
     ) -> bool {
         if self.scheduler_lifetime != SchedulerLifetime::Finite || !join_set_empty {
             return false;
         }
+        let captured;
+        let work_snapshot = match work_snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                captured = self.capture_reducer_work_snapshot().await;
+                &captured
+            }
+        };
+        if !work_snapshot.is_complete() {
+            return false;
+        }
         self.is_fully_drained(join_set_empty, queued.is_empty(), in_flight.is_empty())
             || self
-                .is_blocked_only_scheduler_state(queued, in_flight)
+                .is_blocked_only_scheduler_state_with_snapshot(queued, in_flight, work_snapshot)
                 .await
     }
 
+    /// Whether a persistent run may park in the event-driven idle wait.
+    ///
+    /// That wait has no timer by design, so entering it on incomplete reducer
+    /// evidence is what let queued intent sit untouched until an unrelated
+    /// queue, merge, or cancellation event happened to arrive.
     pub(super) async fn should_enter_persistent_idle_wait(
         &self,
         join_set_empty: bool,
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
+        work_snapshot: Option<&ReducerWorkSnapshot>,
     ) -> bool {
         if self.scheduler_lifetime != SchedulerLifetime::Persistent || !join_set_empty {
+            return false;
+        }
+        let captured;
+        let work_snapshot = match work_snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                captured = self.capture_reducer_work_snapshot().await;
+                &captured
+            }
+        };
+        if !work_snapshot.is_complete() {
             return false;
         }
         self.is_fully_drained(join_set_empty, queued.is_empty(), in_flight.is_empty())
@@ -164,7 +204,7 @@ impl ParallelExecutor {
                 && self.manual_resolve_active() == 0
                 && self.pending_merge_count.load(Ordering::Relaxed) == 0)
             || self
-                .is_blocked_only_scheduler_state(queued, in_flight)
+                .is_blocked_only_scheduler_state_with_snapshot(queued, in_flight, work_snapshot)
                 .await
     }
 
@@ -219,19 +259,19 @@ impl ParallelExecutor {
             self.upstream_enabled() || self.explicit_target_plan.is_some();
 
         if changes.is_empty() && !must_reach_upstream_boundary {
-            let (reducer_has_queued_intent, reducer_has_lane_wait) = self
-                .shared_orchestrator_state
-                .as_ref()
-                .and_then(|state| state.try_read().ok())
-                .map(|state| {
-                    (
-                        !state.queued_change_ids().is_empty(),
-                        !state.resolve_wait_change_ids().is_empty()
-                            || !state.reject_wait_change_ids().is_empty(),
-                    )
-                })
-                .unwrap_or((false, false));
-            if !reducer_has_queued_intent && !reducer_has_lane_wait {
+            // Awaited, not attempted: this gate reports a *completed* run, so a
+            // reducer write that happened to overlap startup must delay it, not
+            // convert an unreadable reducer into "there was never any queued
+            // work". An incomplete view (cancellation) falls through to the loop,
+            // whose cancellation branch owns that exit.
+            let startup_snapshot = self.capture_reducer_work_snapshot().await;
+            let reducer_has_queued_intent = !startup_snapshot.queued_intent_ids().is_empty();
+            let reducer_has_lane_wait = !startup_snapshot.resolve_wait_ids().is_empty()
+                || !startup_snapshot.reject_wait_ids().is_empty();
+            if startup_snapshot.is_complete()
+                && !reducer_has_queued_intent
+                && !reducer_has_lane_wait
+            {
                 return Ok(self.finish_completed_run().await);
             }
             if reducer_has_lane_wait {
@@ -423,24 +463,46 @@ impl ParallelExecutor {
             // dependents.
             let explicit_retry_edge = self.consume_explicit_retry_edges().await;
 
-            // Step 1: Check dynamic queue for newly added changes (TUI mode)
+            // Step 1: Capture one coherent reducer work view for this evaluation.
+            //
+            // Hint admission, lane-wait synchronization, queue reconciliation,
+            // queue/dependency classification, and the drain/idle decision below
+            // all read *this* view. Previously each took its own `try_read`, so a
+            // single short reducer write could make one stage refuse a hint,
+            // another return an empty reconciliation, and a third report every
+            // candidate unavailable — leaving a scheduler pass that looked
+            // drained or stably blocked while reducer intent was still queued.
+            //
+            // Acquisition awaits rather than polls, so a writer only delays this
+            // pass; Tokio resumes the same evaluation on release without needing
+            // another queue mutation or wake notification.
+            let work_snapshot = self.capture_reducer_work_snapshot().await;
+            if self.is_cancelled() {
+                // Acquisition lost the race to cancellation. The top-of-loop
+                // cancellation branch owns termination, so nothing here may
+                // classify, terminate, or idle on the incomplete view.
+                continue;
+            }
+
+            // Step 2: Check dynamic queue for newly added changes (TUI mode)
             let dynamic_queue_added = self
-                .check_dynamic_queue_and_add_changes(
+                .check_dynamic_queue_and_add_changes_with_snapshot(
                     &mut queued,
                     &in_flight,
                     &mut reanalysis_reason,
+                    &work_snapshot,
                 )
                 .await;
 
-            // Step 2: Sync reducer-owned ResolveWait intent before scheduler drain/idle checks.
+            // Step 3: Sync reducer-owned ResolveWait intent before scheduler drain/idle checks.
             // This keeps manual resolve dispatch reducer-owned while making scheduler work detection truthful.
-            self.sync_resolve_wait_from_shared_state_nonblocking();
+            self.sync_resolve_wait_from_snapshot(&work_snapshot);
             self.maybe_dispatch_resolve_wait_retry_with_tx(&merge_result_tx)
                 .await;
 
-            // Step 2: Reconcile reducer-visible queue intent into scheduler-local candidates.
+            // Step 4: Reconcile reducer-visible queue intent into scheduler-local candidates.
             let reconciliation = self
-                .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+                .reconcile_queued_candidates_with_snapshot(&mut queued, &in_flight, &work_snapshot)
                 .await;
             if reconciliation.has_queued_additions() || explicit_retry_edge {
                 // A consumed explicit-retry edge arms exactly one reevaluation:
@@ -459,8 +521,14 @@ impl ParallelExecutor {
                 reanalysis_reason = ReanalysisReason::Initial;
             }
 
-            // Step 3: Re-analysis decision is derived from scheduler state.
-            let work_drained = queued.is_empty()
+            // Step 5: Re-analysis decision is derived from scheduler state.
+            //
+            // `queued` is only trustworthy as drain evidence when reconciliation
+            // above ran on complete reducer facts. An incomplete view leaves the
+            // local list untouched, and an untouched empty list is absence of
+            // evidence, not evidence of absence.
+            let work_drained = work_snapshot.is_complete()
+                && queued.is_empty()
                 && in_flight.is_empty()
                 && self.resolve_wait_changes.is_empty()
                 && self.reject_wait_changes.is_empty()
@@ -485,6 +553,7 @@ impl ParallelExecutor {
                         semaphore: semaphore.clone(),
                         join_set: &mut join_set,
                         cleanup_guard: &mut cleanup_guard,
+                        work_snapshot: Some(&work_snapshot),
                     },
                     &mut reanalysis_reason,
                 )
@@ -497,9 +566,14 @@ impl ParallelExecutor {
                 }
             }
 
-            // Step 3: Check if all work is done (before waiting on select)
+            // Step 6: Check if all work is done (before waiting on select)
             if self
-                .should_exit_when_idle(join_set.is_empty(), &queued, &in_flight)
+                .should_exit_when_idle(
+                    join_set.is_empty(),
+                    &queued,
+                    &in_flight,
+                    Some(&work_snapshot),
+                )
                 .await
             {
                 info!(
@@ -521,7 +595,12 @@ impl ParallelExecutor {
             }
 
             if self
-                .should_enter_persistent_idle_wait(join_set.is_empty(), &queued, &in_flight)
+                .should_enter_persistent_idle_wait(
+                    join_set.is_empty(),
+                    &queued,
+                    &in_flight,
+                    Some(&work_snapshot),
+                )
                 .await
             {
                 self.wait_for_persistent_idle_wake_with_tx(

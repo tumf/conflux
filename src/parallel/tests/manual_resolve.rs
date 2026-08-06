@@ -294,6 +294,7 @@ async fn test_manual_resolve_zero_capacity_runs_analysis_but_suppresses_apply_di
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
+            work_snapshot: None,
         })
         .await
         .expect("re-analysis should not fail");
@@ -378,6 +379,7 @@ async fn repeated_capacity_zero_does_not_spam_dispatch_diagnostic() {
                 semaphore: semaphore.clone(),
                 join_set: &mut join_set,
                 cleanup_guard: &mut cleanup_guard,
+                work_snapshot: None,
             })
             .await
             .expect("re-analysis should not fail");

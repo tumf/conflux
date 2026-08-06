@@ -125,6 +125,14 @@ The current section MUST represent repository-fixable findings from the latest F
 - **THEN** only the repository defect is a checkbox task
 - **AND** the external blocker is metadata with evidence and next action
 
+#### Scenario: OpenCode adapter delegates follow-up persistence
+
+- **GIVEN** the tracked OpenCode Acceptance command adapter is used to review a change
+- **WHEN** the reviewer prepares a FAIL verdict
+- **THEN** the adapter requires the reviewer to return all actionable findings without editing `tasks.md` or `## Current Acceptance Follow-up`
+- **AND** the adapter delegates normalized follow-up persistence to Conflux runtime
+- **AND** the adapter does not instruct the reviewer to derive an attempt number or create a numbered `## Acceptance #N Failure Follow-up` section
+
 ### Requirement: Acceptance MUST fail when git working tree is dirty
 acceptance プロンプトは Git の作業ツリーが完全にクリーンであることを確認しなければならない（MUST）。この確認では `git status --porcelain` を使用し、出力が空であることを前提とする。未コミット変更または未追跡ファイルが存在する場合、acceptance は FAIL を出力し、FINDINGS に該当ファイルのパスを列挙しなければならない（MUST）。
 

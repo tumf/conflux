@@ -1559,6 +1559,47 @@ impl OrchestratorState {
         }
     }
 
+    /// Set form of [`Self::is_ordinary_queue_eligible`].
+    ///
+    /// A scheduler evaluation decides hint admission, queue reconciliation, and
+    /// queue classification for many IDs at once. Capturing the eligible set from
+    /// one read keeps every one of those decisions on the same reducer revision;
+    /// an ID missing from the set is exactly the `false` the per-ID predicate
+    /// returns, including for an ID the reducer has never seen.
+    pub fn ordinary_queue_eligible_change_ids(&self) -> HashSet<String> {
+        self.change_runtime
+            .keys()
+            .filter(|id| self.is_ordinary_queue_eligible(id))
+            .cloned()
+            .collect()
+    }
+
+    /// Set form of [`Self::is_final_terminal_dispatch_stop`].
+    pub fn final_terminal_dispatch_stop_change_ids(&self) -> HashSet<String> {
+        self.change_runtime
+            .keys()
+            .filter(|id| self.is_final_terminal_dispatch_stop(id))
+            .cloned()
+            .collect()
+    }
+
+    /// Set form of [`Self::is_terminal_error_change`].
+    pub fn terminal_error_change_ids(&self) -> HashSet<String> {
+        self.change_runtime
+            .iter()
+            .filter(|(_, rt)| matches!(rt.terminal, TerminalState::Error(_)))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Active change IDs whose display status is `resolving`.
+    pub fn resolving_change_ids(&self) -> HashSet<String> {
+        self.active_change_ids()
+            .into_iter()
+            .filter(|id| self.display_status(id) == "resolving")
+            .collect()
+    }
+
     /// Return true when a recoverable terminal error is currently gating ordinary apply dispatch.
     pub fn is_terminal_error_change(&self, change_id: &str) -> bool {
         self.change_runtime

@@ -180,6 +180,7 @@ impl SchedulerLoopHarness {
                     semaphore: self.semaphore.clone(),
                     join_set: &mut self.join_set,
                     cleanup_guard: &mut self.cleanup_guard,
+                    work_snapshot: None,
                 },
                 &mut self.reanalysis_reason,
             )

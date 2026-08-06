@@ -7,7 +7,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::dependency_targets::{
@@ -15,9 +14,9 @@ use crate::dependency_targets::{
     collect_rejected_change_ids, DependencyTargetClass,
 };
 use crate::error::{OrchestratorError, Result};
-use crate::orchestration::state::OrchestratorState;
 use crate::vcs::WorkspaceManager;
 
+use super::work_snapshot::ReducerWorkSnapshot;
 use super::{DependencyBlockerFingerprint, ParallelExecutor};
 
 /// The dependency base a scheduler pass evaluates merge evidence against, together with the
@@ -59,80 +58,55 @@ pub(super) struct DependencyContext {
     /// now yields every candidate, so an unreadable snapshot withholds work
     /// instead of silently granting it.
     ordinary_ineligible_ids: Option<HashSet<String>>,
-    lifecycle_evidence_available: bool,
     effective_dependency_base: Option<String>,
 }
 
 impl DependencyContext {
-    pub(super) fn from_executor(
+    /// Build a context from an awaited coherent reducer view.
+    ///
+    /// The read is awaited rather than attempted: a scheduler pass that arrives
+    /// during a short reducer write suspends until the write completes, instead
+    /// of manufacturing a "lifecycle evidence unavailable" classification that
+    /// the scheduler could mistake for stable state. No reducer guard is held
+    /// when this returns, so every repository probe and dependency await below
+    /// runs lock-free.
+    ///
+    /// Callers that already hold an evaluation-scoped snapshot should use
+    /// [`Self::from_snapshot`] so the whole evaluation stays on one reducer
+    /// revision.
+    pub(super) async fn from_executor(
         executor: &ParallelExecutor,
         queued_ids: impl IntoIterator<Item = impl AsRef<str>>,
         in_flight: &HashSet<String>,
     ) -> Self {
-        Self::from_parts(
-            executor.repo_root.clone(),
-            queued_ids,
-            in_flight,
-            executor.shared_orchestrator_state.as_ref(),
-        )
+        let snapshot = executor.capture_reducer_work_snapshot().await;
+        Self::from_snapshot(executor.repo_root.clone(), queued_ids, in_flight, &snapshot)
     }
 
-    fn from_parts(
+    pub(super) fn from_snapshot(
         repo_root: PathBuf,
         queued_ids: impl IntoIterator<Item = impl AsRef<str>>,
         in_flight: &HashSet<String>,
-        shared_orchestrator_state: Option<&std::sync::Arc<RwLock<OrchestratorState>>>,
+        snapshot: &ReducerWorkSnapshot,
     ) -> Self {
         let queued_ids = queued_ids
             .into_iter()
             .map(|id| id.as_ref().to_string())
             .collect::<HashSet<_>>();
 
-        let (
-            terminal_error_ids,
-            resolving_ids,
-            resolve_wait_ids,
-            ordinary_ineligible_ids,
-            lifecycle_evidence_available,
-        ) = match shared_orchestrator_state {
-            Some(state) => match state.try_read() {
-                Ok(state) => (
-                    state
-                        .initial_change_ids()
-                        .iter()
-                        .filter(|id| state.is_terminal_error_change(id))
-                        .cloned()
-                        .collect::<HashSet<_>>(),
-                    state
-                        .active_change_ids()
-                        .into_iter()
-                        .filter(|id| state.display_status(id) == "resolving")
-                        .collect::<HashSet<_>>(),
-                    state
-                        .resolve_wait_change_ids()
-                        .into_iter()
-                        .collect::<HashSet<_>>(),
-                    Some(
-                        queued_ids
-                            .iter()
-                            .filter(|id| !state.is_ordinary_queue_eligible(id))
-                            .cloned()
-                            .collect::<HashSet<_>>(),
-                    ),
-                    true,
-                ),
-                // A reducer that exists but cannot be read right now proves
-                // nothing, so every candidate is withheld until it can.
-                Err(_) => (
-                    HashSet::new(),
-                    HashSet::new(),
-                    HashSet::new(),
-                    Some(queued_ids.clone()),
-                    false,
-                ),
-            },
-            None => (HashSet::new(), HashSet::new(), HashSet::new(), None, true),
-        };
+        // A wired reducer is authoritative about ordinary intent, so eligibility
+        // is decided from the captured set. An abandoned acquisition carries an
+        // empty set, which withholds every candidate rather than granting it.
+        let ordinary_ineligible_ids = snapshot.reducer_present().then(|| {
+            queued_ids
+                .iter()
+                .filter(|id| !snapshot.is_ordinary_queue_eligible(id))
+                .cloned()
+                .collect::<HashSet<_>>()
+        });
+        let terminal_error_ids = snapshot.terminal_error_ids().clone();
+        let resolving_ids = snapshot.resolving_ids().clone();
+        let resolve_wait_ids = snapshot.resolve_wait_ids().clone();
         let in_flight_ids = in_flight.iter().cloned().collect::<HashSet<_>>();
         let active_ids = collect_active_change_ids(&repo_root);
         let archived_ids = collect_archived_change_ids(&repo_root);
@@ -147,7 +121,8 @@ impl DependencyContext {
             terminal_error = terminal_error_ids.len(),
             resolving = resolving_ids.len(),
             resolve_wait = resolve_wait_ids.len(),
-            lifecycle_evidence_available,
+            reducer_present = snapshot.reducer_present(),
+            reducer_evidence_complete = snapshot.is_complete(),
             "Built dependency classification context"
         );
 
@@ -162,7 +137,6 @@ impl DependencyContext {
             resolving_ids,
             resolve_wait_ids,
             ordinary_ineligible_ids,
-            lifecycle_evidence_available,
             effective_dependency_base: None,
         }
     }
@@ -195,9 +169,6 @@ impl DependencyContext {
 
         if matches!(class, DependencyTargetClass::Rejected) {
             return class;
-        }
-        if !self.lifecycle_evidence_available {
-            return DependencyTargetClass::Error;
         }
 
         if self.terminal_error_ids.contains(dep_id) {
@@ -387,7 +358,17 @@ impl DependencyContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::state::OrchestratorState;
+    use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    /// Await one coherent reducer view the way production code does.
+    async fn capture(state: &Arc<RwLock<OrchestratorState>>) -> ReducerWorkSnapshot {
+        let guard = state.read().await;
+        ReducerWorkSnapshot::from_state(&guard)
+    }
 
     fn write_change(root: &std::path::Path, id: &str) {
         let change_dir = root.join("openspec/changes").join(id);
@@ -431,11 +412,11 @@ mod tests {
         )
         .unwrap();
 
-        let context = DependencyContext::from_parts(
+        let context = DependencyContext::from_snapshot(
             temp_dir.path().to_path_buf(),
             ["queued-gate"],
             &HashSet::new(),
-            None,
+            &ReducerWorkSnapshot::absent(),
         );
 
         assert_eq!(
@@ -452,25 +433,54 @@ mod tests {
         );
     }
 
+    /// A reducer writer delays dependency classification; it never fabricates a
+    /// lifecycle verdict.
+    ///
+    /// The awaited read is driven from a separate task on purpose: reading in the
+    /// task that holds the writer would self-deadlock, which is exactly the
+    /// same-task pattern the old `try_read` contention test relied on.
     #[tokio::test]
-    async fn context_blocks_dependencies_when_lifecycle_evidence_lock_is_unavailable() {
+    async fn reducer_snapshot_contention_defers_dependency_context_until_writer_releases() {
         let temp_dir = TempDir::new().unwrap();
-        let state = std::sync::Arc::new(RwLock::new(OrchestratorState::new(
+        write_change(temp_dir.path(), "resolving-a");
+        let state = Arc::new(RwLock::new(OrchestratorState::new(
             vec!["resolving-a".to_string()],
             1,
         )));
-        let _write_guard = state.write().await;
-        let context = DependencyContext::from_parts(
-            temp_dir.path().to_path_buf(),
-            ["dependent"],
-            &HashSet::new(),
-            Some(&state),
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ResolveStarted {
+                change_id: "resolving-a".to_string(),
+                command: "resolve".to_string(),
+            });
+        }
+
+        let write_guard = state.write().await;
+        let repo_root = temp_dir.path().to_path_buf();
+        let contended = Arc::clone(&state);
+        let mut classification = tokio::spawn(async move {
+            let snapshot = capture(&contended).await;
+            DependencyContext::from_snapshot(repo_root, ["dependent"], &HashSet::new(), &snapshot)
+                .classify("resolving-a")
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut classification)
+                .await
+                .is_err(),
+            "classification must suspend behind the writer instead of resolving from partial evidence"
         );
 
+        drop(write_guard);
+
+        let class = tokio::time::timeout(Duration::from_secs(5), classification)
+            .await
+            .expect("released writer must let the pending snapshot acquisition finish")
+            .expect("classification task must not panic");
         assert_eq!(
-            context.classify("resolving-a"),
-            DependencyTargetClass::Error,
-            "unavailable lifecycle evidence must fail closed"
+            class,
+            DependencyTargetClass::Resolving,
+            "the resumed evaluation classifies from real reducer evidence"
         );
     }
 
@@ -495,7 +505,7 @@ mod tests {
         .unwrap();
 
         let in_flight = HashSet::from(["flight-a".to_string()]);
-        let state = std::sync::Arc::new(RwLock::new(OrchestratorState::new(
+        let state = Arc::new(RwLock::new(OrchestratorState::new(
             vec!["resolving-a".to_string(), "resolve-wait-a".to_string()],
             1,
         )));
@@ -508,11 +518,11 @@ mod tests {
             "resolve-wait-a".to_string(),
         ));
         drop(state_guard);
-        let context = DependencyContext::from_parts(
+        let context = DependencyContext::from_snapshot(
             temp_dir.path().to_path_buf(),
             ["queued-a"],
             &in_flight,
-            Some(&state),
+            &capture(&state).await,
         );
 
         let cases = [

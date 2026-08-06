@@ -32,6 +32,7 @@ mod target_plan;
 mod types;
 pub(crate) mod upstream_bridge;
 mod upstream_lane;
+mod work_snapshot;
 mod workspace;
 
 // Re-export unified event type as ParallelEvent for backward compatibility.

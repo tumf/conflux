@@ -116,6 +116,24 @@ impl DynamicQueue {
         queue.pop_front()
     }
 
+    /// Put back a hint the scheduler popped but could not yet dispose of.
+    ///
+    /// This preserves an existing wake edge rather than creating one, so unlike
+    /// [`Self::push`] it clears no pending removal marker and emits no
+    /// notification: the scheduler is the one holding the hint, and it is about
+    /// to re-evaluate anyway. Restoring at the head keeps queue order intact.
+    ///
+    /// Returns false when the ID is already queued, in which case the edge is
+    /// already represented and nothing needs restoring.
+    pub async fn requeue_front(&self, id: String) -> bool {
+        let mut queue = self.inner.lock().await;
+        if queue.contains(&id) {
+            return false;
+        }
+        queue.push_front(id);
+        true
+    }
+
     /// Remove a specific change ID from the queue
     /// Returns true if the ID was found and removed, false otherwise
     pub async fn remove(&self, id: &str) -> bool {
