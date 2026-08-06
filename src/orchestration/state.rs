@@ -1629,6 +1629,46 @@ impl OrchestratorState {
         self.clear_base_mutating_wait_queues(change_id);
     }
 
+    /// Reconcile reducer-owned transient state at a run's terminal stop boundary.
+    ///
+    /// The scheduler has already reached its cancellation-safe barrier by the
+    /// time process-level `Stopped` is reduced, so any row still carrying
+    /// activity, queue intent, or a wait/hold was interrupted by that stop and
+    /// no longer has an owner. Each such row returns to the same non-terminal
+    /// idle, not-queued shape an explicit dequeue produces, including the
+    /// process-local dequeue guard that keeps a late lifecycle event or a
+    /// same-process workspace observation from reactivating it before an
+    /// explicit requeue.
+    ///
+    /// Deliberately *not* a per-change terminal outcome: a process stop is not a
+    /// change result. Fresh idle rows were never part of the stopped run, and an
+    /// existing terminal outcome — including recoverable `Error` — is a fact the
+    /// stop must not erase.
+    fn on_run_stopped(&mut self) {
+        let interrupted: Vec<String> = self
+            .change_runtime
+            .iter()
+            .filter(|(_, rt)| {
+                !rt.is_terminal()
+                    && (rt.is_active()
+                        || matches!(rt.queue_intent, QueueIntent::Queued)
+                        || !matches!(rt.wait_state, WaitState::None))
+            })
+            .map(|(change_id, _)| change_id.clone())
+            .collect();
+
+        for change_id in interrupted {
+            self.transition_change_to_dequeued(&change_id);
+            // Scheduler-owned stall/skip membership belongs to the run that just
+            // ended; the retry budget it gates is re-derived from the workspace.
+            self.stalled_change_ids.remove(&change_id);
+            self.skipped_change_ids.remove(&change_id);
+            if self.current_change_id.as_deref() == Some(change_id.as_str()) {
+                self.current_change_id = None;
+            }
+        }
+    }
+
     fn transition_change_to_stopped(&mut self, change_id: &str) {
         let rt = self.runtime_entry(change_id);
         rt.transition_to_terminal(TerminalState::Stopped);
@@ -2462,6 +2502,10 @@ impl OrchestratorState {
                 }
                 self.transition_change_to_dequeued(change_id);
             }
+
+            // Process-level run boundary: the reducer, not a frontend, owns the
+            // transition every interrupted row makes when the run ends.
+            ExecutionEvent::Stopped => self.on_run_stopped(),
 
             // Dynamic queue support
             ExecutionEvent::ChangesRefreshed {
@@ -6714,5 +6758,332 @@ mod tests {
         let restarted = OrchestratorState::new(vec!["c".to_string()], 0);
         assert_eq!(restarted.display_status("c"), "not queued");
         assert!(!restarted.is_active_change("c"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Process-level stop: reducer-owned run-boundary reconciliation
+    // -----------------------------------------------------------------------
+
+    /// Drive one change into a named reducer state through ordinary events.
+    fn enter_runtime_family(state: &mut OrchestratorState, change_id: &str, family: &str) {
+        use crate::events::ExecutionEvent;
+        use crate::vcs::WorkspaceStatus;
+
+        match family {
+            "queued" => {
+                state.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+            }
+            "preparing" => {
+                state.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+                state.apply_execution_event(&ExecutionEvent::WorkspacePreparationStarted {
+                    change_id: change_id.to_string(),
+                });
+            }
+            "applying" => {
+                state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+                    change_id: change_id.to_string(),
+                    command: "apply".to_string(),
+                });
+            }
+            "accepting" => {
+                state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+                    change_id: change_id.to_string(),
+                    command: "accept".to_string(),
+                });
+            }
+            "archiving" => {
+                state.apply_execution_event(&ExecutionEvent::ArchiveStarted {
+                    change_id: change_id.to_string(),
+                    command: "archive".to_string(),
+                });
+            }
+            "resolving" => {
+                state.apply_execution_event(&ExecutionEvent::ResolveStarted {
+                    change_id: change_id.to_string(),
+                    command: "resolve".to_string(),
+                });
+            }
+            "rejecting" => {
+                state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+                    change_id: change_id.to_string(),
+                    workspace_name: format!("ws-{change_id}"),
+                    status: WorkspaceStatus::Rejecting,
+                });
+            }
+            "merge wait" => {
+                state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+                    change_id: change_id.to_string(),
+                    reason: "base branch is dirty".to_string(),
+                    auto_resumable: false,
+                });
+            }
+            "resolve pending" => {
+                state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+                    change_id: change_id.to_string(),
+                    reason: "another merge is in progress".to_string(),
+                    auto_resumable: true,
+                });
+            }
+            "reject pending" => {
+                // Rejection review is a base-mutating lane: an occupied lane is
+                // what produces the queued `reject pending` wait.
+                state.apply_execution_event(&ExecutionEvent::ResolveStarted {
+                    change_id: "lane-occupant".to_string(),
+                    command: "resolve".to_string(),
+                });
+                state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+                    change_id: change_id.to_string(),
+                    workspace_name: format!("ws-{change_id}"),
+                    status: WorkspaceStatus::Rejecting,
+                });
+            }
+            "blocked (dependency)" => {
+                state.apply_execution_event(&ExecutionEvent::DependencyBlocked {
+                    change_id: change_id.to_string(),
+                    dependency_ids: vec!["dep".to_string()],
+                });
+            }
+            "blocked (external)" => {
+                state.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+                    change_id: change_id.to_string(),
+                    blocker: crate::events::StalledBlocker::acceptance_external(
+                        "credential",
+                        "STAGING_API_KEY is unset",
+                    ),
+                });
+            }
+            "stalled" => {
+                state.mark_stalled(change_id.to_string());
+                state.apply_execution_event(&ExecutionEvent::ExecutionBlocked {
+                    change_id: change_id.to_string(),
+                    blocker: crate::events::StalledBlocker {
+                        category: "no_progress".to_string(),
+                        phase: "apply".to_string(),
+                        gate: "apply".to_string(),
+                        error_summary: "no semantic progress".to_string(),
+                        evidence: vec!["tasks.md unchanged".to_string()],
+                        unblock_condition: None,
+                        prerequisite_owner: None,
+                        next_action: "operator review".to_string(),
+                        resumable: true,
+                        worktree_preserved: true,
+                    },
+                });
+            }
+            other => panic!("unknown runtime family: {other}"),
+        }
+    }
+
+    /// A terminal process stop returns every interrupted row to resumable
+    /// `not queued`, and touches nothing it did not own.
+    ///
+    /// The regression: `ExecutionEvent::Stopped` was a reducer no-op, so a row
+    /// the operator had just stopped stayed `accepting` in the one state both
+    /// frontends read back.
+    #[test]
+    fn global_stopped_reconciles_interrupted_runtime() {
+        use crate::events::ExecutionEvent;
+
+        // ── Every interrupted activity and wait family returns to not queued ──
+        let families = [
+            "queued",
+            "preparing",
+            "applying",
+            "accepting",
+            "archiving",
+            "resolving",
+            "rejecting",
+            "merge wait",
+            "resolve pending",
+            "reject pending",
+            "blocked (dependency)",
+            "blocked (external)",
+            "stalled",
+        ];
+
+        for family in families {
+            let mut state =
+                OrchestratorState::new(vec!["target".to_string(), "lane-occupant".to_string()], 0);
+            enter_runtime_family(&mut state, "target", family);
+            assert_ne!(
+                state.display_status("target"),
+                "not queued",
+                "{family} setup did not produce interrupted runtime state"
+            );
+
+            state.apply_execution_event(&ExecutionEvent::Stopped);
+
+            assert_eq!(
+                state.display_status("target"),
+                "not queued",
+                "{family} was not reconciled by the run-boundary stop"
+            );
+            let rt = state.change_runtime.get("target").expect("runtime entry");
+            assert_eq!(rt.activity, ActivityState::Idle, "{family} stayed active");
+            assert_eq!(rt.wait_state, WaitState::None, "{family} stayed waiting");
+            assert_eq!(
+                rt.queue_intent,
+                QueueIntent::NotQueued,
+                "{family} kept queue intent"
+            );
+            assert_eq!(
+                rt.terminal,
+                TerminalState::None,
+                "{family} was given a terminal outcome by a process stop"
+            );
+            assert_eq!(rt.blocked_metadata, BlockedMetadata::default());
+            assert!(rt.commit_phase_attempt.is_none());
+            assert!(rt.dequeued, "{family} did not get the reactivation guard");
+            assert!(
+                state.resolve_wait_change_ids().is_empty(),
+                "{family} left scheduler resolve membership behind"
+            );
+            assert!(
+                state.reject_wait_change_ids().is_empty(),
+                "{family} left scheduler reject membership behind"
+            );
+            assert!(
+                !state.stalled_change_ids().contains("target"),
+                "{family} left stall membership behind"
+            );
+            assert!(
+                !state.is_ordinary_queue_eligible("target"),
+                "{family} remained dispatchable after the run ended"
+            );
+        }
+
+        // ── Terminal outcomes and fresh idle rows are not the stop's to change ──
+        let mut state = OrchestratorState::new(
+            vec![
+                "err".to_string(),
+                "merged".to_string(),
+                "pushed".to_string(),
+                "rejected".to_string(),
+                "fresh".to_string(),
+            ],
+            0,
+        );
+        state.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "err".to_string(),
+            error: "apply exited 1".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("merged".to_string()));
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "merged".to_string(),
+            revision: "rev".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::PushCompleted {
+            change_id: "pushed".to_string(),
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ChangeRejected {
+            change_id: "rejected".to_string(),
+            reason: "acceptance confirmed rejection".to_string(),
+        });
+
+        state.apply_execution_event(&ExecutionEvent::Stopped);
+
+        assert_eq!(state.display_status("err"), "error");
+        assert_eq!(state.display_status("merged"), "merged");
+        assert_eq!(state.display_status("pushed"), "pushed");
+        assert_eq!(state.display_status("rejected"), "rejected");
+        assert_eq!(state.display_status("fresh"), "not queued");
+        assert!(
+            !state
+                .change_runtime
+                .get("fresh")
+                .expect("fresh runtime entry")
+                .dequeued,
+            "an unrelated idle row must not be claimed by the stopped run"
+        );
+
+        // ── Duplicate stop, late lifecycle events, and same-process refresh ──
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+            change_id: "alpha".to_string(),
+            command: "accept".to_string(),
+        });
+        assert_eq!(state.display_status("alpha"), "accepting");
+
+        state.apply_execution_event(&ExecutionEvent::Stopped);
+        let after_first_stop = format!("{:?}", state.change_runtime.get("alpha"));
+        state.apply_execution_event(&ExecutionEvent::Stopped);
+        assert_eq!(
+            format!("{:?}", state.change_runtime.get("alpha")),
+            after_first_stop,
+            "a duplicate stop must not change reconciled state"
+        );
+        assert_eq!(state.display_status("alpha"), "not queued");
+
+        for late in [
+            ExecutionEvent::AcceptanceStarted {
+                change_id: "alpha".to_string(),
+                command: "accept".to_string(),
+            },
+            ExecutionEvent::ArchiveStarted {
+                change_id: "alpha".to_string(),
+                command: "archive".to_string(),
+            },
+            ExecutionEvent::ResolveStarted {
+                change_id: "alpha".to_string(),
+                command: "resolve".to_string(),
+            },
+            ExecutionEvent::WorkspacePreparationStarted {
+                change_id: "alpha".to_string(),
+            },
+        ] {
+            state.apply_execution_event(&late);
+            assert_eq!(
+                state.display_status("alpha"),
+                "not queued",
+                "a late event from the stopped run reactivated the row"
+            );
+        }
+
+        // A same-process refresh observes the archived workspace the stopped run
+        // released; the guard is what keeps it from restoring `merge wait`.
+        state.apply_execution_event(&stop_refresh_event("alpha"));
+        assert_eq!(
+            state.display_status("alpha"),
+            "not queued",
+            "a same-process workspace observation resurrected stopped work"
+        );
+
+        // ── Explicit requeue releases the guard ──────────────────────────────
+        state.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
+        assert_eq!(state.display_status("alpha"), "queued");
+        assert!(
+            !state
+                .change_runtime
+                .get("alpha")
+                .expect("runtime entry")
+                .dequeued,
+            "an explicit requeue must release the reactivation guard"
+        );
+        assert!(state.is_ordinary_queue_eligible("alpha"));
+
+        // ── The guard is process-local, never restart-routing evidence ───────
+        let mut restarted = OrchestratorState::new(vec!["alpha".to_string()], 0);
+        restarted.apply_execution_event(&stop_refresh_event("alpha"));
+        assert_eq!(
+            restarted.display_status("alpha"),
+            "merge wait",
+            "a restarted process must re-derive routing from workspace evidence alone"
+        );
+    }
+
+    /// A refresh whose workspace observation would restore `merge wait`.
+    fn stop_refresh_event(change_id: &str) -> crate::events::ExecutionEvent {
+        crate::events::ExecutionEvent::ChangesRefreshed {
+            changes: Vec::new(),
+            rejected_changes: Vec::new(),
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::from([change_id.to_string()]),
+        }
     }
 }

@@ -21,6 +21,12 @@ fn is_reducer_owned_refresh_merge_wait_protected_status(status: &str) -> bool {
             | "merged"
             | "rejected"
             | "error"
+            // The reducer consumed this same refresh before the TUI did, so
+            // `not queued` is its answer to the very observation below — a row
+            // released by a process-level stop or an explicit dequeue, whose
+            // guard holds until an explicit requeue. A restarted process has no
+            // such guard and re-derives `merge wait` here instead.
+            | "not queued"
     )
 }
 

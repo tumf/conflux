@@ -180,11 +180,18 @@ impl AppState {
 
     /// Apply a terminal `Stopped` transition.
     ///
+    /// Presentation only: process mode, timing, controls, and the terminal log.
+    /// The row lifecycle belongs to the shared reducer, which reconciles every
+    /// interrupted change to `not queued` for this run boundary before the TUI
+    /// re-reads its display caches. A competing reset here would be a second
+    /// lifecycle authority — the original defect, where a later reducer
+    /// synchronization copied the stale `accepting` status straight back.
+    ///
     /// The first transition into `AppExecutionMode::Stopped` owns the terminal
     /// `Processing stopped` message. A repeated or late `Stopped` delivery (for
     /// example the scheduler's own cancellation event arriving after the
-    /// frontend already applied the stop) still reconciles queue and mode state,
-    /// but must not append a duplicate terminal message.
+    /// frontend already applied the stop) still reconciles mode state, but must
+    /// not append a duplicate terminal message.
     pub(crate) fn handle_stopped(&mut self) {
         let already_stopped = matches!(self.execution_mode, AppExecutionMode::Stopped);
         self.reset_analysis_log_dedupe();
@@ -195,15 +202,13 @@ impl AppState {
             self.orchestration_elapsed = Some(started.elapsed());
         }
 
+        // Freeze the elapsed value of every run that was still timing. The
+        // status cache is deliberately not consulted: the reducer has already
+        // moved these rows to `not queued`, so a status-keyed condition here
+        // would silently stop recording durations.
         for change in &mut self.changes {
-            if matches!(
-                change.display_status_cache.as_str(),
-                "applying" | "accepting" | "archiving" | "resolving" | "queued" | "blocked"
-            ) {
-                if let Some(started) = change.started_at {
-                    change.elapsed_time = Some(started.elapsed());
-                }
-                change.set_display_status_cache("not queued");
+            if let (Some(started), None) = (change.started_at, change.elapsed_time) {
+                change.elapsed_time = Some(started.elapsed());
             }
         }
         if !already_stopped {
@@ -401,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_resets_display_status_cache() {
+    fn stopped_enters_stopped_mode_and_preserves_execution_marks() {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
@@ -411,12 +416,16 @@ mod tests {
         app.handle_stopped();
 
         assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
-        assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert!(app.changes[0].selected);
     }
 
+    /// Row status after a stop is the reducer's answer, not this handler's.
+    ///
+    /// The regression this pins: a local string-matching reset here made the
+    /// TUI a second lifecycle authority, and the next reducer-cache
+    /// synchronization copied the stale active status straight back.
     #[test]
-    fn handle_stopped_resets_blocked_to_not_queued() {
+    fn handle_stopped_does_not_own_row_lifecycle() {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
         let mut app = AppState::new(changes);
         app.execution_mode = AppExecutionMode::Running;
@@ -427,26 +436,39 @@ mod tests {
 
         app.handle_stopped();
 
-        assert_eq!(app.changes[0].display_status_cache, "not queued");
-        assert_eq!(app.changes[1].display_status_cache, "not queued");
+        assert_eq!(app.changes[0].display_status_cache, "applying");
+        assert_eq!(app.changes[1].display_status_cache, "blocked");
         assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
     }
 
     #[test]
-    fn stopped_resets_resolving_changes() {
+    fn stopped_freezes_elapsed_time_for_runs_that_were_still_timing() {
         let changes = vec![
             create_test_change("change-a", 3, 3),
             create_test_change("change-b", 2, 4),
         ];
         let mut app = AppState::new(changes);
         app.execution_mode = AppExecutionMode::Running;
-        app.changes[0].display_status_cache = "resolving".to_string();
+        // The reducer has already reconciled this row for the stopped run, so
+        // its status carries no evidence of the interrupted work any more.
+        app.changes[0].display_status_cache = "not queued".to_string();
+        app.changes[0].started_at = Some(Instant::now());
         app.changes[0].selected = true;
         app.changes[1].display_status_cache = "merged".to_string();
+        app.changes[1].started_at = Some(Instant::now());
+        app.changes[1].elapsed_time = Some(std::time::Duration::from_secs(7));
 
         app.handle_stopped();
 
-        assert_eq!(app.changes[0].display_status_cache, "not queued");
+        assert!(
+            app.changes[0].elapsed_time.is_some(),
+            "an interrupted run must still report how long it ran"
+        );
+        assert_eq!(
+            app.changes[1].elapsed_time,
+            Some(std::time::Duration::from_secs(7)),
+            "a finished run keeps the duration it already recorded"
+        );
         assert!(app.changes[0].selected);
         assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
     }
@@ -485,7 +507,6 @@ mod tests {
 
         assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
         assert_eq!(count_logs(&app, "Processing stopped"), 1);
-        assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert!(app.changes[0].selected, "execution marks must be preserved");
     }
 
@@ -498,13 +519,12 @@ mod tests {
 
         app.handle_stopped();
         // A late scheduler-side `Stopped` arriving after the frontend already
-        // applied the stop only reconciles state.
+        // applied the stop only reconciles mode state.
         app.handle_stopped();
         app.handle_stopped();
 
         assert_eq!(count_logs(&app, "Processing stopped"), 1);
         assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
-        assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert!(app.changes[0].selected, "execution marks must be preserved");
     }
 

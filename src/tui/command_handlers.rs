@@ -558,6 +558,20 @@ pub async fn handle_tui_command(
                             "Waiting for in-flight work to reach a safe stop boundary...",
                         ));
                     } else {
+                        // No live scheduler will emit this run's terminal stop,
+                        // so this command is its dispatch owner. The reducer
+                        // transition comes first and the frontends read it back:
+                        // the row lifecycle for a process stop has exactly one
+                        // authority, and a TUI-local reset would diverge from
+                        // what `/api/v2` publishes for the same event.
+                        use crate::events::ExecutionEvent;
+                        shared_state
+                            .write()
+                            .await
+                            .apply_execution_event(&ExecutionEvent::Stopped);
+                        ctx.app.apply_display_statuses_from_reducer(
+                            &shared_state.read().await.all_display_statuses(),
+                        );
                         ctx.app
                             .handle_orchestrator_event(OrchestratorEvent::Stopped);
                         ctx.app.current_change = None;
@@ -565,7 +579,6 @@ pub async fn handle_tui_command(
                         // Forward stopped event to web state
                         #[cfg(feature = "web-monitoring")]
                         if let Some(ref web_state) = ctx.web_state {
-                            use crate::events::ExecutionEvent;
                             web_state
                                 .apply_execution_event(&ExecutionEvent::Stopped)
                                 .await;
