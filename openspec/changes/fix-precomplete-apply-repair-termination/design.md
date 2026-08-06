@@ -52,7 +52,7 @@ The watchdog needs one fact: whether task completion occurred before this child 
 
 ### Disabling all completion detection was rejected
 
-A task-complete repair can still produce `APPLY_BLOCKED` or `REJECTED.md` and leave a child alive. Those are new handoff conditions created by the active dispatch and must retain bounded termination.
+A task-complete repair can still produce `APPLY_BLOCKED` or `REJECTED.md` and leave a child alive. Those are new handoff conditions created by the active dispatch and must retain bounded termination. A pre-existing `APPLY_BLOCKED` is consumed at loop entry, while a rejecting handoff exits the loop before another dispatch, so an active repair child cannot inherit a stale handoff artifact that would recreate the pre-existing-task-completion defect.
 
 ### Moving policy into `AiCommandRunner` was rejected
 

@@ -20,8 +20,8 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: Makefile
-    evidence: "Rust test output covering stage, task-format, and final-commit-hook repair commands that outlive a shortened completion grace; ordinary task-completion transition; transient completion; blocked and rejecting handoffs; and process-group cleanup compatibility"
-    rerun: "cargo test --lib precomplete_apply_repair && cargo test --lib test_execute_apply_loop_terminates_lingering_child_after_tasks_complete && cargo test --lib test_execute_apply_loop_keeps_child_running_when_tasks_become_incomplete_during_grace && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings"
+    evidence: "Non-empty Rust test selection and passing output covering dispatch eligibility, stage, task-format, and final-commit-hook repair commands that outlive a shortened completion grace; ordinary task-completion transition; transient completion; blocked and rejecting handoffs; and process-group cleanup compatibility"
+    rerun: 'for filter in precomplete_apply_repair_eligibility precomplete_apply_repair_stage precomplete_apply_repair_task_format precomplete_apply_repair_commit_hook precomplete_apply_repair_handoff precomplete_apply_repair_failure; do cargo test --lib "$filter" -- --list | grep -q ": test$" || exit 1; done && cargo test --lib precomplete_apply_repair && cargo test --lib test_execute_apply_loop_terminates_lingering_child_after_tasks_complete && cargo test --lib test_execute_apply_loop_keeps_child_running_when_tasks_become_incomplete_during_grace && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings'
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -80,8 +80,9 @@ The dispatch-local completion rule, its canonical requirement update, and regres
 - Both completion probes and deadline rechecks use the same eligibility while continuing to detect blocked and rejecting handoffs.
 - No changes are required in `src/ai_command_runner.rs`, `src/command_queue.rs`, process-group cleanup semantics, persisted workflow state, configuration schema, or frontend-specific code.
 - Integration regressions fail against the pre-fix behavior by delaying each repair action beyond a shortened test grace, then pass only when the repair command remains alive long enough to complete.
+- The six named `precomplete_apply_repair_*` verification filters each select at least one test, preventing a missing test family from passing vacuously.
 - Regression coverage proves all three pre-complete repair paths, ordinary incomplete-to-complete termination, transient completion recheck, blocked handoff, rejecting handoff, and cleanup compatibility.
-- `cargo test --lib precomplete_apply_repair`, the two named existing completion-grace tests, `cargo fmt --check`, and `cargo clippy --locked --all-targets --all-features -- -D warnings` pass.
+- The declared `apply-repair-completion-regressions` rerun command, including its non-empty selection gate, the two named existing completion-grace tests, `cargo fmt --check`, and `cargo clippy --locked --all-targets --all-features -- -D warnings`, passes.
 
 ## Out of Scope
 
