@@ -26,19 +26,19 @@ references:
   - src/web/remote_control_api/projection.rs
 verifications:
   - id: accepted-operator-command-regressions
-    requirement: "Equivalent accepted TUI and v2 start, retry, resolve, stop, cancel-stop, force-stop, queue, mark, and dequeue commands produce one coherent process-local effect, one frontend fan-out, truthful scheduler or cancellation behavior, and no partial state on failure"
+    requirement: "Equivalent accepted TUI and v2 start, retry, resolve, stop, cancel-stop, force-stop, queue, mark, and dequeue commands produce one coherent process-local effect, one frontend fan-out, truthful scheduler or cancellation behavior, and no partial committed decision state on failure"
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: Makefile
-    evidence: "Non-empty Rust test selection and passing output covering shared application transaction ordering, process mode transitions, scheduler activation, resolve reservations, launch failure rollback, targeted mark deltas, TUI next-frame convergence, and TUI/v2 parity"
-    rerun: 'for filter in accepted_operator_command_transaction accepted_operator_command_mode_matrix accepted_operator_command_scheduler_order accepted_operator_command_tui_convergence; do cargo test --features web-monitoring "$filter" -- --list | grep -q ": test$" || exit 1; done && cargo test --features web-monitoring accepted_operator_command && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings'
+    evidence: "Non-empty Rust test selection and passing output covering shared application transaction ordering, process mode transitions, scheduler activation, resolve reservations, scheduler preparation rollback, termination-wait liveness, targeted mark deltas, TUI next-frame convergence, and TUI/v2 parity"
+    rerun: 'cargo test --lib accepted_operator_command_transaction -- --list | grep -q ": test$" && cargo test --lib accepted_operator_command_transaction && for filter in accepted_operator_command_mode_matrix accepted_operator_command_scheduler_order accepted_operator_command_dequeue_liveness accepted_operator_command_tui_convergence; do cargo test --features web-monitoring "$filter" -- --list | grep -q ": test$" || exit 1; done && cargo test --features web-monitoring accepted_operator_command && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings'
     prerequisites:
       - execution-mark-event-regressions
     execution_class: repository-local
     completion_role: change-blocking
   - id: accepted-command-revision-regressions
-    requirement: "Each new v2 command is revision-fenced through completion, stores the exact revision produced by its synchronous accepted effect, and preserves the original record under replay without duplicate side effects"
+    requirement: "Each ordinary new v2 command is revision-fenced through settlement; a termination-waiting command is fenced at admission and revalidated at settlement; every changed command stores its exact outcome revision and replay preserves the original record without duplicate side effects"
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
@@ -74,18 +74,19 @@ The command registry compounds the problem. Admission and execution are separate
 
 ## Proposed Solution
 
-Introduce one process-local operator application transaction shared by TUI and v2 adapters. It serializes a new command from final revision/mode revalidation through typed service execution, authoritative outcome dispatch, exact result-revision capture, and scheduler activation or notification.
+Introduce one process-local operator application transaction shared by TUI and v2 adapters. For ordinary commands it serializes final revision/mode revalidation, typed service execution, authoritative outcome dispatch, exact result-revision capture, and scheduler activation or notification. A command that must await confirmed runtime termination uses a two-phase transaction so the wait does not monopolize operator admission or the TUI event loop.
 
-The transaction SHALL:
+The ordinary transaction SHALL:
 
 1. resolve exact idempotent replay before new-command validation and return the stored record without service execution;
 2. serialize each new command against the projection owner, revalidate `expected_revision`, process lifecycle mode, target status, and eligibility immediately before mutation, and prevent a second new command from executing against the consumed revision;
-3. prepare scheduler launch or wake without allowing scheduler events to overtake the accepted command effect;
-4. commit reducer commands, execution-mark deltas, queue effects, resolve reservations, graceful-stop state, and process-mode transition as one accepted decision;
-5. publish one typed operator-command outcome through the process-wide authoritative `EventSink` dispatch boundary so TUI, Web, `/api/v2`, and lifecycle observers consume the same post-transition state;
-6. activate or wake scheduling only after the accepted outcome dispatch is visible, while keeping the scheduler free to emit later progress as separate events and revisions;
-7. settle the command record with the exact revision returned by that outcome dispatch rather than sampling global revision afterwards;
-8. rollback or avoid every staged reducer, mark, queue/retry-edge, resolve-reservation, mode, and scheduler effect when preparation or activation fails.
+3. prepare scheduler launch or wake without allowing activity enabled by that command to overtake the accepted command effect;
+4. commit reducer commands, execution-mark deltas, queue effects, resolve reservations, graceful-stop state, and process-mode transition and publish one typed operator-command outcome atomically through the process-lifetime authoritative `EventSink` dispatch boundary shared by the TUI runner and orchestration runs;
+5. settle the command record with the exact revision returned by that outcome dispatch rather than sampling global revision afterwards;
+6. release the transaction gate, then activate an infallible prepared scheduler permit or issue its wake so later scheduler progress produces separate events and revisions;
+7. rollback or avoid every staged reducer, mark, queue/retry-edge, resolve-reservation, mode, and scheduler effect when preparation fails.
+
+`stop_and_dequeue` SHALL serialize only admission, final validation, command reservation, and cancellation issuance, keep its command record Running while termination confirmation waits outside both the application gate and authoritative dispatch transaction, then reacquire the gate and revalidate the target's current runtime state before commit, outcome dispatch, and settlement. Exact replay joins the in-progress record without reissuing cancellation. Force stop and unrelated operator commands remain admissible, and the confirmation wait MUST NOT block event fan-out or TUI rendering.
 
 Use existing execution events when their semantics are exact: graceful stop uses `Stopping`, settled force stop uses `Stopped`, and successful target dequeue uses `ChangeDequeued`. Add one typed operator-outcome event vocabulary only for accepted effects with no existing event, including run dispatch, stop cancellation, force-stop safe-boundary wait, mark/queue delta, and resolve reservation. The reducer remains the owner of change lifecycle; the new event carries process-level decision facts and frontend projection, not a second workflow state machine.
 
@@ -99,30 +100,34 @@ Command serialization, outcome fan-out, scheduler ordering, and exact `result_re
 
 ## Acceptance Criteria
 
-1. Equivalent TUI and v2 start, resume, retry, resolve, stop, cancel-stop, force-stop, set-mark, set-queue-intent, and stop-and-dequeue intents enter the same application transaction and return equivalent typed changed, no-op, or failed outcomes and errors.
+1. Equivalent TUI and v2 start, resume, retry, resolve, stop, cancel-stop, force-stop, set-mark, and set-queue-intent intents enter the same ordinary application transaction, while equivalent stop-and-dequeue intents enter the same two-phase termination transaction; both adapters return equivalent typed changed, no-op, or failed outcomes and errors.
 2. Start in Select or Stopped consumes the authoritative marked set at the admitted revision, commits the exact target queue intent, projects `Running`, and activates the scheduler once. No marked/startable target returns no-op or failure without false success or scheduler effect.
 3. Error retry uses the existing evidence-aware route, commits marks/queue/retry intent, projects `Running`, and starts or wakes scheduling once. Unsupported or non-resumable retry preserves all blocker evidence and produces no partial side effect.
 4. Active resolve reservation projects the reducer status, `is_resolving=true`, and `Running` in the same accepted-command revision before scheduler progress. Queued resolve preserves FIFO and current mode, duplicate reservation is revision-idempotent, and only the active reservation dispatches scheduling.
 5. Graceful stop projects `Stopping` in the accepted revision; cancel-stop from that state projects `Running`; invalid modes fail before mutating the graceful-stop flag.
 6. Force stop reports the same safe-boundary classification to both adapters. Awaiting cleanup projects `Stopping`; settled cancellation emits authoritative `Stopped`; neither path publishes terminal state before required cleanup.
-7. Successful stop-and-dequeue emits `ChangeDequeued`, clears only the target's ordinary queue/mark eligibility, and reaches the next TUI render and v2 snapshot coherently. Missing handles, cancellation failure, or timeout preserve active state.
+7. Successful stop-and-dequeue emits `ChangeDequeued`, clears only the target's ordinary queue/mark eligibility, and reaches the next TUI render and v2 snapshot coherently. Its termination confirmation wait runs outside the application gate and TUI event loop, so force stop, unrelated commands, rendering, and event fan-out remain live. Missing handles, cancellation failure, timeout, or failed post-wait revalidation commit no dequeue state; an already-issued cancellation remains an intentional runtime request rather than a rollbackable decision-state mutation.
 8. TUI command-side mark and queue projection applies only IDs named by the accepted outcome. A remote delta for an unrelated row cannot be erased by a later local command, and hidden Error retry intent is not converted into a checked row by broad synchronization.
 9. Archived and process-level Stopped rows retain execution marks; successful target dequeue/stop clears only that target. Event-driven Error and Rejected revocation remain owned by `synchronize-execution-marks` and are not duplicated here.
 10. Every accepted state-changing command produces at most one synchronous state revision containing all of its decision fields. Later scheduler progress may advance revision separately and never rewrites the command record's `result_revision`.
-11. A no-op does not advance revision. A failed command has no reducer, mark, queue, retry-edge, resolve-reservation, stop-flag, mode, scheduler, hook, or event side effect and records the unchanged admitted revision.
-12. Two new commands submitted with the same expected revision cannot both execute after the first changes state. The later command fails stale without service execution unless it is an exact idempotent replay.
+11. An ordinary no-op does not advance revision. An ordinary failed command has no reducer, mark, queue, retry-edge, resolve-reservation, stop-flag, mode, scheduler, hook, or event side effect and records the unchanged admitted revision. A two-phase dequeue timeout or post-wait refusal commits no dequeue event or decision-state mutation and stores the explicit unchanged revision returned at settlement; cancellation already issued in phase one is not repeated or misreported as dequeue success.
+12. Two ordinary new commands submitted with the same expected revision cannot both execute after the first changes state. The later command fails stale without service execution unless it is an exact idempotent replay; a two-phase command consumes its revision only for admission and is revalidated against current runtime state at settlement.
 13. Exact replay after any later state advance returns the original command ID, outcome, detail, and `result_revision` without repeating scheduler, cancellation, queue hook, reservation, event, or projection effects. A reused key with a different typed identity remains `idempotency_mismatch`.
-14. Scheduler events cannot overtake the accepted command outcome. Late or duplicate command/outcome delivery cannot overwrite Error, Stopping, Stopped, or a later completion state.
-15. All coordination state is process-local and discarded at restart; workspace and Git evidence remain the only durable next-action authority.
-16. Added default-suite tests remain under one second each or follow the repository heavy-test policy when an existing platform boundary makes that impractical.
+14. Staged decision commit and accepted outcome dispatch are atomic inside the process-lifetime dispatch boundary, and scheduler activity enabled by that command's later activation or wake cannot overtake the outcome. Late or duplicate command/outcome delivery cannot overwrite Error, Stopping, Stopped, or a later completion state.
+15. Authoritative lifecycle events also transition the same Core process mode: typed run activation such as `ProcessingStarted` enters or retains Running; `Stopping`, `Stopped`, global `Error`, guarded `AllCompleted`, and the persistent-idle Ready event when available preserve their existing semantics. Natural completion returns to Select and readmits a later Start without frontend repair.
+16. TUI command submission does not await the application gate or termination confirmation inside the event-processing/render loop; accepted outcomes return through the authoritative dispatch, and a bounded typed busy refusal is allowed only when submission cannot be queued safely.
+17. All coordination state is process-local and discarded at restart; workspace and Git evidence remain the only durable next-action authority.
+18. Added default-suite tests remain under one second each or follow the repository heavy-test policy when an existing platform boundary makes that impractical.
 
 ## Explicit Completion Conditions
 
-- One application transaction owns final new-command revision/mode validation, shared service invocation, fail-atomic commit, authoritative outcome dispatch, exact revision return, and scheduler activation ordering for both adapters.
+- One ordinary application transaction owns final new-command revision/mode validation, shared service invocation, fail-atomic commit plus outcome dispatch, exact revision return, and scheduler activation ordering for both adapters; one two-phase variant releases the gate during confirmed-termination waits and revalidates before commit.
 - `src/web/remote_control_api/commands.rs` no longer permits two new state-changing commands to execute from one consumed revision, and `Projection::complete_command` receives the command-produced revision explicitly instead of sampling current global state.
-- `src/orchestration/run_control.rs` and scheduler supervision expose a prepared/activation boundary or equivalent gate that prevents scheduler event emission before accepted outcome dispatch and leaves no mutation after launch failure.
-- `src/events.rs` exhaustively classifies the minimal typed operator outcome vocabulary and sends it through the same process-wide dispatch owner used by orchestration events; no synthetic `ProcessingStarted` or other lifecycle event is used to fake command acceptance.
-- `src/tui/command_handlers.rs`, `src/tui/runner.rs`, `src/tui/state.rs`, `src/web/state.rs`, and `src/web/remote_control_api/executor.rs` consume the same outcome projection without maintaining independent admission mode or resolve truth.
+- `src/orchestration/run_control.rs` and scheduler supervision expose an event-silent prepared permit whose infallible activation occurs after accepted outcome dispatch; preparation failure leaves no mutation.
+- `src/events.rs`, `src/tui/runner.rs`, `src/tui/orchestrator.rs`, and `src/tui/run_supervisor.rs` establish one process-lifetime dispatch boundary shared by runner-local, command-outcome, and orchestration-run producers; no synthetic `ProcessingStarted` or other lifecycle event is used to fake command acceptance.
+- `src/tui/command_handlers.rs`, `src/tui/runner.rs`, `src/tui/state.rs`, `src/web/state.rs`, and `src/web/remote_control_api/executor.rs` consume the same outcome projection without maintaining independent admission mode or resolve truth, and direct command-handler calls to `WebState::apply_execution_event` are removed.
+- The Core mode consumes authoritative lifecycle events as well as command outcomes, and mode regressions prove natural completion, Stopped resume, and explicit Error retry cannot wedge future admission.
+- The TUI submits coordinator work outside its event-processing/render loop, including the two-phase stop-and-dequeue path, and a never-completing termination waiter cannot prevent force stop or event drain.
 - Command-side execution-mark projection uses target deltas only and integrates with the common mark dispatcher supplied by `synchronize-execution-marks`; no command path calls a stale-row full-store replacement.
 - Table-driven tests cover the full mode/status matrix, scheduler live/idle and preparation failure, active/queued/duplicate resolve, force-stop safe-boundary classes, dequeue cancellation errors, unrelated mark preservation, TUI next-frame convergence, concurrent expected revisions, no-op/failure revision behavior, and exact replay.
 - The commands declared by `accepted-operator-command-regressions` and `accepted-command-revision-regressions` pass with non-empty test selections.
