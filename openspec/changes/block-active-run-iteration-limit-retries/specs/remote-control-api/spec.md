@@ -2,7 +2,7 @@
 
 ### Requirement: Authoritative operator snapshot
 
-The state resource MUST be a coherent reducer-derived operator snapshot that includes every server-authoritative field needed to determine current change presentation and permitted operator actions without replaying prior events or parsing logs. For each change whose active run owns typed Apply iteration-limit evidence, the snapshot MUST expose nullable typed evidence containing exact `attempts` and `max`, and MUST block `retry_change` with the stable reason `apply_iteration_limit_active` at the same state revision. Retired evidence from a closed run MUST NOT remain an action blocker.
+The state resource MUST be a coherent reducer-derived operator snapshot that includes every server-authoritative field needed to determine current change presentation and permitted operator actions without replaying prior events or parsing logs. For each change whose command-capable run owns typed Apply iteration-limit evidence and whose scheduler task reports live, the snapshot MUST block `retry_change` with `apply_iteration_limit_active` at the same state revision. Projection and command admission MUST consult the same scheduler-liveness authority. A live-to-exited scheduler transition MUST publish the changed authoritative action snapshot without waiting for unrelated repository activity. Record presence without live ownership MUST NOT remain an action blocker. A headless `cflx run` process with no bound command executor or scheduler-liveness authority MUST omit this process-local blocked reason; command submission remains unavailable through the existing unbound-runtime lifecycle contract.
 
 #### Scenario: Client discovers and snapshots operator state
 
@@ -27,19 +27,28 @@ The state resource MUST be a coherent reducer-derived operator snapshot that inc
 
 #### Scenario: Active iteration limit is projected as typed eligibility
 
-**Given**: An active run owns `ApplyIterationLimit` for change `alpha` with attempts 50 and max 50
+**Given**: A command-capable run owns `ApplyIterationLimit` for change `alpha` with attempts 50 and max 50
+**And**: The owning scheduler task reports live
 **When**: A client reads `/api/v2/state`
-**Then**: `alpha` exposes iteration-limit evidence with `attempts=50` and `max=50`
-**And**: `alpha.actions.retry_change.allowed` is false
+**Then**: `alpha.actions.retry_change.allowed` is false
 **And**: Its blocked reason is `apply_iteration_limit_active`
-**And**: No client must parse the error detail, display status, or logs
+**And**: No client must parse the error detail, display status, iteration count, or logs
 
-#### Scenario: Closed boundary removes the active action block
+#### Scenario: Scheduler-task exit removes the active action block
 
 **Given**: The finish-hook owner observed `alpha`'s typed iteration-limit evidence
-**When**: The owning run closes and retires its admission gate
-**Then**: A subsequent authoritative snapshot does not expose active iteration-limit evidence for `alpha`
+**When**: The owning scheduler task exits while the old record remains in shared state
+**Then**: The liveness transition publishes a new authoritative revision
+**And**: That snapshot does not block `alpha` with `apply_iteration_limit_active`
 **And**: Retry eligibility is derived from `alpha`'s remaining current evidence
+
+#### Scenario: Headless read-only projection does not retain an actionable block
+
+**Given**: `cflx run` serves `/api/v2` without a bound command executor
+**And**: Its old shared state retains typed iteration-limit evidence after the run
+**When**: A client reads the subsequent snapshot
+**Then**: The snapshot does not expose `apply_iteration_limit_active` as a current action block
+**And**: A submitted command is refused by the existing unbound-runtime lifecycle contract
 
 ### Requirement: Shared lifecycle scheduling semantics
 
@@ -72,9 +81,9 @@ Start, retry, stop, cancel stop, force stop, and resolve MUST use shared applica
 
 **Given**: `alpha` is active-run limited and `beta` is ordinarily retryable
 **When**: A client submits `retry_errors` for both at the current revision
-**Then**: `alpha` is excluded with `apply_iteration_limit_active`
-**And**: `beta` is retried and dispatched exactly once
+**Then**: `beta` is retried and dispatched exactly once
 **And**: The result does not claim that `alpha` was accepted
+**And**: `alpha.actions.retry_change.blocked_reason` remains `apply_iteration_limit_active` in the authoritative snapshot at the result revision
 
 #### Scenario: Retry after run closure starts a later boundary
 
