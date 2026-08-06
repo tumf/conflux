@@ -16,7 +16,7 @@
 
 Archive validation is the authoritative final OpenSpec gate. Expected archive gate: `cflx openspec validate converge-accepted-operator-commands --archive-gate`.
 
-The tracked Rust hooks are path-scoped, so the declared Rust verification retains explicit format and all-target/all-feature Clippy coverage. No browser or external-service verification is required because this change modifies process-local service, event, TUI adapter, and API projection behavior without adding browser controls or deployed contracts.
+The hook-enabled final Apply commit owns format and all-target/all-feature Clippy coverage, so the declared Rust verification does not rerun them. No browser or external-service verification is required because this change modifies process-local service, event, TUI adapter, and API projection behavior without adding browser controls or deployed contracts.
 
 ## Future Work
 

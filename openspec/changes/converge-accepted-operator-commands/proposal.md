@@ -32,7 +32,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: "Non-empty Rust test selection and passing output covering shared application transaction ordering, process mode transitions, scheduler activation, resolve reservations, scheduler preparation rollback, termination-wait liveness, targeted mark deltas, TUI next-frame convergence, and TUI/v2 parity"
-    rerun: 'cargo test --lib accepted_operator_command_transaction -- --list | grep -q ": test$" && cargo test --lib accepted_operator_command_transaction && for filter in accepted_operator_command_mode_matrix accepted_operator_command_scheduler_order accepted_operator_command_dequeue_liveness accepted_operator_command_tui_convergence; do cargo test --features web-monitoring "$filter" -- --list | grep -q ": test$" || exit 1; done && cargo test --features web-monitoring accepted_operator_command && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings'
+    rerun: 'if output="$(cargo test --features web-monitoring accepted_operator_command 2>&1)"; then :; else status=$?; printf "%s\n" "$output"; exit "$status"; fi; printf "%s\n" "$output"; for filter in accepted_operator_command_transaction accepted_operator_command_mode_matrix accepted_operator_command_scheduler_order accepted_operator_command_dequeue_liveness accepted_operator_command_tui_convergence; do printf "%s\n" "$output" | grep -Eq "^test .*${filter}.* \.\.\. ok$" || { printf "missing passing test selection: %s\n" "$filter" >&2; exit 1; }; done'
     prerequisites:
       - execution-mark-event-regressions
     execution_class: repository-local
@@ -44,7 +44,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: "Passing remote-control integration tests covering concurrent same-revision submissions, success/no-op/failure result revisions, later scheduler progress, exact replay, and idempotency mismatch"
-    rerun: 'cargo test --features web-monitoring accepted_command_revision -- --list | grep -q ": test$" && cargo test --features web-monitoring accepted_command_revision'
+    rerun: 'if output="$(cargo test --features web-monitoring accepted_command_revision 2>&1)"; then :; else status=$?; printf "%s\n" "$output"; exit "$status"; fi; printf "%s\n" "$output"; printf "%s\n" "$output" | grep -Eq "^test .*accepted_command_revision.* \.\.\. ok$" || { printf "missing passing test selection: accepted_command_revision\n" >&2; exit 1; }'
     prerequisites:
       - accepted-operator-command-regressions
     execution_class: repository-local
