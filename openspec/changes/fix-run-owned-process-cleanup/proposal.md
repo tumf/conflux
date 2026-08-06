@@ -13,8 +13,10 @@ references:
   - openspec/changes/fix-force-stop-reducer-reconciliation/
   - src/ai_command_runner.rs
   - src/process_manager.rs
+  - src/parallel/dispatch.rs
   - src/parallel/orchestration.rs
   - src/parallel/queue_state.rs
+  - src/tui/run_supervisor.rs
   - src/tui/orchestrator.rs
   - src/tui/runner.rs
   - src/tui/queue.rs
@@ -55,7 +57,7 @@ The scope SHALL:
 
 - atomically reject final command spawn admission after shutdown starts, including a shutdown that races with stagger delay or retry delay;
 - notify runner tasks directly through a scope cancellation token rather than depending on a droppable `StreamingChildHandle`;
-- retain each execution registration and current PGID or platform process-set identity until the retry task has exited and cleanup evidence confirms quiescence;
+- retain each execution registration and current PGID or platform process-set identity until the retry task has exited and cleanup evidence confirms quiescence or bounded managed escalation completes;
 - suppress inactivity and ordinary retry branches after shutdown is observed;
 - await all registrations under one bounded absolute deadline, then reuse the existing managed force-kill and verification path for retained process identities;
 - remain process-local and be recreated on every new run.
@@ -82,7 +84,7 @@ This proposal has no hard dependency on `fix-force-stop-reducer-reconciliation`:
 2. Scope shutdown atomically closes final spawn admission. A command waiting for stagger, retry delay, or a new retry attempt cannot spawn after closure.
 3. Global cancellation reaches a runner task independently of `StreamingChildHandle` lifetime, terminates the current owned process group through the existing cleanup path, and starts no later retry.
 4. A dropped streaming handle cannot authorize detached continuation. Its runner remains scope-owned until cleanup and task completion are acknowledged.
-5. Global cancellation emits terminal `Stopped` only after active workspace task drain, truthful execution-handle completion, run command scope quiescence or completed managed escalation, and pending merge/base-lane result handling. Cleanup failure remains classified as operator cancellation and produces actionable diagnostics rather than `AgentCommand` failure.
+5. Global cancellation emits terminal `Stopped` only after active workspace task drain, a truthful execution-handle outcome (confirmed completion or bounded unconfirmed timeout), run command scope quiescence or completed managed escalation, and pending merge/base-lane result handling. Cleanup failure remains classified as operator cancellation and produces actionable diagnostics rather than `AgentCommand` failure.
 6. Run-fatal handling emits exactly one prompt global `Error`, closes admission, starts no new dispatch or retry, and returns scheduler failure only after the same run-owned command cleanup barrier. It emits neither `Stopped` nor `AllCompleted` for that failure.
 7. No Conflux-owned preparation release, worktree cleanup, handoff, or Git mutation occurs after workspace abort while a command registration for that worktree remains live.
 8. Per-change `done` handshakes are not fired merely because `JoinSet::abort_all` dropped a workspace future; they require confirmed terminal command cleanup for the corresponding change.
@@ -107,6 +109,7 @@ This proposal has no hard dependency on `fix-force-stop-reducer-reconciliation`:
 - Changing the Apply pre-complete repair watchdog already integrated by `fix-precomplete-apply-repair-termination`.
 - Implementing reducer row reconciliation or TUI header presentation covered by active independent changes.
 - Replacing the existing Unix process-group or Windows job-object termination implementation.
+- Refactoring the per-change 100 ms cancellation polling task in `src/parallel/dispatch.rs`; it owns no agent process, remains a separate task-lifecycle concern, and is not part of run command scope quiescence evidence.
 - Persisting process IDs, cleanup registries, cancellation state, or workflow-control state outside the run invocation.
 - Killing unrelated processes or descendants that deliberately escape the process group/session owned by Conflux.
 - Changing remote TUI client close into a remote server stop command.

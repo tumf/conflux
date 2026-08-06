@@ -71,6 +71,8 @@ This is construction-boundary plumbing, not operation-boundary plumbing. Operati
 
 The TUI's standalone worktree-command runner is outside a scheduler run and is not silently attached to a later run scope. Its existing caller-owned lifecycle remains unchanged.
 
+The per-change 100 ms cancellation polling task in `src/parallel/dispatch.rs` owns no AI command or process identity, so the run command scope does not register it or count it as process-quiescence evidence. Its independent run-fatal lifetime is a separate task-lifecycle concern rather than part of this atomic process-cleanup change.
+
 ## Shutdown and Barrier Ordering
 
 ### Global cancellation

@@ -2,7 +2,7 @@
 
 ### Requirement: Loop termination reason must be tracked and distinguished
 
-The system SHALL track the reason for loop termination as normal completion, genuine execution error, graceful stop, active-execution force stop, scheduler-only cancellation, merge wait, or run-fatal failure. This termination reason SHALL control terminal logs and events without inferring process activity from TUI mode or error-message text. Operator cancellation SHALL request cancellation without dropping the running scheduler future and SHALL establish terminal stop only after the scheduler reaches its bounded cleanup barrier. That barrier MUST include active workspace-task drain, truthful registered execution-handle completion, invocation-scoped AI runner-task and owned process-set quiescence or completed managed escalation, and pending background merge/base-lane result handling. Aborting workspace futures or removing execution handles MUST NOT by itself establish process quiescence. Run-fatal failure SHALL retain exactly one prompt global `Error` before cleanup waiting, stop new admission and retries, and return scheduler failure only after the same cleanup barrier.
+The system SHALL track the reason for loop termination as normal completion, genuine execution error, graceful stop, active-execution force stop, scheduler-only cancellation, merge wait, or run-fatal failure. This termination reason SHALL control terminal logs and events without inferring process activity from TUI mode or error-message text. Operator cancellation SHALL request cancellation without dropping the running scheduler future and SHALL establish terminal stop only after the scheduler reaches its bounded cleanup barrier. That barrier MUST include active workspace-task drain, a truthful registered execution-handle outcome (confirmed completion or bounded unconfirmed timeout), invocation-scoped AI runner-task and owned process-set quiescence or completed managed escalation, and pending background merge/base-lane result handling. Aborting workspace futures or removing execution handles MUST NOT by itself establish process quiescence. Run-fatal failure SHALL retain exactly one prompt global `Error` before cleanup waiting, stop new admission and retries, and return scheduler failure only after the same cleanup barrier.
 
 #### Scenario: Operator cancellation reaches terminal classification
 
@@ -13,7 +13,7 @@ The system SHALL track the reason for loop termination as normal completion, gen
 **And** run command admission closes before workspace futures are aborted
 **And** cancellation is not converted to `OrchestratorError::AgentCommand`
 **And** the outer boundary continues polling the scheduler future until its bounded cleanup barrier completes
-**And** active task drain, confirmed runner-task and owned process-set cleanup, truthful execution-handle completion, and pending merge/base-lane result handling precede terminal stop
+**And** active task drain, a truthful execution-handle outcome, pending merge/base-lane result handling, and either confirmed runner-task and owned process-set cleanup or completed managed escalation precede terminal stop
 **And** no retry or command process starts after scope shutdown
 **And** a cleanup deadline or managed escalation remains classified as operator cancellation rather than execution failure
 **And** later terminal event handling remains idempotent if the frontend already applied `OrchestratorEvent::Stopped`
