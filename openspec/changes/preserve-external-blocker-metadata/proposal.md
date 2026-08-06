@@ -18,7 +18,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: "Rust test output covering reducer event ordering, blocker projection, queue suppression, and resumable/non-resumable operator retry"
-    rerun: "cargo test --lib structured_blocker_metadata_survives_workspace_blocked && cargo test --lib external_blocker_hold_survives_dispatch_status && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings"
+    rerun: "cargo test --lib structured_blocker_metadata_survives_workspace_blocked && cargo test --lib external_blocker_hold_survives_dispatch_status && cargo test --lib orchestration::operator_command && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings"
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -32,7 +32,7 @@ verifications:
 
 A validated Acceptance external blocker is first reduced through `AcceptanceGated`, which correctly creates `ExternalBlocked` state with category, origin, prerequisite owner, unblock condition, next action, and resumability. The same dispatch branch then emits a generic `WorkspaceStatusUpdated { Blocked }`. The reducer treats that lower-fidelity status as a fresh generic stall and replaces the structured state with `BlockerKind::None`, no owner or unblock condition, and `resumable: false`.
 
-The loss is operational, not cosmetic. Queue classification no longer recognizes the Acceptance hold, the applied workspace can be routed back through Acceptance repeatedly, and `/api/v2` refuses an otherwise resumable retry as `hold_not_resumable`. The external prerequisite remains real, but Conflux stops representing and controlling it truthfully.
+The loss is operational, not cosmetic. Queue classification no longer recognizes the Acceptance hold, so the applied workspace can be routed back through Acceptance repeatedly. The `/api/v2` action projection advertises the erased hold as `hold_not_resumable`, while the imperative retry command sees generic `stalled` state without Acceptance ownership and can accept it. Projection and command routing disagree, and neither represents the real external prerequisite truthfully.
 
 ## Proposed Solution
 
@@ -73,3 +73,4 @@ Reducer precedence, producer-path regression coverage, queue suppression, and re
 - Persisting Acceptance or external blocker state across process restart.
 - Redesigning external blocker validation categories or verdict parsing.
 - Removing generic blocked workspace events from unrelated rejection or legacy handoff paths.
+- Protecting Apply-origin non-external stalls from generic blocked-status downgrade; they carry no Acceptance/external routing ownership and remain part of any later event-contract cleanup.

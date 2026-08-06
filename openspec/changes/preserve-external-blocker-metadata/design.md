@@ -5,7 +5,7 @@ Structured blocker events and generic workspace status observations carry differ
 - `AcceptanceGated` and `ExecutionBlocked` carry blocker facts used by the orchestrator classifier.
 - `WorkspaceStatusUpdated { Blocked }` carries only a coarse workspace presentation status.
 
-The current reducer lets the second event replace the first. Event delivery order is deterministic in the observed path, so the richer state is always created and then immediately erased.
+The current reducer lets the second event replace the first when the boundary applies both events to reducer state. The TUI `EventDispatcher` boundary does so; the headless CLI path records the structured hold directly and forwards channel events to Web projection without reducing them again. Regression coverage must therefore exercise the TUI-style dispatch boundary rather than assuming every frontend has the same event application path.
 
 ## Goals
 
