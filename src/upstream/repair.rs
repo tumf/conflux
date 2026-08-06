@@ -16,7 +16,7 @@ use super::ports::{
     PortResult, RepairAttemptResult, RepairCause, RepairRequest, UpstreamPortError,
     UpstreamRepairAgent,
 };
-use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+use crate::ai_command_runner::AiCommandRunner;
 use crate::config::OrchestratorConfig;
 
 /// Operation identifier passed to the `cflx-resolve` skill's upstream mode.
@@ -98,7 +98,7 @@ pub struct ResolveCommandRepairAgent {
     config: OrchestratorConfig,
     repo_root: PathBuf,
     max_attempts: u32,
-    shared_stagger_state: SharedStaggerState,
+    ai_runner: AiCommandRunner,
 }
 
 impl ResolveCommandRepairAgent {
@@ -106,13 +106,13 @@ impl ResolveCommandRepairAgent {
         config: OrchestratorConfig,
         repo_root: impl Into<PathBuf>,
         max_attempts: u32,
-        shared_stagger_state: SharedStaggerState,
+        ai_runner: AiCommandRunner,
     ) -> Self {
         Self {
             config,
             repo_root: repo_root.into(),
             max_attempts,
-            shared_stagger_state,
+            ai_runner,
         }
     }
 }
@@ -141,11 +141,10 @@ impl UpstreamRepairAgent for ResolveCommandRepairAgent {
             "Invoking bounded resolve_command for upstream repair"
         );
 
-        let runner = AiCommandRunner::from_orchestrator_config(
-            &self.config,
-            self.shared_stagger_state.clone(),
-        );
-        let (mut child, mut rx) = runner
+        // The invocation's scoped runner, so bounded upstream repair is owned by
+        // the same run cleanup barrier as every other AI command.
+        let (mut child, mut rx) = self
+            .ai_runner
             .execute_streaming_with_retry(&command, Some(&self.repo_root), Some("resolve"), None)
             .await
             .map_err(|e| UpstreamPortError::new("resolve_command", e.to_string()))?;

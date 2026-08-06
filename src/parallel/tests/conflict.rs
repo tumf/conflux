@@ -275,7 +275,11 @@ async fn test_resolve_merges_with_retry_args_struct() {
     let base_revision = "base123";
     let max_retries = 3;
 
-    let shared_stagger_state = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let ai_runner = crate::ai_command_runner::AiCommandRunner::for_run(
+        &config,
+        std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        crate::ai_command_runner::RunCommandScope::new(),
+    );
     let auto_resolve_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let args = ResolveMergesWithRetryArgs {
         workspace_manager: &manager as &dyn WorkspaceManager,
@@ -285,7 +289,7 @@ async fn test_resolve_merges_with_retry_args_struct() {
         target_branch,
         base_revision,
         max_retries,
-        shared_stagger_state,
+        ai_runner,
         auto_resolve_count,
         publication_owns_completion: false,
     };
@@ -309,7 +313,11 @@ fn test_resolve_merges_with_retry_args_clone() {
     let config = crate::config::OrchestratorConfig::default();
     let items = test_items();
 
-    let shared_stagger_state = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let ai_runner = crate::ai_command_runner::AiCommandRunner::for_run(
+        &config,
+        std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        crate::ai_command_runner::RunCommandScope::new(),
+    );
     let auto_resolve_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let args1 = ResolveMergesWithRetryArgs {
         workspace_manager: &manager as &dyn WorkspaceManager,
@@ -319,7 +327,7 @@ fn test_resolve_merges_with_retry_args_clone() {
         target_branch: "main",
         base_revision: "base123",
         max_retries: 3,
-        shared_stagger_state,
+        ai_runner,
         auto_resolve_count,
         publication_owns_completion: false,
     };
@@ -358,7 +366,11 @@ async fn run_auto_resolve_and_report_counter(
         &["change-a".to_string()],
         "merge conflict",
         1,
-        std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        crate::ai_command_runner::AiCommandRunner::for_run(
+            &config,
+            std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            crate::ai_command_runner::RunCommandScope::new(),
+        ),
         auto_resolve_count.clone(),
     )
     .await;

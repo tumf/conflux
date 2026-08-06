@@ -886,19 +886,42 @@ The system SHALL send completion events and messages only when processing comple
 
 ### Requirement: Loop termination reason must be tracked and distinguished
 
-The system SHALL track the reason for loop termination as normal completion, genuine execution error, graceful stop, active-execution force stop, scheduler-only cancellation, or merge wait. This termination reason SHALL control terminal logs and events without inferring process activity from TUI mode or error-message text. Operator cancellation SHALL request cancellation without dropping the running scheduler future and SHALL establish terminal stop only after the scheduler reaches its bounded cleanup barrier, including active task drain and pending background merge/base-lane result handling.
+The system SHALL track the reason for loop termination as normal completion, genuine execution error, graceful stop, active-execution force stop, scheduler-only cancellation, merge wait, or run-fatal failure. This termination reason SHALL control terminal logs and events without inferring process activity from TUI mode or error-message text. Operator cancellation SHALL request cancellation without dropping the running scheduler future and SHALL establish terminal stop only after the scheduler reaches its bounded cleanup barrier. That barrier MUST include active workspace-task drain, a truthful registered execution-handle outcome (confirmed completion or bounded unconfirmed timeout), invocation-scoped AI runner-task and owned process-set quiescence or completed managed escalation, and pending background merge/base-lane result handling. Aborting workspace futures or removing execution handles MUST NOT by itself establish process quiescence. Run-fatal failure SHALL retain exactly one prompt global `Error` before cleanup waiting, stop new admission and retries, and return scheduler failure only after the same cleanup barrier.
 
 #### Scenario: Operator cancellation reaches terminal classification
 
 **Given** the global parallel cancellation token is triggered by an operator stop
+**And** one or more run-owned AI commands may be active, waiting to spawn, or waiting to retry
 **When** the outer parallel orchestration boundary observes cancellation before the scheduler future returns
 **Then** the termination reason is recorded as stopped or cancelled
+**And** run command admission closes before workspace futures are aborted
 **And** cancellation is not converted to `OrchestratorError::AgentCommand`
 **And** the outer boundary continues polling the scheduler future until its bounded cleanup barrier completes
-**And** active task drain, registered execution-handle cleanup, and pending merge/base-lane result handling precede terminal stop
+**And** active task drain, a truthful execution-handle outcome, pending merge/base-lane result handling, and either confirmed runner-task and owned process-set cleanup or completed managed escalation precede terminal stop
+**And** no retry or command process starts after scope shutdown
 **And** a cleanup deadline or managed escalation remains classified as operator cancellation rather than execution failure
 **And** later terminal event handling remains idempotent if the frontend already applied `OrchestratorEvent::Stopped`
 **And** `Processing stopped` is not logged more than once
+
+#### Scenario: Run-fatal Error remains prompt while failure return waits for cleanup
+
+**Given** a typed background base-lane outcome invalidates the run
+**And** a run-owned AI command or retry task is still active
+**When** the queue boundary classifies the outcome as run-fatal
+**Then** it emits exactly one global `Error` promptly without waiting for process cleanup
+**And** it closes run command admission and signals active runner tasks
+**And** no new ordinary dispatch or retry is started
+**And** the scheduler does not return its run-fatal failure until registered runner tasks and owned process sets reach the bounded cleanup barrier
+**And** Conflux-owned preparation or workspace cleanup does not race the still-registered command
+**And** the run emits neither `Stopped` nor `AllCompleted` for the run-fatal outcome
+
+#### Scenario: Aborted workspace future does not prove execution completion
+
+**Given** a per-change workspace future has a registered execution handle and a run-owned AI command
+**When** cancellation or run-fatal shutdown aborts the workspace future
+**Then** removing the workspace future does not fire the execution `done` handshake by itself
+**And** confirmed terminal command cleanup precedes `done`
+**And** unconfirmed cleanup remains pending for bounded timeout and managed escalation rather than reporting false completion
 
 #### Scenario: Genuine failure remains distinct
 
@@ -2551,16 +2574,83 @@ When repeated retries produce consecutive empty WIP commits, the runtime MAY ent
 
 ### Requirement: Apply completion grace requires stable repository completion
 
-When runtime observes an apply completion condition while the apply child is still running, it MAY start a bounded grace period before terminating the child. Runtime MUST re-evaluate the same repository completion condition when the grace period expires and MUST terminate the child only if that condition remains present. If completion disappears or changes during the grace period, runtime MUST cancel or restart the deadline for the current condition and continue apply.
+When runtime observes an Apply completion condition while the owned Apply command is still running, it MAY start a bounded grace period before terminating the child. A task-completion condition is eligible for that grace only when task progress was incomplete at the start of the active command dispatch and became complete during that dispatch. Task progress that was already complete when a stage, task-format, final-commit-hook, or other task-complete repair command began MUST NOT by itself start, refresh, or finalize completion grace for that command.
 
-#### Scenario: transient task completion does not terminate apply
+Blocked and rejecting handoff conditions remain eligible regardless of task progress at dispatch start. Runtime MUST re-evaluate the same eligible repository completion condition when the grace period expires and MUST terminate the child only if that condition remains present. If an eligible completion disappears or changes during the grace period, runtime MUST cancel or restart the deadline for the current eligible condition and continue Apply. After grace-driven termination, runtime MUST preserve the existing process-group cleanup and quiescence gate before repository finalization or handoff.
 
-- **GIVEN** `tasks.md` becomes complete while the apply child remains running
+Dispatch-start eligibility MAY be retained as ephemeral in-memory state for the lifetime of the owned command. Restart routing MUST remain derived from workspace file state, Git state, and base-branch evidence and MUST NOT depend on persisted dispatch state.
+
+#### Scenario: Active dispatch reaches stable task completion
+
+- **GIVEN** task progress is incomplete when an Apply command is dispatched
+- **AND** the active command makes task progress complete while the owned child remains running
+- **WHEN** the task-complete condition remains present through the bounded grace period
+- **THEN** runtime terminates the lingering owned process group through the existing cleanup path
+- **AND** repository finalization may continue only after process-group quiescence is confirmed
+
+#### Scenario: Transient task completion does not terminate Apply
+
+- **GIVEN** task progress is incomplete when an Apply command is dispatched
+- **AND** `tasks.md` becomes complete while the Apply child remains running
 - **AND** runtime starts its completion grace period
 - **AND** `tasks.md` becomes incomplete before the grace period expires
 - **WHEN** runtime rechecks repository state at the deadline
 - **THEN** it does not terminate the child based on the stale completion observation
-- **AND** apply continues until a completion condition remains stable or the child exits
+- **AND** Apply continues until an eligible completion condition remains stable or the child exits
+
+#### Scenario: Pre-complete stage repair outlives completion grace
+
+- **GIVEN** task progress is already complete when finalization rejects an unstaged or untracked workspace
+- **AND** Conflux dispatches an Apply command to repair explicit staging
+- **WHEN** the repair command remains active longer than the configured completion grace before staging the intended files
+- **THEN** the pre-existing task completion does not terminate that repair command
+- **AND** the command may complete normally before finalization is retried
+
+#### Scenario: Pre-complete task-format repair outlives completion grace
+
+- **GIVEN** all checkboxes are complete but worktree-local task-format validation requires another Apply command
+- **WHEN** the task-format repair remains active longer than the configured completion grace before correcting `tasks.md`
+- **THEN** the pre-existing task completion does not terminate that repair command
+- **AND** Acceptance remains undispatched until the repair exits and task-format validation succeeds
+
+#### Scenario: Pre-complete final-commit-hook repair outlives completion grace
+
+- **GIVEN** all tasks are complete and a hook-enabled final Apply commit was rejected with repository-fixable diagnostics
+- **AND** Conflux dispatches the required repair Apply command
+- **WHEN** the repair remains active longer than the configured completion grace before resolving the rejection
+- **THEN** the pre-existing task completion does not terminate that repair command
+- **AND** finalization is retried through the existing hook-enabled commit path only after the repair command exits and process-group quiescence is confirmed
+
+#### Scenario: Repair dispatch still terminates for blocked handoff
+
+- **GIVEN** task progress was already complete when an Apply repair command began
+- **AND** that active command creates a valid `APPLY_BLOCKED` handoff artifact and leaves its child running
+- **WHEN** the blocked condition remains stable through completion grace
+- **THEN** runtime terminates the lingering owned process group through the existing cleanup path
+- **AND** Apply returns the blocked handoff rather than treating pre-existing task completion as success
+
+#### Scenario: Repair dispatch still terminates for rejecting handoff
+
+- **GIVEN** task progress was already complete when an Apply repair command began
+- **AND** that active command creates `REJECTED.md` and leaves its child running
+- **WHEN** the rejecting condition remains stable through completion grace
+- **THEN** runtime terminates the lingering owned process group through the existing cleanup path
+- **AND** Apply returns the rejecting handoff rather than treating pre-existing task completion as success
+
+#### Scenario: Pre-complete repair failure remains a failed attempt
+
+- **GIVEN** task progress was already complete when an Apply repair command began
+- **AND** the command exits non-zero without completing its repair or creating a recognized handoff
+- **WHEN** runtime classifies the command result
+- **THEN** pre-existing task completion does not make the command success-equivalent
+- **AND** existing failure, permission, retry, stall, and iteration-budget policy remains authoritative
+
+#### Scenario: Restart recomputes repair without persisted dispatch policy
+
+- **GIVEN** the process stops before a task-complete repair is finished
+- **WHEN** Conflux resumes from the preserved workspace
+- **THEN** it re-derives the next Apply action from workspace file state, Git state, and base-branch evidence
+- **AND** no persisted dispatch-start completion value or out-of-worktree workflow-control state is required
 
 ### Requirement: Empty-WIP apply escalation before stall finalization
 
@@ -3108,9 +3198,15 @@ Managed-worktree execution MUST produce one structured diagnostic contract for `
 
 ### Requirement: Repository monitoring avoids optional Git index locks
 
-Repository-monitoring queries used to classify uncommitted OpenSpec changes for TUI refresh, parallel startup, or queue filtering MUST preserve current worktree classification without requesting optional Git index locks. Optional-lock suppression MUST be local to the monitoring child command and MUST NOT alter index-mutating Git commands or process-wide environment state.
+Every Conflux-owned native read-only `git status` observation used for repository or managed-worktree classification or context capture MUST preserve its existing output and classification contract without requesting an optional Git index lock. This includes change-list monitoring, dirty/clean checks, human-readable conflict-resolution context, untrimmed porcelain reads, Apply and Archive phase classification, merge precondition observation, upstream cleanliness, and porcelain-v2 failure classification.
+
+Optional-lock suppression MUST be expressed as the child command's Git global `--no-optional-locks` option before the `status` subcommand. Conflux MUST NOT implement this policy through process-wide `GIT_OPTIONAL_LOCKS` state, MUST NOT apply it to index-mutating Git commands, and MUST NOT delete or bypass an existing lock.
+
+Each observation MUST retain its existing porcelain version, human-readable or machine-readable output shape, status-column fidelity, explicit untracked/ignored behavior, pathspec scope, and error mapping.
 
 The monitoring query MUST continue to classify active change paths from staged, unstaged, renamed, and untracked state while excluding clean committed paths, archive entries, hidden change directories, ignored files, and unrelated repository paths. Results MAY represent a point-in-time observation and MAY converge on concurrent mutations during a later poll.
+
+<!-- Expected canonical result after archive: all Conflux-owned native read-only status observations, not only change-list refresh, avoid optional index writes while preserving their existing classification contracts. -->
 
 #### Scenario: Periodic refresh does not request an optional index lock
 
@@ -3119,6 +3215,15 @@ The monitoring query MUST continue to classify active change paths from staged, 
 **When**: The refresh executes its Git status query
 **Then**: The query disables Git optional locks for that child command
 **And**: Repo-mutating Git commands retain their existing lock behavior
+
+#### Scenario: Periodic root observation does not contend with an authorized commit
+
+**Given**: A running Conflux frontend periodically checks root repository dirty or clean state
+**And**: An `on_merged` hook, release command, or operator may stage and commit in the same repository
+**When**: Conflux executes its native read-only Git status observation
+**Then**: The child command passes `--no-optional-locks` before `status`
+**And**: The observation does not request an optional index lock
+**And**: The authorized mutating Git command retains normal lock behavior
 
 #### Scenario: Active change classifications remain visible
 
@@ -3133,12 +3238,50 @@ The monitoring query MUST continue to classify active change paths from staged, 
 **When**: Conflux classifies change IDs with uncommitted files
 **Then**: Only the qualifying active change ID is returned
 
+#### Scenario: Managed-worktree phase classification preserves status semantics
+
+**Given**: A managed worktree contains staged, unstaged, deleted, renamed, untracked, ignored, or conflicted state
+**When**: Apply, Archive, merge, or resume classification reads native Git status
+**Then**: The existing clean, dirty, staged, unstaged, untracked, ignored, and conflict classifications are unchanged
+**And**: An untrimmed porcelain caller retains both status columns on the first line
+**And**: The read-only child command does not request an optional index lock
+
+#### Scenario: Upstream porcelain-v2 observation remains machine-readable
+
+**Given**: Upstream integration needs working-tree cleanliness or post-failure porcelain-v2 evidence
+**When**: The native upstream Git adapter runs its status observation
+**Then**: The child command disables optional locks before `status`
+**And**: `--porcelain=v2` output remains porcelain v2
+**And**: Existing upstream error mapping and routing classification remain unchanged
+
+#### Scenario: Conflict-resolution context remains human-readable
+
+**Given**: Conflict resolution captures native Git status text for a resolve prompt
+**When**: Conflux obtains that context from the Git backend
+**Then**: The child command disables optional locks before `status`
+**And**: The prompt receives the same human-readable status content and error behavior as before
+
 #### Scenario: Monitoring does not persist an optional index refresh
 
 **Given**: A repository fixture has index stat information that a normal status command demonstrably persists
 **When**: Conflux runs the uncommitted-change monitoring query
 **Then**: The query reports current working-tree changes
 **And**: The complete Git index bytes remain unchanged
+
+#### Scenario: Read-only status does not persist an optional index refresh
+
+**Given**: A repository fixture has stale index stat information that a normal status command demonstrably persists
+**When**: Representative Conflux production status paths observe current repository state
+**Then**: They return the current clean or dirty evidence required by their callers
+**And**: The complete Git index bytes remain unchanged
+
+#### Scenario: Optional-lock suppression stays command-local
+
+**Given**: The Conflux process also executes add, commit, merge, reset, checkout, tag, push, or release publication commands
+**When**: Read-only status observations and mutating commands run in the same process
+**Then**: Only the read-only status children receive `--no-optional-locks`
+**And**: Process-wide `GIT_OPTIONAL_LOCKS` is not set by this policy
+**And**: Mutating commands retain Git's normal lock semantics
 
 ### Requirement: Acceptance command failures MUST use bounded Acceptance-only recovery
 

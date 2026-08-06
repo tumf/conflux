@@ -65,7 +65,7 @@ fn stagger() -> crate::ai_command_runner::SharedStaggerState {
 fn executor(root: &Path, enabled: bool) -> ParallelExecutor {
     let mut executor = ParallelExecutor::new(root.to_path_buf(), test_config(), None);
     if enabled {
-        executor.set_upstream_integration(runtime(), stagger());
+        executor.set_upstream_integration(runtime());
     }
     executor
 }
@@ -257,7 +257,7 @@ async fn per_change_upstream_retry_resumes_publication_without_apply_dispatch() 
     let head = git(&root, &["rev-parse", "HEAD"]).expect("head");
 
     let mut executor = ParallelExecutor::new(root.clone(), test_config(), None);
-    executor.set_upstream_integration(passing_runtime(), stagger());
+    executor.set_upstream_integration(passing_runtime());
     assert!(executor.has_pending_publication_for("alpha").await);
 
     // This is the explicit-retry / restart entry point. It performs publication
@@ -450,13 +450,10 @@ async fn per_change_upstream_base_lane_orders_merge_hook_verification_and_public
         },
         root.clone(),
     ));
-    executor.set_upstream_integration(
-        UpstreamRuntime {
-            config: UpstreamIntegrationConfig::new("origin", ordering_probe("verify", &root, &log)),
-            branch: "main".to_string(),
-        },
-        stagger(),
-    );
+    executor.set_upstream_integration(UpstreamRuntime {
+        config: UpstreamIntegrationConfig::new("origin", ordering_probe("verify", &root, &log)),
+        branch: "main".to_string(),
+    });
 
     let _serialize = crate::parallel::merge_lock_test_mutex().lock().await;
     let outcome = executor

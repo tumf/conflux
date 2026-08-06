@@ -24,6 +24,8 @@ mod per_change_upstream;
 mod reanalysis_trigger_lifetime;
 #[cfg(test)]
 mod reducer_snapshot_contention;
+
+mod run_command_scope;
 #[cfg(test)]
 mod unchanged_analysis_input;
 #[cfg(test)]

@@ -45,7 +45,7 @@ fn configure_parallel_upstream_integration(
 /// result handling, and workspace-guard drop can complete. Exceeding this
 /// deadline escalates to managed cleanup; it never reclassifies the run as an
 /// execution failure.
-const PARALLEL_CANCELLATION_CLEANUP_DEADLINE: std::time::Duration =
+pub(crate) const PARALLEL_CANCELLATION_CLEANUP_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(120);
 
 /// Run `on_finish` exactly once for a TUI parallel run.
@@ -254,6 +254,7 @@ pub async fn run_orchestrator_parallel(
     config: OrchestratorConfig,
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,
+    run_command_scope: crate::ai_command_runner::RunCommandScope,
     dynamic_queue: DynamicQueue,
     _graceful_stop_flag: Arc<AtomicBool>,
     shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
@@ -291,6 +292,9 @@ pub async fn run_orchestrator_parallel(
     // manual resolve startup observes the same ResolveWait/RejectWait intent that
     // accepted the TUI command.
     let mut service = ParallelRunService::new(repo_root.clone(), config.clone());
+    // The run owner created the scope, so a clone survives outside this task
+    // and local shutdown can still reach the process identities it holds.
+    service.set_run_command_scope(run_command_scope);
     configure_parallel_post_archive_action(&mut service, post_archive_action);
     // The local TUI implements no Git operation of its own: it hands the same
     // validated runtime to the same shared parallel service `cflx run` uses, so

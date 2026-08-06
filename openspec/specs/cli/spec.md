@@ -130,7 +130,7 @@ TUI は Running モードでダッシュボード形式の UI を表示しなけ
 
 TUI が shared reducer の display snapshot を `AppState` に同期する場合、Running mode の in-flight 状態を表す execution lifecycle events を reducer に反映してから display snapshot を適用しなければならない（MUST）。これにより、`ChangesRefreshed` 後も active display status と header count が stale reducer snapshot によって失われてはならない（MUST NOT）。
 
-<!-- Expected canonical result after archive: Running Mode Dashboard will explicitly require reducer lifecycle-event sync before display snapshot application so active header counts survive refresh. -->
+ヘッダーステータスは現在のオーケストレーション活動を表示し、内部の停止後再開制御状態を新しい実行中ステータスとして公開してはならない（MUST NOT）。`AppExecutionMode::Select` と `AppExecutionMode::Stopped` は `Ready`、`Running` は `Running` または `Running <count>`、`Stopping` は `Stopping` を表示する。`Error` は既存どおりステータスラベルを表示しない。内部 Stopped mode は resume routing と controls のために維持し、Header projectionによって変更してはならない（MUST NOT）。
 
 #### Scenario: Display on processing completion
 - **WHEN** すべての queued change が処理完了する
@@ -153,14 +153,21 @@ TUI が shared reducer の display snapshot を `AppState` に同期する場合
 - **AND** ヘッダーは active change 数を `Running <count>` として表示し続ける
 - **AND** queued のみの change は <count> に含めない
 
-#### Scenario: Header hides status in stopped and error modes
-- **GIVEN** TUI が Stopped または Error モードである
+#### Scenario: Stopped mode header projects Ready
+- **GIVEN** TUI の内部 execution mode が Stopped である
+- **WHEN** ヘッダーが描画される
+- **THEN** ヘッダーは cyan の `Ready` ステータスを表示する
+- **AND** ヘッダーは `Stopped` ステータスを表示しない
+- **AND** 内部 execution mode は Stopped のまま維持される
+
+#### Scenario: Error mode header remains unlabeled
+- **GIVEN** TUI が Error モードである
 - **WHEN** ヘッダーが描画される
 - **THEN** ヘッダーはステータスラベルを表示しない
 
 ### Requirement: TUI Layout Structure
 
-The TUI SHALL display appropriate layout for Stopping and Stopped modes in addition to existing modes.
+The TUI SHALL display appropriate layout for Stopping and Stopped modes in addition to existing modes. Stopped mode SHALL use the Ready header projection while retaining stopped-mode resume controls.
 
 #### Scenario: Stopping mode layout
 
@@ -173,9 +180,10 @@ The TUI SHALL display appropriate layout for Stopping and Stopped modes in addit
 #### Scenario: Stopped mode layout
 
 - **WHEN** TUI is in Stopped mode
-- **THEN** header displays "Stopped" status in gray
+- **THEN** header displays "Ready" status in cyan
 - **AND** status panel shows summary of completed/queued changes
 - **AND** footer shows available actions (F5: resume, q: quit)
+- **AND** rendering does not change the internal Stopped mode
 
 ### Requirement: Auto-refresh Feature
 
@@ -1051,13 +1059,15 @@ TUIはEsc二度押しによる停止時、現在の実行活動を確認しな�
 
 ### Requirement: TUI Stopped Mode
 
-The TUI SHALL provide a Stopped mode that manages change state by holding queued status only during execution. When transitioning to Stopped, queue_status SHALL be reset to NotQueued while preserving execution marks ([x]). Space operations in Stopped mode SHALL only add/remove execution marks while maintaining queue_status as NotQueued. When resuming with F5, execution-marked changes SHALL be restored to queued and processing SHALL resume. Task progress updates in Stopped mode SHALL NOT trigger queuing.
+The TUI SHALL provide an internal Stopped mode that manages change state by holding queued status only during execution. When transitioning to Stopped, queue_status SHALL be reset to NotQueued while preserving execution marks ([x]). Space operations in Stopped mode SHALL only add/remove execution marks while maintaining queue_status as NotQueued. When resuming with F5, execution-marked changes SHALL be restored to queued and processing SHALL resume. Task progress updates in Stopped mode SHALL NOT trigger queuing. The header SHALL project this inactive resumable mode as `Ready`; mode-specific controls SHALL continue to identify F5 as `resume`.
 
 #### Scenario: Stopped mode display
 - **WHEN** TUI is in Stopped mode
-- **THEN** header status displays "Stopped" in gray color
+- **THEN** header status displays "Ready" in cyan color
+- **AND** status controls display the configured start key as `resume`
 - **AND** the change list remains visible with current statuses
 - **AND** execution-marked changes show "[x]" while their queue_status remains not queued
+- **AND** the internal execution mode remains Stopped
 
 #### Scenario: Queue management in Stopped mode
 - **WHEN** TUI is in Stopped mode

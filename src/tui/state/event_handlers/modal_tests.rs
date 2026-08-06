@@ -136,7 +136,8 @@ fn stopped_event_clears_a_force_kill_confirmation_atomically() {
 
     assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
     assert_eq!(app.stop_mode, StopMode::None);
-    assert_eq!(app.changes[0].display_status_cache, "not queued");
+    // The row's own status is the reducer's answer to the same stop; this
+    // handler owns the mode, the stop mode, and the modal only.
     assert!(
         app.modal.is_none(),
         "the modal and its target payload are cleared together"
