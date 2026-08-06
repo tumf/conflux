@@ -18,6 +18,16 @@ use super::state::{
 use super::types::{AppExecutionMode, ModalState};
 use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
 
+/// Key-hint replacement for a row whose active run owns its Apply ceiling.
+///
+/// It deliberately names no key. Offering `Space` or the start key here would
+/// advertise a mutation the shared service refuses before it touches anything.
+const APPLY_LIMIT_KEY_HINT: &str = "Apply limit reached (retry after the run closes)";
+
+/// Footer/status condition for rows blocked by an active-run Apply ceiling.
+const APPLY_LIMIT_CONDITION: &str =
+    "Apply iteration limit reached: retry becomes available after the active run closes";
+
 /// Parsed parts of a remote change ID.
 ///
 /// Remote server mode encodes the change ID as `<project_id>::<project_name>/<change_id>`.
@@ -826,6 +836,10 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             } else {
                 keys.push("K: kill".to_string());
             }
+        } else if item.apply_iteration_limit_active {
+            // Never a Space promise for a row the shared service refuses: the
+            // row keeps its diagnostic and gets the stable condition instead.
+            keys.push(APPLY_LIMIT_KEY_HINT.to_string());
         } else if !is_parallel_blocked {
             keys.push(match (item.display_status_cache.as_str(), item.selected) {
                 ("error", true) => "Space: clear retry".to_string(),
@@ -1173,6 +1187,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             } else {
                 keys.push("K: kill".to_string());
             }
+        } else if item.apply_iteration_limit_active {
+            // Never a Space promise for a row the shared service refuses: the
+            // row keeps its diagnostic and gets the stable condition instead.
+            keys.push(APPLY_LIMIT_KEY_HINT.to_string());
         } else if !is_parallel_blocked {
             keys.push(match (item.display_status_cache.as_str(), item.selected) {
                 ("error", true) => "Space: clear retry".to_string(),
@@ -1311,6 +1329,15 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
             format!(" Status ({start_key_label}: continue, Esc: force stop, Ctrl+C: quit) ")
         }
         AppExecutionMode::Stopped => format!(" Status ({start_key_label}: resume, Ctrl+C: quit) "),
+        // The retry affordance survives every other Error-mode condition, but not
+        // one where the only failed rows are held by the active run's own Apply
+        // ceiling: the start key would be refused without mutating anything, so
+        // the header states the condition instead of naming a key.
+        AppExecutionMode::Error
+            if app.has_active_apply_iteration_limit() && !app.has_admissible_retry_target() =>
+        {
+            format!(" Status ({APPLY_LIMIT_CONDITION}, Ctrl+C: quit) ")
+        }
         AppExecutionMode::Error => format!(" Status ({start_key_label}: retry, Ctrl+C: quit) "),
     };
 
@@ -1713,12 +1740,15 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ));
     } else if selected == 0 {
-        // Changes exist but none selected
-        let has_error_changes = app
-            .changes
-            .iter()
-            .any(|change| change.display_status_cache == "error");
-        let message = if has_error_changes {
+        // Changes exist but none selected. Guidance names a key only for rows the
+        // shared service would actually admit: a row at the active run's Apply
+        // ceiling must not make the footer promise Space or the start key.
+        let retryable_error_rows = app.changes.iter().any(|change| {
+            change.display_status_cache == "error" && !change.apply_iteration_limit_active
+        });
+        let message = if app.has_active_apply_iteration_limit() && !app.has_bulk_toggle_targets() {
+            APPLY_LIMIT_CONDITION
+        } else if retryable_error_rows {
             "Select changes with Space to process (error rows need retry mark)"
         } else {
             "Select changes with Space to process"
@@ -3407,6 +3437,125 @@ mod tests {
         assert!(content.contains("Press F5/! to start processing"));
     }
 
+    // ========================================================================
+    // Active-run Apply iteration limit: TUI guidance (integration — rendering)
+    // ========================================================================
+    //
+    // These render the real widget tree over an in-memory buffer. No terminal,
+    // process, or repository is involved.
+
+    /// One error row already gated by the active run's Apply ceiling.
+    fn app_with_limited_error_row() -> AppState {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.changes[0].set_error_message_cache("max iterations reached".to_string());
+        app.changes[0].apply_iteration_limit_active = true;
+        app
+    }
+
+    #[test]
+    fn active_iteration_limit_tui_row_hint_promises_no_space_retry() {
+        let mut app = app_with_limited_error_row();
+        app.cursor_index = 0;
+
+        let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
+
+        assert!(
+            !content.contains("Space: retry mark") && !content.contains("Space: clear retry"),
+            "a limited row must not advertise a mark the service refuses:\n{content}"
+        );
+        assert!(
+            content.contains("Apply limit reached"),
+            "the row states the stable condition instead:\n{content}"
+        );
+        assert!(
+            content.contains("Enter: details"),
+            "the retained diagnostic stays inspectable:\n{content}"
+        );
+    }
+
+    #[test]
+    fn active_iteration_limit_tui_row_hint_returns_after_the_gate_retires() {
+        let mut app = app_with_limited_error_row();
+        app.cursor_index = 0;
+        app.sync_active_apply_iteration_limits(&std::collections::HashSet::new());
+
+        let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
+        assert!(
+            content.contains("Space: retry mark"),
+            "ordinary retry guidance returns once the owning boundary closes:\n{content}"
+        );
+    }
+
+    #[test]
+    fn active_iteration_limit_tui_select_footer_states_the_condition() {
+        let mut app = app_with_limited_error_row();
+
+        let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
+        assert!(
+            content.contains("Apply iteration limit reached"),
+            "the footer reports the stable active-limit condition:\n{content}"
+        );
+        assert!(
+            !content.contains("Select changes with Space to process"),
+            "and never instructs the operator to mark a row the service refuses:\n{content}"
+        );
+        assert!(
+            !content.contains("Press F5/! to start processing"),
+            "nor promises the start key for it:\n{content}"
+        );
+    }
+
+    /// A limited row must not suppress guidance for unrelated eligible rows.
+    #[test]
+    fn active_iteration_limit_tui_select_footer_keeps_guidance_for_eligible_rows() {
+        let mut app = create_test_app(vec![
+            create_test_change("limited"),
+            create_test_change("eligible"),
+        ]);
+        app.changes[0].set_error_message_cache("max iterations reached".to_string());
+        app.changes[0].apply_iteration_limit_active = true;
+
+        let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
+        assert!(
+            content.contains("Select changes with Space to process"),
+            "an eligible row keeps its ordinary guidance:\n{content}"
+        );
+        assert!(
+            !content.contains("error rows need retry mark"),
+            "but the error-row retry promise is not made for a limited row:\n{content}"
+        );
+    }
+
+    #[test]
+    fn active_iteration_limit_tui_error_header_offers_no_retry_key() {
+        let mut app = app_with_limited_error_row();
+        app.execution_mode = AppExecutionMode::Error;
+        app.error_change_id = Some("change-a".to_string());
+        // The Status panel is part of the logs-bearing layout, which is what a
+        // real Error-mode session always has by the time a change has failed.
+        app.add_log(LogEntry::error("apply failed"));
+
+        // The taller layout the other base-control tests use; at 24 rows the
+        // Status panel is not laid out at all.
+        let content = buffer_to_string(&render_buffer(&mut app, 120, 40));
+        assert!(
+            !content.contains(&format!("{}: retry", app.start_key_label())),
+            "the header must not promise a retry key the service refuses:\n{content}"
+        );
+        assert!(
+            content.contains("Apply iteration limit reached"),
+            "it states the condition instead:\n{content}"
+        );
+
+        // An unrelated retryable row restores the ordinary control.
+        app.changes[0].apply_iteration_limit_active = false;
+        let content = buffer_to_string(&render_buffer(&mut app, 120, 40));
+        assert!(
+            content.contains(&format!("{}: retry", app.start_key_label())),
+            "the retry control returns once a target is admissible:\n{content}"
+        );
+    }
+
     #[test]
     fn test_render_status_uses_configured_start_label() {
         let mut stopped_app = create_test_app(vec![create_test_change("change-a")]);
@@ -4686,6 +4835,7 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
+            apply_iteration_limit_active: false,
         }
     }
 

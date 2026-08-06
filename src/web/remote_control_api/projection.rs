@@ -447,6 +447,7 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
                     &display_status,
                     change.blocker.as_ref(),
                     change.parallel.eligible,
+                    change.apply_iteration_limit_active,
                 ),
                 display_status,
                 progress_status: change.status.clone(),
@@ -502,14 +503,27 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
 /// bulk mutation: a row worktree execution would refuse to start must not be
 /// advertised as markable, or a client would mark it and then watch start
 /// refuse the whole set.
+///
+/// `apply_iteration_limit_active` is the process-local admission gate: the
+/// snapshot builder sets it only when typed iteration-limit evidence exists and
+/// the owning command-capable scheduler task is still live. It blocks retry and
+/// both mark actions, because in Running mode a mark for an `error` row *is* the
+/// terminal-error queue alias the same guard refuses.
 fn classify_actions(
     mode: OperatorMode,
     display_status: &str,
     blocker: Option<&ChangeBlocker>,
     parallel_eligible: bool,
+    apply_iteration_limit_active: bool,
 ) -> ChangeActions {
     let final_status = is_final_status(display_status);
     let route = classify_mark_route(mode, display_status);
+
+    // Only a terminal-error row can route through `RetryError`, so only that row
+    // carries the gate. Anything else with a retained record is describing a
+    // ceiling that no current action would touch.
+    let limit_blocked = apply_iteration_limit_active && display_status == "error";
+    let limit_reason = ActionBlockedReason::ApplyIterationLimitActive;
 
     let immutable_reason = if final_status {
         ActionBlockedReason::FinalStatus
@@ -527,6 +541,7 @@ fn classify_actions(
         ActionBlockedReason::from_mark_exclusion(MarkExclusion::ParallelIneligible);
 
     let set_execution_mark = match route {
+        _ if limit_blocked => ActionEligibility::blocked(limit_reason),
         _ if parallel_blocked => ActionEligibility::blocked(parallel_reason),
         MarkRoute::MarkOnly | MarkRoute::QueueIntent => ActionEligibility::allowed(),
         MarkRoute::RetryRequired => ActionEligibility::blocked(ActionBlockedReason::RetryRequired),
@@ -534,6 +549,7 @@ fn classify_actions(
     };
 
     let set_queue_intent = match route {
+        _ if limit_blocked => ActionEligibility::blocked(limit_reason),
         _ if parallel_blocked => ActionEligibility::blocked(parallel_reason),
         MarkRoute::QueueIntent => ActionEligibility::allowed(),
         // Select and Stopped have no runtime queue to mutate; a base-lane wait in
@@ -546,7 +562,11 @@ fn classify_actions(
         MarkRoute::Immutable => ActionEligibility::blocked(immutable_reason),
     };
 
-    let retry_change = classify_retry_action(display_status, blocker, final_status);
+    let retry_change = if limit_blocked {
+        ActionEligibility::blocked(limit_reason)
+    } else {
+        classify_retry_action(display_status, blocker, final_status)
+    };
 
     // `DequeueChange` is refused only for a final outcome; `error` and `stopped`
     // are terminal for accounting but still dequeuable.
@@ -588,6 +608,23 @@ pub fn change_actions_for_test(
         display_status,
         blocker,
         true,
+        false,
+    )
+}
+
+/// Action eligibility with an explicit active Apply-iteration-limit gate.
+#[cfg(test)]
+pub fn limited_change_actions_for_test(
+    app_mode: &str,
+    display_status: &str,
+    apply_iteration_limit_active: bool,
+) -> ChangeActions {
+    classify_actions(
+        OperatorMode::from_app_mode(app_mode),
+        display_status,
+        None,
+        true,
+        apply_iteration_limit_active,
     )
 }
 
@@ -604,6 +641,7 @@ pub fn parallel_change_actions_for_test(
         display_status,
         None,
         parallel_eligible,
+        false,
     )
 }
 

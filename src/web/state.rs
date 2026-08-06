@@ -69,6 +69,15 @@ pub struct ChangeStatus {
     /// Operator attention state.
     #[serde(default)]
     pub attention: AttentionState,
+    /// True while a live command-capable run boundary owns this change's
+    /// exhausted Apply-dispatch ceiling.
+    ///
+    /// Both halves are required: the reducer's typed record supplies the
+    /// evidence, and the bound scheduler-task liveness supplies the ownership.
+    /// A retained record whose boundary has exited is not an action block, and a
+    /// process with no bound boundary (headless `cflx run`) never sets this.
+    #[serde(default)]
+    pub apply_iteration_limit_active: bool,
 }
 
 impl From<&Change> for ChangeStatus {
@@ -103,6 +112,7 @@ impl From<&Change> for ChangeStatus {
             latest_activity: None,
             worktree: None,
             attention: AttentionState::None,
+            apply_iteration_limit_active: false,
         }
     }
 }
@@ -281,6 +291,11 @@ fn apply_reducer_derived_operator_state(
         change.error_detail = runtime
             .and_then(ChangeRuntimeState::error_message)
             .map(crate::events::sanitize_detail);
+        // Evidence only. Ownership is applied once, from one liveness read, in
+        // `operator_snapshot_with`: doing it per change here would let a boundary
+        // that exits mid-loop produce a snapshot that gates some rows and not
+        // others.
+        change.apply_iteration_limit_active = shared.apply_iteration_limit(&change.id).is_some();
     }
 }
 
@@ -403,6 +418,15 @@ pub struct WebState {
     /// which is exactly what a process that cannot start a run should report.
     parallel_runtime:
         tokio::sync::RwLock<Option<Arc<crate::orchestration::operator_command::ParallelRuntime>>>,
+    /// Scheduler-task liveness authority for the active Apply-limit gate.
+    ///
+    /// The *same* handle operator command admission consults, so the snapshot
+    /// cannot advertise a retry the shared service would refuse, and cannot keep
+    /// advertising a block after the owning task exits. A headless `cflx run`
+    /// binds nothing here and therefore projects no process-local action block.
+    run_boundary: tokio::sync::RwLock<
+        Option<Arc<dyn crate::orchestration::operator_command::RunBoundaryLiveness>>,
+    >,
     /// Timing, latest activity, attention, parallel eligibility, and worktree
     /// relation for this process incarnation.
     operator_facts: tokio::sync::RwLock<OperatorFactsStore>,
@@ -455,6 +479,7 @@ impl WebState {
             remote_control: Arc::new(crate::web::remote_control_api::RemoteControlRuntime::new()),
             execution_marks: tokio::sync::RwLock::new(None),
             parallel_runtime: tokio::sync::RwLock::new(None),
+            run_boundary: tokio::sync::RwLock::new(None),
             operator_facts: tokio::sync::RwLock::new(OperatorFactsStore::new()),
             projected_dispatches: Mutex::new(RecentDispatchIds::default()),
         }
@@ -488,6 +513,19 @@ impl WebState {
         parallel: Arc<crate::orchestration::operator_command::ParallelRuntime>,
     ) {
         *self.parallel_runtime.write().await = Some(parallel);
+        self.sync_remote_control_projection().await;
+    }
+
+    /// Bind the scheduler-task liveness authority for the active Apply-limit gate.
+    ///
+    /// Bound only by a command-capable frontend, and bound to the same handle the
+    /// operator services use. Without it the projection has no way to tell a
+    /// live boundary's gate from a retained record, so it reports neither.
+    pub async fn set_run_boundary(
+        &self,
+        boundary: Arc<dyn crate::orchestration::operator_command::RunBoundaryLiveness>,
+    ) {
+        *self.run_boundary.write().await = Some(boundary);
         self.sync_remote_control_projection().await;
     }
 
@@ -554,9 +592,18 @@ impl WebState {
             }
             None => ParallelRuntimeState::default(),
         };
+        // One liveness read for the whole snapshot. A retained iteration-limit
+        // record whose scheduler task has exited is history, not an action block,
+        // and a process with no bound boundary has no gate to publish at all.
+        let boundary_running = match self.run_boundary.read().await.as_ref() {
+            Some(boundary) => boundary.boundary_running(),
+            None => false,
+        };
+
         let facts = self.operator_facts.read().await;
         snapshot.process_error = facts.process_error();
         for change in &mut snapshot.changes {
+            change.apply_iteration_limit_active &= boundary_running;
             change.execution_marked = marks
                 .as_ref()
                 .is_some_and(|marks| marks.is_marked(&change.id));

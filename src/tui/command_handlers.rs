@@ -305,6 +305,20 @@ pub async fn handle_start_processing_command(ids: Vec<String>, ctx: &mut TuiComm
     }
 }
 
+/// Message for a retry the shared service settled without a target.
+///
+/// `NoRetryableTarget` is truthful but not actionable when the reason is an
+/// active-run Apply ceiling, so the active condition is named when one exists.
+fn no_retryable_target_message(app: &AppState) -> String {
+    if app.has_active_apply_iteration_limit() && !app.has_admissible_retry_target() {
+        return format!(
+            "Retry is unavailable: every candidate is {}",
+            crate::tui::state::ACTIVE_APPLY_LIMIT_EXPLANATION
+        );
+    }
+    "No marked change carries retryable evidence".to_string()
+}
+
 /// Surface a refusal from the shared run-control service.
 ///
 /// A refusal is never silent: the operator gets the same actionable detail the
@@ -320,9 +334,7 @@ fn report_run_no_op(app: &mut AppState, reason: &RunNoOpReason) {
         RunNoOpReason::ResolveAlreadyReserved { change_id } => {
             format!("Change '{}' is already queued for resolve", change_id)
         }
-        RunNoOpReason::NoRetryableTarget => {
-            "No marked change carries retryable evidence".to_string()
-        }
+        RunNoOpReason::NoRetryableTarget => no_retryable_target_message(app),
     };
     app.warning_message = Some(message.clone());
     app.add_log(LogEntry::warn(message));
