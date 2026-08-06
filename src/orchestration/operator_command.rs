@@ -72,6 +72,84 @@ pub fn is_final_status(display_status: &str) -> bool {
 }
 
 // ============================================================================
+// Active-run Apply iteration limit
+// ============================================================================
+
+/// Stable machine-readable token for an active-run Apply iteration limit.
+///
+/// One spelling for the internal refusal, the bulk-mark exclusion, and the
+/// `/api/v2` blocked reason, so no surface has to invent its own.
+pub const APPLY_ITERATION_LIMIT_ACTIVE: &str = "apply_iteration_limit_active";
+
+/// Whether the scheduler task that owns the current active-run state is alive.
+///
+/// This is the *only* thing that retires the retry gate. The typed
+/// [`crate::orchestration::state::ApplyIterationLimit`] record deliberately
+/// survives its boundary — the finish hook still has to read it — so record
+/// presence alone can never say whether the gate is active.
+///
+/// A process with no command-capable boundary (headless `cflx run`) binds
+/// nothing here and therefore has no gate to report.
+pub trait RunBoundaryLiveness: Send + Sync {
+    /// True when the scheduler task owning the current active-run state is live.
+    fn boundary_running(&self) -> bool;
+}
+
+/// An Apply-dispatch ceiling that is still owned by a live scheduler boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveApplyIterationLimit {
+    /// Exact cumulative configured Apply dispatches reserved for the change.
+    pub attempts: u32,
+    /// The configured ceiling that refused the next dispatch.
+    pub max: u32,
+}
+
+/// The one shared active-limit query.
+///
+/// Operator command admission, TUI eligibility, and the command-capable v2
+/// projection all call this rather than re-deriving the lifetime rule, which is
+/// what keeps a keypress, a remote command, and a rendered control from
+/// disagreeing about the same row.
+///
+/// `boundary` is `None` for a process with no command-capable scheduler
+/// authority; such a process never reports an active gate.
+pub fn active_apply_iteration_limit(
+    state: &OrchestratorState,
+    boundary: Option<&dyn RunBoundaryLiveness>,
+    change_id: &str,
+) -> Option<ActiveApplyIterationLimit> {
+    // Liveness first: it is the cheap half, and a closed boundary makes the
+    // record irrelevant no matter what it says.
+    if !boundary.is_some_and(RunBoundaryLiveness::boundary_running) {
+        return None;
+    }
+    state
+        .apply_iteration_limit(change_id)
+        .map(|record| ActiveApplyIterationLimit {
+            attempts: record.attempts,
+            max: record.max,
+        })
+}
+
+/// Every change whose Apply-dispatch ceiling is owned by a live boundary.
+///
+/// One liveness observation for the whole set, so a bulk classification cannot
+/// see the boundary alive for one row and closed for the next.
+pub fn active_apply_iteration_limited_ids(
+    state: &OrchestratorState,
+    boundary: Option<&dyn RunBoundaryLiveness>,
+) -> HashSet<String> {
+    if !boundary.is_some_and(RunBoundaryLiveness::boundary_running) {
+        return HashSet::new();
+    }
+    state
+        .apply_iteration_limits()
+        .iter()
+        .map(|record| record.change_id.clone())
+        .collect()
+}
+
+// ============================================================================
 // Mode and routing
 // ============================================================================
 
@@ -258,12 +336,15 @@ pub enum MarkExclusion {
     ParallelIneligible,
     /// A change whose proposal is absent from `HEAD` cannot be queued.
     ParallelProposalAbsent,
+    /// The active run owns the change's exhausted Apply-dispatch ceiling.
+    ApplyIterationLimitActive,
 }
 
 impl MarkExclusion {
     /// Every exclusion, in the order used when grouping reasons for display.
-    pub const ALL: [MarkExclusion; 7] = [
+    pub const ALL: [MarkExclusion; 8] = [
         MarkExclusion::ChangeActive,
+        MarkExclusion::ApplyIterationLimitActive,
         MarkExclusion::ParallelIneligible,
         MarkExclusion::ParallelProposalAbsent,
         MarkExclusion::FinalStatus,
@@ -282,6 +363,7 @@ impl MarkExclusion {
             Self::StatusImmutable => "status_immutable",
             Self::ParallelIneligible => "parallel_ineligible",
             Self::ParallelProposalAbsent => "parallel_proposal_absent",
+            Self::ApplyIterationLimitActive => APPLY_ITERATION_LIMIT_ACTIVE,
         }
     }
 
@@ -295,6 +377,9 @@ impl MarkExclusion {
             Self::StatusImmutable => "not mutable in this mode",
             Self::ParallelIneligible => "uncommitted (commit first)",
             Self::ParallelProposalAbsent => "not present in HEAD (cannot queue)",
+            Self::ApplyIterationLimitActive => {
+                "at the active run's Apply iteration limit (retry after it closes)"
+            }
         }
     }
 }
@@ -313,6 +398,11 @@ pub struct MarkTargetRow<'a> {
     pub display_status: &'a str,
     /// Server-observed parallel eligibility, with its reason.
     pub parallel_eligibility: ParallelEligibility,
+    /// True when the active run owns this change's exhausted Apply ceiling.
+    ///
+    /// Carried on the row rather than queried per row so one bulk operation
+    /// classifies against one liveness observation.
+    pub apply_iteration_limit_active: bool,
     /// Current execution mark.
     pub marked: bool,
 }
@@ -375,7 +465,16 @@ pub fn classify_bulk_mark_row(
     mode: OperatorMode,
     display_status: &str,
     parallel_eligibility: ParallelEligibility,
+    apply_iteration_limit_active: bool,
 ) -> Option<MarkExclusion> {
+    // Before anything else: a bulk mark that admitted this row would route it
+    // through the terminal-error `RetryError` alias, which the shared guard
+    // refuses. Excluding it here is what keeps that refusal from aborting a
+    // partially applied bulk mutation.
+    if apply_iteration_limit_active && display_status == "error" {
+        return Some(MarkExclusion::ApplyIterationLimitActive);
+    }
+
     if !is_final_status(display_status) {
         // The refusal is identical for every ineligible reason; only the reason
         // reported back to the operator differs.
@@ -418,7 +517,12 @@ pub fn plan_bulk_marks(mode: OperatorMode, rows: &[MarkTargetRow<'_>]) -> BulkMa
     }
 
     for row in rows {
-        match classify_bulk_mark_row(mode, row.display_status, row.parallel_eligibility) {
+        match classify_bulk_mark_row(
+            mode,
+            row.display_status,
+            row.parallel_eligibility,
+            row.apply_iteration_limit_active,
+        ) {
             Some(reason) => excluded.push((row.change_id.to_string(), reason)),
             None => {
                 any_unmarked |= !row.marked;
@@ -805,6 +909,19 @@ pub enum OperatorCommandError {
         /// Mode the request arrived in.
         mode: OperatorMode,
     },
+    /// The active run owns the change's exhausted Apply-dispatch ceiling.
+    ///
+    /// Refused *before* any mutation: retry cannot create budget inside the
+    /// boundary that already spent it, so admitting it would only reach the same
+    /// ceiling again after destroying the row's failed classification.
+    ApplyIterationLimitActive {
+        /// Target change.
+        change_id: String,
+        /// Exact cumulative Apply dispatches the active run reserved.
+        attempts: u32,
+        /// The configured ceiling that refused the next dispatch.
+        max: u32,
+    },
 }
 
 impl std::fmt::Display for OperatorCommandError {
@@ -846,6 +963,15 @@ impl std::fmt::Display for OperatorCommandError {
             Self::BulkMarksNotAllowed { mode } => write!(
                 f,
                 "bulk execution-mark mutation is not available in {mode:?} mode"
+            ),
+            Self::ApplyIterationLimitActive {
+                change_id,
+                attempts,
+                max,
+            } => write!(
+                f,
+                "'{change_id}' reached the active run's Apply iteration limit \
+                 ({attempts}/{max}); retry becomes available after that run closes"
             ),
         }
     }
@@ -1054,6 +1180,11 @@ pub struct OperatorCommandService {
     marks: Arc<ExecutionMarkStore>,
     parallel: Arc<ParallelRuntime>,
     cancellation_timeout: Duration,
+    /// Scheduler-task liveness authority for the active-limit gate.
+    ///
+    /// Unbound for a process with no command-capable scheduler, which is exactly
+    /// the process that has no retry to admit.
+    run_boundary: Option<Arc<dyn RunBoundaryLiveness>>,
 }
 
 impl OperatorCommandService {
@@ -1075,12 +1206,23 @@ impl OperatorCommandService {
             marks,
             parallel: Arc::new(ParallelRuntime::new()),
             cancellation_timeout: DEFAULT_CANCELLATION_TIMEOUT,
+            run_boundary: None,
         }
     }
 
     /// Bind the shared parallel runtime store.
     pub fn with_parallel(mut self, parallel: Arc<ParallelRuntime>) -> Self {
         self.parallel = parallel;
+        self
+    }
+
+    /// Bind the scheduler-task liveness authority the active-limit gate uses.
+    ///
+    /// The same handle the run-control service dispatches through and the same
+    /// one `/api/v2` projection reads, so admission and eligibility can never
+    /// disagree about whether the owning boundary is still alive.
+    pub fn with_run_boundary(mut self, boundary: Arc<dyn RunBoundaryLiveness>) -> Self {
+        self.run_boundary = Some(boundary);
         self
     }
 
@@ -1098,6 +1240,39 @@ impl OperatorCommandService {
     /// Shared process-local parallel runtime facts.
     pub fn parallel(&self) -> Arc<ParallelRuntime> {
         self.parallel.clone()
+    }
+
+    /// The bound scheduler-task liveness authority, if this process has one.
+    fn boundary(&self) -> Option<&dyn RunBoundaryLiveness> {
+        self.run_boundary.as_deref()
+    }
+
+    /// The active Apply-dispatch ceiling owning `change_id`, if any.
+    ///
+    /// The single query every admission path and every command-capable frontend
+    /// consults; see [`active_apply_iteration_limit`].
+    pub async fn active_apply_iteration_limit(
+        &self,
+        change_id: &str,
+    ) -> Option<ActiveApplyIterationLimit> {
+        active_apply_iteration_limit(&*self.state.read().await, self.boundary(), change_id)
+    }
+
+    /// Every change whose Apply-dispatch ceiling the active run still owns.
+    pub async fn active_apply_iteration_limited_ids(&self) -> HashSet<String> {
+        active_apply_iteration_limited_ids(&*self.state.read().await, self.boundary())
+    }
+
+    /// The refusal an active-limited target produces, or `Ok(())` when free.
+    async fn admit_past_apply_iteration_limit(&self, change_id: &str) -> OperatorResult<()> {
+        match self.active_apply_iteration_limit(change_id).await {
+            Some(limit) => Err(OperatorCommandError::ApplyIterationLimitActive {
+                change_id: change_id.to_string(),
+                attempts: limit.attempts,
+                max: limit.max,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Current display status for a change.
@@ -1219,9 +1394,11 @@ impl OperatorCommandService {
         let _mutation = self.parallel.lock_mutations().await;
 
         // One read, one classification: re-reading per row could observe two
-        // different instants and derive a target state from neither.
-        let observed: Vec<(String, String, ParallelEligibility, bool)> = {
+        // different instants and derive a target state from neither. The
+        // active-limit set is taken from the same read for the same reason.
+        let observed: Vec<(String, String, ParallelEligibility, bool, bool)> = {
             let guard = self.state.read().await;
+            let limited = active_apply_iteration_limited_ids(&guard, self.boundary());
             guard
                 .tracked_change_ids()
                 .into_iter()
@@ -1229,7 +1406,8 @@ impl OperatorCommandService {
                     let display_status = guard.display_status(&change_id).to_string();
                     let eligibility = self.parallel.eligibility(&change_id);
                     let marked = self.marks.is_marked(&change_id);
-                    (change_id, display_status, eligibility, marked)
+                    let limit_active = limited.contains(&change_id);
+                    (change_id, display_status, eligibility, limit_active, marked)
                 })
                 .collect()
         };
@@ -1237,11 +1415,14 @@ impl OperatorCommandService {
         let rows: Vec<MarkTargetRow<'_>> = observed
             .iter()
             .map(
-                |(change_id, display_status, parallel_eligibility, marked)| MarkTargetRow {
-                    change_id,
-                    display_status,
-                    parallel_eligibility: *parallel_eligibility,
-                    marked: *marked,
+                |(change_id, display_status, parallel_eligibility, limit_active, marked)| {
+                    MarkTargetRow {
+                        change_id,
+                        display_status,
+                        parallel_eligibility: *parallel_eligibility,
+                        apply_iteration_limit_active: *limit_active,
+                        marked: *marked,
+                    }
                 },
             )
             .collect();
@@ -1308,7 +1489,21 @@ impl OperatorCommandService {
     pub async fn add_to_queue(&self, change_id: &str) -> OperatorResult<QueueOutcome> {
         let (reduce_outcome, was_error_retry) = {
             let mut guard = self.state.write().await;
+            // A terminal-error addition *is* a retry: it applies `RetryError`,
+            // releases the failed classification, and publishes an explicit-retry
+            // edge. It therefore consults the same gate `retry_change` does,
+            // before the reducer is touched, so `set_queue_intent=true` cannot
+            // become a bypass.
             if guard.is_terminal_error_change(change_id) {
+                if let Some(limit) =
+                    active_apply_iteration_limit(&guard, self.boundary(), change_id)
+                {
+                    return Err(OperatorCommandError::ApplyIterationLimitActive {
+                        change_id: change_id.to_string(),
+                        attempts: limit.attempts,
+                        max: limit.max,
+                    });
+                }
                 (
                     guard.apply_command(ReducerCommand::RetryError(change_id.to_string())),
                     true,
@@ -1462,6 +1657,9 @@ impl OperatorCommandService {
 
     /// Route a retry request for one change.
     pub async fn retry_change(&self, change_id: &str) -> OperatorResult<RetryPlan> {
+        // Ahead of route classification, and therefore ahead of every reducer,
+        // mark, queue, hook, explicit-retry, and scheduler effect a route implies.
+        self.admit_past_apply_iteration_limit(change_id).await?;
         let display_status = self.display_status(change_id).await;
         let blocker_kind = self.blocker_kind(change_id).await;
         let Some(route) = classify_retry_route(&display_status, blocker_kind) else {
@@ -1477,14 +1675,23 @@ impl OperatorCommandService {
     /// Route a bulk retry request.
     ///
     /// Changes without retryable evidence are skipped rather than rejected, so a
-    /// bulk retry never consumes an unsupported or identity-mismatched hold.
+    /// bulk retry never consumes an unsupported or identity-mismatched hold. An
+    /// active-run-limited target is skipped for the same reason: one exhausted
+    /// per-change ceiling is not a reason to refuse every unrelated candidate,
+    /// and a skipped target is never reported as accepted.
     pub async fn retry_errors(&self, change_ids: &[String]) -> RetryPlan {
         let mut plan = RetryPlan {
             change_ids: Vec::new(),
             routes: Vec::new(),
             explicit_retry: false,
         };
+        // One coherent eligibility snapshot for the whole request: a boundary
+        // that closes mid-loop must not make the request partly gated.
+        let limited = self.active_apply_iteration_limited_ids().await;
         for change_id in change_ids {
+            if limited.contains(change_id) {
+                continue;
+            }
             let display_status = self.display_status(change_id).await;
             let blocker_kind = self.blocker_kind(change_id).await;
             let Some(route) = classify_retry_route(&display_status, blocker_kind) else {

@@ -11,7 +11,28 @@
  * header.
  */
 
+export { actions as sampleActions };
+
 export const INSTANCE_ID = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+
+/**
+ * Server-side action eligibility, as `/api/v2` always publishes it.
+ *
+ * The console renders per-change controls from this block alone, so a fixture
+ * that omitted it would let a spec pass against a contract the server does not
+ * serve.
+ */
+function actions({ retry = false, blockedReason = null } = {}) {
+  const allow = () => ({ allowed: true, blocked_reason: null });
+  const block = (reason) => ({ allowed: false, blocked_reason: reason });
+  return {
+    set_execution_mark: retry ? allow() : block('status_immutable'),
+    set_queue_intent: retry ? allow() : block('status_immutable'),
+    retry_change: retry ? allow() : block(blockedReason ?? 'no_retryable_evidence'),
+    stop_and_dequeue: allow(),
+    resolve_merge: block('not_merge_waiting'),
+  };
+}
 
 /** A snapshot covering every operator-priority bucket. */
 export function sampleSnapshot(overrides = {}) {
@@ -28,6 +49,7 @@ export function sampleSnapshot(overrides = {}) {
         progress_percent: 25,
         dependencies: ['add-base-capability'],
         iteration_number: 3,
+        actions: actions({ retry: true }),
       },
       {
         id: 'add-base-capability',
@@ -37,6 +59,7 @@ export function sampleSnapshot(overrides = {}) {
         total_tasks: 10,
         progress_percent: 40,
         dependencies: [],
+        actions: actions(),
       },
       {
         id: 'queued-change',
@@ -46,6 +69,7 @@ export function sampleSnapshot(overrides = {}) {
         total_tasks: 5,
         progress_percent: 0,
         dependencies: [],
+        actions: actions(),
       },
       {
         id: 'done-change',
@@ -55,6 +79,7 @@ export function sampleSnapshot(overrides = {}) {
         total_tasks: 6,
         progress_percent: 100,
         dependencies: [],
+        actions: actions(),
       },
     ],
     totals: { total: 4, completed: 1, in_progress: 2, pending: 1 },

@@ -1460,3 +1460,197 @@ fn every_stable_reason_token_round_trips_as_snake_case() {
     );
     assert_eq!(serde_json::to_value(AttentionState::New).unwrap(), "new");
 }
+
+// ============================================================================
+// Active-run Apply iteration limit: typed eligibility projection
+// ============================================================================
+//
+// Integration evidence for the projection path: a real `WebState`, a real
+// reducer, and an explicitly driven liveness authority, published through the
+// real `project_snapshot`. Nothing spawns a process or touches a repository.
+
+/// Liveness authority double for the projection tests.
+#[derive(Debug, Default)]
+struct TestBoundary {
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl TestBoundary {
+    fn live() -> Self {
+        let boundary = Self::default();
+        boundary.running.store(true, Ordering::SeqCst);
+        boundary
+    }
+
+    fn set_running(&self, running: bool) {
+        self.running.store(running, Ordering::SeqCst);
+    }
+}
+
+impl crate::orchestration::operator_command::RunBoundaryLiveness for TestBoundary {
+    fn boundary_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+}
+
+use std::sync::atomic::Ordering;
+
+/// Arrange a limited terminal-error change behind a live command-capable run.
+async fn limited_web_state() -> (
+    Arc<WebState>,
+    Arc<tokio::sync::RwLock<OrchestratorState>>,
+    Arc<TestBoundary>,
+) {
+    let (web_state, reducer, _marks) = wired_web_state(&["alpha"]).await;
+    let web_state = Arc::new(web_state);
+    web_state.update(&[change("alpha")]).await;
+    {
+        let mut guard = reducer.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "max iterations reached".to_string(),
+        });
+        guard.record_apply_iteration_limit("alpha", 50, 50);
+    }
+    let boundary = Arc::new(TestBoundary::live());
+    web_state.set_run_boundary(boundary.clone()).await;
+    (web_state, reducer, boundary)
+}
+
+#[tokio::test]
+async fn active_iteration_limit_projection_blocks_retry_while_the_task_is_live() {
+    let (web_state, _reducer, _boundary) = limited_web_state().await;
+    web_state.sync_remote_control_projection().await;
+
+    let (snapshot, _revision, _) = web_state.remote_control().projection().snapshot();
+    let alpha = snapshot
+        .changes
+        .iter()
+        .find(|change| change.id == "alpha")
+        .expect("the limited change is projected");
+
+    assert_eq!(alpha.display_status, "error");
+    assert!(!alpha.actions.retry_change.allowed);
+    assert_eq!(
+        alpha.actions.retry_change.blocked_reason,
+        Some(ActionBlockedReason::ApplyIterationLimitActive),
+        "the stable token is projected, not prose"
+    );
+    // The terminal-error queue alias is refused by the same guard, so it must
+    // not be advertised either.
+    assert_eq!(
+        alpha.actions.set_queue_intent.blocked_reason,
+        Some(ActionBlockedReason::ApplyIterationLimitActive)
+    );
+    assert_eq!(
+        alpha.actions.set_execution_mark.blocked_reason,
+        Some(ActionBlockedReason::ApplyIterationLimitActive)
+    );
+}
+
+#[tokio::test]
+async fn active_iteration_limit_projection_clears_the_block_after_task_exit() {
+    let (web_state, reducer, boundary) = limited_web_state().await;
+    web_state.sync_remote_control_projection().await;
+    let projection = web_state.remote_control().projection();
+    let revision_before = projection.revision();
+
+    // The owning scheduler task returned; its typed record is deliberately kept.
+    boundary.set_running(false);
+    web_state.sync_remote_control_projection().await;
+
+    let (snapshot, revision_after, _) = projection.snapshot();
+    assert_eq!(
+        revision_after,
+        revision_before + 1,
+        "the liveness transition publishes one new authoritative revision"
+    );
+    let alpha = snapshot
+        .changes
+        .iter()
+        .find(|change| change.id == "alpha")
+        .expect("the change is still projected");
+    assert!(
+        alpha.actions.retry_change.allowed,
+        "eligibility falls back to the row's remaining evidence: {:?}",
+        alpha.actions.retry_change
+    );
+    assert!(
+        reducer
+            .read()
+            .await
+            .apply_iteration_limit("alpha")
+            .is_some(),
+        "retirement is by task exit, not by clearing the record"
+    );
+}
+
+#[tokio::test]
+async fn active_iteration_limit_projection_leaves_ordinary_errors_retryable() {
+    let (web_state, reducer, _marks) = wired_web_state(&["alpha"]).await;
+    let web_state = Arc::new(web_state);
+    web_state.update(&[change("alpha")]).await;
+    reducer
+        .write()
+        .await
+        .apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "boom".to_string(),
+        });
+    web_state
+        .set_run_boundary(Arc::new(TestBoundary::live()))
+        .await;
+    web_state.sync_remote_control_projection().await;
+
+    let (snapshot, _revision, _) = web_state.remote_control().projection().snapshot();
+    let alpha = &snapshot.changes[0];
+    assert_eq!(alpha.display_status, "error");
+    assert!(
+        alpha.actions.retry_change.allowed,
+        "an ordinary terminal error with no typed ceiling stays retryable"
+    );
+}
+
+/// Headless `cflx run` binds no command executor and no liveness authority, so a
+/// retained record must never become a current action block.
+#[tokio::test]
+async fn active_iteration_limit_projection_is_absent_for_an_unbound_runtime() {
+    let (web_state, reducer, _marks) = wired_web_state(&["alpha"]).await;
+    let web_state = Arc::new(web_state);
+    web_state.update(&[change("alpha")]).await;
+    {
+        let mut guard = reducer.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "max iterations reached".to_string(),
+        });
+        guard.record_apply_iteration_limit("alpha", 50, 50);
+    }
+    web_state.sync_remote_control_projection().await;
+
+    let (snapshot, _revision, _) = web_state.remote_control().projection().snapshot();
+    assert_ne!(
+        snapshot.changes[0].actions.retry_change.blocked_reason,
+        Some(ActionBlockedReason::ApplyIterationLimitActive),
+        "no bound boundary means no process-local action block to publish"
+    );
+    assert!(!web_state.remote_control().is_bound().await);
+}
+
+#[test]
+fn active_iteration_limit_projection_serializes_the_stable_token() {
+    use crate::web::remote_control_api::projection::limited_change_actions_for_test;
+
+    assert_eq!(
+        serde_json::to_value(ActionBlockedReason::ApplyIterationLimitActive).unwrap(),
+        json!("apply_iteration_limit_active")
+    );
+
+    let blocked = limited_change_actions_for_test("running", "error", true);
+    assert_eq!(
+        blocked.retry_change.blocked_reason,
+        Some(ActionBlockedReason::ApplyIterationLimitActive)
+    );
+    let allowed = limited_change_actions_for_test("running", "error", false);
+    assert!(allowed.retry_change.allowed);
+}

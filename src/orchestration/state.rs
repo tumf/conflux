@@ -865,6 +865,19 @@ impl OrchestratorState {
         &self.apply_iteration_limits
     }
 
+    /// The typed Apply-dispatch ceiling record for one change, if it has one.
+    ///
+    /// Record presence alone is *not* the retry gate: this reducer is active-run
+    /// memory that outlives the boundary which wrote it, so the caller must pair
+    /// this with the owning scheduler task's liveness. See
+    /// [`crate::orchestration::operator_command::active_apply_iteration_limit`],
+    /// the one query every admission and projection path goes through.
+    pub fn apply_iteration_limit(&self, change_id: &str) -> Option<&ApplyIterationLimit> {
+        self.apply_iteration_limits
+            .iter()
+            .find(|record| record.change_id == change_id)
+    }
+
     /// Finish status and Apply count a parallel run reports to `on_finish`.
     ///
     /// Parallel execution has no `LoopControl` return path, so this reducer is

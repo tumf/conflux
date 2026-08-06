@@ -678,6 +678,47 @@ fn the_authoritative_snapshot_publishes_every_operator_field() {
     assert_eq!(snapshot_field_errors(&generated()), Vec::<String>::new());
 }
 
+/// The active-run Apply-limit refusal is a published token, not prose.
+///
+/// A client branches on `apply_iteration_limit_active` to know that Retry is
+/// unavailable until the owning run closes. If the generated document did not
+/// carry the member, a generated client would either drop the variant or fail to
+/// deserialize the snapshot that contains it.
+#[test]
+fn active_iteration_limit_projection_publishes_the_blocked_reason_token() {
+    let doc = generated();
+    let published = published_enum(&doc, "ActionBlockedReason");
+    assert!(
+        published.contains("apply_iteration_limit_active"),
+        "the active Apply-limit refusal must be published: {published:?}"
+    );
+    // The same token the server actually serializes, taken from the type rather
+    // than repeated as a literal on both sides.
+    assert_eq!(
+        serde_json::to_value(
+            conflux::web::remote_control_api::dto::ActionBlockedReason::ApplyIterationLimitActive
+        )
+        .unwrap(),
+        json!("apply_iteration_limit_active")
+    );
+    // And a payload carrying it still validates against the published schema.
+    let mut resource = change_resource();
+    resource.actions.retry_change = ActionEligibility::blocked(
+        conflux::web::remote_control_api::dto::ActionBlockedReason::ApplyIterationLimitActive,
+    );
+    let mut errors = Vec::new();
+    let value = to_value(&resource);
+    let defs = schemas(&doc);
+    validate(
+        &value,
+        &defs["ChangeResource"],
+        defs,
+        "ChangeResource",
+        &mut errors,
+    );
+    assert_eq!(errors, Vec::<String>::new());
+}
+
 /// Closes the third side of the triangle: the constant and the document could
 /// agree with each other and still describe a route the server never binds.
 ///
