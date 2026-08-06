@@ -261,6 +261,7 @@ pub async fn run_orchestrator_parallel(
     manual_resolve_counter: Arc<std::sync::atomic::AtomicUsize>,
     post_archive_action: PostArchiveAction,
     upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
+    marks: Option<crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native_from;
@@ -272,14 +273,22 @@ pub async fn run_orchestrator_parallel(
     // different membership per event; routing the scheduler's event stream and
     // the boundary's own events through one owner is what makes every frontend
     // receive the same events.
-    let dispatcher = Arc::new(EventDispatcher::new(
-        shared_state.clone(),
-        boundary_event_sinks(
-            &tx,
-            #[cfg(feature = "web-monitoring")]
-            web_state.as_ref(),
-        ),
-    ));
+    // The boundary's dispatch owner also owns execution-mark reconciliation: it
+    // is the only place that sees the reducer immediately before and after each
+    // transition, which is what a mark-revoking *edge* is defined by. Binding the
+    // shared reconciler here — not a new store — is what keeps the TUI row, the
+    // `/api/v2` snapshot, and Start target resolution one value.
+    let dispatcher = Arc::new(
+        EventDispatcher::new(
+            shared_state.clone(),
+            boundary_event_sinks(
+                &tx,
+                #[cfg(feature = "web-monitoring")]
+                web_state.as_ref(),
+            ),
+        )
+        .with_mark_reconciler(marks),
+    );
 
     dispatcher
         .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(

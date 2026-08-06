@@ -583,9 +583,19 @@ async fn bulk_through_tui(rows: &[BulkRow], marked: &[&str], mode: AppExecutionM
     }
     app.publish_parallel_runtime();
 
-    // The key handler classifies and marks; the emitted queue commands are what
-    // the runner loop feeds back through the shared service.
-    for command in app.toggle_all_marks() {
+    // The key handler classifies and records target-scoped mark writes; the
+    // runner loop applies those through the shared service and then feeds the
+    // emitted queue commands back through it, in that order.
+    let commands = app.toggle_all_marks();
+    for (change_id, marked) in app.take_pending_mark_writes() {
+        harness
+            .run_control
+            .operator()
+            .apply_execution_mark(&change_id, marked)
+            .await;
+    }
+    app.sync_execution_marks_from_store();
+    for command in commands {
         harness.run(&mut app, command).await;
     }
 

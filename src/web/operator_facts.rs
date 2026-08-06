@@ -310,7 +310,19 @@ impl OperatorFactsStore {
             }
         }
 
-        if !NON_ACTIVITY_EVENT_TYPES.contains(&event_type) {
+        // A repeat that carries the same transition and the same detail is new
+        // arrival time and nothing else. Refreshing the timestamp for it would
+        // make the candidate snapshot differ, advance a state revision, and
+        // invalidate every client's concurrency token for information they
+        // already have — which is exactly what a duplicate or late delivery
+        // must not cost. Streaming output never reaches here (it is excluded
+        // above), so this cannot freeze a live run's activity heartbeat.
+        let repeats_current_activity = facts.latest_activity.as_ref().is_some_and(|current| {
+            current.event_type == event_type
+                && current.detail == detail.as_deref().map(crate::events::sanitize_detail)
+        });
+
+        if !NON_ACTIVITY_EVENT_TYPES.contains(&event_type) && !repeats_current_activity {
             facts.latest_activity = Some(ChangeActivity {
                 event_type: event_type.to_string(),
                 timestamp: now.to_rfc3339(),

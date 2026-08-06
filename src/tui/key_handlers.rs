@@ -972,6 +972,7 @@ mod tests {
             crate::parallel::PostArchiveAction::MergeToBase,
             None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
             #[cfg(feature = "web-monitoring")]
             None,
         ))

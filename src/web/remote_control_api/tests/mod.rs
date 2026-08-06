@@ -8,6 +8,7 @@ mod command_tests;
 mod compatibility_tests;
 mod dto_tests;
 mod event_ownership_tests;
+mod execution_mark_event_tests;
 mod operator_snapshot_tests;
 mod parallel_control_tests;
 mod projection_tests;

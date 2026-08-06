@@ -197,6 +197,11 @@ pub(super) fn toggle_all_marks(state: &mut AppState) -> Vec<TuiCommand> {
         }
 
         state.changes[index].selected = snapshot.target_state;
+        // One target, one write. The whole-row publish this replaced derived the
+        // store from every cached row, so a row a concurrent event had already
+        // invalidated came back marked.
+        let toggled_id = state.changes[index].id.clone();
+        state.request_mark_write(&toggled_id, snapshot.target_state);
         // Clear NEW flag when user interacts with the change
         if state.changes[index].is_new {
             state.changes[index].is_new = false;
@@ -244,9 +249,6 @@ pub(super) fn toggle_all_marks(state: &mut AppState) -> Vec<TuiCommand> {
     }
     state.add_log(LogEntry::info(summary));
 
-    // Keep the shared process-local mark store in sync with the TUI projection.
-    state.publish_execution_marks();
-
     commands
 }
 
@@ -274,6 +276,8 @@ pub(super) fn toggle_selection(state: &mut AppState) -> Option<TuiCommand> {
     }
 
     let mode = state.execution_mode;
+    let target_id = state.changes[state.cursor_index].id.clone();
+    let was_marked = state.changes[state.cursor_index].selected;
     let mut new_change_count = state.new_change_count;
     let result = {
         let change = &mut state.changes[state.cursor_index];
@@ -294,9 +298,13 @@ pub(super) fn toggle_selection(state: &mut AppState) -> Option<TuiCommand> {
     state.new_change_count = new_change_count;
 
     let command = dispatch_toggle_result(state, result);
-    // Keep the shared process-local mark store in sync with the TUI projection so
-    // other operator frontends observe the same intent.
-    state.publish_execution_marks();
+    // Target-scoped, and only when this row's mark actually moved: the shared
+    // store belongs to every frontend, so one interaction must never republish
+    // this frontend's whole cached row set over it.
+    let now_marked = state.changes[state.cursor_index].selected;
+    if now_marked != was_marked {
+        state.request_mark_write(&target_id, now_marked);
+    }
     command
 }
 

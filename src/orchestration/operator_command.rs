@@ -890,7 +890,15 @@ impl ExecutionMarkStore {
         }
     }
 
-    /// Replace the whole mark set (used by frontends that own a mark projection).
+    /// Replace the whole mark set.
+    ///
+    /// Test-only, and deliberately so. No frontend owns a mark projection it may
+    /// publish back: a whole-set write derived from one frontend's cached rows
+    /// both resurrects marks a concurrent event revoked and erases marks another
+    /// frontend set. Production writes are target-scoped — through
+    /// [`OperatorCommandService`] for operator intent, through the dispatch
+    /// boundary's reconciliation for system-driven revocation.
+    #[cfg(test)]
     pub fn replace(&self, change_ids: impl IntoIterator<Item = String>) {
         *self.lock() = change_ids.into_iter().collect();
     }
@@ -1130,6 +1138,22 @@ impl OperatorCommandService {
         }
     }
 
+    /// Apply one already-classified target-scoped execution-mark write.
+    ///
+    /// A frontend that ran the shared admission rules itself — the TUI `Space`
+    /// and `x` interactions, which own their own row guards and log lines — hands
+    /// the *write* here rather than touching the store directly. Taking the same
+    /// mutation guard event reconciliation takes is what makes an operator write
+    /// and a concurrent revoking event serialize instead of interleaving, and the
+    /// write is scoped to one change so a stale cached row set can never replace
+    /// the store.
+    ///
+    /// Returns true when the stored value actually changed.
+    pub async fn apply_execution_mark(&self, change_id: &str, marked: bool) -> bool {
+        let _mutation = self.parallel.lock_mutations().await;
+        self.marks.set(change_id, marked)
+    }
+
     /// Apply an execution-mark request through the shared lifecycle matrix.
     pub async fn set_execution_mark(
         &self,
@@ -1137,6 +1161,7 @@ impl OperatorCommandService {
         change_id: &str,
         marked: bool,
     ) -> OperatorResult<OperatorOutcome> {
+        let _mutation = self.parallel.lock_mutations().await;
         let display_status = self.display_status(change_id).await;
         match classify_mark_route(mode, &display_status) {
             MarkRoute::MarkOnly => {
@@ -1391,6 +1416,10 @@ impl OperatorCommandService {
             });
         }
 
+        // Commit the dequeue and its mark revocation as one indivisible mutation:
+        // the same guard event reconciliation takes, so the `ChangeDequeued` edge
+        // this produces cannot land between the two halves.
+        let _mutation = self.parallel.lock_mutations().await;
         let reduce_outcome = {
             let mut guard = self.state.write().await;
             guard.apply_command(ReducerCommand::DequeueChange(change_id.to_string()))
@@ -1499,6 +1528,9 @@ impl OperatorCommandService {
             }
         };
         let is_error_retry = matches!(command, ReducerCommand::RetryError(_));
+        // Retry restores fresh execution intent, so it is a mark mutation and
+        // serializes with event reconciliation like every other one.
+        let _mutation = self.parallel.lock_mutations().await;
         let reduce_outcome = {
             let mut guard = self.state.write().await;
             guard.apply_command(command)
