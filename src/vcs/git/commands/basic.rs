@@ -4,6 +4,10 @@
 //! checking repository status, and managing branches.
 
 use crate::vcs::commands::{check_vcs_available, run_vcs_command, run_vcs_command_ignore_error};
+use crate::vcs::git::commands::status_policy::{
+    read_only_status_argv, DIRTY_STATE_STATUS_ARGS, HUMAN_READABLE_STATUS_ARGS,
+    PORCELAIN_STATUS_ARGS,
+};
 use crate::vcs::{VcsBackend, VcsError, VcsResult};
 use std::path::Path;
 use std::process::Stdio;
@@ -77,17 +81,11 @@ pub async fn check_git_repo<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
 /// answer is what a destructive deletion is allowed to act on. Ignored entries
 /// stay excluded on purpose — generated content is not operator work, and
 /// enumerating it is not what this observation is for.
+///
+/// The observation is read-only, so it runs under the shared optional-lock
+/// policy: see [`crate::vcs::git::commands::status_policy`].
 pub async fn has_uncommitted_changes<P: AsRef<Path>>(cwd: P) -> VcsResult<(bool, String)> {
-    let output = run_git(
-        &[
-            "status",
-            "--porcelain",
-            "--untracked-files=normal",
-            "--ignored=no",
-        ],
-        cwd,
-    )
-    .await?;
+    let output = run_git(&read_only_status_argv(DIRTY_STATE_STATUS_ARGS), cwd).await?;
     let has_changes = !output.is_empty();
     Ok((has_changes, output))
 }
@@ -103,16 +101,15 @@ pub async fn has_uncommitted_changes<P: AsRef<Path>>(cwd: P) -> VcsResult<(bool,
 /// The untracked and ignored modes are passed explicitly for the same reason
 /// they are on [`has_uncommitted_changes`]: repository or user configuration
 /// must not be able to make unselected work report as clean.
+///
+/// Reading the stage gate must not cost the final Apply commit its index, so
+/// this observation also runs under the shared optional-lock policy: see
+/// [`crate::vcs::git::commands::status_policy`].
 pub async fn porcelain_status<P: AsRef<Path>>(cwd: P) -> VcsResult<String> {
     let cwd = cwd.as_ref();
     let output = crate::vcs::commands::run_vcs_command_captured(
         "git",
-        &[
-            "status",
-            "--porcelain",
-            "--untracked-files=normal",
-            "--ignored=no",
-        ],
+        &read_only_status_argv(DIRTY_STATE_STATUS_ARGS),
         cwd,
         VcsBackend::Git,
     )
@@ -259,8 +256,12 @@ pub async fn get_current_branch<P: AsRef<Path>>(cwd: P) -> VcsResult<Option<Stri
 }
 
 /// Get git status output.
+///
+/// The human-readable text is captured as conflict-resolution prompt context,
+/// so it is a read-only observation and runs under the shared optional-lock
+/// policy: see [`crate::vcs::git::commands::status_policy`].
 pub async fn get_status<P: AsRef<Path>>(cwd: P) -> VcsResult<String> {
-    run_git(&["status"], cwd).await
+    run_git(&read_only_status_argv(HUMAN_READABLE_STATUS_ARGS), cwd).await
 }
 
 /// Get list of conflicted files.
@@ -276,8 +277,11 @@ pub async fn get_conflict_files<P: AsRef<Path>>(cwd: P) -> VcsResult<Vec<String>
 /// Check if the working directory is clean (no uncommitted changes).
 ///
 /// Returns true if working directory is clean, false otherwise.
+///
+/// Read-only, so it runs under the shared optional-lock policy: see
+/// [`crate::vcs::git::commands::status_policy`].
 pub async fn is_working_directory_clean<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
-    let output = run_git(&["status", "--porcelain"], cwd).await?;
+    let output = run_git(&read_only_status_argv(PORCELAIN_STATUS_ARGS), cwd).await?;
     Ok(output.trim().is_empty())
 }
 
