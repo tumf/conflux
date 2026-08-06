@@ -2,9 +2,9 @@
 
 ### Requirement: Shared operator command service
 
-The system MUST route TUI and remote orchestration actions through one process-local operator application transaction. Authoritative workflow transitions MUST use `ReducerCommand`, notifications MUST use the process-wide authoritative `EventSink` dispatch owner, and Start target resolution MUST use the shared run-control boundary. Equivalent accepted TUI and remote intent MUST produce identical target resolution, process-mode transition, reducer and mark/queue effects, resolve reservation, scheduler activation or wake, cancellation classification, typed outcome, and error.
+The system MUST route TUI and remote orchestration actions through one process-local operator application coordinator. Authoritative workflow transitions MUST use `ReducerCommand`, notifications MUST use one process-lifetime authoritative `EventSink` dispatch boundary shared by runner-local and orchestration-run producers, and Start target resolution MUST use the shared run-control boundary. Equivalent accepted TUI and remote intent MUST produce identical target resolution, process-mode transition, reducer and mark/queue effects, resolve reservation, scheduler activation or wake, cancellation classification, typed outcome, and error.
 
-For each new command, the transaction MUST serialize final mode/status/eligibility validation, fail-atomic intent commit, authoritative outcome dispatch, and scheduler activation. A scheduler started or woken by the command MUST NOT emit an event before the accepted command effect is dispatched. A failed preparation or activation MUST leave no reducer, execution-mark, queue, explicit-retry, resolve-reservation, graceful-stop, mode, hook, scheduler, or frontend effect.
+For each ordinary new command, the transaction MUST serialize final mode/status/eligibility validation, fail-atomic intent commit plus authoritative outcome dispatch, exact revision capture, and scheduler preparation. Activity enabled by the command's later activation or wake MUST NOT emit an event before the accepted command effect is dispatched. A failed preparation MUST leave no reducer, execution-mark, queue, explicit-retry, resolve-reservation, graceful-stop, mode, hook, scheduler, or frontend effect. A command awaiting confirmed runtime termination MUST use the same coordinator's two-phase protocol and MUST NOT hold the application gate, authoritative dispatch transaction, or TUI event loop during that wait.
 
 Catalog refresh, observation refresh, and worktree discovery MUST NOT bypass the shared intent boundaries or synthesize queue intent. All transaction, mode, mark, and reservation coordination MUST remain process-local and MUST NOT become durable workflow authority.
 
@@ -49,9 +49,27 @@ Catalog refresh, observation refresh, and worktree discovery MUST NOT bypass the
 **And**: accepted stop projects Stopping, accepted cancel-stop projects Running, force-stop waiting for cleanup projects Stopping, and settled force-stop emits Stopped
 **And**: an invalid-mode request changes neither stop flags nor projection
 
-#### Scenario: Scheduler launch failure rolls back staged intent
+#### Scenario: Lifecycle events keep Core mode admissible
 
-**Given**: Start, retry, or active resolve has valid targets but scheduler preparation or activation fails
+**Given**: Core mode entered Running for an accepted run
+**When**: typed run activation such as `ProcessingStarted`, authoritative `Stopping`, `Stopped`, global `Error`, guarded `AllCompleted`, or a typed persistent-idle Ready event is dispatched
+**Then**: the same Core mode and every frontend projection apply that lifecycle transition
+**And**: natural completion returns to Select and admits a later Start
+**And**: Stopped admits resume and Error retains explicit retry semantics
+
+#### Scenario: Confirmed termination does not monopolize admission
+
+**Given**: stop-and-dequeue has issued cancellation and is waiting for confirmed termination
+**When**: another valid force-stop or unrelated operator command is submitted
+**Then**: the second command can execute and settle without waiting for the dequeue timeout
+**And**: TUI rendering and authoritative event fan-out remain live
+**And**: stop-and-dequeue revalidates the target after reacquiring the gate before it commits
+**And**: exact replay does not issue cancellation or start another waiter
+**And**: timeout or failed revalidation commits no dequeue reducer, event, or projection effect
+
+#### Scenario: Scheduler preparation failure rolls back staged intent
+
+**Given**: Start, retry, or active resolve has valid targets but scheduler preparation fails
 **When**: the shared application transaction returns failure
 **Then**: reducer status, marks, dynamic queue, explicit-retry edges, resolve reservations, process mode, hooks, and frontend projection equal their pre-command state
 **And**: no scheduler event is emitted
@@ -75,7 +93,7 @@ Catalog refresh, observation refresh, and worktree discovery MUST NOT bypass the
 
 ### Requirement: Accepted command outcomes converge every same-process frontend
 
-Every changed operator command MUST produce one typed authoritative outcome dispatch containing the process-level decision facts that are not already represented by an exact existing execution event. TUI, Web, `/api/v2`, and lifecycle projections MUST consume that same dispatch and MUST NOT independently rederive admission mode, resolver ownership, or scheduler acceptance from a frontend cache.
+Every changed operator command MUST produce one typed authoritative outcome dispatch containing the process-level decision facts that are not already represented by an exact existing execution event. TUI, Web, `/api/v2`, and lifecycle projections MUST consume that same process-lifetime dispatch and MUST NOT independently rederive admission mode, resolver ownership, or scheduler acceptance from a frontend cache. TUI submission MUST NOT await application-gate ownership or termination confirmation inside its event-processing/render loop.
 
 Existing exact event meanings MUST be reused: graceful stop uses `Stopping`, settled force stop uses `Stopped`, and successful target dequeue uses `ChangeDequeued`. New outcome vocabulary MUST NOT synthesize `ProcessingStarted` or another change lifecycle event merely to signal command acceptance.
 
@@ -106,8 +124,9 @@ TUI row marks changed by operator commands MUST be projected by target delta fro
 #### Scenario: Late command projection cannot overwrite terminal state
 
 **Given**: scheduler progress or cancellation reaches Error, Stopping, Stopped, or completion after a command is accepted
-**When**: command and scheduler events are delivered through the authoritative dispatch owner
-**Then**: the accepted command effect is ordered before scheduler activation
+**When**: command and scheduler events are delivered through the authoritative dispatch boundary
+**Then**: staged decision commit and outcome dispatch are atomic
+**And**: scheduler activity enabled by the command's activation or wake is ordered afterwards
 **And**: duplicate or late outcome delivery cannot restore an earlier mode
 
 #### Scenario: Restart discards command coordination

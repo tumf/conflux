@@ -118,6 +118,29 @@ use crate::upstream::coordinator::SchedulerOutcome;
 pub(super) const CANCELLATION_MERGE_DRAIN_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(90);
 
+/// Bounded deadline for proving that every run-owned AI command is quiescent on
+/// the cancellation and run-fatal exits.
+///
+/// Shared with the command-runner layer so there is one number, and it is
+/// consumed from the same absolute cancellation start as the merge drain:
+/// 30s + 90s exactly fills the 120s outer boundary rather than stacking two
+/// fresh budgets on top of it.
+pub(super) const RUN_COMMAND_CLEANUP_DEADLINE: std::time::Duration =
+    crate::ai_command_runner::RUN_COMMAND_CLEANUP_DEADLINE;
+
+/// Remaining slice of one absolute cleanup timeline.
+///
+/// Nested waits share `started` instead of each restarting a full budget, so
+/// the sum of the command-scope wait and the merge drain can never exceed the
+/// outer scheduler boundary.
+pub(super) fn remaining_cleanup_budget(
+    started: std::time::Instant,
+    outer: std::time::Duration,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    cap.min(outer.saturating_sub(started.elapsed()))
+}
+
 impl ParallelExecutor {
     pub(super) fn is_fully_drained(
         &self,
@@ -290,6 +313,14 @@ impl ParallelExecutor {
             changes.len()
         );
 
+        // The scope observes the run's global token directly, so a caller
+        // blocked on command output far from this loop — inline dependency
+        // analysis, for one — starts cleaning up the instant cancellation
+        // happens instead of waiting to return here first.
+        if let Some(token) = &self.cancel_token {
+            self.run_command_scope.link_cancellation(token.clone());
+        }
+
         // Prepare for parallel execution (clean check for git)
         info!("Preparing for parallel execution...");
         match self.workspace_manager.prepare_for_parallel().await {
@@ -395,6 +426,13 @@ impl ParallelExecutor {
                     in_flight = in_flight.len(),
                     "Run-fatal base-lane outcome; stopping dispatch and draining owned work"
                 );
+                // One absolute timeline for every nested cleanup wait below.
+                let shutdown_started = std::time::Instant::now();
+                // Admission closes and runner tasks are signalled *before* the
+                // workspace futures are aborted: an aborted future drops its
+                // `StreamingChildHandle`, which is not a cancellation channel
+                // this run may depend on.
+                self.run_command_scope.close();
                 join_set.abort_all();
                 while let Some(result) = join_set.join_next().await {
                     if let Err(err) = result {
@@ -403,6 +441,11 @@ impl ParallelExecutor {
                         }
                     }
                 }
+                // Nothing Conflux owns — preparation release, workspace
+                // cleanup, or the truthful `done` handshakes — may run while a
+                // command registration for that worktree is still live.
+                self.await_run_command_quiescence(shutdown_started, "run-fatal abort")
+                    .await;
                 self.release_execution_handles_after_cancellation().await;
                 self.clear_preparation_for_aborted_changes(&in_flight).await;
                 in_flight.clear();
@@ -410,7 +453,11 @@ impl ParallelExecutor {
                 self.drain_pending_merge_results_after_cancellation(
                     &merge_result_tx,
                     &mut merge_result_rx,
-                    CANCELLATION_MERGE_DRAIN_DEADLINE,
+                    remaining_cleanup_budget(
+                        shutdown_started,
+                        crate::tui::orchestrator::PARALLEL_CANCELLATION_CLEANUP_DEADLINE,
+                        CANCELLATION_MERGE_DRAIN_DEADLINE,
+                    ),
                 )
                 .await;
                 break;
@@ -433,6 +480,13 @@ impl ParallelExecutor {
                 .await;
                 cancelled = true;
                 scheduler_outcome = SchedulerOutcome::Cancelled;
+                // One absolute timeline for every nested cleanup wait below.
+                let shutdown_started = std::time::Instant::now();
+                // Close run command admission and signal active runner tasks
+                // before the workspace futures are aborted. Abort drops the
+                // caller-held `StreamingChildHandle`, so a run that relied on
+                // that handle would have no way left to reach the process group.
+                self.run_command_scope.close();
                 join_set.abort_all();
                 while let Some(result) = join_set.join_next().await {
                     if let Err(err) = result {
@@ -441,6 +495,11 @@ impl ParallelExecutor {
                         }
                     }
                 }
+                // Dropping the workspace futures proves nothing about the
+                // processes they owned, so the command barrier comes before
+                // handle release, preparation clearing, and terminal stop.
+                self.await_run_command_quiescence(shutdown_started, "operator cancellation")
+                    .await;
                 // Aborted tasks never reach `handle_workspace_completion`, so their
                 // registered execution handles are released here instead.
                 self.release_execution_handles_after_cancellation().await;
@@ -451,7 +510,11 @@ impl ParallelExecutor {
                 self.drain_pending_merge_results_after_cancellation(
                     &merge_result_tx,
                     &mut merge_result_rx,
-                    CANCELLATION_MERGE_DRAIN_DEADLINE,
+                    remaining_cleanup_budget(
+                        shutdown_started,
+                        crate::tui::orchestrator::PARALLEL_CANCELLATION_CLEANUP_DEADLINE,
+                        CANCELLATION_MERGE_DRAIN_DEADLINE,
+                    ),
                 )
                 .await;
                 break;
@@ -805,13 +868,63 @@ impl ParallelExecutor {
         let Some(queue) = self.dynamic_queue.as_ref() else {
             return;
         };
-        let released = queue.release_all_execution_handles().await;
-        if released > 0 {
+        let scope = self.run_command_scope.clone();
+        let release = queue
+            .release_all_execution_handles(|change_id| scope.change_is_quiescent(change_id))
+            .await;
+        if release.confirmed > 0 {
             info!(
-                released,
-                "Released registered execution handles for aborted in-flight changes after cancellation"
+                confirmed = release.confirmed,
+                "Released registered execution handles whose run-owned commands reached confirmed cleanup"
             );
         }
+        for change_id in &release.unconfirmed {
+            warn!(
+                change_id = %change_id,
+                "Execution handle released without confirmed command cleanup; the completion \
+                 handshake stays unfired and its waiter times out truthfully"
+            );
+        }
+    }
+
+    /// Wait for every run-owned AI command to reach quiescence, or for bounded
+    /// managed escalation to complete.
+    ///
+    /// A deadline or an escalation is a cleanup diagnostic, never a
+    /// reclassification: the run stays operator cancellation or run-fatal.
+    async fn await_run_command_quiescence(
+        &self,
+        shutdown_started: std::time::Instant,
+        reason: &str,
+    ) {
+        #[allow(unused_mut)]
+        let mut cap = RUN_COMMAND_CLEANUP_DEADLINE;
+        #[cfg(test)]
+        if let Some(override_budget) = self.run_command_cleanup_budget_override {
+            cap = override_budget;
+        }
+        let budget = remaining_cleanup_budget(
+            shutdown_started,
+            crate::tui::orchestrator::PARALLEL_CANCELLATION_CLEANUP_DEADLINE,
+            cap,
+        );
+        let cleanup = self.run_command_scope.shutdown(budget).await;
+        if cleanup.is_quiescent() {
+            info!(
+                reason,
+                escalated = cleanup.escalated,
+                "Run-owned AI commands reached process quiescence"
+            );
+            return;
+        }
+
+        let message = format!(
+            "Run-owned command cleanup could not be fully proven while stopping ({}): {}",
+            reason,
+            cleanup.diagnostics()
+        );
+        warn!("{}", message);
+        send_event(&self.event_tx, ParallelEvent::Log(LogEntry::warn(&message))).await;
     }
 
     /// Clear ephemeral workspace preparation for tasks cancellation aborted.

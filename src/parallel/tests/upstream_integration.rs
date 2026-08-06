@@ -55,7 +55,7 @@ fn upstream_integration_disabled_executor_installs_no_checkpoint() {
 #[test]
 fn upstream_integration_enabled_executor_installs_checkpoint() {
     let mut executor = executor();
-    executor.set_upstream_integration(runtime(), stagger());
+    executor.set_upstream_integration(runtime());
     assert!(executor.has_upstream_integration());
 }
 
@@ -67,7 +67,7 @@ fn upstream_integration_survives_restart_loop_reconstruction() {
     let runtime = runtime();
     for _ in 0..3 {
         let mut executor = executor();
-        executor.set_upstream_integration(runtime.clone(), stagger());
+        executor.set_upstream_integration(runtime.clone());
         assert!(executor.has_upstream_integration());
     }
     assert_eq!(runtime.config.remote, "origin");
@@ -83,7 +83,7 @@ fn upstream_integration_leaves_post_archive_action_untouched() {
     executor.set_post_archive_action(PostArchiveAction::PushToRemote {
         remote: "origin".to_string(),
     });
-    executor.set_upstream_integration(runtime(), stagger());
+    executor.set_upstream_integration(runtime());
     assert!(executor.has_upstream_integration());
 }
 

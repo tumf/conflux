@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+use crate::ai_command_runner::{AiCommandRunner, RunCommandScope, SharedStaggerState};
 use crate::config::OrchestratorConfig;
 use crate::hooks::HookRunner;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
@@ -102,9 +102,17 @@ impl ParallelExecutor {
         let shared_stagger_state =
             shared_stagger_state.unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
-        // Create shared AI command runner
-        let ai_runner =
-            AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
+        // Create the invocation scope and the shared AI command runner bound to
+        // it. Every run-owned command surface clones this runner, so no run path
+        // can build one from the stagger timestamp alone. A run owner that
+        // already created a scope replaces this one through
+        // `set_run_command_scope` before dispatch.
+        let run_command_scope = RunCommandScope::new();
+        let ai_runner = AiCommandRunner::for_run(
+            &config,
+            shared_stagger_state.clone(),
+            run_command_scope.clone(),
+        );
 
         Self {
             workspace_manager,
@@ -129,6 +137,7 @@ impl ParallelExecutor {
             last_available_slots: None,
             dynamic_queue: None,
             ai_runner,
+            run_command_scope,
             shared_stagger_state,
             apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
@@ -163,6 +172,8 @@ impl ParallelExecutor {
             // Default: the scheduler loop owns its merge-result channel.
             #[cfg(test)]
             merge_result_channel_override: None,
+            #[cfg(test)]
+            run_command_cleanup_budget_override: None,
         }
     }
 
@@ -212,11 +223,7 @@ impl ParallelExecutor {
     /// through [`crate::upstream::git_ops::GitUpstreamOps`] and
     /// [`crate::upstream::verify::CommandVerifier`]; only bounded repair reaches
     /// the AI command harness through the existing `resolve_command` runner.
-    pub fn set_upstream_integration(
-        &mut self,
-        runtime: crate::upstream::UpstreamRuntime,
-        shared_stagger_state: SharedStaggerState,
-    ) {
+    pub fn set_upstream_integration(&mut self, runtime: crate::upstream::UpstreamRuntime) {
         use crate::upstream::coordinator::UpstreamCoordinator;
         use crate::upstream::git_ops::GitUpstreamOps;
         use crate::upstream::repair::ResolveCommandRepairAgent;
@@ -234,7 +241,7 @@ impl ParallelExecutor {
                 self.config.clone(),
                 self.repo_root.clone(),
                 self.max_conflict_retries,
-                shared_stagger_state,
+                self.ai_runner.clone(),
             )),
             Arc::new(
                 crate::parallel::upstream_bridge::EventUpstreamObserver::new(self.event_tx.clone()),
@@ -296,6 +303,35 @@ impl ParallelExecutor {
     /// Set the cancellation token for force stop cleanup.
     pub fn set_cancel_token(&mut self, cancel_token: CancellationToken) {
         self.cancel_token = Some(cancel_token);
+    }
+
+    /// The invocation scope owning every AI command this executor launches.
+    #[allow(dead_code)] // Read by scope-ownership coverage; the loop uses the field directly.
+    pub fn run_command_scope(&self) -> &RunCommandScope {
+        &self.run_command_scope
+    }
+
+    /// The shared runner every run command surface clones.
+    #[cfg(test)]
+    pub(crate) fn ai_runner_for_test(&self) -> &AiCommandRunner {
+        &self.ai_runner
+    }
+
+    /// Shorten the run-command cleanup barrier so scheduler-level coverage of
+    /// an unproven cleanup stays inside the default-suite time budget.
+    #[cfg(test)]
+    pub(crate) fn set_cancellation_cleanup_budget_for_test(&mut self, budget: std::time::Duration) {
+        self.run_command_cleanup_budget_override = Some(budget);
+    }
+
+    /// Adopt the run owner's scope in place of the one built here.
+    ///
+    /// Rebinding the shared runner is what keeps analyze, Apply, Archive,
+    /// Acceptance, cleanup review, rejection review, conflict resolve, and
+    /// upstream repair on a single scope identity: they all clone this runner.
+    pub fn set_run_command_scope(&mut self, scope: RunCommandScope) {
+        self.ai_runner.set_run_command_scope(scope.clone());
+        self.run_command_scope = scope;
     }
 
     pub fn set_post_archive_action(&mut self, action: PostArchiveAction) {

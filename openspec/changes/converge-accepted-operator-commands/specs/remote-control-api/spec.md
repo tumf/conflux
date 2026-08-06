@@ -4,7 +4,7 @@
 
 `POST /api/v2/commands` MUST accept only `start`, `stop`, `cancel_stop`, `force_stop`, `set_execution_mark`, `set_queue_intent`, `retry_change`, `retry_errors`, `stop_and_dequeue`, `resolve_merge`, and `set_all_execution_marks` until a later spec delta extends the enum. Every command MUST include `expected_revision` and `idempotency_key`. Accepted operator commands MUST execute through the same process-local application transaction used by the TUI; the API MUST NOT equate internal channel enqueue with successful command execution, derive command admission from a stale frontend mode, or maintain an independent workflow state machine.
 
-The API MUST settle a command as succeeded, no-op, or failed from the actual shared-service outcome. A failed command MUST NOT retain partial reducer, execution-mark, queue, retry-edge, resolve-reservation, stop-flag, process-mode, scheduler, hook, event, or projection effects.
+The API MUST settle a command as succeeded, no-op, or failed from the actual shared-service outcome. An ordinary failed command MUST NOT retain partial reducer, execution-mark, queue, retry-edge, resolve-reservation, stop-flag, process-mode, scheduler, hook, event, or projection effects. A two-phase termination command that fails after cancellation issuance MUST commit no dequeue decision state or outcome event and MUST NOT repeat that intentional runtime request.
 
 #### Scenario: Accepted command uses shared behavior
 
@@ -25,7 +25,7 @@ The API MUST settle a command as succeeded, no-op, or failed from the actual sha
 #### Scenario: Failed dispatch does not certify partial intent
 
 **Given**: Start, retry, or active resolve passes target validation
-**And**: scheduler preparation or activation fails
+**And**: scheduler preparation fails before commit
 **When**: the command record settles
 **Then**: the command is failed
 **And**: the snapshot at `result_revision` equals the pre-command decision state
@@ -48,11 +48,13 @@ The API MUST settle a command as succeeded, no-op, or failed from the actual sha
 
 ### Requirement: Serialized optimistic revision control
 
-One process-local projection/application owner MUST serialize exact idempotency lookup, new-command admission, final lifecycle and target revalidation, service mutation, synchronous outcome dispatch, snapshot mutation, `state_revision`, `event_sequence`, event storage, command settlement, and publication. The serialization boundary MUST remain held until a state-changing command stores the revision produced by its own accepted outcome or a no-op/failed command stores the unchanged admitted revision.
+One process-local projection/application owner MUST serialize exact idempotency lookup, ordinary new-command admission, final lifecycle and target revalidation, staged service mutation plus synchronous outcome dispatch, snapshot mutation, `state_revision`, `event_sequence`, event storage, command settlement, and publication. For an ordinary command, the serialization boundary MUST remain held until the accepted outcome or unchanged no-op/failure revision is stored, then release before infallible scheduler activation or wake.
 
-For each state-affecting input, the owner MUST increment revision exactly once if and only if the snapshot changes and MUST attach that resulting revision to the event. Log-only inputs MUST retain the current revision. Every command MUST supply `expected_revision`; after exact replay lookup, a new stale command MUST fail without service execution. Two new commands submitted with the same expected revision MUST NOT both execute after one consumes that revision. Snapshot mutations MUST publish all related decision fields coherently at the same resulting revision.
+A command whose accepted effect requires awaiting confirmed runtime termination MUST hold the serialization boundary only for admission, final validation, command-record reservation, and cancellation issuance. Confirmation MUST wait outside the serialization boundary, authoritative dispatch transaction, and TUI event loop. The command remains Running during that wait. It MUST reacquire the boundary, revalidate the target's current runtime state rather than the original `expected_revision`, and only then commit, dispatch, and settle. Exact replay during either phase returns the original record without a second cancellation or waiter. Force stop and unrelated operator commands remain admissible while confirmation is pending.
 
-A command's `result_revision` MUST be the revision returned by its synchronous outcome dispatch and MUST NOT be sampled from mutable global state after unrelated work can advance it. Later asynchronous scheduler progress MUST NOT rewrite the settled record.
+For each state-affecting input, the owner MUST increment revision exactly once if and only if the snapshot changes and MUST attach that resulting revision to the event. Log-only inputs MUST retain the current revision. Every command MUST supply `expected_revision`; after exact replay lookup, a new stale command MUST fail without service execution. Two ordinary new commands submitted with the same expected revision MUST NOT both execute after one consumes that revision. Snapshot mutations MUST publish all related decision fields coherently at the same resulting revision.
+
+A changed command's `result_revision` MUST be the revision returned by its synchronous outcome dispatch. An ordinary no-op or failure MUST store the unchanged admitted revision, while a two-phase no-op or failure after the wait MUST store the explicit unchanged revision returned under the reacquired settlement boundary. No command MAY sample mutable global state after releasing its boundary, and later asynchronous progress MUST NOT rewrite the settled record.
 
 #### Scenario: State event and snapshot share one revision
 
@@ -68,13 +70,29 @@ A command's `result_revision` MUST be the revision returned by its synchronous o
 **Then**: `state_revision` is unchanged
 **And**: `result_revision` equals the unchanged admitted revision
 
-#### Scenario: Failure is revision-idempotent
+#### Scenario: Ordinary failure is revision-idempotent
 
-**Given**: a command fails validation, preparation, cancellation, or scheduler activation after reservation
+**Given**: an ordinary command fails validation or preparation after reservation
 **When**: its record settles
 **Then**: no command side effect remains
 **And**: `result_revision` equals the unchanged admitted revision
 **And**: no state event is published for a mutation that did not commit
+
+#### Scenario: Two-phase failure does not certify dequeue
+
+**Given**: stop-and-dequeue issued cancellation and later times out or fails post-wait revalidation
+**When**: its record settles
+**Then**: no dequeue reducer mutation or outcome event is committed
+**And**: `result_revision` is the explicit unchanged revision returned under the reacquired settlement boundary
+**And**: replay does not issue cancellation again
+
+#### Scenario: Termination wait does not block other commands
+
+**Given**: stop-and-dequeue is Running while it awaits confirmed termination
+**When**: a valid force-stop or unrelated operator command is submitted
+**Then**: that command executes and settles without waiting for the dequeue timeout
+**And**: event fan-out and TUI rendering remain live
+**And**: exact replay returns the original Running stop-and-dequeue record without another cancellation request
 
 #### Scenario: Stale new command is rejected
 
@@ -107,6 +125,15 @@ A command's `result_revision` MUST be the revision returned by its synchronous o
 **Then**: `result_revision` identifies the one snapshot containing all of that command's synchronous accepted decision fields
 **And**: Later asynchronous progress may advance revision separately
 **And**: that later progress does not rewrite `result_revision`
+
+#### Scenario: Two-phase command records its commit revision
+
+**Given**: stop-and-dequeue was admitted at revision 12
+**And**: unrelated commands or lifecycle events advance projection while termination is pending
+**When**: confirmed termination is revalidated and `ChangeDequeued` commits
+**Then**: `result_revision` is the revision returned by that dequeue outcome dispatch
+**And**: it is not revision 12 or a later sampled revision unrelated to the outcome
+**And**: timeout or failed revalidation stores the unchanged revision observed at settlement without publishing a dequeue event
 
 ### Requirement: Structurally idempotent side-effect commands
 

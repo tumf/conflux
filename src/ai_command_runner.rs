@@ -28,6 +28,572 @@ use tracing::{debug, error, warn};
 /// This type is shared across all AI command executions to coordinate stagger delays
 pub type SharedStaggerState = Arc<Mutex<Option<Instant>>>;
 
+// ---------------------------------------------------------------------------
+// Run command scope
+// ---------------------------------------------------------------------------
+
+/// Bounded budget for proving that every run-owned AI command reached
+/// quiescence after shutdown started.
+///
+/// It exceeds one command's SIGTERM grace plus process-group verification path
+/// and assumes active cleanups run concurrently, so together with the existing
+/// 90-second pending merge/base-lane drain it stays inside the scheduler's
+/// 120-second outer cancellation boundary instead of adding a new layer on top
+/// of it.
+pub const RUN_COMMAND_CLEANUP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// SIGTERM grace used when the scope itself force-cleans a retained identity.
+const SCOPE_ESCALATION_SIGTERM_GRACE_MS: u64 = 500;
+
+/// Total budget for one retained-identity managed escalation sweep.
+const SCOPE_ESCALATION_TOTAL_MS: u64 = 5_000;
+
+/// Lifecycle of one run-owned AI command execution inside its scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionPhase {
+    /// Admission is reserved; the runner task has not spawned a process yet.
+    WaitingToSpawn,
+    /// A real owned process group exists for the current attempt.
+    Running,
+    /// Termination and verification are in progress; the identity stays registered.
+    Cleaning,
+    /// The runner task ended without proving quiescence. The identity is kept
+    /// for bounded managed escalation and diagnostics.
+    UnconfirmedRetained,
+}
+
+impl ExecutionPhase {
+    /// Whether the runner task behind this registration is still running.
+    fn is_active(self) -> bool {
+        !matches!(self, Self::UnconfirmedRetained)
+    }
+}
+
+/// One run-owned execution tracked by the scope.
+#[derive(Debug, Clone)]
+struct ScopeEntry {
+    operation: Option<String>,
+    change_id: Option<String>,
+    phase: ExecutionPhase,
+    /// Owned process identities (PGID == leader PID) whose quiescence is not
+    /// yet proven. Retained across attempts so an earlier unproven attempt
+    /// cannot be forgotten by a later one.
+    unproven_pids: Vec<u32>,
+    /// Last actionable cleanup diagnostic recorded for this execution.
+    detail: Option<String>,
+}
+
+impl ScopeEntry {
+    fn describe(&self) -> String {
+        format!(
+            "op={}, change_id={}, pgids={:?}: {}",
+            self.operation.as_deref().unwrap_or("unknown"),
+            self.change_id.as_deref().unwrap_or("none"),
+            self.unproven_pids,
+            self.detail
+                .as_deref()
+                .unwrap_or("owned process-set quiescence was never proven")
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct ScopeState {
+    /// Once closed, no new execution and no new process spawn is admitted.
+    closed: bool,
+    next_id: u64,
+    entries: std::collections::BTreeMap<u64, ScopeEntry>,
+}
+
+struct RunCommandScopeInner {
+    state: std::sync::Mutex<ScopeState>,
+    cancel: tokio_util::sync::CancellationToken,
+    quiescence: tokio::sync::Notify,
+}
+
+/// Ephemeral, clone-shared ownership of every AI command one orchestration
+/// invocation launches.
+///
+/// The scope is the missing layer above `StreamingChildHandle`: it closes final
+/// spawn admission atomically, notifies runner tasks directly, and retains each
+/// execution and owned process identity until the runner task ended *and*
+/// typed cleanup evidence confirmed quiescence. It is process-local, is
+/// recreated for every run, and is never persisted or used for restart routing.
+#[derive(Clone)]
+pub struct RunCommandScope {
+    inner: Arc<RunCommandScopeInner>,
+}
+
+impl Default for RunCommandScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RunCommandScope {
+    /// Create one fresh, open scope for a single orchestration invocation.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RunCommandScopeInner {
+                state: std::sync::Mutex::new(ScopeState::default()),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                quiescence: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ScopeState> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Cancellation observed directly by runner tasks.
+    ///
+    /// Runner shutdown never depends on a caller-held `StreamingChildHandle`:
+    /// dropping the handle cannot silence this token.
+    pub fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.inner.cancel.clone()
+    }
+
+    /// Whether admission is already closed.
+    pub fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
+    /// Whether both handles are clones of the *same* scope.
+    ///
+    /// Scope identity is what the run's cleanup barrier is built on: a runner
+    /// carrying an equal-but-separate scope reports into a barrier nobody waits
+    /// on.
+    #[allow(dead_code)] // Read by scope-ownership coverage, not by the binary.
+    pub fn is_same(&self, other: &RunCommandScope) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Atomically close final spawn admission and broadcast runner shutdown.
+    ///
+    /// Idempotent. A command parked in stagger or retry delay cannot reach
+    /// `Command::spawn` after this returns, because the admission check and the
+    /// spawn share this lock.
+    pub fn close(&self) {
+        {
+            let mut state = self.lock();
+            state.closed = true;
+        }
+        self.inner.cancel.cancel();
+        self.inner.quiescence.notify_waiters();
+    }
+
+    /// Close this scope as soon as `token` is cancelled.
+    ///
+    /// The scope observes the run's global token directly, so a caller blocked
+    /// on command output far from the scheduler loop still starts cleaning up
+    /// the instant cancellation happens.
+    pub fn link_cancellation(&self, token: tokio_util::sync::CancellationToken) {
+        let scope = self.clone();
+        tokio::spawn(async move {
+            token.cancelled().await;
+            scope.close();
+        });
+    }
+
+    /// Number of registrations whose runner task has not ended yet.
+    pub fn active_executions(&self) -> usize {
+        self.lock()
+            .entries
+            .values()
+            .filter(|entry| entry.phase.is_active())
+            .count()
+    }
+
+    /// Owned process identities the scope still cannot prove quiescent.
+    #[allow(dead_code)] // Consumed by TUI escalation coverage and heavy regressions.
+    pub fn retained_process_ids(&self) -> Vec<u32> {
+        let state = self.lock();
+        let mut pids: Vec<u32> = state
+            .entries
+            .values()
+            .flat_map(|entry| entry.unproven_pids.iter().copied())
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
+    /// Whether every run-owned command for `change_id` reached terminal cleanup.
+    ///
+    /// A change with no registration at all is quiescent: it owns no command.
+    /// A change with a live or retained registration is not, and its execution
+    /// `done` handshake must stay unfired.
+    pub fn change_is_quiescent(&self, change_id: &str) -> bool {
+        !self
+            .lock()
+            .entries
+            .values()
+            .any(|entry| entry.change_id.as_deref() == Some(change_id))
+    }
+
+    /// Reserve one execution before its runner task is spawned.
+    ///
+    /// Returns `None` when the scope is already closing, which is what refuses
+    /// a command that raced shutdown before anything was launched.
+    fn register(&self, operation: Option<&str>, change_id: Option<&str>) -> Option<ScopeExecution> {
+        let mut state = self.lock();
+        if state.closed {
+            return None;
+        }
+        state.next_id += 1;
+        let id = state.next_id;
+        state.entries.insert(
+            id,
+            ScopeEntry {
+                operation: operation.map(|s| s.to_string()),
+                change_id: change_id.map(|s| s.to_string()),
+                phase: ExecutionPhase::WaitingToSpawn,
+                unproven_pids: Vec::new(),
+                detail: None,
+            },
+        );
+        drop(state);
+        Some(ScopeExecution {
+            scope: self.clone(),
+            id,
+            finished: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn set_phase(&self, id: u64, phase: ExecutionPhase) {
+        let mut state = self.lock();
+        if let Some(entry) = state.entries.get_mut(&id) {
+            entry.phase = phase;
+        }
+        drop(state);
+        self.inner.quiescence.notify_waiters();
+    }
+
+    fn remove_entry(&self, id: u64) {
+        let mut state = self.lock();
+        state.entries.remove(&id);
+        drop(state);
+        self.inner.quiescence.notify_waiters();
+    }
+
+    /// Close the barrier on this scope and wait for bounded quiescence.
+    pub async fn shutdown(&self, deadline: Duration) -> RunCommandScopeCleanup {
+        self.close();
+        self.wait_quiescent(deadline).await
+    }
+
+    /// Await runner-task exit for every registration, then escalate whatever
+    /// could not be proven quiescent, all inside one absolute `deadline`.
+    pub async fn wait_quiescent(&self, deadline: Duration) -> RunCommandScopeCleanup {
+        let started = Instant::now();
+        let mut timed_out = false;
+
+        loop {
+            if self.active_executions() == 0 {
+                break;
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= deadline {
+                timed_out = true;
+                break;
+            }
+            // Register interest before re-reading so a completion that lands
+            // between the check and the wait cannot be missed.
+            let notified = self.inner.quiescence.notified();
+            if self.active_executions() == 0 {
+                break;
+            }
+            if tokio::time::timeout(deadline - elapsed, notified)
+                .await
+                .is_err()
+            {
+                timed_out = true;
+                break;
+            }
+        }
+
+        let remaining = deadline.saturating_sub(started.elapsed());
+        self.escalate_retained(remaining, timed_out).await
+    }
+
+    /// Force-clean and verify every retained owned identity.
+    ///
+    /// Used by the local TUI supervisor when the orchestrator task itself
+    /// stopped cooperating: the scope is retained outside that task, so it is
+    /// still the path to the PGIDs the run owns.
+    pub async fn force_cleanup_retained(&self, budget: Duration) -> RunCommandScopeCleanup {
+        self.close();
+        self.escalate_retained(budget, self.active_executions() > 0)
+            .await
+    }
+
+    async fn escalate_retained(&self, budget: Duration, timed_out: bool) -> RunCommandScopeCleanup {
+        let pending: Vec<(u64, ScopeEntry)> = {
+            let state = self.lock();
+            state
+                .entries
+                .iter()
+                .filter(|(_, entry)| !entry.unproven_pids.is_empty())
+                .map(|(id, entry)| (*id, entry.clone()))
+                .collect()
+        };
+
+        let per_identity_ms = if budget.is_zero() {
+            0
+        } else {
+            SCOPE_ESCALATION_TOTAL_MS.min(budget.as_millis() as u64)
+        };
+
+        let mut escalated = 0usize;
+        for (id, entry) in pending {
+            // Per entry: only this entry's own confirmed identities may be
+            // dropped from its list.
+            let mut proven = Vec::new();
+            let mut first_failure = None;
+            for pid in &entry.unproven_pids {
+                let report = crate::process_manager::cleanup_process_group_verified(
+                    *pid,
+                    SCOPE_ESCALATION_SIGTERM_GRACE_MS.min(per_identity_ms),
+                    per_identity_ms,
+                    entry.operation.as_deref(),
+                    entry.change_id.as_deref(),
+                )
+                .await;
+                if report.is_confirmed() {
+                    proven.push(*pid);
+                } else if first_failure.is_none() {
+                    first_failure = Some(report.diagnostics());
+                }
+            }
+            escalated += proven.len();
+
+            let mut state = self.lock();
+            if let Some(current) = state.entries.get_mut(&id) {
+                current.unproven_pids.retain(|pid| !proven.contains(pid));
+                if let Some(detail) = first_failure {
+                    current.detail = Some(detail);
+                }
+                if current.unproven_pids.is_empty() && !current.phase.is_active() {
+                    state.entries.remove(&id);
+                }
+            }
+        }
+
+        let state = self.lock();
+        let unconfirmed: Vec<String> = state.entries.values().map(ScopeEntry::describe).collect();
+        drop(state);
+
+        RunCommandScopeCleanup {
+            escalated,
+            unconfirmed,
+            timed_out,
+        }
+    }
+}
+
+/// Result of one bounded run command scope cleanup barrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunCommandScopeCleanup {
+    /// Owned identities that only managed escalation could prove quiescent.
+    pub escalated: usize,
+    /// One bounded actionable diagnostic per unproven registration.
+    pub unconfirmed: Vec<String>,
+    /// Whether the bounded barrier expired before every runner task ended.
+    pub timed_out: bool,
+}
+
+impl RunCommandScopeCleanup {
+    /// Whether the run may treat every owned command as quiescent.
+    pub fn is_quiescent(&self) -> bool {
+        self.unconfirmed.is_empty() && !self.timed_out
+    }
+
+    /// One bounded operator-facing summary of what could not be proven.
+    pub fn diagnostics(&self) -> String {
+        if self.is_quiescent() {
+            return format!(
+                "run command cleanup confirmed (escalated={})",
+                self.escalated
+            );
+        }
+        format!(
+            "run command cleanup unconfirmed (timed_out={}, escalated={}): {}",
+            self.timed_out,
+            self.escalated,
+            self.unconfirmed.join("; ")
+        )
+    }
+}
+
+/// A run-owned execution reserved in a [`RunCommandScope`].
+///
+/// Held by the detached runner task for its whole life. Dropping it without
+/// [`ScopeExecution::finish`] — a panicked task — leaves the registration
+/// retained as unconfirmed rather than silently quiescent.
+struct ScopeExecution {
+    scope: RunCommandScope,
+    id: u64,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl ScopeExecution {
+    /// Whether scope shutdown has already started.
+    fn is_shutdown(&self) -> bool {
+        self.scope.is_closed()
+    }
+
+    fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.scope.cancel_token()
+    }
+
+    fn mark_waiting_to_spawn(&self) {
+        self.scope
+            .set_phase(self.id, ExecutionPhase::WaitingToSpawn);
+    }
+
+    fn mark_cleaning(&self) {
+        self.scope.set_phase(self.id, ExecutionPhase::Cleaning);
+    }
+
+    /// Final admission serialized with scope shutdown.
+    ///
+    /// The admission check and `spawn` share one critical section, so a scope
+    /// closed anywhere in between cannot leave a started process behind.
+    /// Returns `None` when admission was refused.
+    fn admit_spawn<F>(&self, spawn: F) -> Option<std::io::Result<tokio::process::Child>>
+    where
+        F: FnOnce() -> std::io::Result<tokio::process::Child>,
+    {
+        let mut state = self.scope.lock();
+        if state.closed {
+            return None;
+        }
+        let result = spawn();
+        if let Ok(child) = &result {
+            if let Some(entry) = state.entries.get_mut(&self.id) {
+                entry.phase = ExecutionPhase::Running;
+                if let Some(pid) = child.id() {
+                    entry.unproven_pids.push(pid);
+                }
+            }
+        }
+        Some(result)
+    }
+
+    /// Record typed cleanup evidence for one owned identity.
+    fn record_cleanup(&self, pid: u32, report: &ProcessGroupCleanupReport) {
+        let mut state = self.scope.lock();
+        if let Some(entry) = state.entries.get_mut(&self.id) {
+            if report.is_confirmed() {
+                entry.unproven_pids.retain(|owned| *owned != pid);
+            } else {
+                entry.detail = Some(report.diagnostics());
+            }
+        }
+        drop(state);
+        self.scope.inner.quiescence.notify_waiters();
+    }
+
+    /// The runner task is ending. The registration disappears only when every
+    /// owned identity is already proven quiescent.
+    fn finish(&self) {
+        if self.finished.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let retained = {
+            let mut state = self.scope.lock();
+            match state.entries.get_mut(&self.id) {
+                Some(entry) if entry.unproven_pids.is_empty() => false,
+                Some(entry) => {
+                    entry.phase = ExecutionPhase::UnconfirmedRetained;
+                    true
+                }
+                None => false,
+            }
+        };
+        if retained {
+            self.scope.inner.quiescence.notify_waiters();
+        } else {
+            self.scope.remove_entry(self.id);
+        }
+    }
+}
+
+/// A scope registration created directly by in-crate tests.
+///
+/// Lets a caller hold the run's cleanup barrier open — and release it as either
+/// confirmed or unproven — without spawning a real process.
+#[cfg(test)]
+pub(crate) struct ScopeTestRegistration(ScopeExecution);
+
+#[cfg(test)]
+impl ScopeTestRegistration {
+    /// Release as a runner task that ended with proven quiescence.
+    pub(crate) fn release_confirmed(self) {
+        self.0.finish();
+    }
+}
+
+#[cfg(test)]
+impl RunCommandScope {
+    /// Reserve an execution the way `execute_streaming_with_retry` does.
+    pub(crate) fn register_for_test(
+        &self,
+        operation: &str,
+        change_id: Option<&str>,
+    ) -> Option<ScopeTestRegistration> {
+        self.register(Some(operation), change_id)
+            .map(ScopeTestRegistration)
+    }
+
+    /// Reserve an execution that already owns an unproven process identity.
+    pub(crate) fn register_unproven_for_test(
+        &self,
+        operation: &str,
+        change_id: Option<&str>,
+        pid: u32,
+    ) -> ScopeTestRegistration {
+        let execution = self
+            .register(Some(operation), change_id)
+            .expect("an open scope admits the registration");
+        {
+            let mut state = self.lock();
+            if let Some(entry) = state.entries.get_mut(&execution.id) {
+                entry.phase = ExecutionPhase::Running;
+                entry.unproven_pids.push(pid);
+            }
+        }
+        ScopeTestRegistration(execution)
+    }
+}
+
+impl Drop for ScopeExecution {
+    fn drop(&mut self) {
+        if self.finished.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // A runner task that never reached its own finalization proved nothing:
+        // retain the registration so the barrier still sees it.
+        let mut state = self.scope.lock();
+        if let Some(entry) = state.entries.get_mut(&self.id) {
+            entry.phase = ExecutionPhase::UnconfirmedRetained;
+            if entry.detail.is_none() {
+                entry.detail =
+                    Some("the runner task ended without publishing cleanup evidence".to_string());
+            }
+            if entry.unproven_pids.is_empty() {
+                state.entries.remove(&self.id);
+            }
+        }
+        drop(state);
+        self.scope.inner.quiescence.notify_waiters();
+    }
+}
+
 /// Output line from a child process
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Infrastructure ready, integration pending (tasks 3.2, 3.3, 4.1-4.3)
@@ -58,6 +624,12 @@ pub struct AiCommandRunner {
     /// cleanup evidence fail when this budget expires without proof.
     process_group_cleanup_timeout_ms: u64,
     command_envs: HashMap<String, String>,
+    /// Invocation-scoped ownership of every command this runner launches.
+    ///
+    /// `None` is the caller-owned lifecycle used outside a scheduler run (the
+    /// TUI's standalone worktree command and in-crate tests): such a command is
+    /// deliberately not attached to a later run's scope.
+    run_command_scope: Option<RunCommandScope>,
 }
 
 impl AiCommandRunner {
@@ -77,6 +649,7 @@ impl AiCommandRunner {
             strict_process_cleanup: true,
             process_group_cleanup_timeout_ms: DEFAULT_PROCESS_GROUP_CLEANUP_TIMEOUT_MS,
             command_envs: HashMap::new(),
+            run_command_scope: None,
         }
     }
 
@@ -90,6 +663,32 @@ impl AiCommandRunner {
         runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
         runner.set_command_envs(config.get_command_envs());
         runner
+    }
+
+    /// Create a run-owned runner: same settings, bound to `scope`.
+    ///
+    /// Every production command surface of one orchestration invocation is
+    /// constructed through here (or cloned from a runner that was), so no run
+    /// path can build an unscoped runner out of a bare stagger timestamp.
+    pub fn for_run(
+        config: &OrchestratorConfig,
+        shared_state: SharedStaggerState,
+        scope: RunCommandScope,
+    ) -> Self {
+        let mut runner = Self::from_orchestrator_config(config, shared_state);
+        runner.run_command_scope = Some(scope);
+        runner
+    }
+
+    /// The invocation scope this runner is bound to, if any.
+    #[allow(dead_code)] // Read by scope-ownership coverage, not by the binary.
+    pub fn run_command_scope(&self) -> Option<&RunCommandScope> {
+        self.run_command_scope.as_ref()
+    }
+
+    /// Bind (or rebind) this runner to an invocation scope.
+    pub fn set_run_command_scope(&mut self, scope: RunCommandScope) {
+        self.run_command_scope = Some(scope);
     }
 
     pub fn set_command_envs(&mut self, envs: HashMap<String, String>) {
@@ -171,6 +770,23 @@ impl AiCommandRunner {
         operation_type: Option<&str>,
         change_id: Option<&str>,
     ) -> Result<(StreamingChildHandle, mpsc::Receiver<OutputLine>)> {
+        // Admission is reserved before anything is launched. A scope that is
+        // already closing refuses the execution outright, so a command that
+        // raced shutdown never reaches stagger, retry, or `Command::spawn`.
+        let scope_execution = match &self.run_command_scope {
+            Some(scope) => match scope.register(operation_type, change_id) {
+                Some(execution) => Some(execution),
+                None => {
+                    return Ok(refused_after_shutdown(
+                        "run command admission is closed",
+                        operation_type,
+                        change_id,
+                    ));
+                }
+            },
+            None => None,
+        };
+
         // Output channel that callers drain while the background task streams.
         let (out_tx, out_rx) = mpsc::channel::<OutputLine>(1024);
 
@@ -204,6 +820,13 @@ impl AiCommandRunner {
         // Spawn the background retry task. It owns the real child processes and responds
         // to the cancel signal by terminating the current process group via SIGTERM/SIGKILL.
         tokio::spawn(async move {
+            // Owned for the whole runner task: the registration is what keeps
+            // the run's cleanup barrier waiting, independently of whether the
+            // caller still holds its `StreamingChildHandle`.
+            let scope_execution = scope_execution;
+            let scope_cancel = scope_execution.as_ref().map(ScopeExecution::cancel_token);
+            let scoped = scope_execution.is_some();
+
             let max_retries = command_queue.config().max_retries;
             let retry_delay_ms = command_queue.config().retry_delay_ms;
             let inactivity_timeout_secs = command_queue.config().inactivity_timeout_secs;
@@ -227,6 +850,24 @@ impl AiCommandRunner {
             let mut final_exit_status: Option<std::process::ExitStatus> = None;
 
             'retry: loop {
+                // Shutdown recheck before every attempt. A scope that closed
+                // while the previous retry delay was sleeping admits no further
+                // attempt, so the counter never advances after closure.
+                if let Some(execution) = &scope_execution {
+                    if execution.is_shutdown() {
+                        let _ = out_tx
+                            .send(OutputLine::Stderr(shutdown_refusal_line(
+                                "retry",
+                                operation_type_owned.as_deref(),
+                                change_id_owned.as_deref(),
+                                attempt + 1,
+                            )))
+                            .await;
+                        break 'retry;
+                    }
+                    execution.mark_waiting_to_spawn();
+                }
+
                 attempt += 1;
                 let start_time = Instant::now();
 
@@ -256,10 +897,31 @@ impl AiCommandRunner {
                     configure_process_group(&mut cmd);
                 }
 
-                // Apply stagger delay then spawn.
-                let child = match command_queue.execute_with_stagger(|| cmd).await {
-                    Ok(c) => c,
-                    Err(e) => {
+                // Apply the stagger delay first, then take final scope
+                // admission and spawn inside one critical section. Checking
+                // admission before the delay would leave a window in which
+                // shutdown starts and a process is still launched.
+                command_queue.wait_for_stagger_slot().await;
+                let spawned = match &scope_execution {
+                    Some(execution) => execution.admit_spawn(|| cmd.spawn()),
+                    None => Some(cmd.spawn()),
+                };
+                let child = match spawned {
+                    None => {
+                        // Admission closed between registration and spawn: the
+                        // command body never runs.
+                        let _ = out_tx
+                            .send(OutputLine::Stderr(shutdown_refusal_line(
+                                "spawn",
+                                operation_type_owned.as_deref(),
+                                change_id_owned.as_deref(),
+                                attempt,
+                            )))
+                            .await;
+                        break 'retry;
+                    }
+                    Some(Ok(c)) => c,
+                    Some(Err(e)) => {
                         error!(
                             op = ?operation_type_owned,
                             change_id = ?change_id_owned,
@@ -399,6 +1061,41 @@ impl AiCommandRunner {
                         tokio::select! {
                             biased;
 
+                            // Scope shutdown reaches the runner task directly,
+                            // so it is not silenced by a dropped handle.
+                            _ = wait_for_scope_shutdown(&scope_cancel) => {
+                                warn!(
+                                    pid,
+                                    op = ?operation_type_owned,
+                                    change_id = ?change_id_owned,
+                                    "Run command scope shutdown, terminating process group (pid={})", pid
+                                );
+                                if let Some(execution) = &scope_execution {
+                                    execution.mark_cleaning();
+                                }
+                                let _ = managed_child
+                                    .terminate_with_timeout(Duration::from_secs(5))
+                                    .await;
+                                let report = verify_owned_process_group(
+                                    pid,
+                                    cleanup_timeout_ms,
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                    &out_tx,
+                                )
+                                .await;
+                                pid_arc.store(0, Ordering::SeqCst);
+                                if let Some(execution) = &scope_execution {
+                                    execution.record_cleanup(pid, &report);
+                                }
+                                publish_cleanup_report(&mut cleanup_tx, report);
+                                let _ = status_tx.send(make_fail_status());
+                                if let Some(execution) = &scope_execution {
+                                    execution.finish();
+                                }
+                                return;
+                            }
+
                             // Cancellation from StreamingChildHandle.terminate().
                             result = async {
                                 match cancel_rx_opt {
@@ -408,13 +1105,20 @@ impl AiCommandRunner {
                             }, if !cancel_observed => {
                                 cancel_observed = true;
                                 cancel_rx_opt = None;
-                                if result.is_ok() {
+                                // A scoped runner treats handle-channel closure
+                                // as cancellation too: losing the caller's
+                                // handle is never permission to detach.
+                                if result.is_ok() || scoped {
                                     warn!(
                                         pid,
                                         op = ?operation_type_owned,
                                         change_id = ?change_id_owned,
+                                        handle_dropped = result.is_err(),
                                         "Streaming command cancelled, terminating process group (pid={})", pid
                                     );
+                                    if let Some(execution) = &scope_execution {
+                                        execution.mark_cleaning();
+                                    }
                                     let _ = managed_child
                                         .terminate_with_timeout(Duration::from_secs(5))
                                         .await;
@@ -430,8 +1134,14 @@ impl AiCommandRunner {
                                     )
                                     .await;
                                     pid_arc.store(0, Ordering::SeqCst);
+                                    if let Some(execution) = &scope_execution {
+                                        execution.record_cleanup(pid, &report);
+                                    }
                                     publish_cleanup_report(&mut cleanup_tx, report);
                                     let _ = status_tx.send(make_fail_status());
+                                    if let Some(execution) = &scope_execution {
+                                        execution.finish();
+                                    }
                                     return;
                                 }
                                 // Err = handle was dropped without calling terminate() — continue.
@@ -574,6 +1284,39 @@ impl AiCommandRunner {
                         tokio::select! {
                             biased;
 
+                            _ = wait_for_scope_shutdown(&scope_cancel) => {
+                                warn!(
+                                    pid,
+                                    op = ?operation_type_owned,
+                                    change_id = ?change_id_owned,
+                                    "Run command scope shutdown, terminating process group (pid={})", pid
+                                );
+                                if let Some(execution) = &scope_execution {
+                                    execution.mark_cleaning();
+                                }
+                                let _ = managed_child
+                                    .terminate_with_timeout(Duration::from_secs(5))
+                                    .await;
+                                let report = verify_owned_process_group(
+                                    pid,
+                                    cleanup_timeout_ms,
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                    &out_tx,
+                                )
+                                .await;
+                                pid_arc.store(0, Ordering::SeqCst);
+                                if let Some(execution) = &scope_execution {
+                                    execution.record_cleanup(pid, &report);
+                                }
+                                publish_cleanup_report(&mut cleanup_tx, report);
+                                let _ = status_tx.send(make_fail_status());
+                                if let Some(execution) = &scope_execution {
+                                    execution.finish();
+                                }
+                                return;
+                            }
+
                             result = async {
                                 match cancel_rx_opt {
                                     Some(ref mut rx) => rx.await,
@@ -582,13 +1325,17 @@ impl AiCommandRunner {
                             }, if !cancel_observed => {
                                 cancel_observed = true;
                                 cancel_rx_opt = None;
-                                if result.is_ok() {
+                                if result.is_ok() || scoped {
                                     warn!(
                                         pid,
                                         op = ?operation_type_owned,
                                         change_id = ?change_id_owned,
+                                        handle_dropped = result.is_err(),
                                         "Streaming command cancelled, terminating process group (pid={})", pid
                                     );
+                                    if let Some(execution) = &scope_execution {
+                                        execution.mark_cleaning();
+                                    }
                                     let _ = managed_child
                                         .terminate_with_timeout(Duration::from_secs(5))
                                         .await;
@@ -601,8 +1348,14 @@ impl AiCommandRunner {
                                     )
                                     .await;
                                     pid_arc.store(0, Ordering::SeqCst);
+                                    if let Some(execution) = &scope_execution {
+                                        execution.record_cleanup(pid, &report);
+                                    }
                                     publish_cleanup_report(&mut cleanup_tx, report);
                                     let _ = status_tx.send(make_fail_status());
+                                    if let Some(execution) = &scope_execution {
+                                        execution.finish();
+                                    }
                                     return;
                                 }
                             }
@@ -636,6 +1389,9 @@ impl AiCommandRunner {
                 };
 
                 pid_arc.store(0, Ordering::SeqCst);
+                if let Some(execution) = &scope_execution {
+                    execution.mark_cleaning();
+                }
 
                 // Strict post-completion cleanup: sweep the process group after every
                 // command outcome (success, failure, inactivity timeout) to ensure no
@@ -654,6 +1410,9 @@ impl AiCommandRunner {
                         "strict post-completion process-group cleanup is disabled",
                     )
                 };
+                if let Some(execution) = &scope_execution {
+                    execution.record_cleanup(pid, &attempt_cleanup);
+                }
                 // An earlier attempt that could not be proven quiescent stays
                 // the published verdict: its survivors may still be running.
                 if cleanup_report.is_confirmed() {
@@ -664,6 +1423,12 @@ impl AiCommandRunner {
                 if inactivity_triggered {
                     if inactivity_timeout_max_retries > 0
                         && inactivity_retries_used < inactivity_timeout_max_retries
+                        // Shutdown is rechecked immediately before the retry
+                        // delay, not only at the top of the loop, so a scope
+                        // that closed during this attempt never buys a sleep.
+                        && !scope_execution
+                            .as_ref()
+                            .is_some_and(ScopeExecution::is_shutdown)
                     {
                         inactivity_retries_used += 1;
                         warn!(
@@ -714,7 +1479,14 @@ impl AiCommandRunner {
                     let exit_code = status.code().unwrap_or(-1);
                     let duration = start_time.elapsed();
 
-                    if command_queue.should_retry(attempt, duration, &stderr_collected, exit_code) {
+                    // Shutdown suppresses the ordinary retry branch as well: an
+                    // observed closure is checked before the delay and again at
+                    // final spawn admission.
+                    if command_queue.should_retry(attempt, duration, &stderr_collected, exit_code)
+                        && !scope_execution
+                            .as_ref()
+                            .is_some_and(ScopeExecution::is_shutdown)
+                    {
                         warn!(
                             attempt,
                             max_retries,
@@ -763,6 +1535,12 @@ impl AiCommandRunner {
             }
             publish_cleanup_report(&mut cleanup_tx, cleanup_report);
             let _ = status_tx.send(final_status);
+            // The registration is released only here: the runner task has
+            // ended, and it disappears from the scope only when every owned
+            // identity was already proven quiescent.
+            if let Some(execution) = &scope_execution {
+                execution.finish();
+            }
             // Dropping out_tx closes the output channel, signalling end-of-output to callers.
         });
 
@@ -892,6 +1670,70 @@ fn launch_failure_line(
         attempt,
         bounded
     )
+}
+
+/// One bounded stderr line describing a command refused by scope shutdown.
+///
+/// `stage` distinguishes the two closure points a command can hit: `spawn` is
+/// the final serialized admission check, `retry` is a later attempt that was
+/// never admitted at all.
+fn shutdown_refusal_line(
+    stage: &str,
+    operation_type: Option<&str>,
+    change_id: Option<&str>,
+    attempt: u32,
+) -> String {
+    format!(
+        "Command refused by run command scope shutdown (stage={}, op={}, change_id={}, attempt={})",
+        stage,
+        operation_type.unwrap_or("unknown"),
+        change_id.unwrap_or("none"),
+        attempt
+    )
+}
+
+/// Result handed back when the scope refuses an execution before it starts.
+///
+/// The caller gets the same shape it always gets — a handle plus an output
+/// receiver — so no operation needs a shutdown-specific code path: it drains
+/// one diagnostic line and observes a failure status.
+fn refused_after_shutdown(
+    reason: &str,
+    operation_type: Option<&str>,
+    change_id: Option<&str>,
+) -> (StreamingChildHandle, mpsc::Receiver<OutputLine>) {
+    let (out_tx, out_rx) = mpsc::channel::<OutputLine>(1);
+    let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let (status_tx, status_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
+    let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel::<ProcessGroupCleanupReport>();
+
+    let _ = out_tx.try_send(OutputLine::Stderr(shutdown_refusal_line(
+        "admission",
+        operation_type,
+        change_id,
+        1,
+    )));
+    let _ = cleanup_tx.send(ProcessGroupCleanupReport::not_applicable(reason));
+    let _ = status_tx.send(make_fail_status());
+    drop(out_tx);
+
+    (
+        StreamingChildHandle::new(
+            cancel_tx,
+            Arc::new(AtomicU32::new(0)),
+            status_rx,
+            cleanup_rx,
+        ),
+        out_rx,
+    )
+}
+
+/// Await scope shutdown, or never resolve for an unscoped runner.
+async fn wait_for_scope_shutdown(token: &Option<tokio_util::sync::CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Runs bounded cleanup on the owned process group and returns typed evidence.
@@ -1185,6 +2027,324 @@ mod tests {
             unsafe {
                 libc::killpg(*last_pgid, libc::SIGKILL);
             }
+        }
+    }
+
+    /// Invocation-scoped command ownership.
+    ///
+    /// These drive the real runner control flow — a real scope, a real retry
+    /// loop, a real `Command::spawn` — because the defect they pin is precisely
+    /// that a command could still start, or still retry, after the run that
+    /// owned it had already begun shutting down.
+    mod run_command_scope {
+        use super::*;
+
+        fn scoped_runner(
+            config: CommandQueueConfig,
+            stagger: SharedStaggerState,
+        ) -> (AiCommandRunner, RunCommandScope) {
+            let scope = RunCommandScope::new();
+            let mut runner = AiCommandRunner::new(config, stagger);
+            runner.set_run_command_scope(scope.clone());
+            (runner, scope)
+        }
+
+        fn marker_path(label: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!(
+                "cflx_scope_{}_{}_{}.txt",
+                label,
+                std::process::id(),
+                Instant::now().elapsed().as_nanos()
+            ))
+        }
+
+        /// Closing the scope while a command is parked at the stagger delay
+        /// must refuse the spawn itself, not merely the next retry.
+        ///
+        /// The marker file is the proof: it exists only if the command body ran.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn run_command_scope_refuses_spawn_after_shutdown() {
+            let marker = marker_path("refuse");
+            let _ = std::fs::remove_file(&marker);
+
+            // Pre-armed stagger timestamp: the runner parks in the stagger wait
+            // with its final admission still pending, which is exactly the
+            // window a check taken *before* the delay would miss.
+            let stagger: SharedStaggerState = Arc::new(Mutex::new(Some(Instant::now())));
+            let config = CommandQueueConfig {
+                stagger_delay_ms: 250,
+                max_retries: 3,
+                retry_delay_ms: 0,
+                retry_error_patterns: vec![],
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 1,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+            };
+            let (runner, scope) = scoped_runner(config, stagger);
+
+            let command = format!("touch {}", marker.display());
+            let (mut handle, mut rx) = runner
+                .execute_streaming_with_retry(&command, None, Some("apply"), Some("change-a"))
+                .await
+                .expect("the call itself succeeds; the spawn is what is refused");
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            scope.close();
+
+            let mut stderr_lines = Vec::new();
+            while let Some(line) = rx.recv().await {
+                if let OutputLine::Stderr(s) = line {
+                    stderr_lines.push(s);
+                }
+            }
+            let status = handle.wait().await.expect("a final status is reported");
+
+            assert!(
+                !marker.exists(),
+                "the command body must never run after admission closed"
+            );
+            assert!(!status.success(), "a refused command is not a success");
+            assert!(
+                stderr_lines.iter().any(|line| line
+                    .contains("refused by run command scope shutdown")
+                    && line.contains("op=apply")
+                    && line.contains("change_id=change-a")),
+                "the refusal must be legible to the caller: {stderr_lines:?}"
+            );
+            assert_eq!(
+                scope.active_executions(),
+                0,
+                "a command that never spawned holds no barrier open"
+            );
+            let _ = std::fs::remove_file(&marker);
+        }
+
+        /// A scope that closes while an attempt sits in its retry delay must
+        /// stop the attempt counter where it is.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn run_command_scope_suppresses_retry_after_shutdown() {
+            let attempts = marker_path("retry");
+            let _ = std::fs::remove_file(&attempts);
+
+            let config = CommandQueueConfig {
+                stagger_delay_ms: 0,
+                max_retries: 5,
+                retry_delay_ms: 300,
+                retry_error_patterns: vec![],
+                // Treat the fast failing exit as retryable, so an unscoped run
+                // would keep going.
+                retry_if_duration_under_secs: 30,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 1,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+            };
+            let (runner, scope) = scoped_runner(config, Arc::new(Mutex::new(None)));
+
+            let command = format!("echo attempt >> {}; exit 1", attempts.display());
+            let (mut handle, mut rx) = runner
+                .execute_streaming_with_retry(&command, None, Some("apply"), Some("change-a"))
+                .await
+                .expect("the first attempt is admitted");
+
+            // Attempt 1 has failed and is sleeping out its retry delay by now.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            scope.close();
+
+            let mut stderr_lines = Vec::new();
+            while let Some(line) = rx.recv().await {
+                if let OutputLine::Stderr(s) = line {
+                    stderr_lines.push(s);
+                }
+            }
+            let _ = handle.wait().await;
+
+            let recorded = std::fs::read_to_string(&attempts).unwrap_or_default();
+            let _ = std::fs::remove_file(&attempts);
+            assert_eq!(
+                recorded.lines().count(),
+                1,
+                "no attempt may start after shutdown, got: {recorded:?}"
+            );
+            assert!(
+                stderr_lines.iter().any(|line| line.contains("stage=retry")
+                    && line.contains("refused by run command scope shutdown")),
+                "the suppressed retry must say why: {stderr_lines:?}"
+            );
+            assert_eq!(scope.active_executions(), 0);
+        }
+
+        /// A registered execution keeps the barrier open, and multiple
+        /// registrations are awaited concurrently under one deadline rather
+        /// than one after another.
+        #[tokio::test]
+        async fn run_command_scope_awaits_registrations_concurrently() {
+            let scope = RunCommandScope::new();
+            let held: Vec<_> = ["alpha", "beta", "gamma"]
+                .iter()
+                .map(|change| {
+                    scope
+                        .register_for_test("apply", Some(change))
+                        .expect("an open scope admits registrations")
+                })
+                .collect();
+            assert_eq!(scope.active_executions(), 3);
+
+            let releasing = scope.clone();
+            tokio::spawn(async move {
+                for (index, registration) in held.into_iter().enumerate() {
+                    tokio::time::sleep(Duration::from_millis(40 * (index as u64 + 1))).await;
+                    registration.release_confirmed();
+                }
+                let _ = releasing;
+            });
+
+            let started = Instant::now();
+            let cleanup = scope.shutdown(Duration::from_secs(2)).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                cleanup.is_quiescent(),
+                "every registration reported quiescence: {}",
+                cleanup.diagnostics()
+            );
+            assert!(
+                elapsed < Duration::from_millis(400),
+                "cleanups share one absolute budget instead of running back to back: {elapsed:?}"
+            );
+        }
+
+        /// An execution that never reports leaves the barrier at its deadline
+        /// with diagnostics naming the operation and change.
+        #[tokio::test]
+        async fn run_command_scope_reports_bounded_escalation_diagnostics() {
+            let scope = RunCommandScope::new();
+            let _held = scope
+                .register_for_test("acceptance", Some("change-a"))
+                .expect("an open scope admits the registration");
+
+            let cleanup = scope.shutdown(Duration::from_millis(60)).await;
+
+            assert!(
+                !cleanup.is_quiescent(),
+                "an unreported execution is never silently quiescent"
+            );
+            assert!(cleanup.timed_out, "the bounded barrier must expire");
+            let diagnostics = cleanup.diagnostics();
+            assert!(
+                diagnostics.contains("op=acceptance") && diagnostics.contains("change_id=change-a"),
+                "diagnostics must be actionable: {diagnostics}"
+            );
+        }
+
+        /// An owned identity that is already gone is proven quiescent by the
+        /// scope's own managed escalation, and the change stops blocking its
+        /// completion handshake only then.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn run_command_scope_escalates_a_retained_identity() {
+            // A short-lived real child gives a genuinely dead PGID rather than a
+            // number that might belong to an unrelated live process.
+            let child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .expect("spawn");
+            let pid = child.id();
+            let mut child = child;
+            let _ = child.wait();
+
+            let scope = RunCommandScope::new();
+            let registration = scope.register_unproven_for_test("apply", Some("change-a"), pid);
+            assert!(
+                !scope.change_is_quiescent("change-a"),
+                "a retained identity keeps the change unproven"
+            );
+            registration.release_confirmed();
+            assert!(
+                !scope.change_is_quiescent("change-a"),
+                "runner-task exit alone is not cleanup evidence"
+            );
+            assert_eq!(scope.retained_process_ids(), vec![pid]);
+
+            let cleanup = scope.shutdown(Duration::from_secs(2)).await;
+
+            assert!(
+                cleanup.is_quiescent(),
+                "managed escalation proves the dead group quiescent: {}",
+                cleanup.diagnostics()
+            );
+            assert!(
+                scope.change_is_quiescent("change-a"),
+                "only confirmed cleanup releases the change"
+            );
+        }
+
+        /// A closed scope admits nothing at all, so a later operation cannot
+        /// slip a command into a run that has already stopped.
+        #[tokio::test]
+        async fn run_command_scope_refuses_registration_once_closed() {
+            let scope = RunCommandScope::new();
+            scope.close();
+            assert!(scope
+                .register_for_test("archive", Some("change-a"))
+                .is_none());
+            assert!(scope.cancel_token().is_cancelled());
+        }
+
+        /// Losing the caller's handle is treated as cancellation, never as
+        /// permission to keep the process group running.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn run_command_scope_treats_handle_loss_as_cancellation() {
+            let config = CommandQueueConfig {
+                stagger_delay_ms: 0,
+                max_retries: 1,
+                retry_delay_ms: 0,
+                retry_error_patterns: vec![],
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 1,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+            };
+            let (runner, scope) = scoped_runner(config, Arc::new(Mutex::new(None)));
+
+            let (handle, _rx) = runner
+                .execute_streaming_with_retry(
+                    "sleep 300 >/dev/null 2>&1 </dev/null & sleep 300",
+                    None,
+                    Some("apply"),
+                    Some("change-a"),
+                )
+                .await
+                .expect("admitted");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let pgid = handle.id().expect("a real pid") as i32;
+
+            // The workspace future was aborted: its handle is simply gone.
+            drop(handle);
+
+            let cleanup = scope.wait_quiescent(Duration::from_secs(5)).await;
+
+            // Reap before asserting so a failure cannot leak the group.
+            let survived = unsafe { libc::killpg(pgid, 0) } == 0;
+            if survived {
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            }
+            assert!(
+                cleanup.is_quiescent(),
+                "a dropped handle must still reach cleanup: {}",
+                cleanup.diagnostics()
+            );
+            assert!(
+                !survived,
+                "process group {pgid} outlived the run that owned it"
+            );
         }
     }
 

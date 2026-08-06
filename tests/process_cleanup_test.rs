@@ -381,3 +381,272 @@ async fn test_process_group_isolation() {
     // Clean up
     let _ = child.wait_with_output().await;
 }
+
+/// Run-owned process cleanup at the three shutdown boundaries.
+///
+/// The unit coverage in `src/` proves that the scheduler and the TUI *consult*
+/// the run command scope in the right order. These prove the other half with
+/// real processes: that when each boundary is reached, the owned process group
+/// is actually empty — including a descendant that ignores SIGTERM, which is the
+/// case a graceful-only path silently leaves behind.
+///
+/// Each test records the PGID before shutdown starts and probes `killpg(pgid, 0)`
+/// after the asserted boundary. Every assertion path force-kills the group first
+/// so a failure cannot leak a `sleep` into the test runner's process table.
+#[cfg(unix)]
+mod run_scope_process_cleanup {
+    use conflux::ai_command_runner::{AiCommandRunner, OutputLine, RunCommandScope};
+    use conflux::config::OrchestratorConfig;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+
+    /// A leader that stays alive plus a descendant that ignores SIGTERM.
+    ///
+    /// Graceful termination alone cannot clear this group; only the SIGKILL
+    /// escalation and verification the cleanup path owns can.
+    const SIGTERM_IMMUNE_GROUP: &str =
+        "sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' >/dev/null 2>&1 </dev/null & sleep 300";
+
+    /// A run-owned runner built the way production builds one.
+    ///
+    /// Inactivity timeout is off so nothing but the shutdown path can end the
+    /// command, which is what makes a surviving group unambiguous evidence.
+    fn scoped_runner(scope: &RunCommandScope) -> AiCommandRunner {
+        let config = OrchestratorConfig {
+            command_queue_stagger_delay_ms: Some(0),
+            command_queue_max_retries: Some(1),
+            command_queue_retry_delay_ms: Some(0),
+            command_inactivity_timeout_secs: Some(0),
+            command_inactivity_timeout_max_retries: Some(0),
+            ..OrchestratorConfig::default()
+        };
+        AiCommandRunner::for_run(&config, Arc::new(Mutex::new(None)), scope.clone())
+    }
+
+    fn group_has_members(pgid: i32) -> bool {
+        unsafe { libc::killpg(pgid, 0) == 0 }
+    }
+
+    /// Reap the group unconditionally, then report whether it had survived.
+    ///
+    /// Called before every terminal assertion so a failing test cleans up after
+    /// itself instead of leaking the process it was written to detect.
+    fn reap_and_report_survival(pgid: i32) -> bool {
+        let survived = group_has_members(pgid);
+        if survived {
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+        survived
+    }
+
+    /// Launch one run-owned command and return its PGID once the leader exists.
+    ///
+    /// The `StreamingChildHandle` is returned so the caller decides when the
+    /// caller-side handle disappears — dropping it is how an aborted workspace
+    /// future looks from the runner's side.
+    async fn launch_owned_group(
+        runner: &AiCommandRunner,
+        change_id: &str,
+    ) -> (
+        conflux::process_manager::StreamingChildHandle,
+        tokio::sync::mpsc::Receiver<OutputLine>,
+        i32,
+    ) {
+        let (handle, rx) = runner
+            .execute_streaming_with_retry(
+                SIGTERM_IMMUNE_GROUP,
+                None,
+                Some("apply"),
+                Some(change_id),
+            )
+            .await
+            .expect("an open scope admits the command");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = handle.id() {
+                // `configure_process_group` makes the leader its own group.
+                return (handle, rx, pid as i32);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command never reported a real pid"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Global cancellation: no member remains at the boundary where the
+    /// scheduler is allowed to publish terminal `Stopped`.
+    #[tokio::test]
+    async fn run_scope_global_cancellation_cleans_process_group() {
+        let scope = RunCommandScope::new();
+        let cancel = CancellationToken::new();
+        // The scope observes the run's global token directly, exactly as the
+        // scheduler wires it at run start.
+        scope.link_cancellation(cancel.clone());
+
+        let runner = scoped_runner(&scope);
+
+        let (handle, _rx, pgid) = launch_owned_group(&runner, "change-a").await;
+        assert!(
+            group_has_members(pgid),
+            "arrangement failed: the owned group must exist before shutdown"
+        );
+
+        // Operator cancellation, then `JoinSet::abort_all` drops the workspace
+        // future — and with it the only caller-held handle.
+        cancel.cancel();
+        drop(handle);
+
+        // The scheduler's cleanup barrier. `Stopped` may not precede it.
+        let cleanup = scope.wait_quiescent(Duration::from_secs(30)).await;
+
+        let survived = reap_and_report_survival(pgid);
+        assert!(
+            cleanup.is_quiescent(),
+            "the barrier must prove quiescence before terminal Stopped: {}",
+            cleanup.diagnostics()
+        );
+        assert!(
+            !survived,
+            "process group {pgid} survived global cancellation"
+        );
+    }
+
+    /// Run-fatal: the global Error is published promptly, and no member remains
+    /// at the boundary where the scheduler returns its failure.
+    ///
+    /// The Error/barrier *ordering* against the real queue boundary is pinned by
+    /// `run_fatal_error_precedes_cleanup_barrier` in the crate's unit tests;
+    /// this models the same sequence to assert the process outcome at the
+    /// failure-return boundary with a real SIGTERM-immune group.
+    #[tokio::test]
+    async fn run_scope_run_fatal_cleans_process_group() {
+        let scope = RunCommandScope::new();
+        let runner = scoped_runner(&scope);
+
+        let (handle, _rx, pgid) = launch_owned_group(&runner, "change-a").await;
+        assert!(
+            group_has_members(pgid),
+            "arrangement failed: the owned group must exist before shutdown"
+        );
+
+        // Step 1: the queue boundary publishes exactly one global Error without
+        // waiting for cleanup.
+        let (error_tx, mut errors) = tokio::sync::mpsc::channel::<String>(8);
+        error_tx
+            .send("Background merge failed for 'change-a'".to_string())
+            .await
+            .expect("the prompt Error is published before any waiting");
+        drop(error_tx);
+
+        // Step 2: the same boundary closes admission and signals runner tasks.
+        scope.close();
+        assert!(
+            scope.is_closed(),
+            "run-fatal shutdown closes command admission"
+        );
+
+        // Step 3: dispatch stops and the workspace futures are aborted.
+        drop(handle);
+
+        // Step 4: only now may the scheduler return its run-fatal failure.
+        let cleanup = scope.wait_quiescent(Duration::from_secs(30)).await;
+
+        let survived = reap_and_report_survival(pgid);
+        assert!(
+            cleanup.is_quiescent(),
+            "failure return must follow proven cleanup: {}",
+            cleanup.diagnostics()
+        );
+        assert!(
+            !survived,
+            "process group {pgid} survived run-fatal shutdown"
+        );
+
+        let mut emitted = Vec::new();
+        while let Some(message) = errors.recv().await {
+            emitted.push(message);
+        }
+        assert_eq!(
+            emitted.len(),
+            1,
+            "exactly one prompt global Error for the run-fatal outcome, got {emitted:?}"
+        );
+
+        // No new command may be admitted after the failure either.
+        let (mut refused, mut refused_rx) = runner
+            .execute_streaming_with_retry("echo never", None, Some("archive"), Some("change-b"))
+            .await
+            .expect("the call returns a refusal rather than launching");
+        while refused_rx.recv().await.is_some() {}
+        assert!(!refused.wait().await.expect("status").success());
+    }
+
+    /// Local TUI quit: no member remains when the supervisor reports
+    /// `AbortedAfterTimeout`.
+    ///
+    /// The orchestrator task here never finishes, which is exactly the case
+    /// where aborting the task would otherwise be the end of the story: the
+    /// retained scope outside that task is the only remaining path to the PGID.
+    #[tokio::test]
+    async fn run_scope_tui_quit_cleans_process_group_after_timeout() {
+        let scope = RunCommandScope::new();
+        let mut runner = scoped_runner(&scope);
+        // A zero per-command verification budget makes the ordinary cleanup
+        // unprovable, so the identity stays retained for managed escalation —
+        // the state the TUI timeout path exists to resolve.
+        runner.set_process_group_cleanup_timeout_ms(0);
+
+        let (handle, mut rx, pgid) = launch_owned_group(&runner, "change-a").await;
+        assert!(
+            group_has_members(pgid),
+            "arrangement failed: the owned group must exist before shutdown"
+        );
+
+        scope.close();
+        drop(handle);
+        // Drain so the runner task is never blocked on a full output channel.
+        while rx.recv().await.is_some() {}
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while scope.retained_process_ids().is_empty() {
+            if std::time::Instant::now() >= deadline {
+                reap_and_report_survival(pgid);
+                panic!("the unprovable cleanup must retain its owned identity");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The local orchestrator task has stopped cooperating.
+        let orchestrator = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let outcome = conflux::tui::shutdown_local_orchestrator_task(
+            Some(orchestrator),
+            Some(CancellationToken::new()),
+            Some(scope.clone()),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        let survived = reap_and_report_survival(pgid);
+        assert_eq!(
+            outcome,
+            conflux::tui::LocalOrchestratorShutdownOutcome::AbortedAfterTimeout,
+            "the timeout outcome stays distinguishable from graceful completion"
+        );
+        assert!(
+            !survived,
+            "process group {pgid} survived the local TUI timeout abort"
+        );
+        assert!(
+            scope.retained_process_ids().is_empty(),
+            "forced cleanup must verify, not merely signal"
+        );
+    }
+}

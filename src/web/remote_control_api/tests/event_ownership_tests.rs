@@ -517,6 +517,86 @@ async fn duplicate_stopped_is_idempotent_on_the_stream() {
     assert_eq!(sequence, 2, "both deliveries are still ordered");
 }
 
+/// The stop a remote client sees is the reducer's, not a frontend repair.
+///
+/// `/api/v2` never had a stopped-row fixup of its own, so before the reducer
+/// owned this transition an operator's stop left `accepting` on the wire for as
+/// long as the process ran. The assertions here are the API half of the same
+/// one-authority contract the TUI reads back.
+#[tokio::test]
+async fn stopped_projection_reconciles_change_status() {
+    use crate::openspec::{Change, ProposalMetadata};
+    use crate::orchestration::operator_command::ExecutionMarkStore;
+    use crate::web::remote_control_api::dto::QueueIntent;
+
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
+    let marks = Arc::new(ExecutionMarkStore::new());
+    marks.set("change-a", true);
+    web_state.set_execution_marks(marks.clone()).await;
+    web_state
+        .update(&[Change {
+            id: "change-a".to_string(),
+            completed_tasks: 0,
+            total_tasks: 2,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
+        }])
+        .await;
+    let projection = web_state.remote_control().projection();
+    let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
+
+    dispatch(
+        &reducer,
+        &sinks,
+        ExecutionEvent::AcceptanceStarted {
+            change_id: "change-a".to_string(),
+            command: "accept".to_string(),
+        },
+    )
+    .await;
+    let (snapshot, revision_before_stop, sequence_before_stop) = projection.snapshot();
+    assert_eq!(snapshot.changes[0].display_status, "accepting");
+
+    dispatch(&reducer, &sinks, ExecutionEvent::Stopped).await;
+
+    let (snapshot, revision_after_stop, sequence_after_stop) = projection.snapshot();
+    let change = &snapshot.changes[0];
+    assert_eq!(
+        change.display_status, "not queued",
+        "the stopped run's row is still published as active"
+    );
+    assert_eq!(
+        change.queue_intent,
+        QueueIntent::NotQueued,
+        "display status and queue intent must agree at one revision"
+    );
+    assert!(
+        change.execution_marked,
+        "a process stop must not clear the mark that keeps the row resumable"
+    );
+    assert_eq!(
+        revision_after_stop,
+        revision_before_stop + 1,
+        "the reconciled stop is exactly one state revision"
+    );
+    assert_eq!(sequence_after_stop, sequence_before_stop + 1);
+
+    dispatch(&reducer, &sinks, ExecutionEvent::Stopped).await;
+
+    let (snapshot, revision, sequence) = projection.snapshot();
+    assert_eq!(snapshot.changes[0].display_status, "not queued");
+    assert_eq!(
+        revision, revision_after_stop,
+        "a duplicate stop advanced the revision"
+    );
+    assert_eq!(
+        sequence,
+        sequence_after_stop + 1,
+        "both deliveries are still ordered"
+    );
+}
+
 /// Ownership consolidation must not break replay: a retained cursor still
 /// replays in order, and an unusable one is reported as a gap.
 #[tokio::test]

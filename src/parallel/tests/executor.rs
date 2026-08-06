@@ -1036,7 +1036,9 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
     };
-    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
+    let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    ai_runner.set_run_command_scope(run_command_scope.clone());
 
     let executor = ParallelExecutor {
         workspace_manager: Box::new(manager),
@@ -1061,6 +1063,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
+        run_command_scope,
         shared_stagger_state,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
@@ -1087,6 +1090,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         change_failures_this_run: HashSet::new(),
         run_fatal_abort: None,
         merge_result_channel_override: None,
+        run_command_cleanup_budget_override: None,
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -1189,7 +1193,9 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
     };
-    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
+    let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    ai_runner.set_run_command_scope(run_command_scope.clone());
 
     let executor = ParallelExecutor {
         workspace_manager: Box::new(manager),
@@ -1214,6 +1220,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
+        run_command_scope,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
@@ -1240,6 +1247,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         change_failures_this_run: HashSet::new(),
         run_fatal_abort: None,
         merge_result_channel_override: None,
+        run_command_cleanup_budget_override: None,
     };
 
     let items = crate::parallel::resolve_state::SequentialMergeItem::batch(
@@ -1358,7 +1366,9 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
     };
-    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
+    let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    ai_runner.set_run_command_scope(run_command_scope.clone());
 
     let executor = ParallelExecutor {
         workspace_manager: Box::new(manager),
@@ -1383,6 +1393,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
+        run_command_scope,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
@@ -1409,6 +1420,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         change_failures_this_run: HashSet::new(),
         run_fatal_abort: None,
         merge_result_channel_override: None,
+        run_command_cleanup_budget_override: None,
     };
 
     let items = crate::parallel::resolve_state::SequentialMergeItem::batch(
@@ -1582,7 +1594,9 @@ async fn test_merge_retries_when_merge_commit_missing() {
         strict_process_cleanup: true,
     };
 
-    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
+    let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    ai_runner.set_run_command_scope(run_command_scope.clone());
 
     let executor = ParallelExecutor {
         workspace_manager: Box::new(manager),
@@ -1607,6 +1621,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
+        run_command_scope,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
@@ -1633,6 +1648,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         change_failures_this_run: HashSet::new(),
         run_fatal_abort: None,
         merge_result_channel_override: None,
+        run_command_cleanup_budget_override: None,
     };
 
     let items = crate::parallel::resolve_state::SequentialMergeItem::batch(
@@ -1798,7 +1814,9 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         strict_process_cleanup: true,
     };
 
-    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
+    let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    ai_runner.set_run_command_scope(run_command_scope.clone());
 
     let executor = ParallelExecutor {
         workspace_manager: Box::new(manager),
@@ -1823,6 +1841,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
+        run_command_scope,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
@@ -1849,6 +1868,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         change_failures_this_run: HashSet::new(),
         run_fatal_abort: None,
         merge_result_channel_override: None,
+        run_command_cleanup_budget_override: None,
     };
 
     let items = crate::parallel::resolve_state::SequentialMergeItem::batch(
@@ -2020,7 +2040,9 @@ async fn test_merge_retries_after_pre_commit_changes() {
         strict_process_cleanup: true,
     };
 
-    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
+    let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    ai_runner.set_run_command_scope(run_command_scope.clone());
 
     let executor = ParallelExecutor {
         workspace_manager: Box::new(manager),
@@ -2045,6 +2067,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         last_available_slots: None,
         dynamic_queue: None,
         ai_runner,
+        run_command_scope,
         apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
@@ -2071,6 +2094,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         change_failures_this_run: HashSet::new(),
         run_fatal_abort: None,
         merge_result_channel_override: None,
+        run_command_cleanup_budget_override: None,
     };
 
     let items = crate::parallel::resolve_state::SequentialMergeItem::batch(

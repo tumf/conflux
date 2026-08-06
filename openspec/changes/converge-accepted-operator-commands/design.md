@@ -4,7 +4,7 @@ The repository already has the right domain services but not one complete applic
 
 - `OperatorCommandService` owns mark, queue, dequeue, retry planning, and hooks.
 - `RunControlService` owns start target resolution, scheduler dispatch, process stop controls, force-stop classification, and resolve reservations.
-- `EventDispatcher` applies `ExecutionEvent` to `OrchestratorState` and fans one post-transition state to `EventSink` implementations.
+- `EventDispatcher` applies `ExecutionEvent` to `OrchestratorState` and fans one post-transition state to `EventSink` implementations, but production currently constructs it per orchestration run while the TUI runner and command handlers retain separate local/direct paths.
 - `WebState` owns the v2 projection, while TUI `AppState` caches mode, row status, and checkbox presentation.
 - `SharedServiceExecutor` calls the services and then requests a Web snapshot refresh; it does not deliver the accepted outcome to live TUI state or bind the command record to the revision that outcome produced.
 
@@ -42,7 +42,9 @@ The coordinator owns:
 - scheduler activation ordering;
 - the exact revision returned by projection.
 
-TUI key handling may still decide presentation-only concerns such as a confirmation modal or local log wording. It cannot apply a lifecycle transition before the coordinator accepts it.
+TUI key handling may still decide presentation-only concerns such as a confirmation modal or local log wording. It cannot apply a lifecycle transition before the coordinator accepts it, and it MUST NOT await the coordinator gate or a termination waiter inside the event-processing/render loop. The adapter submits typed intent to a spawned coordinator task and consumes the accepted outcome through authoritative dispatch; a bounded typed busy refusal is allowed only when submission cannot be queued safely.
+
+The coordinator and process-mode core live outside the `web-monitoring` feature. TUI-only builds use the same transaction and dispatch semantics without constructing a v2 projection; Web binding adds a sink and revision result but does not create the authority.
 
 ## Decision: Process Mode Is Core State, Not Frontend Admission State
 
@@ -63,13 +65,13 @@ Mode transitions are outcome-driven:
 | settled force stop | Stopped |
 | no-op/failure | unchanged |
 
-Existing terminal-event guards remain authoritative for late `AllCompleted` and similar delivery.
+Authoritative lifecycle events transition the same Core mode at the process-lifetime dispatch boundary: typed run activation such as `ProcessingStarted` keeps or enters Running; `Stopping`, `Stopped`, and global `Error` enter their named modes; guarded `AllCompleted` returns non-retained modes to Select; and the persistent-idle Ready event enters Select when that independent change exists. Existing terminal-event guards, including `all_completed_may_overwrite_mode`, remain authoritative. This event path is required so natural completion readmits a later Start instead of leaving Core wedged in Running.
 
 ## Decision: Serialize New Remote Commands Through Settlement
 
 Current projection admission is atomic only for record reservation. It releases the lock before service execution, allowing two new commands to reserve against the same revision.
 
-Move final new-command admission under the application coordinator gate:
+Move final ordinary-command admission under the application coordinator gate:
 
 ```text
 lookup exact idempotency identity
@@ -78,35 +80,53 @@ acquire application gate
   -> re-check exact replay
   -> validate expected_revision against current projection
   -> reserve command record
-  -> execute application transaction
-  -> dispatch accepted outcome or retain unchanged state on no-op/failure
+  -> prepare every fallible runtime capability
+  -> atomically commit staged effects and dispatch the accepted outcome
   -> complete record with the returned revision
+release gate
+  -> activate the infallible scheduler permit or issue the wake
+```
+
+A long `stop_and_dequeue` is the explicit two-phase exception:
+
+```text
+acquire gate
+  -> replay/revision/mode/target validation
+  -> reserve record and issue cancellation
+release gate
+  -> await confirmed termination outside the gate and dispatch transaction
+reacquire gate
+  -> re-check replay identity and revalidate current target runtime state
+  -> commit dequeue and dispatch ChangeDequeued, or fail/no-op without dequeue mutation
+  -> complete the original record with the exact outcome or settlement revision
 release gate
 ```
 
-A long `stop_and_dequeue` can still execute asynchronously relative to the HTTP request and return `202`; it remains serialized as a command until it settles. This favors correctness over concurrent operator mutations. Runtime orchestration events continue independently through the authoritative dispatcher, but the command's accepted outcome is bound to its own dispatch revision rather than a later read.
+The second phase revalidates target runtime state, not the old `expected_revision`: unrelated commands may legitimately advance projection while termination is pending. The record remains Running throughout the wait, exact replay returns that same record without reissuing cancellation, and unrelated operator commands, event fan-out, rendering, and force stop remain live. Cancellation issuance is an intentional runtime request and cannot be rolled back; timeout or post-wait refusal therefore commits no dequeue decision state and settles with the explicit unchanged revision observed under the reacquired boundary.
 
-Exact replay never waits for or reacquires side-effect execution. It returns the current stored representation of the original record.
+Runtime orchestration events continue through the authoritative dispatcher, but each command's accepted outcome is bound to its own dispatch revision rather than a later read. Exact replay never reacquires side-effect execution.
 
 ## Decision: Prepare, Commit, Dispatch, Activate
 
 A new scheduler task must not emit progress before its command's accepted mode and decision state. Use a prepared activation boundary or an equivalent dispatch transaction held across service execution.
 
-The required order is:
+The required ordinary-command order is:
 
 ```text
 validate
   -> prepare scheduler/cancellation capability without observable progress
   -> stage reducer, mark, queue/retry, resolve, stop, and mode changes
-  -> commit staged changes
-  -> dispatch one authoritative command outcome and obtain its revision
-  -> activate/wake scheduler or complete cancellation control
-  -> settle command with the dispatch revision
+  -> atomically commit staged changes and dispatch one authoritative outcome
+  -> obtain and store the outcome revision
+  -> release the application/dispatch critical section
+  -> activate an infallible permit or issue the wake
 ```
 
 Activation after dispatch must be infallible. If an operation can fail, that failure belongs to preparation before commit. A port that can still fail after commit must provide rollback covering every staged axis and must prove no event escaped. The simpler preferred implementation is a prepared scheduler permit whose final activation cannot fail.
 
-For a live scheduler wake, queue/retry state is committed before wake and the outcome dispatch occurs before notification. For a new run, the spawned future waits on activation and cannot publish through `EventDispatcher` until released.
+For a live scheduler wake, queue/retry state and outcome dispatch share the process-lifetime dispatch critical section before notification. For a new run, the spawned future waits on a permit held by the command and cannot publish through `EventDispatcher` until released.
+
+Run activation currently rebuilds `OrchestratorState` from the accepted targets and reapplies their queue intent. That rebuild is later scheduler progress, not the accepted command effect. Tests assert the coherent outcome-dispatch snapshot and its ordering before activation; they do not require the same reducer allocation to survive scheduler initialization.
 
 ## Decision: Minimal Typed Outcome Vocabulary
 
@@ -143,8 +163,9 @@ This gives precise semantics:
 | Outcome | `result_revision` |
 |---|---|
 | changed | outcome dispatch revision |
-| no-op | unchanged admitted revision |
-| failed with no effect | unchanged admitted revision |
+| ordinary no-op | unchanged admitted revision |
+| ordinary failure with no effect | unchanged admitted revision |
+| two-phase no-op/failure after wait | explicit unchanged revision returned at settlement |
 | replay | originally stored revision |
 
 Later scheduler events advance projection normally but never mutate the record.
@@ -173,7 +194,7 @@ Remove command-side calls that rebuild all marks from every `ChangeState::select
 
 ## Failure Atomicity
 
-The coordinator must snapshot or stage only the affected process-local axes. A failure must preserve:
+The coordinator must snapshot or stage only the affected process-local axes. An ordinary failure must preserve:
 
 - reducer runtime and blocker evidence;
 - target and unrelated marks;
@@ -186,38 +207,40 @@ The coordinator must snapshot or stage only the affected process-local axes. A f
 - scheduler start/notify/cancel counts;
 - event sequence and state revision.
 
-Tests use recording ports and compare before/after state. A narrative error result without those comparisons is insufficient.
+Tests use recording ports and compare before/after state. For the two-phase exception they separately assert that cancellation is issued at most once and that timeout or post-wait refusal adds no dequeue reducer/event/projection effect. A narrative error result without those comparisons is insufficient.
 
 ## Event Ordering and Duplicate Handling
 
-All command outcomes and scheduler events use the same process-wide dispatch owner supplied by the event-ownership architecture. The owner serializes reducer application and sink fan-out for one event before processing the next.
+Create one process-lifetime authoritative dispatch boundary over the shared reducer and the frontend sink set owned by the TUI runner. Runner-local producers, operator outcomes in Select/Stopped/Error, and every orchestration run use this same owner. Replace the current per-run dispatcher construction and command-handler direct Web application with references to this boundary. The owner serializes reducer application, mark reconciliation supplied by `synchronize-execution-marks`, decision commit, and sink fan-out for one event before processing the next.
 
-The scheduler activation gate establishes the causal order. Frontend mode handlers still retain monotonic guards so duplicate delivery is harmless, but guards are defense in depth rather than the primary ordering mechanism.
+The decision commit and accepted outcome dispatch are one critical section. The scheduler activation gate then establishes the causal order for activity enabled by that command. Frontend mode handlers still retain monotonic guards so duplicate delivery is harmless, but guards are defense in depth rather than the primary ordering mechanism.
 
 ## Dependency and Parallel Work
 
-This change depends on `synchronize-execution-marks` because it consumes the dispatcher/store binding and one-way TUI mark projection introduced there. Its verification prerequisite is `execution-mark-event-regressions`.
+This change depends on `synchronize-execution-marks` because it consumes the dispatcher/store binding and one-way TUI mark projection introduced there instead of implementing a second command-specific row synchronization path. The command transaction could exist without its event-revocation policy, but landing after that concrete repository output prevents duplicate ownership. Its verification prerequisite is `execution-mark-event-regressions`.
 
 No hard dependency is declared on:
 
 - `fix-force-stop-reducer-reconciliation`: this change orders and emits `Stopped`; that change independently defines the reducer row transition.
-- `restore-ready-on-persistent-idle`: idle mode projection is independent from command acceptance.
+- `restore-ready-on-persistent-idle`: idle mode projection is independent from command acceptance. Whichever change lands second must route the typed persistent-idle Ready event through the same Core mode transition; this coordination note is not an implementation-order gate.
 - bulk or parallel-control work: this change preserves their existing command shapes and classifications.
 
 ## Verification Strategy
 
 1. Table-drive every command across process mode, target status, scheduler live/idle, and changed/no-op/failure outcomes using one shared coordinator harness.
 2. Use the same shared `ExecutionMarkStore`, `ResolveReservations`, reducer, Web projection, TUI `AppState`, and recording scheduler for same-process convergence tests.
-3. Gate scheduler test emission until accepted outcome dispatch and deliberately race activation with immediate terminal events.
+3. Gate scheduler test emission until accepted outcome dispatch, deliberately race activation with immediate terminal events, and assert the outcome revision precedes the first scheduler-event revision.
 4. Compare every mutable axis before and after injected preparation failure.
-5. Submit concurrent v2 requests with one expected revision and prove only one new state-changing identity enters service execution.
-6. Advance projection after settlement and prove replay retains the original record and revision without effects.
-7. Keep default unit/integration cases under one second; no real agent or external process is required.
+5. Use a never-completing termination waiter and a short configured timeout to prove stop-and-dequeue waiting neither holds the application gate nor blocks force stop, event drain, or TUI rendering.
+6. Apply `AllCompleted`, `Stopped`, and global `Error` through the process-lifetime dispatcher and prove later Start/resume/retry admission observes the updated Core mode.
+7. Submit concurrent v2 requests with one expected revision and prove only one new state-changing identity enters service execution.
+8. Advance projection after settlement and prove replay retains the original record and revision without effects.
+9. Keep default unit/integration cases under one second; no real agent or external process is required.
 
 ## Risks and Mitigations
 
-- **Long stop-and-dequeue blocks other operator commands:** serialize by design; exposing interleaving would violate revision and target assumptions. HTTP can return `202` while the record remains running.
-- **Process mode duplicates reducer lifecycle:** keep mode process-level only; change statuses remain reducer-derived and restart routing remains workspace-derived.
+- **Long stop-and-dequeue blocks other operator commands:** serialization excludes the confirmation wait; only admission/cancellation issuance and post-wait revalidated commit serialize. The original record remains Running and can return `202` without blocking force stop, unrelated commands, or event drain.
+- **Process mode duplicates reducer lifecycle:** keep mode process-level only, transition it from the same authoritative lifecycle events every frontend consumes, and leave change statuses reducer-derived and restart routing workspace-derived.
 - **Prepared scheduler adds lifecycle complexity:** confine it to `RunSchedulerPort` and test that activation is infallible and event-silent before release.
 - **Outcome enum grows into a second event model:** reuse exact existing events and keep the added enum limited to accepted command decision facts.
 - **Dependency creates unnecessary blockage:** the dependency consumes concrete dispatcher/mark projection code, not roadmap ordering; unrelated idle and stop-reconciliation work remains parallelizable.
