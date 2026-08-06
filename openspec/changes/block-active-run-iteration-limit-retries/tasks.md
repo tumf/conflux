@@ -1,0 +1,25 @@
+## Implementation Tasks
+
+- [ ] Add an explicit active-boundary lifetime for typed `ApplyIterationLimit` evidence in `src/orchestration/state.rs` and both CLI/TUI run-boundary owners. Completion requires the exact record to remain visible through the sole `on_finish` attempt, hook failure to release ownership normally, and closure to retire the gate only through a synchronization boundary shared with operator admission. A deterministic test must pause closure and prove no retry can mutate state while dispatch still addresses the closing scheduler. (verification: integration - `cargo test --features web-monitoring active_iteration_limit_run_boundary`; verification-id: active-run-iteration-limit-regressions)
+
+- [ ] Enforce one typed active-limit guard in `src/orchestration/operator_command.rs` and `src/orchestration/run_control.rs` before `retry_change` or the terminal-error queue-add/`set_queue_intent` alias applies any mutation. Completion requires refusal to preserve reducer status and error detail, failed classification, marks, dynamic queue, explicit-retry publications, queue hooks, scheduler notifications, and scheduler starts byte-for-byte/count-for-count, while ordinary error and acceptance-hold retry behavior remains unchanged. (verification: unit - `cargo test --features web-monitoring active_iteration_limit_retry_guard`; verification-id: active-run-iteration-limit-regressions)
+
+- [ ] Make `retry_errors` classify one coherent bulk snapshot, exclude active-run-limited targets with a stable typed reason, and dispatch all other retryable targets once. Completion requires a mixed request to leave limited rows untouched while retrying ordinary errors and resumable holds, and an all-limited request to return no-op without reducer, queue, edge, mark, hook, notify, or spawn effects. (verification: unit - `cargo test --features web-monitoring active_iteration_limit_bulk_retry`; verification-id: active-run-iteration-limit-regressions)
+
+- [ ] Project nullable per-change `{ attempts, max }` active-limit evidence through `src/web/state.rs` and the `/api/v2` DTO/projection, add `apply_iteration_limit_active` to `ActionBlockedReason`, and derive `retry_change` eligibility from the shared lifecycle query at the same revision. Completion requires projection tests for active, retired, and ordinary-error states plus generated OpenAPI serialization of the evidence object and enum token. (verification: integration - `cargo test --features web-monitoring active_iteration_limit_projection && cargo test --features web-monitoring --test openapi_contract_tests`; verification-id: active-run-iteration-limit-regressions)
+
+- [ ] Change `web/app.js::changeActions` to render Retry only from `change.actions.retry_change.allowed`, without inferring permission from `display_status`, error text, or iteration count. Completion requires `tests/web/destructive-actions.spec.js` to prove an `error` row blocked by `apply_iteration_limit_active` has no Retry control and emits no command, while a later allowed snapshot restores one non-confirming `retry_change` action. (verification: e2e - `npm --prefix tests/web test -- destructive-actions.spec.js`; verification-id: active-run-iteration-limit-browser-regressions)
+
+- [ ] Synchronize active iteration-limit eligibility into TUI state and apply it to row Space handling, bulk retry selection, F5 retry handling, and retry guidance in `src/tui/state/selection_logic.rs`, command handlers, and rendering. Completion requires the limited row to retain its diagnostic but produce no mark, queue command, retry command, or retry-promising Space/F5 text; unrelated eligible rows remain operable and eligibility returns after boundary retirement. (verification: integration - `cargo test --features web-monitoring active_iteration_limit_tui`; verification-id: active-run-iteration-limit-regressions)
+
+- [ ] Add cross-adapter regressions proving TUI and `/api/v2` use the same typed refusal and later-run recovery. Completion requires both adapters to reject the same active target without side effects, a concurrent close/retry test to avoid notifying the old scheduler generation, and a same-process later retry to create fresh active-run state from current workspace evidence without resetting or persisting the old budget. (verification: integration - `cargo test --features web-monitoring active_iteration_limit`; verification-id: active-run-iteration-limit-regressions)
+
+## Final Validation
+
+Archive validation is the authoritative final OpenSpec gate. Expected archive gate: `cflx openspec validate block-active-run-iteration-limit-retries --archive-gate`.
+
+The tracked Rust pre-commit hooks are path-scoped, so the declared Rust verification retains explicit `cargo fmt --check` and all-target/all-feature Clippy coverage. Browser verification remains explicit because it is not owned by pre-commit.
+
+## Future Work
+
+- If operators later need automatic continuation after a closed boundary, propose it separately with an explicit safety policy rather than weakening the active-run ceiling.
