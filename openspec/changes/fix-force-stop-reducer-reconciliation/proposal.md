@@ -23,7 +23,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: "Rust test output covering global Stopped reducer transitions, stale-event suppression, TUI reducer-cache ordering, execution-mark preservation, and API projection/idempotency"
-    rerun: "cargo test --lib global_stopped_reconciles_interrupted_runtime && cargo test --lib stopped_reducer_sync_prevents_accepting_resurrection && cargo test --lib stopped_projection_reconciles_change_status && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings"
+    rerun: "cargo test --lib global_stopped_reconciles_interrupted_runtime -- --list | grep -q global_stopped_reconciles_interrupted_runtime && cargo test --lib global_stopped_reconciles_interrupted_runtime && cargo test --lib stopped_reducer_sync_prevents_accepting_resurrection -- --list | grep -q stopped_reducer_sync_prevents_accepting_resurrection && cargo test --lib stopped_reducer_sync_prevents_accepting_resurrection && cargo test --lib stopped_projection_reconciles_change_status -- --list | grep -q stopped_projection_reconciles_change_status && cargo test --lib stopped_projection_reconciles_change_status && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings"
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -67,8 +67,8 @@ Reducer transition, TUI cache ordering, stale-event protection, and API projecti
 3. Existing terminal outcomes, including recoverable `Error`, `Merged`, `Pushed`, and `Rejected`, remain unchanged; fresh idle `not queued` rows are not converted into stopped work.
 4. Process-level `Stopped` never creates per-change terminal `stopped` status.
 5. Execution marks remain set, so stopped changes remain selectable for F5 resume while queue intent stays `NotQueued`.
-6. Late active lifecycle events cannot resurrect a reconciled change before a new explicit queue/start command; explicit resume clears the guard and restores ordinary eligibility.
-7. TUI reducer synchronization followed by local stopped handling and `ChangesRefreshed` cannot restore `accepting` or another interrupted transient status.
+6. Late active lifecycle events and same-process workspace observations, including `ChangesRefreshed.merge_wait_ids`, cannot resurrect a reconciled change before a new explicit queue/start command; explicit resume clears the guard and restores ordinary eligibility, while process restart may re-derive state from workspace evidence.
+7. TUI reducer synchronization followed by local stopped handling and `ChangesRefreshed` cannot restore `accepting`, `MergeWait`, or another interrupted transient status in the same process.
 8. `/api/v2` publishes the reconciled row status and queue intent at the same state revision as the `stopped` event, and duplicate `Stopped` delivery remains state-idempotent.
 9. Existing safe-boundary cancellation, process cleanup, terminal logging, and internal TUI stopped/resume mode semantics remain unchanged.
 10. All reconciliation state remains process-local and non-authoritative for restart routing, in accordance with `openspec/CONSTITUTION.md`.
@@ -76,7 +76,7 @@ Reducer transition, TUI cache ordering, stale-event protection, and API projecti
 ## Explicit Completion Conditions
 
 - `src/orchestration/state.rs` has one reducer-owned global-stop transition that targets only non-terminal rows carrying transient run ownership, clears all associated scheduler wait/hold membership, and establishes the not-queued dequeue guard without using per-change `TerminalState::Stopped`.
-- Reducer unit tests cover every active and wait-state family, queued intent, existing terminal outcomes, fresh idle rows, duplicate stop, late lifecycle suppression, and explicit requeue after stop.
+- Reducer unit tests cover every active and wait-state family, queued intent, existing terminal outcomes, fresh idle rows, duplicate stop, late lifecycle suppression, same-process `ChangesRefreshed.merge_wait_ids` suppression, process-restart workspace re-derivation, and explicit requeue after stop.
 - `src/tui/runner.rs` treats `ExecutionEvent::Stopped` as reducer-display-affecting, and TUI stopped handling does not maintain a competing row-state transition.
 - A runner integration regression traverses `AcceptanceStarted` → authoritative dispatch → `Stopped` → reducer cache synchronization → local stopped handling → `ChangesRefreshed` and proves the row remains `not queued` with its execution mark intact.
 - A web event-ownership regression proves the same stop changes API `display_status` and `queue_intent` coherently while duplicate delivery does not add another state revision.

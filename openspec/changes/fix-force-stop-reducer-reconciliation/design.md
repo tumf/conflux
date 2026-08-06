@@ -65,6 +65,8 @@ The production order remains reducer-first:
 4. TUI local handler updates only process mode, timing, controls, and log presentation;
 5. later refreshes reconcile workspace observations against the dequeue guard and cannot restore stale activity.
 
+Within the same process, the guard applies to every reactivation input, including workspace observations from `ChangesRefreshed.merge_wait_ids`; an archived-workspace refresh cannot restore `MergeWait` for work explicitly released by the stopped run. After process restart, the guard no longer exists and the same workspace may truthfully re-derive `MergeWait`. This boundary keeps the guard process-local while preserving workspace-derived routing.
+
 `should_apply_event_to_tui_reducer` must therefore classify `Stopped` as display-affecting. Keeping a second string-matching reset in `handle_stopped` would preserve the original architectural defect: newly added status variants could again be omitted from one copy.
 
 ## Verification Strategy

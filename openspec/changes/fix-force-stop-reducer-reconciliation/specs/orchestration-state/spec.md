@@ -30,13 +30,15 @@ The global event MUST NOT assign per-change `TerminalState::Stopped`. It MUST pr
 - **THEN** both rows remain unchanged
 - **AND** the stop does not erase a change outcome or claim ownership of unrelated idle work
 
-#### Scenario: Late lifecycle event cannot resurrect stopped work
+#### Scenario: Same-process reactivation input cannot resurrect stopped work
 
 - **GIVEN** `alpha` was reconciled by process-level `Stopped`
-- **WHEN** a late activity event from the stopped run arrives
-- **THEN** `alpha` remains `not queued`
+- **WHEN** a late activity event arrives or `ChangesRefreshed.merge_wait_ids` observes its archived workspace in the same process
+- **THEN** `alpha` remains `not queued` and does not re-enter `MergeWait`
 - **WHEN** the operator later explicitly queues the marked change
 - **THEN** the dequeue guard is released and ordinary workspace-derived execution becomes eligible again
+- **WHEN** the process instead restarts with the same workspace evidence
+- **THEN** startup may re-derive `MergeWait` because the process-local guard is not durable routing state
 
 #### Scenario: Frontends publish one reconciled state
 

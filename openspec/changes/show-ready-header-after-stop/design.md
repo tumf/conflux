@@ -2,7 +2,7 @@
 
 `AppExecutionMode` is an internal command-admission and control state. The header is a user-facing projection of current orchestration activity, while the status panel carries mode-specific actions.
 
-Stopped mode needs distinct controls because F5 resumes retained execution marks instead of behaving exactly like a fresh Select-mode start. That distinction does not require a separate header status. Once the scheduler and agents are no longer executing, the header-level fact is Ready.
+Stopped mode needs distinct status controls and execution-mark admission rules even though F5 ultimately uses the same `start_marked()` dispatch as Select mode. That internal distinction does not require a separate header status. Once the scheduler and agents are no longer executing, the header-level fact is Ready.
 
 ## Goals
 
@@ -46,10 +46,10 @@ Modal labels continue to take presentation precedence. Closing or replacing a mo
 
 Use the existing Ratatui `TestBackend` buffer helpers:
 
-- stopped render contains `[Ready]` and the configured resume hint;
+- stopped render contains `[Ready]` in `Color::Cyan`, asserted through the existing `fg_at` buffer helper, and the configured resume hint;
 - stopped render never contains `[Stopped]`;
 - rendering does not mutate `AppExecutionMode::Stopped`;
-- Error remains unlabeled and retry-owned;
+- modal-free Error renders neither `[Ready]` nor `[Stopped]` and remains retry-owned;
 - Running count, Stopping label, QR, and destructive confirmation behavior remain unchanged.
 
 No browser or external environment is required.

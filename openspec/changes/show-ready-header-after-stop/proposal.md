@@ -17,8 +17,8 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: Makefile
-    evidence: "Ratatui buffer-test output covering stopped Ready presentation, resume controls, running/stopping/error mappings, and modal label precedence"
-    rerun: "cargo test --lib stopped_mode_header_shows_ready_with_resume_controls && cargo test --lib overlay_header_label_is_presentation_only && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings"
+    evidence: "Ratatui buffer-test output covering cyan stopped Ready presentation, resume controls, modal-free Error behavior, running/stopping mappings, and modal label precedence"
+    rerun: "cargo test --lib stopped_mode_header_shows_ready_with_resume_controls -- --list | grep -q stopped_mode_header_shows_ready_with_resume_controls && cargo test --lib stopped_mode_header_shows_ready_with_resume_controls && cargo test --lib error_mode_header_remains_unlabeled_without_modal -- --list | grep -q error_mode_header_remains_unlabeled_without_modal && cargo test --lib error_mode_header_remains_unlabeled_without_modal && cargo test --lib overlay_header_label_is_presentation_only -- --list | grep -q overlay_header_label_is_presentation_only && cargo test --lib overlay_header_label_is_presentation_only && cargo test --lib test_running_header_counts_only_in_flight_changes -- --list | grep -q test_running_header_counts_only_in_flight_changes && cargo test --lib test_running_header_counts_only_in_flight_changes && cargo test --lib test_stopping_mode_header_shows_stopping -- --list | grep -q test_stopping_mode_header_shows_stopping && cargo test --lib test_stopping_mode_header_shows_stopping && cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings"
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -54,7 +54,7 @@ This proposal is independent from `fix-force-stop-reducer-reconciliation`. Heade
 
 1. Internal stopped mode renders the same cyan `[Ready]` header label as Select mode.
 2. Stopped mode continues to render resume-specific status controls, including the configured start-key label followed by `resume`.
-3. F5 in stopped mode continues to use `OperatorMode::Stopped` and the existing execution-marked resume path; it is not treated as a fresh Select-mode start by the control layer.
+3. Stopped mode retains `OperatorMode::Stopped` and its stopped-specific execution-mark admission rules; F5 continues through the existing `start_marked()` dispatch shared with Select mode, and this presentation change does not alter start/resume routing.
 4. The header never displays a new `[Stopped]` execution status.
 5. Running, active-count, Stopping, Error, QR, and confirmation-modal header behavior remain unchanged.
 6. Rendering `[Ready]` does not mutate `AppExecutionMode`, API `app_mode`, external lifecycle projection, queue intent, or execution marks.
@@ -63,8 +63,8 @@ This proposal is independent from `fix-force-stop-reducer-reconciliation`. Heade
 ## Explicit Completion Conditions
 
 - `src/tui/render.rs::render_header` maps only `AppExecutionMode::Stopped` to the existing Ready text/color path while leaving Error and overlay mappings unchanged.
-- A `stopped_mode_header_shows_ready_with_resume_controls` buffer test proves `[Ready]` and resume controls coexist, `[Stopped]` is absent, and the internal mode remains `Stopped` after rendering.
-- Existing tests continue to prove Running counts only active rows, Stopping remains visible, Error is not rewritten as Ready, and modal labels are presentation-only.
+- A `stopped_mode_header_shows_ready_with_resume_controls` buffer test proves `[Ready]` is cyan via the existing `fg_at` helper, resume controls coexist, `[Stopped]` is absent, and the internal mode remains `Stopped` after rendering.
+- A modal-free `error_mode_header_remains_unlabeled_without_modal` regression proves Error renders neither `[Ready]` nor `[Stopped]`; existing tests continue to prove Running counts only active rows, Stopping remains visible, and modal labels are presentation-only.
 - The CLI spec delta consistently updates `Running Mode Dashboard`, `TUI Layout Structure`, and `TUI Stopped Mode` without changing stop/resume command semantics.
 - The commands declared by `stopped-ready-header-regressions` pass.
 
@@ -74,4 +74,5 @@ This proposal is independent from `fix-force-stop-reducer-reconciliation`. Heade
 - Changing stopped-mode F5, Space, bulk mark, queue intent, or execution-mark behavior.
 - Fixing stale per-change `accepting` state; that independent reducer correction is covered by `fix-force-stop-reducer-reconciliation`.
 - Changing Error-mode header or retry controls.
+- Reconciling unrelated canonical inconsistencies such as Stopping punctuation, historical Error-label requirements, or exact resume log text outside the three modified requirements.
 - Adding a new TUI header state, badge, color token, or configuration option.
