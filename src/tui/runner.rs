@@ -1032,6 +1032,154 @@ mod tests {
         );
     }
 
+    /// An acceptance blocker whose external prerequisite claim is complete, so
+    /// the reducer classifies it as canonical `blocked`.
+    fn external_blocker() -> StalledBlocker {
+        StalledBlocker::acceptance_external(
+            "pending_verification",
+            "docker image pull failed: lookup registry-1.docker.io i/o timeout",
+        )
+    }
+
+    /// A reported hold with no verifiable unblock condition, which the reducer
+    /// keeps on the `stalled` path instead of promoting to external `blocked`.
+    fn unvalidated_blocker() -> StalledBlocker {
+        StalledBlocker {
+            category: "no_progress".to_string(),
+            phase: "acceptance".to_string(),
+            gate: "acceptance_review".to_string(),
+            error_summary: "no semantic progress across the retry budget".to_string(),
+            evidence: vec!["tasks.md unchanged across two iterations".to_string()],
+            unblock_condition: None,
+            prerequisite_owner: None,
+            next_action: "operator review".to_string(),
+            resumable: true,
+            worktree_preserved: true,
+        }
+    }
+
+    /// A persistent TUI holds `Running` while every remaining change waits, and
+    /// external lifecycle reporting must say `blocked` rather than `working`.
+    ///
+    /// The path is deliberately traversed end to end — event dispatch, reducer
+    /// blocker classification, display-cache synchronization, snapshot
+    /// projection — because the bug lived in the seam between the reducer's
+    /// canonical row status and the frontend snapshot, not in either alone.
+    #[tokio::test]
+    async fn running_tui_projects_blocked_for_reducer_blocked_and_stalled_rows() {
+        use crate::events::EventSink;
+        use crate::lifecycle_integration::LifecycleState;
+        use crate::orchestration::state::OrchestratorState;
+        use crate::tui::lifecycle::TuiLifecycleSnapshot;
+        use crate::tui::types::AppExecutionMode;
+
+        for (blocker, expected_status) in [
+            (external_blocker(), "blocked"),
+            (unvalidated_blocker(), "stalled"),
+        ] {
+            let shared_state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+                vec!["change-a".to_string()],
+                10,
+            )));
+            let sinks: Vec<Arc<dyn EventSink>> = Vec::new();
+            let mut app = AppState::new(vec![sample_change()]);
+            app.set_shared_state(shared_state.clone());
+            app.execution_mode = AppExecutionMode::Running;
+
+            for event in [
+                ExecutionEvent::AcceptanceStarted {
+                    change_id: "change-a".to_string(),
+                    command: "accept".to_string(),
+                },
+                ExecutionEvent::AcceptanceGated {
+                    change_id: "change-a".to_string(),
+                    blocker: blocker.clone(),
+                },
+            ] {
+                crate::events::dispatch_event(&shared_state, &sinks, event.clone()).await;
+                super::sync_reducer_display_caches(&mut app, &shared_state, &event).await;
+            }
+
+            assert_eq!(
+                app.changes[0].display_status_cache, expected_status,
+                "reducer classification must reach the TUI row for {blocker:?}"
+            );
+            assert_eq!(
+                app.execution_mode,
+                AppExecutionMode::Running,
+                "the persistent process stays Running while it waits"
+            );
+            assert_eq!(
+                TuiLifecycleSnapshot::from_app(&app).lifecycle_state(),
+                LifecycleState::Blocked,
+                "a {expected_status}-only wait must report blocked"
+            );
+        }
+    }
+
+    /// Once work is active or queued again, the same still-`Running` TUI reports
+    /// `working` even while a blocked row remains on screen.
+    #[tokio::test]
+    async fn active_or_queued_reducer_row_restores_working_lifecycle() {
+        use crate::events::EventSink;
+        use crate::lifecycle_integration::LifecycleState;
+        use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+        use crate::tui::lifecycle::TuiLifecycleSnapshot;
+        use crate::tui::types::AppExecutionMode;
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            10,
+        )));
+        let sinks: Vec<Arc<dyn EventSink>> = Vec::new();
+        let mut change_b = sample_change();
+        change_b.id = "change-b".to_string();
+        let mut app = AppState::new(vec![sample_change(), change_b]);
+        app.set_shared_state(shared_state.clone());
+        app.execution_mode = AppExecutionMode::Running;
+
+        let gated = ExecutionEvent::AcceptanceGated {
+            change_id: "change-a".to_string(),
+            blocker: external_blocker(),
+        };
+        crate::events::dispatch_event(&shared_state, &sinks, gated.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &gated).await;
+        assert_eq!(
+            TuiLifecycleSnapshot::from_app(&app).lifecycle_state(),
+            LifecycleState::Blocked
+        );
+
+        // A queued sibling keeps work admitted for dispatch.
+        shared_state
+            .write()
+            .await
+            .apply_command(ReducerCommand::AddToQueue("change-b".to_string()));
+        let refresh = empty_changes_refreshed_event();
+        crate::events::dispatch_event(&shared_state, &sinks, refresh.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &refresh).await;
+        assert_eq!(app.changes[0].display_status_cache, "blocked");
+        assert_eq!(app.changes[1].display_status_cache, "queued");
+        assert_eq!(
+            TuiLifecycleSnapshot::from_app(&app).lifecycle_state(),
+            LifecycleState::Working,
+            "a queued row alongside a blocked row must report working"
+        );
+
+        // And so does an actively executing sibling.
+        let started = ExecutionEvent::ApplyStarted {
+            change_id: "change-b".to_string(),
+            command: "apply".to_string(),
+        };
+        crate::events::dispatch_event(&shared_state, &sinks, started.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &started).await;
+        assert_eq!(app.changes[1].display_status_cache, "applying");
+        assert_eq!(
+            TuiLifecycleSnapshot::from_app(&app).lifecycle_state(),
+            LifecycleState::Working,
+            "an active row alongside a blocked row must report working"
+        );
+    }
+
     #[test]
     fn tui_reducer_sync_includes_running_lifecycle_display_events() {
         let reducer_visible_events = vec![

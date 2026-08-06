@@ -722,6 +722,65 @@ mod tests {
         assert!(tracker.should_emit(LifecycleState::Idle, &context));
     }
 
+    /// The TUI publishes its snapshot once per frame, so a persistent
+    /// blocked/stalled-only wait reaches this boundary dozens of times per
+    /// second. It must collapse into a single semantic transition, and a wait
+    /// that changes only its blocker word must never surface as `working`.
+    #[test]
+    fn repeated_blocked_tui_frames_emit_one_transition_without_an_intervening_working() {
+        use crate::tui::lifecycle::TuiLifecycleSnapshot;
+        use crate::tui::types::{AppExecutionMode, StopMode};
+
+        let waiting = TuiLifecycleSnapshot {
+            execution_mode: AppExecutionMode::Running,
+            modal: None,
+            stop_mode: StopMode::None,
+            current_change: None,
+            has_active_or_queued_change: false,
+            has_blocked_or_stalled_change: true,
+        };
+        let mut requeued = waiting.clone();
+        requeued.has_active_or_queued_change = true;
+
+        let mut tracker = LifecycleStateTracker::default();
+        let mut emitted: Vec<LifecycleState> = Vec::new();
+        let publish_frames = |snapshot: &TuiLifecycleSnapshot,
+                                  tracker: &mut LifecycleStateTracker,
+                                  emitted: &mut Vec<LifecycleState>| {
+            for _ in 0..5 {
+                let state = snapshot.lifecycle_state();
+                if tracker.should_emit(state, &snapshot.lifecycle_context("/repo")) {
+                    emitted.push(state);
+                }
+            }
+        };
+
+        publish_frames(&waiting, &mut tracker, &mut emitted);
+        assert_eq!(
+            emitted,
+            vec![LifecycleState::Blocked],
+            "an unchanged blocked/stalled-only wait must publish exactly once"
+        );
+
+        // Requeued work resumes `working` exactly once, and only then.
+        publish_frames(&requeued, &mut tracker, &mut emitted);
+        assert_eq!(
+            emitted,
+            vec![LifecycleState::Blocked, LifecycleState::Working]
+        );
+
+        publish_frames(&waiting, &mut tracker, &mut emitted);
+        assert_eq!(
+            emitted,
+            vec![
+                LifecycleState::Blocked,
+                LifecycleState::Working,
+                LifecycleState::Blocked
+            ],
+            "returning to a blocked-only wait must publish one new transition"
+        );
+    }
+
     #[test]
     fn state_tracker_treats_context_change_as_a_new_state() {
         let mut tracker = LifecycleStateTracker::default();
