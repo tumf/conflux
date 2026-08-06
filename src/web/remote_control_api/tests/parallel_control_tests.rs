@@ -29,7 +29,8 @@ use crate::orchestration::operator_command::{
     OperatorOutcome, ParallelEligibility, ParallelRuntime, QueuePort, TerminationWaiter,
 };
 use crate::orchestration::run_control::{
-    testing::RecordingScheduler, ResolveReservations, RunControlService,
+    testing::{RecordingScheduler, SchedulerCall},
+    ResolveReservations, RunControlService,
 };
 use crate::orchestration::state::OrchestratorState;
 use crate::web::remote_control_api::dto::{CommandSpec, ErrorCode};
@@ -76,6 +77,8 @@ struct Wired {
     scheduler: Arc<RecordingScheduler>,
     executor: SharedServiceExecutor,
     service: Arc<OperatorCommandService>,
+    /// The same run-lifecycle service the TUI command handlers drive.
+    run_control: Arc<RunControlService>,
 }
 
 impl Wired {
@@ -101,6 +104,12 @@ impl Wired {
         web_state.set_parallel_runtime(parallel.clone()).await;
         web_state.set_repo_root(PathBuf::from("/repo")).await;
 
+        // One scheduler handle, three readers: dispatch, command admission, and
+        // the published action eligibility. Two handles would be two answers to
+        // "is the owning boundary still alive".
+        let scheduler = Arc::new(RecordingScheduler::new());
+        web_state.set_run_boundary(scheduler.clone()).await;
+
         let service = Arc::new(
             OperatorCommandService::new(
                 reducer.clone(),
@@ -108,9 +117,9 @@ impl Wired {
                 Arc::new(NoopQueueHooks),
                 marks.clone(),
             )
-            .with_parallel(parallel.clone()),
+            .with_parallel(parallel.clone())
+            .with_run_boundary(scheduler.clone()),
         );
-        let scheduler = Arc::new(RecordingScheduler::new());
         let run_control = Arc::new(RunControlService::new(
             reducer.clone(),
             service.clone(),
@@ -119,8 +128,12 @@ impl Wired {
             parallel.clone(),
         ));
         let projection = web_state.remote_control().projection();
-        let executor =
-            SharedServiceExecutor::new(service.clone(), run_control, web_state.clone(), projection);
+        let executor = SharedServiceExecutor::new(
+            service.clone(),
+            run_control.clone(),
+            web_state.clone(),
+            projection,
+        );
 
         Self {
             web_state,
@@ -130,6 +143,7 @@ impl Wired {
             scheduler,
             executor,
             service,
+            run_control,
         }
     }
 
@@ -904,4 +918,227 @@ async fn preparing_projection_clears_on_a_pre_operation_exit() {
         Some("queued".to_string())
     );
     assert_eq!(wired.web_state.get_state().await.in_progress_changes, 0);
+}
+
+// ============================================================================
+// Active-run Apply iteration limit: cross-adapter parity (integration)
+// ============================================================================
+//
+// One wiring, two adapters. The TUI adapter reaches the shared services through
+// `RunControlService` exactly as `handle_start_processing_command` does, and the
+// v2 adapter reaches them through `SharedServiceExecutor`. Both are asserted
+// against the same recorded scheduler, so "the adapters agree" is a comparison
+// of one instrumented runtime rather than two differently stubbed ones.
+
+impl Wired {
+    /// Record a terminal error plus its typed Apply-ceiling evidence.
+    async fn to_iteration_limit(&self, change_id: &str, attempts: u32, max: u32) {
+        {
+            let mut guard = self.reducer.write().await;
+            guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+                id: change_id.to_string(),
+                error: "max iterations reached".to_string(),
+            });
+            guard.record_apply_iteration_limit(change_id, attempts, max);
+        }
+        self.web_state.sync_remote_control_projection().await;
+    }
+
+    fn blocked_reason(
+        &self,
+        change_id: &str,
+    ) -> Option<crate::web::remote_control_api::dto::ActionBlockedReason> {
+        self.snapshot()
+            .changes
+            .iter()
+            .find(|change| change.id == change_id)
+            .and_then(|change| change.actions.retry_change.blocked_reason)
+    }
+}
+
+#[tokio::test]
+async fn active_iteration_limit_rejects_the_same_target_through_both_adapters() {
+    use crate::orchestration::operator_command::OperatorCommandError;
+    use crate::orchestration::run_control::RunControlError;
+    use crate::web::remote_control_api::dto::ActionBlockedReason;
+
+    let wired = Wired::new(&["limited"]).await;
+    wired
+        .observe(&["limited"], &["limited"], &[], "running")
+        .await;
+    wired.scheduler.set_running(true);
+    wired.to_iteration_limit("limited", 50, 50).await;
+
+    assert_eq!(
+        wired.blocked_reason("limited"),
+        Some(ActionBlockedReason::ApplyIterationLimitActive),
+        "the authoritative snapshot advertises the refusal before either adapter acts"
+    );
+
+    // TUI adapter: the same shared service a keypress reaches.
+    let tui_error = wired
+        .run_control
+        .retry_change("limited")
+        .await
+        .expect_err("the TUI adapter is refused");
+    assert!(
+        matches!(
+            tui_error,
+            RunControlError::Operator(OperatorCommandError::ApplyIterationLimitActive { .. })
+        ),
+        "unexpected TUI error: {tui_error:?}"
+    );
+
+    // v2 adapter: the same services behind the remote command executor.
+    let v2_failure = wired
+        .executor
+        .execute(&CommandSpec::RetryChange {
+            change_id: "limited".to_string(),
+        })
+        .await
+        .expect_err("the v2 adapter is refused identically");
+    assert_eq!(v2_failure.error_code, ErrorCode::TargetIneligible);
+
+    assert_eq!(wired.status("limited").await, "error");
+    assert!(
+        wired.marks.marked_ids().is_empty(),
+        "neither adapter may mark a refused target"
+    );
+    assert!(
+        !wired.scheduler.calls().iter().any(|call| matches!(
+            call,
+            SchedulerCall::Notified | SchedulerCall::Started { .. }
+        )),
+        "neither adapter may notify or start a scheduler for a refused target: {:?}",
+        wired.scheduler.calls()
+    );
+    assert_eq!(
+        wired.blocked_reason("limited"),
+        Some(ActionBlockedReason::ApplyIterationLimitActive),
+        "the reason is still readable in the snapshot at the result revision"
+    );
+}
+
+/// The queue alias is refused through the remote surface too, so a client cannot
+/// route around `retry_change` by submitting `set_queue_intent=true`.
+#[tokio::test]
+async fn active_iteration_limit_refuses_the_remote_queue_intent_alias() {
+    let wired = Wired::new(&["limited"]).await;
+    wired
+        .observe(&["limited"], &["limited"], &[], "running")
+        .await;
+    wired.scheduler.set_running(true);
+    wired.to_iteration_limit("limited", 50, 50).await;
+
+    let failure = wired
+        .executor
+        .execute(&CommandSpec::SetQueueIntent {
+            change_id: "limited".to_string(),
+            queued: true,
+        })
+        .await
+        .expect_err("the alias is refused by the same guard");
+    assert_eq!(failure.error_code, ErrorCode::TargetIneligible);
+    assert_eq!(wired.status("limited").await, "error");
+}
+
+/// Bulk retry stays partial across the remote surface, and the limited target's
+/// reason stays readable at the result revision.
+#[tokio::test]
+async fn active_iteration_limit_bulk_retry_stays_partial_through_the_remote_surface() {
+    use crate::web::remote_control_api::dto::ActionBlockedReason;
+
+    let wired = Wired::new(&["limited", "ordinary"]).await;
+    wired
+        .observe(
+            &["limited", "ordinary"],
+            &["limited", "ordinary"],
+            &[],
+            "running",
+        )
+        .await;
+    wired.scheduler.set_running(true);
+    wired.to_iteration_limit("limited", 50, 50).await;
+    {
+        let mut guard = wired.reducer.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "ordinary".to_string(),
+            error: "boom".to_string(),
+        });
+    }
+    wired.web_state.sync_remote_control_projection().await;
+
+    let summary = wired
+        .executor
+        .execute(&CommandSpec::RetryErrors {
+            change_ids: vec!["limited".to_string(), "ordinary".to_string()],
+        })
+        .await
+        .expect("an unrelated retryable target keeps the request useful");
+
+    assert!(summary.changed);
+    let detail = summary.detail.clone().unwrap_or_default();
+    assert!(
+        detail.contains("ordinary") && !detail.contains("limited"),
+        "the result must not claim the limited target was accepted: {detail}"
+    );
+    assert_eq!(
+        wired.blocked_reason("limited"),
+        Some(ActionBlockedReason::ApplyIterationLimitActive)
+    );
+    assert_eq!(wired.status("limited").await, "error");
+}
+
+/// Scheduler-task exit retires the gate for both adapters at once, and the later
+/// admission starts a boundary instead of waking the one that exited.
+#[tokio::test]
+async fn active_iteration_limit_run_boundary_exit_admits_a_later_run_for_both_adapters() {
+    let wired = Wired::new(&["limited"]).await;
+    wired
+        .observe(&["limited"], &["limited"], &[], "running")
+        .await;
+    wired.scheduler.set_running(true);
+    wired.to_iteration_limit("limited", 50, 50).await;
+    assert!(wired.run_control.retry_change("limited").await.is_err());
+
+    wired.scheduler.set_running(false);
+    wired.web_state.sync_remote_control_projection().await;
+
+    assert_eq!(
+        wired.blocked_reason("limited"),
+        None,
+        "task exit removes the action block even though the record remains"
+    );
+    assert!(
+        wired
+            .reducer
+            .read()
+            .await
+            .apply_iteration_limit("limited")
+            .is_some(),
+        "the typed record survives its boundary"
+    );
+
+    let summary = wired
+        .executor
+        .execute(&CommandSpec::RetryChange {
+            change_id: "limited".to_string(),
+        })
+        .await
+        .expect("a closed boundary admits the ordinary retry route");
+    assert!(summary.changed);
+    assert_eq!(
+        wired.scheduler.started_targets(),
+        vec![vec!["limited".to_string()]],
+        "a later boundary is started, never a wake-up of the exited scheduler"
+    );
+    assert!(
+        !wired
+            .scheduler
+            .calls()
+            .iter()
+            .any(|call| matches!(call, SchedulerCall::Notified)),
+        "the exited scheduler is never notified: {:?}",
+        wired.scheduler.calls()
+    );
 }

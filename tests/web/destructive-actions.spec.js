@@ -153,6 +153,71 @@ describe('non-destructive actions', () => {
   });
 });
 
+describe('server-blocked retry', () => {
+  /** A snapshot whose error row is blocked by the active run's Apply ceiling. */
+  function limitedByActiveRun() {
+    return {
+      snapshot: (base) => {
+        const change = base.changes.find((entry) => entry.id === 'fix-broken-thing');
+        change.actions.retry_change = {
+          allowed: false,
+          blocked_reason: 'apply_iteration_limit_active',
+        };
+        change.actions.set_queue_intent = {
+          allowed: false,
+          blocked_reason: 'apply_iteration_limit_active',
+        };
+        return base;
+      },
+    };
+  }
+
+  it('renders no Retry control for an error row the server blocks', async () => {
+    const { doc, server } = await connected();
+    server.advance(limitedByActiveRun().snapshot);
+    await flush();
+
+    const row = doc.querySelector('[data-change-id="fix-broken-thing"]');
+    // `display_status` is still `error` and the iteration count is still 3;
+    // neither may authorize the control.
+    expect(row.textContent).toContain('error');
+    expect(row.querySelector('[data-intent^="retry-"]')).toBeNull();
+
+    // Nothing to click, and nothing reaches the server either way.
+    for (const button of row.querySelectorAll('[data-intent]')) button.click();
+    await flush(2);
+    expect(server.commands.filter((command) => command.type === 'retry_change')).toHaveLength(0);
+  });
+
+  it('restores exactly one Retry control when a later snapshot allows it', async () => {
+    const { doc, server } = await connected();
+    server.advance(limitedByActiveRun().snapshot);
+    await flush();
+    expect(
+      doc.querySelector('[data-change-id="fix-broken-thing"] [data-intent^="retry-"]'),
+    ).toBeNull();
+
+    server.advance((snapshot) => {
+      const change = snapshot.changes.find((entry) => entry.id === 'fix-broken-thing');
+      change.actions.retry_change = { allowed: true, blocked_reason: null };
+    });
+    await flush();
+
+    const controls = doc.querySelectorAll(
+      '[data-change-id="fix-broken-thing"] [data-intent^="retry-"]',
+    );
+    expect(controls).toHaveLength(1);
+
+    controls[0].click();
+    await flush();
+
+    expect(doc.getElementById('confirm-dialog').open).toBe(false);
+    const retries = server.commands.filter((command) => command.type === 'retry_change');
+    expect(retries).toHaveLength(1);
+    expect(retries[0].change_id).toBe('fix-broken-thing');
+  });
+});
+
 describe('dialog reuse', () => {
   it('refuses to open a second dialog while one is unresolved', async () => {
     const { doc, app } = await connected();

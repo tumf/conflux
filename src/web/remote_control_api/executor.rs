@@ -90,8 +90,13 @@ pub fn map_operator_error(error: &OperatorCommandError) -> CommandFailure {
             };
             CommandFailure::new(code, error.to_string())
         }
+        // The active run owns this target's exhausted Apply ceiling. It is a
+        // target problem, not a mode problem: unrelated targets in the same run
+        // are still retryable, and this one becomes retryable again once its
+        // owning boundary closes.
         OperatorCommandError::MissingCancellationHandle { .. }
-        | OperatorCommandError::RetryUnsupported { .. } => {
+        | OperatorCommandError::RetryUnsupported { .. }
+        | OperatorCommandError::ApplyIterationLimitActive { .. } => {
             CommandFailure::new(ErrorCode::TargetIneligible, error.to_string())
         }
         // A mode that has to move on, not a target that has to change: the same
