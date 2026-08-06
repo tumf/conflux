@@ -771,21 +771,33 @@ fn killing_the_lock_owner_releases_the_repository_lock() {
             .expect("failed to spawn cflx run"),
     );
 
-    // Wait until the child actually owns the lock, proven by a competing
-    // invocation being rejected with the conflict diagnostic.
+    // Wait until the child actually owns the lock, proven by the owner metadata
+    // naming its PID. Polling with a competing `run` instead would race the
+    // child for the lock: a probe that wins it orchestrates indefinitely behind
+    // an unbounded pipe read, hanging this test and the whole suite with it.
+    let owner_file = repo_lock::discover_common_dir(tmp.path())
+        .expect("git common dir")
+        .join(repo_lock::OWNER_FILE_NAME);
+    let owner_pid = owner.0.id();
     let start = Instant::now();
-    loop {
-        let output = cflx_output(tmp.path(), &["run", "--all"]);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() && stderr.contains(CONFLICT_HEADLINE) {
-            break;
-        }
+    while repo_lock::read_owner_metadata(&owner_file).and_then(|metadata| metadata.pid)
+        != Some(owner_pid)
+    {
         assert!(
             start.elapsed() < Duration::from_secs(30),
-            "the spawned owner never took the repository lock (stderr={stderr})"
+            "the spawned owner never took the repository lock"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+
+    // Ownership is exclusive while it lasts: with the child holding the lock, a
+    // competing invocation is rejected with the conflict diagnostic.
+    let output = cflx_output(tmp.path(), &["run", "--all"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains(CONFLICT_HEADLINE),
+        "a competing run must be rejected while the owner holds the lock (stderr={stderr})"
+    );
 
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
