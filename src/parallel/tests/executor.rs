@@ -1074,6 +1074,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -1231,6 +1232,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -1404,6 +1406,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -1632,6 +1635,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -1852,6 +1856,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -2078,6 +2083,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -5525,6 +5531,133 @@ async fn test_persistent_idle_wait_detection_requires_fully_drained_state() {
             .should_enter_persistent_idle_wait(true, &queued, &in_flight, None)
             .await,
         "stable ResolveWait-only work should use event-driven persistent idle wait"
+    );
+}
+
+/// Verification `persistent-idle-ready-regressions`: the scheduler announces a
+/// persistent-idle park once per episode and stays alive across it.
+///
+/// Unit-scoped: the admission predicate, the latch, and the event channel are
+/// all in-memory, and the drained/waiting-only inputs are held constant so the
+/// only thing under test is the edge.
+#[tokio::test]
+async fn persistent_idle_event_is_edge_triggered() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let mut executor = ParallelExecutor::new(
+        PathBuf::from("/tmp/test-repo"),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.set_persistent_lifetime();
+
+    let queued: Vec<crate::openspec::Change> = Vec::new();
+    let in_flight = HashSet::new();
+
+    let idle_events = |rx: &mut mpsc::Receiver<ExecutionEvent>| {
+        let mut count = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, ExecutionEvent::PersistentSchedulerIdle) {
+                count += 1;
+            }
+        }
+        count
+    };
+
+    // A fully drained persistent scheduler parks and announces it exactly once.
+    assert!(
+        executor
+            .admit_persistent_idle_wait(true, &queued, &in_flight, None)
+            .await,
+        "a fully drained persistent scheduler must park"
+    );
+    assert_eq!(idle_events(&mut rx), 1, "the first park is the idle edge");
+    assert!(
+        executor.persistent_idle_is_latched(),
+        "the episode stays open while the scheduler is parked"
+    );
+
+    // Repeated evaluation of the same state, and a wake that admits nothing,
+    // both reach the same park and announce nothing further.
+    for _ in 0..3 {
+        assert!(
+            executor
+                .admit_persistent_idle_wait(true, &queued, &in_flight, None)
+                .await,
+            "the scheduler is still alive and still parking"
+        );
+    }
+    assert_eq!(
+        idle_events(&mut rx),
+        0,
+        "repeated evaluation and no-op wakes must not re-announce idle"
+    );
+
+    // A blocked/waiting-only episode is the same episode: still nothing
+    // executing, so it must not produce a second edge either.
+    executor
+        .resolve_wait_changes
+        .insert("needs-resolve".to_string());
+    assert!(
+        executor
+            .admit_persistent_idle_wait(true, &queued, &in_flight, None)
+            .await,
+        "a resolve-wait-only persistent scheduler must park"
+    );
+    assert_eq!(idle_events(&mut rx), 0, "the episode is still open");
+
+    // Admitted work rearms the edge; the next park announces again.
+    executor.rearm_persistent_idle();
+    assert!(
+        !executor.persistent_idle_is_latched(),
+        "admitted work must close the episode"
+    );
+    assert!(
+        executor
+            .admit_persistent_idle_wait(true, &queued, &in_flight, None)
+            .await
+    );
+    assert_eq!(
+        idle_events(&mut rx),
+        1,
+        "the park after admitted work is a new idle edge"
+    );
+
+    // A finite scheduler never parks, so it never announces.
+    let (finite_tx, mut finite_rx) = mpsc::channel(4);
+    let finite = ParallelExecutor::new(
+        PathBuf::from("/tmp/test-repo"),
+        create_test_config(),
+        Some(finite_tx),
+    );
+    assert!(
+        !finite
+            .admit_persistent_idle_wait(true, &queued, &in_flight, None)
+            .await,
+        "a finite scheduler terminates instead of parking"
+    );
+    assert_eq!(idle_events(&mut finite_rx), 0);
+}
+
+/// The two boundaries that rearm the edge are the two where admitted work
+/// really begins, and neither is a wake.
+#[tokio::test]
+async fn persistent_idle_latch_survives_until_admitted_work() {
+    let executor =
+        ParallelExecutor::new(PathBuf::from("/tmp/test-repo"), create_test_config(), None);
+
+    assert!(
+        executor.latch_persistent_idle(),
+        "the first latch of an episode is the edge"
+    );
+    assert!(
+        !executor.latch_persistent_idle(),
+        "a second latch in the same episode is not an edge"
+    );
+
+    executor.rearm_persistent_idle();
+    assert!(
+        executor.latch_persistent_idle(),
+        "a rearmed latch reports the next edge"
     );
 }
 

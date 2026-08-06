@@ -139,6 +139,15 @@ pub struct OrchestratorStateSnapshot {
     pub worktrees: Vec<WorktreeInfo>,
     /// Application mode (e.g., "select", "running", "stopped")
     pub app_mode: String,
+    /// Whether `app_mode: select` is a live persistent-scheduler idle episode
+    /// rather than ordinary pre-run selection.
+    ///
+    /// Process-local presentation state: it defaults to false, resets on
+    /// restart, and never authorizes a command. Shared run control validates
+    /// scheduler liveness on its own before executing anything this fact makes
+    /// discoverable.
+    #[serde(default)]
+    pub persistent_scheduler_idle: bool,
     /// Whether resolve is currently running
     pub is_resolving: bool,
     /// Sanitized fatal process-level error, kept distinct from a change's own
@@ -222,6 +231,7 @@ impl OrchestratorStateSnapshot {
             logs: Vec::new(),
             worktrees: Vec::new(),
             app_mode: "select".to_string(),
+            persistent_scheduler_idle: false,
             is_resolving: false,
             process_error: None,
             parallel: ParallelRuntimeState::default(),
@@ -715,17 +725,21 @@ impl WebState {
         drop(shared_state_opt); // Drop read lock
 
         // Preserve progress, queue_status, app_mode, and is_resolving from existing state
-        let (old_changes, old_app_mode, old_is_resolving) = {
+        let (old_changes, old_app_mode, old_persistent_idle, old_is_resolving) = {
             let old_state = self.state.read().await;
             (
                 old_state.changes.clone(),
                 old_state.app_mode.clone(),
+                old_state.persistent_scheduler_idle,
                 old_state.is_resolving,
             )
         };
 
-        // Preserve app_mode and is_resolving to prevent overwriting runtime state during refresh
+        // Preserve app_mode and is_resolving to prevent overwriting runtime state during refresh.
+        // The idle-episode fact travels with the mode it qualifies: a workspace
+        // refresh is not evidence that the scheduler stopped being idle.
         new_state.app_mode = old_app_mode.clone();
+        new_state.persistent_scheduler_idle = old_persistent_idle;
         new_state.is_resolving = old_is_resolving;
 
         for new_change in &mut new_state.changes {
@@ -783,13 +797,20 @@ impl WebState {
         new_state.app_mode = app_mode.to_string();
 
         // Preserve progress, queue_status, and is_resolving from existing state
-        let (old_changes, old_is_resolving) = {
+        let (old_changes, old_persistent_idle, old_is_resolving) = {
             let old_state = self.state.read().await;
-            (old_state.changes.clone(), old_state.is_resolving)
+            (
+                old_state.changes.clone(),
+                old_state.persistent_scheduler_idle,
+                old_state.is_resolving,
+            )
         };
 
-        // Preserve is_resolving to prevent overwriting runtime state
+        // Preserve is_resolving to prevent overwriting runtime state. The
+        // idle-episode fact is only meaningful under `select`, so a caller that
+        // publishes a different execution mode clears it with the mode.
         new_state.is_resolving = old_is_resolving;
+        new_state.persistent_scheduler_idle = old_persistent_idle && app_mode == "select";
 
         for new_change in &mut new_state.changes {
             if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
@@ -854,6 +875,32 @@ impl WebState {
         {
             let mut state = self.state.write().await;
             let mut updated = false;
+
+            // Typed work-start evidence owns the Ready-to-Running transition,
+            // and it runs before the per-variant arms so an arm that reads
+            // `app_mode` already sees the resumed one. This is one shared rule
+            // over many variants — the same rule the TUI applies — rather than
+            // bookkeeping copied into each arm.
+            //
+            // A Start notification, a queue notification, `AnalysisStarted`, and
+            // a catalog refresh are deliberately not admitted work: none of them
+            // proves anything is executing, so none may leave Ready.
+            if crate::events::is_admitted_work_start(event) {
+                state.persistent_scheduler_idle = false;
+                // A graceful stop that arrived first is still owed, so only
+                // Ready — never Stopping — becomes Running here.
+                if state.app_mode == "select" {
+                    state.app_mode = "running".to_string();
+                    updated = true;
+                }
+            } else if state.persistent_scheduler_idle
+                && matches!(
+                    event,
+                    ExecutionEvent::Stopped | ExecutionEvent::Error { .. }
+                )
+            {
+                state.persistent_scheduler_idle = false;
+            }
 
             match event {
                 // Lifecycle events
@@ -1108,10 +1155,25 @@ impl WebState {
 
                 // Completion events
                 ExecutionEvent::Stopping => {
+                    // The idle-episode fact is intentionally retained: a stop
+                    // requested from persistent-idle Ready is still that same
+                    // episode until work starts or the run terminates, which is
+                    // what lets cancel-stop return to Ready rather than Running.
                     state.app_mode = "stopping".to_string();
                 }
                 ExecutionEvent::Stopped => {
                     state.app_mode = "stopped".to_string();
+                }
+                // A persistent scheduler parked with nothing to execute. Ready
+                // here describes a *live* scheduler, so this shares nothing with
+                // the completion arm below: no success semantics, no row
+                // rewrite, and the guard leaves pre-run Select, a pending stop,
+                // and both terminal modes exactly as they are.
+                ExecutionEvent::PersistentSchedulerIdle => {
+                    if crate::events::persistent_idle_may_project_ready(&state.app_mode) {
+                        state.app_mode = "select".to_string();
+                        state.persistent_scheduler_idle = true;
+                    }
                 }
                 ExecutionEvent::AllCompleted => {
                     // Same rule the TUI applies: a late or duplicate completion
@@ -1155,6 +1217,41 @@ impl WebState {
         // against is the one this event just produced.
         self.project_execution_event(event, dispatch.ownership, dispatch.state)
             .await;
+    }
+
+    /// Project an accepted cancel-stop onto the monitoring snapshot.
+    ///
+    /// Cancel-stop withdraws a request; it does not start anything. Where the
+    /// frontend returns to therefore depends on where the stop came from: a stop
+    /// requested from persistent-idle Ready returns to Ready with its episode
+    /// intact, while a stop requested from a genuinely running scheduler returns
+    /// to Running. Claiming Running for the first case would advertise execution
+    /// that no typed work-start event has ever proved.
+    ///
+    /// Every frontend that can accept a cancel-stop routes it through here, so
+    /// TUI keypresses and `/api/v2` commands cannot disagree about the same run.
+    pub async fn project_stop_cancelled(&self) {
+        {
+            let mut state = self.state.write().await;
+            if state.app_mode != "stopping" {
+                return;
+            }
+            state.app_mode = if state.persistent_scheduler_idle {
+                "select".to_string()
+            } else {
+                "running".to_string()
+            };
+        }
+        self.sync_remote_control_projection().await;
+    }
+
+    /// Project an accepted graceful-stop request onto the monitoring snapshot.
+    ///
+    /// Routed through the ordinary dispatch so the stop reaches `/api/v2` as one
+    /// ordered `stopping` event at one revision, exactly as it does when the
+    /// request comes from a TUI keypress.
+    pub async fn project_stop_requested(&self) {
+        self.apply_execution_event(&ExecutionEvent::Stopping).await;
     }
 
     /// Update the process-local operator facts from one execution event.

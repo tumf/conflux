@@ -1419,6 +1419,11 @@ impl ParallelExecutor {
         retry_executor.hooks = self.hooks.clone();
         retry_executor.shared_orchestrator_state = self.shared_orchestrator_state.clone();
 
+        // Scheduler-owned base-lane work is admitted work too: a resolve or
+        // rejection review starting here ends the persistent-idle episode, so
+        // the next park emits a fresh idle edge.
+        self.rearm_persistent_idle();
+
         self.pending_merge_count.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let mut workspace_name = change_id.clone();

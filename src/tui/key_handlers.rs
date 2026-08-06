@@ -299,9 +299,19 @@ pub(crate) enum EscStopAction {
 }
 
 /// Decide the Esc stop action from typed TUI state only.
-pub(crate) fn esc_stop_action(mode: &AppExecutionMode, stop_mode: &StopMode) -> EscStopAction {
+///
+/// `persistent_scheduler_idle` is what separates the two kinds of Ready: pre-run
+/// Select has no scheduler to stop and Esc stays inert, while Ready backed by a
+/// live idle scheduler keeps the ordinary first-Esc graceful stop and, once that
+/// has projected Stopping, the ordinary second-Esc force stop.
+pub(crate) fn esc_stop_action(
+    mode: &AppExecutionMode,
+    stop_mode: &StopMode,
+    persistent_scheduler_idle: bool,
+) -> EscStopAction {
     match mode {
         AppExecutionMode::Running => EscStopAction::RequestGracefulStop,
+        AppExecutionMode::Select if persistent_scheduler_idle => EscStopAction::RequestGracefulStop,
         AppExecutionMode::Stopping if *stop_mode == StopMode::ImmediatePending => {
             EscStopAction::None
         }
@@ -311,7 +321,11 @@ pub(crate) fn esc_stop_action(mode: &AppExecutionMode, stop_mode: &StopMode) -> 
 }
 
 pub(crate) async fn handle_esc_key_inner(app: &mut AppState, cmd_tx: &mpsc::Sender<TuiCommand>) {
-    match esc_stop_action(&app.execution_mode, &app.stop_mode) {
+    match esc_stop_action(
+        &app.execution_mode,
+        &app.stop_mode,
+        app.persistent_scheduler_idle,
+    ) {
         EscStopAction::RequestGracefulStop => {
             // The stop effect itself belongs to the shared service, so the first
             // Esc enqueues the same command a remote `stop` submits. Recording
@@ -1756,11 +1770,15 @@ mod tests {
     #[test]
     fn idle_parallel_stop_second_esc_requests_the_shared_immediate_stop_command() {
         assert_eq!(
-            esc_stop_action(&AppExecutionMode::Running, &StopMode::None),
+            esc_stop_action(&AppExecutionMode::Running, &StopMode::None, false),
             EscStopAction::RequestGracefulStop
         );
         assert_eq!(
-            esc_stop_action(&AppExecutionMode::Stopping, &StopMode::GracefulPending),
+            esc_stop_action(
+                &AppExecutionMode::Stopping,
+                &StopMode::GracefulPending,
+                false
+            ),
             EscStopAction::RequestImmediateStop
         );
     }
@@ -1768,11 +1786,15 @@ mod tests {
     #[test]
     fn idle_parallel_stop_repeated_esc_does_not_duplicate_the_stop_request() {
         assert_eq!(
-            esc_stop_action(&AppExecutionMode::Stopping, &StopMode::ImmediatePending),
+            esc_stop_action(
+                &AppExecutionMode::Stopping,
+                &StopMode::ImmediatePending,
+                false
+            ),
             EscStopAction::None
         );
         assert_eq!(
-            esc_stop_action(&AppExecutionMode::Stopped, &StopMode::None),
+            esc_stop_action(&AppExecutionMode::Stopped, &StopMode::None, false),
             EscStopAction::None
         );
     }

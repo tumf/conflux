@@ -46,6 +46,28 @@ impl AppState {
         self.add_log(LogEntry::success("All changes processed successfully"));
     }
 
+    /// Project a persistent scheduler parking with no executable work.
+    ///
+    /// Ready here is a presentation of a *live* scheduler, not a finished run, so
+    /// this deliberately shares nothing with [`AppState::handle_all_completed`]:
+    /// no success log, no row rewrite, no queue/blocker/mark mutation, and no
+    /// elapsed-run bookkeeping. The only things that change are the execution
+    /// axis, the run-level "what is executing" pointer, and the process-local
+    /// idle-episode fact the live-scheduler controls key off.
+    ///
+    /// The guard is shared with the `/api/v2` projection so a late event cannot
+    /// leave the two frontends disagreeing: only `Running` becomes Ready, and
+    /// pre-run Select, a pending stop, and both terminal modes are left alone.
+    pub(crate) fn handle_persistent_scheduler_idle(&mut self) {
+        if !crate::events::persistent_idle_may_project_ready(self.execution_mode.app_mode_token()) {
+            return;
+        }
+
+        self.execution_mode = AppExecutionMode::Select;
+        self.persistent_scheduler_idle = true;
+        self.current_change = None;
+    }
+
     pub(crate) fn handle_change_archived(&mut self, id: String) {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
@@ -297,6 +319,168 @@ mod tests {
         app.handle_all_completed();
 
         assert_eq!(app.execution_mode, AppExecutionMode::Select);
+    }
+
+    /// Every non-mode fact a row carries, captured so before/after comparison
+    /// pins that the idle transition rewrote none of them.
+    fn row_facts(app: &AppState) -> Vec<(String, String, bool, Option<std::time::Duration>)> {
+        app.changes
+            .iter()
+            .map(|change| {
+                (
+                    change.id.clone(),
+                    change.display_status_cache.clone(),
+                    change.selected,
+                    change.elapsed_time,
+                )
+            })
+            .collect()
+    }
+
+    /// Verification `persistent-idle-ready-regressions`: a persistent scheduler
+    /// parking projects Ready without claiming completion.
+    #[test]
+    fn persistent_idle_projects_ready_without_completion() {
+        // Fully drained, and a blocked/stalled/waiting-only park, reach the same
+        // Ready presentation while every row keeps its reducer-derived facts.
+        for statuses in [
+            &["not queued", "archived"][..],
+            &["blocked", "stalled"][..],
+            &["merge wait", "resolve pending"][..],
+        ] {
+            let mut app = AppState::new(
+                statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| create_test_change(&format!("change-{index}"), 0, 1))
+                    .collect(),
+            );
+            app.execution_mode = AppExecutionMode::Running;
+            app.current_change = Some("change-0".to_string());
+            for (change, status) in app.changes.iter_mut().zip(statuses) {
+                change.set_display_status_cache(status);
+                change.selected = true;
+            }
+            // Marks are the shared store's to decide, so the arranged rows only
+            // hold after the store agrees with them; otherwise the reconciliation
+            // every orchestrator event runs would clear them and the assertion
+            // below would be measuring the fixture rather than the transition.
+            app.publish_execution_marks();
+            let before = row_facts(&app);
+            let logs_before = app.logs.len();
+
+            app.handle_orchestrator_event(OrchestratorEvent::PersistentSchedulerIdle);
+
+            assert_eq!(
+                app.execution_mode,
+                AppExecutionMode::Select,
+                "a parked persistent scheduler must present Ready for rows {statuses:?}"
+            );
+            assert!(app.persistent_scheduler_idle);
+            assert_eq!(app.current_change, None);
+            assert_eq!(
+                row_facts(&app),
+                before,
+                "the idle transition must not rewrite reducer-derived row facts"
+            );
+            assert_eq!(
+                app.logs.len(),
+                logs_before,
+                "an idle park is not a completion and adds no operator message"
+            );
+            assert!(
+                app.orchestration_elapsed.is_none(),
+                "a resumable park must not close out the run's elapsed time"
+            );
+        }
+    }
+
+    /// Ready is a *live* scheduler, so a mode that already describes a stop or a
+    /// failure outranks it.
+    #[test]
+    fn persistent_idle_retains_transitional_and_terminal_modes() {
+        for retained in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+            app.execution_mode = retained;
+
+            app.handle_orchestrator_event(OrchestratorEvent::PersistentSchedulerIdle);
+
+            assert_eq!(
+                app.execution_mode, retained,
+                "a late idle event overwrote {retained:?}"
+            );
+            assert!(
+                !app.persistent_scheduler_idle,
+                "a rejected transition must not claim an idle episode"
+            );
+        }
+    }
+
+    /// The episode ends only on typed evidence: admitted work resumes Running,
+    /// a terminal outcome clears it, and neither analysis nor a refresh does.
+    #[test]
+    fn persistent_idle_episode_ends_only_on_typed_evidence() {
+        let idle_app = || {
+            let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+            app.execution_mode = AppExecutionMode::Running;
+            app.handle_orchestrator_event(OrchestratorEvent::PersistentSchedulerIdle);
+            assert!(app.persistent_scheduler_idle);
+            app
+        };
+
+        for inert in [
+            OrchestratorEvent::AnalysisStarted {
+                remaining_changes: 1,
+                attempt_id: "attempt-1".to_string(),
+            },
+            OrchestratorEvent::WorktreesRefreshed { worktrees: vec![] },
+        ] {
+            let mut app = idle_app();
+            app.handle_orchestrator_event(inert);
+            assert_eq!(app.execution_mode, AppExecutionMode::Select);
+            assert!(
+                app.persistent_scheduler_idle,
+                "analysis and refresh are not execution evidence"
+            );
+        }
+
+        let mut app = idle_app();
+        app.handle_orchestrator_event(OrchestratorEvent::WorkspacePreparationStarted {
+            change_id: "change-a".to_string(),
+        });
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
+        assert!(!app.persistent_scheduler_idle);
+
+        // A graceful stop keeps the episode; work starting under it preserves
+        // Stopping and still closes the episode.
+        let mut app = idle_app();
+        app.execution_mode = AppExecutionMode::Stopping;
+        app.handle_orchestrator_event(OrchestratorEvent::Stopping);
+        assert!(app.persistent_scheduler_idle);
+        app.handle_orchestrator_event(OrchestratorEvent::WorkspacePreparationStarted {
+            change_id: "change-a".to_string(),
+        });
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopping);
+        assert!(!app.persistent_scheduler_idle);
+
+        for terminal in [
+            OrchestratorEvent::Stopped,
+            OrchestratorEvent::Error {
+                message: "boom".to_string(),
+            },
+        ] {
+            let mut app = idle_app();
+            app.handle_orchestrator_event(terminal);
+            assert!(
+                !app.persistent_scheduler_idle,
+                "a terminal outcome must close the idle episode"
+            );
+        }
     }
 
     /// `ChangeSkipped` for a failed dependency is a compatibility observation,

@@ -288,7 +288,15 @@ pub async fn handle_start_processing_command(ids: Vec<String>, ctx: &mut TuiComm
             scheduler,
             ..
         }) => {
-            ctx.app.begin_run(&change_ids);
+            // Only a newly spawned scheduler proves execution has begun. A
+            // notification woke a scheduler that was already alive — including
+            // one parked in persistent-idle Ready — and the work it will admit
+            // has not started yet, so the execution axis waits for the first
+            // typed work-start event instead of claiming Running here.
+            match scheduler {
+                SchedulerEffect::Started => ctx.app.begin_run(&change_ids),
+                _ => ctx.app.queue_run(&change_ids),
+            }
             let verb = match scheduler {
                 SchedulerEffect::Started => "Starting",
                 _ => "Queued for the running scheduler:",
@@ -535,18 +543,21 @@ pub async fn handle_tui_command(
             match ctx.run_control.cancel_stop(ctx.app.operator_mode()).await {
                 Ok(RunControlOutcome::StopCancelled) => {
                     ctx.app.stop_mode = StopMode::None;
-                    ctx.app.execution_mode = AppExecutionMode::Running;
+                    // Withdrawing a stop restores where the stop came from. A
+                    // stop requested from persistent-idle Ready returns to
+                    // Ready — nothing has started, and claiming Running would
+                    // advertise execution no typed event ever proved.
+                    ctx.app.execution_mode = if ctx.app.persistent_scheduler_idle {
+                        AppExecutionMode::Select
+                    } else {
+                        AppExecutionMode::Running
+                    };
                     ctx.app
                         .add_log(LogEntry::info("Stop canceled, continuing..."));
                     // Forward to web state immediately for web control API
                     #[cfg(feature = "web-monitoring")]
                     if let Some(ref web_state) = ctx.web_state {
-                        // Use ProcessingStarted with empty string to transition to running mode
-                        web_state
-                            .apply_execution_event(&OrchestratorEvent::ProcessingStarted(
-                                "".to_string(),
-                            ))
-                            .await;
+                        web_state.project_stop_cancelled().await;
                     }
                 }
                 Ok(other) => debug!("Cancel stop produced an unexpected outcome: {:?}", other),
@@ -2285,16 +2296,18 @@ mod tests {
 
         assert_eq!(app.execution_mode, AppExecutionMode::Stopping);
         assert_eq!(app.stop_mode, StopMode::GracefulPending);
+        // The wake follows the request: a scheduler already parked in its
+        // event-driven idle wait has no timer to notice the flag on its own.
         assert_eq!(
             harness.scheduler.calls(),
-            vec![SchedulerCall::GracefulStop(true)]
+            vec![SchedulerCall::GracefulStop(true), SchedulerCall::Notified]
         );
 
         // A second stop in Stopping mode is refused without a further effect.
         harness.run(&mut app, TuiCommand::Stop).await;
         assert_eq!(
             harness.scheduler.calls(),
-            vec![SchedulerCall::GracefulStop(true)]
+            vec![SchedulerCall::GracefulStop(true), SchedulerCall::Notified]
         );
         assert!(app
             .warning_message

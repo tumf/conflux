@@ -252,6 +252,15 @@ pub struct AppState {
     pub log_auto_scroll: bool,
     /// Current stop mode
     pub stop_mode: StopMode,
+    /// Whether Ready is currently backed by a live persistent-scheduler idle
+    /// episode rather than pre-run selection.
+    ///
+    /// Process-local presentation state, exactly like `execution_mode`: it
+    /// defaults to false, is discarded on restart, and never authorizes a
+    /// command. It only makes the live-scheduler controls discoverable —
+    /// [`crate::orchestration::run_control::RunControlService`] revalidates
+    /// scheduler liveness itself before executing any of them.
+    pub persistent_scheduler_idle: bool,
     /// VCS backend being used (git)
     pub vcs_backend: String,
     /// Max concurrent workspaces for worktree execution
@@ -531,6 +540,7 @@ impl AppState {
             log_scroll_offset: 0,
             log_auto_scroll: true,
             stop_mode: StopMode::None,
+            persistent_scheduler_idle: false,
             vcs_backend: "git".to_string(),
             max_concurrent: 4, // Default value, can be overridden from config
             orchestration_started_at: None,
@@ -1783,13 +1793,30 @@ impl AppState {
     /// intent; this only refreshes the row cache and the run-scoped UI state so
     /// the screen matches what was actually dispatched.
     pub fn begin_run(&mut self, change_ids: &[String]) {
+        self.admit_run_targets(change_ids);
+        self.execution_mode = AppExecutionMode::Running;
+    }
+
+    /// Project an accepted Start that only *woke* a live scheduler.
+    ///
+    /// The queue intent is real and the rows are queued, but nothing has been
+    /// admitted for execution yet: `SchedulerEffect::Notified` means the
+    /// scheduler was notified, not that it started anything. Claiming Running
+    /// here would make a Start against a persistent-idle scheduler report
+    /// execution the operator cannot see, so the execution axis is left for the
+    /// first typed work-start event to move.
+    pub fn queue_run(&mut self, change_ids: &[String]) {
+        self.admit_run_targets(change_ids);
+    }
+
+    /// Row cache and run-scoped presentation shared by both Start projections.
+    fn admit_run_targets(&mut self, change_ids: &[String]) {
         for change in &mut self.changes {
             if change_ids.iter().any(|id| id == &change.id) {
                 change.set_display_status_cache("queued");
             }
         }
         self.reset_for_run();
-        self.execution_mode = AppExecutionMode::Running;
         // The service resolved these targets *from* the shared marks, so the row
         // projection is read back from the store rather than written into it.
         self.sync_execution_marks_from_store();
