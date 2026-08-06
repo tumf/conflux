@@ -1737,7 +1737,7 @@ mod tests {
             .logs
             .iter()
             .any(|entry| entry.message.contains("cancelling local orchestration")));
-        let (handle, _) = supervisor.take_run();
+        let (handle, _, _) = supervisor.take_run();
         if let Some(handle) = handle {
             handle.abort();
         }

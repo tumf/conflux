@@ -57,7 +57,7 @@ pub use crate::vcs::Workspace;
 #[allow(unused_imports)]
 pub use merge::MergeAttempt;
 
-use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+use crate::ai_command_runner::{AiCommandRunner, RunCommandScope, SharedStaggerState};
 use crate::config::OrchestratorConfig;
 use crate::hooks::HookRunner;
 use crate::parallel::analysis_signature::{
@@ -223,6 +223,11 @@ pub struct ParallelExecutor {
     dynamic_queue: Option<Arc<crate::tui::queue::DynamicQueue>>,
     /// Shared AI command runner for stagger coordination
     ai_runner: AiCommandRunner,
+    /// Invocation-scoped ownership of every AI command this run launches.
+    ///
+    /// Ephemeral and process-local: it is created for one run, discarded when
+    /// that run ends, and never persisted or consulted for restart routing.
+    run_command_scope: RunCommandScope,
     /// Shared stagger state for resolve operations
     #[allow(dead_code)]
     shared_stagger_state: SharedStaggerState,
@@ -313,6 +318,13 @@ pub struct ParallelExecutor {
     /// and completed on demand — without spawning real detached merge tasks.
     #[cfg(test)]
     merge_result_channel_override: Option<(mpsc::Sender<MergeResult>, mpsc::Receiver<MergeResult>)>,
+    /// Override for the bounded run-command cleanup barrier.
+    ///
+    /// `None` uses the fixed 30-second production budget. Tests shorten it so
+    /// an unproven-cleanup path can be driven inside the default-suite time
+    /// budget; there is no user-facing configuration surface for it.
+    #[cfg(test)]
+    run_command_cleanup_budget_override: Option<std::time::Duration>,
     /// Explicit-target classification deferred to the post-checkpoint boundary.
     ///
     /// `None` is the ordinary path: explicit targets were already classified

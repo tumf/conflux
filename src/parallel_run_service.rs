@@ -4,7 +4,7 @@
 //! that can be used by both CLI and TUI orchestrators, eliminating
 //! code duplication between the two modes.
 
-use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+use crate::ai_command_runner::{AiCommandRunner, RunCommandScope, SharedStaggerState};
 use crate::analyzer::{ParallelGroup, ParallelizationAnalyzer};
 use crate::config::OrchestratorConfig;
 use crate::dependency_targets::union_metadata_dependencies;
@@ -45,6 +45,12 @@ pub struct ParallelRunService {
         Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     /// AI command runner for analyze commands
     ai_runner: AiCommandRunner,
+    /// Invocation-scoped ownership of every AI command this run launches.
+    ///
+    /// Created once per service and shared with the executor it builds, so
+    /// analyze, Apply, Archive, Acceptance, cleanup review, rejection review,
+    /// conflict resolve, and upstream repair all report into one barrier.
+    run_command_scope: RunCommandScope,
     /// Runtime-only observability dedupe for stable analyzer failure signatures.
     diagnostic_dedup: AnalysisDiagnosticStore,
     /// Invocation-scoped upstream integration runtime.
@@ -61,8 +67,12 @@ impl ParallelRunService {
     /// Create a new parallel run service
     pub fn new(repo_root: PathBuf, config: OrchestratorConfig) -> Self {
         let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
-        let ai_runner =
-            AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
+        let run_command_scope = RunCommandScope::new();
+        let ai_runner = AiCommandRunner::for_run(
+            &config,
+            shared_stagger_state.clone(),
+            run_command_scope.clone(),
+        );
 
         let shared_orchestrator_state = Arc::new(tokio::sync::RwLock::new(
             crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
@@ -76,6 +86,7 @@ impl ParallelRunService {
             post_archive_action: PostArchiveAction::MergeToBase,
             shared_orchestrator_state,
             ai_runner,
+            run_command_scope,
             diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
             upstream_integration: None,
             explicit_target_plan: None,
@@ -88,8 +99,12 @@ impl ParallelRunService {
         config: OrchestratorConfig,
         shared_stagger_state: SharedStaggerState,
     ) -> Self {
-        let ai_runner =
-            AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
+        let run_command_scope = RunCommandScope::new();
+        let ai_runner = AiCommandRunner::for_run(
+            &config,
+            shared_stagger_state.clone(),
+            run_command_scope.clone(),
+        );
 
         let shared_orchestrator_state = Arc::new(tokio::sync::RwLock::new(
             crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
@@ -103,6 +118,7 @@ impl ParallelRunService {
             post_archive_action: PostArchiveAction::MergeToBase,
             shared_orchestrator_state,
             ai_runner,
+            run_command_scope,
             diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
             upstream_integration: None,
             explicit_target_plan: None,
@@ -150,7 +166,7 @@ impl ParallelRunService {
     /// is constructed on the default-off path.
     fn install_upstream_integration(&self, executor: &mut ParallelExecutor) {
         if let Some(runtime) = &self.upstream_integration {
-            executor.set_upstream_integration(runtime.clone(), self.shared_stagger_state.clone());
+            executor.set_upstream_integration(runtime.clone());
         }
         if let Some(plan) = &self.explicit_target_plan {
             executor.set_explicit_target_plan(plan.clone());
@@ -168,6 +184,19 @@ impl ParallelRunService {
         shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     ) {
         self.shared_orchestrator_state = shared_state;
+    }
+
+    /// The invocation scope owning every AI command this service launches.
+    #[allow(dead_code)] // Read by scope-ownership coverage; the run owner injects its own.
+    pub fn run_command_scope(&self) -> RunCommandScope {
+        self.run_command_scope.clone()
+    }
+
+    /// Adopt a scope created by the run owner (the local TUI supervisor), so a
+    /// clone survives outside the spawned orchestrator task.
+    pub fn set_run_command_scope(&mut self, scope: RunCommandScope) {
+        self.ai_runner.set_run_command_scope(scope.clone());
+        self.run_command_scope = scope;
     }
 
     /// Check that a usable Git workspace is available for worktree execution.
@@ -216,6 +245,7 @@ impl ParallelRunService {
             shared_queue_change,
             Some(self.shared_stagger_state.clone()),
         );
+        executor.set_run_command_scope(self.run_command_scope.clone());
         executor.set_no_resume(self.no_resume);
         executor.set_post_archive_action(self.post_archive_action.clone());
         self.install_upstream_integration(&mut executor);
@@ -389,6 +419,7 @@ impl ParallelRunService {
             None,
             Some(self.shared_stagger_state.clone()),
         );
+        executor.set_run_command_scope(self.run_command_scope.clone());
         executor.set_no_resume(self.no_resume);
         executor.set_shared_orchestrator_state(self.shared_orchestrator_state.clone());
         self.install_upstream_integration(&mut executor);

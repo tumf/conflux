@@ -24,7 +24,7 @@ pub mod web;
 // Internal modules required by public modules
 mod acceptance;
 mod agent;
-mod ai_command_runner;
+pub mod ai_command_runner;
 mod analyzer;
 mod archive_layout;
 mod cli;

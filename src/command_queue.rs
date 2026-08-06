@@ -136,6 +136,21 @@ impl CommandQueue {
     where
         F: FnOnce() -> Command,
     {
+        self.wait_for_stagger_slot().await;
+
+        // Execute command
+        let mut cmd = command_fn();
+        cmd.spawn().map_err(OrchestratorError::Io)
+    }
+
+    /// Wait out the stagger delay and claim this execution's slot.
+    ///
+    /// Split out from [`Self::execute_with_stagger`] so a caller that must
+    /// serialize the spawn itself against a separate admission gate can hold
+    /// that gate across `spawn` alone. The shared-timestamp semantics are
+    /// unchanged: the slot is claimed under the shared lock, which is released
+    /// before the process is created either way.
+    pub async fn wait_for_stagger_slot(&self) {
         let mut last = self.last_execution.lock().await;
 
         if let Some(last_time) = *last {
@@ -151,11 +166,6 @@ impl CommandQueue {
 
         // Update execution time
         *last = Some(Instant::now());
-        drop(last);
-
-        // Execute command
-        let mut cmd = command_fn();
-        cmd.spawn().map_err(OrchestratorError::Io)
     }
 
     /// Check if an error message matches retryable patterns

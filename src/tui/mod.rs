@@ -13,7 +13,7 @@ mod events;
 mod key_handlers;
 pub mod lifecycle;
 pub mod log_deduplicator;
-mod orchestrator;
+pub(crate) mod orchestrator;
 mod qr;
 pub mod queue;
 mod render;
@@ -29,3 +29,13 @@ mod worktrees;
 
 // Public API re-exports
 pub use runner::run_tui;
+/// Local-shutdown surface reused by the heavy process-cleanup regressions.
+///
+/// The TUI's quit path is where a run-owned process group can survive a task
+/// abort, so the deterministic Unix coverage for it drives this exact function
+/// rather than a reimplementation of it.
+#[allow(unused_imports)] // The binary target compiles this tree privately.
+pub use runner::{
+    shutdown_local_orchestrator_task, LocalOrchestratorShutdownOutcome,
+    LOCAL_ORCHESTRATOR_SHUTDOWN_GRACE,
+};
