@@ -4318,8 +4318,8 @@ mod tests {
     /// the wait: the conservative `stalled` fallback that rejection and legacy
     /// apply handoffs depend on is unchanged, and it invents no external facts.
     #[test]
-    fn structured_blocker_metadata_survives_workspace_blocked_fallback_stays_generic_without_a_hold()
-    {
+    fn structured_blocker_metadata_survives_workspace_blocked_fallback_stays_generic_without_a_hold(
+    ) {
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
         state.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
             change_id: "c".to_string(),

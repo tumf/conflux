@@ -1406,7 +1406,10 @@ async fn external_blocker_hold_survives_dispatch_status_and_refuses_a_non_resuma
     let guard = fixture.state.read().await;
     assert_eq!(guard.display_status("change-a"), "blocked");
     let after = guard.blocker_view("change-a").expect("retained evidence");
-    assert_eq!(after, before, "a refused retry discards no blocker evidence");
+    assert_eq!(
+        after, before,
+        "a refused retry discards no blocker evidence"
+    );
     assert!(!after.resumable);
     assert!(guard.externally_blocked_change_ids().contains("change-a"));
     assert!(
