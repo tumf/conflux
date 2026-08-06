@@ -1,0 +1,15 @@
+## Implementation Tasks
+
+- [ ] Implement one reducer-owned process-stop reconciliation in `src/orchestration/state.rs`. Completion requires `ExecutionEvent::Stopped` to reset every non-terminal row carrying activity, queue intent, or wait/hold state to idle `NotQueued` with no wait/blocker/commit or scheduler-owned retry membership, establish stale-event suppression until explicit requeue, preserve fresh idle rows and all existing terminal outcomes, and never create per-change `TerminalState::Stopped`. Add the `global_stopped_reconciles_interrupted_runtime` table-driven regression covering all activity/wait families, queued intent, terminal/fresh-idle exclusions, duplicate stop, late lifecycle delivery, and explicit requeue. (verification: unit - `cargo test --lib global_stopped_reconciles_interrupted_runtime`; verification-id: stopped-reconciliation-regressions)
+
+- [ ] Route process-level `Stopped` through reducer-derived TUI display synchronization and remove independent TUI row lifecycle ownership from the local stopped handler while preserving mode, timing, controls, elapsed values, and exactly-once `Processing stopped` logging. Add `stopped_reducer_sync_prevents_accepting_resurrection`, traversing authoritative `AcceptanceStarted` and `Stopped` dispatch, reducer-cache synchronization, local event handling, and a later `ChangesRefreshed`; completion requires `not queued` to survive the full order and the execution mark to remain set. (verification: integration - `cargo test --lib stopped_reducer_sync_prevents_accepting_resurrection`; verification-id: stopped-reconciliation-regressions)
+
+- [ ] Verify `/api/v2` consumes the same stopped dispatch state without frontend repair logic. Add `stopped_projection_reconciles_change_status` covering an accepting row becoming `display_status: not queued` with `queue_intent: not_queued`, unchanged execution mark, one state revision for the first stop, and no additional revision for duplicate `Stopped`; completion requires the test to use the authoritative event-dispatch boundary rather than mutating the projected snapshot directly. (verification: integration - `cargo test --lib stopped_projection_reconciles_change_status`; verification-id: stopped-reconciliation-regressions)
+
+## Final Validation
+
+Archive validation is the authoritative final OpenSpec gate. Expected archive gate: `cflx openspec validate fix-force-stop-reducer-reconciliation --archive-gate`.
+
+## Future Work
+
+- Consider removing unused per-change terminal stopped vocabulary only in a separate compatibility change after all producer and API references are audited.
