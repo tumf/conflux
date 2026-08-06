@@ -8111,6 +8111,110 @@ async fn in_memory_stalled_change_is_not_requeued_until_its_hold_is_cleared() {
     );
 }
 
+/// The external-blocker branch in `dispatch.rs` emits `AcceptanceGated` and then
+/// the compatibility `WorkspaceStatusUpdated { Blocked }` on the same channel.
+///
+/// The TUI boundary owns an `EventDispatcher` that reduces *both* events, so the
+/// ordered pair — not the structured event alone — is what queue classification
+/// actually sees. (The headless CLI path records the structured hold directly
+/// through `record_stall_in_shared_state` and forwards channel events to the Web
+/// projection without reducing them a second time, which is why this
+/// reducer-owning boundary is the one under test.)
+///
+/// Before monotonic reducer precedence the second event rebuilt the hold as a
+/// generic stall, both held sets went empty, and the unchanged applied workspace
+/// became an ordinary dispatchable candidate that would repeat Acceptance.
+#[tokio::test]
+async fn external_blocker_hold_survives_dispatch_status_through_the_tui_event_dispatcher() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    let change_id = "external-blocked-dispatch";
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
+        vec![change_id.to_string()],
+        1,
+    )));
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+
+    let dispatcher =
+        crate::events::EventDispatcher::new(shared.clone(), crate::events::cli_event_sinks());
+
+    // Exactly the ordered pair the external-blocker branch produces.
+    dispatcher
+        .dispatch(ExecutionEvent::AcceptanceGated {
+            change_id: change_id.to_string(),
+            blocker: crate::events::StalledBlocker::acceptance_external(
+                "credential",
+                "STAGING_API_KEY is unset",
+            ),
+        })
+        .await;
+    dispatcher
+        .dispatch(ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: change_id.to_string(),
+            workspace_name: format!("ws-{change_id}"),
+            status: WorkspaceStatus::Blocked,
+        })
+        .await;
+
+    {
+        let guard = shared.read().await;
+        assert_eq!(guard.display_status(change_id), "blocked");
+        let view = guard
+            .blocker_view(change_id)
+            .or_fail("the hold must survive the compatibility status event");
+        assert_eq!(
+            view.kind,
+            crate::orchestration::state::BlockerKind::External,
+            "the generic status must not downgrade the blocker kind"
+        );
+        assert_eq!(view.origin.as_deref(), Some("acceptance"));
+        assert!(view.unblock_condition.is_some());
+        assert!(view.resumable);
+        assert_eq!(
+            guard.externally_blocked_change_ids(),
+            HashSet::from([change_id.to_string()])
+        );
+    }
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let queued = vec![make_test_change(change_id)];
+    let classification = executor
+        .classify_queued_work(&queued, &HashSet::new())
+        .await;
+
+    assert_eq!(
+        classification.class_for(change_id),
+        Some(crate::parallel::queue_state::QueuedWorkClass::AcceptanceStalled),
+        "the held change must stay held after the compatibility status event"
+    );
+    assert!(
+        !classification.has_dispatchable_apply(),
+        "an unchanged applied workspace must not automatically repeat acceptance"
+    );
+    assert!(classification.has_blocked_or_waiting_work());
+
+    // The hold is a wait, not a wall: an explicit retry still releases it.
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+    let after_retry = executor
+        .classify_queued_work(&queued, &HashSet::new())
+        .await;
+    assert_ne!(
+        after_retry.class_for(change_id),
+        Some(crate::parallel::queue_state::QueuedWorkClass::AcceptanceStalled),
+        "an explicit retry must release the preserved hold"
+    );
+}
+
 /// A restart is modelled by a fresh reducer: no hold exists, so the same queued
 /// change is dispatchable again and acceptance decides its fate.
 #[tokio::test]

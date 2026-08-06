@@ -1297,6 +1297,168 @@ async fn operator_command_retry_reruns_an_externally_blocked_change() {
     );
 }
 
+/// Apply the compatibility workspace status the external-blocker dispatch
+/// branch emits right after its structured event.
+async fn observe_generic_blocked_workspace(fixture: &Fixture, change_id: &str) {
+    fixture
+        .state
+        .write()
+        .await
+        .apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: change_id.to_string(),
+            workspace_name: format!("ws-{change_id}"),
+            status: crate::vcs::WorkspaceStatus::Blocked,
+        });
+}
+
+/// Retry admission is decided after the *full* producer sequence, not after the
+/// structured event alone. A preserved resumable external hold keeps routing to
+/// the existing blocked-phase retry, and its projected evidence is unchanged.
+#[tokio::test]
+async fn external_blocker_hold_survives_dispatch_status_and_stays_explicitly_retryable() {
+    let fixture = fixture(&["change-a"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "change-a".to_string(),
+            blocker: external_prerequisite_blocker(),
+        });
+    }
+    let before = fixture
+        .state
+        .read()
+        .await
+        .blocker_view("change-a")
+        .expect("the structured event establishes the blocker view");
+
+    observe_generic_blocked_workspace(&fixture, "change-a").await;
+
+    {
+        let guard = fixture.state.read().await;
+        assert_eq!(
+            guard.display_status("change-a"),
+            "blocked",
+            "the generic observation must not downgrade the wait"
+        );
+        let after = guard.blocker_view("change-a").expect("preserved hold");
+        assert_eq!(
+            after, before,
+            "every projected blocker field stays reducer-derived and unchanged"
+        );
+        assert_eq!(
+            after.kind,
+            crate::orchestration::state::BlockerKind::External
+        );
+        assert_eq!(after.prerequisite_owner.as_deref(), Some("platform"));
+        assert!(after.resumable);
+        assert!(guard.externally_blocked_change_ids().contains("change-a"));
+    }
+
+    let plan = fixture
+        .service
+        .retry_change("change-a")
+        .await
+        .expect("a preserved external prerequisite wait is explicitly retryable");
+    assert_eq!(plan.change_ids, ["change-a"]);
+    assert_eq!(plan.routes, vec![RetryRoute::AcceptanceStall]);
+    assert!(plan.explicit_retry, "the blocked phase must run again");
+
+    let guard = fixture.state.read().await;
+    assert_eq!(guard.display_status("change-a"), "queued");
+    assert!(guard.externally_blocked_change_ids().is_empty());
+}
+
+/// The same sequence with a non-resumable hold: retry is still refused, and the
+/// refusal must not consume the evidence the operator owns. Losing resumability
+/// to the generic observation would have made this hold silently retryable.
+#[tokio::test]
+async fn external_blocker_hold_survives_dispatch_status_and_refuses_a_non_resumable_retry() {
+    let fixture = fixture(&["change-a"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "change-a".to_string(),
+            blocker: StalledBlocker {
+                resumable: false,
+                ..external_prerequisite_blocker()
+            },
+        });
+    }
+    let before = fixture
+        .state
+        .read()
+        .await
+        .blocker_view("change-a")
+        .expect("the structured event establishes the blocker view");
+
+    observe_generic_blocked_workspace(&fixture, "change-a").await;
+
+    let plan = fixture
+        .service
+        .retry_change("change-a")
+        .await
+        .expect("refusal is not an error");
+    assert!(
+        plan.change_ids.is_empty() && plan.routes.is_empty() && !plan.explicit_retry,
+        "a non-resumable hold must dispatch nothing"
+    );
+
+    let guard = fixture.state.read().await;
+    assert_eq!(guard.display_status("change-a"), "blocked");
+    let after = guard.blocker_view("change-a").expect("retained evidence");
+    assert_eq!(
+        after, before,
+        "a refused retry discards no blocker evidence"
+    );
+    assert!(!after.resumable);
+    assert!(guard.externally_blocked_change_ids().contains("change-a"));
+    assert!(
+        fixture.queue.explicit_retries().is_empty(),
+        "a refused retry publishes no edge"
+    );
+}
+
+/// An Acceptance-owned non-external stall keeps the same guarantees: it remains
+/// `stalled`, keeps its Acceptance ownership, and stays retryable.
+#[tokio::test]
+async fn external_blocker_hold_survives_dispatch_status_for_an_acceptance_owned_stall() {
+    let fixture = fixture(&["change-a"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "change-a".to_string(),
+            blocker: acceptance_blocker(),
+        });
+    }
+    let before = fixture
+        .state
+        .read()
+        .await
+        .blocker_view("change-a")
+        .expect("the structured event establishes the blocker view");
+
+    observe_generic_blocked_workspace(&fixture, "change-a").await;
+
+    {
+        let guard = fixture.state.read().await;
+        assert_eq!(guard.display_status("change-a"), "stalled");
+        assert_eq!(
+            guard.blocker_view("change-a").as_ref(),
+            Some(&before),
+            "the Acceptance-owned hold keeps its guidance and resumability"
+        );
+        assert!(guard.acceptance_stalled_change_ids().contains("change-a"));
+    }
+
+    let plan = fixture
+        .service
+        .retry_change("change-a")
+        .await
+        .expect("a preserved resumable acceptance hold is retryable");
+    assert_eq!(plan.routes, vec![RetryRoute::AcceptanceStall]);
+    assert!(plan.explicit_retry);
+}
+
 /// A dependency wait is not explicitly retryable: it clears when the dependency
 /// completes, so a retry request must not be routed as an acceptance hold even
 /// though both waits display as `blocked`.
