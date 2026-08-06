@@ -3,6 +3,9 @@
 //! This module provides functions for creating, managing, and querying Git commits.
 
 use super::basic::run_git;
+use super::status_policy::{
+    read_only_status_argv, CHANGE_MONITOR_STATUS_ARGS, PORCELAIN_STATUS_ARGS,
+};
 use crate::events::CommitOutputStream;
 use crate::vcs::commands::{run_vcs_command_captured, run_vcs_command_streamed, VcsCommandOutput};
 use crate::vcs::{CommitRejection, VcsBackend, VcsError, VcsResult, VerifiedCommitOutcome};
@@ -303,24 +306,24 @@ pub async fn list_changes_in_head<P: AsRef<Path>>(cwd: P) -> VcsResult<Vec<Strin
 }
 
 /// Check if there are staged or unstaged changes to commit.
+///
+/// Read-only, so it runs under the shared optional-lock policy: see
+/// [`crate::vcs::git::commands::status_policy`].
 #[allow(dead_code)]
 pub async fn has_changes_to_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
-    let output = run_git(&["status", "--porcelain"], cwd).await?;
+    let output = run_git(&read_only_status_argv(PORCELAIN_STATUS_ARGS), cwd).await?;
     Ok(!output.is_empty())
 }
 
 /// Argv of the read-oriented repository monitoring query.
 ///
-/// `--no-optional-locks` is a Git *global* option, so it must come before the
-/// `status` subcommand; Git rejects it once the subcommand has been parsed.
-/// Without it, `git status` may take `.git/index.lock` just to persist a
-/// refreshed stat cache, which contends with hooks and release commits that
-/// mutate the same repository.
-///
-/// Suppression is deliberately expressed as a child-command argument rather
-/// than a `GIT_OPTIONAL_LOCKS` environment variable: the environment would be
-/// process-wide and would also weaken repo-mutating Git commands.
-const UNCOMMITTED_MONITOR_ARGV: [&str; 4] = ["--no-optional-locks", "status", "--porcelain", "-u"];
+/// Built from the shared read-only status policy, so the global
+/// `--no-optional-locks` option always precedes the `status` subcommand and the
+/// suppression stays child-command-local. See
+/// [`crate::vcs::git::commands::status_policy`] for why both properties matter.
+fn uncommitted_monitor_argv() -> Vec<&'static str> {
+    read_only_status_argv(CHANGE_MONITOR_STATUS_ARGS)
+}
 
 /// List change IDs that have uncommitted or untracked files under `openspec/changes/<change_id>/`.
 ///
@@ -331,7 +334,7 @@ const UNCOMMITTED_MONITOR_ARGV: [&str; 4] = ["--no-optional-locks", "status", "-
 ///
 /// The query is read-oriented monitoring (TUI refresh, parallel startup, queue
 /// filtering), so it reports a point-in-time observation and never persists an
-/// optional index refresh. See [`UNCOMMITTED_MONITOR_ARGV`].
+/// optional index refresh. See [`uncommitted_monitor_argv`].
 ///
 /// Returns a sorted vector of change IDs that have uncommitted modifications.
 pub async fn list_changes_with_uncommitted_files<P: AsRef<Path>>(cwd: P) -> VcsResult<Vec<String>> {
@@ -339,7 +342,7 @@ pub async fn list_changes_with_uncommitted_files<P: AsRef<Path>>(cwd: P) -> VcsR
 
     // Get all files with uncommitted changes or untracked status
     // Use -u to show individual untracked files instead of just directories
-    let output = run_git(&UNCOMMITTED_MONITOR_ARGV, cwd_ref).await?;
+    let output = run_git(&uncommitted_monitor_argv(), cwd_ref).await?;
 
     let mut change_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -849,17 +852,18 @@ mod tests {
 
     #[test]
     fn uncommitted_monitor_argv_disables_optional_locks_before_subcommand() {
+        let argv = uncommitted_monitor_argv();
         assert_eq!(
-            UNCOMMITTED_MONITOR_ARGV,
+            argv,
             ["--no-optional-locks", "status", "--porcelain", "-u"],
             "monitoring argv must stay exactly `--no-optional-locks status --porcelain -u`"
         );
 
-        let option_index = UNCOMMITTED_MONITOR_ARGV
+        let option_index = argv
             .iter()
             .position(|arg| *arg == "--no-optional-locks")
             .expect("monitoring argv must disable optional locks");
-        let subcommand_index = UNCOMMITTED_MONITOR_ARGV
+        let subcommand_index = argv
             .iter()
             .position(|arg| *arg == "status")
             .expect("monitoring argv must run the status subcommand");
@@ -993,7 +997,7 @@ mod tests {
                 "change-untracked".to_string(),
             ],
             "classification drifted; raw status was: {:?}",
-            run_git(&UNCOMMITTED_MONITOR_ARGV, root).await.unwrap()
+            run_git(&uncommitted_monitor_argv(), root).await.unwrap()
         );
     }
 

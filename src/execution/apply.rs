@@ -28,6 +28,9 @@ use crate::history::{bounded_output_tail, ApplyOrchestrationFeedback, OutputColl
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
+use crate::vcs::git::commands::status_policy::{
+    read_only_status_command_display, DIRTY_STATE_STATUS_ARGS,
+};
 use crate::vcs::{CommitRejection, VcsBackend, VcsResult, VerifiedCommitOutcome, WorkspaceManager};
 use std::fs;
 use std::future::Future;
@@ -894,9 +897,30 @@ fn final_commit_rejection_feedback(rejection: &CommitRejection) -> ApplyOrchestr
 pub type FinalCommitSink<'a> = &'a (dyn Fn(u32, CommitOutputStream, &str) + Send + Sync);
 
 /// The porcelain query the finalization stage gate reads, rendered exactly the
-/// way [`crate::vcs::git::commands::has_uncommitted_changes`] issues it.
-const STAGE_GATE_STATUS_COMMAND: &str =
-    "git status --porcelain --untracked-files=normal --ignored=no";
+/// way [`crate::vcs::git::commands::porcelain_status`] issues it.
+///
+/// It is a read-only observation, so it carries the shared optional-lock policy
+/// (see [`crate::vcs::git::commands::status_policy`]) and the operator-facing
+/// text has to show that. Rendering it from the same argument set the reader
+/// passes is what makes drift impossible rather than merely detectable.
+fn stage_gate_status_command() -> String {
+    read_only_status_command_display(DIRTY_STATE_STATUS_ARGS)
+}
+
+#[cfg(test)]
+mod native_git_status_optional_locks {
+    /// The stage-gate feedback names the command Conflux actually ran, so the
+    /// rendered text is pinned to the exact argv `porcelain_status` issues.
+    #[test]
+    fn stage_gate_status_command_matches_the_argv_it_describes() {
+        assert_eq!(
+            super::stage_gate_status_command(),
+            "git --no-optional-locks status --porcelain --untracked-files=normal --ignored=no",
+            "the operator-facing stage-gate command drifted from the argv \
+             `porcelain_status` issues"
+        );
+    }
+}
 
 /// Where a failed stage gate was observed.
 ///
@@ -997,7 +1021,7 @@ fn incomplete_stage_feedback(
     ApplyOrchestrationFeedback {
         kind: ApplyOrchestrationFeedback::INCOMPLETE_STAGE,
         summary,
-        command: Some(STAGE_GATE_STATUS_COMMAND.to_string()),
+        command: Some(stage_gate_status_command()),
         exit_code: Some(0),
         stdout_tail: Some(status.bounded_paths_report()),
         stderr_tail: None,
@@ -1035,7 +1059,7 @@ fn unreadable_stage_feedback(error: &str, origin: StageGateOrigin) -> ApplyOrche
     ApplyOrchestrationFeedback {
         kind: ApplyOrchestrationFeedback::INCOMPLETE_STAGE,
         summary: summary.to_string(),
-        command: Some(STAGE_GATE_STATUS_COMMAND.to_string()),
+        command: Some(stage_gate_status_command()),
         exit_code: None,
         stdout_tail: None,
         stderr_tail: bounded_output_tail(error),

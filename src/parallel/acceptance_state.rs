@@ -29,6 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 use crate::error::{OrchestratorError, Result};
+use crate::vcs::git::commands::status_policy::{
+    read_only_status_argv, PATH_SCOPED_PORCELAIN_STATUS_ARGS,
+};
 
 const BLOCKED_MARKER_FILE: &str = "APPLY_BLOCKED/marker.md";
 const MARKER_VERSION: &str = "acceptance-stalled-v1";
@@ -691,9 +694,10 @@ fn marker_is_tracked(workspace_path: &Path, change_id: &str) -> bool {
 /// for it, leaving no residue behind. Any unexpected sibling file keeps the
 /// directory, so nothing a human placed there is destroyed.
 ///
-/// The removal is verified: `git status --porcelain` scoped to the marker
-/// directory must come back empty, so a migration can never silently hand back a
-/// dirty managed worktree.
+/// The removal is verified: a path-scoped read-only porcelain status must come
+/// back empty, so a migration can never silently hand back a dirty managed
+/// worktree. The observation is read-only, so it carries the shared
+/// optional-lock policy: see [`crate::vcs::git::commands::status_policy`].
 #[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 fn remove_generated_marker(workspace_path: &Path, change_id: &str) -> Result<()> {
     let path = marker_path(workspace_path, change_id);
@@ -715,7 +719,7 @@ fn verify_marker_removal_left_worktree_clean(workspace_path: &Path, path: &Path)
         return Ok(());
     };
     let output = std::process::Command::new("git")
-        .args(["status", "--porcelain", "--"])
+        .args(read_only_status_argv(PATH_SCOPED_PORCELAIN_STATUS_ARGS))
         .arg(marker_dir)
         .current_dir(workspace_path)
         .output();
@@ -1034,6 +1038,76 @@ mod tests {
         assert!(
             source.contains("#[cfg(test)]\n#[allow(clippy::too_many_arguments)]\npub fn write_legacy_acceptance_marker"),
             "the only marker writer left must be the test-only legacy fixture helper"
+        );
+    }
+}
+
+/// Coverage for the path-scoped residue check after it moved onto the shared
+/// read-only `git status` optional-lock policy.
+///
+/// The check is the only remaining native status observation in this module, so
+/// its output contract and its fail-closed behavior are asserted directly.
+#[cfg(test)]
+mod native_git_status_optional_locks {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "cflx")
+            .env("GIT_AUTHOR_EMAIL", "cflx@example.com")
+            .env("GIT_COMMITTER_NAME", "cflx")
+            .env("GIT_COMMITTER_EMAIL", "cflx@example.com")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn repo_with_marker(tracked: bool) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        fs::write(root.join("README.md"), "base\n").unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-q", "-m", "base"]);
+
+        let marker = marker_path(root, "change-a");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, "blocked\n").unwrap();
+        if tracked {
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-q", "-m", "tracked marker"]);
+        }
+        dir
+    }
+
+    /// Generated residue removal still reports success when the scoped status
+    /// comes back empty.
+    #[test]
+    fn generated_marker_removal_still_verifies_clean() {
+        let dir = repo_with_marker(false);
+        remove_generated_marker(dir.path(), "change-a").expect("untracked residue removes cleanly");
+        assert!(!marker_path(dir.path(), "change-a").exists());
+    }
+
+    /// Removing tracked content leaves a git-visible deletion, and the check
+    /// must still fail closed rather than report a clean worktree.
+    #[test]
+    fn tracked_marker_removal_still_fails_closed() {
+        let dir = repo_with_marker(true);
+        let error = remove_generated_marker(dir.path(), "change-a")
+            .expect_err("a tracked deletion is git-visible residue");
+        assert!(
+            format!("{error}").contains("left the worktree dirty"),
+            "the residue failure must keep its message: {error}"
         );
     }
 }
