@@ -152,7 +152,7 @@ pub async fn resolve_conflicts_with_retry(
     change_ids: &[String],
     vcs_error: &str,
     max_retries: u32,
-    shared_stagger_state: crate::ai_command_runner::SharedStaggerState,
+    ai_runner: crate::ai_command_runner::AiCommandRunner,
     auto_resolve_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::result::Result<(), ResolveFailure> {
     // Create RAII guard to ensure counter is decremented on all exit paths
@@ -181,9 +181,9 @@ pub async fn resolve_conflicts_with_retry(
     // Create a combined change_id for logging (join multiple IDs if present)
     let combined_change_id = change_ids.join("+");
 
-    // Create AiCommandRunner for resolve command execution
-    use crate::ai_command_runner::AiCommandRunner;
-    let ai_runner = AiCommandRunner::from_orchestrator_config(config, shared_stagger_state.clone());
+    // The invocation's scoped runner is reused as-is: constructing one from
+    // the stagger timestamp alone would launch a resolve command that no run
+    // cleanup barrier owns.
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
     let initial_resolve_prompt = crate::agent::append_optional_prompt(
@@ -395,7 +395,7 @@ pub struct ResolveMergesWithRetryArgs<'a> {
     pub target_branch: &'a str,
     pub base_revision: &'a str,
     pub max_retries: u32,
-    pub shared_stagger_state: crate::ai_command_runner::SharedStaggerState,
+    pub ai_runner: crate::ai_command_runner::AiCommandRunner,
     pub auto_resolve_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Upstream publication, not local integration, owns the change's terminal
     /// success for this cumulative merge.
@@ -482,7 +482,7 @@ pub async fn resolve_merges_with_retry(
         target_branch,
         base_revision,
         max_retries,
-        shared_stagger_state,
+        ai_runner,
         auto_resolve_count,
         publication_owns_completion,
     } = args;
@@ -592,9 +592,9 @@ pub async fn resolve_merges_with_retry(
     // Create a combined change_id for logging (join multiple IDs if present)
     let combined_change_id = change_ids.join("+");
 
-    // Create AiCommandRunner for resolve command execution
-    use crate::ai_command_runner::AiCommandRunner;
-    let ai_runner = AiCommandRunner::from_orchestrator_config(config, shared_stagger_state.clone());
+    // The invocation's scoped runner is reused as-is: constructing one from
+    // the stagger timestamp alone would launch a resolve command that no run
+    // cleanup barrier owns.
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
     let initial_resolve_prompt = crate::agent::append_optional_prompt(

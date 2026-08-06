@@ -444,11 +444,17 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         })
         .count();
 
-    // Per spec (update-tui-header-loop-state):
+    // Per spec (show-ready-header-after-stop):
     // - Select mode: Ready
     // - Running mode: Running / Running <count>
     // - Stopping mode: Stopping
-    // - Stopped/Error modes: no status label
+    // - Stopped mode: Ready
+    // - Error mode: no status label
+    // The header reports current orchestration activity, not internal control
+    // state. `AppExecutionMode::Stopped` is a resume-specific command-admission
+    // mode, not a running condition, so it projects to the same Ready label as
+    // Select. Its stop/resume semantics stay in the status panel, which keeps
+    // reporting the configured start key as `resume`.
     // An active overlay may relabel the header, but that label is presentation
     // only: it never changes what the execution axis is, and the status panel
     // below still reports the execution mode's own controls.
@@ -465,7 +471,9 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
             (modal.title_label().to_string(), Color::Red, true)
         }
         None => match app.execution_mode {
-            AppExecutionMode::Select => ("Ready".to_string(), Color::Cyan, true),
+            AppExecutionMode::Select | AppExecutionMode::Stopped => {
+                ("Ready".to_string(), Color::Cyan, true)
+            }
             AppExecutionMode::Running => {
                 if active_count > 0 {
                     (format!("Running {}", active_count), Color::Yellow, true)
@@ -474,8 +482,8 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
                 }
             }
             AppExecutionMode::Stopping => ("Stopping".to_string(), Color::Yellow, true),
-            AppExecutionMode::Stopped | AppExecutionMode::Error => {
-                // Hide status in Stopped and Error modes per spec
+            AppExecutionMode::Error => {
+                // Hide status in Error mode per spec
                 (String::new(), Color::White, false)
             }
         },
@@ -3797,6 +3805,71 @@ mod tests {
             !content.contains("[Ready]"),
             "Header should not show '[Ready]' in Stopping mode, but got:\n{}",
             content
+        );
+    }
+
+    #[test]
+    fn stopped_mode_header_shows_ready_with_resume_controls() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.execution_mode = AppExecutionMode::Stopped;
+        // The status panel only renders on the running-mode screen, which is
+        // what carries the stopped-mode resume control.
+        app.add_log(LogEntry::info("stop requested"));
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(
+            content.contains("[Ready]"),
+            "Stopped mode must project the Ready header, but got:\n{}",
+            content
+        );
+        assert_eq!(
+            fg_at(&buffer, "[Ready]"),
+            Color::Cyan,
+            "the stopped Ready label must use the existing cyan Ready presentation"
+        );
+        assert!(
+            content.contains(&format!("{}: resume", app.start_key_label())),
+            "Stopped mode must keep its resume control alongside the Ready header, but got:\n{}",
+            content
+        );
+        assert!(
+            !content.contains("[Stopped]"),
+            "the header must never expose a Stopped execution status, but got:\n{}",
+            content
+        );
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Stopped,
+            "rendering must not mutate the internal execution mode"
+        );
+    }
+
+    #[test]
+    fn error_mode_header_remains_unlabeled_without_modal() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.execution_mode = AppExecutionMode::Error;
+        app.modal = None;
+        app.add_log(LogEntry::info("apply failed"));
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(
+            !content.contains("[Ready]") && !content.contains("[Stopped]"),
+            "Error mode without a modal must render no status label, but got:\n{}",
+            content
+        );
+        assert!(
+            content.contains(&format!("{}: retry", app.start_key_label())),
+            "Error mode must keep its retry control, but got:\n{}",
+            content
+        );
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Error,
+            "rendering must not mutate the internal execution mode"
         );
     }
 

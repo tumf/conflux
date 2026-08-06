@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::ai_command_runner::RunCommandScope;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::orchestration::run_control::RunSchedulerPort;
@@ -55,6 +56,13 @@ pub struct TuiRunSupervisor {
     launch: LaunchContext,
     handle: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     cancel: Mutex<Option<CancellationToken>>,
+    /// The live run's command scope, retained *outside* the spawned
+    /// orchestrator task.
+    ///
+    /// Aborting that task destroys everything it owns, so a scope reachable
+    /// only from inside it would take the run's process identities with it.
+    /// This clone is what still lets local shutdown force-clean them.
+    scope: Mutex<Option<RunCommandScope>>,
     graceful_stop: Arc<AtomicBool>,
 }
 
@@ -88,20 +96,29 @@ impl TuiRunSupervisor {
             },
             handle: Mutex::new(None),
             cancel: Mutex::new(None),
+            scope: Mutex::new(None),
             graceful_stop,
         }
     }
 
-    /// Take the current run task and cancellation token for shutdown.
+    /// Take the current run task, cancellation token, and command scope for shutdown.
     pub fn take_run(
         &self,
     ) -> (
         Option<tokio::task::JoinHandle<Result<()>>>,
         Option<CancellationToken>,
+        Option<RunCommandScope>,
     ) {
         let handle = lock(&self.handle).take();
         let cancel = lock(&self.cancel).take();
-        (handle, cancel)
+        let scope = lock(&self.scope).take();
+        (handle, cancel, scope)
+    }
+
+    /// The command scope of the live run, if any.
+    #[cfg(test)]
+    pub fn run_command_scope(&self) -> Option<RunCommandScope> {
+        lock(&self.scope).clone()
     }
 
     /// The cancellation token of the live run, if any.
@@ -111,6 +128,10 @@ impl TuiRunSupervisor {
 
     fn spawn(&self, targets: Vec<String>, explicit_retry: bool) -> CancellationToken {
         let cancel = CancellationToken::new();
+        // One fresh scope per run start. A closed scope is never reused, so a
+        // restarted run always begins with open admission.
+        let scope = RunCommandScope::new();
+        scope.link_cancellation(cancel.clone());
 
         let repo_root = self.launch.repo_root.clone();
         let config = self.launch.config.clone();
@@ -122,6 +143,7 @@ impl TuiRunSupervisor {
         let upstream_runtime = self.launch.upstream_runtime.clone();
         let graceful_stop = self.graceful_stop.clone();
         let run_cancel = cancel.clone();
+        let run_scope = scope.clone();
         #[cfg(feature = "web-monitoring")]
         let web_state = self.launch.web_state.clone();
 
@@ -133,6 +155,7 @@ impl TuiRunSupervisor {
                 config,
                 tx,
                 run_cancel,
+                run_scope,
                 dynamic_queue,
                 graceful_stop,
                 shared_state,
@@ -147,6 +170,7 @@ impl TuiRunSupervisor {
 
         *lock(&self.handle) = Some(handle);
         *lock(&self.cancel) = Some(cancel.clone());
+        *lock(&self.scope) = Some(scope);
         cancel
     }
 }
@@ -287,7 +311,7 @@ mod tests {
                 other => panic!("expected the worktree startup log, got: {other:?}"),
             }
 
-            let (handle, cancel) = supervisor.take_run();
+            let (handle, cancel, _scope) = supervisor.take_run();
             if let Some(cancel) = cancel {
                 cancel.cancel();
             }
@@ -330,7 +354,7 @@ mod tests {
             .await
             .expect("the launch keeps the publication contract");
 
-        let (handle, cancel) = supervisor.take_run();
+        let (handle, cancel, _scope) = supervisor.take_run();
         if let Some(cancel) = cancel {
             cancel.cancel();
         }

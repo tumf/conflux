@@ -401,6 +401,29 @@ impl ChangeRuntimeState {
         matches!(self.wait_state, WaitState::ExternalBlocked)
     }
 
+    /// Whether a structured blocker classification currently owns this wait.
+    ///
+    /// `AcceptanceGated` and `ExecutionBlocked` carry validated facts — category,
+    /// origin, prerequisite owner, unblock condition, next action, resumability —
+    /// that a generic `WorkspaceStatus::Blocked` observation does not have. A
+    /// hold established from those facts therefore outranks the coarse
+    /// observation for the same non-terminal change: the observation may confirm
+    /// that the change is still held, but it must not rebuild the metadata from
+    /// generic strings.
+    ///
+    /// Only the two holds that own routing qualify. A validated external wait
+    /// drives dispatch suppression and blocked-phase retry, and an
+    /// Acceptance-owned stall drives the same suppression plus resumability.
+    /// An Apply-origin non-external stall carries neither, so the existing
+    /// generic fallback keeps owning it.
+    pub fn has_structured_blocker_hold(&self) -> bool {
+        match self.wait_state {
+            WaitState::ExternalBlocked => true,
+            WaitState::Stalled => self.blocked_metadata.acceptance_stall,
+            _ => false,
+        }
+    }
+
     /// Machine-readable blocker kind for a `blocked` change.
     ///
     /// Derived from the wait state, never from the recorded metadata alone, so a
@@ -2077,6 +2100,27 @@ impl OrchestratorState {
             return;
         }
         match status {
+            // Monotonic blocker precedence: a structured classification already
+            // owns this wait, so the lower-fidelity workspace observation is
+            // idempotent. Both structured transitions already left the change
+            // idle, so confirming "still blocked" requires no mutation at all —
+            // and any mutation here would downgrade the wait kind and replace
+            // validated metadata with generic strings.
+            crate::vcs::WorkspaceStatus::Blocked
+                if self
+                    .change_runtime
+                    .get(change_id)
+                    .is_some_and(ChangeRuntimeState::has_structured_blocker_hold) =>
+            {
+                if let Some(rt) = self.change_runtime.get(change_id) {
+                    tracing::debug!(
+                        change_id = %change_id,
+                        current_status = rt.display_status(),
+                        blocker_kind = ?rt.blocker_kind(),
+                        "Ignoring generic blocked workspace status because a structured blocker hold owns this wait"
+                    );
+                }
+            }
             crate::vcs::WorkspaceStatus::Blocked if self.stalled_change_ids.contains(change_id) => {
                 self.transition_change_to_stalled(
                     change_id,
@@ -4146,6 +4190,289 @@ mod tests {
             state.acceptance_stalled_change_ids(),
             HashSet::from(["c".to_string()])
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Monotonic blocker precedence: a structured classification outranks the
+    // generic blocked workspace observation the same producer emits right after
+    // it. Every test below applies the exact ordered pair the external-blocker
+    // path produces.
+    // -----------------------------------------------------------------------
+
+    /// Apply the compatibility workspace status the external-blocker producers
+    /// emit immediately after their structured event.
+    fn observe_generic_blocked_workspace(state: &mut OrchestratorState, change_id: &str) {
+        state.apply_execution_event(&crate::events::ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: change_id.to_string(),
+            workspace_name: format!("ws-{change_id}"),
+            status: crate::vcs::WorkspaceStatus::Blocked,
+        });
+    }
+
+    /// Reported facts that validate as an Apply-observed external prerequisite.
+    fn apply_external_blocker() -> crate::events::StalledBlocker {
+        crate::events::StalledBlocker {
+            category: "infrastructure".to_string(),
+            phase: "apply".to_string(),
+            gate: "apply".to_string(),
+            error_summary: "the build cache service is unreachable".to_string(),
+            evidence: vec!["cargo test: connection refused to cache.internal".to_string()],
+            unblock_condition: Some("cache.internal accepts connections again".to_string()),
+            prerequisite_owner: Some("platform".to_string()),
+            next_action: "restore cache.internal then retry apply".to_string(),
+            resumable: true,
+            worktree_preserved: true,
+        }
+    }
+
+    /// An Acceptance-observed external wait keeps every routing-relevant field
+    /// after the generic blocked workspace status the same dispatch branch
+    /// emits. Before monotonic precedence this second event rebuilt the metadata
+    /// as a generic stall: kind `none`, no owner, no unblock condition, and
+    /// `resumable: false`.
+    #[test]
+    fn structured_blocker_metadata_survives_workspace_blocked_for_an_acceptance_external_wait() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+            change_id: "c".to_string(),
+            command: "accept".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "c".to_string(),
+            blocker: StalledBlocker {
+                prerequisite_owner: Some("platform".to_string()),
+                ..StalledBlocker::acceptance_external("credential", "STAGING_API_KEY is unset")
+            },
+        });
+        let before = state
+            .blocker_view("c")
+            .expect("the structured event must establish a blocker view");
+
+        observe_generic_blocked_workspace(&mut state, "c");
+
+        assert_eq!(state.display_status("c"), "blocked");
+        let after = state
+            .blocker_view("c")
+            .expect("the hold must survive the generic observation");
+        assert_eq!(
+            after, before,
+            "a lower-fidelity observation must not change any projected blocker field"
+        );
+        assert_eq!(after.kind, BlockerKind::External);
+        assert_eq!(after.origin.as_deref(), Some("acceptance"));
+        assert_eq!(after.prerequisite_owner.as_deref(), Some("platform"));
+        assert_eq!(
+            after.category.as_deref(),
+            Some("external-blocked:credential")
+        );
+        assert!(after
+            .unblock_condition
+            .as_deref()
+            .unwrap_or_default()
+            .contains("STAGING_API_KEY is unset"));
+        assert!(after
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("next action"));
+        assert!(after.resumable, "resumability drives explicit retry");
+
+        let runtime = state.change_runtime("c").expect("runtime for c");
+        assert_eq!(runtime.wait_state, WaitState::ExternalBlocked);
+        assert_eq!(runtime.activity, ActivityState::Idle);
+        assert!(matches!(runtime.terminal, TerminalState::None));
+        assert!(runtime.blocked_metadata.acceptance_stall);
+        assert!(runtime.is_resumable_acceptance_stall());
+
+        // Queue classification and operator routing read these sets.
+        assert_eq!(
+            state.externally_blocked_change_ids(),
+            HashSet::from(["c".to_string()]),
+            "dispatch suppression must survive the generic observation"
+        );
+        assert_eq!(
+            state.acceptance_stalled_change_ids(),
+            HashSet::from(["c".to_string()])
+        );
+    }
+
+    /// The same precedence protects an Apply-observed external prerequisite:
+    /// origin and every structured field survive, and the wait never degrades
+    /// into an Acceptance-owned hold it never was.
+    #[test]
+    fn structured_blocker_metadata_survives_workspace_blocked_for_an_apply_external_wait() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::ExecutionBlocked {
+            change_id: "c".to_string(),
+            blocker: apply_external_blocker(),
+        });
+        let before = state
+            .blocker_view("c")
+            .expect("a validated apply claim must establish a blocker view");
+
+        observe_generic_blocked_workspace(&mut state, "c");
+
+        assert_eq!(state.display_status("c"), "blocked");
+        let after = state
+            .blocker_view("c")
+            .expect("the hold must survive the generic observation");
+        assert_eq!(after, before);
+        assert_eq!(after.kind, BlockerKind::External);
+        assert_eq!(after.origin.as_deref(), Some("apply"));
+        assert_eq!(after.prerequisite_owner.as_deref(), Some("platform"));
+        assert_eq!(
+            after.category.as_deref(),
+            Some("external-blocked:infrastructure")
+        );
+        assert_eq!(
+            after.unblock_condition.as_deref(),
+            Some("cache.internal accepts connections again")
+        );
+        assert!(after.resumable);
+
+        let runtime = state.change_runtime("c").expect("runtime for c");
+        assert_eq!(runtime.wait_state, WaitState::ExternalBlocked);
+        assert!(
+            !runtime.blocked_metadata.acceptance_stall,
+            "an apply-origin external wait is not an Acceptance-owned hold"
+        );
+        assert_eq!(
+            state.externally_blocked_change_ids(),
+            HashSet::from(["c".to_string()]),
+            "queue suppression uses the external set for either origin"
+        );
+        assert!(state.acceptance_stalled_change_ids().is_empty());
+    }
+
+    /// An Acceptance-owned non-external execution hold stays `stalled` and keeps
+    /// its Acceptance ownership and resumability. Losing either would let the
+    /// applied workspace be dispatched back through Acceptance automatically.
+    #[test]
+    fn structured_blocker_metadata_survives_workspace_blocked_for_an_acceptance_owned_stall() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+
+        let denial = crate::permission::classify_permission_denial(&[Some(
+            "Read permission denied for /private/secret.txt",
+        )])
+        .expect("denial should classify");
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::ExecutionBlocked {
+            change_id: "c".to_string(),
+            blocker: StalledBlocker::permission_denial("acceptance", &denial),
+        });
+        let before = state
+            .blocker_view("c")
+            .expect("an acceptance-owned hold must establish a blocker view");
+
+        observe_generic_blocked_workspace(&mut state, "c");
+
+        assert_eq!(state.display_status("c"), "stalled");
+        let after = state
+            .blocker_view("c")
+            .expect("the hold must survive the generic observation");
+        assert_eq!(after, before);
+        assert_eq!(after.kind, BlockerKind::None);
+        assert!(after.resumable);
+        assert_eq!(
+            after.category.as_deref(),
+            Some("execution-blocked:permission:file_read")
+        );
+        assert!(after
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("permission"));
+
+        let runtime = state.change_runtime("c").expect("runtime for c");
+        assert_eq!(runtime.wait_state, WaitState::Stalled);
+        assert!(runtime.blocked_metadata.acceptance_stall);
+        assert!(runtime.is_resumable_acceptance_stall());
+        assert_eq!(
+            state.acceptance_stalled_change_ids(),
+            HashSet::from(["c".to_string()]),
+            "ordinary dispatch stays suppressed until explicit retry or restart"
+        );
+        assert!(state.externally_blocked_change_ids().is_empty());
+    }
+
+    /// Without a structured classification the generic observation still owns
+    /// the wait: the conservative `stalled` fallback that rejection and legacy
+    /// apply handoffs depend on is unchanged, and it invents no external facts.
+    #[test]
+    fn structured_blocker_metadata_survives_workspace_blocked_fallback_stays_generic_without_a_hold(
+    ) {
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
+            change_id: "c".to_string(),
+            command: "apply".to_string(),
+        });
+
+        observe_generic_blocked_workspace(&mut state, "c");
+
+        assert_eq!(state.display_status("c"), "stalled");
+        let view = state
+            .blocker_view("c")
+            .expect("the fallback still records a blocker view");
+        assert_eq!(view.kind, BlockerKind::None);
+        assert!(view.unblock_condition.is_none());
+        assert!(view.prerequisite_owner.is_none());
+        assert!(view.origin.is_none());
+        assert!(!view.resumable);
+        assert_eq!(
+            view.category.as_deref(),
+            Some("apply reported recoverable blocker; workspace remains stalled")
+        );
+
+        let runtime = state.change_runtime("c").expect("runtime for c");
+        assert_eq!(runtime.wait_state, WaitState::Stalled);
+        assert!(!runtime.blocked_metadata.acceptance_stall);
+        assert!(state.acceptance_stalled_change_ids().is_empty());
+        assert!(state.externally_blocked_change_ids().is_empty());
+
+        // The `mark_stalled` fallback keeps its own generic message too.
+        let mut marked = OrchestratorState::new(vec!["d".to_string()], 0);
+        marked.mark_stalled("d".to_string());
+        observe_generic_blocked_workspace(&mut marked, "d");
+        assert_eq!(marked.display_status("d"), "stalled");
+        assert_eq!(
+            marked
+                .change_runtime("d")
+                .unwrap()
+                .blocked_metadata
+                .blocker_reason
+                .as_deref(),
+            Some("change stalled with recoverable blocker")
+        );
+    }
+
+    /// Duplicate and replayed generic observations stay idempotent, and the
+    /// existing explicit-retry boundary still releases the hold afterwards.
+    #[test]
+    fn structured_blocker_metadata_survives_workspace_blocked_under_duplicate_delivery() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "c".to_string(),
+            blocker: StalledBlocker::acceptance_external("credential", "STAGING_API_KEY is unset"),
+        });
+        let before = state.blocker_view("c").expect("blocker view");
+
+        for _ in 0..3 {
+            observe_generic_blocked_workspace(&mut state, "c");
+        }
+        assert_eq!(state.blocker_view("c").as_ref(), Some(&before));
+        assert_eq!(state.display_status("c"), "blocked");
+
+        // Precedence protects metadata; it does not make a hold permanent.
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert_eq!(state.display_status("c"), "queued");
+        assert!(state.blocker_view("c").is_none());
+        assert!(state.externally_blocked_change_ids().is_empty());
     }
 
     #[test]

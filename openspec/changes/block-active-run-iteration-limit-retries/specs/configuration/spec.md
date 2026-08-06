@@ -29,7 +29,7 @@ The configured `max_iterations` value SHALL be enforced by one per-change active
 
 ### Requirement: Iteration Limit Finish Status
 
-When one change exhausts its positive per-change Apply-dispatch budget, the sole budget owner SHALL record a typed `iteration_limit` outcome with the change ID, exact cumulative attempts, and configured maximum. CLI, TUI, and remote-controlled worktree run boundaries SHALL preserve that evidence through their existing sole finish-hook attempt. While the owning boundary remains active, shared operator admission SHALL treat the typed record as a retry gate. After the finish-hook attempt returns, run closure SHALL atomically retire the gate and make the old scheduler unavailable for notification before later retry can be admitted.
+When one change exhausts its positive per-change Apply-dispatch budget, the sole budget owner SHALL record a typed `iteration_limit` outcome with the change ID, exact cumulative attempts, and configured maximum. CLI, TUI, and remote-controlled worktree run boundaries SHALL preserve that evidence through their existing sole finish-hook attempt. In a command-capable boundary, shared operator admission SHALL treat the record as a retry gate only while the owning scheduler task reports live through `RunSchedulerPort::is_running()`. The existing task handle SHALL remain live through the finish-hook attempt and terminal publication; task exit SHALL retire the gate without clearing the record or adding a separate closing barrier. A later admission SHALL NOT notify the exited scheduler.
 
 #### Scenario: All frontends preserve typed iteration-limit ownership
 
@@ -44,20 +44,20 @@ When one change exhausts its positive per-change Apply-dispatch budget, the sole
 - **GIVEN** an active boundary recorded typed iteration-limit evidence
 - **WHEN** its finish hook is still pending or running
 - **THEN** the record remains available to the finish-hook owner
-- **AND** retry admission still treats the owning boundary as limited
+- **AND** command-capable retry admission still treats the owning boundary as limited
 
 #### Scenario: Hook failure does not make the gate permanent
 
 - **GIVEN** the finish-hook owner observed typed iteration-limit evidence
 - **WHEN** the hook command returns an error
 - **THEN** the boundary reports the hook error through existing behavior
-- **AND** run closure still retires the active retry gate
+- **AND** scheduler-task exit still retires the active retry gate
 - **AND** no durable blocker is created
 
-#### Scenario: Closing boundary cannot receive a late retry
+#### Scenario: Scheduler-task liveness closes the admission race
 
-- **GIVEN** `on_finish` has returned and the limited boundary is closing
-- **WHEN** retry races with the closing transition
-- **THEN** admission is serialized with that transition
-- **AND** the retry is either refused by the still-active gate or admitted only after the old scheduler is unavailable
+- **GIVEN** the limited boundary's scheduler task remains live through `on_finish` and terminal publication
+- **WHEN** retry races with the task tail
+- **THEN** admission is refused while `RunSchedulerPort::is_running()` is true
+- **OR** retry is admitted only after task exit makes the old scheduler unavailable
 - **AND** no accepted retry is notified into the exhausted or closing scheduler

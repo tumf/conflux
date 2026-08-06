@@ -1393,11 +1393,11 @@ impl ParallelExecutor {
         items: &[SequentialMergeItem],
     ) -> BaseLaneResult<String> {
         let change_ids_vec = SequentialMergeItem::change_ids(items);
-        let shared_stagger_state = self.shared_stagger_state.clone();
+        let ai_runner = self.ai_runner.clone();
         let auto_resolve_count = self.auto_resolve_count.clone();
         self.merge_and_resolve_with(items, |revisions, details| {
             let change_ids_clone = change_ids_vec.clone();
-            let shared_stagger_state_clone = shared_stagger_state.clone();
+            let ai_runner_clone = ai_runner.clone();
             let auto_resolve_count_clone = auto_resolve_count.clone();
             async move {
                 conflict::resolve_conflicts_with_retry(
@@ -1408,7 +1408,7 @@ impl ParallelExecutor {
                     &change_ids_clone,
                     &details,
                     self.max_conflict_retries,
-                    shared_stagger_state_clone,
+                    ai_runner_clone,
                     auto_resolve_count_clone,
                 )
                 .await
@@ -1459,7 +1459,7 @@ impl ParallelExecutor {
                 target_branch: target_branch.as_str(),
                 base_revision: base_revision.as_str(),
                 max_retries: max_attempts,
-                shared_stagger_state: self.shared_stagger_state.clone(),
+                ai_runner: self.ai_runner.clone(),
                 auto_resolve_count: self.auto_resolve_count.clone(),
                 // An opted-in change's terminal success is remote confirmation,
                 // not this local merge, so the resolve path must not emit the

@@ -2,7 +2,7 @@
 
 ### Requirement: Mode-aware mark and queue behavior
 
-The service MUST allow execution-mark mutation in Select and Stopped modes, resolve accepted marks into initial targets at Start, use reducer queue intent for ordinary Running additions, allow mark-only mutation for MergeWait and ResolveWait, and reject mark mutation in Error mode. Queue removal and successful stop-and-dequeue MUST revoke ordinary execution eligibility until explicit requeue or retry. Catalog refresh or eligibility re-evaluation MUST classify one coherent state, clear marks and queue presentation for changes that became ineligible, and report stable exclusion reasons. Bulk execution-mark mutation MUST choose one target state from eligible rows only and update eligible marks plus Running queue intent atomically. A terminal-error queue addition that would route through `RetryError` MUST consult active typed Apply iteration-limit eligibility before changing reducer state, marks, queue state, hooks, or explicit-retry edges; while limited it MUST be rejected with the same stable reason as explicit retry.
+The service MUST allow execution-mark mutation in Select and Stopped modes, resolve accepted marks into initial targets at Start, use reducer queue intent for ordinary Running additions, allow mark-only mutation for MergeWait and ResolveWait, and reject mark mutation in Error mode. Queue removal and successful stop-and-dequeue MUST revoke ordinary execution eligibility until explicit requeue or retry. Catalog refresh or eligibility re-evaluation MUST classify one coherent state, clear marks and queue presentation for changes that became ineligible, and report stable exclusion reasons. Bulk execution-mark classification MUST exclude an active-run-limited terminal-error row with `apply_iteration_limit_active` before mutation, choose one target state from the remaining eligible rows only, and update their marks plus Running queue intent atomically. A terminal-error queue addition that would route through `RetryError` MUST consult the same active typed Apply iteration-limit eligibility before changing reducer state, marks, queue state, hooks, or explicit-retry edges; while limited it MUST be rejected with the same stable reason as explicit retry.
 
 #### Scenario: Eligibility refresh cleans invalid intent
 
@@ -18,6 +18,15 @@ The service MUST allow execution-mark mutation in Select and Stopped modes, reso
 **Then**: The service derives one target mark from eligible changes only
 **And**: It updates eligible marks and Running queue intent atomically
 **And**: Excluded changes retain coherent intent and receive stable reasons
+
+#### Scenario: Bulk mark excludes active limited queue aliases before mutation
+
+**Given**: An active-run-limited terminal-error row and unrelated eligible rows exist in one Running-mode bulk request
+**When**: The service classifies and applies bulk execution marks
+**Then**: It excludes the limited row with `apply_iteration_limit_active`
+**And**: The limited row's mark and queue intent remain unchanged
+**And**: It atomically applies one coherent target state and queue intent to the remaining eligible rows
+**And**: The terminal-error alias guard cannot abort a partially applied bulk operation
 
 #### Scenario: Queue intent cannot alias an active limited retry
 
@@ -52,7 +61,8 @@ Terminal error retry MUST use `ReducerCommand::RetryError`. Acceptance-stalled r
 **Given**: One requested change is limited by its active run
 **And**: Other requested changes carry ordinary retryable terminal-error or resumable acceptance evidence
 **When**: The operator requests bulk retry
-**Then**: The limited change retains all state and receives the stable exclusion reason
+**Then**: The limited change retains all state and is not reported as accepted
+**And**: Its `apply_iteration_limit_active` reason remains readable in the authoritative snapshot at the result revision
 **And**: The other retryable changes are mutated and dispatched exactly once
 
 #### Scenario: All-limited bulk retry is a no-op

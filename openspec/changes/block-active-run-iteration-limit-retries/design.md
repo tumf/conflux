@@ -16,7 +16,7 @@ The record cannot simply be permanent. `OrchestratorState` is active-run state a
 
 - Reject every path that would retry an iteration-limited change into its owning active boundary.
 - Preserve the typed record until the sole finish-hook attempt consumes it.
-- Make run closure and retry admission race-free.
+- Use the existing scheduler-task lifetime to keep run closure and retry admission race-free.
 - Keep bulk retry useful for unrelated retryable changes.
 - Publish one typed eligibility contract to API, WebUI, and TUI.
 - Allow a later scheduler boundary to start from workspace evidence with a fresh budget.
@@ -37,15 +37,15 @@ The scheduler boundary that created the current `OrchestratorState`, reserved th
 
 ### Active iteration-limit gate
 
-A typed `ApplyIterationLimit { change_id, attempts, max }` record whose owning boundary is still open for operator admission. The record is not a durable blocker and is not workspace evidence.
+A typed `ApplyIterationLimit { change_id, attempts, max }` record whose owning scheduler task still reports live through `RunSchedulerPort::is_running()`. The record is not a durable blocker and is not workspace evidence.
 
 ### Later boundary
 
 A scheduler boundary admitted only after the prior boundary has closed. It creates or installs fresh active-run state and re-evaluates the preserved workspace. It is not a wake-up of the prior scheduler.
 
-## Decision 1: Keep typed evidence as the only retry-gate input
+## Decision 1: Use typed evidence and task liveness as the only gate inputs
 
-The retry gate is derived from the reducer's typed `ApplyIterationLimit` record plus the owning boundary's active lifetime. The implementation must not inspect `error_detail`, logs, status-bar text, or a formatted max-iterations error.
+The retry gate is derived from the reducer's typed `ApplyIterationLimit` record plus the owning scheduler task's `RunSchedulerPort::is_running()` result. The implementation must not inspect `error_detail`, logs, status-bar text, or a formatted max-iterations error.
 
 Expose one shared query equivalent to:
 
@@ -53,48 +53,47 @@ Expose one shared query equivalent to:
 active_apply_iteration_limit(change_id) -> Option<{ attempts, max }>
 ```
 
-Operator commands, TUI projection, and v2 projection consume this query. They do not each recreate the lifetime rule.
+Operator commands, TUI projection, and command-capable v2 projection consume this query. They do not each recreate the lifetime rule. Headless `cflx run` has no bound command executor, so its read-only projection uses an explicit degraded boundary-liveness rule and does not treat retained record presence alone as an active gate.
 
 ## Decision 2: Guard before mutation
 
 For an individual target, admission order is:
 
-1. Acquire the shared operator/run-boundary admission guard.
-2. Read active typed limit evidence for the target.
-3. If present, return a typed refusal.
-4. Only otherwise classify the ordinary retry route and mutate reducer, failed classification, marks, queue, hooks, explicit-retry edges, or scheduler state.
+1. Evaluate the shared active-limit query from typed evidence and scheduler-task liveness.
+2. If active evidence is present, return a typed refusal.
+3. Only otherwise classify the ordinary retry route and mutate reducer, failed classification, marks, queue, hooks, explicit-retry edges, or scheduler state.
 
 This order also applies when queue addition would treat a terminal-error row as `RetryError`. A caller cannot bypass the guard by sending `set_queue_intent=true` instead of `retry_change`.
 
 The refusal should remain machine-readable end to end. The internal error/exclusion type and the v2 `ActionBlockedReason` may use different Rust enums, but both represent the stable semantic token `apply_iteration_limit_active` rather than prose.
 
-## Decision 3: Bulk retry is filtering, not all-or-nothing
+## Decision 3: Bulk classification excludes active limits before mutation
 
-Bulk retry takes one coherent admission snapshot under the same guard. For each candidate it records one of:
+Bulk execution-mark planning and bulk retry take one coherent eligibility snapshot. Bulk-mark planning adds `apply_iteration_limit_active` to `MarkExclusion` and excludes a limited terminal-error row before any eligible mark or Running queue intent is applied. This prevents the terminal-error `add_to_queue` guard from aborting a partially applied bulk operation.
+
+For bulk retry, each candidate is one of:
 
 - accepted ordinary retry route;
 - excluded because an active Apply limit owns the target;
 - excluded by existing unsupported or non-resumable evidence.
 
-Accepted targets are mutated and dispatched once. Limited targets are untouched. If no target is accepted, the result is `NoRetryableTarget`/no-op and the scheduler receives neither notify nor start.
+Accepted targets are mutated and dispatched once. Limited targets are untouched. If no target is accepted, the result is `NoRetryableTarget`/no-op and the scheduler receives neither notify nor start. The existing `RetryPlan` and `RunControlOutcome` need no per-target exclusion DTO: a limited target is never claimed accepted, and its stable blocked reason remains readable in the authoritative snapshot at the command's result revision.
 
-Bulk result detail should retain stable exclusion reasons where the existing outcome surface supports them. It must never make a limited row look accepted merely because another row dispatched.
+## Decision 4: Use scheduler-task liveness as the command-capable boundary primitive
 
-## Decision 4: Close the run through a serialized barrier
-
-A run that records the limit follows this order:
+A TUI/remote command-capable run that records the limit follows this order:
 
 1. The budget owner records typed `ApplyIterationLimit` with the exact count.
-2. Frontends may observe the failed row and active retry block.
-3. The run boundary reads the record and invokes its existing sole `on_finish` owner with `iteration_limit` and the exact Apply count.
-4. After the hook attempt returns, the boundary enters a closing barrier shared with operator admission.
-5. Under that barrier, it publishes terminal reducer/frontend state, retires the active limit gate, and makes the old scheduler unavailable for notification as one ordered lifecycle transition.
-6. It performs no later reducer or frontend mutation after releasing that barrier.
-7. A subsequent command may then create a later boundary with fresh active-run state.
+2. Frontends may observe the failed row and active retry block while `RunSchedulerPort::is_running()` is true.
+3. The run task reads the record and invokes its existing sole `on_finish` owner with `iteration_limit` and the exact Apply count.
+4. The task publishes its existing terminal reducer/frontend events and then returns.
+5. `JoinHandle::is_finished()` makes `RunSchedulerPort::is_running()` false, retiring the gate without clearing the record.
+6. The TUI loop observes that liveness transition, refreshes its eligibility cache, and asks `WebState` to publish the changed action snapshot once.
+7. A subsequent command may create a later boundary with fresh active-run state.
 
-Hook failure does not preserve the gate forever. The ordering requirement is that the hook attempt observed the record, not that an external hook command succeeded.
+The task handle remains live throughout `on_finish` and terminal publication, including when the hook reports an error. Therefore a limited retry is refused for the entire interval in which it could notify the old scheduler. Once the task exits, that scheduler cannot resurrect: dispatch can only observe a live newly started task or start a new boundary. No close operation, lock, run generation, record clearing, or closing barrier is needed.
 
-The implementation may use a run generation, an active-boundary lease, or an equivalent process-local primitive. It must not rely on a timing assumption between clearing a vector and `JoinHandle::is_finished`. A deterministic concurrency regression must pause the closing transition and prove there is no interval in which retry mutates old state while dispatch still targets the old scheduler.
+A closing barrier is rejected because terminal publication uses bounded event channels. Holding an admission lock while publishing could deadlock against an event loop waiting for that same lock in a command handler. Tests instead drive scheduler liveness deterministically with `running=true` and `running=false`, verify that `on_finish` observes the record, and prove later admission never notifies the exited task. Headless `cflx run` has no admission surface, so its only obligation is the existing regression that the record survives until its finish hook returns.
 
 ## Decision 5: Later runs replace, never repair, the budget
 
@@ -106,11 +105,11 @@ The same-process case and process-restart case have the same authority model:
 - preserved worktree files and Git state remain;
 - no API snapshot, log, or local-state artifact is read back as control input.
 
-## Decision 6: Project typed data, not inferred permission
+## Decision 6: Project typed eligibility, not inferred permission
 
 ### API
 
-Each change resource gains nullable active iteration-limit evidence containing `attempts` and `max`. While present, `actions.retry_change` is:
+While the shared active-limit query returns evidence, `actions.retry_change` is:
 
 ```json
 {
@@ -119,7 +118,7 @@ Each change resource gains nullable active iteration-limit evidence containing `
 }
 ```
 
-The evidence and action eligibility must come from one coherent reducer/run-lifetime observation and appear at the same `state_revision`. Generated OpenAPI reflects both the evidence object and enum value; no tracked schema file is added.
+Typed record presence and scheduler-task liveness must come from one coherent command-capable boundary observation and publish action eligibility at one `state_revision`. `WebState` receives the same scheduler-liveness authority used by admission. Generated OpenAPI reflects the enum value; no unused per-change evidence DTO or tracked schema file is added. A headless `cflx run` API has no command executor, so it remains read-only instead of projecting a stale actionable block after task exit.
 
 ### WebUI
 
@@ -127,7 +126,7 @@ The evidence and action eligibility must come from one coherent reducer/run-life
 
 ### TUI
 
-The TUI synchronizes a process-local per-change limit eligibility cache from the same shared state used by the command service. Row Space handling, bulk selection, F5 retry, and footer/row guidance consult that cache. The diagnostic remains visible, but retry-promising guidance is replaced by a stable explanation while blocked.
+The TUI synchronizes a process-local per-change limit eligibility cache from the same shared query used by the command service. Row Space handling, bulk selection, F5 retry, and footer/row guidance consult that cache. The diagnostic remains visible, but retry-promising guidance is replaced by a stable explanation while blocked. This cache is required because row Space handling optimistically flips a mark before command dispatch; without the pre-dispatch guard the UI would briefly claim intent the service refuses.
 
 TUI state is presentation and ephemeral. It cannot become the service guard; direct API/service calls remain protected without a TUI.
 
@@ -163,17 +162,17 @@ Unrelated recoverable changes do not share the exhausted target's budget. Reject
 
 Unit tests arrange a reducer error, mark store, queue double, hook double, explicit-retry recorder, and scheduler recorder. They capture every value before retry and assert exact equality after an active-limit refusal. A separate test drives the terminal-error `add_to_queue` alias.
 
-### Bulk routing
+### Bulk classification and routing
 
-One test combines a limited terminal error, an ordinary terminal error, and a resumable acceptance hold. It proves only the latter two mutate and dispatch once. An all-limited test proves no reducer, queue, edge, mark, hook, notify, or spawn effect.
+A bulk-mark test combines a limited terminal error with unrelated eligible rows. It proves the limited row receives `MarkExclusion::ApplyIterationLimitActive`, remains untouched, and cannot abort atomic application to eligible rows. A bulk-retry test combines a limited terminal error, an ordinary terminal error, and a resumable acceptance hold. It proves only the latter two mutate and dispatch once and the result does not claim the limited row was accepted. An all-limited test proves no reducer, queue, edge, mark, hook, notify, or spawn effect.
 
 ### Boundary ordering
 
-A deterministic test gate pauses the run-closing barrier after `on_finish` reads the typed record. A concurrent retry must remain blocked or return the typed refusal until closure commits. After release, retry must start a new scheduler generation, never notify the old generation. The new state begins with a fresh budget while preserving workspace-derived routing evidence.
+Deterministic service tests set `RecordingScheduler` liveness true and false. They prove active evidence blocks while true, task exit retires the gate while retaining the record, and later admission starts rather than notifies. Existing finish-hook ordering fixtures prove the TUI owner observes the exact record before task completion and the CLI owner observes it before the run returns. The new state begins with a fresh budget while preserving workspace-derived routing evidence.
 
 ### API and OpenAPI
 
-Projection tests assert typed `{ attempts, max }`, the blocked reason, coherent retirement, and ordinary-error behavior. The generated OpenAPI contract test serializes the new object and enum token.
+Projection tests assert the blocked reason while evidence and scheduler liveness are active, retirement after task exit, ordinary-error behavior, and the headless read-only rule. The generated OpenAPI contract test serializes the new enum token without adding an evidence object.
 
 ### TUI and browser
 

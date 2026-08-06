@@ -2649,7 +2649,7 @@ mod run_supervisor_tests {
         );
 
         // A persistent TUI stays alive after publishing, so the operator ends it.
-        let (handle, cancel) = supervisor.take_run();
+        let (handle, cancel, _scope) = supervisor.take_run();
         cancel
             .expect("retry must own a cancellation token")
             .cancel();

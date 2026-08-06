@@ -255,17 +255,80 @@ pub(crate) fn evaluate_process_group_barrier(
     )))
 }
 
-fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<ApplyCompletionKind> {
-    if detect_apply_blocked_handoff(workspace_path, change_id).is_some() {
+/// Which completion conditions may arm the completion grace for one dispatched
+/// Apply command.
+///
+/// Finalization repair deliberately dispatches another Apply command while every
+/// checkbox is already `[x]`: staging, task format, or the hook-enabled final
+/// commit still needs work. For those commands the already-complete `tasks.md`
+/// is the *reason* the command runs, not evidence that it finished, so it must
+/// not start, refresh, or finalize the grace timer. Blocked and rejecting
+/// handoffs stay eligible for every dispatch because only the active command can
+/// create those artifacts.
+///
+/// Per `openspec/CONSTITUTION.md` this is ephemeral in-memory state for the
+/// lifetime of one owned command. It is never persisted; a restart re-derives
+/// the next Apply action from workspace files and Git state alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchCompletionPolicy {
+    /// Whether `TasksComplete` may terminate this dispatch's child.
+    tasks_complete_eligible: bool,
+}
+
+impl DispatchCompletionPolicy {
+    /// Derive the policy from the task progress observed before the child is
+    /// launched.
+    fn for_dispatch(progress_at_dispatch_start: &TaskProgress) -> Self {
+        Self {
+            tasks_complete_eligible: !is_progress_complete(progress_at_dispatch_start),
+        }
+    }
+}
+
+/// Repository completion evidence read for one probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApplyCompletionEvidence {
+    blocked_handoff: bool,
+    rejecting_handoff: bool,
+    tasks_complete: bool,
+}
+
+/// Completion-condition precedence for one dispatch.
+///
+/// Kept separate from the workspace reads so the eligibility rule is verifiable
+/// without touching the filesystem.
+fn resolve_apply_completion(
+    evidence: ApplyCompletionEvidence,
+    policy: DispatchCompletionPolicy,
+) -> Option<ApplyCompletionKind> {
+    if evidence.blocked_handoff {
         return Some(ApplyCompletionKind::BlockedHandoff);
     }
-    if detect_apply_rejected_handoff(workspace_path, change_id).is_some() {
+    if evidence.rejecting_handoff {
         return Some(ApplyCompletionKind::RejectingHandoff);
     }
-    match check_task_progress(workspace_path, change_id) {
-        Ok(progress) if is_progress_complete(&progress) => Some(ApplyCompletionKind::TasksComplete),
-        _ => None,
+    if evidence.tasks_complete && policy.tasks_complete_eligible {
+        return Some(ApplyCompletionKind::TasksComplete);
     }
+    None
+}
+
+fn detect_apply_completion(
+    workspace_path: &Path,
+    change_id: &str,
+    policy: DispatchCompletionPolicy,
+) -> Option<ApplyCompletionKind> {
+    let evidence = ApplyCompletionEvidence {
+        blocked_handoff: detect_apply_blocked_handoff(workspace_path, change_id).is_some(),
+        rejecting_handoff: detect_apply_rejected_handoff(workspace_path, change_id).is_some(),
+        // Only read when it can matter: a disabled condition must not pay for a
+        // `tasks.md` parse on every probe.
+        tasks_complete: policy.tasks_complete_eligible
+            && check_task_progress(workspace_path, change_id)
+                .map(|progress| is_progress_complete(&progress))
+                .unwrap_or(false),
+    };
+    resolve_apply_completion(evidence, policy)
 }
 
 /// Default maximum iterations for apply loops.
@@ -2001,8 +2064,23 @@ where
         // acceptance-verdict grace period: once we observe the completion
         // condition via workspace state, start a bounded grace timer and
         // terminate the child when it expires.
+        //
+        // The grace is relative to *this* dispatch. `progress` was read before
+        // the child was launched, so a stage, task-format, or final-commit-hook
+        // repair — every one of which runs with `tasks.md` already complete —
+        // keeps its normal command lifetime instead of being terminated by the
+        // very condition that made the repair necessary.
         let grace_period = apply_completion_grace_period();
         let check_interval = apply_completion_check_interval();
+        let completion_policy = DispatchCompletionPolicy::for_dispatch(&progress);
+        if !completion_policy.tasks_complete_eligible {
+            debug!(
+                change_id = change_id,
+                iteration = iteration,
+                "Apply dispatched with task progress already complete; task completion alone \
+                 cannot terminate this command, only a blocked or rejecting handoff can"
+            );
+        }
         let mut completion_kind: Option<ApplyCompletionKind> = None;
         let mut completion_deadline: Option<tokio::time::Instant> = None;
         let mut early_terminated = false;
@@ -2013,7 +2091,8 @@ where
             // that lands between output bursts is observed promptly and does not
             // depend on receiving further stdout/stderr data.
             if completion_kind.is_none() && tokio::time::Instant::now() >= next_check_at {
-                completion_kind = detect_apply_completion(workspace_path, change_id);
+                completion_kind =
+                    detect_apply_completion(workspace_path, change_id, completion_policy);
                 next_check_at = tokio::time::Instant::now() + check_interval;
                 if let Some(kind) = completion_kind {
                     completion_deadline = Some(tokio::time::Instant::now() + grace_period);
@@ -2065,8 +2144,14 @@ where
                 Err(_) => {
                     if let Some(deadline) = completion_deadline {
                         if tokio::time::Instant::now() >= deadline {
-                            let current_completion =
-                                detect_apply_completion(workspace_path, change_id);
+                            // The deadline recheck uses the same dispatch-local
+                            // policy, so a disabled `TasksComplete` cannot
+                            // reappear only at grace expiry.
+                            let current_completion = detect_apply_completion(
+                                workspace_path,
+                                change_id,
+                                completion_policy,
+                            );
                             if current_completion == completion_kind {
                                 info!(
                                     change_id = change_id,
@@ -3342,7 +3427,11 @@ mod tests {
         .unwrap();
         std::fs::write(change_dir.join("REJECTED.md"), "# REJECTED\n").unwrap();
 
-        let completion = detect_apply_completion(workspace, "change-a");
+        let completion = detect_apply_completion(
+            workspace,
+            "change-a",
+            DispatchCompletionPolicy::for_dispatch(&TaskProgress::with_counts(0, 1)),
+        );
         assert_eq!(completion, Some(ApplyCompletionKind::RejectingHandoff));
     }
 
@@ -6427,6 +6516,394 @@ mod apply_commit_recovery {
         );
         assert!(lock.exists(), "Conflux must never delete a live lock");
         assert_ne!(repo.head_subject(), "Apply: lock-forever");
+    }
+
+    /// Dispatch-local Apply completion eligibility.
+    ///
+    /// Finalization repair dispatches an Apply command while every checkbox is
+    /// already `[x]`. Each integration test below delays its repair action past
+    /// the shortened completion grace `run_recovery_loop` configures, so a
+    /// watchdog that arms on pre-existing task completion kills the child before
+    /// it stages, rewrites `tasks.md`, or clears the hook blocker.
+    ///
+    /// Nested here to reuse the hook-enabled `RecoveryRepo` and the shortened
+    /// grace/interval wiring the finalization-repair tests already own.
+    mod precomplete_repair_completion {
+        use super::*;
+
+        /// How long each repair waits before doing its actual work.
+        ///
+        /// `run_recovery_loop` shortens the completion grace to 50ms and the
+        /// probe interval to 20ms, so the pre-fix watchdog terminated a
+        /// task-complete repair around 70ms in. This is roughly three times
+        /// that, while leaving the ~0.6s of real Git and hook work these tests
+        /// already cost inside the sub-second default-suite budget.
+        const REPAIR_DELAY_SECS: &str = "0.2";
+
+        /// Complete checkboxes plus an active-section bullet the task-format
+        /// validator rejects: complete progress that still needs another Apply.
+        const COMPLETE_BUT_MALFORMED_TASKS: &str = concat!(
+            "## Implementation Tasks\n",
+            "- [x] Implement the change\n",
+            "- evidence: cargo test passed\n",
+        );
+
+        const REPAIRED_TASKS_PRINTF: &str = "## Implementation Tasks\\n\
+             - [x] Implement the change\\n\\n\
+             ## Notes\\n\
+             - evidence: cargo test passed\\n";
+
+        fn evidence(
+            blocked_handoff: bool,
+            rejecting_handoff: bool,
+            tasks_complete: bool,
+        ) -> ApplyCompletionEvidence {
+            ApplyCompletionEvidence {
+                blocked_handoff,
+                rejecting_handoff,
+                tasks_complete,
+            }
+        }
+
+        /// A tracked edit the agent left unstaged. It fails the finalization
+        /// stage gate while `tasks.md` is already complete, which is the exact
+        /// routing that dispatches a task-complete repair command.
+        fn unstaged_repair_case(change_id: &str) -> RecoveryRepo {
+            let repo = recovery_repo(change_id, COMPLETE_TASKS);
+            std::fs::write(repo.workspace.join("README.md"), "edited but not staged\n").unwrap();
+            assert!(
+                porcelain_status(&repo.workspace).contains(" M README.md"),
+                "precondition: a task-complete workspace with an unstaged tracked edit"
+            );
+            repo
+        }
+
+        fn dispatch_count(apply_log: &Path) -> usize {
+            std::fs::read_to_string(apply_log)
+                .map(|log| log.lines().count())
+                .unwrap_or(0)
+        }
+
+        // === Dispatch-local eligibility (unit) ===
+
+        #[test]
+        fn precomplete_apply_repair_eligibility_follows_dispatch_start_progress() {
+            for incomplete in [
+                TaskProgress::with_counts(0, 2),
+                TaskProgress::with_counts(1, 2),
+                // No parsed tasks is not completion, so the ordinary
+                // incomplete-to-complete watchdog stays armed.
+                TaskProgress::with_counts(0, 0),
+            ] {
+                assert!(
+                    DispatchCompletionPolicy::for_dispatch(&incomplete).tasks_complete_eligible,
+                    "a dispatch that began incomplete keeps the original watchdog: {incomplete:?}"
+                );
+            }
+
+            assert!(
+                !DispatchCompletionPolicy::for_dispatch(&TaskProgress::with_counts(2, 2))
+                    .tasks_complete_eligible,
+                "a dispatch that began complete must not arm task-completion grace"
+            );
+        }
+
+        #[test]
+        fn precomplete_apply_repair_eligibility_disarms_pre_existing_task_completion() {
+            let policy = DispatchCompletionPolicy::for_dispatch(&TaskProgress::with_counts(2, 2));
+
+            assert_eq!(
+                resolve_apply_completion(evidence(false, false, true), policy),
+                None,
+                "the completion that caused the repair is not evidence the repair finished"
+            );
+        }
+
+        #[test]
+        fn precomplete_apply_repair_eligibility_arms_completion_reached_during_the_dispatch() {
+            let policy = DispatchCompletionPolicy::for_dispatch(&TaskProgress::with_counts(0, 2));
+
+            assert_eq!(
+                resolve_apply_completion(evidence(false, false, true), policy),
+                Some(ApplyCompletionKind::TasksComplete)
+            );
+            assert_eq!(
+                resolve_apply_completion(evidence(false, false, false), policy),
+                None
+            );
+        }
+
+        #[test]
+        fn precomplete_apply_repair_eligibility_keeps_handoffs_armed_for_every_dispatch() {
+            for progress in [
+                TaskProgress::with_counts(0, 2),
+                TaskProgress::with_counts(2, 2),
+            ] {
+                let policy = DispatchCompletionPolicy::for_dispatch(&progress);
+
+                assert_eq!(
+                    resolve_apply_completion(evidence(true, false, true), policy),
+                    Some(ApplyCompletionKind::BlockedHandoff),
+                    "blocked handoff stays eligible ({progress:?})"
+                );
+                assert_eq!(
+                    resolve_apply_completion(evidence(false, true, true), policy),
+                    Some(ApplyCompletionKind::RejectingHandoff),
+                    "rejecting handoff stays eligible ({progress:?})"
+                );
+                assert_eq!(
+                    resolve_apply_completion(evidence(true, true, true), policy),
+                    Some(ApplyCompletionKind::BlockedHandoff),
+                    "existing blocked-over-rejecting precedence is unchanged ({progress:?})"
+                );
+            }
+        }
+
+        // === Task-complete repair keeps its normal command lifetime (integration) ===
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn precomplete_apply_repair_stage_outlives_completion_grace() {
+            let repo = unstaged_repair_case("precomplete-stage");
+            let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+            let config = OrchestratorConfig {
+                apply_command: Some(format!(
+                    "sh -c 'echo repair >> {}; sleep {}; git add README.md'",
+                    apply_log.display(),
+                    REPAIR_DELAY_SECS
+                )),
+                max_iterations: Some(3),
+                ..Default::default()
+            };
+
+            let result = run_recovery_loop(&repo, "precomplete-stage", &config).await;
+
+            let loop_result =
+                result.expect("a stage repair that outlives the grace must reach finalization");
+            assert!(
+                loop_result.completed,
+                "the delayed staging must finalize instead of being terminated"
+            );
+            assert_eq!(
+                dispatch_count(&apply_log),
+                1,
+                "exactly one repair dispatch was needed"
+            );
+            assert_eq!(repo.head_subject(), "Apply: precomplete-stage");
+            assert!(
+                repo.hook_runs() >= 1,
+                "finalization ran the hook-enabled verified commit"
+            );
+            assert!(
+                porcelain_status(&repo.workspace).is_empty(),
+                "the staged repair is committed, leaving nothing behind"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn precomplete_apply_repair_task_format_outlives_completion_grace() {
+            let repo = recovery_repo("precomplete-format", COMPLETE_BUT_MALFORMED_TASKS);
+            assert!(
+                !check_task_format(&repo.workspace, "precomplete-format").is_empty(),
+                "precondition: complete checkboxes the format gate still rejects"
+            );
+
+            let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+            let config = OrchestratorConfig {
+                apply_command: Some(format!(
+                    "sh -c 'echo repair >> {}; sleep {}; printf \"{}\" > openspec/changes/{{change_id}}/tasks.md; git add -A'",
+                    apply_log.display(),
+                    REPAIR_DELAY_SECS,
+                    REPAIRED_TASKS_PRINTF
+                )),
+                max_iterations: Some(3),
+                ..Default::default()
+            };
+
+            let result = run_recovery_loop(&repo, "precomplete-format", &config).await;
+
+            assert_eq!(
+                count_acceptance_dispatch(&result),
+                1,
+                "the delayed format repair must hand off to acceptance exactly once: {:?}",
+                result.as_ref().err().map(|error| error.to_string())
+            );
+            let loop_result = result.expect("a corrected task file completes apply");
+            assert!(loop_result.completed);
+            assert_eq!(
+                dispatch_count(&apply_log),
+                1,
+                "the repair must not need a second dispatch"
+            );
+            assert!(check_task_format(&repo.workspace, "precomplete-format").is_empty());
+            assert!(
+                check_task_progress(&repo.workspace, "precomplete-format")
+                    .map(|progress| is_progress_complete(&progress))
+                    .unwrap_or(false),
+                "completed implementation evidence must survive the repair"
+            );
+            assert_eq!(repo.head_subject(), "Apply: precomplete-format");
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn precomplete_apply_repair_commit_hook_outlives_completion_grace() {
+            let repo = recovery_repo("precomplete-hook", COMPLETE_TASKS);
+            repo.block_commits();
+            let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+            let config = OrchestratorConfig {
+                apply_command: Some(format!(
+                    "sh -c 'echo repair >> {}; sleep {}; rm -f .git/blocker.txt'",
+                    apply_log.display(),
+                    REPAIR_DELAY_SECS
+                )),
+                max_iterations: Some(4),
+                ..Default::default()
+            };
+
+            let result = run_recovery_loop(&repo, "precomplete-hook", &config).await;
+
+            let loop_result =
+                result.expect("a hook repair that outlives the grace must reach a verified commit");
+            assert!(loop_result.completed);
+            assert_eq!(
+                dispatch_count(&apply_log),
+                1,
+                "exactly one repair dispatch between rejection and retry"
+            );
+            assert_eq!(repo.head_subject(), "Apply: precomplete-hook");
+            assert!(
+                repo.hook_runs() >= 2,
+                "the retried final commit executed repository hooks again, with no bypass"
+            );
+        }
+
+        // === Handoffs created by the repair dispatch still terminate it ===
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn precomplete_apply_repair_handoff_terminates_for_a_new_blocked_marker() {
+            let repo = unstaged_repair_case("precomplete-blocked");
+            let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+            let config = OrchestratorConfig {
+                apply_command: Some(format!(
+                    "sh -c 'echo repair >> {log}; mkdir -p openspec/changes/{{change_id}}/APPLY_BLOCKED; \
+                     printf \"# APPLY_BLOCKED\\n\\n- change_id: precomplete-blocked\\n- reason: test\\n\" \
+                     > openspec/changes/{{change_id}}/APPLY_BLOCKED/marker.md; sleep 30'",
+                    log = apply_log.display()
+                )),
+                max_iterations: Some(3),
+                ..Default::default()
+            };
+
+            let start = std::time::Instant::now();
+            let result = run_recovery_loop(&repo, "precomplete-blocked", &config).await;
+            let elapsed = start.elapsed();
+
+            let loop_result = result.expect("a blocked handoff is an outcome, not an apply error");
+            assert!(
+                loop_result.blocked_handoff.is_some(),
+                "the marker the repair created must still be handed off"
+            );
+            assert!(
+                !loop_result.completed,
+                "pre-existing task completion must not make a blocked repair successful"
+            );
+            assert_eq!(
+                dispatch_count(&apply_log),
+                1,
+                "the handoff must not authorize another Apply dispatch"
+            );
+            assert!(
+                elapsed < Duration::from_secs(20),
+                "grace-driven termination must bound the lingering child, took {elapsed:?}"
+            );
+            assert_ne!(repo.head_subject(), "Apply: precomplete-blocked");
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn precomplete_apply_repair_handoff_terminates_for_a_new_rejected_proposal() {
+            let repo = unstaged_repair_case("precomplete-rejected");
+            let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+            let config = OrchestratorConfig {
+                apply_command: Some(format!(
+                    "sh -c 'echo repair >> {log}; \
+                     printf \"# REJECTED\\n\\n- change_id: precomplete-rejected\\n\" \
+                     > openspec/changes/{{change_id}}/REJECTED.md; sleep 30'",
+                    log = apply_log.display()
+                )),
+                max_iterations: Some(3),
+                ..Default::default()
+            };
+
+            let start = std::time::Instant::now();
+            let result = run_recovery_loop(&repo, "precomplete-rejected", &config).await;
+            let elapsed = start.elapsed();
+
+            let loop_result =
+                result.expect("a rejecting handoff is an outcome, not an apply error");
+            assert!(
+                loop_result.rejected_handoff.is_some(),
+                "REJECTED.md written by the repair must still be handed off"
+            );
+            assert!(
+                loop_result.blocked_handoff.is_none(),
+                "a rejecting handoff must stay distinct from a blocked one"
+            );
+            assert!(!loop_result.completed);
+            assert_eq!(
+                dispatch_count(&apply_log),
+                1,
+                "the handoff must not authorize another Apply dispatch"
+            );
+            assert!(
+                elapsed < Duration::from_secs(20),
+                "grace-driven termination must bound the lingering child, took {elapsed:?}"
+            );
+        }
+
+        // === Failure classification is unchanged ===
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn precomplete_apply_repair_failure_stays_an_ordinary_failed_attempt() {
+            let repo = unstaged_repair_case("precomplete-failure");
+            let apply_log = repo.workspace.parent().unwrap().join("apply.log");
+            let config = OrchestratorConfig {
+                apply_command: Some(format!(
+                    "sh -c 'echo attempt >> {}; sleep 0.15; echo \"repair could not run\" >&2; exit 3'",
+                    apply_log.display()
+                )),
+                max_iterations: Some(2),
+                ..Default::default()
+            };
+
+            let result = run_recovery_loop(&repo, "precomplete-failure", &config).await;
+
+            assert_eq!(
+                count_acceptance_dispatch(&result),
+                0,
+                "a repair that never repaired must not reach acceptance"
+            );
+            let message = result
+                .expect_err("an exhausted budget must stop the loop")
+                .to_string();
+            assert!(message.contains("Max iterations (2)"), "{message}");
+            assert!(
+                message.contains("exit code: Some(3)"),
+                "the non-zero exit must stay an ordinary failed attempt rather than becoming \
+                 success-equivalent because tasks were already complete: {message}"
+            );
+            assert!(message.contains("repair could not run"), "{message}");
+            assert_eq!(
+                dispatch_count(&apply_log),
+                2,
+                "existing retry and iteration-budget policy stays authoritative"
+            );
+            assert_ne!(repo.head_subject(), "Apply: precomplete-failure");
+        }
     }
 }
 

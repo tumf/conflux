@@ -195,18 +195,39 @@ async fn sync_reducer_display_caches(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LocalOrchestratorShutdownOutcome {
+pub enum LocalOrchestratorShutdownOutcome {
     NoTask,
     AlreadyFinished,
     Graceful,
     AbortedAfterTimeout,
 }
 
-pub(crate) async fn shutdown_local_orchestrator_task(
+/// How long local TUI quit waits for the orchestrator before escalating.
+///
+/// It must not undercut the scheduler's own cancellation boundary: the run
+/// needs that whole window to finish command cleanup and pending merge/base-lane
+/// handling. The extra margin covers the scheduler's own return path after its
+/// barrier completes, so a run that used its full budget still gets to report
+/// gracefully instead of being aborted at the exact same instant.
+pub const LOCAL_ORCHESTRATOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(
+    crate::tui::orchestrator::PARALLEL_CANCELLATION_CLEANUP_DEADLINE.as_secs() + 5,
+);
+
+/// Bounded budget for the supervisor's own forceful cleanup after a timeout.
+const LOCAL_SHUTDOWN_FORCE_CLEANUP_BUDGET: Duration = Duration::from_secs(10);
+
+pub async fn shutdown_local_orchestrator_task(
     orchestrator_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     orchestrator_cancel: Option<CancellationToken>,
+    run_command_scope: Option<crate::ai_command_runner::RunCommandScope>,
     grace_period: Duration,
 ) -> LocalOrchestratorShutdownOutcome {
+    // Admission closes at cancellation time, not after the grace period: a
+    // command must not be able to start while the TUI is already leaving.
+    if let Some(scope) = &run_command_scope {
+        scope.close();
+    }
+
     if let Some(cancel) = orchestrator_cancel {
         info!(
             grace_ms = grace_period.as_millis(),
@@ -241,6 +262,26 @@ pub(crate) async fn shutdown_local_orchestrator_task(
                 grace_ms = grace_period.as_millis(),
                 "Local TUI orchestrator did not finish before shutdown grace period; aborting task to prevent detached local work"
             );
+            // Task abort is not child-process cleanup evidence, and it destroys
+            // the only in-task path to the run's PGIDs. The retained scope is
+            // consumed here, before the abort, so deterministic groups are
+            // force-cleaned and verified while their identities still exist.
+            if let Some(scope) = &run_command_scope {
+                let cleanup = scope
+                    .force_cleanup_retained(LOCAL_SHUTDOWN_FORCE_CLEANUP_BUDGET)
+                    .await;
+                if cleanup.is_quiescent() {
+                    info!(
+                        escalated = cleanup.escalated,
+                        "Forced cleanup of retained run-owned process groups before aborting the local TUI orchestrator"
+                    );
+                } else {
+                    warn!(
+                        "Local TUI shutdown could not prove run-owned process cleanup: {}",
+                        cleanup.diagnostics()
+                    );
+                }
+            }
             handle.as_ref().abort_handle().abort();
             match tokio::time::timeout(Duration::from_secs(1), &mut handle).await {
                 Ok(Ok(_)) => info!("Aborted local TUI orchestrator task joined after abort"),
@@ -890,11 +931,14 @@ async fn run_tui_loop(
     // Wait for tasks to finish gracefully. Remote mode has no local orchestrator handle here;
     // remote server-side work is stopped only by explicit Stop/ForceStop commands.
     refresh_handle.abort();
-    let (orchestrator_handle, orchestrator_cancel) = supervisor.take_run();
+    // Remote mode has no local run, so `take_run` yields no handle and no scope
+    // and this is a no-op: closing a remote TUI client still sends no stop.
+    let (orchestrator_handle, orchestrator_cancel, run_command_scope) = supervisor.take_run();
     let _ = shutdown_local_orchestrator_task(
         orchestrator_handle,
         orchestrator_cancel,
-        Duration::from_secs(5),
+        run_command_scope,
+        LOCAL_ORCHESTRATOR_SHUTDOWN_GRACE,
     )
     .await;
 
@@ -1507,9 +1551,13 @@ mod tests {
             Ok(())
         });
 
-        let outcome =
-            shutdown_local_orchestrator_task(Some(handle), Some(token), Duration::from_millis(10))
-                .await;
+        let outcome = shutdown_local_orchestrator_task(
+            Some(handle),
+            Some(token),
+            None,
+            Duration::from_millis(10),
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -1530,8 +1578,104 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_local_orchestrator_without_handle_is_noop() {
-        let outcome = shutdown_local_orchestrator_task(None, None, Duration::from_millis(1)).await;
+        let outcome =
+            shutdown_local_orchestrator_task(None, None, None, Duration::from_millis(1)).await;
 
         assert_eq!(outcome, LocalOrchestratorShutdownOutcome::NoTask);
+    }
+
+    /// Local quit is a cancellation boundary for the run this TUI started.
+    ///
+    /// Three things had to hold together and previously did not: the command
+    /// scope must close at cancellation time rather than after a grace period,
+    /// that grace must not expire before the scheduler's own cancellation
+    /// boundary has had its chance, and a timeout must force-clean the retained
+    /// process identities *before* the task is aborted — because abort destroys
+    /// the only in-task path to them and is not cleanup evidence by itself.
+    ///
+    /// The real process boundary is covered by
+    /// `run_scope_tui_quit_cleans_process_group_after_timeout` in
+    /// `tests/process_cleanup_test.rs`; this pins the control flow.
+    #[tokio::test]
+    async fn local_tui_shutdown_waits_for_run_command_scope() {
+        use crate::ai_command_runner::RunCommandScope;
+        use crate::tui::orchestrator::PARALLEL_CANCELLATION_CLEANUP_DEADLINE;
+
+        // The grace must not undercut the scheduler's outer cancellation
+        // boundary, or the TUI aborts the very cleanup it is waiting for.
+        assert!(
+            super::LOCAL_ORCHESTRATOR_SHUTDOWN_GRACE >= PARALLEL_CANCELLATION_CLEANUP_DEADLINE,
+            "local shutdown grace {:?} undercuts the scheduler boundary {:?}",
+            super::LOCAL_ORCHESTRATOR_SHUTDOWN_GRACE,
+            PARALLEL_CANCELLATION_CLEANUP_DEADLINE
+        );
+
+        // Graceful completion: the scope closes at cancellation time, and the
+        // task is joined rather than aborted.
+        let scope = RunCommandScope::new();
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let handle = tokio::spawn(async move {
+            task_token.cancelled().await;
+            Ok(())
+        });
+        let outcome = shutdown_local_orchestrator_task(
+            Some(handle),
+            Some(token),
+            Some(scope.clone()),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(outcome, LocalOrchestratorShutdownOutcome::Graceful);
+        assert!(
+            scope.is_closed() && scope.cancel_token().is_cancelled(),
+            "quit closes run command admission immediately, not after the grace period"
+        );
+
+        // Timeout escalation: a retained owned identity is force-cleaned and
+        // verified before the task is aborted.
+        let dead = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn");
+        let pid = dead.id();
+        let mut dead = dead;
+        let _ = dead.wait();
+
+        let scope = RunCommandScope::new();
+        scope
+            .register_unproven_for_test("apply", Some("change-a"), pid)
+            .release_confirmed();
+        assert_eq!(scope.retained_process_ids(), vec![pid]);
+
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let outcome = shutdown_local_orchestrator_task(
+            Some(handle),
+            Some(token),
+            Some(scope.clone()),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            LocalOrchestratorShutdownOutcome::AbortedAfterTimeout,
+            "timeout stays distinguishable from graceful completion"
+        );
+        assert!(
+            scope.retained_process_ids().is_empty(),
+            "retained owned identities must be cleaned and verified before task abort"
+        );
+
+        // Remote mode: no local run means no handle and no scope, and nothing
+        // here reaches the remote server.
+        assert_eq!(
+            shutdown_local_orchestrator_task(None, None, None, Duration::from_millis(1)).await,
+            LocalOrchestratorShutdownOutcome::NoTask
+        );
     }
 }

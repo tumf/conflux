@@ -19,6 +19,15 @@ struct ChangeExecutionHandle {
     done: CancellationToken,
 }
 
+/// Outcome of clearing the execution registry on a cancellation exit.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExecutionHandleRelease {
+    /// Changes whose `done` handshake fired because command cleanup was confirmed.
+    pub confirmed: usize,
+    /// Changes released without confirmed cleanup; their `done` stayed unfired.
+    pub unconfirmed: Vec<String>,
+}
+
 /// Dynamic queue for runtime change additions
 ///
 /// This struct provides a thread-safe queue for dynamically adding changes
@@ -243,8 +252,8 @@ impl DynamicQueue {
         }
     }
 
-    /// Release every registered per-change execution handle, firing each done
-    /// handshake.
+    /// Clear the execution registry after cancellation, firing `done` only for
+    /// changes whose run-owned commands reached confirmed process cleanup.
     ///
     /// Ordinary completion releases one handle at a time through
     /// [`Self::unregister_kill_token`]. Operator cancellation aborts in-flight
@@ -254,16 +263,30 @@ impl DynamicQueue {
     /// would later be read as proof that an agent process is still running and
     /// would misclassify a subsequent idle stop as a force stop.
     ///
-    /// Returns the number of handles released.
-    pub async fn release_all_execution_handles(&self) -> usize {
+    /// Dropping a workspace future is not completion evidence, though. `done`
+    /// means "the task and its child process exited", so it fires only where
+    /// `is_quiescent` confirms it; an unconfirmed change leaves its waiter
+    /// pending for its own bounded timeout rather than receiving a false
+    /// completion.
+    pub async fn release_all_execution_handles<F>(&self, is_quiescent: F) -> ExecutionHandleRelease
+    where
+        F: Fn(&str) -> bool,
+    {
         let handles = {
             let mut tokens = self.kill_tokens.lock().await;
             std::mem::take(&mut *tokens)
         };
-        for handle in handles.values() {
-            handle.done.cancel();
+        let mut release = ExecutionHandleRelease::default();
+        for (change_id, handle) in handles {
+            if is_quiescent(&change_id) {
+                handle.done.cancel();
+                release.confirmed += 1;
+            } else {
+                release.unconfirmed.push(change_id);
+            }
         }
-        handles.len()
+        release.unconfirmed.sort();
+        release
     }
 
     /// Number of currently registered per-change execution handles.
@@ -459,6 +482,70 @@ mod tests {
 
         assert!(queue.request_cancellation("b").await.is_none());
         assert!(queue.is_stopped("b").await);
+    }
+
+    /// `done` means the task *and its child process* exited.
+    ///
+    /// The regression this pins: the cancellation exit used to fire every
+    /// registered handshake just because `JoinSet::abort_all` had dropped the
+    /// workspace futures. Dropping a future proves nothing about the process
+    /// group it owned, so a waiter could be told an agent had finished while it
+    /// was still editing the worktree.
+    #[tokio::test]
+    async fn execution_done_requires_process_quiescence() {
+        let queue = DynamicQueue::new();
+        for change in ["confirmed", "unconfirmed"] {
+            queue
+                .register_kill_token(change.to_string(), CancellationToken::new())
+                .await;
+        }
+        let confirmed_done = queue
+            .request_cancellation("confirmed")
+            .await
+            .expect("handle registered");
+        let unconfirmed_done = queue
+            .request_cancellation("unconfirmed")
+            .await
+            .expect("handle registered");
+
+        // The workspace futures have just been aborted. Nothing has proven
+        // anything about their process groups yet.
+        assert!(
+            !confirmed_done.is_cancelled() && !unconfirmed_done.is_cancelled(),
+            "requesting cancellation is not completion evidence"
+        );
+
+        // Only `confirmed` has matching run-scope cleanup evidence.
+        let release = queue
+            .release_all_execution_handles(|change_id| change_id == "confirmed")
+            .await;
+
+        assert_eq!(release.confirmed, 1);
+        assert_eq!(release.unconfirmed, vec!["unconfirmed".to_string()]);
+        assert!(
+            confirmed_done.is_cancelled(),
+            "confirmed terminal cleanup releases the handshake"
+        );
+        assert!(
+            !unconfirmed_done.is_cancelled(),
+            "an aborted task without cleanup evidence must not report completion"
+        );
+
+        // The waiter for the unconfirmed change is left to its own bounded
+        // timeout rather than receiving a false completion.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(30),
+                unconfirmed_done.cancelled()
+            )
+            .await
+            .is_err(),
+            "the unconfirmed waiter times out truthfully"
+        );
+
+        // The registry itself is empty either way, so a later idle stop in the
+        // same session cannot read a stale handle as a live agent process.
+        assert_eq!(queue.registered_execution_count().await, 0);
     }
 
     #[tokio::test]
