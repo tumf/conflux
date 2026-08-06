@@ -213,78 +213,27 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel and serial execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
-
-A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts.
-
-During an active run, serial and parallel execution MUST instead apply the same dedicated missing-verdict protocol-retry policy. While the dedicated budget remains, runtime MUST invoke the normal configured acceptance command again with bounded Conflux-managed prior acceptance output, attempt evidence, current workspace context, and a trusted corrective instruction requiring exactly one canonical verdict. This continuation MUST NOT depend on harness session resume, harness-specific CLI flags, provider events, or external managed-job identifiers.
-
-The dedicated policy MUST allow no more than two retries after the initial missing-verdict attempt. Its counter MUST be independent from explicit-`CONTINUE` accounting and MUST reset after any canonical verdict. Exhaustion MUST produce a terminal missing-verdict protocol failure with bounded evidence and attempt-count diagnostics. Acceptance command launch or execution failure MUST retain command-failure routing and MUST NOT be reclassified as a missing-verdict retry.
-
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact or another generated retry checkpoint for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in active-run memory, events, or non-authoritative observability logs, but archive and resume routing MUST remain derivable from workspace file/git state. After process restart, an applied but unarchived workspace MUST run acceptance again and MUST NOT infer acceptance from prior narrative output.
-
-When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
-
-#### Scenario: status-only exit continues through a dedicated protocol retry
-
-- **GIVEN** an acceptance command reports that it is waiting for owned verification
-- **AND** the command exits without emitting a canonical verdict
-- **AND** the active run has missing-verdict retry budget remaining
-- **WHEN** acceptance execution classifies the completed command
-- **THEN** the result remains an explicit missing-verdict protocol failure and is not classified as `CONTINUE`
-- **AND** runtime records bounded evidence and invokes the normal acceptance command again
-- **AND** the new prompt includes bounded prior attempt context plus a corrective canonical-verdict instruction
-- **AND** the configured explicit-`CONTINUE` counter is unchanged
-- **AND** queue reconciliation does not classify the active retry as `terminal_error_retry_required`
-
-#### Scenario: continuation is harness neutral
-
-- **GIVEN** any configured acceptance command can receive the normal Conflux prompt
-- **WHEN** runtime retries after a missing verdict
-- **THEN** continuity is provided only through Conflux-managed prompt context and workspace evidence
-- **AND** runtime does not require a harness session ID, resume flag, provider event, or external job ID
-
-#### Scenario: missing-verdict retry budget is exhausted
-
-- **GIVEN** an initial acceptance attempt and two consecutive protocol retries all emit no canonical verdict
-- **WHEN** runtime classifies the third consecutive missing verdict
-- **THEN** it emits the terminal missing-verdict protocol failure
-- **AND** the diagnostic identifies the exhausted attempts and includes bounded evidence
-- **AND** no fourth protocol retry starts
-
-#### Scenario: canonical outcome resets protocol retry state
-
-- **GIVEN** acceptance previously entered a missing-verdict protocol retry
-- **WHEN** a later invocation emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
-- **THEN** that canonical outcome retains its existing routing semantics
-- **AND** the consecutive missing-verdict retry count resets
-- **AND** explicit `CONTINUE` retains its configured continuation policy
+Managed-worktree execution SHALL run `acceptance_command` after successful apply and before archive. Every configured frontend SHALL use the same verdict parsing, missing-verdict retry, history, restart, and stalled-hold behavior.
 
 #### Scenario: process restart uses workspace evidence
 
 - **GIVEN** an acceptance protocol retry was active before process termination
-- **AND** the workspace remains applied but unarchived
-- **WHEN** Conflux restarts without out-of-worktree runtime state
-- **THEN** it runs acceptance again from workspace file/git state
-- **AND** it does not infer PASS from prior missing-verdict output
-- **AND** it does not require a generated acceptance retry checkpoint
-
-#### Scenario: missing verdict does not create report artifact
-
-- **GIVEN** an acceptance command exits without a canonical verdict
-- **WHEN** runtime records or retries the missing-verdict failure
-- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json` or another generated acceptance retry checkpoint
-- **AND** evidence is carried through existing prompt, history, event, and observability paths
+- **AND** the managed workspace remains applied but unarchived
+- **WHEN** Conflux restarts
+- **THEN** it runs acceptance again from workspace file and Git state
+- **AND** it does not require a generated retry checkpoint
 
 ### Requirement: Parallel apply runs in worktree
-parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
 
-#### Scenario: apply 実行が worktree 以外の場合は失敗する
-- **GIVEN** parallel mode で change が実行対象に選ばれている
-- **AND** apply 実行ディレクトリが worktree パスではない
-- **WHEN** apply コマンドが実行される
-- **THEN** システムはエラーを返し apply を停止する
-- **AND** エラーメッセージに change_id と実行ディレクトリが含まれる
+Every change-level apply command MUST run in the selected change's managed worktree. A base-repository or other non-managed execution directory MUST fail before the apply command starts.
+
+#### Scenario: apply outside managed worktree fails
+
+- **GIVEN** a change is selected for execution
+- **AND** its apply directory is not its managed worktree
+- **WHEN** apply dispatch is attempted
+- **THEN** execution fails with the change ID and invalid directory
+- **AND** the base repository is not mutated by apply
 
 ### Requirement: VCS Backend Abstraction
 
@@ -319,37 +268,14 @@ parallel mode の apply コマンドは、対象 change の worktree ディレ�
 
 ### Requirement: VCS Backend Auto-Detection
 
-システムは並列実行時に VCS バックエンドを自動検出しなければならない（SHALL）。
-
-検出優先順位:
-1. Git リポジトリ（`.git` ディレクトリ存在）→ Git バックエンド
-2. `.git` が存在しない → 並列実行不可エラー
-
-#### Scenario: Auto-detect git backend
-
-- **WHEN** カレントディレクトリに `.git` ディレクトリが存在する
-- **AND** `--vcs` オプションが指定されていない、または `auto` である
-- **THEN** Git バックエンドが選択される
+The sole execution path SHALL auto-detect Git when `--vcs` is absent or `auto`. Executable orchestration without a usable Git repository SHALL fail before orchestration side effects.
 
 #### Scenario: No VCS available
 
-- **WHEN** `.git` が存在しない
-- **AND** `--parallel` フラグが指定されている
-- **THEN** エラーメッセージ "Parallel mode requires git repository" が表示される
-- **AND** 終了コードは非ゼロである
-
-#### Scenario: Explicit VCS selection with --vcs flag
-
-- **WHEN** `--vcs git` が指定されている
-- **AND** `.git` ディレクトリが存在する
-- **THEN** Git バックエンドが使用される
-
-#### Scenario: Explicit VCS not available
-
-- **WHEN** `--vcs git` が指定されている
-- **AND** `.git` ディレクトリが存在しない
-- **THEN** エラーメッセージ "git repository not found (.git directory missing)" が表示される
-- **AND** 終了コードは非ゼロである
+- **WHEN** executable orchestration starts outside a usable Git repository
+- **THEN** an actionable Git-repository error is displayed
+- **AND** the exit code is non-zero
+- **AND** no serial fallback starts
 
 ### Requirement: Git Worktree Workspace Management
 
@@ -1187,48 +1113,15 @@ runtime は dependency blocked だった change が resolved になったこと�
 
 ### Requirement: AI エージェントクラッシュリカバリー
 
-Apply または Archive コマンドが異常終了（exit code ≠ 0）した場合、システムはコマンドキューの既存 transport retry を適用しなければならない（SHALL）。transport retry が終了しても Apply command が非ゼロの場合、workspace-local completion、cancellation、permission、blocked/rejecting handoff の別 routing が所有しない限り、システムは失敗 attempt を既存 Apply history に記録し、同一 managed workspace 上の次の Apply iteration を実行しなければならない（MUST）。
-
-Apply の全 configured agent dispatch は、serial CLI、TUI、parallel execution、および Acceptance FAIL 後の再入を通じて、同じ per-change active-run `max_iterations` counter を共有しなければならない（MUST）。正の値は command failure、通常実装、task-format repair、escalation、final-commit repair を含む dispatched Apply attempt の総上限であり、command queue transport retry は一つの dispatch 内部として数えなければならない（MUST）。`0` は numeric limit のみを無効化し、fresh repository/handoff evaluation、permission、progress/WIP/stall policy を無効化してはならない（MUST NOT）。
-
-Ordinary non-zero Apply result は、history 記録と `on_error` 後に即時 redispatch してはならない（MUST NOT）。システムは fresh task/Git state、completion、blocked/rejecting handoff、permission、progress/WIP/stall accounting、および既存 hook eligibility を評価し、その routing が Apply continuation を許可した場合のみ次の dispatch を開始しなければならない（MUST）。Archive command の transport retry は既存 `ARCHIVE_COMMAND_MAX_RETRIES` を使用し、operation-level Archive recovery はこの requirement では追加しない。
-
-#### Scenario: Parallel Apply command failure continues with bounded history
-
-- **GIVEN** parallel mode の Apply command が command queue retry 後も非ゼロで終了する
-- **AND** tasks は未完了で cancellation、permission stall、blocked/rejecting handoff、completion-finalized state のいずれも存在しない
-- **AND** 正の `max_iterations` budget が残っている
-- **WHEN** Apply loop が command result を処理する
-- **THEN** exit code、error、bounded stdout tail、bounded stderr tail を Apply history に記録する
-- **AND** 同じ managed workspace 上で次の Apply iteration を実行する
-- **AND** 次の prompt はその bounded failure context を含む
-- **AND** queue state は Applying のままで terminal processing error を生成しない
+ApplyまたはArchiveコマンドの異常終了時、managed-worktree executionは既存transport retry、history、fresh repository/handoff evaluation、permission、progress、stall、およびper-change active-run `max_iterations` contractを維持しなければならない（MUST）。
 
 #### Scenario: Apply command failures exhaust one per-change active-run budget
 
-- **GIVEN** `max_iterations` が `3` である
+- **GIVEN** `max_iterations` is `3`
 - **AND** one change has Apply dispatches before and after an Acceptance FAIL-to-Apply cycle
-- **AND** command queue 内部 retry 後の Apply command が繰り返し非ゼロで終了する
-- **WHEN** that change completes its third cumulative configured Apply dispatch
-- **THEN** 4 回目の Apply command は serial CLI、TUI、parallel のいずれからも開始しない
-- **AND** typed `iteration_limit` diagnostic は change ID、上限、exact cumulative count、最新の bounded actionable failure を含む
-- **AND** process restartだけがactive-run countをresetする
-
-#### Scenario: Zero leaves Apply iteration count unlimited but still reaches stall
-
-- **GIVEN** `max_iterations` が `0` である
-- **AND** Apply commands repeatedly exit non-zero without task or Git progress
-- **WHEN** each command result is recorded
-- **THEN** iteration count のみを理由に Apply loop を停止しない
-- **AND** each result reaches fresh completion、cancellation、stall、permission、blocked/rejecting handoff evaluation
-- **AND** existing no-progress diagnosis、escalation、または stalled outcome can stop redispatch
-
-#### Scenario: Owned Apply outcomes do not become generic crash recovery
-
-- **GIVEN** Apply execution が explicit cancellation、repeated unresolved permission denial、blocked/rejecting handoff、または observed completion 後の orchestrator terminate に到達する
-- **WHEN** child status が非ゼロである
-- **THEN** 既存の cancellation、permission stall、handoff、または completion-finalized routing を保持する
-- **AND** ordinary command-failure iteration として重複 retry しない
+- **WHEN** the third cumulative configured Apply dispatch completes
+- **THEN** no fourth Apply command starts from CLI, TUI, or remote-controlled execution
+- **AND** the typed `iteration_limit` diagnostic includes the exact cumulative count
 
 ### Requirement: Git 以外では WIP/スタール検知を無効化
 
@@ -1653,68 +1546,15 @@ When parallel merge verification runs after archive completion, a change that is
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel and serial execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
-
-A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts.
-
-During an active run, serial and parallel execution MUST instead apply the same dedicated missing-verdict protocol-retry policy. While the dedicated budget remains, runtime MUST invoke the normal configured acceptance command again with bounded Conflux-managed prior acceptance output, attempt evidence, current workspace context, and a trusted corrective instruction requiring exactly one canonical verdict. This continuation MUST NOT depend on harness session resume, harness-specific CLI flags, provider events, or external managed-job identifiers.
-
-The dedicated policy MUST allow no more than two retries after the initial missing-verdict attempt. Its counter MUST be independent from explicit-`CONTINUE` accounting and MUST reset after any canonical verdict. Exhaustion MUST produce a terminal missing-verdict protocol failure with bounded evidence and attempt-count diagnostics. Acceptance command launch or execution failure MUST retain command-failure routing and MUST NOT be reclassified as a missing-verdict retry.
-
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact or another generated retry checkpoint for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in active-run memory, events, or non-authoritative observability logs, but archive and resume routing MUST remain derivable from workspace file/git state. After process restart, an applied but unarchived workspace MUST run acceptance again and MUST NOT infer acceptance from prior narrative output.
-
-When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
-
-#### Scenario: status-only exit continues through a dedicated protocol retry
-
-- **GIVEN** an acceptance command reports that it is waiting for owned verification
-- **AND** the command exits without emitting a canonical verdict
-- **AND** the active run has missing-verdict retry budget remaining
-- **WHEN** acceptance execution classifies the completed command
-- **THEN** the result remains an explicit missing-verdict protocol failure and is not classified as `CONTINUE`
-- **AND** runtime records bounded evidence and invokes the normal acceptance command again
-- **AND** the new prompt includes bounded prior attempt context plus a corrective canonical-verdict instruction
-- **AND** the configured explicit-`CONTINUE` counter is unchanged
-- **AND** queue reconciliation does not classify the active retry as `terminal_error_retry_required`
-
-#### Scenario: continuation is harness neutral
-
-- **GIVEN** any configured acceptance command can receive the normal Conflux prompt
-- **WHEN** runtime retries after a missing verdict
-- **THEN** continuity is provided only through Conflux-managed prompt context and workspace evidence
-- **AND** runtime does not require a harness session ID, resume flag, provider event, or external job ID
-
-#### Scenario: missing-verdict retry budget is exhausted
-
-- **GIVEN** an initial acceptance attempt and two consecutive protocol retries all emit no canonical verdict
-- **WHEN** runtime classifies the third consecutive missing verdict
-- **THEN** it emits the terminal missing-verdict protocol failure
-- **AND** the diagnostic identifies the exhausted attempts and includes bounded evidence
-- **AND** no fourth protocol retry starts
-
-#### Scenario: canonical outcome resets protocol retry state
-
-- **GIVEN** acceptance previously entered a missing-verdict protocol retry
-- **WHEN** a later invocation emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
-- **THEN** that canonical outcome retains its existing routing semantics
-- **AND** the consecutive missing-verdict retry count resets
-- **AND** explicit `CONTINUE` retains its configured continuation policy
+Managed-worktree execution SHALL run `acceptance_command` after successful apply and before archive. Every configured frontend SHALL use the same verdict parsing, missing-verdict retry, history, restart, and stalled-hold behavior.
 
 #### Scenario: process restart uses workspace evidence
 
 - **GIVEN** an acceptance protocol retry was active before process termination
-- **AND** the workspace remains applied but unarchived
-- **WHEN** Conflux restarts without out-of-worktree runtime state
-- **THEN** it runs acceptance again from workspace file/git state
-- **AND** it does not infer PASS from prior missing-verdict output
-- **AND** it does not require a generated acceptance retry checkpoint
-
-#### Scenario: missing verdict does not create report artifact
-
-- **GIVEN** an acceptance command exits without a canonical verdict
-- **WHEN** runtime records or retries the missing-verdict failure
-- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json` or another generated acceptance retry checkpoint
-- **AND** evidence is carried through existing prompt, history, event, and observability paths
+- **AND** the managed workspace remains applied but unarchived
+- **WHEN** Conflux restarts
+- **THEN** it runs acceptance again from workspace file and Git state
+- **AND** it does not require a generated retry checkpoint
 
 ### Requirement: Shared Parallel Orchestration Service
 
@@ -2022,68 +1862,15 @@ The runtime SHALL NOT leave a change in the `Rejecting` activity stage after rej
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel and serial execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
-
-A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts.
-
-During an active run, serial and parallel execution MUST instead apply the same dedicated missing-verdict protocol-retry policy. While the dedicated budget remains, runtime MUST invoke the normal configured acceptance command again with bounded Conflux-managed prior acceptance output, attempt evidence, current workspace context, and a trusted corrective instruction requiring exactly one canonical verdict. This continuation MUST NOT depend on harness session resume, harness-specific CLI flags, provider events, or external managed-job identifiers.
-
-The dedicated policy MUST allow no more than two retries after the initial missing-verdict attempt. Its counter MUST be independent from explicit-`CONTINUE` accounting and MUST reset after any canonical verdict. Exhaustion MUST produce a terminal missing-verdict protocol failure with bounded evidence and attempt-count diagnostics. Acceptance command launch or execution failure MUST retain command-failure routing and MUST NOT be reclassified as a missing-verdict retry.
-
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact or another generated retry checkpoint for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in active-run memory, events, or non-authoritative observability logs, but archive and resume routing MUST remain derivable from workspace file/git state. After process restart, an applied but unarchived workspace MUST run acceptance again and MUST NOT infer acceptance from prior narrative output.
-
-When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
-
-#### Scenario: status-only exit continues through a dedicated protocol retry
-
-- **GIVEN** an acceptance command reports that it is waiting for owned verification
-- **AND** the command exits without emitting a canonical verdict
-- **AND** the active run has missing-verdict retry budget remaining
-- **WHEN** acceptance execution classifies the completed command
-- **THEN** the result remains an explicit missing-verdict protocol failure and is not classified as `CONTINUE`
-- **AND** runtime records bounded evidence and invokes the normal acceptance command again
-- **AND** the new prompt includes bounded prior attempt context plus a corrective canonical-verdict instruction
-- **AND** the configured explicit-`CONTINUE` counter is unchanged
-- **AND** queue reconciliation does not classify the active retry as `terminal_error_retry_required`
-
-#### Scenario: continuation is harness neutral
-
-- **GIVEN** any configured acceptance command can receive the normal Conflux prompt
-- **WHEN** runtime retries after a missing verdict
-- **THEN** continuity is provided only through Conflux-managed prompt context and workspace evidence
-- **AND** runtime does not require a harness session ID, resume flag, provider event, or external job ID
-
-#### Scenario: missing-verdict retry budget is exhausted
-
-- **GIVEN** an initial acceptance attempt and two consecutive protocol retries all emit no canonical verdict
-- **WHEN** runtime classifies the third consecutive missing verdict
-- **THEN** it emits the terminal missing-verdict protocol failure
-- **AND** the diagnostic identifies the exhausted attempts and includes bounded evidence
-- **AND** no fourth protocol retry starts
-
-#### Scenario: canonical outcome resets protocol retry state
-
-- **GIVEN** acceptance previously entered a missing-verdict protocol retry
-- **WHEN** a later invocation emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
-- **THEN** that canonical outcome retains its existing routing semantics
-- **AND** the consecutive missing-verdict retry count resets
-- **AND** explicit `CONTINUE` retains its configured continuation policy
+Managed-worktree execution SHALL run `acceptance_command` after successful apply and before archive. Every configured frontend SHALL use the same verdict parsing, missing-verdict retry, history, restart, and stalled-hold behavior.
 
 #### Scenario: process restart uses workspace evidence
 
 - **GIVEN** an acceptance protocol retry was active before process termination
-- **AND** the workspace remains applied but unarchived
-- **WHEN** Conflux restarts without out-of-worktree runtime state
-- **THEN** it runs acceptance again from workspace file/git state
-- **AND** it does not infer PASS from prior missing-verdict output
-- **AND** it does not require a generated acceptance retry checkpoint
-
-#### Scenario: missing verdict does not create report artifact
-
-- **GIVEN** an acceptance command exits without a canonical verdict
-- **WHEN** runtime records or retries the missing-verdict failure
-- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json` or another generated acceptance retry checkpoint
-- **AND** evidence is carried through existing prompt, history, event, and observability paths
+- **AND** the managed workspace remains applied but unarchived
+- **WHEN** Conflux restarts
+- **THEN** it runs acceptance again from workspace file and Git state
+- **AND** it does not require a generated retry checkpoint
 
 ### Requirement: Workspace State Detection
 Existing workspaces SHALL be classified from worktree state in a way that preserves canonical execution ordering for resume.
@@ -2272,133 +2059,27 @@ If the base-mutating lane is occupied, the rejection-review handoff SHALL become
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel and serial execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
-
-A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts.
-
-During an active run, serial and parallel execution MUST instead apply the same dedicated missing-verdict protocol-retry policy. While the dedicated budget remains, runtime MUST invoke the normal configured acceptance command again with bounded Conflux-managed prior acceptance output, attempt evidence, current workspace context, and a trusted corrective instruction requiring exactly one canonical verdict. This continuation MUST NOT depend on harness session resume, harness-specific CLI flags, provider events, or external managed-job identifiers.
-
-The dedicated policy MUST allow no more than two retries after the initial missing-verdict attempt. Its counter MUST be independent from explicit-`CONTINUE` accounting and MUST reset after any canonical verdict. Exhaustion MUST produce a terminal missing-verdict protocol failure with bounded evidence and attempt-count diagnostics. Acceptance command launch or execution failure MUST retain command-failure routing and MUST NOT be reclassified as a missing-verdict retry.
-
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact or another generated retry checkpoint for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in active-run memory, events, or non-authoritative observability logs, but archive and resume routing MUST remain derivable from workspace file/git state. After process restart, an applied but unarchived workspace MUST run acceptance again and MUST NOT infer acceptance from prior narrative output.
-
-When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
-
-#### Scenario: status-only exit continues through a dedicated protocol retry
-
-- **GIVEN** an acceptance command reports that it is waiting for owned verification
-- **AND** the command exits without emitting a canonical verdict
-- **AND** the active run has missing-verdict retry budget remaining
-- **WHEN** acceptance execution classifies the completed command
-- **THEN** the result remains an explicit missing-verdict protocol failure and is not classified as `CONTINUE`
-- **AND** runtime records bounded evidence and invokes the normal acceptance command again
-- **AND** the new prompt includes bounded prior attempt context plus a corrective canonical-verdict instruction
-- **AND** the configured explicit-`CONTINUE` counter is unchanged
-- **AND** queue reconciliation does not classify the active retry as `terminal_error_retry_required`
-
-#### Scenario: continuation is harness neutral
-
-- **GIVEN** any configured acceptance command can receive the normal Conflux prompt
-- **WHEN** runtime retries after a missing verdict
-- **THEN** continuity is provided only through Conflux-managed prompt context and workspace evidence
-- **AND** runtime does not require a harness session ID, resume flag, provider event, or external job ID
-
-#### Scenario: missing-verdict retry budget is exhausted
-
-- **GIVEN** an initial acceptance attempt and two consecutive protocol retries all emit no canonical verdict
-- **WHEN** runtime classifies the third consecutive missing verdict
-- **THEN** it emits the terminal missing-verdict protocol failure
-- **AND** the diagnostic identifies the exhausted attempts and includes bounded evidence
-- **AND** no fourth protocol retry starts
-
-#### Scenario: canonical outcome resets protocol retry state
-
-- **GIVEN** acceptance previously entered a missing-verdict protocol retry
-- **WHEN** a later invocation emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
-- **THEN** that canonical outcome retains its existing routing semantics
-- **AND** the consecutive missing-verdict retry count resets
-- **AND** explicit `CONTINUE` retains its configured continuation policy
+Managed-worktree execution SHALL run `acceptance_command` after successful apply and before archive. Every configured frontend SHALL use the same verdict parsing, missing-verdict retry, history, restart, and stalled-hold behavior.
 
 #### Scenario: process restart uses workspace evidence
 
 - **GIVEN** an acceptance protocol retry was active before process termination
-- **AND** the workspace remains applied but unarchived
-- **WHEN** Conflux restarts without out-of-worktree runtime state
-- **THEN** it runs acceptance again from workspace file/git state
-- **AND** it does not infer PASS from prior missing-verdict output
-- **AND** it does not require a generated acceptance retry checkpoint
-
-#### Scenario: missing verdict does not create report artifact
-
-- **GIVEN** an acceptance command exits without a canonical verdict
-- **WHEN** runtime records or retries the missing-verdict failure
-- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json` or another generated acceptance retry checkpoint
-- **AND** evidence is carried through existing prompt, history, event, and observability paths
+- **AND** the managed workspace remains applied but unarchived
+- **WHEN** Conflux restarts
+- **THEN** it runs acceptance again from workspace file and Git state
+- **AND** it does not require a generated retry checkpoint
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel and serial execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
-
-A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts.
-
-During an active run, serial and parallel execution MUST instead apply the same dedicated missing-verdict protocol-retry policy. While the dedicated budget remains, runtime MUST invoke the normal configured acceptance command again with bounded Conflux-managed prior acceptance output, attempt evidence, current workspace context, and a trusted corrective instruction requiring exactly one canonical verdict. This continuation MUST NOT depend on harness session resume, harness-specific CLI flags, provider events, or external managed-job identifiers.
-
-The dedicated policy MUST allow no more than two retries after the initial missing-verdict attempt. Its counter MUST be independent from explicit-`CONTINUE` accounting and MUST reset after any canonical verdict. Exhaustion MUST produce a terminal missing-verdict protocol failure with bounded evidence and attempt-count diagnostics. Acceptance command launch or execution failure MUST retain command-failure routing and MUST NOT be reclassified as a missing-verdict retry.
-
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact or another generated retry checkpoint for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in active-run memory, events, or non-authoritative observability logs, but archive and resume routing MUST remain derivable from workspace file/git state. After process restart, an applied but unarchived workspace MUST run acceptance again and MUST NOT infer acceptance from prior narrative output.
-
-When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
-
-#### Scenario: status-only exit continues through a dedicated protocol retry
-
-- **GIVEN** an acceptance command reports that it is waiting for owned verification
-- **AND** the command exits without emitting a canonical verdict
-- **AND** the active run has missing-verdict retry budget remaining
-- **WHEN** acceptance execution classifies the completed command
-- **THEN** the result remains an explicit missing-verdict protocol failure and is not classified as `CONTINUE`
-- **AND** runtime records bounded evidence and invokes the normal acceptance command again
-- **AND** the new prompt includes bounded prior attempt context plus a corrective canonical-verdict instruction
-- **AND** the configured explicit-`CONTINUE` counter is unchanged
-- **AND** queue reconciliation does not classify the active retry as `terminal_error_retry_required`
-
-#### Scenario: continuation is harness neutral
-
-- **GIVEN** any configured acceptance command can receive the normal Conflux prompt
-- **WHEN** runtime retries after a missing verdict
-- **THEN** continuity is provided only through Conflux-managed prompt context and workspace evidence
-- **AND** runtime does not require a harness session ID, resume flag, provider event, or external job ID
-
-#### Scenario: missing-verdict retry budget is exhausted
-
-- **GIVEN** an initial acceptance attempt and two consecutive protocol retries all emit no canonical verdict
-- **WHEN** runtime classifies the third consecutive missing verdict
-- **THEN** it emits the terminal missing-verdict protocol failure
-- **AND** the diagnostic identifies the exhausted attempts and includes bounded evidence
-- **AND** no fourth protocol retry starts
-
-#### Scenario: canonical outcome resets protocol retry state
-
-- **GIVEN** acceptance previously entered a missing-verdict protocol retry
-- **WHEN** a later invocation emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
-- **THEN** that canonical outcome retains its existing routing semantics
-- **AND** the consecutive missing-verdict retry count resets
-- **AND** explicit `CONTINUE` retains its configured continuation policy
+Managed-worktree execution SHALL run `acceptance_command` after successful apply and before archive. Every configured frontend SHALL use the same verdict parsing, missing-verdict retry, history, restart, and stalled-hold behavior.
 
 #### Scenario: process restart uses workspace evidence
 
 - **GIVEN** an acceptance protocol retry was active before process termination
-- **AND** the workspace remains applied but unarchived
-- **WHEN** Conflux restarts without out-of-worktree runtime state
-- **THEN** it runs acceptance again from workspace file/git state
-- **AND** it does not infer PASS from prior missing-verdict output
-- **AND** it does not require a generated acceptance retry checkpoint
-
-#### Scenario: missing verdict does not create report artifact
-
-- **GIVEN** an acceptance command exits without a canonical verdict
-- **WHEN** runtime records or retries the missing-verdict failure
-- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json` or another generated acceptance retry checkpoint
-- **AND** evidence is carried through existing prompt, history, event, and observability paths
+- **AND** the managed workspace remains applied but unarchived
+- **WHEN** Conflux restarts
+- **THEN** it runs acceptance again from workspace file and Git state
+- **AND** it does not require a generated retry checkpoint
 
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
@@ -2551,68 +2232,15 @@ runtime は dependency blocked だった change が resolved になったこと�
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel and serial execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
-
-A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts.
-
-During an active run, serial and parallel execution MUST instead apply the same dedicated missing-verdict protocol-retry policy. While the dedicated budget remains, runtime MUST invoke the normal configured acceptance command again with bounded Conflux-managed prior acceptance output, attempt evidence, current workspace context, and a trusted corrective instruction requiring exactly one canonical verdict. This continuation MUST NOT depend on harness session resume, harness-specific CLI flags, provider events, or external managed-job identifiers.
-
-The dedicated policy MUST allow no more than two retries after the initial missing-verdict attempt. Its counter MUST be independent from explicit-`CONTINUE` accounting and MUST reset after any canonical verdict. Exhaustion MUST produce a terminal missing-verdict protocol failure with bounded evidence and attempt-count diagnostics. Acceptance command launch or execution failure MUST retain command-failure routing and MUST NOT be reclassified as a missing-verdict retry.
-
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact or another generated retry checkpoint for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in active-run memory, events, or non-authoritative observability logs, but archive and resume routing MUST remain derivable from workspace file/git state. After process restart, an applied but unarchived workspace MUST run acceptance again and MUST NOT infer acceptance from prior narrative output.
-
-When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
-
-#### Scenario: status-only exit continues through a dedicated protocol retry
-
-- **GIVEN** an acceptance command reports that it is waiting for owned verification
-- **AND** the command exits without emitting a canonical verdict
-- **AND** the active run has missing-verdict retry budget remaining
-- **WHEN** acceptance execution classifies the completed command
-- **THEN** the result remains an explicit missing-verdict protocol failure and is not classified as `CONTINUE`
-- **AND** runtime records bounded evidence and invokes the normal acceptance command again
-- **AND** the new prompt includes bounded prior attempt context plus a corrective canonical-verdict instruction
-- **AND** the configured explicit-`CONTINUE` counter is unchanged
-- **AND** queue reconciliation does not classify the active retry as `terminal_error_retry_required`
-
-#### Scenario: continuation is harness neutral
-
-- **GIVEN** any configured acceptance command can receive the normal Conflux prompt
-- **WHEN** runtime retries after a missing verdict
-- **THEN** continuity is provided only through Conflux-managed prompt context and workspace evidence
-- **AND** runtime does not require a harness session ID, resume flag, provider event, or external job ID
-
-#### Scenario: missing-verdict retry budget is exhausted
-
-- **GIVEN** an initial acceptance attempt and two consecutive protocol retries all emit no canonical verdict
-- **WHEN** runtime classifies the third consecutive missing verdict
-- **THEN** it emits the terminal missing-verdict protocol failure
-- **AND** the diagnostic identifies the exhausted attempts and includes bounded evidence
-- **AND** no fourth protocol retry starts
-
-#### Scenario: canonical outcome resets protocol retry state
-
-- **GIVEN** acceptance previously entered a missing-verdict protocol retry
-- **WHEN** a later invocation emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
-- **THEN** that canonical outcome retains its existing routing semantics
-- **AND** the consecutive missing-verdict retry count resets
-- **AND** explicit `CONTINUE` retains its configured continuation policy
+Managed-worktree execution SHALL run `acceptance_command` after successful apply and before archive. Every configured frontend SHALL use the same verdict parsing, missing-verdict retry, history, restart, and stalled-hold behavior.
 
 #### Scenario: process restart uses workspace evidence
 
 - **GIVEN** an acceptance protocol retry was active before process termination
-- **AND** the workspace remains applied but unarchived
-- **WHEN** Conflux restarts without out-of-worktree runtime state
-- **THEN** it runs acceptance again from workspace file/git state
-- **AND** it does not infer PASS from prior missing-verdict output
-- **AND** it does not require a generated acceptance retry checkpoint
-
-#### Scenario: missing verdict does not create report artifact
-
-- **GIVEN** an acceptance command exits without a canonical verdict
-- **WHEN** runtime records or retries the missing-verdict failure
-- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json` or another generated acceptance retry checkpoint
-- **AND** evidence is carried through existing prompt, history, event, and observability paths
+- **AND** the managed workspace remains applied but unarchived
+- **WHEN** Conflux restarts
+- **THEN** it runs acceptance again from workspace file and Git state
+- **AND** it does not require a generated retry checkpoint
 
 ### Requirement: Applied resume uses workspace-local evidence only
 
@@ -2719,68 +2347,15 @@ A change already in reducer-owned `ResolveWait` MUST follow the same classificat
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel and serial execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
-
-A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts.
-
-During an active run, serial and parallel execution MUST instead apply the same dedicated missing-verdict protocol-retry policy. While the dedicated budget remains, runtime MUST invoke the normal configured acceptance command again with bounded Conflux-managed prior acceptance output, attempt evidence, current workspace context, and a trusted corrective instruction requiring exactly one canonical verdict. This continuation MUST NOT depend on harness session resume, harness-specific CLI flags, provider events, or external managed-job identifiers.
-
-The dedicated policy MUST allow no more than two retries after the initial missing-verdict attempt. Its counter MUST be independent from explicit-`CONTINUE` accounting and MUST reset after any canonical verdict. Exhaustion MUST produce a terminal missing-verdict protocol failure with bounded evidence and attempt-count diagnostics. Acceptance command launch or execution failure MUST retain command-failure routing and MUST NOT be reclassified as a missing-verdict retry.
-
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact or another generated retry checkpoint for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in active-run memory, events, or non-authoritative observability logs, but archive and resume routing MUST remain derivable from workspace file/git state. After process restart, an applied but unarchived workspace MUST run acceptance again and MUST NOT infer acceptance from prior narrative output.
-
-When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
-
-#### Scenario: status-only exit continues through a dedicated protocol retry
-
-- **GIVEN** an acceptance command reports that it is waiting for owned verification
-- **AND** the command exits without emitting a canonical verdict
-- **AND** the active run has missing-verdict retry budget remaining
-- **WHEN** acceptance execution classifies the completed command
-- **THEN** the result remains an explicit missing-verdict protocol failure and is not classified as `CONTINUE`
-- **AND** runtime records bounded evidence and invokes the normal acceptance command again
-- **AND** the new prompt includes bounded prior attempt context plus a corrective canonical-verdict instruction
-- **AND** the configured explicit-`CONTINUE` counter is unchanged
-- **AND** queue reconciliation does not classify the active retry as `terminal_error_retry_required`
-
-#### Scenario: continuation is harness neutral
-
-- **GIVEN** any configured acceptance command can receive the normal Conflux prompt
-- **WHEN** runtime retries after a missing verdict
-- **THEN** continuity is provided only through Conflux-managed prompt context and workspace evidence
-- **AND** runtime does not require a harness session ID, resume flag, provider event, or external job ID
-
-#### Scenario: missing-verdict retry budget is exhausted
-
-- **GIVEN** an initial acceptance attempt and two consecutive protocol retries all emit no canonical verdict
-- **WHEN** runtime classifies the third consecutive missing verdict
-- **THEN** it emits the terminal missing-verdict protocol failure
-- **AND** the diagnostic identifies the exhausted attempts and includes bounded evidence
-- **AND** no fourth protocol retry starts
-
-#### Scenario: canonical outcome resets protocol retry state
-
-- **GIVEN** acceptance previously entered a missing-verdict protocol retry
-- **WHEN** a later invocation emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
-- **THEN** that canonical outcome retains its existing routing semantics
-- **AND** the consecutive missing-verdict retry count resets
-- **AND** explicit `CONTINUE` retains its configured continuation policy
+Managed-worktree execution SHALL run `acceptance_command` after successful apply and before archive. Every configured frontend SHALL use the same verdict parsing, missing-verdict retry, history, restart, and stalled-hold behavior.
 
 #### Scenario: process restart uses workspace evidence
 
 - **GIVEN** an acceptance protocol retry was active before process termination
-- **AND** the workspace remains applied but unarchived
-- **WHEN** Conflux restarts without out-of-worktree runtime state
-- **THEN** it runs acceptance again from workspace file/git state
-- **AND** it does not infer PASS from prior missing-verdict output
-- **AND** it does not require a generated acceptance retry checkpoint
-
-#### Scenario: missing verdict does not create report artifact
-
-- **GIVEN** an acceptance command exits without a canonical verdict
-- **WHEN** runtime records or retries the missing-verdict failure
-- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json` or another generated acceptance retry checkpoint
-- **AND** evidence is carried through existing prompt, history, event, and observability paths
+- **AND** the managed workspace remains applied but unarchived
+- **WHEN** Conflux restarts
+- **THEN** it runs acceptance again from workspace file and Git state
+- **AND** it does not require a generated retry checkpoint
 
 ### Requirement: Archive retry observability is non-authoritative
 
@@ -2906,66 +2481,15 @@ active path が無いことだけを理由に change を terminal `Error` にし
 
 ### Requirement: Acceptance follow-up persistence failure must not override primary acceptance failure
 
-When acceptance returns a non-pass verdict with findings and retry policy routes the change back to apply, the runtime SHALL preserve that acceptance verdict as the primary outcome even if follow-up persistence into `tasks.md` degrades.
+Managed-worktree runtime MUST preserve a non-pass Acceptance verdict as the primary outcome when follow-up persistence degrades. Runtime MUST remain the sole writer of the latest numbered Acceptance follow-up, normalize repository-fixable findings into checkbox tasks, preserve external blocker metadata and recoverable unknown content, rehydrate altered runtime findings, and remove only runtime-owned follow-up state after PASS. Persistence degradation MUST remain supplemental unless the primary verdict is indeterminate.
 
-For an apply-retry outcome, the runtime SHALL attempt to persist acceptance follow-up findings to the canonical tasks location for the workspace. It MUST prefer the active change tasks path and MUST fall back to the matching archived tasks path when the active path does not exist. A FAIL routed directly to a resumable stalled hold MAY preserve current findings in its workspace checkpoint and stalled marker without updating `tasks.md`.
+#### Scenario: Follow-up persistence degrades without replacing FAIL
 
-Runtime MUST be the sole writer of numbered `## Acceptance #<n> Failure Follow-up` sections. For apply-retry outcomes it MUST retain only the latest runtime-owned section, normalize multiline findings into one checkbox task per finding, rehydrate deleted or altered runtime findings during apply, and remove the runtime-owned section after acceptance PASS. Serial and parallel execution MUST apply the same persistence and cleanup behavior.
-
-Runtime MUST ignore matching headings inside fenced code examples. When a detected runtime-owned section has an unambiguous boundary but contains content outside the supported runtime record forms, runtime MUST preserve the unknown content byte-for-byte outside the runtime-owned section under `## Recovered Acceptance Notes`, enclose it in a dynamically sized fenced literal, emit supplemental recovery diagnostics, and continue replacement or cleanup. The recovered representation MUST identify the payload as untrusted content that is neither instructions nor task state, MUST deduplicate identical payload bytes across retries and restarts, and MUST remain after acceptance PASS cleanup. Preservation and runtime-section replacement or removal MUST occur in one atomic tasks-file update.
-
-Runtime MUST refuse the destructive update and leave `tasks.md` unchanged when the runtime-owned boundary cannot be determined safely, including an unclosed fence or ambiguous layout, or when unknown content cannot be preserved before replacement. Failure to persist or recover follow-up findings MUST NOT by itself convert an acceptance `FAIL` into a terminal execution `Error` unless the primary acceptance outcome itself is indeterminate.
-
-Task progress and OpenSpec task validation MUST ignore checkbox-like content inside valid backtick or tilde fenced blocks so recovered content cannot alter completion or archive decisions.
-
-If persistence degrades, the runtime SHALL record the explored path(s) and expose the persistence issue as supplemental warning/error context rather than replacing the acceptance diagnosis.
-
-#### Scenario: unknown follow-up prose is preserved and normalized
-
-- **GIVEN** a runtime-owned acceptance follow-up has an unambiguous boundary
-- **AND** it contains supported runtime findings plus unknown multiline evidence or presentation text
-- **WHEN** runtime replaces the follow-up for a retry
-- **THEN** runtime preserves the unknown bytes in one fenced recovered-notes block
-- **AND** runtime writes the canonical current follow-up from normalized findings
-- **AND** execution continues with a supplemental warning rather than a terminal configuration error
-
-#### Scenario: repeated recovery is idempotent
-
-- **GIVEN** unknown follow-up content has already been moved to recovered notes
-- **WHEN** apply hydration, retry, or process restart normalizes the same findings again
-- **THEN** the same recovered payload is not appended a second time
-- **AND** workspace-derived follow-up state remains deterministic
-
-#### Scenario: pass cleanup retains recovered notes
-
-- **GIVEN** a current runtime-owned follow-up and previously recovered notes exist
-- **WHEN** acceptance returns PASS and runtime performs cleanup
-- **THEN** the runtime-owned follow-up is removed
-- **AND** recovered notes remain as non-task repository evidence
-
-#### Scenario: recovered checkbox text is inert
-
-- **GIVEN** recovered content contains headings and `- [ ]` or `- [x]` text inside a valid fenced literal
-- **WHEN** Conflux calculates task progress or performs strict and archive-gate task validation
-- **THEN** fenced checkbox text does not change task totals or completion totals
-- **AND** fenced content does not create implementation-task validation findings
-
-#### Scenario: ambiguous boundary remains a hard error
-
-- **GIVEN** a possible runtime-owned follow-up contains an unclosed fence or another layout that prevents safe boundary determination
-- **WHEN** runtime attempts replacement or PASS cleanup
-- **THEN** runtime leaves the original tasks file byte-for-byte unchanged
-- **AND** reports an actionable hard error identifying the structural ambiguity
-
-#### Scenario: failed preservation does not destroy content
-
-- **GIVEN** an unambiguous runtime-owned follow-up contains unknown content
-- **AND** runtime cannot complete the atomic recovered-notes update
-- **WHEN** replacement or cleanup is attempted
-- **THEN** the original tasks file remains unchanged
-- **AND** an acceptance FAIL remains the primary diagnosis while persistence degradation is supplemental
-
-<!-- Expected canonical result after archive: acceptance follow-up updates preserve recoverable unknown content in inert workspace-local notes, remain idempotent and atomic, keep fenced text out of task accounting, and reserve hard errors for unsafe boundaries or failed preservation. -->
+- **GIVEN** Acceptance returns FAIL with actionable findings
+- **AND** the canonical tasks file cannot be updated safely
+- **WHEN** runtime records the outcome
+- **THEN** FAIL remains the primary diagnosis
+- **AND** the original file remains unchanged with supplemental persistence diagnostics
 
 ### Requirement: Incomplete apply does not get success-equivalent terminate treatment
 
@@ -3331,46 +2855,14 @@ The scheduler SHALL maintain a single `DependencyContext` implementation that en
 
 ### Requirement: Acceptance stalled retry evidence is workspace-local
 
-Ordinary Acceptance retry bookkeeping during an active serial or parallel run MUST remain in memory and MUST NOT use `.cflx/acceptance-state.json` or a worktree checkpoint. Acceptance MUST NOT create an Acceptance-origin `APPLY_BLOCKED/marker.md` or another change-directory artifact.
+Ordinary Acceptance retry bookkeeping during managed-worktree execution MUST remain in memory and MUST NOT use `.cflx/acceptance-state.json`, a worktree checkpoint, an Acceptance-origin marker, or an out-of-worktree durable stall record. A validated stalled hold MAY live only in process-local `OrchestratorState`; restart MUST clear it and require Acceptance again unless repository evidence proves archive or base integration.
 
-A validated Acceptance stalled hold MUST be stored in the in-memory `OrchestratorState` only. It MUST NOT be persisted to `~/.local/state/cflx/acceptance-stalls/` or any other out-of-worktree durable location. The in-memory state binds change ID, blocker category, evidence, next action, and resumability for the lifetime of the current process.
+#### Scenario: Restart clears process-local stall state
 
-In-memory state MAY control ordinary dispatch suppression, stalled presentation, explicit retry eligibility, and Acceptance resume phase. It MUST NOT prove implementation completion, Acceptance PASS, archive readiness, merge eligibility, or base integration. Process restart MUST clear all in-memory stall state. When repository evidence shows a complete unarchived Apply revision, Conflux MUST run Acceptance again and MUST NOT infer PASS.
-
-#### Scenario: stalled hold is process-lifetime only
-
-- **GIVEN** Acceptance records a validated resumable external blocker for a complete Apply revision
-- **AND** the managed worktree is clean
-- **WHEN** the current Conflux process displays the stalled status
-- **THEN** ordinary dispatch starts neither Apply, Acceptance, nor archive
-- **AND** the worktree remains clean and the Apply commit remains unchanged
-- **AND** no stall file is written under `~/.local/state/cflx/`
-
-#### Scenario: restart clears stall and re-runs acceptance
-
-- **GIVEN** a change was stalled in a previous Conflux process
-- **AND** the worktree contains a complete unarchived Apply revision
-- **WHEN** a new Conflux process starts and reconciles workspace state
-- **THEN** the stalled status is not restored
-- **AND** Conflux runs Acceptance again
-- **AND** it does not infer prior PASS, enter archive, or rerun Apply solely from missing stall state
-
-#### Scenario: stale stall files are ignored, not consulted or removed
-
-- **GIVEN** files exist under `~/.local/state/cflx/acceptance-stalls/` from a previous version
-- **WHEN** a new Conflux process starts and dispatches the same change
-- **THEN** no stall file is read and none controls routing
-- **AND** the files are left in place so a concurrent older process keeps its own holds
-- **AND** no managed worktree is mutated
-
-#### Scenario: explicit retry resumes Acceptance from in-memory hold
-
-- **GIVEN** a valid resumable Acceptance stall exists in the current in-memory state
-- **AND** the Apply revision matches
-- **WHEN** an operator explicitly retries it
-- **THEN** runtime prepares and starts Acceptance without rerunning Apply
-- **AND** the in-memory hold is consumed across a successful dispatch-preparation boundary
-- **AND** preparation failure retains the blocker evidence and does not dispatch ambiguous work
+- **GIVEN** a prior process held a complete unarchived Apply revision as stalled
+- **WHEN** a new process reconciles the managed workspace
+- **THEN** it does not restore or infer Acceptance PASS from the old hold
+- **AND** it runs Acceptance again
 
 ### Requirement: Runtime acceptance follow-up preserves completed repair work
 
@@ -3393,33 +2885,14 @@ During apply hydration, runtime MUST preserve the checked state of an existing a
 
 ### Requirement: Acceptance retry safeguards are mode-independent
 
-Serial and parallel execution MUST use equivalent blocker validation, protocol retry, finding normalization, semantic progress, retry, mixed-blocker, stalled persistence, reconciliation, migration, and explicit-retry decisions.
+Managed-worktree execution MUST apply one blocker-validation, protocol-retry, finding-normalization, semantic-progress, mixed-blocker, stalled-state, reconciliation, migration, and explicit-retry policy across CLI, TUI, and remote-controlled entrypoints. Bare `gated` or legacy `blocked` input MUST use the fixed two-retry missing-verdict bound with an independent consecutive counter and MUST NOT consume Apply or explicit-CONTINUE budget.
 
-Bare `gated` or legacy `blocked` input MUST share the fixed two-retry protocol bound used for missing verdict while retaining a distinct consecutive counter and corrective context. It MUST NOT consume Apply or explicit-CONTINUE budget, rerun Apply, or persist stalled state. Exhaustion MUST produce a terminal Acceptance protocol error requiring explicit retry.
+#### Scenario: Every frontend uses the same bare GATED budget
 
-The existing apply+Acceptance ceiling of ten cycles remains a safety ceiling. A validated repository-external blocker or cycle-exhaustion hold MAY become resumable runtime `stalled` only with explicit evidence; evidence-free exhaustion MUST NOT create a synthetic category or worktree marker.
-
-#### Scenario: bare GATED budget is equivalent across modes
-
-- **GIVEN** serial and parallel Acceptance each emit the same sequence of bare GATED results
-- **WHEN** each applies protocol retry policy
-- **THEN** both run at most two Acceptance-only retries after the initial result
-- **AND** both return the same terminal protocol error on the third consecutive result
-- **AND** neither writes stalled state or a worktree marker
-
-#### Scenario: canonical verdict resets bare GATED sequence
-
-- **GIVEN** a bare GATED result was retried
-- **WHEN** the next Acceptance invocation returns a canonical PASS, FAIL, CONTINUE, or validated stalled blocker
-- **THEN** the consecutive bare-GATED retry counter resets
-- **AND** the canonical result follows its normal routing
-
-#### Scenario: equivalent validated blockers produce equivalent state
-
-- **GIVEN** serial and parallel observe equivalent validated structured external blockers for equivalent Apply revisions
-- **WHEN** each computes and persists its decision
-- **THEN** both preserve the same explicit category, evidence, resumability, next action, and revision binding
-- **AND** both enter user-facing `stalled` without dirtying the worktree
+- **GIVEN** equivalent managed-worktree Acceptance invocations emit the same bare GATED sequence through different frontends
+- **WHEN** runtime applies protocol retry
+- **THEN** each runs at most two Acceptance-only retries after the initial result
+- **AND** each returns the same terminal protocol error on the third consecutive result
 
 ### Requirement: Acceptance findings retain repository and external scopes
 
@@ -3452,94 +2925,36 @@ Runtime MUST preserve an explicitly supplied supported category and MUST NOT inf
 
 ### Requirement: Acceptance follow-up rendering uses normalized finding scopes
 
-Serial and parallel execution MUST use the shared normalized finding representation when runtime updates acceptance follow-up state. Repository-fixable findings MUST affect task completion; external blockers MUST remain non-checkbox metadata. Both modes MUST produce equivalent follow-up and prompt context for equivalent observations.
+Managed-worktree runtime MUST use the shared normalized finding representation for Acceptance follow-up state. Repository-fixable findings MUST affect task completion; external blockers MUST remain non-checkbox metadata; and every frontend MUST produce equivalent follow-up and prompt context for equivalent observations.
 
-#### Scenario: serial and parallel render equivalent mixed findings
+#### Scenario: Equivalent findings render identically
 
-- **GIVEN** serial and parallel receive equivalent repository and external findings
-- **WHEN** each persists follow-up and builds the next acceptance context
-- **THEN** both produce the same repository task identities
-- **AND** both preserve the same external blocker metadata
-- **AND** neither replays prior attempt history
-
-#### Scenario: re-reported identity reopens despite detail changes
-
-- **GIVEN** a repository finding was completed in the current follow-up
-- **AND** the latest FAIL reports the same stable identity with changed descriptive detail
-- **WHEN** runtime updates the section
-- **THEN** the finding is reopened as unchecked
-- **AND** identities absent from the latest payload are removed
+- **GIVEN** equivalent repository and external findings enter through different frontends
+- **WHEN** runtime persists follow-up and builds the next Acceptance context
+- **THEN** each produces the same repository task identities and external blocker metadata
+- **AND** prior attempt history is not replayed
 
 ### Requirement: Acceptance finding reconciliation uses stable identity and monotonic completion
 
-Serial and parallel runtime MUST reconcile repository-fixable acceptance findings by stable identity rather than exact human-readable text. Explicit finding codes MUST be preferred when present. When a code is absent, runtime MUST generate a deterministic fallback identity from normalized structural finding fields and MUST NOT require summary or evidence text to remain unchanged.
+Managed-worktree runtime MUST reconcile repository-fixable Acceptance findings by stable identity rather than exact prose. Explicit codes take precedence; otherwise runtime MUST derive deterministic identity from normalized structural fields. Completed findings MUST remain complete during hydration and MAY reopen only when a new Acceptance FAIL explicitly reports the same identity.
 
-A completed runtime-owned finding MUST remain completed during apply hydration and reconciliation. Runtime MAY reopen it only while ingesting a new acceptance FAIL payload that explicitly reports the same identity. Serial and parallel execution MUST apply equivalent identity and completion transition rules.
+#### Scenario: Missing reviewer code uses deterministic fallback identity
 
-#### Scenario: partial completion survives apply reconciliation
-
-- **GIVEN** a current acceptance follow-up contains multiple findings
-- **AND** apply completed one finding while others remain unchecked
-- **AND** remediation evidence or human-readable detail changed
-- **WHEN** runtime hydrates or reconciles follow-up state during apply
-- **THEN** the completed finding remains checked
-- **AND** the remaining findings retain their prior state
-
-#### Scenario: latest FAIL explicitly reopens a completed identity
-
-- **GIVEN** a finding is completed in the current follow-up
-- **WHEN** a later acceptance FAIL reports the same stable identity with current repository evidence
-- **THEN** runtime reopens that finding as unchecked
-- **AND** changed summary or evidence does not create a duplicate identity
-
-#### Scenario: missing reviewer code uses runtime fallback identity
-
-- **GIVEN** an acceptance finding has no explicit stable code
-- **WHEN** runtime normalizes the finding in serial or parallel execution
-- **THEN** both modes derive the same identity from normalized structural fields
-- **AND** prose-only changes do not change the identity
-- **AND** a distinct rule or repository location does not collide with it
-
-#### Scenario: reconciliation cannot implicitly reopen completion
-
-- **GIVEN** a completed finding exists
-- **WHEN** runtime performs any follow-up update outside ingestion of a new FAIL payload
-- **THEN** the update cannot transition the finding to unchecked
+- **GIVEN** an Acceptance finding has no explicit stable code
+- **WHEN** managed-worktree runtime normalizes it
+- **THEN** all frontends derive the same identity from normalized structural fields
+- **AND** prose-only changes do not change that identity
 
 ### Requirement: Acceptance execution creates no JSON checkpoint
 
-Serial and parallel Acceptance execution MUST NOT create, read, update, or delete `.cflx/acceptance-state.json`. Acceptance PASS for an active run MAY be held in memory only until archive handoff. After restart, incomplete archive work MUST be accepted again unless repository evidence already proves archive or base integration.
+Managed-worktree Acceptance MUST NOT create, read, update, or delete `.cflx/acceptance-state.json`. PASS MAY remain in memory only until archive handoff. After restart, incomplete archive work MUST run Acceptance again unless repository evidence already proves archive or base integration.
 
-No out-of-worktree Acceptance stall record exists. In-memory stall state MAY represent a validated temporary external hold bound to the current process lifetime and MUST NOT survive restart.
+#### Scenario: Uninterrupted pass reaches archive without checkpoint
 
-#### Scenario: uninterrupted pass reaches archive without checkpoint
-
-- **GIVEN** Apply completed and Acceptance runs in the same orchestration process
+- **GIVEN** Apply completed and Acceptance runs in the same process
 - **WHEN** Acceptance returns PASS
 - **THEN** archive handoff proceeds for that accepted revision
-- **AND** neither `.cflx/acceptance-state.json` nor a persisted PASS record exists
-
-#### Scenario: in-memory stall cannot substitute for PASS
-
-- **GIVEN** an in-memory stall state exists
-- **WHEN** Conflux evaluates archive readiness
-- **THEN** the in-memory state cannot prove PASS or authorize archive
-- **AND** Acceptance must pass for the current revision through the normal execution path
-
-#### Scenario: runtime metadata cannot dirty post-archive worktree
-
-- **GIVEN** Acceptance passes and archive artifacts are committed
-- **WHEN** post-archive merge verification runs
-- **THEN** no Acceptance runtime-state cleanup mutates the managed worktree
-- **AND** no manual `MergeWait` is produced solely by runtime stall metadata
-
-#### Scenario: genuine dirty evidence remains a blocker
-
-- **GIVEN** archive artifacts are valid
-- **AND** an unrelated user file remains modified
-- **WHEN** post-archive merge verification runs
-- **THEN** the unrelated dirty worktree remains concrete manual blocker evidence
-- **AND** in-memory stall state does not suppress the deferral
+- **AND** no JSON checkpoint or persisted PASS record is created
 
 ### Requirement: Apply completion MUST validate task format before acceptance
 
@@ -3578,55 +2993,26 @@ The gate and its retry decision MUST be derived from workspace file state and Gi
 
 ### Requirement: Acceptance repair state MUST separate actionable payload from retry identity
 
-Serial and parallel runtime MUST keep the complete latest Acceptance finding payload separate from stable retry identities and semantic fingerprints. Updating comparison identities, semantic baselines, cycle counters, or retry checkpoints MUST NOT mutate or replace actionable evidence, required changes, or verification expectations.
+Managed-worktree runtime MUST keep the complete latest Acceptance finding payload separate from stable retry identities and semantic fingerprints. Updating comparison identities, semantic baselines, cycle counters, or retry state MUST NOT replace actionable evidence, required changes, or verification expectations.
 
-Ordinary retry counters and semantic baselines MUST remain in memory. The runtime-owned current follow-up MUST preserve enough immutable actionable finding detail and Apply remediation evidence for an interrupted FAIL-to-Apply handoff using workspace-local evidence. If actionable workspace evidence is absent or invalid after restart, Conflux MUST rerun Acceptance before Apply and MUST NOT infer a repair target, closure, PASS, or archive readiness from hidden state.
+#### Scenario: Retry identity cannot overwrite actionable payload
 
-#### Scenario: retry checkpoint cannot overwrite payload
-
-- **GIVEN** Acceptance records a detailed finding and runtime derives `repository|path|verification` as comparison identity
+- **GIVEN** Acceptance records a detailed finding and runtime derives a comparison identity
 - **WHEN** runtime updates retry identity and semantic baseline state
-- **THEN** the complete detailed finding remains unchanged
-- **AND** the next Apply receives its evidence, required changes, and verification expectations
-
-#### Scenario: restart preserves constitutional routing
-
-- **GIVEN** orchestration stops after FAIL and before repair Apply
-- **WHEN** Conflux resumes the workspace
-- **THEN** it uses valid workspace-local current finding evidence or reruns Acceptance
-- **AND** missing out-of-worktree metadata cannot imply closure or PASS
-- **AND** all archive and merge decisions still require repository-verifiable current-revision evidence
+- **THEN** the complete finding remains unchanged
+- **AND** the next Apply receives its evidence and verification expectations
 
 ### Requirement: Acceptance repair diff MUST cover declared finding work
 
-Before rerunning Acceptance after repair Apply, serial and parallel runtime MUST compare the workspace delta from the finding's FAIL revision through the repair result. For every structured finding, every declared `required_changes` file and every declared `verification` file MUST occur in that delta. Runtime MUST retain actual changed files, uncovered required files, unrelated changed files, and Apply remediation evidence as structured diagnostics.
+Before rerunning Acceptance after repair Apply, managed-worktree runtime MUST compare the workspace delta from the finding's FAIL revision through the repair result. Every declared required-change and verification file MUST occur in that delta. Missing coverage MUST stop before Acceptance with an evidenced resumable `acceptance_remediation_mismatch` hold; unrelated progress MUST NOT satisfy coverage.
 
-Passing coverage authorizes only the next Acceptance review; it MUST NOT prove semantic resolution. Missing declared coverage MUST stop before Acceptance with an evidenced, resumable `acceptance_remediation_mismatch` hold. Changes outside the finding contract, including calibration-only or comment-only changes, MUST NOT satisfy missing coverage. Legacy findings without declared path sets MAY retain compatibility behavior.
+#### Scenario: Missing declared coverage stops before Acceptance
 
-#### Scenario: complete coverage permits semantic review
-
-- **GIVEN** a structured finding declares an implementation file and a verification file
-- **AND** repair Apply changes both files
+- **GIVEN** a structured finding declares implementation and verification files
+- **AND** repair Apply does not change every declared file
 - **WHEN** runtime validates the repair delta
-- **THEN** coverage passes and Acceptance may run
-- **AND** runtime does not claim the finding is resolved until Acceptance decides
-
-#### Scenario: calibration-only change stops before Acceptance
-
-- **GIVEN** a finding requires test-support observability and a value-based integration assertion
-- **AND** repair Apply changes only a calibration test or unrelated comments
-- **WHEN** runtime validates the delta
-- **THEN** coverage fails with `acceptance_remediation_mismatch`
-- **AND** Acceptance is not invoked
-- **AND** diagnostics identify the missing implementation and verification files plus unrelated changes
-
-#### Scenario: unrelated progress cannot satisfy coverage
-
-- **GIVEN** broad semantic fingerprinting observes source, test, or spec changes
-- **AND** none covers a finding's declared required file
-- **WHEN** runtime evaluates remediation
-- **THEN** semantic progress does not override the coverage failure
-- **AND** the change enters the same evidenced hold
+- **THEN** Acceptance is not invoked
+- **AND** diagnostics identify missing and unrelated files
 
 ### Requirement: Repeated Acceptance finding IDs MUST stop automatic repair
 
@@ -3668,25 +3054,14 @@ A genuinely new ID receives one automatic repair opportunity. If a FAIL contains
 
 ### Requirement: Acceptance repair-stop diagnostics MUST be actionable and mode-independent
 
-Serial and parallel execution MUST produce equivalent structured diagnostics for `acceptance_remediation_mismatch` and `repeated_acceptance_finding`. Diagnostics MUST include the complete open findings, stable IDs, occurrence counts, relevant FAIL and Apply revisions, declared required and verification files, actual changed files, coverage results, unrelated files and relationship explanations, Apply remediation evidence, stop reason, resumability, and next action.
+Managed-worktree execution MUST produce one structured diagnostic contract for `acceptance_remediation_mismatch` and `repeated_acceptance_finding` across all frontends. Diagnostics MUST include open findings, stable IDs, occurrence counts, relevant revisions, declared and actual files, coverage, unrelated changes, remediation evidence, stop reason, resumability, and next action. These holds MUST NOT prove completion, PASS, archive readiness, or merge eligibility.
 
-These temporary hold records MAY control stalled presentation, ordinary dispatch suppression, and explicit retry eligibility only through the revision-bound lifecycle established by `replace-acceptance-marker-stalls`. They MUST NOT prove implementation completion, finding closure, Acceptance PASS, archive readiness, or merge eligibility, and MUST NOT create an Acceptance-origin worktree marker.
+#### Scenario: Equivalent repair failures expose equivalent evidence
 
-#### Scenario: serial and parallel stop with equivalent evidence
-
-- **GIVEN** serial and parallel observe equivalent detailed findings and repair diffs
-- **WHEN** each detects remediation mismatch or a repeated ID
-- **THEN** both choose the same stop reason and resumability
-- **AND** both expose equivalent structured diagnostic fields
-- **AND** neither writes Acceptance-origin workflow evidence into the worktree
-
-#### Scenario: explicit retry remains reviewable
-
-- **GIVEN** an operator explicitly retries an evidenced repair hold
-- **WHEN** runtime resumes the current revision
-- **THEN** prior finding occurrences and remediation diagnostics remain inspectable
-- **AND** the retry resumes at the appropriate revision-bound phase
-- **AND** runtime still requires a later current-revision Acceptance PASS before archive
+- **GIVEN** equivalent findings and repair diffs enter through different frontends
+- **WHEN** runtime detects remediation mismatch or a repeated ID
+- **THEN** each chooses the same stop reason and resumability
+- **AND** each exposes equivalent structured diagnostics without writing workflow evidence into the worktree
 
 ### Requirement: Repository monitoring avoids optional Git index locks
 
@@ -3724,64 +3099,15 @@ The monitoring query MUST continue to classify active change paths from staged, 
 
 ### Requirement: Acceptance command failures MUST use bounded Acceptance-only recovery
 
-Serial および parallel execution は、configured Acceptance command の launch または execution failure を、同一の applied かつ clean な workspace 上で Acceptance だけを再実行する active-run recovery として扱わなければならない（MUST）。初回 failure 後の retry は最大 2 回で、3 回目の連続 command failure 後にのみ terminal error としなければならない（MUST）。
-
-この command-failure counter は missing-verdict または他の protocol correction、explicit `CONTINUE`、canonical FAIL から Apply への repair cycle、および `MAX_ACCEPTANCE_RETRY_CYCLES` から独立しなければならない（MUST）。retry は Apply または cleanup-review を再実行してはならない（MUST NOT）。Acceptance invocation が command failure 以外の completed result を返した場合、runtime は canonical、missing/malformed protocol、stalled、permission-stalled、または blocker routing に入る前に command-failure counter を reset しなければならない（MUST）。
+Managed-worktree execution MUST treat configured Acceptance command launch or execution failure as Acceptance-only recovery on the same applied clean workspace. It MUST allow at most two retries after the initial failure and return terminal error after the third consecutive failure. This counter MUST remain independent from protocol correction, explicit CONTINUE, FAIL-to-Apply cycles, and the outer cycle ceiling; retry MUST NOT rerun Apply or cleanup-review.
 
 #### Scenario: Acceptance command recovers without rerunning Apply
 
-- **GIVEN** applied かつ clean な workspace の Acceptance command が command queue retry 後に失敗する
-- **AND** dedicated command-failure retry budget が残っている
-- **WHEN** serial または parallel runtime が failure を処理する
-- **THEN** latest bounded error、exit code、stdout tail、stderr tail を次の Acceptance prompt に渡す
-- **AND** normal configured Acceptance command だけを再実行する
-- **AND** Apply と cleanup-review の invocation count は増加しない
-
-#### Scenario: Acceptance command retry budgets remain independent
-
-- **GIVEN** Acceptance command failure recovery が active である
-- **WHEN** runtime が次の Acceptance invocation を開始する
-- **THEN** missing-verdict/protocol、explicit-CONTINUE、FAIL-to-Apply cycle の counters を消費しない
-- **AND** FAIL findings を tasks に追加しない
-- **AND** outer Apply/Acceptance `cycle_count` を command failure のみを理由に増加させない
-
-#### Scenario: Any completed non-command-failure result resets Acceptance command recovery
-
-- **GIVEN** one or more Acceptance command failures were followed by a completed command invocation
-- **WHEN** that invocation produces canonical PASS, FAIL, CONTINUE, validated stalled/permission-stalled, missing verdict, malformed finding, bare blocker, or another completed protocol-bearing result
-- **THEN** consecutive command-failure state resets before that result follows its existing routing semantics
-- **AND** its dedicated canonical or protocol counter remains independent
-
-#### Scenario: Protocol completion breaks command-failure consecutiveness
-
-- **GIVEN** Acceptance results occur as `CommandFailed`, then `MissingVerdict`, then `CommandFailed`
-- **WHEN** runtime records the final result
-- **THEN** the completed missing-verdict invocation has already reset command-failure state
-- **AND** the final command failure is attempt one of a new command-failure sequence
-- **AND** missing-verdict budget follows its own existing accounting
-
-#### Scenario: Acceptance command recovery exhausts after three failures
-
-- **GIVEN** initial Acceptance invocation and two corrective invocations all fail at command level
-- **WHEN** runtime processes the third consecutive failure
-- **THEN** it emits one terminal Acceptance command failure containing the attempt count and latest bounded diagnostics
-- **AND** no fourth command-failure invocation starts
-- **AND** the managed workspace remains available for explicit retry
-
-#### Scenario: Cancellation and permission stall bypass command recovery
-
-- **GIVEN** Acceptance is cancelled or produces the existing classified permission-stall outcome
-- **WHEN** runtime routes the result
-- **THEN** it does not classify the result as an ordinary command failure
-- **AND** it starts no Acceptance command-failure retry
-
-#### Scenario: Restart derives Acceptance from workspace evidence
-
-- **GIVEN** Acceptance command recovery was active before process termination
-- **AND** the workspace remains applied, clean, and unarchived
-- **WHEN** Conflux restarts
-- **THEN** it runs Acceptance from workspace and Git evidence with a fresh active-run budget
-- **AND** it does not require a report, retry checkpoint, provider session, external job identifier, cache, or prior log
+- **GIVEN** Acceptance command fails after command-queue retry on an applied clean managed workspace
+- **AND** the dedicated command-failure budget remains
+- **WHEN** runtime handles the failure
+- **THEN** it passes bounded diagnostics to the next Acceptance invocation
+- **AND** it reruns only the configured Acceptance command
 
 ### Requirement: Managed worktree apply MUST run post-apply cleanup review before acceptance handoff
 

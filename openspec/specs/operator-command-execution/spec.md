@@ -45,35 +45,13 @@ Execution marks MUST remain distinct from queue intent, activity, hold state, te
 
 ### Requirement: Mode-aware mark and queue behavior
 
-The service MUST allow execution-mark mutation in Select and Stopped modes, resolve accepted marks into initial targets at Start, use reducer queue intent for ordinary Running additions, allow mark-only mutation for MergeWait and ResolveWait, and reject mark mutation in Error mode. Queue removal and successful stop-and-dequeue MUST revoke ordinary execution eligibility until explicit requeue or retry. Parallel mode changes MUST classify one coherent state, clear marks and queue presentation for newly ineligible changes, and report stable exclusion reasons. Bulk execution-mark mutation MUST choose one target state from eligible rows only and update eligible marks plus Running queue intent atomically.
+The service MUST allow execution-mark mutation in Select and Stopped modes, resolve accepted marks into initial targets at Start, use reducer queue intent for ordinary Running additions, allow mark-only mutation for MergeWait and ResolveWait, and reject mark mutation in Error mode. Queue removal and successful stop-and-dequeue MUST revoke ordinary execution eligibility until explicit requeue or retry. Catalog refresh or eligibility re-evaluation MUST classify one coherent state, clear marks and queue presentation for changes that became ineligible, and report stable exclusion reasons. Bulk execution-mark mutation MUST choose one target state from eligible rows only and update eligible marks plus Running queue intent atomically.
 
-#### Scenario: Running queue addition enables recovery
+#### Scenario: Eligibility refresh cleans invalid intent
 
-**Given**: `alpha` is Running-mode eligible and has a preserved recoverable worktree
-**When**: TUI or remote operator service accepts queue addition for `alpha`
-**Then**: Reducer `QueueIntent::Queued` is set
-**And**: The shared scheduler may resolve `alpha` from its preserved workspace
-
-#### Scenario: Queue removal prevents reacquisition
-
-**Given**: `alpha` was previously queued and has a preserved worktree
-**When**: The operator service accepts queue removal or successful stop-and-dequeue
-**Then**: Ordinary execution eligibility is revoked
-**And**: Catalog refresh and worktree discovery do not reacquire `alpha`
-**And**: Explicit requeue or retry is required for later ordinary execution
-
-#### Scenario: Error mode requires retry
-
-**Given**: The application is in Error mode
-**When**: The operator requests execution-mark mutation
-**Then**: The request is rejected without state change
-**And**: `retry_change` or `retry_errors` remains the supported action
-
-#### Scenario: Parallel mode change cleans ineligible intent
-
-**Given**: The application is in Select or Stopped mode and marked changes become ineligible in parallel mode
-**When**: The operator enables parallel mode
-**Then**: The service clears those execution marks and queue presentation atomically
+**Given**: Marked or queued changes become ineligible under current repository and worktree evidence
+**When**: The operator service applies catalog refresh or eligibility re-evaluation
+**Then**: It clears those execution marks and queue presentation atomically
 **And**: The outcome identifies each excluded change and reason
 
 #### Scenario: Bulk mark updates one coherent target set

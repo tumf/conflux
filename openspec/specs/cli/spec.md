@@ -43,58 +43,13 @@ When `--push [remote]` is provided on the top-level TUI entrypoint without an ex
 
 ### Requirement: run Subcommand
 
-The `run` subcommand SHALL execute the OpenSpec change workflow orchestration loop only when the operator provides an explicit target mode: `--all`, one or more positional change IDs, or the legacy `--change` option. Positional IDs and legacy `--change` values SHALL be normalized into the same explicit change ID target list. `--all` SHALL target all current changes from the initial run snapshot. The target modes SHALL be mutually exclusive.
+The `run` subcommand SHALL execute explicit targets through cumulative worktree orchestration. Push post-archive mode and upstream integration remain mutually exclusive; upstream integration SHALL be rejected for unsupported remote-client or server surfaces before work starts.
 
-The `run` subcommand, explicit local `tui` subcommand, and bare local TUI SHALL expose one normalized cumulative upstream integration contract. Value-less `-u` and `--integrate-upstream` SHALL select `origin`; a named remote SHALL require `--integrate-upstream=<remote>`; enablement SHALL require `--upstream-verify-command <command>`. This capability SHALL use cumulative base merge plus change-scoped upstream publication and SHALL NOT use push post-archive mode.
+#### Scenario: run uses explicit targets
 
-When `--push [remote]` is provided with parallel execution, `run` or local TUI SHALL instead use push post-archive mode. If the remote argument is omitted, the remote SHALL default to `origin`. Upstream integration and `--push` SHALL be mutually exclusive. Upstream integration SHALL be rejected for remote-client `tui --server`, server orchestration, or serial effective execution before work starts.
-
-#### Scenario: run enables per-change upstream publication
-
-- **WHEN** user runs `cflx run --all -u --upstream-verify-command '<command>'`
-- **THEN** run uses cumulative base integration and change-scoped upstream publication for remote `origin`
-- **AND** it does not configure push post-archive mode
-- **AND** each successful targeted change requires terminal `pushed`
-
-#### Scenario: explicit local TUI enables equivalent upstream publication
-
-- **WHEN** user runs `cflx tui --integrate-upstream=upstream --upstream-verify-command '<command>'`
-- **THEN** local TUI installs the same upstream publication runtime used by run
-- **AND** selected remote is `upstream`
-- **AND** each completed change publishes without waiting for TUI shutdown or scheduler drain
-
-#### Scenario: missing verification command is rejected
-
-- **WHEN** user supplies `-u` or `--integrate-upstream` to run or local TUI without a non-empty `--upstream-verify-command`
-- **THEN** orchestration does not start
-- **AND** no fetch, worktree, merge, verification, or push side effect occurs
-
-#### Scenario: upstream integration rejects push post-archive mode
-
-- **WHEN** user combines `-u` or `--integrate-upstream` with `--push`
-- **THEN** parsing or startup validation fails before orchestration
-- **AND** the diagnostic explains that cumulative upstream publication and change-branch push are distinct mutually exclusive modes
-
-#### Scenario: explicit TUI rejects upstream remote server mode
-
-- **WHEN** user runs `cflx tui -u --upstream-verify-command '<command>' --server http://host:39876`
-- **THEN** TUI orchestration does not start
-- **AND** the CLI reports that upstream integration is available only to local TUI
-
-#### Scenario: successful opted-in run exits after all changes are pushed
-
-- **GIVEN** every targeted successful change has completed remote-confirmed upstream publication
-- **WHEN** `cflx run` reports successful completion
-- **THEN** every such change has display status `pushed`
-- **AND** the command exits promptly with status code 0
-- **AND** it does not wait for an additional stop signal
-
-#### Scenario: local TUI remains active after pushed change
-
-- **GIVEN** local TUI runs with upstream integration enabled
-- **WHEN** one selected change reaches `pushed`
-- **THEN** the TUI remains active in its normal persistent lifecycle
-- **AND** a later queued change can execute through the same upstream publication contract
+- **WHEN** user provides `--all`, positional change IDs, or legacy `--change` values
+- **THEN** targets are normalized and dispatched through worktree orchestration
+- **AND** no execution-mode selection is required
 
 ### Requirement: Orchestration loop runs apply and archive
 
@@ -995,37 +950,15 @@ The TUI archive phase SHALL NOT send redundant status transition events for chan
 - **AND** `ChangeArchived` event is sent (status → Archived)
 
 ### Requirement: Apply Context History
-オーケストレーターは、逐次/並列のどちらの apply でも共通ループで同一の履歴注入ロジックを使用し、各 apply 試行の最終サマリーメッセージを記録して同一 change の次回 apply プロンプトに含めなければならない（MUST）。さらに、acceptance が FAIL で apply ループへ戻る場合、次の apply 試行のプロンプトに直前の acceptance コマンド出力の stdout_tail/stderr_tail を `<last_acceptance_output>` ブロックで含めなければならない（MUST）。stdout_tail が空の場合は stderr_tail を使用し、両方空の場合はブロックを含めなくてもよい（MAY）。同一 acceptance 試行に由来する tail は最初の apply 試行にのみ注入し、以降の apply 試行では再注入してはならない（MUST NOT）。
 
-#### Scenario: parallel の2回目 apply に履歴が含まれる
-- **GIVEN** parallel mode で change が apply 実行中である
-- **AND** 1回目の apply がエージェントのサマリーを返している
-- **WHEN** 2回目の apply が実行される
-- **THEN** プロンプトは base apply_prompt を含む
-- **AND** プロンプトは `<last_apply attempt="1">` ブロックを含む
-- **AND** ブロックには 1回目のサマリーが含まれる
+The orchestrator MUST use one history-injection loop for every managed-worktree apply attempt. Each attempt summary and one-shot acceptance failure tail MUST retain their existing bounded injection semantics.
 
-#### Scenario: serial の2回目 apply に履歴が含まれる
-- **GIVEN** 逐次モードで change が apply 実行中である
-- **AND** 1回目の apply がエージェントのサマリーを返している
-- **WHEN** 2回目の apply が実行される
-- **THEN** プロンプトは base apply_prompt を含む
-- **AND** プロンプトは `<last_apply attempt="1">` ブロックを含む
-- **AND** ブロックには 1回目のサマリーが含まれる
+#### Scenario: second apply includes history
 
-#### Scenario: acceptance failure tail が次の apply に含まれる
-- **GIVEN** acceptance が FAIL で終了して apply ループへ戻る
-- **AND** AcceptanceHistory に stdout_tail または stderr_tail が記録されている
-- **WHEN** 次の apply 試行が開始される
-- **THEN** apply プロンプトは `<last_acceptance_output>` ブロックを含む
-- **AND** stdout_tail が存在する場合は stdout_tail が含まれる
-- **AND** stdout_tail が空の場合は stderr_tail が含まれる
-
-#### Scenario: acceptance tail は 1 回だけ注入される
-- **GIVEN** acceptance が FAIL で終了して apply ループへ戻る
-- **AND** AcceptanceHistory に stdout_tail または stderr_tail が記録されている
-- **WHEN** 連続して 2 回の apply 試行が実行される
-- **THEN** 1 回目の apply プロンプトにのみ `<last_acceptance_output>` ブロックが含まれる
+- **GIVEN** a change's first managed-worktree apply returned an agent summary
+- **WHEN** its second apply starts
+- **THEN** the prompt includes `<last_apply attempt="1">`
+- **AND** the block contains the first summary
 
 ### Requirement: Apply History Context Format
 
@@ -1139,94 +1072,92 @@ Changes interrupted by stop SHALL be handled according to the policy of holding 
 
 ### Requirement: Parallel Execution Mode Flag
 
-The CLI SHALL support a `--parallel` flag to enable parallel change execution using git worktrees. Parallel mode is OFF by default.
+The CLI SHALL use cumulative Git-worktree orchestration for every executable `run` invocation. Execution mode SHALL NOT be selectable through a `--parallel` or serial-equivalent flag.
 
-#### Scenario: Enable parallel mode via CLI flag
+#### Scenario: Default run uses worktree orchestration
+
+- **WHEN** user runs `cflx run --all` in a usable Git repository
+- **THEN** the orchestrator analyzes eligible changes and dispatches cumulative worktree execution
+- **AND** no execution-mode flag is required
+
+#### Scenario: Single change uses the same execution path
+
+- **WHEN** user runs `cflx run my-feature` in a usable Git repository
+- **THEN** `my-feature` executes in a managed worktree
+- **AND** it follows the same archive and post-archive state transitions as a multi-change run
+
+#### Scenario: Retired parallel flag is rejected
+
 - **WHEN** user runs `cflx run --parallel`
-- **AND** a `.git` directory exists
-- **THEN** the orchestrator enters parallel execution mode
-- **AND** changes are analyzed for parallelization opportunities
+- **THEN** argument parsing fails with a non-zero exit status
+- **AND** help output does not advertise `--parallel`
 
-#### Scenario: Parallel mode disabled by default
-- **WHEN** user runs `cflx run` without `--parallel` flag
-- **THEN** the orchestrator uses sequential execution mode
-- **AND** no parallelization analysis is performed
+#### Scenario: Execution requires Git before side effects
 
-#### Scenario: Parallel mode requires git directory
-- **WHEN** user runs `cflx run --parallel`
-- **AND** no `.git` directory exists
-- **THEN** the command exits with error code 1
-- **AND** an error message indicates git repository is required for parallel mode
+- **WHEN** user starts executable run orchestration outside a usable Git repository or without the Git command
+- **THEN** startup fails with a non-zero exit status and an actionable error
+- **AND** no hook, lifecycle adapter, AI subprocess, or managed-worktree mutation has started
 
-#### Scenario: Parallel mode with max concurrent limit
-- **WHEN** user runs `cflx run --parallel --max-concurrent 4`
-- **THEN** at most 4 workspaces are created simultaneously
-- **AND** additional changes wait until a workspace becomes available
+#### Scenario: Concurrency remains configurable
+
+- **WHEN** user runs `cflx run --all --max-concurrent 4`
+- **THEN** at most 4 managed workspaces execute simultaneously
+- **AND** additional eligible changes wait until capacity is available
 
 ### Requirement: Parallel Mode TUI Display
 
-The TUI SHALL display parallel execution progress when in parallel mode.
+The TUI SHALL display worktree execution, workspace, and post-archive progress as the standard execution presentation. It SHALL NOT display a selectable execution-mode badge or mode toggle.
 
-#### Scenario: Display parallel groups
-- **WHEN** TUI is in running mode with parallel execution
-- **THEN** changes are grouped by their parallel group assignment
-- **AND** each group is visually distinguished
+#### Scenario: Display concurrent worktree progress
 
-#### Scenario: Display workspace status
-- **WHEN** changes are being processed in parallel
-- **THEN** each change shows its workspace status (creating, running, completed, failed)
-- **AND** multiple spinners can be active simultaneously
+- **WHEN** TUI is running one or more changes
+- **THEN** each change shows its managed-workspace status
+- **AND** concurrently active changes may show simultaneous progress
 
-#### Scenario: Display merge progress
-- **WHEN** a parallel group completes and merge begins
-- **THEN** a merge progress indicator is displayed
-- **AND** the merge result (success/conflict) is shown
+#### Scenario: Display post-archive progress
+
+- **WHEN** an archived change enters merge, resolve, or push handling
+- **THEN** the corresponding progress and terminal result are displayed
+- **AND** archive alone is not presented as terminal because of an execution mode
 
 ### Requirement: Parallel Mode Dry Run
 
-The CLI SHALL support `--dry-run` to preview parallelization groups without execution.
+The CLI SHALL support `--dry-run` to preview dependency groups without execution on the standard worktree orchestration path.
 
-#### Scenario: Preview parallelization groups
-- **WHEN** user runs `cflx run --parallel --dry-run`
-- **THEN** the analyzer determines parallelization groups
-- **AND** the groups are displayed without executing any changes
-- **AND** no workspaces are created
+#### Scenario: Preview dependency groups
+
+- **WHEN** user runs `cflx run --all --dry-run`
+- **THEN** the analyzer determines execution groups
+- **AND** the groups are displayed without executing changes
+- **AND** no managed workspace is created or mutated
 
 ### Requirement: VCS Backend Selection Flag
 
-CLI SHALL allow explicit VCS backend selection via `--vcs` flag.
+CLI SHALL apply `--vcs` directly to the sole worktree execution path.
 
 #### Scenario: Default auto detection
 
-- **WHEN** `--parallel` flag is specified
-- **AND** `--vcs` flag is not specified
-- **THEN** VCS backend is auto-detected
-- **AND** Git backend is selected when a `.git` directory exists
+- **WHEN** an executable run starts without `--vcs`
+- **THEN** the VCS backend is auto-detected
+- **AND** Git is selected in a usable Git repository
 
 #### Scenario: Explicit git selection
 
-- **WHEN** `cflx run --parallel --vcs git` is executed
-- **THEN** Git backend is used
-- **AND** an error is displayed if Git is not available
+- **WHEN** `cflx run --all --vcs git` is executed
+- **THEN** the Git backend is used
+- **AND** startup fails before orchestration side effects if Git is unavailable
 
 #### Scenario: Explicit auto selection
 
-- **WHEN** `cflx run --parallel --vcs auto` is executed
-- **THEN** VCS backend is auto-detected
-- **AND** Git backend is selected when a `.git` directory exists
+- **WHEN** `cflx run --all --vcs auto` is executed
+- **THEN** the VCS backend is auto-detected
+- **AND** Git is selected in a usable Git repository
 
 #### Scenario: Invalid VCS value
 
-- **WHEN** `cflx run --parallel --vcs invalid` is executed
+- **WHEN** `cflx run --all --vcs invalid` is executed
 - **THEN** error message "Invalid VCS backend: invalid. Valid options: auto, git" is displayed
 - **AND** exit code is non-zero
-
-#### Scenario: --vcs without --parallel
-
-- **WHEN** `cflx run --vcs git` is executed
-- **AND** `--parallel` flag is not specified
-- **THEN** `--vcs` option is ignored
-- **AND** normal sequential execution proceeds
 
 ### Requirement: Git Uncommitted Changes Error Message
 
@@ -1358,17 +1289,13 @@ TUI は archived 状態になった change をアプリ終了まで Changes 一�
 
 ### Requirement: Git Repository Detection
 
-The CLI SHALL detect whether the current directory is a git-managed repository by checking for the `.git` directory.
+Executable CLI orchestration SHALL require a usable Git repository and Git command. Validation SHALL happen before orchestration side effects.
 
-#### Scenario: git repository detected
-- **WHEN** a `.git` directory exists in the current working directory
-- **THEN** git worktree parallel features are available
+#### Scenario: Git repository unavailable
 
-#### Scenario: git repository not detected
-- **WHEN** no `.git` directory exists in the current working directory
-- **AND** user runs `cflx run --parallel`
-- **THEN** the command exits with a non-zero exit code
-- **AND** an error message is displayed: "Error: --parallel requires a git repository (.git directory not found)"
+- **WHEN** user starts `cflx run --all` outside a usable Git repository
+- **THEN** the command exits non-zero with an actionable Git error
+- **AND** no hook, lifecycle adapter, AI subprocess, or workspace mutation starts
 
 ### Requirement: TUIのChange一覧にworktree存在を表示する
 TUIのChange一覧は、各changeに紐づくworktreeの有無を識別できるインジケータを表示しなければならない（SHALL）。
@@ -1402,70 +1329,48 @@ TUIはProcessing/Running中のchangeに対してworktree削除を許可しては
 
 ### Requirement: Serial Apply Iteration WIP Commits
 
-逐次（非parallel）applyループでは、各イテレーション終了後に作業内容をWIPコミットとして保存しなければならない（MUST）。apply成功・失敗や進捗増加の有無に関わらず、最新状態をスナップショットとして残さなければならない（MUST）。
+Managed-worktree apply execution MUST preserve each iteration's latest work as a new WIP snapshot commit after successful, failed, or no-progress apply results. The message MUST use `WIP: {change_id} ({completed}/{total} tasks, apply#{iteration})`; the snapshot MUST be equivalent to `git add -A` followed by `git commit --no-verify --allow-empty`; and it MUST NOT amend an existing WIP commit.
 
-WIPコミットメッセージは `WIP: {change_id} ({completed}/{total} tasks, apply#{iteration})` の形式としなければならない（MUST）。Gitリポジトリで実行中の場合、`git add -A` と `git commit --no-verify --allow-empty` 相当の操作で新規WIPコミットを作成しなければならない（MUST）。既存WIPコミットの `--amend` を使用してはならない（MUST NOT）。
+Only when Conflux-owned WIP `git add -A` or commit cannot create an `index.lock` because the current managed worktree Git directory already contains that lock, Conflux MUST retry the complete `create_progress_commit` snapshot sequence up to three total attempts at fixed 200 millisecond intervals without backoff. It MUST NOT delete or bypass the lock and MUST NOT apply this retry policy to general Git commands.
 
-Conflux が所有する WIP スナップショットの `git add -A` または `git commit --no-verify --allow-empty` が、管理対象 worktree の Git directory に解決される `index.lock` を既存ファイルのため作成できず失敗した場合に限り、Conflux は `create_progress_commit` の完全な snapshot sequence を最大3回、固定200ミリ秒間隔、backoffなしで再試行しなければならない（MUST）。Conflux は lock を削除してはならず（MUST NOT）、一般の Git command にこの retry policy を適用してはならない（MUST NOT）。
+Before each attempt Conflux MUST record `HEAD_before`. A failed attempt counts as committed only when HEAD advanced to a commit whose sole parent is `HEAD_before` and whose subject exactly matches the expected WIP message. A same-subject commit elsewhere in history MUST NOT prove success. Runtime MUST check cancellation after a retryable failure, before waiting, and before each next attempt. Exhausted lock contention and non-lock VCS errors MUST preserve workspace content and return actionable diagnostics.
 
-各 attempt 前に `HEAD_before` を記録し、失敗後の HEAD が前進し、その新HEADの唯一のparentが `HEAD_before` で、subjectが期待するWIP messageと完全一致する場合に限り、その attempt をcommit済みとして扱わなければならない（MUST）。履歴中の同一subjectだけを成功証拠にしてはならない（MUST NOT）。Cancellation は VCS trait の内部ではなく progress-commit orchestration boundary で retryable failure 後、待機前、次 attempt 前に確認しなければならない（MUST）。競合が3回で解消しない場合、および分類条件を満たさない VCS error の場合は、作業内容を保持して診断可能な失敗を返さなければならない（MUST）。
+#### Scenario: Managed-worktree iterations always snapshot current work
 
-#### Scenario: WIP created after successful apply iteration
-
-- Given: 逐次applyループが実行中である
-- When: applyコマンドが正常に完了しイテレーションが終了する
-- Then: WIPスナップショットが新規コミットとして作成される
-
-#### Scenario: WIP created after failed apply iteration
-
-- Given: 逐次applyループが実行中である
-- When: applyコマンドが失敗してイテレーションが終了する
-- Then: 失敗時点の作業内容がWIPスナップショットとして保存される
-
-#### Scenario: WIP created when no progress is made
-
-- Given: 逐次applyループが実行中である
-- When: applyコマンドは成功したがタスク進捗が増加しない
-- Then: 最新の作業内容を反映したWIPスナップショットが作成される
+- **GIVEN** a managed-worktree apply iteration finishes successfully, fails, or makes no task progress
+- **WHEN** iteration finalization runs
+- **THEN** current staged and unstaged work is saved in exactly one new WIP snapshot commit
+- **AND** no existing WIP commit is amended
 
 #### Scenario: Transient index lock clears within retry budget
 
-- **GIVEN** Conflux-owned WIP `git add -A` or WIP commit reports an existing `index.lock` that resolves to the current managed worktree Git directory
+- **GIVEN** a Conflux-owned WIP snapshot reports an existing `index.lock` in the current managed worktree Git directory
 - **AND** the lock becomes available before the third total attempt
-- **WHEN** Conflux retries the complete progress-commit snapshot sequence after the fixed 200 ms delay
+- **WHEN** Conflux retries the complete snapshot sequence after each fixed 200 millisecond delay
 - **THEN** the expected WIP commit is created exactly once
-- **AND** staged and unstaged apply output is included in the snapshot
 - **AND** Conflux does not delete or bypass the lock
 
 #### Scenario: Ambiguous commit completion does not duplicate WIP
 
-- **GIVEN** a WIP commit attempt captured `HEAD_before` and then reports failure
-- **AND** current HEAD advanced to a commit whose only parent is `HEAD_before` and whose subject exactly matches the expected WIP message
-- **WHEN** Conflux evaluates whether another attempt is required
-- **THEN** Conflux recognizes that attempt as committed
-- **AND** no duplicate WIP commit is created
-- **AND** a same-subject commit elsewhere in history is not accepted as evidence
+- **GIVEN** a WIP attempt captured `HEAD_before` and then reported failure
+- **AND** current HEAD advanced to a commit whose sole parent is `HEAD_before` and whose subject exactly matches the expected WIP message
+- **WHEN** Conflux evaluates another attempt
+- **THEN** it recognizes the prior attempt as committed
+- **AND** it does not create a duplicate WIP commit
 
-#### Scenario: Persistent index lock exhausts retries safely
+#### Scenario: Persistent lock and cancellation preserve workspace state
 
-- **GIVEN** the managed worktree `index.lock` remains unavailable for all three attempts
-- **WHEN** Conflux exhausts the third attempt
-- **THEN** apply fails with command, working directory, lock contention, and attempt diagnostics
-- **AND** the apply output remains preserved in the workspace
-- **AND** the lock file is not deleted
-
-#### Scenario: Cancellation stops lock retry
-
-- **GIVEN** Conflux has classified a WIP snapshot lock failure as retryable
-- **WHEN** runtime cancellation is observed after that failure, before delay, or before the next attempt
-- **THEN** no further snapshot attempt starts
-- **AND** the workspace state remains preserved
+- **GIVEN** lock contention exhausts three attempts or cancellation is observed before another attempt
+- **WHEN** progress-commit orchestration stops
+- **THEN** no further attempt starts
+- **AND** workspace content and the lock file remain untouched
+- **AND** diagnostics identify the command, working directory, contention, and attempts
 
 #### Scenario: Non-lock VCS failure is not retried
 
 - **GIVEN** a WIP snapshot fails because of a permission, identity, configuration, hook, conflict, or other non-lock VCS error
 - **WHEN** Conflux classifies the failure
-- **THEN** Conflux returns the structured VCS failure without applying the transient lock retry policy
+- **THEN** it returns the structured VCS failure without transient-lock retry
 
 ### Requirement: Archive Context History
 
@@ -1599,35 +1504,13 @@ When resolve verification continues because merge completion is still incomplete
 
 ### Requirement: Enhanced Help Output
 
-The CLI SHALL provide comprehensive help output that includes all subcommands, key options, and usage examples. Help output SHALL include the `--push [remote]` option anywhere it is accepted: top-level TUI launch, `run`, and `tui`.
+CLI help SHALL document all current subcommands and supported options. It SHALL include `--max-concurrent`, `--dry-run`, `--vcs`, web controls, and `--push [remote]` where accepted, and SHALL NOT advertise `--parallel`.
 
-#### Scenario: Main help shows all subcommands
-- **WHEN** user runs `cflx --help`
-- **THEN** help output includes list of all subcommands: run, tui, init
-- **AND** help output includes key options: --parallel, --max-concurrent, --dry-run, --vcs, --web, --web-port, --web-bind
-- **AND** help output includes `--push [remote]`
+#### Scenario: Run help describes standard worktree execution
 
-#### Scenario: Main help shows push option
-- **WHEN** user runs `cflx --help`
-- **THEN** help output includes `--push [remote]`
-- **AND** help output indicates it configures push post-archive behavior for local TUI parallel execution
-
-#### Scenario: Run subcommand help shows detailed options
 - **WHEN** user runs `cflx run --help`
-- **THEN** help output includes detailed description of run subcommand
-- **AND** help output includes examples of parallel execution
-- **AND** help output includes examples of web monitoring
-
-#### Scenario: TUI subcommand help shows push option
-- **WHEN** user runs `cflx tui --help`
-- **THEN** help output includes `--push [remote]`
-- **AND** help output indicates it configures push post-archive behavior for local TUI parallel execution
-
-#### Scenario: TUI subcommand help shows keybindings
-- **WHEN** user runs `cflx tui --help`
-- **THEN** help output includes TUI key bindings (Space, F5, Esc, Tab, q)
-- **AND** help output includes description of TUI features
-- **AND** help output includes web monitoring options
+- **THEN** help describes explicit targets, concurrency, dry-run, VCS, web monitoring, and post-archive options
+- **AND** it contains no `--parallel` option or mode-selection example
 
 ### Requirement: Deprecated Flags Removed
 
@@ -1842,31 +1725,14 @@ The CLI SHALL provide an `install-skills` subcommand for installing bundled Conf
 
 ### Requirement: run Surfaces Hook Output
 
-The `run` subcommand SHALL display hook execution details in the same user-visible CLI log stream used for other run progress messages.
+The `run` subcommand SHALL preserve hook command, output, and failure ordering on the sole worktree execution path.
 
-#### Scenario: Hook command is logged before hook output
+#### Scenario: CLI run preserves hook visibility
 
 - **GIVEN** a hook is configured for a lifecycle stage reached during `cflx run`
-- **WHEN** the hook starts
-- **THEN** the CLI log first shows the hook type and expanded command string
-- **AND** any captured hook output is displayed after the command log entry
-
-#### Scenario: Hook output ordering includes failure result
-
-- **GIVEN** a hook produces captured output and then fails during `cflx run`
-- **WHEN** the run subcommand reports the failure
-- **THEN** the CLI log shows hook command information first
-- **AND** the CLI log shows captured hook output next
-- **AND** the CLI log shows the hook failure result after the captured output
-
-#### Scenario: CLI run preserves hook visibility parity with non-interactive execution
-
-- **GIVEN** the same hook configuration is used in serial CLI run and another existing execution path that already emits hook logs
-- **WHEN** the hook executes in serial CLI run
-- **THEN** users can see the hook command and any captured output without needing debug-only tracing configuration
-
-
-#
+- **WHEN** the hook executes
+- **THEN** users see the hook command followed by captured output and any failure result
+- **AND** debug-only tracing is not required
 
 ### Requirement: install-skills Subcommand
 
@@ -2047,36 +1913,6 @@ Versioned startup logs MUST use a consistent version/build representation so ope
 - **WHEN** the CLI starts the server runtime
 - **THEN** the startup log includes the cflx version and build number
 - **AND** the startup log identifies the mode as server
-
-### Requirement: Serial run resolves workflow state from its captured repository root
-
-Serial orchestration MUST rediscover changes after apply and evaluate subsequent acceptance, archive, and resume routing relative to the repository root captured when the service was created. Ambient process working-directory changes MUST NOT redirect those operations to another repository.
-
-Serial orchestration MUST NOT create or load `.cflx/acceptance-state.json`. Within one active run it MAY retain acceptance context in memory. After restart, complete unarchived work MUST run acceptance again before archive unless repository evidence already proves archive or base integration.
-
-#### Scenario: ambient working directory does not redirect serial resume
-
-- **GIVEN** serial run was created for repository `alpha`
-- **AND** the process working directory later points at repository `beta`
-- **WHEN** serial run refreshes the change after apply or evaluates resume routing
-- **THEN** it reads repository `alpha`
-- **AND** repository `beta` does not influence workflow routing
-- **AND** neither repository receives `.cflx/acceptance-state.json`
-
-#### Scenario: serial restart reruns acceptance for unarchived work
-
-- **GIVEN** repository `alpha` contains a complete implementation that is not repository-verifiably archived
-- **AND** the previous serial process ended after acceptance activity
-- **WHEN** a new serial run resumes repository `alpha`
-- **THEN** it runs acceptance before archive
-- **AND** it does not infer PASS from a generated checkpoint
-
-#### Scenario: serial uninterrupted pass hands off in memory
-
-- **GIVEN** serial apply and acceptance execute in one active run
-- **WHEN** acceptance returns PASS for the current revision
-- **THEN** serial execution may continue to archive using active-run context
-- **AND** no acceptance JSON checkpoint is written
 
 ### Requirement: CLI acceptance failure reporting distinguishes verdict failure from follow-up persistence degradation
 

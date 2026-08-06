@@ -78,22 +78,18 @@ A project MUST NOT expose a dispatch view that starts more than one base-lane ow
 
 ### Requirement: Additive Runtime Model Introduction
 
-The initial three-level runtime state change SHALL be additive and SHALL NOT replace existing execution paths, scheduler wiring, TUI/Web state consumption, server runner behavior, or obsolete serial-path removal in the same change.
+The initial three-level runtime state change remains an additive migration milestone. This follow-up SHALL remove obsolete serial compatibility from execution consumers and SHALL make archive-to-post-archive handling independent of an execution-mode enum.
 
-Follow-up changes MAY migrate those consumers after the new model has reducer and snapshot test coverage.
+#### Scenario: follow-up migrates execution consumers
 
-<!-- Expected canonical result after archive: `runtime-state` will require the first migration step to add tested model/reducer primitives before rewiring execution surfaces. -->
+**Given**: the three-level runtime model and reducer coverage exist
+**When**: executable CLI, TUI, server control, scheduler, and event consumers are migrated
+**Then**: they use cumulative worktree orchestration without serial compatibility adapters
+**And**: reducer and snapshot tests cover the sole runtime path
 
-#### Scenario: existing execution behavior remains unchanged
+#### Scenario: archive terminal behavior is mode-free
 
-**Given**: the three-level runtime state model has been added
-**When**: existing parallel execution, server, TUI, and legacy orchestration tests run
-**Then**: they continue to use their existing runtime paths unless explicitly migrated by a later change
-**And**: the new runtime model is covered by isolated reducer and snapshot tests
-
-#### Scenario: serial mode does not shape the new model
-
-**Given**: serial mode is obsolete
-**When**: the new runtime types are introduced
-**Then**: they do not require serial-specific terminal archive semantics as a foundational design constraint
-**And**: any legacy serial compatibility remains outside the new three-level model or in later compatibility adapters
+**Given**: a managed-worktree change reaches archived state
+**When**: runtime state chooses the next action
+**Then**: it enters the configured merge, resolve, or push handling
+**And**: no `ExecutionMode::Serial` branch treats archive as terminal

@@ -16,7 +16,7 @@ Single-instance web monitoring MUST expose `/api/v2` health, capabilities, insta
 
 ### Requirement: Closed shared command delegation
 
-`POST /api/v2/commands` MUST accept only `start`, `stop`, `cancel_stop`, `force_stop`, `set_execution_mark`, `set_queue_intent`, `retry_change`, `retry_errors`, `stop_and_dequeue`, `resolve_merge`, `set_parallel_mode`, and `set_all_execution_marks` until a later spec delta extends the enum. Every command MUST include `expected_revision` and `idempotency_key`. Accepted lifecycle commands MUST execute through the same process-local application services used by the TUI; the API MUST NOT equate internal channel enqueue with successful command execution and MUST NOT maintain an independent workflow state machine.
+`POST /api/v2/commands` MUST accept only `start`, `stop`, `cancel_stop`, `force_stop`, `set_execution_mark`, `set_queue_intent`, `retry_change`, `retry_errors`, `stop_and_dequeue`, `resolve_merge`, and `set_all_execution_marks` until a later spec delta extends the enum. Every command MUST include `expected_revision` and `idempotency_key`. Accepted lifecycle commands MUST execute through the same process-local application services used by the TUI; the API MUST NOT equate internal channel enqueue with successful command execution and MUST NOT maintain an independent workflow state machine.
 
 #### Scenario: Accepted command uses shared behavior
 
@@ -24,29 +24,13 @@ Single-instance web monitoring MUST expose `/api/v2` health, capabilities, insta
 **When**: The API accepts it
 **Then**: The shared application service revalidates and executes it
 **And**: TUI-equivalent reducer, scheduler, cancellation, side-effect, and event semantics apply
-**And**: The command settles as succeeded, no-op, or failed according to the actual service outcome
 
-#### Scenario: Unknown command type is rejected
+#### Scenario: Retired set_parallel_mode command is rejected
 
-**Given**: A command envelope names a type outside the closed enum
+**Given**: A command envelope names `set_parallel_mode`
 **When**: It is submitted
 **Then**: The server returns HTTP 422 with `validation_failed`
-**And**: No service call occurs
-
-#### Scenario: Empty start target is not successful
-
-**Given**: No eligible execution-marked change exists at the admitted revision
-**When**: Start is submitted
-**Then**: No scheduler is started
-**And**: The command settles as no-op or failed with actionable detail
-
-#### Scenario: Parallel toggle uses shared behavior
-
-**Given**: The application is in Select or Stopped mode and parallel execution is available
-**When**: `set_parallel_mode` is accepted
-**Then**: The shared service changes the mode
-**And**: It clears marks and queue presentation for changes that are ineligible in parallel mode
-**And**: The outcome identifies excluded changes and reasons
+**And**: No service call occurs and the state revision does not change
 
 #### Scenario: Bulk mark classifies one revision
 
@@ -288,14 +272,14 @@ Start, retry, stop, cancel stop, force stop, and resolve MUST use shared applica
 
 ### Requirement: Remote parallel execution discovery
 
-Capabilities and state MUST expose parallel execution availability, active mode, maximum concurrency, VCS backend, and per-change eligibility with machine-readable blocked reasons.
+Capabilities and state MUST expose maximum concurrency, VCS backend, and per-change worktree eligibility with machine-readable blocked reasons. They MUST NOT expose an active execution-mode dimension or distinguish serial from parallel modes.
 
-#### Scenario: Client discovers parallel execution state
+#### Scenario: Client discovers worktree execution state
 
 **Given**: A single cflx process has web monitoring enabled
 **When**: A client reads capabilities and state
-**Then**: It can distinguish sequential, available parallel, unavailable parallel, and active parallel modes
-**And**: It can explain why each non-final change is or is not parallel-eligible without inspecting Git itself
+**Then**: It can read concurrency, VCS, and eligibility without an execution-mode field
+**And**: It can explain why each non-final change is or is not eligible without inspecting Git itself
 
 ### Requirement: Atomic parallel start eligibility
 
