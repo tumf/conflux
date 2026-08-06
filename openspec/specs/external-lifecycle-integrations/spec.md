@@ -64,7 +64,7 @@ Lifecycle messages MUST NOT include environment values, credentials, provider to
 
 ### Requirement: Typed frontend lifecycle emission
 
-TUI and non-interactive frontends MUST publish lifecycle state from typed runtime state and actions rather than rendered-screen scraping. The TUI lifecycle snapshot MUST represent execution mode independently from modal interaction state. This lifecycle publication MUST preserve the existing `EventSink` and `ReducerCommand` ownership boundaries.
+TUI and non-interactive frontends MUST publish lifecycle state from typed runtime state and actions rather than rendered-screen scraping. The TUI lifecycle snapshot MUST represent execution mode independently from modal interaction state and MUST include only two typed row-status facts evaluated after reducer-to-TUI synchronization: whether any row is active or queued, and whether any row is blocked or stalled. This lifecycle publication MUST preserve the existing `EventSink` and `ReducerCommand` ownership boundaries and MUST remain observability-only.
 
 #### Scenario: Confirmation dialog reports blocked
 
@@ -76,10 +76,48 @@ TUI and non-interactive frontends MUST publish lifecycle state from typed runtim
 
 #### Scenario: QR overlay preserves underlying lifecycle
 
-- **GIVEN** the TUI displays the QR overlay while execution is idle, working, stopping, stopped, or error
+- **GIVEN** the TUI displays the QR overlay while execution is idle, working, stopping, stopped, error, or waiting on blocked/stalled changes
 - **WHEN** the typed TUI state is projected to an external lifecycle event
-- **THEN** the lifecycle state is derived from the underlying execution mode
+- **THEN** the lifecycle state is derived from the underlying execution and reducer-synchronized row state
 - **AND** QR presentation alone does not report `blocked`
+
+#### Scenario: Persistent blocked or stalled wait reports blocked
+
+- **GIVEN** the TUI execution mode is `Running`
+- **AND** at least one reducer-synchronized change row is `blocked` or `stalled`
+- **AND** no change row is active or queued
+- **WHEN** the TUI snapshot is projected to an external lifecycle event
+- **THEN** the lifecycle dispatcher receives `blocked`
+- **AND** repeated unchanged frames do not emit an intervening `working` transition
+
+#### Scenario: Active work takes precedence over waiting rows
+
+- **GIVEN** the TUI execution mode is `Running`
+- **AND** one or more rows are `blocked` or `stalled`
+- **AND** at least one row has a canonical active execution status
+- **WHEN** the TUI snapshot is projected to an external lifecycle event
+- **THEN** the lifecycle dispatcher receives `working`
+
+#### Scenario: Queued work preserves working lifecycle
+
+- **GIVEN** the TUI execution mode is `Running`
+- **AND** no row has an active execution status
+- **AND** at least one row is queued alongside a blocked or stalled row
+- **WHEN** the TUI snapshot is projected to an external lifecycle event
+- **THEN** the lifecycle dispatcher receives `working`
+
+#### Scenario: Ordinary zero-active running state remains working
+
+- **GIVEN** the TUI execution mode is `Running`
+- **AND** no row is active, queued, blocked, or stalled
+- **WHEN** the TUI snapshot is projected to an external lifecycle event
+- **THEN** the lifecycle dispatcher receives `working`
+
+#### Scenario: Graceful stopping remains working
+
+- **GIVEN** the TUI execution mode is `Stopping`
+- **WHEN** the TUI snapshot is projected with any reducer-synchronized row-status combination
+- **THEN** the lifecycle dispatcher receives `working`
 
 #### Scenario: Adapter cannot mutate core state
 

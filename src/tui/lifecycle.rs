@@ -1,11 +1,13 @@
 //! Typed TUI → lifecycle state mapping.
 //!
 //! Semantic lifecycle state is derived from typed TUI state (`AppExecutionMode`,
-//! `ModalState`, `StopMode`, and the currently processing change). Rendered screen
-//! contents are never parsed, and this mapping never feeds back into
-//! `ReducerCommand` or `EventSink` ownership: it is observability-only.
+//! `ModalState`, `StopMode`, the currently processing change, and the
+//! reducer-synchronized row statuses). Rendered screen contents are never parsed,
+//! and this mapping never feeds back into `ReducerCommand` or `EventSink`
+//! ownership: it is observability-only.
 
 use crate::lifecycle_integration::{LifecycleContext, LifecycleState};
+use crate::orchestration::operator_command::is_active_status;
 
 use super::state::AppState;
 use super::types::{AppExecutionMode, ModalState, StopMode};
@@ -25,29 +27,65 @@ pub struct TuiLifecycleSnapshot {
     pub stop_mode: StopMode,
     /// Change currently being processed, if any.
     pub current_change: Option<String>,
+    /// Whether any row is actively executing or still queued for dispatch.
+    ///
+    /// A copied observability fact, never a scheduler or admission input.
+    pub has_active_or_queued_change: bool,
+    /// Whether any row is waiting in `blocked` or `stalled`.
+    pub has_blocked_or_stalled_change: bool,
 }
 
 impl TuiLifecycleSnapshot {
     /// Capture the lifecycle-relevant subset of the TUI state.
+    ///
+    /// Row facts are read from the reducer-synchronized display caches, so the
+    /// active vocabulary is the canonical one rather than a copy that could drift
+    /// from [`is_active_status`].
     pub fn from_app(app: &AppState) -> Self {
+        let mut has_active_or_queued_change = false;
+        let mut has_blocked_or_stalled_change = false;
+        for change in &app.changes {
+            let status = change.display_status_cache.as_str();
+            if is_active_status(status) || status == "queued" {
+                has_active_or_queued_change = true;
+            }
+            if matches!(status, "blocked" | "stalled") {
+                has_blocked_or_stalled_change = true;
+            }
+        }
+
         Self {
             execution_mode: app.execution_mode,
             modal: app.modal.clone(),
             stop_mode: app.stop_mode.clone(),
             current_change: app.current_change.clone(),
+            has_active_or_queued_change,
+            has_blocked_or_stalled_change,
         }
     }
 
     /// Semantic lifecycle state for this snapshot.
     ///
     /// Projection order is: a confirmation that awaits an operator decision blocks;
-    /// a QR overlay is presentation only and reports whatever execution is doing
-    /// underneath it; otherwise the execution mode maps directly.
+    /// a persistent `Running` process whose every remaining row is waiting in
+    /// `blocked` or `stalled` blocks, because nothing is executing and nothing is
+    /// admitted for dispatch; a QR overlay is presentation only and reports
+    /// whatever execution is doing underneath it; otherwise the execution mode
+    /// maps directly.
     pub fn lifecycle_state(&self) -> LifecycleState {
         if self
             .modal
             .as_ref()
             .is_some_and(ModalState::is_user_decision)
+        {
+            return LifecycleState::Blocked;
+        }
+
+        // Active or queued work always wins: a mixed run is still working, and a
+        // queued row keeps `working` while it remains admitted for dispatch.
+        if matches!(self.execution_mode, AppExecutionMode::Running)
+            && !self.has_active_or_queued_change
+            && self.has_blocked_or_stalled_change
         {
             return LifecycleState::Blocked;
         }
@@ -98,7 +136,37 @@ mod tests {
             modal: None,
             stop_mode: StopMode::None,
             current_change: None,
+            has_active_or_queued_change: false,
+            has_blocked_or_stalled_change: false,
         }
+    }
+
+    /// Build an `AppState` whose rows carry the given reducer display statuses.
+    fn app_with_row_statuses(
+        execution_mode: AppExecutionMode,
+        statuses: &[&str],
+    ) -> crate::tui::state::AppState {
+        use crate::openspec::{Change, ProposalMetadata};
+
+        let changes: Vec<Change> = statuses
+            .iter()
+            .enumerate()
+            .map(|(index, _)| Change {
+                id: format!("change-{index}"),
+                completed_tasks: 0,
+                total_tasks: 1,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
+            })
+            .collect();
+
+        let mut app = AppState::new(changes);
+        app.execution_mode = execution_mode;
+        for (change, status) in app.changes.iter_mut().zip(statuses) {
+            change.set_display_status_cache(status);
+        }
+        app
     }
 
     fn with_modal(execution_mode: AppExecutionMode, modal: ModalState) -> TuiLifecycleSnapshot {
@@ -228,6 +296,187 @@ mod tests {
 
         let context = confirm.lifecycle_context("/repo");
         assert_eq!(context.change_id.as_deref(), Some("change-b"));
+    }
+
+    #[test]
+    fn row_statuses_project_the_documented_precedence_table() {
+        // (execution mode, reducer-synchronized row statuses, expected lifecycle)
+        let cases: [(AppExecutionMode, &[&str], LifecycleState); 12] = [
+            // Blocked/stalled-only waits under a persistent Running process.
+            (
+                AppExecutionMode::Running,
+                &["blocked"],
+                LifecycleState::Blocked,
+            ),
+            (
+                AppExecutionMode::Running,
+                &["stalled"],
+                LifecycleState::Blocked,
+            ),
+            (
+                AppExecutionMode::Running,
+                &["blocked", "stalled", "archived", "not queued"],
+                LifecycleState::Blocked,
+            ),
+            // Any active row wins over waiting rows.
+            (
+                AppExecutionMode::Running,
+                &["applying", "stalled"],
+                LifecycleState::Working,
+            ),
+            (
+                AppExecutionMode::Running,
+                &["preparing", "blocked"],
+                LifecycleState::Working,
+            ),
+            (
+                AppExecutionMode::Running,
+                &["resolving", "blocked"],
+                LifecycleState::Working,
+            ),
+            // A queued row keeps work admitted, so the wait is not exclusive.
+            (
+                AppExecutionMode::Running,
+                &["queued", "blocked"],
+                LifecycleState::Working,
+            ),
+            // Ordinary zero-active Running keeps the existing fallback.
+            (AppExecutionMode::Running, &[], LifecycleState::Working),
+            (
+                AppExecutionMode::Running,
+                &["not queued", "archived", "merge wait"],
+                LifecycleState::Working,
+            ),
+            // Non-Running modes are unchanged by row status.
+            (
+                AppExecutionMode::Stopping,
+                &["blocked", "stalled"],
+                LifecycleState::Working,
+            ),
+            (AppExecutionMode::Select, &["blocked"], LifecycleState::Idle),
+            (
+                AppExecutionMode::Stopped,
+                &["stalled"],
+                LifecycleState::Idle,
+            ),
+        ];
+
+        for (mode, statuses, expected) in cases {
+            let app = app_with_row_statuses(mode, statuses);
+            assert_eq!(
+                TuiLifecycleSnapshot::from_app(&app).lifecycle_state(),
+                expected,
+                "unexpected lifecycle for {mode:?} with rows {statuses:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_mode_stays_blocked_with_any_row_combination() {
+        for statuses in [&[][..], &["applying"][..], &["blocked"][..]] {
+            let app = app_with_row_statuses(AppExecutionMode::Error, statuses);
+            assert_eq!(
+                TuiLifecycleSnapshot::from_app(&app).lifecycle_state(),
+                LifecycleState::Blocked,
+                "error mode must stay blocked with rows {statuses:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qr_overlay_is_transparent_over_a_blocked_only_wait() {
+        let mut app = app_with_row_statuses(AppExecutionMode::Running, &["blocked"]);
+        app.web_url = Some("http://127.0.0.1:8080".to_string());
+        app.show_qr_popup();
+
+        let captured = TuiLifecycleSnapshot::from_app(&app);
+        assert_eq!(captured.modal, Some(ModalState::QrPopup));
+        assert_eq!(captured.lifecycle_state(), LifecycleState::Blocked);
+    }
+
+    #[test]
+    fn user_decision_modal_outranks_an_active_row() {
+        let mut app = app_with_row_statuses(AppExecutionMode::Running, &["applying"]);
+        app.modal = Some(force_kill_confirmation());
+
+        assert_eq!(
+            TuiLifecycleSnapshot::from_app(&app).lifecycle_state(),
+            LifecycleState::Blocked
+        );
+    }
+
+    #[test]
+    fn row_facts_are_captured_from_the_display_status_caches() {
+        let app = app_with_row_statuses(AppExecutionMode::Running, &["accepting", "stalled"]);
+        let captured = TuiLifecycleSnapshot::from_app(&app);
+
+        assert!(captured.has_active_or_queued_change);
+        assert!(captured.has_blocked_or_stalled_change);
+
+        let idle = app_with_row_statuses(AppExecutionMode::Running, &["not queued"]);
+        let captured_idle = TuiLifecycleSnapshot::from_app(&idle);
+        assert!(!captured_idle.has_active_or_queued_change);
+        assert!(!captured_idle.has_blocked_or_stalled_change);
+    }
+
+    #[test]
+    fn every_canonical_active_status_preserves_working() {
+        for status in [
+            "preparing",
+            "applying",
+            "accepting",
+            "rejecting",
+            "archiving",
+            "resolving",
+        ] {
+            assert!(
+                is_active_status(status),
+                "{status} must remain a canonical active status"
+            );
+            let app = app_with_row_statuses(AppExecutionMode::Running, &[status, "blocked"]);
+            assert_eq!(
+                TuiLifecycleSnapshot::from_app(&app).lifecycle_state(),
+                LifecycleState::Working,
+                "{status} alongside a blocked row must report working"
+            );
+        }
+    }
+
+    /// The frame loop republishes every frame, so the row facts must survive the
+    /// publisher's deduplication as one semantic transition rather than
+    /// alternating with `working`.
+    #[test]
+    fn repeated_frames_over_a_blocked_only_app_state_publish_one_transition() {
+        use crate::lifecycle_integration::LifecycleStateTracker;
+
+        let mut app = app_with_row_statuses(AppExecutionMode::Running, &["blocked", "not queued"]);
+        let mut tracker = LifecycleStateTracker::default();
+        let mut emitted = Vec::new();
+
+        let publish_frames = |app: &AppState,
+                              tracker: &mut LifecycleStateTracker,
+                              emitted: &mut Vec<LifecycleState>| {
+            for _ in 0..5 {
+                let snapshot = TuiLifecycleSnapshot::from_app(app);
+                let state = snapshot.lifecycle_state();
+                if tracker.should_emit(state, &snapshot.lifecycle_context("/repo")) {
+                    emitted.push(state);
+                }
+            }
+        };
+
+        publish_frames(&app, &mut tracker, &mut emitted);
+        // The wait changes only its blocker word: the same semantic state.
+        app.changes[0].set_display_status_cache("stalled");
+        publish_frames(&app, &mut tracker, &mut emitted);
+        assert_eq!(emitted, vec![LifecycleState::Blocked]);
+
+        app.changes[1].set_display_status_cache("queued");
+        publish_frames(&app, &mut tracker, &mut emitted);
+        assert_eq!(
+            emitted,
+            vec![LifecycleState::Blocked, LifecycleState::Working]
+        );
     }
 
     #[test]
