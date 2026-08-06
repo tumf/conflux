@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { flush, mountConsole } from './helpers/console.js';
-import { classifyChange, groupChanges, lifecycleActions } from '../../web/app.js';
+import { classifyChange, describeMode, groupChanges, lifecycleActions } from '../../web/app.js';
 import { sampleSnapshot } from './helpers/server.js';
 
 async function connected(options = {}) {
@@ -67,6 +67,57 @@ describe('next valid action', () => {
       const primary = lifecycleActions({ app_mode: mode }).filter((action) => action.primary);
       expect(primary).toHaveLength(1);
     }
+  });
+
+  // A persistent scheduler parked with nothing to execute reports
+  // `app_mode: select`, but it is still alive and still stoppable. Offering only
+  // Start there would make a live process look unreachable from the console.
+  describe('persistent-idle Ready', () => {
+    const idle = { app_mode: 'select', persistent_scheduler_idle: true };
+
+    it('exposes start, graceful stop, and force stop', () => {
+      expect(lifecycleActions(idle).map((action) => action.id)).toEqual([
+        'start',
+        'stop',
+        'force-stop',
+      ]);
+    });
+
+    it('keeps exactly one primary action', () => {
+      const primary = lifecycleActions(idle).filter((action) => action.primary);
+      expect(primary).toHaveLength(1);
+      expect(primary[0].id).toBe('start');
+    });
+
+    it('keeps force stop marked destructive', () => {
+      const forceStop = lifecycleActions(idle).find((action) => action.id === 'force-stop');
+      expect(forceStop).toMatchObject({ destructive: true, command: { type: 'force_stop' } });
+    });
+
+    it('leaves pre-run selection with start alone', () => {
+      for (const snapshot of [
+        { app_mode: 'select' },
+        { app_mode: 'select', persistent_scheduler_idle: false },
+      ]) {
+        expect(lifecycleActions(snapshot).map((action) => action.id)).toEqual(['start']);
+      }
+    });
+
+    it('does not widen any other mode', () => {
+      // The field only qualifies `select`; a stale copy alongside another mode
+      // must not add controls that mode does not admit.
+      expect(
+        lifecycleActions({ app_mode: 'running', persistent_scheduler_idle: true }).map((a) => a.id),
+      ).toEqual(['stop', 'force-stop']);
+      expect(
+        lifecycleActions({ app_mode: 'stopping', persistent_scheduler_idle: true }).map((a) => a.id),
+      ).toEqual(['cancel-stop', 'force-stop']);
+    });
+
+    it('names the difference from pre-run selection', () => {
+      expect(describeMode(idle)).toBe('Idle (scheduler waiting)');
+      expect(describeMode({ app_mode: 'select' })).toBe('Idle');
+    });
   });
 });
 

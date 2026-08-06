@@ -488,9 +488,13 @@ async fn stop_and_cancel_stop_enforce_the_mode_matrix() {
     );
     assert_eq!(
         harness.scheduler.calls(),
-        vec![SchedulerCall::GracefulStop(true)]
+        vec![SchedulerCall::GracefulStop(true), SchedulerCall::Notified],
+        "the request is recorded, then the idle waiter is woken so a parked \
+         scheduler can reach its stop boundary without an unrelated event"
     );
 
+    // `Select` stays refused while no scheduler is alive: pre-run selection has
+    // nothing to stop, and liveness — not the mode name — is the widening rule.
     for refused in [
         OperatorMode::Select,
         OperatorMode::Stopped,

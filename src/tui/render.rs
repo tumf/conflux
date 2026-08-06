@@ -1313,6 +1313,12 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     // instructions inside the overlay itself, so it must not erase the retry or
     // resume affordance the execution state underneath still owns.
     let title = match app.execution_mode {
+        // Ready backed by a live idle scheduler keeps the stop affordance: the
+        // scheduler task still exists and still accepts a graceful stop, so
+        // hiding Esc here would make a running process look unstoppable.
+        AppExecutionMode::Select if app.persistent_scheduler_idle => {
+            format!(" Status ({start_key_label}: start, Esc: stop, Ctrl+C: quit) ")
+        }
         AppExecutionMode::Select => " Status (Ctrl+C: quit) ".to_string(),
         AppExecutionMode::Running => " Status (Esc: stop, Ctrl+C: quit) ".to_string(),
         AppExecutionMode::Stopping => {

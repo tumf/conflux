@@ -231,6 +231,63 @@ impl ParallelExecutor {
                 .await
     }
 
+    /// Decide whether to park, emitting the one idle transition for this episode.
+    ///
+    /// The decision and the emission are the same step on purpose: the event
+    /// exists to describe *this* park, so it reuses
+    /// [`Self::should_enter_persistent_idle_wait`] and its coherent snapshot
+    /// rather than a second drain calculation that could disagree with the park
+    /// it claims to describe.
+    ///
+    /// Returns true when the caller must enter the event-driven idle wait.
+    pub(super) async fn admit_persistent_idle_wait(
+        &self,
+        join_set_empty: bool,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        work_snapshot: Option<&ReducerWorkSnapshot>,
+    ) -> bool {
+        if !self
+            .should_enter_persistent_idle_wait(join_set_empty, queued, in_flight, work_snapshot)
+            .await
+        {
+            return false;
+        }
+        if self.latch_persistent_idle() {
+            send_event(&self.event_tx, ParallelEvent::PersistentSchedulerIdle).await;
+        }
+        true
+    }
+
+    /// Open a persistent-idle episode, reporting whether this is its first edge.
+    ///
+    /// The latch is what separates "the scheduler parked" from "the scheduler is
+    /// still parked": the first park in an episode emits, and every later
+    /// evaluation or no-op wake that reaches the same park emits nothing.
+    pub(super) fn latch_persistent_idle(&self) -> bool {
+        !self
+            .persistent_idle_latched
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// End the current persistent-idle episode so the next park is a new edge.
+    ///
+    /// Called from the two boundaries where admitted work really begins —
+    /// ordinary workspace preparation and a scheduler-owned base-lane retry —
+    /// rather than from a wake, because a wake that admits nothing must leave
+    /// the frontend Ready.
+    pub(super) fn rearm_persistent_idle(&self) {
+        self.persistent_idle_latched
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a persistent-idle episode is currently open (tests).
+    #[cfg(test)]
+    pub(super) fn persistent_idle_is_latched(&self) -> bool {
+        self.persistent_idle_latched
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Whether this invocation recorded any change-local base-lane failure.
     ///
     /// Invocation-scoped and in-memory: it exists so a finite run cannot report
@@ -657,8 +714,12 @@ impl ParallelExecutor {
                 break;
             }
 
+            // One typed transition per idle episode, emitted from the same
+            // coherent admission decision that is about to park, so the
+            // frontends stop claiming Running for a scheduler that has nothing
+            // left to execute.
             if self
-                .should_enter_persistent_idle_wait(
+                .admit_persistent_idle_wait(
                     join_set.is_empty(),
                     &queued,
                     &in_flight,

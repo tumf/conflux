@@ -616,15 +616,36 @@ impl RunControlService {
     // ------------------------------------------------------------------
 
     /// Request a graceful stop after the current change completes.
+    ///
+    /// `Select` is admitted only when the scheduler is really alive. That is the
+    /// persistent-idle case: the run parked with nothing to execute and the
+    /// frontend presents Ready, but the task still exists and still owes the
+    /// operator a stop. Scheduler liveness — never the frontend's idle-episode
+    /// fact — is the authority, so a stale client cannot stop a run that ended.
     pub async fn stop(&self, mode: OperatorMode) -> RunControlResult<RunControlOutcome> {
-        if mode != OperatorMode::Running {
+        if mode != OperatorMode::Running && !self.is_persistent_idle_ready(mode) {
             return Err(RunControlError::InvalidMode {
                 command: RunCommandKind::Stop,
                 mode,
             });
         }
         self.scheduler.set_graceful_stop(true);
+        // The request is recorded first, then the wait is woken: a scheduler
+        // parked in its event-driven idle wait has no timer to notice the flag
+        // on its own, so without this it would sit there until an unrelated
+        // queue, merge, or cancellation event happened to arrive.
+        self.scheduler.notify_scheduler().await;
         Ok(RunControlOutcome::StopRequested)
+    }
+
+    /// Whether `Select` here is persistent-idle Ready over a live scheduler.
+    ///
+    /// This is the one place the stop family widens beyond its existing modes,
+    /// and it widens on scheduler liveness — never on a presentation fact a
+    /// frontend sent along — so a stale client cannot stop a run that ended, and
+    /// pre-run Select stays refused exactly as before.
+    fn is_persistent_idle_ready(&self, mode: OperatorMode) -> bool {
+        mode == OperatorMode::Select && self.scheduler.is_running()
     }
 
     /// Withdraw a pending graceful stop.
@@ -645,7 +666,9 @@ impl RunControlService {
     /// controls what may be *claimed* and whether the caller must wait for the
     /// scheduler's cancellation-safe boundary, never whether cleanup runs.
     pub async fn force_stop(&self, mode: OperatorMode) -> RunControlResult<RunControlOutcome> {
-        if !matches!(mode, OperatorMode::Running | OperatorMode::Stopping) {
+        if !matches!(mode, OperatorMode::Running | OperatorMode::Stopping)
+            && !self.is_persistent_idle_ready(mode)
+        {
             return Err(RunControlError::InvalidMode {
                 command: RunCommandKind::ForceStop,
                 mode,

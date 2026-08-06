@@ -114,11 +114,16 @@ export function groupChanges(changes) {
  * Exactly one action is primary so the initial viewport can answer "what do I do
  * next" without asking the user to interpret a row of disabled buttons.
  *
- * @param {{app_mode?: string}} snapshot
+ * `persistent_scheduler_idle` is what tells the two kinds of `select` apart: a
+ * live scheduler parked with nothing to execute still accepts a stop, while
+ * pre-run selection has no scheduler to stop and offers Start alone.
+ *
+ * @param {{app_mode?: string, persistent_scheduler_idle?: boolean}} snapshot
  * @returns {Array<object>}
  */
 export function lifecycleActions(snapshot) {
   const mode = String(snapshot?.app_mode ?? '').toLowerCase();
+  const idleScheduler = mode === 'select' && snapshot?.persistent_scheduler_idle === true;
   const forceStop = {
     id: 'force-stop',
     label: 'Force stop',
@@ -127,6 +132,26 @@ export function lifecycleActions(snapshot) {
     destructive: true,
     description: 'Stop every running change immediately without waiting for it to finish.',
   };
+
+  if (idleScheduler) {
+    return [
+      {
+        id: 'start',
+        label: 'Start processing',
+        command: { type: 'start' },
+        primary: true,
+        description: 'Begin or resume processing queued changes.',
+      },
+      {
+        id: 'stop',
+        label: 'Stop gracefully',
+        command: { type: 'stop' },
+        primary: false,
+        description: 'Stop the idle scheduler at its next boundary.',
+      },
+      forceStop,
+    ];
+  }
 
   if (mode === 'running') {
     return [
@@ -181,7 +206,8 @@ export function describeMode(snapshot) {
     case 'error':
       return 'Error';
     case 'select':
-      return 'Idle';
+      // Both are idle; only one of them still has a scheduler waiting behind it.
+      return snapshot?.persistent_scheduler_idle === true ? 'Idle (scheduler waiting)' : 'Idle';
     default:
       return mode ? mode : 'Unknown';
   }

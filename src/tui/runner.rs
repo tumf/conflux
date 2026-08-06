@@ -147,6 +147,10 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         | ExecutionEvent::Log(_)
         | ExecutionEvent::Stopping
         | ExecutionEvent::AllCompleted
+        // The idle transition owns no reducer mutation at all: rows keep their
+        // status, blockers, queue intent, and worktree evidence across it, so
+        // re-reading the reducer here could only cost a lock for no new fact.
+        | ExecutionEvent::PersistentSchedulerIdle
         | ExecutionEvent::Error { .. }
         | ExecutionEvent::WorktreesRefreshed { .. }
         | ExecutionEvent::BranchMergeStarted { .. }

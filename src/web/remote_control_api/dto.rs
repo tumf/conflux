@@ -926,6 +926,20 @@ pub struct SnapshotTotals {
 pub struct InstanceSnapshot {
     /// Operator-facing application mode.
     pub app_mode: String,
+    /// Whether `app_mode: select` is backed by a live persistent-scheduler idle
+    /// episode rather than ordinary pre-run selection.
+    ///
+    /// True means the scheduler task is still alive and parked with nothing to
+    /// execute, so `start`, `stop`, and `force_stop` all remain meaningful. It is
+    /// process-local presentation state: it defaults to false, resets on
+    /// restart, and authorizes nothing — shared run control revalidates
+    /// scheduler liveness before executing any command.
+    ///
+    /// A client that replaced its state after a replay gap can read this field
+    /// to rebuild the idle Ready controls without replaying events or reading
+    /// logs.
+    #[serde(default)]
+    pub persistent_scheduler_idle: bool,
     /// Whether merge resolution is currently running.
     pub is_resolving: bool,
     /// Sanitized detail of a fatal process-level error; `null` when there is none.
@@ -946,6 +960,7 @@ impl InstanceSnapshot {
     pub fn empty() -> Self {
         Self {
             app_mode: "select".to_string(),
+            persistent_scheduler_idle: false,
             is_resolving: false,
             process_error: None,
             parallel: ParallelRuntimeState::default(),

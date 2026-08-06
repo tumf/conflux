@@ -470,6 +470,7 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
 
     InstanceSnapshot {
         app_mode: source.app_mode.clone(),
+        persistent_scheduler_idle: source.persistent_scheduler_idle,
         is_resolving: source.is_resolving,
         process_error: source.process_error.clone(),
         parallel: source.parallel.clone(),
@@ -1023,6 +1024,10 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
         E::Stopping => ("stopping", None, json!({})),
         E::Stopped => ("stopped", None, json!({})),
         E::AllCompleted => ("all_completed", None, json!({})),
+        // Stable vocabulary note for controllers: this is *not* a terminal
+        // event. The scheduler is alive and waiting; the snapshot at this
+        // revision reports `app_mode: select` with `persistent_scheduler_idle`.
+        E::PersistentSchedulerIdle => ("persistent_scheduler_idle", None, json!({})),
         E::Error { message } => ("process_error", None, json!({ "detail": detail(message) })),
         E::Log(entry) => ("log", entry.change_id.clone(), json!({})),
         E::ChangesRefreshed {

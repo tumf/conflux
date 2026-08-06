@@ -371,8 +371,24 @@ impl SharedServiceExecutor {
     ) -> Result<ExecutionSummary, CommandFailure> {
         match command {
             CommandSpec::Start => self.run(self.run_control.start(mode).await),
-            CommandSpec::Stop => self.run(self.run_control.stop(mode).await),
-            CommandSpec::CancelStop => self.run(self.run_control.cancel_stop(mode).await),
+            // Both stop-family projections mirror what the TUI adapter does for
+            // the same accepted outcome, so a remote command and a keypress
+            // leave the instance reporting the same mode. Projecting only after
+            // the service accepted keeps a refused command invisible.
+            CommandSpec::Stop => {
+                let outcome = self.run(self.run_control.stop(mode).await);
+                if outcome.is_ok() {
+                    self.web_state.project_stop_requested().await;
+                }
+                outcome
+            }
+            CommandSpec::CancelStop => {
+                let outcome = self.run(self.run_control.cancel_stop(mode).await);
+                if outcome.is_ok() {
+                    self.web_state.project_stop_cancelled().await;
+                }
+                outcome
+            }
             CommandSpec::ForceStop => self.run(self.run_control.force_stop(mode).await),
             CommandSpec::SetExecutionMark { change_id, marked } => self
                 .service
