@@ -3,7 +3,7 @@
 The TUI has two relevant typed layers:
 
 - `AppExecutionMode` describes process-level orchestration lifetime.
-- Each `ChangeState::display_status_cache` mirrors the reducer's canonical per-change status after `sync_reducer_display_caches` runs.
+- Each `ChangeState::display_status_cache` is typed TUI row state refreshed from the reducer by `sync_reducer_display_caches`; typed local queue and presentation transitions may also update it.
 
 Persistent execution deliberately keeps the process-level mode at `Running` when queued work is blocked-only. The current external lifecycle snapshot reads only the first layer, so it cannot distinguish active execution from a process that is alive but waiting on blocked/stalled changes.
 
@@ -25,13 +25,12 @@ The TUI frame loop publishes its snapshot every frame and the lifecycle dispatch
 
 ## Typed Snapshot Summary
 
-Add only the row facts needed by lifecycle projection, derived in `TuiLifecycleSnapshot::from_app` from `AppState::changes`:
+Add only two row facts, derived in `TuiLifecycleSnapshot::from_app` from `AppState::changes[].display_status_cache` after reducer-to-TUI synchronization:
 
-- whether any row has a canonical active status, using `orchestration::operator_command::is_active_status`;
-- whether any row is `queued`;
+- whether any row has a canonical active status, using `orchestration::operator_command::is_active_status`, or is `queued`;
 - whether any row is `blocked` or `stalled`.
 
-Final, not-queued, and other presentation statuses do not become new lifecycle categories. They neither manufacture a blocked state nor suppress a real blocked/stalled wait when no active or queued work exists.
+The display cache is typed TUI state. Reducer synchronization is the canonical source for this bug path, while existing typed TUI event and command handlers can also update the same cache. The projection intentionally classifies the current typed row status; reducer-path tests prove the canonical `blocked` and `stalled` outcomes are synchronized before publication. Final, not-queued, and other presentation statuses do not become new lifecycle categories. They neither manufacture a blocked state nor suppress a real blocked/stalled wait when no active or queued work exists.
 
 This summary is a copied observability snapshot. It must never be read by the scheduler, reducer, command admission, or resume routing.
 
@@ -86,6 +85,7 @@ The reducer-path test is required in addition to hand-built snapshots because th
 
 - **Stale display cache:** lifecycle publication occurs after event handling and reducer-cache synchronization in the frame loop. The integration test pins that ordering.
 - **False blocked during startup:** queued rows explicitly preserve `working`; an empty or otherwise ordinary `Running` snapshot keeps the previous fallback.
+- **Scheduler eligibility differs from row state:** a candidate can remain canonically `queued` while temporarily unavailable to the scheduler. The projection intentionally follows the typed row state and leaves any scheduler-level reclassification to a separate change.
 - **Divergent active vocabulary:** reuse `is_active_status` instead of copying status strings.
 - **Dual-publisher flapping:** retain the frame snapshot as the sole TUI lifecycle authority.
 - **Workflow-control leakage:** keep all new facts inside the observability snapshot and preserve the constitutional one-way boundary.

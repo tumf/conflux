@@ -22,7 +22,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: "Rust test output covering typed snapshot precedence, reducer-to-TUI status synchronization, repeated publication deduplication, and unchanged fallback behavior"
-    rerun: "cargo test --lib tui::lifecycle:: && cargo test --lib tui::runner:: && cargo fmt --check && cargo clippy -- -D warnings"
+    rerun: "cargo test --lib tui::lifecycle:: && cargo test --lib tui::runner:: && cargo test --lib lifecycle_integration:: && cargo fmt --check && cargo clippy -- -D warnings"
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -42,7 +42,7 @@ The non-interactive event projection already knows that blocker events are seman
 
 ## Proposed Solution
 
-Extend `TuiLifecycleSnapshot::from_app` with a minimal typed summary of reducer-synchronized row statuses. Reuse the canonical active-status helper and distinguish queued work from `blocked`/`stalled` waits without parsing rendered terminal content.
+Extend `TuiLifecycleSnapshot::from_app` with two typed row-status facts evaluated after reducer-to-TUI synchronization: whether any row is active or queued, and whether any row is `blocked` or `stalled`. Reuse the canonical active-status helper and do not parse rendered terminal content.
 
 Apply this projection order:
 
@@ -62,7 +62,7 @@ The canonical lifecycle requirement and the typed TUI projection describe one ex
 
 1. A persistent TUI in `Running` with no active or queued change and at least one reducer-synchronized `blocked` or `stalled` row reports external lifecycle `blocked`.
 2. Any active canonical row status takes precedence over blocked/stalled rows and reports `working`.
-3. A queued row also preserves `working`, so dispatchable work is not reported as blocked before execution begins.
+3. A queued row also preserves `working`, matching the canonical row state while work remains admitted for possible dispatch.
 4. User-decision modals remain the highest-priority `blocked` signal, and QR remains transparent to the underlying lifecycle.
 5. `Stopping` remains `working`; `Select` and `Stopped` remain `idle`; `Error` remains `blocked`.
 6. A `Running` snapshot with no active, queued, blocked, or stalled rows retains the existing `working` fallback.
@@ -71,12 +71,12 @@ The canonical lifecycle requirement and the typed TUI projection describe one ex
 
 ## Explicit Completion Conditions
 
-- `src/tui/lifecycle.rs` captures the minimum reducer-synchronized row-status summary required by the precedence above and reuses the canonical active-status vocabulary rather than defining a divergent active list.
+- `src/tui/lifecycle.rs` captures the two typed row-status facts required by the precedence above after reducer-to-TUI synchronization and reuses the canonical active-status vocabulary rather than defining a divergent active list.
 - The TUI frame loop remains the sole TUI lifecycle publisher; no second `LifecycleEventSink`, screen scraper, or adapter-specific branch is added.
 - Unit tests cover blocked-only, stalled-only, mixed active/waiting, queued/waiting, empty-running fallback, stopping, QR, and user-decision precedence.
 - A reducer-path test applies blocker events, synchronizes the resulting canonical display cache into `AppState`, and proves a still-`Running` TUI projects `blocked` for both blocked and stalled outcomes.
 - A publication test proves consecutive equivalent blocked snapshots emit one semantic transition and never emit an intervening `working` transition.
-- `cargo test --lib tui::lifecycle::`, `cargo test --lib tui::runner::`, `cargo fmt --check`, and `cargo clippy -- -D warnings` pass.
+- `cargo test --lib tui::lifecycle::`, `cargo test --lib tui::runner::`, `cargo test --lib lifecycle_integration::`, `cargo fmt --check`, and `cargo clippy -- -D warnings` pass.
 
 ## Out of Scope
 
@@ -84,5 +84,6 @@ The canonical lifecycle requirement and the typed TUI projection describe one ex
 - Changing the external adapter, Herdr status authority, lifecycle protocol, or JSON schema.
 - Changing persistent scheduler behavior, `AppExecutionMode`, or the TUI `[Running]` presentation.
 - Reclassifying canonical blocker facts or broadening this change to error, merge-wait, or resolve-pending semantics.
+- Reclassifying a candidate that remains canonically `queued` while scheduler eligibility is temporarily unavailable; this change follows the typed row state rather than duplicating scheduler classification.
 - Changing the non-interactive `cflx run` lifecycle event mapping.
 - Using lifecycle output as workflow-control input.
