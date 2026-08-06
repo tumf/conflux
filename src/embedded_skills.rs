@@ -723,6 +723,39 @@ mod tests {
     }
 
     #[test]
+    fn test_opencode_acceptance_command_is_read_only() {
+        for required in &[
+            "Acceptance review is read-only.",
+            "do NOT modify the reviewed worktree",
+            "Conflux runtime owns persistence",
+            "`openspec/changes/<change_id>/tasks.md`,",
+            "`## Current Acceptance Follow-up`",
+            "Do NOT derive an acceptance attempt number",
+            "Conflux runtime persists normalized repository-fixable findings",
+        ] {
+            assert!(
+                CFLX_ACCEPT_COMMAND_MD.contains(required),
+                "acceptance command template must keep read-only review and runtime-owned \
+                 follow-up persistence wording: '{required}'"
+            );
+        }
+
+        // Exact pre-change imperatives only. Broad substrings such as `tasks.md` or the
+        // numbered follow-up heading legitimately appear inside the prohibition text.
+        for forbidden in &[
+            "After listing all findings, update openspec/changes/<change_id>/tasks.md",
+            "Determine the next acceptance attempt number",
+            "Append or create the section for that attempt",
+        ] {
+            assert!(
+                !CFLX_ACCEPT_COMMAND_MD.contains(forbidden),
+                "acceptance command template must not instruct the reviewer to persist \
+                 follow-up itself: '{forbidden}'"
+            );
+        }
+    }
+
+    #[test]
     fn test_rust_prompt_builder_does_not_contain_acceptance_checklist() {
         // The ARCHIVE_READINESS_CONTEXT is the only fixed content the Rust prompt builder
         // injects. Verify it doesn't contain the portable acceptance checklist
