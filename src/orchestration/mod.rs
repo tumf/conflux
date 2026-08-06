@@ -7,6 +7,7 @@ pub mod apply;
 pub mod archive;
 pub mod blocker_classification;
 pub mod hooks;
+pub mod mark_reconciliation;
 pub mod operator_command;
 pub mod output;
 pub mod rejection;

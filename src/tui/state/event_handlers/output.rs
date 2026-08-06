@@ -155,7 +155,6 @@ impl AppState {
             .find(|change| change.id == change_id)
         {
             change.set_display_status_cache("rejected");
-            change.selected = false;
         }
 
         self.add_log(
@@ -283,6 +282,7 @@ mod tests {
         app.handle_orchestrator_event(OrchestratorEvent::ProcessingStarted("change-a".to_string()));
         app.changes[1].display_status_cache = "queued".to_string();
         app.changes[1].selected = true;
+        app.publish_execution_marks();
         (app, shared)
     }
 
@@ -554,7 +554,14 @@ mod tests {
         app.changes[0].display_status_cache = "queued".to_string();
         app.changes[1].display_status_cache = "queued".to_string();
 
-        app.handle_change_rejected("change-a".to_string(), "blocked by review".to_string());
+        app.publish_execution_marks();
+        // The dispatch boundary revoked only the rejected target before this
+        // frontend saw the event.
+        app.execution_marks().set("change-a", false);
+        app.handle_orchestrator_event(OrchestratorEvent::ChangeRejected {
+            change_id: "change-a".to_string(),
+            reason: "blocked by review".to_string(),
+        });
 
         assert_eq!(app.changes[0].display_status_cache, "rejected");
         assert!(!app.changes[0].selected);

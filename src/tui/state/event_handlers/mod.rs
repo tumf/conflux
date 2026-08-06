@@ -23,6 +23,13 @@ impl AppState {
     pub fn handle_orchestrator_event(&mut self, event: OrchestratorEvent) {
         self.dispatch_orchestrator_event(event);
 
+        // Marks are not this frontend's to decide. The authoritative dispatcher
+        // already reconciled the shared store for this event — before any sink
+        // ran — so the rows are refreshed from it here instead of each handler
+        // keeping its own opinion. Handlers own status, diagnostics, timing, and
+        // modal state; none of them owns mark truth.
+        self.sync_execution_marks_from_store();
+
         // A background event may move execution or the observed target set while a
         // modal is visible. Handlers own execution state; the modal axis changes
         // only here, through the explicit validity policy, and only ever by being

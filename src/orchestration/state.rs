@@ -2547,6 +2547,26 @@ impl OrchestratorState {
                 }
             }
 
+            // The `on_merged` hook owns the merged transition: while it fails the
+            // change is not merged, so the reducer records the merge-wait
+            // recovery state an operator has to act on. Recording it here is
+            // also what makes the recovery an *edge* — a replayed hook failure
+            // finds the row already in merge wait and changes nothing, so it
+            // cannot revoke an execution mark the operator set in the meantime.
+            ExecutionEvent::HookFailed {
+                change_id,
+                hook_type,
+                ..
+            } if hook_type == crate::hooks::HookType::OnMerged.config_key() => {
+                let rt = self.runtime_entry(change_id);
+                if !rt.is_terminal() && !rt.dequeued {
+                    rt.activity = ActivityState::Idle;
+                    rt.wait_state = WaitState::MergeWait;
+                    rt.queue_intent = QueueIntent::NotQueued;
+                    self.remove_from_resolve_wait_queue(change_id);
+                }
+            }
+
             // Stop/dequeue events
             ExecutionEvent::ChangeDequeued { change_id }
             | ExecutionEvent::ChangeStopped { change_id } => {

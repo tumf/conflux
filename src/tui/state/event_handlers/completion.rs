@@ -226,7 +226,6 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("not queued");
-            change.selected = false;
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }

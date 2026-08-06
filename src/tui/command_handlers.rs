@@ -268,11 +268,17 @@ pub struct TuiCommandContext<'a> {
 /// spawned or woken — the service owns all three, so `/api/v2` start reaches the
 /// same decision.
 ///
-/// A non-empty `ids` list (the F5 key path) republishes the marked set first, so
-/// even an explicit selection is started through the authoritative mark store.
+/// A non-empty `ids` list records those targets in the authoritative mark store
+/// first, one change at a time, so even an explicit selection is started through
+/// it. The write is target-scoped on purpose: replacing the whole store from a
+/// caller-supplied list would also clear marks this frontend never observed.
 pub async fn handle_start_processing_command(ids: Vec<String>, ctx: &mut TuiCommandContext<'_>) {
     if !ids.is_empty() {
-        ctx.app.execution_marks().replace(ids);
+        let service = ctx.run_control.operator();
+        for id in &ids {
+            service.apply_execution_mark(id, true).await;
+        }
+        ctx.app.sync_execution_marks_from_store();
     }
 
     let mode = ctx.app.operator_mode();
@@ -1576,8 +1582,11 @@ mod tests {
             .await
             .apply_command(ReducerCommand::AddToQueue("change-a".to_string()));
         app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
-        assert!(app.changes[0].selected);
         assert_eq!(app.changes[0].display_status_cache, "queued");
+        // Queue intent is not an execution mark: only the shared store carries one.
+        harness.marks.set("change-a", true);
+        app.sync_execution_marks_from_store();
+        assert!(app.changes[0].selected);
 
         harness
             .run(
@@ -2599,6 +2608,7 @@ mod run_supervisor_tests {
             PostArchiveAction::MergeToBase,
             Some(upstream_runtime()),
             Arc::new(AtomicBool::new(false)),
+            None,
             #[cfg(feature = "web-monitoring")]
             None,
         ));
