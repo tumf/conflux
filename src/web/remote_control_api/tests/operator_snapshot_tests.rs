@@ -662,6 +662,84 @@ async fn dependency_external_and_stalled_holds_stay_distinguishable() {
     assert_ne!(dependency.kind, external.kind);
 }
 
+/// The compatibility `WorkspaceStatusUpdated { Blocked }` the external-blocker
+/// dispatch branch emits reaches this surface too. The projection owns no repair
+/// logic, so what it publishes is exactly what the reducer preserved: kind,
+/// origin, owner, unblock condition, and resumability — and therefore an
+/// `allowed` retry for a resumable hold and `hold_not_resumable` for the other.
+#[tokio::test]
+async fn external_blocker_hold_survives_dispatch_status_in_the_operator_snapshot() {
+    let (web_state, reducer, _) = wired_web_state(&["resumable-wait", "stuck-wait"]).await;
+    let changes = vec![change("resumable-wait"), change("stuck-wait")];
+    web_state.update(&changes).await;
+
+    let external = |resumable: bool| StalledBlocker {
+        prerequisite_owner: Some("platform".to_string()),
+        resumable,
+        ..StalledBlocker::acceptance_external("credential", "STAGING_API_KEY is unset")
+    };
+
+    for (change_id, resumable) in [("resumable-wait", true), ("stuck-wait", false)] {
+        observe(
+            &web_state,
+            &reducer,
+            ExecutionEvent::AcceptanceGated {
+                change_id: change_id.to_string(),
+                blocker: external(resumable),
+            },
+        )
+        .await;
+        // The producer's second event, in the order it is actually emitted.
+        observe(
+            &web_state,
+            &reducer,
+            ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: change_id.to_string(),
+                workspace_name: format!("ws-{change_id}"),
+                status: crate::vcs::WorkspaceStatus::Blocked,
+            },
+        )
+        .await;
+    }
+
+    let (snapshot, _, _) = web_state.remote_control().projection().snapshot();
+    let by_id: HashMap<&str, _> = snapshot
+        .changes
+        .iter()
+        .map(|change| (change.id.as_str(), change))
+        .collect();
+
+    for change_id in ["resumable-wait", "stuck-wait"] {
+        let projected = by_id[change_id];
+        let blocker = projected
+            .blocker
+            .as_ref()
+            .unwrap_or_else(|| panic!("{change_id} must still publish its blocker"));
+        assert_eq!(projected.display_status, "blocked");
+        assert_eq!(blocker.kind, BlockerKind::External);
+        assert_eq!(blocker.status, "blocked");
+        assert_eq!(blocker.origin.as_deref(), Some("acceptance"));
+        assert_eq!(blocker.prerequisite_owner.as_deref(), Some("platform"));
+        assert!(blocker.unblock_condition.is_some());
+    }
+
+    assert!(
+        by_id["resumable-wait"].blocker.as_ref().unwrap().resumable,
+        "preserved resumability is what the projection advertises"
+    );
+    assert!(
+        by_id["resumable-wait"].actions.retry_change.allowed,
+        "a preserved resumable hold keeps the acceptance-only retry route"
+    );
+
+    assert!(!by_id["stuck-wait"].blocker.as_ref().unwrap().resumable);
+    assert_eq!(
+        by_id["stuck-wait"].actions.retry_change.blocked_reason,
+        Some(ActionBlockedReason::HoldNotResumable),
+        "a non-resumable hold stays refused with its evidence intact"
+    );
+}
+
 #[tokio::test]
 async fn a_change_local_error_is_distinct_from_a_fatal_process_error() {
     let (web_state, reducer, _) = wired_web_state(&["c1"]).await;

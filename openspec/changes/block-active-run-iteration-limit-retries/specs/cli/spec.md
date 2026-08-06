@@ -99,10 +99,10 @@ The selection and error-mode footer SHALL display guidance based on application 
 - **THEN** the footer does not instruct the operator to mark those rows with Space or retry them with F5
 - **AND** it reports the stable active-limit condition
 
-#### Scenario: Bulk selection excludes a limited error row
+#### Scenario: Bulk mark selection excludes a limited error row
 
 - **GIVEN** an active-run-limited error row and unrelated eligible rows are visible
-- **WHEN** the operator invokes bulk selection
-- **THEN** the limited row's mark remains unchanged
-- **AND** eligible rows still receive the coherent bulk target state
-- **AND** the exclusion is explained with the active-limit reason
+- **WHEN** the operator invokes bulk execution-mark selection
+- **THEN** the limited row's mark and Running queue intent remain unchanged
+- **AND** eligible rows still receive the coherent bulk target state atomically
+- **AND** the exclusion is explained with `apply_iteration_limit_active`
