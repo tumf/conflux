@@ -65,7 +65,6 @@ impl From<UpstreamPortError> for UpstreamStartupError {
 async fn observe_static_preconditions(
     git: &dyn UpstreamGit,
     config: &UpstreamIntegrationConfig,
-    parallel: bool,
     push_remote: Option<String>,
     is_git_repository: bool,
 ) -> Result<StaticPreconditions, UpstreamPortError> {
@@ -73,7 +72,6 @@ async fn observe_static_preconditions(
     // when the workspace is not a Git repository.
     if !is_git_repository {
         return Ok(StaticPreconditions {
-            parallel,
             push_remote,
             is_git_repository: false,
             attached_branch: None,
@@ -93,7 +91,6 @@ async fn observe_static_preconditions(
     };
 
     Ok(StaticPreconditions {
-        parallel,
         push_remote,
         is_git_repository: true,
         attached_branch,
@@ -109,15 +106,12 @@ async fn observe_static_preconditions(
 pub async fn prepare_upstream_integration(
     config: UpstreamIntegrationConfig,
     repo_root: &Path,
-    parallel: bool,
     push_remote: Option<String>,
     is_git_repository: bool,
     dry_run: bool,
 ) -> Result<UpstreamRuntime, UpstreamStartupError> {
     let git = GitUpstreamOps::new(repo_root);
-    let facts =
-        observe_static_preconditions(&git, &config, parallel, push_remote, is_git_repository)
-            .await?;
+    let facts = observe_static_preconditions(&git, &config, push_remote, is_git_repository).await?;
     let branch = validate_static_preconditions(&config, &facts)?;
 
     if dry_run {
@@ -268,7 +262,6 @@ mod tests {
         let facts = observe_static_preconditions(
             &git(true, MergeRepositoryState::default()),
             &config,
-            true,
             None,
             true,
         )
@@ -287,7 +280,6 @@ mod tests {
         let dirty = observe_static_preconditions(
             &git(false, MergeRepositoryState::default()),
             &config,
-            true,
             None,
             true,
         )
@@ -308,7 +300,6 @@ mod tests {
                 },
             ),
             &config,
-            true,
             None,
             true,
         )
@@ -327,7 +318,6 @@ mod tests {
         let facts = observe_static_preconditions(
             &git(true, MergeRepositoryState::default()),
             &config,
-            true,
             None,
             false,
         )

@@ -2,22 +2,16 @@
 //!
 //! Contains the run_orchestrator function and archive operations.
 
-use crate::agent::AgentRunner;
-use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
-use crate::openspec::Change;
-// Note: acceptance_test_streaming and related types are no longer imported here
-// as they are handled by SerialRunService internally.
 use crate::events::{EventDispatcher, EventSink};
-use crate::orchestration::output::{ChannelOutputHandler, ContextualOutputHandler, OutputMessage};
+use crate::openspec::Change;
 use crate::parallel::PostArchiveAction;
-use crate::serial_run_service::SerialRunService;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::events::{LogEntry, OrchestratorEvent, TuiEventSink};
@@ -59,9 +53,8 @@ const PARALLEL_CANCELLATION_CLEANUP_DEADLINE: std::time::Duration =
 /// The workspace task records the shared Apply-budget owner's refusal as a typed
 /// observation on the reducer, so this boundary reports `iteration_limit` with
 /// that change's exact cumulative dispatch count — the same contract `cflx run`
-/// reports through `Orchestrator::run_parallel_finish_hook` and serial reports
-/// through `LoopControl::Break`. Without this call the TUI never delivered the
-/// typed outcome to the hook at all.
+/// reports through `Orchestrator::run_parallel_finish_hook`. Without this call
+/// the TUI never delivered the typed outcome to the hook at all.
 async fn run_tui_parallel_finish_hook(
     hooks: &crate::hooks::HookRunner,
     shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
@@ -181,23 +174,6 @@ pub(crate) fn classify_parallel_terminal_report(
     ParallelTerminalReport::Completed
 }
 
-fn post_archive_dispatch_event(
-    state: &crate::orchestration::state::OrchestratorState,
-    change_id: &str,
-) -> Option<OrchestratorEvent> {
-    let has_resolve_lane_blocker = state.has_other_post_archive_lane_blocker(change_id);
-
-    if has_resolve_lane_blocker {
-        return Some(OrchestratorEvent::MergeDeferred {
-            change_id: change_id.to_string(),
-            reason: "Resolve lane occupied by active resolving/rejecting change; auto-queue archived change".to_string(),
-            auto_resumable: true,
-        });
-    }
-
-    None
-}
-
 /// Buffer for the dispatch bridge handed to `mpsc`-only producers.
 ///
 /// Matches the TUI event channel it ultimately feeds, so bridging cannot make a
@@ -244,15 +220,12 @@ async fn initialize_parallel_shared_state(
         );
         // Do not replace the reducer state here: TuiCommand::ResolveMerge just recorded
         // scheduler-owned ResolveWait intent, and ParallelRunService must observe it via
-        // executor.has_resolve_wait() to avoid a zero-change no-op. Only switch the mode so
-        // any subsequent execution events use parallel semantics.
-        state.set_execution_mode(crate::orchestration::state::ExecutionMode::Parallel);
+        // executor.has_resolve_wait() to avoid a zero-change no-op.
         true
     } else {
-        *state = crate::orchestration::state::OrchestratorState::with_mode(
+        *state = crate::orchestration::state::OrchestratorState::new(
             change_ids.to_vec(),
             max_iterations,
-            crate::orchestration::state::ExecutionMode::Parallel,
         );
         // Re-apply queue intent for each selected change so that the initial
         // ChangesRefreshed display sync (apply_display_statuses_from_reducer) does
@@ -266,702 +239,7 @@ async fn initialize_parallel_shared_state(
     }
 }
 
-/// Run the orchestrator for selected changes
-/// Uses streaming output to send log entries in real-time
-/// Supports cancellation via CancellationToken for graceful shutdown
-#[allow(clippy::too_many_arguments)]
-pub async fn run_orchestrator(
-    change_ids: Vec<String>,
-    explicit_retry: bool,
-    config: OrchestratorConfig,
-    tx: mpsc::Sender<OrchestratorEvent>,
-    cancel_token: CancellationToken,
-    dynamic_queue: DynamicQueue,
-    _graceful_stop_flag: Arc<AtomicBool>,
-    shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
-    #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
-) -> Result<()> {
-    // Note: OutputLine is no longer needed as output is handled by ChannelOutputHandler
-    use crate::hooks::{HookContext, HookRunner, HookType};
-    use crate::openspec;
-
-    let repo_root = std::env::current_dir()?;
-
-    // One dispatch owner for the whole boundary run. Every producer below emits
-    // through it — directly, or through `event_bridge` when it can only speak
-    // `mpsc::Sender` — so no producer can reach one frontend while bypassing
-    // another.
-    let dispatcher = Arc::new(EventDispatcher::new(
-        shared_state.clone(),
-        boundary_event_sinks(
-            &tx,
-            #[cfg(feature = "web-monitoring")]
-            web_state.as_ref(),
-        ),
-    ));
-    let (event_bridge, event_bridge_handle) = dispatcher.bridge(EVENT_BRIDGE_BUFFER);
-
-    let hooks = HookRunner::with_event_tx(config.get_hooks(), &repo_root, event_bridge.clone());
-    let max_iterations = config.get_max_iterations();
-    // Note: acceptance_max_continues is now handled by SerialRunService
-    let mut agent = AgentRunner::new(config.clone());
-
-    // Create AiCommandRunner for serial mode execution
-    let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
-    let ai_runner = AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state);
-
-    // Create serial run service for shared state and helpers
-    let repo_root = std::env::current_dir()?;
-    let mut serial_service = SerialRunService::new(repo_root, config);
-    if explicit_retry {
-        for change_id in &change_ids {
-            serial_service
-                .consume_explicit_acceptance_retry(change_id)
-                .await?;
-        }
-    }
-
-    {
-        let mut state = shared_state.write().await;
-        *state = crate::orchestration::state::OrchestratorState::new(change_ids, max_iterations);
-    }
-
-    // Run on_start hook
-    let total_changes = shared_state.read().await.total_changes();
-    let start_context = HookContext::new(0, total_changes, total_changes, false);
-    if let Err(e) = hooks.run_hook(HookType::OnStart, &start_context).await {
-        dispatcher
-            .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
-                "on_start hook failed: {}",
-                e
-            ))))
-            .await;
-    }
-
-    // Finish status reported to `on_finish` exactly once at the end of this run,
-    // plus the cumulative Apply-dispatch count that accompanies `iteration_limit`.
-    let mut finish_status = "completed";
-    let mut finish_apply_count = 0u32;
-
-    // Main two-phase loop
-    loop {
-        // Check for cancellation before each iteration
-        if cancel_token.is_cancelled() {
-            dispatcher
-                .dispatch(OrchestratorEvent::Log(LogEntry::warn(
-                    "Processing cancelled".to_string(),
-                )))
-                .await;
-            break;
-        }
-
-        // Check for graceful stop flag (stop after current change completes)
-        if _graceful_stop_flag.load(Ordering::SeqCst) {
-            dispatcher
-                .dispatch(OrchestratorEvent::Log(LogEntry::info(
-                    "Graceful stop: stopping after current change".to_string(),
-                )))
-                .await;
-            dispatcher.dispatch(OrchestratorEvent::Stopped).await;
-            break;
-        }
-
-        // `max_iterations` has exactly one owner: the per-change `ApplyBudget`
-        // inside `SerialRunService`, which reserves before each configured Apply
-        // dispatch, emits the single 80% warning, and returns the typed
-        // `iteration_limit` outcome handled below. This loop imposes no second
-        // ceiling and duplicates no warning.
-
-        // Check dynamic queue for new changes before checking if we're done
-        while let Some(dynamic_id) = dynamic_queue.pop().await {
-            // Skip if already archived or in pending
-            let should_add = {
-                let state = shared_state.read().await;
-                !state.is_archived(&dynamic_id) && !state.is_pending(&dynamic_id)
-            };
-            if should_add {
-                dispatcher
-                    .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
-                        "Processing dynamically added: {}",
-                        dynamic_id
-                    ))))
-                    .await;
-                shared_state
-                    .write()
-                    .await
-                    .add_dynamic_change(dynamic_id.clone());
-            }
-        }
-
-        let removed_ids = dynamic_queue.drain_removed().await;
-        if !removed_ids.is_empty() {
-            let mut removed_pending = Vec::new();
-            {
-                let mut state = shared_state.write().await;
-                for id in removed_ids {
-                    if state.drop_pending_change(&id) {
-                        removed_pending.push(id);
-                    }
-                }
-            }
-
-            for id in removed_pending {
-                dispatcher
-                    .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
-                        "Removed from pending queue: {}",
-                        id
-                    ))))
-                    .await;
-            }
-        }
-
-        // Check if all pending changes are done
-        if shared_state.read().await.is_complete() {
-            break;
-        }
-
-        // Note: Phase 1 archive processing has been removed.
-        // SerialRunService::process_change() now handles archiving automatically
-        // for completed changes. Archive results are handled in Phase 2 below.
-
-        // Check for cancellation
-        if cancel_token.is_cancelled() {
-            dispatcher
-                .dispatch(OrchestratorEvent::Log(LogEntry::warn(
-                    "Processing cancelled".to_string(),
-                )))
-                .await;
-            break;
-        }
-
-        // Phase 2: Select and apply next change (including completed ones for archiving)
-        // Fetch current state to find best candidate using native implementation
-        let changes = openspec::list_changes_native()?;
-
-        // Filter to changes in pending set (include completed changes so they can be archived)
-        let eligible_changes: Vec<_> = {
-            let state = shared_state.read().await;
-            changes
-                .iter()
-                .filter(|c| state.is_pending(&c.id))
-                .cloned()
-                .collect()
-        };
-
-        // Use serial service for change selection
-        let next_change = serial_service.select_next_change(&eligible_changes);
-
-        let Some(change) = next_change else {
-            // No incomplete changes found - might all be complete now
-            // Loop will re-check in Phase 1
-            continue;
-        };
-
-        let change_id = change.id.clone();
-        let change = change.clone();
-
-        // Check if this change has been stopped (single-change stop)
-        if dynamic_queue.is_stopped(&change_id).await {
-            dynamic_queue.clear_stopped(&change_id).await;
-            shared_state.write().await.drop_pending_change(&change_id);
-            let change_stopped_event = OrchestratorEvent::ChangeDequeued {
-                change_id: change_id.clone(),
-            };
-            dispatcher.dispatch(change_stopped_event).await;
-            dispatcher
-                .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
-                    "Change stopped: {}",
-                    change_id
-                ))))
-                .await;
-            continue;
-        }
-
-        // Notify processing started
-        let processing_started_event = OrchestratorEvent::ProcessingStarted(change_id.clone());
-        dispatcher.dispatch(processing_started_event).await;
-
-        let remaining_changes = shared_state.read().await.remaining_changes();
-
-        // Get current apply count for this change (before processing)
-        let apply_count_before = shared_state.read().await.apply_count(&change_id);
-
-        // Create output handler that forwards through the dispatch owner.
-        // Use Arc<RwLock<String>> to track current operation (apply/acceptance/archive/resolve)
-        let tx_clone = event_bridge.clone();
-        let change_id_clone = change_id.clone();
-        let apply_count_for_output = apply_count_before + 1; // Will be incremented in process_change
-        let current_operation = std::sync::Arc::new(std::sync::RwLock::new("apply".to_string()));
-        let current_operation_clone = current_operation.clone();
-        let output = ChannelOutputHandler::new(move |msg: OutputMessage| {
-            let tx = tx_clone.clone();
-            let change_id = change_id_clone.clone();
-            let apply_count = apply_count_for_output;
-            let operation = current_operation_clone.read().unwrap().clone();
-            tokio::spawn(async move {
-                match msg {
-                    OutputMessage::Stdout(s) => {
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(
-                                LogEntry::info(s)
-                                    .with_change_id(&change_id)
-                                    .with_operation(&operation)
-                                    .with_iteration(apply_count),
-                            ))
-                            .await;
-                    }
-                    OutputMessage::Stderr(s) => {
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(
-                                LogEntry::warn(s)
-                                    .with_change_id(&change_id)
-                                    .with_operation(&operation)
-                                    .with_iteration(apply_count),
-                            ))
-                            .await;
-                    }
-                    OutputMessage::AgentStderr(s) => {
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(
-                                LogEntry::info(s)
-                                    .with_change_id(&change_id)
-                                    .with_operation(&operation)
-                                    .with_iteration(apply_count),
-                            ))
-                            .await;
-                    }
-                    OutputMessage::Info(s) => {
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(
-                                LogEntry::info(s)
-                                    .with_change_id(&change_id)
-                                    .with_operation(&operation)
-                                    .with_iteration(apply_count),
-                            ))
-                            .await;
-                    }
-                    OutputMessage::Warn(s) => {
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(
-                                LogEntry::warn(s)
-                                    .with_change_id(&change_id)
-                                    .with_operation(&operation)
-                                    .with_iteration(apply_count),
-                            ))
-                            .await;
-                    }
-                    OutputMessage::Error(s) => {
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(
-                                LogEntry::error(s)
-                                    .with_change_id(&change_id)
-                                    .with_operation(&operation)
-                                    .with_iteration(apply_count),
-                            ))
-                            .await;
-                    }
-                    OutputMessage::Success(s) => {
-                        let _ = tx
-                            .send(OrchestratorEvent::Log(
-                                LogEntry::success(s)
-                                    .with_change_id(&change_id)
-                                    .with_operation(&operation)
-                                    .with_iteration(apply_count),
-                            ))
-                            .await;
-                    }
-                }
-            });
-        });
-
-        // Wrap output handler with ContextualOutputHandler to track operation
-        let output = ContextualOutputHandler::new(output, current_operation.clone());
-
-        // Build expanded apply command for ApplyStarted event
-        // This mirrors the logic in AgentRunner::run_apply_streaming_with_runner
-        // Use peek method to avoid consuming the acceptance_tail_injected flag
-        let acceptance_tail = agent.peek_acceptance_tail_context_for_apply(&change_id);
-        let apply_template = agent.config().get_apply_command()?;
-        let apply_user_prompt = agent.config().get_apply_prompt();
-        let apply_history_context = agent.format_apply_history(&change_id);
-        let apply_task_format_context = crate::agent::build_task_format_repair_context(
-            &crate::execution::apply::pending_task_format_repair(
-                std::path::Path::new("."),
-                &change_id,
-            ),
-        );
-        let apply_full_prompt = crate::agent::build_apply_prompt_with_skill(
-            agent.config().get_apply_skill(),
-            &change_id,
-            apply_user_prompt,
-            &apply_history_context,
-            &acceptance_tail,
-            &apply_task_format_context,
-        );
-        let apply_expanded_command =
-            OrchestratorConfig::expand_change_id(apply_template, &change_id);
-        let apply_expanded_command =
-            OrchestratorConfig::expand_prompt(&apply_expanded_command, &apply_full_prompt);
-
-        // Send ApplyStarted event with expanded command
-        let apply_started_event = OrchestratorEvent::ApplyStarted {
-            change_id: change_id.to_string(),
-            command: apply_expanded_command,
-        };
-        dispatcher.dispatch(apply_started_event).await;
-
-        // Process the change using SerialRunService
-        use crate::serial_run_service::ChangeProcessResult;
-        let cancel_token_clone = cancel_token.clone();
-
-        // Create a cancel_check that monitors both global cancel AND single-change stop
-        let dynamic_queue_clone = dynamic_queue.clone();
-        let change_id_for_cancel = change_id.clone();
-        let cancel_check = move || {
-            // Check global cancellation
-            if cancel_token_clone.is_cancelled() {
-                return true;
-            }
-            // Check single-change stop (non-blocking check)
-            dynamic_queue_clone.try_is_stopped(&change_id_for_cancel)
-        };
-
-        // Create a closure that only checks single-change stop
-        let dynamic_queue_clone2 = dynamic_queue.clone();
-        let change_id_for_single_stop = change_id.clone();
-        let is_single_change_stopped =
-            move || dynamic_queue_clone2.try_is_stopped(&change_id_for_single_stop);
-
-        let total_changes = shared_state.read().await.total_changes();
-        let result = serial_service
-            .process_change(
-                &change,
-                &mut agent,
-                &ai_runner,
-                &hooks,
-                &output,
-                total_changes,
-                remaining_changes,
-                cancel_check,
-                is_single_change_stopped,
-                Some(current_operation.clone()),
-            )
-            .await;
-
-        // Get the apply count after processing
-        let apply_count = serial_service.apply_count(&change_id);
-
-        // Send ApplyOutput event to update iteration number
-        let apply_output_event = OrchestratorEvent::ApplyOutput {
-            change_id: change_id.clone(),
-            output: String::new(),
-            iteration: Some(apply_count),
-        };
-        dispatcher.dispatch(apply_output_event).await;
-
-        match result {
-            Ok(ChangeProcessResult::Cancelled) => {
-                dispatcher
-                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(
-                        "Processing cancelled".to_string(),
-                    )))
-                    .await;
-                shared_state.write().await.clear_pending_changes();
-                break;
-            }
-            Ok(ChangeProcessResult::ChangeStopped) => {
-                // Clear the stopped flag to allow re-queueing
-                dynamic_queue.clear_stopped(&change_id).await;
-                // Send ChangeStopped event to move the change to not queued
-                let change_stopped_event = OrchestratorEvent::ChangeDequeued {
-                    change_id: change_id.clone(),
-                };
-                dispatcher.dispatch(change_stopped_event).await;
-
-                dispatcher
-                    .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
-                        "Change {} stopped, continuing with other queued changes",
-                        change_id
-                    ))))
-                    .await;
-                // Remove this change from pending but continue processing others
-                shared_state.write().await.remove_from_pending(&change_id);
-                continue;
-            }
-            Ok(ChangeProcessResult::AcceptancePassed) => {
-                // Send ApplyCompleted event
-                let apply_completed_event = OrchestratorEvent::ApplyCompleted {
-                    change_id: change_id.clone(),
-                    revision: String::new(),
-                };
-                dispatcher.dispatch(apply_completed_event).await;
-
-                // Send AcceptanceStarted event
-                let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
-                    change_id: change_id.clone(),
-                    command: format!("opencode acceptance {}", change_id),
-                };
-                dispatcher.dispatch(acceptance_started_event).await;
-
-                // Send AcceptanceCompleted event
-                let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
-                    change_id: change_id.clone(),
-                };
-                dispatcher.dispatch(acceptance_completed_event).await;
-
-                // Send ProcessingCompleted event
-                let processing_completed_event =
-                    OrchestratorEvent::ProcessingCompleted(change_id.clone());
-                dispatcher.dispatch(processing_completed_event).await;
-            }
-            Ok(ChangeProcessResult::ApplySuccessIncomplete) => {
-                // Send ApplyCompleted event
-                let apply_completed_event = OrchestratorEvent::ApplyCompleted {
-                    change_id: change_id.clone(),
-                    revision: String::new(),
-                };
-                dispatcher.dispatch(apply_completed_event).await;
-            }
-            Ok(ChangeProcessResult::AcceptanceContinue) => {
-                // Send ApplyCompleted event
-                let apply_completed_event = OrchestratorEvent::ApplyCompleted {
-                    change_id: change_id.clone(),
-                    revision: String::new(),
-                };
-                dispatcher.dispatch(apply_completed_event).await;
-
-                // Note: AcceptanceStarted event is sent from acceptance_test_streaming
-                // with the actual command string (including diff context and last output)
-
-                // Send AcceptanceCompleted event
-                let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
-                    change_id: change_id.clone(),
-                };
-                dispatcher.dispatch(acceptance_completed_event).await;
-            }
-            Ok(ChangeProcessResult::AcceptanceContinueExceeded) => {
-                // Send ApplyCompleted event
-                let apply_completed_event = OrchestratorEvent::ApplyCompleted {
-                    change_id: change_id.clone(),
-                    revision: String::new(),
-                };
-                dispatcher.dispatch(apply_completed_event).await;
-
-                // Send AcceptanceCompleted event
-                let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
-                    change_id: change_id.clone(),
-                };
-                dispatcher.dispatch(acceptance_completed_event).await;
-            }
-            Ok(ChangeProcessResult::Rejected { reason }) => {
-                // Send ApplyCompleted event
-                let apply_completed_event = OrchestratorEvent::ApplyCompleted {
-                    change_id: change_id.clone(),
-                    revision: String::new(),
-                };
-                dispatcher.dispatch(apply_completed_event).await;
-
-                // Send AcceptanceCompleted event
-                let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
-                    change_id: change_id.clone(),
-                };
-                dispatcher.dispatch(acceptance_completed_event).await;
-
-                dispatcher
-                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
-                        "Acceptance gated - rejection flow completed: {}",
-                        reason
-                    ))))
-                    .await;
-
-                dispatcher
-                    .dispatch(OrchestratorEvent::ChangeRejected {
-                        change_id: change_id.clone(),
-                        reason,
-                    })
-                    .await;
-            }
-            Ok(ChangeProcessResult::AcceptanceFailed { .. }) => {
-                // Send ApplyCompleted event
-                let apply_completed_event = OrchestratorEvent::ApplyCompleted {
-                    change_id: change_id.clone(),
-                    revision: String::new(),
-                };
-                dispatcher.dispatch(apply_completed_event).await;
-
-                // Note: AcceptanceStarted event is sent from acceptance_test_streaming
-                // with the actual command string (including diff context and last output)
-
-                // Send AcceptanceCompleted event
-                let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
-                    change_id: change_id.clone(),
-                };
-                dispatcher.dispatch(acceptance_completed_event).await;
-            }
-            Ok(ChangeProcessResult::AcceptanceCommandFailed { error }) => {
-                // Send ApplyCompleted event
-                let apply_completed_event = OrchestratorEvent::ApplyCompleted {
-                    change_id: change_id.clone(),
-                    revision: String::new(),
-                };
-                dispatcher.dispatch(apply_completed_event).await;
-
-                // Note: AcceptanceStarted event is sent from acceptance_test_streaming
-                // with the actual command string (including diff context and last output)
-
-                // Send AcceptanceCompleted event
-                let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
-                    change_id: change_id.clone(),
-                };
-                dispatcher.dispatch(acceptance_completed_event).await;
-
-                dispatcher
-                    .dispatch(OrchestratorEvent::Log(LogEntry::error(format!(
-                        "Acceptance command failed: {}",
-                        error
-                    ))))
-                    .await;
-            }
-            Ok(ChangeProcessResult::ApplyFailed { error }) => {
-                let processing_error_event = OrchestratorEvent::ProcessingError {
-                    id: change_id.clone(),
-                    error: error.clone(),
-                };
-                dispatcher.dispatch(processing_error_event).await;
-            }
-            // The sole per-change budget owner refused another dispatch. Stop the
-            // run with the canonical `iteration_limit` finish status and the exact
-            // cumulative count instead of reclassifying it as a command crash.
-            Ok(ChangeProcessResult::IterationLimit { attempts, error }) => {
-                dispatcher
-                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(error.clone())))
-                    .await;
-                dispatcher
-                    .dispatch(OrchestratorEvent::ProcessingError {
-                        id: change_id.clone(),
-                        error,
-                    })
-                    .await;
-                shared_state.write().await.remove_from_pending(&change_id);
-                finish_status = "iteration_limit";
-                finish_apply_count = attempts;
-                dispatcher.dispatch(OrchestratorEvent::AllCompleted).await;
-                break;
-            }
-            Ok(ChangeProcessResult::Archived) => {
-                // Change was complete and successfully archived
-                dispatcher
-                    .dispatch(OrchestratorEvent::Log(LogEntry::success(format!(
-                        "Change {} archived successfully",
-                        change_id
-                    ))))
-                    .await;
-
-                // Send ChangeArchived event
-                let change_archived_event = OrchestratorEvent::ChangeArchived(change_id.clone());
-                dispatcher.dispatch(change_archived_event).await;
-                let post_archive_event = {
-                    let state = shared_state.read().await;
-                    post_archive_dispatch_event(&state, &change_id)
-                };
-                if let Some(post_event) = post_archive_event {
-                    dispatcher.dispatch(post_event).await;
-                }
-            }
-            // A validated acceptance stall carries structured blocker evidence,
-            // so it is published as the same `AcceptanceGated` lifecycle event
-            // parallel mode emits and displays as `stalled` rather than as an
-            // opaque processing error.
-            Ok(ref stalled @ ChangeProcessResult::AcceptanceStalled { ref error, .. }) => {
-                for event in stalled.stalled_lifecycle_events(&change_id) {
-                    dispatcher.dispatch(event).await;
-                }
-                tracing::warn!(
-                    change_id = %change_id,
-                    "Acceptance stalled on a validated external blocker: {error}"
-                );
-
-                // Remove stalled change from pending
-                shared_state.write().await.remove_from_pending(&change_id);
-            }
-            Ok(ChangeProcessResult::Stalled { error }) => {
-                let processing_error_event = OrchestratorEvent::ProcessingError {
-                    id: change_id.clone(),
-                    error: error.clone(),
-                };
-                dispatcher.dispatch(processing_error_event).await;
-
-                // Remove stalled change from pending
-                shared_state.write().await.remove_from_pending(&change_id);
-            }
-            Ok(ChangeProcessResult::Failed { error }) => {
-                let processing_error_event = OrchestratorEvent::ProcessingError {
-                    id: change_id.clone(),
-                    error: error.clone(),
-                };
-                dispatcher.dispatch(processing_error_event).await;
-            }
-            Err(e) => {
-                // Check if this was a single-change stop (error message contains "Cancelled")
-                let error_str = e.to_string();
-                if error_str.contains("Cancelled") && dynamic_queue.try_is_stopped(&change_id) {
-                    // Clear the stop flag and send ChangeStopped event
-                    dynamic_queue.clear_stopped(&change_id).await;
-                    shared_state.write().await.drop_pending_change(&change_id);
-                    let change_stopped_event2 = OrchestratorEvent::ChangeDequeued {
-                        change_id: change_id.clone(),
-                    };
-                    dispatcher.dispatch(change_stopped_event2).await;
-                    dispatcher
-                        .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
-                            "Change stopped during execution: {}",
-                            change_id
-                        ))))
-                        .await;
-                    continue;
-                } else {
-                    // Regular error - treat as before
-                    let error_msg = format!("Processing error for {}: {}", change_id, e);
-                    let processing_error_event = OrchestratorEvent::ProcessingError {
-                        id: change_id.clone(),
-                        error: error_msg,
-                    };
-                    dispatcher.dispatch(processing_error_event).await;
-                    break;
-                }
-            }
-        }
-    }
-
-    // Run on_finish hook after all changes processed or stopped
-    let state = shared_state.read().await;
-    let complete_context =
-        HookContext::new(state.changes_processed(), state.total_changes(), 0, false)
-            .with_status(finish_status)
-            .with_apply_count(finish_apply_count);
-    if let Err(e) = hooks.run_hook(HookType::OnFinish, &complete_context).await {
-        dispatcher
-            .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
-                "on_finish hook failed: {}",
-                e
-            ))))
-            .await;
-    }
-
-    // Flush the bridged producers before the terminal event so a hook or output
-    // line cannot be ordered after completion. Bounded: a producer that somehow
-    // outlives the run must not be able to hold the boundary open.
-    drop(hooks);
-    drop(event_bridge);
-    let _ = tokio::time::timeout(EVENT_BRIDGE_DRAIN_TIMEOUT, event_bridge_handle).await;
-
-    // Send completion event
-    dispatcher.dispatch(OrchestratorEvent::AllCompleted).await;
-
-    Ok(())
-}
-
-/// Run the orchestrator in parallel mode
+/// Run the cumulative worktree orchestrator
 ///
 /// Executes multiple changes concurrently using git worktrees, with dependency analysis
 /// and automatic workspace management.
@@ -988,11 +266,11 @@ pub async fn run_orchestrator_parallel(
     use crate::parallel::ParallelEvent;
     use crate::parallel_run_service::ParallelRunService;
 
-    // The same dispatch owner serial mode uses. Parallel used to reach the TUI,
+    // One dispatch owner for the whole boundary run. This used to reach the TUI,
     // the reducer, and the web state through three hand-written paths with
     // different membership per event; routing the scheduler's event stream and
-    // the boundary's own events through one owner is what makes both modes
-    // deliver the same events to the same frontends.
+    // the boundary's own events through one owner is what makes every frontend
+    // receive the same events.
     let dispatcher = Arc::new(EventDispatcher::new(
         shared_state.clone(),
         boundary_event_sinks(
@@ -1289,7 +567,7 @@ mod tests {
     /// what `on_finish` reports.
     mod parallel_finish_hook {
         use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use crate::orchestration::state::OrchestratorState;
         use std::sync::Arc;
         use tempfile::TempDir;
 
@@ -1329,10 +607,9 @@ mod tests {
             change_id: &str,
             max_iterations: u32,
         ) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
-            Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+            Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
                 vec![change_id.to_string()],
                 max_iterations,
-                ExecutionMode::Parallel,
             )))
         }
 
@@ -1384,11 +661,7 @@ mod tests {
         /// frontend can never report a different finish status for one run.
         #[tokio::test]
         async fn tui_and_run_derive_the_same_report_from_one_observation() {
-            let mut state = OrchestratorState::with_mode(
-                vec!["change-a".to_string()],
-                7,
-                ExecutionMode::Parallel,
-            );
+            let mut state = OrchestratorState::new(vec!["change-a".to_string()], 7);
             assert_eq!(state.parallel_finish_report(), ("completed", 0));
             state.record_apply_iteration_limit("change-a", 7, 7);
             assert_eq!(state.parallel_finish_report(), ("iteration_limit", 7));
@@ -1562,12 +835,13 @@ mod tests {
     #[tokio::test]
     async fn test_parallel_startup_preserves_empty_manual_resolve_wait_state() {
         use crate::orchestration::state::{
-            ExecutionMode, OrchestratorState, ReducerCommand, WorkspaceObservation,
+            OrchestratorState, ReducerCommand, WorkspaceObservation,
         };
 
-        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 3, ExecutionMode::Serial),
-        ));
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["alpha".to_string()],
+            3,
+        )));
         {
             let mut state = shared_state.write().await;
             state.apply_observation("alpha", WorkspaceObservation::WorkspaceArchived);
@@ -1581,7 +855,6 @@ mod tests {
             preserved,
             "empty ResolveWait startup should skip replacement"
         );
-        assert_eq!(state.execution_mode(), ExecutionMode::Parallel);
         assert_eq!(state.display_status("alpha"), "resolve pending");
         assert_eq!(state.resolve_wait_change_ids(), vec!["alpha".to_string()]);
     }
@@ -1589,12 +862,13 @@ mod tests {
     #[tokio::test]
     async fn test_parallel_startup_resets_selected_run_and_drops_stale_resolve_wait() {
         use crate::orchestration::state::{
-            ExecutionMode, OrchestratorState, ReducerCommand, WorkspaceObservation,
+            OrchestratorState, ReducerCommand, WorkspaceObservation,
         };
 
-        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
-            OrchestratorState::with_mode(vec!["stale".to_string()], 3, ExecutionMode::Parallel),
-        ));
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["stale".to_string()],
+            3,
+        )));
         {
             let mut state = shared_state.write().await;
             state.apply_observation("stale", WorkspaceObservation::WorkspaceArchived);
@@ -1606,7 +880,6 @@ mod tests {
 
         let state = shared_state.read().await;
         assert!(!preserved, "selected startup must create a fresh run state");
-        assert_eq!(state.execution_mode(), ExecutionMode::Parallel);
         assert_eq!(state.display_status("fresh"), "queued");
         assert_eq!(state.display_status("stale"), "not queued");
         assert!(state.resolve_wait_change_ids().is_empty());
@@ -1616,11 +889,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_startup_empty_without_resolve_wait_resets_to_noop_state() {
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use crate::orchestration::state::OrchestratorState;
 
-        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
-            OrchestratorState::with_mode(vec!["old".to_string()], 3, ExecutionMode::Parallel),
-        ));
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["old".to_string()],
+            3,
+        )));
 
         let preserved = super::initialize_parallel_shared_state(&shared_state, &[], 7).await;
 
@@ -1629,7 +903,6 @@ mod tests {
             !preserved,
             "empty startup without ResolveWait remains ordinary no-op"
         );
-        assert_eq!(state.execution_mode(), ExecutionMode::Parallel);
         assert!(state.pending_changes().is_empty());
         assert_eq!(state.display_status("old"), "not queued");
         assert!(state.resolve_wait_change_ids().is_empty());
@@ -1654,210 +927,6 @@ mod tests {
         let state = shared_state.read().await;
         assert_eq!(state.pending_changes().len(), 0);
         assert!(state.pending_changes().is_empty());
-    }
-
-    #[test]
-    fn test_tui_archived_during_resolve() {
-        use crate::events::ExecutionEvent;
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState, WaitState};
-
-        let mut state = OrchestratorState::with_mode(
-            vec!["change-a".to_string(), "change-b".to_string()],
-            3,
-            ExecutionMode::Parallel,
-        );
-
-        crate::orchestration::state::OrchestratorState::apply_execution_event(
-            &mut state,
-            &ExecutionEvent::ResolveStarted {
-                change_id: "change-a".to_string(),
-                command: "resolve change-a".to_string(),
-            },
-        );
-        crate::orchestration::state::OrchestratorState::apply_execution_event(
-            &mut state,
-            &ExecutionEvent::ChangeArchived("change-b".to_string()),
-        );
-
-        let deferred = super::post_archive_dispatch_event(&state, "change-b");
-        assert!(matches!(
-            deferred,
-            Some(ExecutionEvent::MergeDeferred {
-                ref change_id,
-                auto_resumable: true,
-                ..
-            }) if change_id == "change-b"
-        ));
-
-        if let Some(event) = deferred {
-            crate::orchestration::state::OrchestratorState::apply_execution_event(
-                &mut state, &event,
-            );
-        }
-
-        let runtime = state
-            .change_runtime("change-b")
-            .expect("change-b runtime should exist");
-        assert_eq!(runtime.wait_state, WaitState::ResolveWait);
-    }
-
-    #[test]
-    fn test_tui_archived_no_active_resolve_or_rejecting() {
-        use crate::events::ExecutionEvent;
-        use crate::orchestration::state::{
-            ActivityState, ExecutionMode, OrchestratorState, WaitState,
-        };
-
-        let mut state =
-            OrchestratorState::with_mode(vec!["change-a".to_string()], 3, ExecutionMode::Parallel);
-
-        crate::orchestration::state::OrchestratorState::apply_execution_event(
-            &mut state,
-            &ExecutionEvent::ChangeArchived("change-a".to_string()),
-        );
-
-        let deferred = super::post_archive_dispatch_event(&state, "change-a");
-        assert!(deferred.is_none());
-
-        let runtime = state
-            .change_runtime("change-a")
-            .expect("change-a runtime should exist");
-        assert_eq!(runtime.wait_state, WaitState::None);
-        assert_eq!(runtime.activity, ActivityState::Resolving);
-    }
-
-    #[test]
-    fn test_tui_archived_during_rejecting_emits_auto_resumable_deferred() {
-        use crate::events::ExecutionEvent;
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
-        use crate::vcs::WorkspaceStatus;
-
-        let mut state = OrchestratorState::with_mode(
-            vec!["change-a".to_string(), "change-b".to_string()],
-            3,
-            ExecutionMode::Parallel,
-        );
-
-        crate::orchestration::state::OrchestratorState::apply_execution_event(
-            &mut state,
-            &ExecutionEvent::WorkspaceStatusUpdated {
-                change_id: "change-a".to_string(),
-                workspace_name: "ws-a".to_string(),
-                status: WorkspaceStatus::Rejecting,
-            },
-        );
-        crate::orchestration::state::OrchestratorState::apply_execution_event(
-            &mut state,
-            &ExecutionEvent::ChangeArchived("change-b".to_string()),
-        );
-
-        let deferred = super::post_archive_dispatch_event(&state, "change-b");
-        assert!(matches!(
-            deferred,
-            Some(ExecutionEvent::MergeDeferred {
-                ref change_id,
-                auto_resumable: true,
-                ..
-            }) if change_id == "change-b"
-        ));
-    }
-
-    #[test]
-    fn test_tui_archived_during_applying_does_not_emit_auto_resumable_deferred() {
-        use crate::events::ExecutionEvent;
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
-
-        let mut state = OrchestratorState::with_mode(
-            vec!["change-a".to_string(), "change-b".to_string()],
-            3,
-            ExecutionMode::Parallel,
-        );
-
-        crate::orchestration::state::OrchestratorState::apply_execution_event(
-            &mut state,
-            &ExecutionEvent::ApplyStarted {
-                change_id: "change-a".to_string(),
-                command: "apply change-a".to_string(),
-            },
-        );
-        crate::orchestration::state::OrchestratorState::apply_execution_event(
-            &mut state,
-            &ExecutionEvent::ChangeArchived("change-b".to_string()),
-        );
-
-        let deferred = super::post_archive_dispatch_event(&state, "change-b");
-        assert!(
-            deferred.is_none(),
-            "applying blocker must not trigger resolve-pending auto dispatch"
-        );
-    }
-
-    #[test]
-    fn test_tui_archived_with_terminal_rejected_change_does_not_emit_auto_resumable_deferred() {
-        use crate::events::ExecutionEvent;
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
-
-        let mut state = OrchestratorState::with_mode(
-            vec!["change-a".to_string(), "change-b".to_string()],
-            3,
-            ExecutionMode::Parallel,
-        );
-
-        crate::orchestration::state::OrchestratorState::apply_execution_event(
-            &mut state,
-            &ExecutionEvent::ChangeRejected {
-                change_id: "change-a".to_string(),
-                reason: "blocked".to_string(),
-            },
-        );
-        crate::orchestration::state::OrchestratorState::apply_execution_event(
-            &mut state,
-            &ExecutionEvent::ChangeArchived("change-b".to_string()),
-        );
-
-        let deferred = super::post_archive_dispatch_event(&state, "change-b");
-        assert!(
-            deferred.is_none(),
-            "terminal rejected blocker must not trigger resolve-pending auto dispatch"
-        );
-    }
-
-    /// Test helper behavior for rejection-like removal from pending in TUI serial mode.
-    #[tokio::test]
-    async fn test_tui_rejection_removes_from_pending_selection() {
-        use crate::serial_run_service::SerialRunService;
-        use std::collections::HashSet;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let config = crate::config::OrchestratorConfig::default();
-        let mut serial_service = SerialRunService::new(temp_dir.path().to_path_buf(), config);
-
-        let blocked_change_id = "blocked-change";
-        let other_change_id = "other-change";
-
-        // Simulate pending changes before blocking
-        let mut pending_changes: HashSet<String> =
-            vec![blocked_change_id.to_string(), other_change_id.to_string()]
-                .into_iter()
-                .collect();
-
-        // Simulate AcceptanceBlocked processing
-        let reason = "Implementation blocker detected - requires manual intervention";
-        serial_service.mark_stalled(blocked_change_id, reason);
-        pending_changes.remove(blocked_change_id);
-
-        // Verify the blocked change is no longer in pending
-        assert!(!pending_changes.contains(blocked_change_id));
-        assert!(pending_changes.contains(other_change_id));
-
-        // Verify the blocked change is marked as stalled
-        assert!(serial_service.is_stalled(blocked_change_id));
-        assert!(!serial_service.is_stalled(other_change_id));
-
-        // Verify that only the non-blocked change remains selectable
-        assert_eq!(pending_changes.len(), 1);
-        assert!(pending_changes.contains(other_change_id));
     }
 
     // ---------------------------------------------------------------------
@@ -2093,14 +1162,13 @@ mod tests {
     #[tokio::test]
     async fn parallel_startup_queues_only_selected_targets_and_refresh_does_not_widen_it() {
         use crate::events::ExecutionEvent;
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState, QueueIntent};
+        use crate::orchestration::state::{OrchestratorState, QueueIntent};
         use std::collections::{HashMap, HashSet};
         use std::sync::Arc;
 
-        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
             vec!["fresh".to_string(), "stale".to_string()],
             1,
-            ExecutionMode::Parallel,
         )));
 
         let preserved = super::initialize_parallel_shared_state(

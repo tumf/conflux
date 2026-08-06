@@ -148,10 +148,10 @@ src/
 ├── agent/                  # AI agent runner (configurable commands)
 ├── history.rs              # Apply attempt history tracking
 ├── hooks.rs                # Lifecycle hooks execution
-├── orchestrator.rs         # Main orchestration loop (serial)
+├── orchestrator.rs         # CLI run entrypoint (cumulative worktree orchestration)
 ├── orchestration/          # Orchestration sub-steps (apply, archive, selection, hooks)
 ├── execution/              # Execution state and apply/archive runners
-├── parallel/               # Parallel execution across jj/git workspaces
+├── parallel/               # Cumulative worktree execution across git workspaces
 ├── vcs/                    # VCS abstraction (git commands, workspace ops)
 ├── templates.rs            # Configuration templates (claude, opencode, codex)
 ├── task_parser.rs          # Task file parsing and progress calculation

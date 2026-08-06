@@ -372,12 +372,10 @@ impl ResolveReservations {
 
 /// Process-local publication of start-time target eligibility.
 ///
-/// Parallel-mode eligibility is derived from workspace observation that only the
+/// Worktree eligibility is derived from workspace observation that only the
 /// frontend running the refresh loop performs. Publishing it in the shared
 /// [`ParallelRuntime`] is what lets the shared service apply one guard to every
-/// frontend instead of letting each one re-derive it — and it is the same store
-/// the operator command service mutates when a remote client or a keypress
-/// toggles parallel mode, so the guard can never read a toggle nobody set.
+/// frontend instead of letting each one re-derive it.
 pub use crate::orchestration::operator_command::ParallelRuntime as StartEligibility;
 
 // ============================================================================
@@ -518,17 +516,16 @@ impl RunControlService {
         }
 
         // The fence is applied to the *complete* marked set before anything is
-        // narrowed down, so parallel start is all-or-nothing: one ineligible
-        // target refuses the whole operation instead of quietly starting the
-        // eligible remainder, which is a target set the operator never asked
-        // for.
+        // narrowed down, so start is all-or-nothing: one ineligible target
+        // refuses the whole operation instead of quietly starting the eligible
+        // remainder, which is a target set the operator never asked for.
         let rejected = self.eligibility.rejected(&marked);
         if !rejected.is_empty() {
             return Err(RunControlError::NoEligibleTarget {
                 command: RunCommandKind::Start,
                 detail: format!(
-                    "parallel mode requires committed changes with no uncommitted files; \
-                     ineligible marked targets: {}",
+                    "worktree execution requires committed changes with no uncommitted \
+                     files; ineligible marked targets: {}",
                     rejected.join(", ")
                 ),
             });

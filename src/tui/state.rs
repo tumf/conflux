@@ -238,13 +238,9 @@ pub struct AppState {
     pub log_auto_scroll: bool,
     /// Current stop mode
     pub stop_mode: StopMode,
-    /// Whether parallel mode is enabled
-    pub parallel_mode: bool,
-    /// Whether parallel execution is available (git)
-    pub parallel_available: bool,
     /// VCS backend being used (git)
     pub vcs_backend: String,
-    /// Max concurrent workspaces for parallel execution
+    /// Max concurrent workspaces for worktree execution
     pub max_concurrent: usize,
     /// When orchestration started (for overall elapsed time)
     pub orchestration_started_at: Option<Instant>,
@@ -298,11 +294,10 @@ pub struct AppState {
     /// frontend-independent copy other adapters read. It is never persisted, so a
     /// restarted process starts with every mark `false`.
     execution_marks: std::sync::Arc<crate::orchestration::operator_command::ExecutionMarkStore>,
-    /// Shared process-wide parallel runtime facts.
+    /// Shared process-wide worktree runtime facts.
     ///
-    /// The toggle itself lives here, not in `parallel_mode`: that field is a
-    /// render cache of this store, so a remote `set_parallel_mode` and an `=`
-    /// keypress mutate one value instead of two that can disagree.
+    /// One store, shared by every frontend, so a keypress and a remote command
+    /// read the same concurrency, backend, and per-change eligibility.
     parallel_runtime: std::sync::Arc<crate::orchestration::operator_command::ParallelRuntime>,
 }
 
@@ -511,8 +506,6 @@ impl AppState {
             log_scroll_offset: 0,
             log_auto_scroll: true,
             stop_mode: StopMode::None,
-            parallel_mode: false,
-            parallel_available: crate::cli::check_parallel_available(),
             vcs_backend: "git".to_string(),
             max_concurrent: 4, // Default value, can be overridden from config
             orchestration_started_at: None,
@@ -563,13 +556,10 @@ impl AppState {
 
     /// Publish the TUI's observations into the shared parallel runtime store.
     ///
-    /// Availability, concurrency, backend, and per-change eligibility are all
-    /// observations only this frontend makes; publishing them is what lets the
-    /// shared start guard and a remote client use them without re-deriving
-    /// them. The toggle deliberately travels the other way: see
-    /// [`AppState::sync_parallel_mode_from_runtime`].
+    /// Concurrency, backend, and per-change eligibility are all observations
+    /// only this frontend makes; publishing them is what lets the shared start
+    /// guard and a remote client use them without re-deriving them.
     pub fn publish_parallel_runtime(&self) {
-        self.parallel_runtime.set_available(self.parallel_available);
         self.parallel_runtime
             .set_max_concurrent(self.max_concurrent);
         self.parallel_runtime
@@ -580,23 +570,6 @@ impl AppState {
                 .filter(|change| !change.is_parallel_eligible())
                 .map(|change| (change.id.clone(), change.parallel_eligibility)),
         );
-    }
-
-    /// Adopt a toggle another frontend changed, cleaning up ineligible intent.
-    ///
-    /// Returns true when the mode actually moved. The cleanup is the same one
-    /// the `=` key applies, so a remote toggle cannot leave the TUI painting a
-    /// marked row that parallel mode would refuse to start.
-    pub fn sync_parallel_mode_from_runtime(&mut self) -> bool {
-        let enabled = self.parallel_runtime.parallel_mode();
-        if enabled == self.parallel_mode {
-            return false;
-        }
-        self.parallel_mode = enabled;
-        if enabled {
-            self.clear_parallel_ineligible_intent();
-        }
-        true
     }
 
     /// Clear mark and queue presentation for every parallel-ineligible row.
@@ -1373,7 +1346,7 @@ impl AppState {
     }
 
     fn can_bulk_toggle_change(&self, change: &ChangeState) -> bool {
-        selection_logic::can_bulk_toggle_change(self.execution_mode, self.parallel_mode, change)
+        selection_logic::can_bulk_toggle_change(self.execution_mode, change)
     }
 
     /// Returns true when at least one change can be targeted by bulk toggle.
@@ -1401,7 +1374,7 @@ impl AppState {
     /// Running mode emits `AddToQueue`/`RemoveFromQueue` commands for
     /// `NotQueued`/`Queued` rows (same semantics as single-row Space).
     /// `MergeWait`/`ResolveWait` rows only toggle the execution mark.
-    /// In parallel mode, uncommitted changes remain excluded.
+    /// Uncommitted changes remain excluded.
     ///
     /// Excluded rows and an empty target set are always reported so the
     /// operation never looks like it silently stopped halfway.
@@ -1500,12 +1473,10 @@ impl AppState {
             );
         }
 
-        if self.parallel_mode
-            && matches!(
-                self.execution_mode,
-                AppExecutionMode::Select | AppExecutionMode::Stopped
-            )
-        {
+        if matches!(
+            self.execution_mode,
+            AppExecutionMode::Select | AppExecutionMode::Stopped
+        ) {
             self.clear_parallel_ineligible_intent();
         }
 
@@ -1663,38 +1634,6 @@ impl AppState {
 // ============================================================================
 
 impl AppState {
-    /// Toggle parallel mode (only if git is available)
-    ///
-    /// Returns true if the mode was toggled, false if git is not available
-    /// or if the mode cannot be changed in current state.
-    /// Request the opposite parallel mode.
-    ///
-    /// Presentation only. Whether the toggle is accepted, which ineligible
-    /// changes lose their mark and queue intent, and what the operator is told
-    /// are all decided by the shared operator command service when the emitted
-    /// command is handled — the same service `/api/v2` `set_parallel_mode`
-    /// calls, so a keypress and a remote command cannot reach different
-    /// conclusions.
-    ///
-    /// The two local refusals below exist only so `=` is never silent; the
-    /// service re-validates both.
-    pub fn toggle_parallel_mode(&mut self) -> Option<TuiCommand> {
-        if !matches!(
-            self.execution_mode,
-            AppExecutionMode::Select | AppExecutionMode::Stopped
-        ) {
-            self.warning_message = Some("Cannot toggle parallel mode while processing".to_string());
-            return None;
-        }
-
-        if !self.parallel_available {
-            self.warning_message = Some("Parallel mode not available (requires git)".to_string());
-            return None;
-        }
-
-        Some(TuiCommand::SetParallelMode(!self.parallel_mode))
-    }
-
     /// Reset stop/cancel state before a new run
     pub fn reset_for_run(&mut self) {
         self.stop_mode = StopMode::None;
@@ -2081,9 +2020,9 @@ mod guards {
     /// groups rows by reason to explain what was excluded.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ToggleBlockReason {
-        /// Parallel mode cannot queue a change with uncommitted proposal files.
+        /// A change with uncommitted proposal files cannot be queued.
         ParallelUncommitted,
-        /// Parallel mode cannot queue a change absent from the `HEAD` tree.
+        /// A change absent from the `HEAD` tree cannot be queued.
         ParallelProposalAbsent,
         /// Rejected proposals are read-only.
         Rejected,
@@ -2095,21 +2034,18 @@ mod guards {
     /// the bulk toggle classification, so both paths stay consistent.
     pub fn classify_toggle_block(
         parallel_eligibility: ParallelEligibility,
-        parallel_mode: bool,
         display_status_cache: &str,
     ) -> Option<ToggleBlockReason> {
         // Active (in-flight) changes can be stopped via Space key in Running mode
         // This is allowed and handled by handle_toggle_running_mode
         // No need to block here
 
-        // Parallel mode refuses every ineligible change (only applies to
+        // Worktree execution refuses every ineligible change (only applies to
         // non-active states); the reason only decides what the operator is told.
-        if parallel_mode
-            && !matches!(
-                display_status_cache,
-                "preparing" | "applying" | "accepting" | "archiving" | "resolving"
-            )
-        {
+        if !matches!(
+            display_status_cache,
+            "preparing" | "applying" | "accepting" | "archiving" | "resolving"
+        ) {
             match parallel_eligibility {
                 ParallelEligibility::UncommittedProposalFiles => {
                     return Some(ToggleBlockReason::ParallelUncommitted)
@@ -2134,19 +2070,18 @@ mod guards {
     /// Validates that a change can be toggled for selection
     pub fn validate_change_toggleable(
         parallel_eligibility: ParallelEligibility,
-        parallel_mode: bool,
         display_status_cache: &str,
         change_id: &str,
     ) -> ToggleGuardResult {
-        match classify_toggle_block(parallel_eligibility, parallel_mode, display_status_cache) {
+        match classify_toggle_block(parallel_eligibility, display_status_cache) {
             Some(ToggleBlockReason::ParallelUncommitted) => ToggleGuardResult::Blocked(format!(
-                "Cannot queue uncommitted change '{}' in parallel mode. Commit it first.",
+                "Cannot queue uncommitted change '{}'. Commit it first.",
                 change_id
             )),
             // No dirty content exists to commit here, so the message names the
             // condition that is actually observable instead of asking for one.
             Some(ToggleBlockReason::ParallelProposalAbsent) => ToggleGuardResult::Blocked(format!(
-                "Cannot queue change '{}' in parallel mode: it is not present in HEAD.",
+                "Cannot queue change '{}': it is not present in HEAD.",
                 change_id
             )),
             Some(ToggleBlockReason::Rejected) => ToggleGuardResult::Blocked(format!(
@@ -3157,8 +3092,8 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_all_marks_parallel_mode_excludes_uncommitted() {
-        // Test that toggle all respects parallel mode restrictions
+    fn test_toggle_all_marks_excludes_uncommitted() {
+        // Test that toggle all respects worktree eligibility restrictions
         let changes = vec![
             create_test_change("committed", 0, 1),
             create_test_change("uncommitted", 0, 1),
@@ -3166,8 +3101,6 @@ mod tests {
 
         let mut app = AppState::new(changes);
         app.execution_mode = AppExecutionMode::Select;
-        app.parallel_mode = true;
-        app.parallel_available = true;
 
         // Mark first as committed, second as uncommitted
         app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
@@ -3176,7 +3109,7 @@ mod tests {
         // Toggle all should only mark the committed change
         app.toggle_all_marks();
         assert!(app.changes[0].selected);
-        assert!(!app.changes[1].selected); // Excluded due to parallel mode
+        assert!(!app.changes[1].selected); // Excluded: uncommitted
 
         // Toggle all again should unmark
         app.toggle_all_marks();
@@ -3281,13 +3214,13 @@ mod tests {
 
         for (eligibility, expected_reason, expected_text) in cases {
             assert_eq!(
-                guards::classify_toggle_block(eligibility, true, "not queued"),
+                guards::classify_toggle_block(eligibility, "not queued"),
                 Some(expected_reason),
                 "{eligibility:?} must block the toggle"
             );
 
             let guards::ToggleGuardResult::Blocked(message) =
-                guards::validate_change_toggleable(eligibility, true, "not queued", "change-a")
+                guards::validate_change_toggleable(eligibility, "not queued", "change-a")
             else {
                 panic!("{eligibility:?} must be refused");
             };
@@ -3301,7 +3234,6 @@ mod tests {
         // uncommitted.
         let guards::ToggleGuardResult::Blocked(absent) = guards::validate_change_toggleable(
             ParallelEligibility::ProposalAbsentFromHead,
-            true,
             "not queued",
             "change-a",
         ) else {
@@ -3309,15 +3241,17 @@ mod tests {
         };
         assert!(!absent.to_lowercase().contains("uncommitted"), "{absent}");
 
-        // Sequential mode is unaffected by either reason.
+        // An eligible row is never refused on eligibility grounds.
+        assert_eq!(
+            guards::classify_toggle_block(ParallelEligibility::Eligible, "not queued"),
+            None
+        );
+        // An in-flight row is judged by its activity, not by eligibility.
         for eligibility in [
             ParallelEligibility::UncommittedProposalFiles,
             ParallelEligibility::ProposalAbsentFromHead,
         ] {
-            assert_eq!(
-                guards::classify_toggle_block(eligibility, false, "not queued"),
-                None
-            );
+            assert_eq!(guards::classify_toggle_block(eligibility, "applying"), None);
         }
     }
 
@@ -3331,8 +3265,6 @@ mod tests {
         ];
         let mut app = AppState::new(changes);
         app.execution_mode = AppExecutionMode::Select;
-        app.parallel_available = true;
-        app.parallel_mode = true;
         app.apply_parallel_eligibility(
             &HashSet::from(["eligible".to_string(), "dirty".to_string()]),
             &HashSet::from(["dirty".to_string()]),
@@ -3349,11 +3281,11 @@ mod tests {
             .clone()
             .expect("excluded rows are reported");
         assert!(
-            summary.contains("uncommitted in parallel mode (commit first)"),
+            summary.contains("uncommitted (commit first)"),
             "the dirty row keeps its actionable instruction: {summary}"
         );
         assert!(
-            summary.contains("not present in HEAD (cannot queue in parallel mode)"),
+            summary.contains("not present in HEAD (cannot queue)"),
             "the absent row is named for what it is: {summary}"
         );
     }
@@ -3604,7 +3536,6 @@ mod tests {
     /// Applies one bulk toggle case and returns the resulting `selected` flags.
     fn run_bulk_toggle_case(
         mode: AppExecutionMode,
-        parallel_mode: bool,
         rows: &[BulkToggleRow],
     ) -> (AppState, Vec<TuiCommand>) {
         let changes = rows
@@ -3613,8 +3544,6 @@ mod tests {
             .collect();
         let mut app = AppState::new(changes);
         app.execution_mode = mode;
-        app.parallel_mode = parallel_mode;
-        app.parallel_available = parallel_mode;
         for (index, (_, status, parallel_eligible, selected)) in rows.iter().enumerate() {
             app.changes[index].display_status_cache = status.to_string();
             app.changes[index].parallel_eligibility = if *parallel_eligible {
@@ -3633,7 +3562,6 @@ mod tests {
     struct BulkToggleCase {
         name: &'static str,
         mode: AppExecutionMode,
-        parallel_mode: bool,
         rows: Vec<BulkToggleRow>,
         /// Expected `selected` flag for each row after the toggle.
         expected: Vec<bool>,
@@ -3645,7 +3573,6 @@ mod tests {
             BulkToggleCase {
                 name: "select mode marks every eligible row alongside a rejected row",
                 mode: AppExecutionMode::Select,
-                parallel_mode: false,
                 rows: vec![
                     ("eligible-marked", "not queued", true, true),
                     ("eligible-unmarked", "not queued", true, false),
@@ -3656,7 +3583,6 @@ mod tests {
             BulkToggleCase {
                 name: "select mode unmarks every eligible row when all are marked",
                 mode: AppExecutionMode::Select,
-                parallel_mode: false,
                 rows: vec![
                     ("eligible-a", "not queued", true, true),
                     ("eligible-b", "not queued", true, true),
@@ -3667,7 +3593,6 @@ mod tests {
             BulkToggleCase {
                 name: "stopped mode marks every eligible row alongside a rejected row",
                 mode: AppExecutionMode::Stopped,
-                parallel_mode: false,
                 rows: vec![
                     ("eligible-marked", "merge wait", true, true),
                     ("eligible-unmarked", "not queued", true, false),
@@ -3678,7 +3603,6 @@ mod tests {
             BulkToggleCase {
                 name: "running mode marks every eligible row and skips active rows",
                 mode: AppExecutionMode::Running,
-                parallel_mode: false,
                 rows: vec![
                     ("active", "applying", true, false),
                     ("eligible-marked", "merge wait", true, true),
@@ -3688,9 +3612,8 @@ mod tests {
                 expected: vec![false, true, true, false],
             },
             BulkToggleCase {
-                name: "parallel mode marks every committed row and skips uncommitted rows",
+                name: "worktree execution marks committed rows and skips uncommitted rows",
                 mode: AppExecutionMode::Select,
-                parallel_mode: true,
                 rows: vec![
                     ("committed-marked", "not queued", true, true),
                     ("committed-unmarked", "not queued", true, false),
@@ -3701,7 +3624,7 @@ mod tests {
         ];
 
         for case in cases {
-            let (app, _) = run_bulk_toggle_case(case.mode, case.parallel_mode, &case.rows);
+            let (app, _) = run_bulk_toggle_case(case.mode, &case.rows);
 
             let actual: Vec<bool> = app.changes.iter().map(|change| change.selected).collect();
             assert_eq!(actual, case.expected, "case failed: {}", case.name);
@@ -3719,7 +3642,6 @@ mod tests {
     fn test_toggle_all_marks_reports_changed_and_excluded_counts_with_reasons() {
         let (app, commands) = run_bulk_toggle_case(
             AppExecutionMode::Running,
-            false,
             &[
                 ("active", "applying", true, false),
                 ("rejected", "rejected", true, false),
@@ -3754,7 +3676,6 @@ mod tests {
     fn test_toggle_all_marks_without_exclusions_does_not_warn() {
         let (app, _) = run_bulk_toggle_case(
             AppExecutionMode::Select,
-            false,
             &[
                 ("a", "not queued", true, false),
                 ("b", "not queued", true, false),
@@ -3772,7 +3693,6 @@ mod tests {
     fn test_toggle_all_marks_with_zero_eligible_targets_reports_reason() {
         let (app, commands) = run_bulk_toggle_case(
             AppExecutionMode::Running,
-            false,
             &[
                 ("active", "applying", true, false),
                 ("rejected", "rejected", true, true),
@@ -3819,11 +3739,8 @@ mod tests {
 
     #[test]
     fn test_toggle_all_marks_in_error_mode_reports_retry_ownership() {
-        let (app, commands) = run_bulk_toggle_case(
-            AppExecutionMode::Error,
-            false,
-            &[("a", "error", true, false)],
-        );
+        let (app, commands) =
+            run_bulk_toggle_case(AppExecutionMode::Error, &[("a", "error", true, false)]);
 
         assert!(commands.is_empty());
         assert!(!app.changes[0].selected);
@@ -3838,7 +3755,6 @@ mod tests {
     fn test_toggle_all_marks_in_stopping_mode_reports_immutability() {
         let (app, commands) = run_bulk_toggle_case(
             AppExecutionMode::Stopping,
-            false,
             &[("a", "not queued", true, false)],
         );
 
@@ -3857,8 +3773,7 @@ mod tests {
     #[test]
     fn bulk_mark_rejection_never_describes_a_modal_as_an_execution_mode() {
         for mode in [AppExecutionMode::Stopping, AppExecutionMode::Error] {
-            let (app, commands) =
-                run_bulk_toggle_case(mode, false, &[("a", "not queued", true, false)]);
+            let (app, commands) = run_bulk_toggle_case(mode, &[("a", "not queued", true, false)]);
 
             assert!(commands.is_empty());
             let message = app.warning_message.clone().expect("rejection is reported");
@@ -3927,7 +3842,6 @@ mod tests {
     fn test_toggle_all_marks_running_partial_selection_emits_command_for_every_eligible_row() {
         let (app, commands) = run_bulk_toggle_case(
             AppExecutionMode::Running,
-            false,
             &[
                 ("already-queued", "queued", true, true),
                 ("not-queued-a", "not queued", true, false),
@@ -5248,7 +5162,6 @@ mod tests {
         let mut app = AppState::new(changes);
         app.changes[0].selected = true;
         app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
-        app.parallel_mode = true;
 
         let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
             vec!["change-a".to_string()],
@@ -5300,7 +5213,6 @@ mod tests {
         let mut app = AppState::new(changes);
         app.changes[0].selected = true;
         app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
-        app.parallel_mode = true;
 
         let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
             vec!["change-a".to_string()],
@@ -5319,11 +5231,7 @@ mod tests {
         // Without the fix this would clear queue_intent back to NotQueued.
         {
             let mut guard = shared.blocking_write();
-            *guard = OrchestratorState::with_mode(
-                vec!["change-a".to_string()],
-                0,
-                crate::orchestration::state::ExecutionMode::Parallel,
-            );
+            *guard = OrchestratorState::new(vec!["change-a".to_string()], 0);
             // The fix: re-apply AddToQueue after the state reset.
             guard.apply_command(ReducerCommand::AddToQueue("change-a".to_string()));
         }

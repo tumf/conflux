@@ -483,14 +483,14 @@ fn mode_changes_the_offered_actions_without_changing_the_status() {
 }
 
 #[test]
-fn parallel_mode_blocks_the_mark_actions_of_an_ineligible_change() {
-    // Sequential mode never consults eligibility: an uncommitted change is still
-    // markable because it will run in the repository root.
-    let sequential = change_actions_for_test("select", "not queued", None);
-    assert!(sequential.set_execution_mark.allowed);
+fn an_ineligible_change_never_advertises_its_mark_actions() {
+    // An eligible change is markable.
+    let eligible_baseline = change_actions_for_test("select", "not queued", None);
+    assert!(eligible_baseline.set_execution_mark.allowed);
 
-    // Parallel mode must refuse it up front, with the same token the bulk
-    // command reports, or a client would mark a row that start then rejects.
+    // Worktree eligibility is an unconditional input, so an uncommitted change
+    // is refused up front with the same token the bulk command reports, or a
+    // client would mark a row that start then rejects.
     let ineligible = parallel_change_actions_for_test("select", "not queued", false);
     assert_eq!(
         ineligible.set_execution_mark.blocked_reason,
@@ -502,12 +502,15 @@ fn parallel_mode_blocks_the_mark_actions_of_an_ineligible_change() {
         Some(ActionBlockedReason::ParallelIneligible)
     );
 
-    // An eligible change is offered exactly what sequential mode offers it.
+    // An eligible change is offered the full set.
     let eligible = parallel_change_actions_for_test("select", "not queued", true);
-    assert_eq!(eligible.set_execution_mark, sequential.set_execution_mark);
+    assert_eq!(
+        eligible.set_execution_mark,
+        eligible_baseline.set_execution_mark
+    );
 
     // A final status stays final: committing the change would not make it
-    // markable, so reporting a parallel problem would be misleading.
+    // markable, so reporting an eligibility problem would be misleading.
     let archived = parallel_change_actions_for_test("running", "archived", false);
     assert_eq!(
         archived.set_execution_mark.blocked_reason,

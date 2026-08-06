@@ -29,12 +29,10 @@ mod parallel;
 mod parallel_run_service;
 mod permission;
 mod process_manager;
-mod progress;
 #[allow(dead_code)]
 mod repo_lock;
 #[allow(dead_code, unused_imports)]
 mod runtime;
-mod serial_run_service;
 mod shell_command;
 mod spec_delta;
 #[cfg(test)]
@@ -91,6 +89,32 @@ fn lifecycle_process_context() -> LifecycleContext {
     }
 }
 
+/// Reject an executable orchestration entrypoint that has no usable Git
+/// repository, before any observable side effect.
+///
+/// Cumulative Git-worktree orchestration is the only execution model: there is
+/// no serial fallback to degrade to, so this is a hard startup requirement for
+/// `cflx run` and the local TUI alike. Read-only commands never reach it.
+///
+/// Returns `None` when the workspace is usable.
+fn git_preflight_error() -> Option<String> {
+    if !cli::check_git_directory() {
+        return Some(
+            "conflux requires a git repository (.git directory not found): worktree \
+             orchestration is the only execution model, so run cflx from inside a git \
+             repository"
+                .to_string(),
+        );
+    }
+    if !cli::check_git_available() {
+        return Some(
+            "conflux requires the git command: install git, or make it available on PATH"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Validate and construct the local TUI's upstream runtime before any TUI or
 /// orchestration state exists.
 ///
@@ -107,14 +131,11 @@ fn lifecycle_process_context() -> LifecycleContext {
 /// back before it terminates.
 async fn resolve_tui_upstream_runtime(
     args: &TuiArgs,
-    config: &OrchestratorConfig,
 ) -> std::result::Result<Option<upstream::UpstreamRuntime>, String> {
     let upstream_config = args.upstream_integration().map_err(|err| err.to_string())?;
 
-    let git_dir_exists = cli::check_git_directory();
-    // Local TUI upstream publication is a cumulative parallel capability; the
-    // effective mode is resolved exactly as the TUI itself resolves it.
-    let use_parallel = config.resolve_parallel_mode(false, git_dir_exists);
+    // Git preflight already ran, so the workspace is a usable repository here.
+    let git_dir_exists = true;
 
     let repo_root = match std::env::current_dir() {
         Ok(root) => root,
@@ -132,7 +153,6 @@ async fn resolve_tui_upstream_runtime(
         Some(upstream_config) => upstream::prepare_upstream_integration(
             upstream_config,
             &repo_root,
-            use_parallel,
             args.push.clone(),
             git_dir_exists,
             false,
@@ -141,7 +161,7 @@ async fn resolve_tui_upstream_runtime(
         .map(Some)
         .map_err(|err| err.to_string()),
         None => {
-            if use_parallel && git_dir_exists {
+            {
                 if let Err(err) = upstream::ensure_no_unpushed_upstream_recovery(&repo_root).await {
                     if matches!(err, upstream::UpstreamStartupError::Invalid(_)) {
                         return Err(err.to_string());
@@ -176,11 +196,22 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
     #[cfg(feature = "web-monitoring")]
     let started = start_local_api(LocalApiOptions::from(&args), &changes).await;
 
+    // Worktree orchestration is the only execution model, so a usable Git
+    // repository is a startup requirement rather than a capability that decides
+    // between two modes. This runs before the upstream fetch, the lifecycle
+    // adapter, any AI subprocess, and any workspace mutation, so a workspace
+    // that cannot be orchestrated leaves nothing behind.
+    let startup: std::result::Result<Option<upstream::UpstreamRuntime>, String> =
+        match git_preflight_error() {
+            Some(err) => Err(err),
+            None => resolve_tui_upstream_runtime(&args).await,
+        };
+
     // Startup validation runs before the terminal is taken over, so a rejected
     // invocation reports plainly and leaves no orchestration state behind. The
     // listeners are already bound here, so a refusal gives the socket back on
     // its way out instead of leaving a stale entry.
-    let upstream_runtime = match resolve_tui_upstream_runtime(&args, &config).await {
+    let upstream_runtime = match startup {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("Error: {err}");
@@ -850,27 +881,18 @@ async fn main() -> Result<()> {
             };
 
             let config = OrchestratorConfig::load(args.config.as_deref())?;
-            let git_dir_exists = cli::check_git_directory();
-            let use_parallel = config.resolve_parallel_mode(args.parallel, git_dir_exists);
 
-            if use_parallel {
-                let backend = vcs_override.unwrap_or(vcs::VcsBackend::Auto);
-                let git_available = cli::check_git_available();
-
-                if !git_dir_exists {
-                    let message = if matches!(backend, vcs::VcsBackend::Git) {
-                        "git repository not found (.git directory missing)"
-                    } else {
-                        "Error: parallel mode requires a git repository (.git directory not found)"
-                    };
-                    eprintln!("{}", message);
-                    std::process::exit(1);
+            // Worktree orchestration is the only execution model, so an
+            // unusable Git workspace stops the run here — after the listeners
+            // bound, and before any hook, lifecycle adapter, AI subprocess, or
+            // managed-worktree mutation exists.
+            if let Some(message) = git_preflight_error() {
+                eprintln!("Error: {}", message);
+                #[cfg(feature = "web-monitoring")]
+                if let Some((handle, _)) = started_api {
+                    handle.shutdown().await;
                 }
-
-                if !git_available {
-                    eprintln!("Error: git command not available");
-                    std::process::exit(1);
-                }
+                std::process::exit(1);
             }
 
             // Opt-in upstream integration. When the option is absent no upstream
@@ -890,9 +912,8 @@ async fn main() -> Result<()> {
                     match upstream::prepare_upstream_integration(
                         config,
                         &repo_root,
-                        use_parallel,
                         args.push.clone(),
-                        git_dir_exists,
+                        true,
                         args.dry_run,
                     )
                     .await
@@ -908,7 +929,7 @@ async fn main() -> Result<()> {
                     // Default-off path: refuse to continue only when repository
                     // evidence proves an unpushed upstream merge is reachable.
                     // The scan is offline, so nothing new is fetched here.
-                    if use_parallel && !args.dry_run && git_dir_exists {
+                    if !args.dry_run {
                         let repo_root = std::env::current_dir()?;
                         if let Err(err) =
                             upstream::ensure_no_unpushed_upstream_recovery(&repo_root).await
@@ -1011,7 +1032,6 @@ async fn main() -> Result<()> {
                     change_ids.clone(),
                     config_path.clone(),
                     max_iterations,
-                    use_parallel,
                     max_concurrent,
                     dry_run,
                     vcs_override,

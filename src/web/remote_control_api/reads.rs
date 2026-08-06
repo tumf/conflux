@@ -93,17 +93,12 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
         authentication_required: state.auth.is_enforced(),
         worktrees: WorktreeCapabilities::default(),
         parallel: ParallelCapabilities {
-            available: parallel.available,
-            mode: parallel.mode,
             max_concurrent: parallel.max_concurrent,
             vcs_backend: parallel.vcs_backend,
             blocked_reasons: ALL_PARALLEL_BLOCKED_REASONS
                 .iter()
                 .map(|reason| (*reason).to_string())
                 .collect(),
-            // The same two modes `set_parallel_mode` accepts, so a client can
-            // tell "not now" apart from "not supported" without probing.
-            toggle_modes: vec!["select".to_string(), "stopped".to_string()],
         },
     })
 }

@@ -1,4 +1,4 @@
-//! Common apply iteration logic for serial and parallel modes.
+//! Common apply iteration logic for managed-worktree execution.
 //!
 //! This module provides shared functionality for executing apply operations,
 //! including:
@@ -6,7 +6,7 @@
 //! - Progress commit creation
 //! - Apply iteration management
 //!
-//! Both serial and parallel modes use these common functions to ensure
+//! Every frontend uses these common functions to ensure
 //! consistent behavior across execution modes.
 
 // Allow dead_code as this is a foundation module - types and functions will be used
@@ -298,8 +298,8 @@ pub enum ApplyBudgetReservation {
 /// The single per-change, active-run owner of the configured `max_iterations`
 /// Apply-dispatch budget.
 ///
-/// One instance is created per process run and shared by serial CLI, TUI, and
-/// parallel execution. Every configured Apply-agent dispatch for a change —
+/// One instance is created per process run and shared by CLI, TUI, and
+/// remote-controlled execution. Every configured Apply-agent dispatch for a change —
 /// ordinary implementation, command-failure recovery, Acceptance FAIL-to-Apply
 /// repair, task-format repair, empty-WIP escalation, and final-commit repair —
 /// reserves from the same per-change total. Command-queue transport retries stay
@@ -410,7 +410,7 @@ pub struct ApplyConfig {
     pub max_iterations: u32,
 
     /// Whether to create progress commits after each iteration.
-    /// Useful for parallel mode where work should be preserved.
+    /// Useful where in-progress work should be preserved.
     pub progress_commits_enabled: bool,
 
     /// Whether streaming output is enabled.
@@ -1394,7 +1394,11 @@ impl ApplyEventHandler for NoOpEventHandler {
     fn on_apply_output(&self, _change_id: &str, _line: &OutputLine, _iteration: u32) {}
 }
 
-/// Context for building hook contexts in the apply loop
+/// Context for building hook contexts in the apply loop.
+///
+/// Change-level apply always runs in a managed worktree, so the workspace path
+/// and group identity are required rather than optional: there is no
+/// workspace-free constructor a caller could reach for.
 pub struct ApplyLoopHookContext {
     /// Changes processed so far
     pub changes_processed: usize,
@@ -1402,30 +1406,15 @@ pub struct ApplyLoopHookContext {
     pub total_changes: usize,
     /// Remaining changes
     pub remaining_changes: usize,
-    /// Workspace path for parallel mode (optional)
-    pub workspace_path: Option<String>,
-    /// Group index for parallel mode (optional)
-    pub group_index: Option<usize>,
+    /// Managed workspace path this change executes in
+    pub workspace_path: String,
+    /// Group index this change was scheduled in
+    pub group_index: usize,
 }
 
 impl ApplyLoopHookContext {
-    /// Create a new hook context for serial mode
-    pub fn serial(
-        changes_processed: usize,
-        total_changes: usize,
-        remaining_changes: usize,
-    ) -> Self {
-        Self {
-            changes_processed,
-            total_changes,
-            remaining_changes,
-            workspace_path: None,
-            group_index: None,
-        }
-    }
-
-    /// Create a new hook context for parallel mode
-    pub fn parallel(
+    /// Create a hook context for a managed-worktree apply loop.
+    pub fn new(
         changes_processed: usize,
         total_changes: usize,
         remaining_changes: usize,
@@ -1436,8 +1425,8 @@ impl ApplyLoopHookContext {
             changes_processed,
             total_changes,
             remaining_changes,
-            workspace_path: Some(workspace_path),
-            group_index: Some(group_index),
+            workspace_path,
+            group_index,
         }
     }
 
@@ -1458,11 +1447,7 @@ impl ApplyLoopHookContext {
         .with_change(change_id, completed, total)
         .with_apply_count(apply_count);
 
-        if let Some(ref workspace_path) = self.workspace_path {
-            if let Some(group_index) = self.group_index {
-                ctx = ctx.with_parallel_context(workspace_path, Some(group_index as u32));
-            }
-        }
+        ctx = ctx.with_parallel_context(&self.workspace_path, Some(self.group_index as u32));
 
         ctx
     }
@@ -1586,7 +1571,7 @@ async fn refuse_dispatch_on_iteration_limit(
 /// Bounded fingerprint of repository state, used to decide whether an Apply
 /// attempt that exited non-zero still moved the repository forward.
 ///
-/// Modes that take no WIP snapshot (serial apply) have no empty-commit signal,
+/// Wirings that take no WIP snapshot have no empty-commit signal,
 /// so this is the only Git evidence available to their stall accounting. A
 /// query that cannot be answered returns `None`, which is treated as "no
 /// evidence" rather than as progress.
@@ -1658,12 +1643,12 @@ async fn repository_content_digest(workspace_path: &Path) -> String {
 
 /// Execute apply iterations until tasks are complete or max iterations reached.
 ///
-/// This is the unified apply loop used by both serial and parallel modes.
+/// This is the unified apply loop every frontend uses.
 ///
 /// # Arguments
 ///
 /// * `change_id` - The change to apply
-/// * `workspace_path` - Working directory (worktree for parallel, repo root for serial)
+/// * `workspace_path` - The managed worktree this change executes in
 /// * `config` - Orchestrator configuration
 /// * `agent` - Agent runner for executing commands
 /// * `vcs_backend` - VCS backend (Git, Auto, etc.)
@@ -1725,11 +1710,10 @@ where
     // Check if VCS is Git for WIP/stall features
     let is_git = matches!(vcs_backend, VcsBackend::Git);
 
-    // Serial apply runs against the repository itself and takes no WIP snapshot,
-    // so it has no empty-commit signal. Repository fingerprints around each
-    // dispatch supply the Git/file evidence its stall accounting would otherwise
-    // lack.
-    let serial_git_progress_accounting = is_git && workspace_manager.is_none();
+    // A wiring without a workspace manager takes no WIP snapshot, so it has no
+    // empty-commit signal. Repository fingerprints around each dispatch supply
+    // the Git/file evidence its stall accounting would otherwise lack.
+    let fingerprint_progress_accounting = is_git && workspace_manager.is_none();
 
     let apply_succeeded = loop {
         // Dispatches reserved for this change so far, across every Apply entry in
@@ -1969,7 +1953,7 @@ where
         // Repository fingerprint taken immediately before the dispatch. Modes
         // without a WIP snapshot compare it against a fresh one after a failed
         // attempt so real Git/file work still counts as progress.
-        let pre_dispatch_fingerprint = if serial_git_progress_accounting {
+        let pre_dispatch_fingerprint = if fingerprint_progress_accounting {
             repository_progress_fingerprint(workspace_path).await
         } else {
             None
@@ -2567,7 +2551,7 @@ where
             debug!("Skipping WIP snapshot for {} (non-Git backend)", change_id);
         }
 
-        // Modes without a WIP snapshot (serial apply, non-Git backends) never
+        // Wirings without a WIP snapshot (non-Git backends) never
         // reach the block above, so an ordinary command failure must still
         // register with existing stall policy. Without this, `max_iterations = 0`
         // could retry a permanently failing command forever instead of reaching
@@ -2837,6 +2821,45 @@ fn format_apply_failure_diagnostic(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Change-level apply hooks always carry managed-worktree identity, and the
+    /// run-level context stays workspace-neutral.
+    ///
+    /// There is no workspace-free change-level constructor to test against any
+    /// more: the type itself requires the workspace path and group index.
+    mod change_level_hook_context {
+        use super::*;
+        use crate::hooks::HookContext;
+
+        #[test]
+        fn a_change_level_context_publishes_workspace_and_group_identity() {
+            let ctx = ApplyLoopHookContext::new(1, 3, 2, "/tmp/ws/change-a".to_string(), 4);
+            let vars = ctx.build_hook_context("change-a", 2, 5, 7).to_env_vars();
+
+            assert_eq!(
+                vars.get("OPENSPEC_WORKSPACE_PATH"),
+                Some(&"/tmp/ws/change-a".to_string()),
+                "change-level apply always runs in a managed worktree"
+            );
+            assert_eq!(vars.get("OPENSPEC_GROUP_INDEX"), Some(&"4".to_string()));
+            assert_eq!(
+                vars.get("OPENSPEC_CHANGE_ID"),
+                Some(&"change-a".to_string())
+            );
+            assert_eq!(vars.get("OPENSPEC_APPLY_COUNT"), Some(&"7".to_string()));
+        }
+
+        /// Run-level hooks (`on_start`, `on_finish`) describe the whole run, so
+        /// they keep publishing no workspace or group identity.
+        #[test]
+        fn a_run_level_context_stays_workspace_neutral() {
+            let vars = HookContext::new(0, 3, 3, false).to_env_vars();
+
+            assert_eq!(vars.get("OPENSPEC_WORKSPACE_PATH"), None);
+            assert_eq!(vars.get("OPENSPEC_GROUP_INDEX"), None);
+            assert_eq!(vars.get("OPENSPEC_TOTAL_CHANGES"), Some(&"3".to_string()));
+        }
+    }
 
     /// Stall accounting for a failed Apply attempt asks one question: did the
     /// repository move? These pin the evidence that answers it.
@@ -3375,7 +3398,7 @@ mod tests {
             VcsBackend::Auto,
             None,
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -3431,7 +3454,7 @@ mod tests {
             VcsBackend::Auto,
             None,
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -3590,7 +3613,7 @@ mod tests {
             VcsBackend::Git,
             Some(&workspace_manager),
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -3668,7 +3691,7 @@ mod tests {
             VcsBackend::Git,
             Some(&workspace_manager),
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -3750,7 +3773,7 @@ mod tests {
             VcsBackend::Git,
             Some(&workspace_manager),
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -3809,7 +3832,7 @@ mod tests {
                     VcsBackend::Auto,
                     None,
                     None,
-                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
                     &NoOpEventHandler,
                     None,
                     &ai_runner,
@@ -4019,7 +4042,7 @@ mod tests {
                     VcsBackend::Git,
                     Some(&workspace_manager),
                     None,
-                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
                     &NoOpEventHandler,
                     None,
                     &ai_runner,
@@ -4154,7 +4177,7 @@ mod tests {
                     VcsBackend::Git,
                     Some(&workspace_manager),
                     None,
-                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
                     &NoOpEventHandler,
                     None,
                     &ai_runner,
@@ -4237,7 +4260,7 @@ mod tests {
                     VcsBackend::Auto,
                     None,
                     None,
-                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
                     &NoOpEventHandler,
                     None,
                     &ai_runner,
@@ -4293,7 +4316,7 @@ mod tests {
             VcsBackend::Auto,
             None,
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -4351,7 +4374,7 @@ mod tests {
                     VcsBackend::Auto,
                     None,
                     None,
-                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
                     &NoOpEventHandler,
                     None,
                     &ai_runner,
@@ -4520,7 +4543,7 @@ mod tests {
             VcsBackend::Git,
             Some(&workspace_manager),
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -4587,7 +4610,7 @@ mod tests {
             VcsBackend::Git,
             Some(&workspace_manager),
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -4646,7 +4669,7 @@ mod tests {
             VcsBackend::Git,
             Some(&workspace_manager),
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -5084,9 +5107,9 @@ mod apply_commit_recovery {
 
     /// Run the shared loop the way a caller wires it.
     ///
-    /// `with_workspace_manager` is the only difference between the two callers:
-    /// parallel mode passes a manager (and therefore has a final commit to
-    /// recover), serial mode passes `None`.
+    /// `with_workspace_manager` is the only difference between the two wirings:
+    /// with a manager the loop owns a final commit to recover; without one it
+    /// completes with nothing to recover.
     async fn run_recovery_loop_as(
         repo: &RecoveryRepo,
         change_id: &str,
@@ -5111,7 +5134,7 @@ mod apply_commit_recovery {
                     VcsBackend::Git,
                     workspace_manager,
                     None,
-                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
                     &NoOpEventHandler,
                     None,
                     &ai_runner,
@@ -5155,7 +5178,7 @@ mod apply_commit_recovery {
                     VcsBackend::Git,
                     Some(&ws_mgr),
                     None,
-                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
                     event_handler,
                     None,
                     &ai_runner,
@@ -6092,7 +6115,8 @@ mod apply_commit_recovery {
     }
 
     /// Stand-in for the failure mapping both callers apply to a loop error:
-    /// serial returns it unchanged, parallel renders it as `Apply failed: {e}`.
+    /// The shared loop returns it unchanged; the workspace executor renders it
+    /// as `Apply failed: {e}`.
     fn caller_visible_failure(result: &Result<ApplyLoopResult>) -> Option<String> {
         result
             .as_ref()
@@ -6226,36 +6250,41 @@ mod apply_commit_recovery {
 
     #[cfg_attr(windows, ignore)]
     #[tokio::test]
-    async fn serial_and_parallel_callers_observe_the_same_shared_loop_contract() {
-        // Serial mode passes no workspace manager, so it has no final Apply
-        // commit and nothing to recover; its outcome must be unchanged.
-        let serial_repo = recovery_repo("caller-serial", COMPLETE_TASKS);
-        serial_repo.block_commits();
-        let serial_config = OrchestratorConfig {
+    async fn both_workspace_manager_wirings_observe_the_same_shared_loop_contract() {
+        // Without a workspace manager there is no final Apply commit and
+        // nothing to recover; the outcome must be unchanged.
+        let unmanaged_repo = recovery_repo("caller-no-manager", COMPLETE_TASKS);
+        unmanaged_repo.block_commits();
+        let unmanaged_config = OrchestratorConfig {
             apply_command: Some("true".to_string()),
             max_iterations: Some(3),
             ..Default::default()
         };
-        let serial_head_before = serial_repo.head_subject();
+        let unmanaged_head_before = unmanaged_repo.head_subject();
 
-        let serial_result =
-            run_recovery_loop_as(&serial_repo, "caller-serial", &serial_config, false).await;
+        let unmanaged_result = run_recovery_loop_as(
+            &unmanaged_repo,
+            "caller-no-manager",
+            &unmanaged_config,
+            false,
+        )
+        .await;
 
-        assert_eq!(caller_visible_failure(&serial_result), None);
+        assert_eq!(caller_visible_failure(&unmanaged_result), None);
         assert!(
-            serial_result
-                .expect("serial wiring must keep completing without a final commit")
+            unmanaged_result
+                .expect("a manager-free wiring must keep completing without a final commit")
                 .completed
         );
-        assert_eq!(serial_repo.head_subject(), serial_head_before);
+        assert_eq!(unmanaged_repo.head_subject(), unmanaged_head_before);
         assert_eq!(
-            serial_repo.hook_runs(),
+            unmanaged_repo.hook_runs(),
             0,
-            "serial wiring has no final commit, so no verification runs"
+            "a manager-free wiring has no final commit, so no verification runs"
         );
 
-        // Parallel mode passes a workspace manager and therefore owns the
-        // recovery, but the recovery lives in the shared loop rather than in
+        // The production wiring passes a workspace manager and therefore owns
+        // the recovery, but the recovery lives in the shared loop rather than in
         // the caller: the caller still just reads completion or an error.
         let parallel_repo = recovery_repo("caller-parallel", COMPLETE_TASKS);
         parallel_repo.block_commits();
@@ -6275,7 +6304,7 @@ mod apply_commit_recovery {
         assert_eq!(caller_visible_failure(&parallel_result), None);
         assert!(
             parallel_result
-                .expect("parallel wiring must recover inside the shared loop")
+                .expect("the managed wiring must recover inside the shared loop")
                 .completed
         );
         assert_eq!(parallel_repo.head_subject(), "Apply: caller-parallel");
@@ -6462,7 +6491,7 @@ mod apply_budget_recovery {
             VcsBackend::Git,
             None,
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             event_handler,
             None,
             &ai_runner,
@@ -6762,7 +6791,7 @@ mod apply_budget_recovery {
             VcsBackend::Git,
             None,
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -6868,7 +6897,7 @@ mod apply_budget_recovery {
             VcsBackend::Git,
             None,
             None,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,
@@ -6939,7 +6968,7 @@ mod apply_dispatch_authorization {
             VcsBackend::Git,
             None,
             hooks,
-            &ApplyLoopHookContext::serial(0, 1, 1),
+            &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
             &NoOpEventHandler,
             None,
             &ai_runner,

@@ -4,7 +4,7 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
-use crate::orchestration::operator_command::{OperatorOutcome, QueueMutation};
+use crate::orchestration::operator_command::QueueMutation;
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
     SchedulerEffect,
@@ -488,54 +488,6 @@ pub async fn handle_tui_command(
         TuiCommand::DeleteWorktree(intent) => {
             handle_delete_worktree_command(intent, ctx).await;
         }
-        TuiCommand::SetParallelMode(enabled) => {
-            // Adapter only: the shared service owns the Select/Stopped guard,
-            // the availability guard, and the ineligible mark and queue-intent
-            // cleanup. The TUI adopts the resulting toggle and reports what the
-            // service actually did, so `=` and `/api/v2` cannot diverge.
-            let service = ctx.run_control.operator();
-            match service
-                .set_parallel_mode(ctx.app.operator_mode(), enabled)
-                .await
-            {
-                Ok(OperatorOutcome::ParallelMode { enabled, cleared }) => {
-                    ctx.app.sync_parallel_mode_from_runtime();
-                    ctx.app.apply_display_statuses_from_reducer(
-                        &shared_state.read().await.all_display_statuses(),
-                    );
-                    ctx.app.add_log(LogEntry::info(format!(
-                        "Parallel mode {}",
-                        if enabled { "enabled" } else { "disabled" }
-                    )));
-                    if !cleared.is_empty() {
-                        let message = format!(
-                            "Removed uncommitted changes from queue in parallel mode: {}",
-                            cleared.join(", ")
-                        );
-                        ctx.app.warning_message = Some(message.clone());
-                        ctx.app.add_log(LogEntry::warn(message));
-                    }
-                }
-                Ok(OperatorOutcome::NoOp { .. }) => {
-                    // Never silent: a keypress that changed nothing has to say so.
-                    let message = format!(
-                        "Parallel mode already {}",
-                        if enabled { "enabled" } else { "disabled" }
-                    );
-                    ctx.app.warning_message = Some(message.clone());
-                    ctx.app.add_log(LogEntry::info(message));
-                }
-                Ok(other) => debug!(
-                    "Parallel toggle produced an unexpected outcome: {:?}",
-                    other
-                ),
-                Err(error) => {
-                    let message = format!("Parallel mode change rejected: {}", error);
-                    ctx.app.warning_message = Some(message.clone());
-                    ctx.app.add_log(LogEntry::warn(message));
-                }
-            }
-        }
         TuiCommand::Stop => {
             // Adapter only: the shared service owns the mode matrix and the
             // graceful-stop request. The TUI projects the accepted outcome onto
@@ -936,10 +888,9 @@ mod tests {
         }
 
         pub(super) fn with_config(change_ids: &[&str], config: OrchestratorConfig) -> Self {
-            let state = Arc::new(RwLock::new(OrchestratorState::with_mode(
+            let state = Arc::new(RwLock::new(OrchestratorState::new(
                 change_ids.iter().map(|id| id.to_string()).collect(),
                 10,
-                crate::orchestration::state::ExecutionMode::Parallel,
             )));
             Self::over(state, DynamicQueue::new(), config)
         }
@@ -952,7 +903,6 @@ mod tests {
             let (tx, rx) = mpsc::channel(256);
             let marks = Arc::new(ExecutionMarkStore::new());
             let parallel = Arc::new(StartEligibility::new());
-            parallel.set_available(true);
             let hook_runner = crate::hooks::HookRunner::with_event_tx(
                 config.get_hooks(),
                 PathBuf::from("."),
@@ -1003,9 +953,7 @@ mod tests {
             app.set_shared_state(self.state.clone());
             app.set_resolve_reservations(self.resolves.clone());
             app.set_execution_marks(self.marks.clone());
-            app.parallel_available = true;
             app.set_parallel_runtime(self.parallel.clone());
-            app.sync_parallel_mode_from_runtime();
             app
         }
 
@@ -2561,10 +2509,8 @@ mod run_supervisor_tests {
     /// The recoverable-error projection a failed publication leaves behind.
     async fn per_change_upstream_failed_publication_state() -> Arc<RwLock<OrchestratorState>> {
         use crate::events::ExecutionEvent;
-        use crate::orchestration::state::ExecutionMode;
 
-        let mut state =
-            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("alpha".to_string()));
         state.apply_execution_event(&ExecutionEvent::PushStarted {
             change_id: "alpha".to_string(),
@@ -2618,7 +2564,6 @@ mod run_supervisor_tests {
         let queue = DynamicQueue::new();
         let marks = Arc::new(ExecutionMarkStore::new());
         marks.set("alpha", true);
-        let parallel_mode = Arc::new(AtomicBool::new(true));
         let supervisor = Arc::new(TuiRunSupervisor::new(
             root.clone(),
             config.clone(),
@@ -2629,7 +2574,6 @@ mod run_supervisor_tests {
             PostArchiveAction::MergeToBase,
             Some(upstream_runtime()),
             Arc::new(AtomicBool::new(false)),
-            parallel_mode,
             #[cfg(feature = "web-monitoring")]
             None,
         ));
@@ -2647,7 +2591,6 @@ mod run_supervisor_tests {
         ));
 
         let mut app = AppState::new(vec![create_test_change("alpha")]);
-        app.parallel_mode = true;
         app.set_shared_state(shared_state.clone());
         app.apply_display_statuses_from_reducer(&shared_state.read().await.all_display_statuses());
         assert_eq!(app.changes[0].display_status_cache, "error");
@@ -2715,75 +2658,5 @@ mod run_supervisor_tests {
             "resumed publication must not redispatch apply or acceptance: {}",
             std::fs::read_to_string(&dispatched).unwrap_or_default()
         );
-    }
-
-    /// The `=` toggle is accepted in Select/Stopped mode, so an opted-in session
-    /// can reach the serial dispatch branch — which carries no upstream runtime
-    /// and would finalize completions as terminal `merged` with nothing
-    /// published. Startup validation cannot see that; dispatch must refuse it.
-    #[tokio::test]
-    async fn per_change_upstream_serial_dispatch_is_refused_while_publication_is_owed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dispatched = dir.path().join("dispatched.txt");
-        let config = OrchestratorConfig {
-            apply_command: Some(format!(
-                "sh -c 'echo apply >> \"{}\"'",
-                dispatched.display()
-            )),
-            ..OrchestratorConfig::default()
-        };
-
-        let (tx, _rx) = mpsc::channel(64);
-        let state = Arc::new(RwLock::new(OrchestratorState::with_mode(
-            vec!["alpha".to_string()],
-            0,
-            crate::orchestration::state::ExecutionMode::Parallel,
-        )));
-        // Serial mode while the session is opted in.
-        let parallel_mode = Arc::new(AtomicBool::new(false));
-        let supervisor = TuiRunSupervisor::new(
-            dir.path().to_path_buf(),
-            config,
-            tx,
-            DynamicQueue::new(),
-            state,
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            PostArchiveAction::MergeToBase,
-            Some(upstream_runtime()),
-            Arc::new(AtomicBool::new(false)),
-            parallel_mode.clone(),
-            #[cfg(feature = "web-monitoring")]
-            None,
-        );
-
-        let refusal = supervisor
-            .start_run(vec!["alpha".to_string()], false)
-            .await
-            .expect_err("an opted-in session must not dispatch serial work");
-
-        assert!(
-            refusal.contains("-u/--integrate-upstream"),
-            "the refusal must say why: {refusal}"
-        );
-        assert!(!supervisor.is_running(), "no run may have been spawned");
-        assert!(
-            !dispatched.exists(),
-            "the refused dispatch must run no apply command"
-        );
-
-        // Restoring parallel mode restores the publication contract.
-        parallel_mode.store(true, std::sync::atomic::Ordering::SeqCst);
-        supervisor
-            .start_run(Vec::new(), false)
-            .await
-            .expect("parallel dispatch is allowed for an opted-in session");
-        let (handle, cancel) = supervisor.take_run();
-        if let Some(cancel) = cancel {
-            cancel.cancel();
-        }
-        if let Some(handle) = handle {
-            handle.abort();
-        }
-        let _ = create_test_change("alpha");
     }
 }

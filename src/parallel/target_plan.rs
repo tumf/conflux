@@ -61,10 +61,7 @@ impl ParallelExecutor {
         let (mut committed, skipped) = filter_committed_changes_at(&self.repo_root, active).await?;
 
         if !skipped.is_empty() {
-            let message = format!(
-                "Skipping uncommitted changes in parallel mode: {}",
-                skipped.join(", ")
-            );
+            let message = format!("Skipping uncommitted changes: {}", skipped.join(", "));
             tracing::warn!("{}", message);
             send_event(
                 &self.event_tx,

@@ -72,7 +72,7 @@ async fn record_stall_in_shared_state(
 /// therefore routed through the same classifier the retry-policy stall uses, so
 /// no category is invented, no unblock condition is fabricated, and a stop can
 /// never acquire an external category by taking a different code path. This is
-/// the parallel expression of serial's `hold_repair_stop`.
+/// the workspace expression of the shared `hold_repair_stop` policy.
 fn repair_stop_stalled_blocker(
     stop: &crate::orchestration::acceptance::AcceptanceRepairStop,
     error_summary: &str,
@@ -1646,7 +1646,7 @@ impl ParallelExecutor {
         let apply_budget = self.apply_budget.clone();
         // Configured hooks travel into the workspace task so parallel Apply runs
         // the same `pre_apply`/`post_apply`/`on_error`/`on_change_complete`
-        // sequence serial does, instead of silently dropping them.
+        // sequence the shared policy defines, instead of silently dropping them.
         let hooks = self.hooks.clone();
         let workspace = workspace_val;
 
@@ -1939,7 +1939,7 @@ impl ParallelExecutor {
             let mut acceptance_retry = AcceptanceRetryContext::default();
             if explicit_retry {
                 // Explicit operator retry: release the automatic per-finding
-                // repair budget through the same shared API serial calls, so both
+                // repair budget through the same shared API every caller uses, so both
                 // modes grant exactly one more repair opportunity per retry.
                 // Parallel's ledger is per-dispatch, so this starts from an empty
                 // budget by construction; calling the release keeps the two
@@ -1949,13 +1949,13 @@ impl ParallelExecutor {
                     .reset_for_explicit_retry();
             }
             // Consecutive missing-verdict accounting for this active run only,
-            // shared with serial orchestration. It is independent from the
+            // shared across the orchestration policy API. It is independent from the
             // configured explicit-CONTINUE budget and is never persisted, so a
             // restart re-runs acceptance from workspace state instead of
             // resuming a protocol-retry sequence.
             let mut protocol = AcceptanceProtocolDriver::default();
             // Consecutive Acceptance command-failure accounting for this dispatch
-            // only, shared with serial orchestration through the same policy API.
+            // only, shared across orchestration through the same policy API.
             // It is independent from the protocol, explicit-CONTINUE, and
             // FAIL-to-Apply cycle budgets and is never persisted.
             let mut acceptance_command_recovery =
@@ -2798,8 +2798,8 @@ impl ParallelExecutor {
                         {
                             cancel_monitor.abort();
                             // A coverage stop is an execution hold, not a
-                            // failure: same stalled presentation serial reaches
-                            // through `ChangeProcessResult::Stalled`.
+                            // failure: it reaches the operator as a stalled
+                            // presentation rather than an execution error.
                             return hold_repair_stop(
                                 change_id,
                                 workspace.name,
@@ -3084,7 +3084,7 @@ impl ParallelExecutor {
                         );
                         // Per-finding accounting runs before the broad semantic
                         // comparison so a repeated ID stops automatic repair even
-                        // when unrelated files changed. Serial makes the same call.
+                        // when unrelated files changed.
                         let mut repair_ledger = acceptance_retry.repair_ledger.clone();
                         let repair = repair_ledger.observe_fail(&normalized);
                         let previous_fail_revision = acceptance_retry.fail_revision.clone();
@@ -3116,8 +3116,8 @@ impl ParallelExecutor {
                             );
                             cancel_monitor.abort();
                             // A repeated finding ID is an execution hold, not a
-                            // failure: same stalled presentation serial reaches
-                            // through `ChangeProcessResult::Stalled`.
+                            // failure: it reaches the operator as a stalled
+                            // presentation rather than an execution error.
                             return hold_repair_stop(
                                 change_id,
                                 workspace.name,
@@ -3157,9 +3157,9 @@ impl ParallelExecutor {
                             // prerequisites: no category is invented, no unblock
                             // condition is fabricated, and nothing durable is
                             // written. They classify as execution `stalled`, the
-                            // same outcome serial mode reaches, so both modes
-                            // agree and neither presents this as a wait on a
-                            // named prerequisite.
+                            // outcome the shared policy reaches, so every frontend
+                            // agrees and none presents this as a wait on a named
+                            // prerequisite.
                             let error = format!(
                                 "Acceptance stopped retrying {change_id} ({reason}). External blocker \
                                  context: {}. Explicit retry is required.",

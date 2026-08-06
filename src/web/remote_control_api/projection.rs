@@ -446,7 +446,6 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
                     mode,
                     &display_status,
                     change.blocker.as_ref(),
-                    source.parallel.mode.is_parallel(),
                     change.parallel.eligible,
                 ),
                 display_status,
@@ -498,16 +497,15 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
 /// change, but advertising "resolve" on a change that is not waiting on a merge
 /// describes an operation nobody asked for.
 ///
-/// `parallel_mode` and `parallel_eligible` gate the mark actions the same way
+/// `parallel_eligible` gates the mark actions the same way
 /// [`crate::orchestration::operator_command::classify_bulk_mark_row`] gates a
-/// bulk mutation: a row parallel mode would refuse to start must not be
+/// bulk mutation: a row worktree execution would refuse to start must not be
 /// advertised as markable, or a client would mark it and then watch start
 /// refuse the whole set.
 fn classify_actions(
     mode: OperatorMode,
     display_status: &str,
     blocker: Option<&ChangeBlocker>,
-    parallel_mode: bool,
     parallel_eligible: bool,
 ) -> ChangeActions {
     let final_status = is_final_status(display_status);
@@ -522,9 +520,9 @@ fn classify_actions(
     };
 
     // Precedence matches `classify_bulk_mark_row`: a final status is reported as
-    // final rather than as a parallel problem, because committing the change
+    // final rather than as an eligibility problem, because committing the change
     // would not make it markable again.
-    let parallel_blocked = parallel_mode && !parallel_eligible && !final_status;
+    let parallel_blocked = !parallel_eligible && !final_status;
     let parallel_reason =
         ActionBlockedReason::from_mark_exclusion(MarkExclusion::ParallelIneligible);
 
@@ -578,8 +576,7 @@ fn classify_actions(
     }
 }
 
-/// Action eligibility for an `app_mode`/status pair in sequential mode, for
-/// tests and fixtures.
+/// Action eligibility for an `app_mode`/status pair, for tests and fixtures.
 #[cfg(test)]
 pub fn change_actions_for_test(
     app_mode: &str,
@@ -590,12 +587,12 @@ pub fn change_actions_for_test(
         OperatorMode::from_app_mode(app_mode),
         display_status,
         blocker,
-        false,
         true,
     )
 }
 
-/// Action eligibility for an `app_mode`/status pair in parallel mode.
+/// Action eligibility for an `app_mode`/status pair with an explicit worktree
+/// eligibility.
 #[cfg(test)]
 pub fn parallel_change_actions_for_test(
     app_mode: &str,
@@ -606,7 +603,6 @@ pub fn parallel_change_actions_for_test(
         OperatorMode::from_app_mode(app_mode),
         display_status,
         None,
-        true,
         parallel_eligible,
     )
 }
@@ -671,7 +667,6 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
 
     match event {
         E::ProcessingStarted(id) => ("processing_started", Some(id.clone()), json!({})),
-        E::ProcessingCompleted(id) => ("processing_completed", Some(id.clone()), json!({})),
         E::ProcessingError { id, error } => (
             "processing_error",
             Some(id.clone()),

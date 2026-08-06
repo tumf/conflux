@@ -163,7 +163,7 @@ pub fn classify_mark_route(mode: OperatorMode, display_status: &str) -> MarkRout
     }
 }
 
-/// Why parallel mode refuses a change, or that it does not.
+/// Why worktree execution refuses a change, or that it does not.
 ///
 /// Parallel eligibility is two independent workspace observations, and a
 /// frontend has to keep them apart: dirty proposal content is something the
@@ -232,11 +232,11 @@ impl ParallelEligibility {
     }
 }
 
-/// Reason text for intent cleared because parallel mode refuses a change.
+/// Reason text for intent cleared because worktree execution refuses a change.
 ///
 /// Deliberately reason-agnostic: the cleanup pass clears every ineligible row,
 /// so naming one specific cause would mislabel the others.
-pub const PARALLEL_INELIGIBLE_CLEANUP_REASON: &str = "not eligible for parallel execution";
+pub const PARALLEL_INELIGIBLE_CLEANUP_REASON: &str = "not eligible for worktree execution";
 
 /// Why a change is excluded from a bulk execution-mark mutation.
 ///
@@ -254,9 +254,9 @@ pub enum MarkExclusion {
     ChangeActive,
     /// The mode/status pair refuses this mutation.
     StatusImmutable,
-    /// Parallel mode cannot queue a change with uncommitted proposal files.
+    /// A change with uncommitted proposal files cannot be queued.
     ParallelIneligible,
-    /// Parallel mode cannot queue a change whose proposal is absent from `HEAD`.
+    /// A change whose proposal is absent from `HEAD` cannot be queued.
     ParallelProposalAbsent,
 }
 
@@ -293,8 +293,8 @@ impl MarkExclusion {
             Self::StopPending => "waiting for the pending stop",
             Self::ChangeActive => "in progress (use K to stop)",
             Self::StatusImmutable => "not mutable in this mode",
-            Self::ParallelIneligible => "uncommitted in parallel mode (commit first)",
-            Self::ParallelProposalAbsent => "not present in HEAD (cannot queue in parallel mode)",
+            Self::ParallelIneligible => "uncommitted (commit first)",
+            Self::ParallelProposalAbsent => "not present in HEAD (cannot queue)",
         }
     }
 }
@@ -373,11 +373,10 @@ pub fn supports_bulk_marks(mode: OperatorMode) -> bool {
 /// row an individual command would refuse.
 pub fn classify_bulk_mark_row(
     mode: OperatorMode,
-    parallel_mode: bool,
     display_status: &str,
     parallel_eligibility: ParallelEligibility,
 ) -> Option<MarkExclusion> {
-    if parallel_mode && !is_final_status(display_status) {
+    if !is_final_status(display_status) {
         // The refusal is identical for every ineligible reason; only the reason
         // reported back to the operator differs.
         if let Some(exclusion) = parallel_eligibility.mark_exclusion() {
@@ -405,11 +404,7 @@ pub fn classify_bulk_mark_row(
 /// One classification pass over one coherent set of rows is what makes a bulk
 /// mutation atomic in meaning: the target state cannot shift halfway through
 /// because a row was re-read at a different instant.
-pub fn plan_bulk_marks(
-    mode: OperatorMode,
-    parallel_mode: bool,
-    rows: &[MarkTargetRow<'_>],
-) -> BulkMarkPlan {
+pub fn plan_bulk_marks(mode: OperatorMode, rows: &[MarkTargetRow<'_>]) -> BulkMarkPlan {
     let mut eligible = Vec::new();
     let mut excluded = Vec::new();
     let mut any_unmarked = false;
@@ -423,12 +418,7 @@ pub fn plan_bulk_marks(
     }
 
     for row in rows {
-        match classify_bulk_mark_row(
-            mode,
-            parallel_mode,
-            row.display_status,
-            row.parallel_eligibility,
-        ) {
+        match classify_bulk_mark_row(mode, row.display_status, row.parallel_eligibility) {
             Some(reason) => excluded.push((row.change_id.to_string(), reason)),
             None => {
                 any_unmarked |= !row.marked;
@@ -445,12 +435,11 @@ pub fn plan_bulk_marks(
     }
 }
 
-/// Changes whose mark and queue presentation enabling parallel mode must clear.
+/// Changes whose mark and queue presentation an eligibility refresh must clear.
 ///
-/// Shared so the TUI toggle and the remote `set_parallel_mode` command clean up
-/// exactly the same rows: an ineligible change that carries operator intent —
-/// a mark, a queue intent, or both — cannot stay in a target set parallel mode
-/// would refuse to start.
+/// Shared so every frontend cleans up exactly the same rows: an ineligible
+/// change that carries operator intent — a mark, a queue intent, or both —
+/// cannot stay in a target set worktree execution would refuse to start.
 pub fn parallel_cleanup_targets(rows: &[ParallelCleanupRow<'_>]) -> Vec<String> {
     rows.iter()
         .filter(|row| !row.parallel_eligible && (row.marked || row.queued))
@@ -475,36 +464,29 @@ pub struct ParallelCleanupRow<'a> {
 // Parallel runtime (process-local)
 // ============================================================================
 
-/// Sequential/parallel runtime facts for this process incarnation.
+/// Worktree runtime facts for this process incarnation.
 ///
-/// One store, shared by every frontend. Parallel eligibility is derived from
+/// One store, shared by every frontend. Worktree eligibility is derived from
 /// workspace observation that only the frontend running the refresh loop
-/// performs, and the toggle itself is operator intent — publishing both here is
-/// what lets a keypress and a remote command read and mutate the *same* value
-/// instead of each keeping a copy that can drift.
+/// performs; publishing it here is what lets a keypress and a remote command
+/// read the *same* value instead of each keeping a copy that can drift.
 ///
-/// Nothing here is durable: a restart re-observes the workspace and re-resolves
-/// the configured mode.
+/// Nothing here is durable: a restart re-observes the workspace.
 #[derive(Debug, Default)]
 pub struct ParallelRuntime {
     inner: Mutex<ParallelRuntimeInner>,
     /// Serializes whole operator mutations, not individual field accesses.
     ///
     /// `inner` makes one read or one write atomic; it cannot make a *sequence*
-    /// atomic, and both mutations that span the toggle await in the middle of
-    /// theirs. Enabling parallel mode clears the intent of every change parallel
-    /// mode refuses, and a bulk mark classifies against the toggle and then
-    /// awaits the reducer and the queue. Interleaved, a bulk mark that
-    /// classified in sequential mode can resume after the cleanup has run and
-    /// re-mark exactly the row the cleanup cleared. Holding this guard for the
-    /// whole of either mutation is what makes that impossible.
+    /// atomic. A bulk mark classifies against one observation and then awaits
+    /// the reducer and the queue; holding this guard for the whole mutation is
+    /// what keeps an interleaved mutation from re-marking a row another one
+    /// just cleared.
     mutations: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Default)]
 struct ParallelRuntimeInner {
-    mode: bool,
-    available: bool,
     max_concurrent: usize,
     vcs_backend: String,
     /// Ineligible changes only, each mapped to the reason it is refused.
@@ -514,13 +496,9 @@ struct ParallelRuntimeInner {
     ineligible: HashMap<String, ParallelEligibility>,
 }
 
-/// A coherent read of the parallel runtime facts.
+/// A coherent read of the worktree runtime facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParallelRuntimeFacts {
-    /// True when parallel execution is the active mode.
-    pub mode: bool,
-    /// True when parallel execution can be enabled at all (requires Git).
-    pub available: bool,
     /// Maximum number of concurrently executing changes.
     pub max_concurrent: usize,
     /// VCS backend the run would use.
@@ -528,7 +506,7 @@ pub struct ParallelRuntimeFacts {
 }
 
 impl ParallelRuntime {
-    /// Create an empty projection (sequential mode, nothing excluded).
+    /// Create an empty projection (nothing excluded).
     pub fn new() -> Self {
         Self::default()
     }
@@ -537,19 +515,6 @@ impl ParallelRuntime {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Publish the current parallel toggle. Returns true when it changed.
-    pub fn set_parallel_mode(&self, parallel_mode: bool) -> bool {
-        let mut guard = self.lock();
-        let changed = guard.mode != parallel_mode;
-        guard.mode = parallel_mode;
-        changed
-    }
-
-    /// Publish whether parallel execution can be enabled at all.
-    pub fn set_available(&self, available: bool) {
-        self.lock().available = available;
     }
 
     /// Publish the configured maximum concurrency.
@@ -562,7 +527,7 @@ impl ParallelRuntime {
         self.lock().vcs_backend = backend.into();
     }
 
-    /// Publish the changes parallel mode refuses to start, each with its reason.
+    /// Publish the changes worktree execution refuses to start, each with its reason.
     ///
     /// [`ParallelEligibility::Eligible`] entries are dropped rather than stored:
     /// an "ineligible" entry that claims eligibility would be a contradiction the
@@ -577,17 +542,7 @@ impl ParallelRuntime {
             .collect();
     }
 
-    /// True when parallel execution is the active mode.
-    pub fn parallel_mode(&self) -> bool {
-        self.lock().mode
-    }
-
-    /// True when parallel execution can be enabled at all.
-    pub fn is_available(&self) -> bool {
-        self.lock().available
-    }
-
-    /// True when the change may take part in parallel execution.
+    /// True when the change may take part in worktree execution.
     pub fn is_eligible(&self, change_id: &str) -> bool {
         !self.lock().ineligible.contains_key(change_id)
     }
@@ -601,7 +556,7 @@ impl ParallelRuntime {
             .unwrap_or_default()
     }
 
-    /// Every change parallel mode refuses, sorted for deterministic output.
+    /// Every change worktree execution refuses, sorted for deterministic output.
     pub fn ineligible_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.lock().ineligible.keys().cloned().collect();
         ids.sort();
@@ -612,8 +567,6 @@ impl ParallelRuntime {
     pub fn facts(&self) -> ParallelRuntimeFacts {
         let guard = self.lock();
         ParallelRuntimeFacts {
-            mode: guard.mode,
-            available: guard.available,
             max_concurrent: guard.max_concurrent,
             vcs_backend: guard.vcs_backend.clone(),
         }
@@ -628,15 +581,9 @@ impl ParallelRuntime {
         self.mutations.lock().await
     }
 
-    /// Targets that parallel mode refuses, in request order.
-    ///
-    /// Returns an empty vector in serial mode: parallel eligibility is not a
-    /// serial-mode constraint.
+    /// Targets that worktree execution refuses, in request order.
     pub fn rejected(&self, targets: &[String]) -> Vec<String> {
         let guard = self.lock();
-        if !guard.mode {
-            return Vec::new();
-        }
         targets
             .iter()
             .filter(|id| guard.ineligible.contains_key(*id))
@@ -710,11 +657,6 @@ pub enum OperatorCommand {
         /// Target change.
         change_id: String,
     },
-    /// Change the sequential/parallel toggle for the whole process.
-    SetParallelMode {
-        /// Requested toggle value.
-        enabled: bool,
-    },
     /// Apply one derived execution-mark state to every eligible change.
     SetAllExecutionMarks,
 }
@@ -752,8 +694,6 @@ pub enum NoOpReason {
     MarkUnchanged,
     /// The reducer rejected the intent in the current lifecycle state.
     ReducerRejected,
-    /// Parallel mode already had the requested value.
-    ParallelModeUnchanged,
     /// Every eligible row already carried the derived target mark.
     BulkMarksUnchanged,
     /// No row was eligible for the bulk mutation.
@@ -779,13 +719,6 @@ pub enum OperatorOutcome {
     },
     /// A retry was accepted and routed.
     Retry(RetryPlan),
-    /// The parallel toggle changed.
-    ParallelMode {
-        /// The mode that is now active.
-        enabled: bool,
-        /// Changes whose mark and queue intent were cleared, sorted.
-        cleared: Vec<String>,
-    },
     /// A bulk execution-mark mutation completed.
     BulkMarks {
         /// The single target state applied to every eligible row.
@@ -867,13 +800,6 @@ pub enum OperatorCommandError {
         /// Display status that carries no retryable evidence.
         display_status: String,
     },
-    /// The parallel toggle cannot be changed in this mode.
-    ParallelModeNotAllowed {
-        /// Mode the request arrived in.
-        mode: OperatorMode,
-    },
-    /// Parallel execution is not available in this workspace.
-    ParallelUnavailable,
     /// Bulk execution-mark mutation is not available in this mode.
     BulkMarksNotAllowed {
         /// Mode the request arrived in.
@@ -916,14 +842,6 @@ impl std::fmt::Display for OperatorCommandError {
             } => write!(
                 f,
                 "retry is not supported for '{change_id}' with status '{display_status}'"
-            ),
-            Self::ParallelModeNotAllowed { mode } => write!(
-                f,
-                "parallel mode cannot be changed in {mode:?} mode; stop the run first"
-            ),
-            Self::ParallelUnavailable => write!(
-                f,
-                "parallel execution is not available in this workspace (requires git)"
             ),
             Self::BulkMarksNotAllowed { mode } => write!(
                 f,
@@ -1208,9 +1126,6 @@ impl OperatorCommandService {
                 .retry_change(&change_id)
                 .await
                 .map(OperatorOutcome::Retry),
-            OperatorCommand::SetParallelMode { enabled } => {
-                self.set_parallel_mode(mode, enabled).await
-            }
             OperatorCommand::SetAllExecutionMarks => self.set_all_execution_marks(mode).await,
         }
     }
@@ -1257,76 +1172,6 @@ impl OperatorCommandService {
         }
     }
 
-    /// Change the sequential/parallel toggle for the whole process.
-    ///
-    /// Only `Select` and `Stopped` accept it: a live or stopping run already
-    /// owns scheduling decisions the toggle would invalidate. Enabling parallel
-    /// mode clears the mark and queue intent of every change parallel mode
-    /// refuses, so the target set a later start reads is coherent by
-    /// construction rather than rejected at start time.
-    ///
-    /// The cleanup and the toggle are one mutation, taken under the shared
-    /// mutation guard: a bulk mark cannot run between them, and no reader can
-    /// observe parallel mode while intent parallel mode refuses is still live.
-    pub async fn set_parallel_mode(
-        &self,
-        mode: OperatorMode,
-        enabled: bool,
-    ) -> OperatorResult<OperatorOutcome> {
-        if !matches!(mode, OperatorMode::Select | OperatorMode::Stopped) {
-            return Err(OperatorCommandError::ParallelModeNotAllowed { mode });
-        }
-
-        let _mutation = self.parallel.lock_mutations().await;
-
-        if enabled && !self.parallel.is_available() {
-            return Err(OperatorCommandError::ParallelUnavailable);
-        }
-        if self.parallel.parallel_mode() == enabled {
-            return Ok(OperatorOutcome::NoOp {
-                change_id: String::new(),
-                reason: NoOpReason::ParallelModeUnchanged,
-            });
-        }
-
-        // Only enabling can strand intent: serial mode refuses nothing. The
-        // cleanup runs *before* the toggle is published so the toggle becoming
-        // visible and the intent it invalidates disappearing are the same
-        // instant; the guard is what makes that ordering meaningful.
-        let mut cleared = Vec::new();
-        if enabled {
-            for change_id in self.cleanup_targets_for_parallel().await {
-                let unmarked = self.marks.set(&change_id, false);
-                let removed = self.remove_from_queue(&change_id).await?;
-                if unmarked || removed.reducer_changed || removed.dynamic_queue_mutated {
-                    cleared.push(change_id);
-                }
-            }
-        }
-        self.parallel.set_parallel_mode(enabled);
-
-        Ok(OperatorOutcome::ParallelMode { enabled, cleared })
-    }
-
-    /// Ineligible changes that currently carry operator intent, sorted.
-    async fn cleanup_targets_for_parallel(&self) -> Vec<String> {
-        let ineligible = self.parallel.ineligible_ids();
-        let guard = self.state.read().await;
-        let rows: Vec<ParallelCleanupRow<'_>> = ineligible
-            .iter()
-            .map(|change_id| ParallelCleanupRow {
-                change_id,
-                parallel_eligible: false,
-                marked: self.marks.is_marked(change_id),
-                queued: matches!(
-                    guard.change_runtime(change_id).map(|rt| &rt.queue_intent),
-                    Some(crate::orchestration::state::QueueIntent::Queued)
-                ),
-            })
-            .collect();
-        parallel_cleanup_targets(&rows)
-    }
-
     /// Apply one derived execution-mark state to every eligible change.
     ///
     /// The whole operation is classified from a single read of the reducer, so
@@ -1348,7 +1193,6 @@ impl OperatorCommandService {
 
         let _mutation = self.parallel.lock_mutations().await;
 
-        let parallel_mode = self.parallel.parallel_mode();
         // One read, one classification: re-reading per row could observe two
         // different instants and derive a target state from neither.
         let observed: Vec<(String, String, ParallelEligibility, bool)> = {
@@ -1376,7 +1220,7 @@ impl OperatorCommandService {
                 },
             )
             .collect();
-        let plan = plan_bulk_marks(mode, parallel_mode, &rows);
+        let plan = plan_bulk_marks(mode, &rows);
 
         if plan.is_empty() {
             return Ok(OperatorOutcome::NoOp {

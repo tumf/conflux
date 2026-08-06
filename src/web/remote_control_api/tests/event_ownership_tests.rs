@@ -2,8 +2,8 @@
 //!
 //! These hold the projection to the contract the dispatch owner promises: one
 //! internal event produces one ordered remote event, no field is dropped on the
-//! way out, a repeated delivery changes nothing, and serial and parallel modes
-//! publish the same thing for the same event.
+//! way out, a repeated delivery changes nothing, and every frontend publishes
+//! the same thing for the same event.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -13,26 +13,24 @@ use crate::events::{
     ownership_fixtures::all_execution_events, EventDispatch, EventOwnership, EventSink,
     ExecutionEvent, LogEntry,
 };
-use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+use crate::orchestration::state::OrchestratorState;
 use crate::web::remote_control_api::dto::{EventCategory, MAX_LOGS};
 use crate::web::remote_control_api::projection::describe_event;
 use crate::web::state::{WebEventSink, WebState};
 
-fn state_with(mode: ExecutionMode, ids: &[&str]) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
-    Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+fn state_with(ids: &[&str]) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
+    Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
         ids.iter().map(|id| id.to_string()).collect(),
         10,
-        mode,
     )))
 }
 
 /// A web frontend bound to a reducer through the single dispatch owner.
 async fn bound_web_state(
-    mode: ExecutionMode,
     ids: &[&str],
 ) -> (Arc<WebState>, Arc<tokio::sync::RwLock<OrchestratorState>>) {
     let web_state = Arc::new(WebState::new(&[]));
-    let reducer = state_with(mode, ids);
+    let reducer = state_with(ids);
     web_state.set_shared_state(reducer.clone()).await;
     (web_state, reducer)
 }
@@ -228,7 +226,7 @@ fn published_detail_is_sanitized_like_a_log_message() {
 /// event can move the revision.
 #[tokio::test]
 async fn every_event_allocates_exactly_one_sequence() {
-    let (web_state, reducer) = bound_web_state(ExecutionMode::Parallel, &["change-a"]).await;
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
     let projection = web_state.remote_control().projection();
     let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
 
@@ -264,7 +262,7 @@ async fn every_event_allocates_exactly_one_sequence() {
 /// A state event that changes nothing observable is a no-op revision.
 #[tokio::test]
 async fn repeating_a_state_event_does_not_advance_the_revision() {
-    let (web_state, reducer) = bound_web_state(ExecutionMode::Parallel, &["change-a"]).await;
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
     let projection = web_state.remote_control().projection();
     let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
 
@@ -294,7 +292,7 @@ async fn repeating_a_state_event_does_not_advance_the_revision() {
 /// The same dispatch delivered twice at the frontend boundary changes nothing.
 #[tokio::test]
 async fn duplicate_dispatch_delivery_is_a_no_op() {
-    let (web_state, reducer) = bound_web_state(ExecutionMode::Parallel, &["change-a"]).await;
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
     let projection = web_state.remote_control().projection();
 
     let event = ExecutionEvent::ProcessingStarted("change-a".to_string());
@@ -343,12 +341,12 @@ async fn duplicate_log_delivery_retains_one_entry() {
     assert_eq!(sequence, 1);
 }
 
-// ── Serial / parallel parity ─────────────────────────────────────────────────
+// ── Frontend parity ──────────────────────────────────────────────────────────
 
-/// The same event published in serial and in parallel mode reaches v2 with the
-/// same ownership, the same wire type, and the same retained-log count.
+/// The same event published through two frontends reaches v2 with the same
+/// ownership, the same wire type, and the same retained-log count.
 #[tokio::test]
-async fn serial_and_parallel_publish_identical_ownership() {
+async fn every_frontend_publishes_identical_ownership() {
     let log_carrying = [
         ExecutionEvent::Log(LogEntry::info("ai output").with_operation("apply")),
         ExecutionEvent::Log(LogEntry::warn("hook warning")),
@@ -371,8 +369,10 @@ async fn serial_and_parallel_publish_identical_ownership() {
     ];
 
     let mut observed = Vec::new();
-    for mode in [ExecutionMode::Serial, ExecutionMode::Parallel] {
-        let (web_state, reducer) = bound_web_state(mode, &["change-a"]).await;
+    // Two independent frontends of the one execution path must publish the
+    // identical ownership for the identical event stream.
+    for _ in 0..2 {
+        let (web_state, reducer) = bound_web_state(&["change-a"]).await;
         let projection = web_state.remote_control().projection();
         let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
 
@@ -395,24 +395,24 @@ async fn serial_and_parallel_publish_identical_ownership() {
         ));
     }
 
-    let (serial_logs, serial_sequence, serial_events) = &observed[0];
-    let (parallel_logs, parallel_sequence, parallel_events) = &observed[1];
+    let (first_logs, first_sequence, first_events) = &observed[0];
+    let (second_logs, second_sequence, second_events) = &observed[1];
     assert_eq!(
-        serial_logs, parallel_logs,
-        "the two modes retained different log counts"
+        first_logs, second_logs,
+        "two frontends retained different log counts"
     );
-    assert_eq!(*serial_logs, log_carrying.len());
-    assert_eq!(serial_sequence, parallel_sequence);
+    assert_eq!(*first_logs, log_carrying.len());
+    assert_eq!(first_sequence, second_sequence);
     assert_eq!(
-        serial_events, parallel_events,
-        "the two modes published different event ownership"
+        first_events, second_events,
+        "two frontends published different event ownership"
     );
-    assert!(serial_events
+    assert!(first_events
         .iter()
         .any(|(name, category)| name == "log" && *category == EventCategory::Log));
-    assert!(serial_events.iter().any(|(name, _)| name == "hook_failed"));
-    assert!(serial_events.iter().any(|(name, _)| name == "warning"));
-    assert!(serial_events
+    assert!(first_events.iter().any(|(name, _)| name == "hook_failed"));
+    assert!(first_events.iter().any(|(name, _)| name == "warning"));
+    assert!(first_events
         .iter()
         .any(|(name, _)| name == "acceptance_gated"));
 }
@@ -420,7 +420,7 @@ async fn serial_and_parallel_publish_identical_ownership() {
 /// Retention is bounded at the documented ring size, oldest first.
 #[tokio::test]
 async fn log_retention_is_bounded_and_ordered() {
-    let (web_state, reducer) = bound_web_state(ExecutionMode::Parallel, &["change-a"]).await;
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
     let projection = web_state.remote_control().projection();
     let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
 
@@ -459,7 +459,7 @@ async fn late_all_completed_preserves_retained_terminal_modes() {
             "error",
         ),
     ] {
-        let (web_state, reducer) = bound_web_state(ExecutionMode::Parallel, &["change-a"]).await;
+        let (web_state, reducer) = bound_web_state(&["change-a"]).await;
         let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
 
         dispatch(&reducer, &sinks, terminal.clone()).await;
@@ -481,7 +481,7 @@ async fn late_all_completed_preserves_retained_terminal_modes() {
 /// A completion that follows ordinary running state still completes.
 #[tokio::test]
 async fn all_completed_still_completes_a_healthy_run() {
-    let (web_state, reducer) = bound_web_state(ExecutionMode::Parallel, &["change-a"]).await;
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
     let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
 
     dispatch(
@@ -499,7 +499,7 @@ async fn all_completed_still_completes_a_healthy_run() {
 /// A duplicate `Stopped` reconciles without doubling anything a client sees.
 #[tokio::test]
 async fn duplicate_stopped_is_idempotent_on_the_stream() {
-    let (web_state, reducer) = bound_web_state(ExecutionMode::Parallel, &["change-a"]).await;
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
     let projection = web_state.remote_control().projection();
     let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
 
@@ -523,7 +523,7 @@ async fn duplicate_stopped_is_idempotent_on_the_stream() {
 async fn replay_and_gap_recovery_survive_ownership_consolidation() {
     use crate::web::remote_control_api::projection::EventsSince;
 
-    let (web_state, reducer) = bound_web_state(ExecutionMode::Parallel, &["change-a"]).await;
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
     let projection = web_state.remote_control().projection();
     let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
 

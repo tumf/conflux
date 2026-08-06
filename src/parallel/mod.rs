@@ -120,7 +120,7 @@ impl SchedulerRunReport {
     }
 }
 
-/// Terminal action after a change has been archived in parallel mode.
+/// Terminal action after a change has been archived.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PostArchiveAction {
     #[default]

@@ -35,7 +35,6 @@ impl AppState {
     fn dispatch_orchestrator_event(&mut self, event: OrchestratorEvent) {
         match event {
             OrchestratorEvent::ProcessingStarted(id) => self.handle_processing_started(id),
-            OrchestratorEvent::ProcessingCompleted(id) => self.handle_processing_completed(id),
             OrchestratorEvent::ProcessingError { id, error } => {
                 self.handle_processing_error(id, error)
             }

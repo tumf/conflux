@@ -12,7 +12,7 @@ use async_trait::async_trait;
 
 use crate::orchestration::operator_command::{
     MarkExclusion, MarkRoute, NoOpReason, OperatorCommandError, OperatorCommandService,
-    OperatorMode, OperatorOutcome, PARALLEL_INELIGIBLE_CLEANUP_REASON,
+    OperatorMode, OperatorOutcome,
 };
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
@@ -96,13 +96,8 @@ pub fn map_operator_error(error: &OperatorCommandError) -> CommandFailure {
         }
         // A mode that has to move on, not a target that has to change: the same
         // request succeeds once the run reaches Select or Stopped.
-        OperatorCommandError::ParallelModeNotAllowed { .. }
-        | OperatorCommandError::BulkMarksNotAllowed { .. } => {
+        OperatorCommandError::BulkMarksNotAllowed { .. } => {
             CommandFailure::new(ErrorCode::LifecycleConflict, error.to_string())
-        }
-        // Parallel execution needs Git; no lifecycle transition makes it appear.
-        OperatorCommandError::ParallelUnavailable => {
-            CommandFailure::new(ErrorCode::TargetIneligible, error.to_string())
         }
         // Termination did not confirm: the change is still occupying the root.
         OperatorCommandError::TerminationTimeout { .. } => {
@@ -143,21 +138,6 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
                 ExecutionSummary::changed(format!("retry accepted for {:?}", plan.change_ids))
             }
         }
-        OperatorOutcome::ParallelMode { enabled, cleared } => {
-            let mode = if *enabled { "parallel" } else { "sequential" };
-            if cleared.is_empty() {
-                ExecutionSummary::changed(format!("execution mode is now {mode}"))
-            } else {
-                // Naming the cleared rows is the whole point: an operator whose
-                // marks silently vanished cannot tell that from a lost command.
-                // The cleanup clears every ineligible row, so the reason stays
-                // generic rather than claiming they all had uncommitted files.
-                ExecutionSummary::changed(format!(
-                    "execution mode is now {mode}; cleared mark and queue intent for {cleared:?} \
-                     ({PARALLEL_INELIGIBLE_CLEANUP_REASON})"
-                ))
-            }
-        }
         OperatorOutcome::BulkMarks {
             marked,
             changed,
@@ -178,9 +158,6 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
             let why = match reason {
                 NoOpReason::MarkUnchanged => "execution mark already had the requested value",
                 NoOpReason::ReducerRejected => "the reducer produced no state change",
-                NoOpReason::ParallelModeUnchanged => {
-                    "execution mode already had the requested value"
-                }
                 NoOpReason::BulkMarksUnchanged => {
                     "every eligible change already carried the derived mark"
                 }
@@ -431,16 +408,9 @@ impl SharedServiceExecutor {
             CommandSpec::ResolveMerge { change_id } => {
                 self.run(self.run_control.resolve_merge(change_id).await)
             }
-            // Both process-wide mutations route through the same per-change
-            // service the TUI uses, so the toggle guard, the ineligible-mark
-            // cleanup, and the bulk classification have exactly one
+            // The process-wide mutation routes through the same per-change
+            // service the TUI uses, so the bulk classification has exactly one
             // implementation.
-            CommandSpec::SetParallelMode { enabled } => self
-                .service
-                .set_parallel_mode(mode, *enabled)
-                .await
-                .map(|outcome| summarize_outcome(&outcome))
-                .map_err(|error| map_operator_error(&error)),
             CommandSpec::SetAllExecutionMarks {} => self
                 .service
                 .set_all_execution_marks(mode)

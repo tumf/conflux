@@ -199,52 +199,25 @@ The shared reducer state that accepts `ResolveMerge` MUST be the same authoritat
 
 ### Requirement: Execution Mode Determines Archive Terminal Semantics
 
-In Serial mode, `ChangeArchived` SHALL set the terminal state to `Archived`.
-
-In Parallel mode, `ChangeArchived` SHALL NOT by itself set `MergeWait`. Parallel archive completion SHALL enter post-archive merge handling according to reducer-owned base-mutating lane state:
+`ChangeArchived` SHALL NOT be terminal by itself. Archive completion SHALL enter post-archive handling according to reducer-owned base-mutating lane state and the configured merge or push action:
 
 - when another non-terminal change occupies the base-mutating lane with `Resolving` or `Rejecting`, the archived change SHALL become `ResolveWait` and remain scheduler-consumable;
 - when no base-mutating lane blocker exists and no concrete manual blocker has been observed, the archived change SHALL become active `Resolving`;
-- only concrete manual deferral evidence, such as `MergeDeferred(auto_resumable=false)`, SHALL set `MergeWait`.
+- only concrete manual deferral evidence SHALL set `MergeWait`.
 
-<!-- Expected canonical result after archive: `orchestration-state` will no longer say parallel `ChangeArchived` unconditionally becomes `MergeWait`; it will describe resolving / resolve pending / merge wait as distinct reducer-owned outcomes. -->
+#### Scenario: archive without blocker enters resolving
 
-#### Scenario: parallel archive without blocker enters resolving
-
-**Given**: the orchestrator is running in Parallel execution mode
-**And**: no other non-terminal change is `Resolving` or `Rejecting`
+**Given**: no other non-terminal change is `Resolving` or `Rejecting`
 **When**: change `alpha` receives a `ChangeArchived` event
 **Then**: `alpha` has `ActivityState::Resolving`
-**And**: `alpha` does not have `WaitState::MergeWait`
-**And**: the derived display status is `resolving`
+**And**: `alpha` is not terminal solely because archive completed
 
-#### Scenario: parallel archive waits behind active base-mutating lane
+#### Scenario: archive waits behind active base-mutating lane
 
-**Given**: the orchestrator is running in Parallel execution mode
-**And**: change `beta` is non-terminal and actively `Resolving` or `Rejecting`
+**Given**: change `beta` is non-terminal and actively `Resolving` or `Rejecting`
 **When**: change `alpha` receives a `ChangeArchived` event
 **Then**: `alpha` has `WaitState::ResolveWait`
-**And**: `alpha` is returned by reducer-owned resolve-wait membership
-**And**: the derived display status is `resolve pending`
-**And**: `alpha` is not displayed as `merge wait`
-
-#### Scenario: manual merge deferral enters merge wait
-
-**Given**: change `alpha` is in post-archive merge handling
-**When**: the reducer receives `MergeDeferred(alpha, auto_resumable=false)`
-**Then**: `alpha` has `WaitState::MergeWait`
-**And**: normal queue intent for `alpha` is removed
-**And**: `alpha` is not returned by reducer-owned resolve-wait membership
-**And**: the derived display status is `merge wait`
-
-#### Scenario: auto-resumable merge deferral remains resolve pending
-
-**Given**: change `alpha` is in post-archive merge handling
-**When**: the reducer receives `MergeDeferred(alpha, auto_resumable=true)` while `alpha` is not already active
-**Then**: `alpha` has `WaitState::ResolveWait`
-**And**: `alpha` remains scheduler-consumable retry work
-**And**: the derived display status is `resolve pending`
-**And**: `alpha` is not classified as manual `merge wait`
+**And**: `alpha` remains scheduler-consumable
 
 ### Requirement: Parallel Resume Applies Archive-Complete Wait Semantics
 
@@ -666,37 +639,15 @@ A recoverable error terminal state MUST gate ordinary apply dispatch. Explicit r
 
 ### Requirement: Rejection Flow Execution
 
-The system SHALL execute a rejection flow when acceptance returns a `Blocked` verdict. The rejection flow MUST perform the following steps in order:
-
-1. Extract the rejection reason from acceptance findings
-2. Checkout the base branch
-3. Generate `openspec/changes/<change_id>/REJECTED.md` containing the rejection reason and timestamp
-4. Stage and commit only `openspec/changes/<change_id>/REJECTED.md` on the base branch
-5. Delete the rejected worktree
-
-The rejection flow SHALL be used by both serial and parallel execution services.
+The system SHALL execute the existing rejection flow when acceptance returns a `Blocked` verdict. The sole managed-worktree execution service SHALL own this flow and preserve its repository-verifiable marker, commit isolation, and worktree cleanup behavior.
 
 #### Scenario: Rejection flow commits only REJECTED.md and cleans worktree
 
 - **GIVEN** acceptance has returned `Blocked` for change `fix-auth`
-- **WHEN** the rejection flow executes
+- **WHEN** the worktree execution service runs rejection handling
 - **THEN** `openspec/changes/fix-auth/REJECTED.md` is created with the rejection reason
-- **AND** the base commit includes only `openspec/changes/fix-auth/REJECTED.md`
-- **AND** the worktree for `fix-auth` is deleted
-
-#### Scenario: Rejection flow does not run openspec resolve
-
-- **GIVEN** acceptance has returned `Blocked` for change `fix-auth`
-- **WHEN** the rejection flow executes
-- **THEN** `openspec resolve fix-auth` is not called
-- **AND** rejection completion does not depend on OpenSpec CLI resolve availability
-
-#### Scenario: Rejection flow failure falls back to error state
-
-- **GIVEN** acceptance has returned `Blocked` for a change
-- **WHEN** any step of the rejection flow fails (e.g., git commit fails)
-- **THEN** the change transitions to `Error` terminal state
-- **AND** the worktree is preserved for manual inspection
+- **AND** the base commit includes only that marker
+- **AND** the rejected worktree is deleted
 
 ### Requirement: Rejected Change Exclusion from Change Listing
 
@@ -743,76 +694,39 @@ This execution-mark clear applies only to the rejected change. It MUST NOT clear
 
 ### Requirement: Parallel mode treats archive as merge-wait
 
-- **GIVEN** the orchestrator is running in Parallel execution mode
-- **WHEN** a change receives a `ChangeArchived` event
-- **THEN** the wait state becomes `MergeWait`
-- **AND** the terminal state remains `None`
-- **AND** the derived display status is `merge wait`
-
-A parallel archived change MUST leave `MergeWait` as soon as merge handling can proceed automatically. Internal recoverable preconditions such as lazy base-branch initialization MUST NOT keep the change in `MergeWait`; only deferred merge conditions that truly require waiting or user intervention may do so.
+An archived managed-worktree change MUST enter reducer-owned post-archive handling. It MUST use `MergeWait` only for a concrete deferred condition that requires waiting or user intervention; recoverable internal preconditions MUST proceed automatically.
 
 #### Scenario: archived change does not stay merge wait for recoverable branch initialization
-- **GIVEN** the orchestrator is running in Parallel execution mode
-- **AND** a change has received a `ChangeArchived` event
-- **AND** merge handling discovers that the Git base branch has not yet been cached
+
+- **GIVEN** an archived change enters merge handling
+- **AND** the Git base branch has not yet been cached
 - **WHEN** the system can initialize that base branch from repository state
 - **THEN** the change proceeds through merge handling
-- **AND** the reducer does not preserve `merge wait` solely because of the missing cached branch name
-
-#### Scenario: archived change enters error instead of merge wait on unrecoverable branch discovery failure
-- **GIVEN** the orchestrator is running in Parallel execution mode
-- **AND** a change has received a `ChangeArchived` event
-- **AND** merge handling cannot determine the base branch because the repository is detached HEAD
-- **WHEN** the failure is reported
-- **THEN** the change is treated as an execution error
-- **AND** the reducer does not classify the failure as `merge wait`
+- **AND** it does not remain in `MergeWait`
 
 ### Requirement: Rejection Flow Execution
 
-The system SHALL execute a rejection flow when acceptance returns a `Gated` verdict, including compatibility inputs where legacy `Blocked` verdicts are parsed as acceptance-gated outcomes. Apply execution MAY generate `openspec/changes/<change_id>/REJECTED.md` as a rejection proposal when it encounters an implementation blocker that prevents completion. This proposal file SHALL NOT become a terminal rejection by itself. Acceptance SHALL review the blocker and decide whether to confirm the rejection. Only after acceptance confirms the gated verdict SHALL the runtime treat the change as rejected, commit only `REJECTED.md` on the base branch, and delete the worktree.
+The system SHALL execute the existing rejection flow when acceptance returns a `Blocked` verdict. The sole managed-worktree execution service SHALL own this flow and preserve its repository-verifiable marker, commit isolation, and worktree cleanup behavior.
 
-#### Scenario: apply-generated rejection proposal requires acceptance confirmation
+#### Scenario: Rejection flow commits only REJECTED.md and cleans worktree
 
-- **GIVEN** apply execution writes `openspec/changes/fix-auth/REJECTED.md` because of an implementation blocker
-- **WHEN** acceptance has not yet confirmed the gated verdict
-- **THEN** the change is not yet in `Rejected` terminal state
-- **AND** no rejection flow commit is created on the base branch
-
-#### Scenario: acceptance-confirmed apply blocker transitions to rejected terminal state
-
-- **GIVEN** apply execution has generated `openspec/changes/fix-auth/REJECTED.md`
-- **AND** acceptance confirms the gated verdict
-- **WHEN** the rejection flow completes
-- **THEN** the terminal state becomes `Rejected` with the rejection reason
-- **AND** the derived display status is `rejected`
-- **AND** the change cannot be re-queued via `AddToQueue`
+- **GIVEN** acceptance has returned `Blocked` for change `fix-auth`
+- **WHEN** the worktree execution service runs rejection handling
+- **THEN** `openspec/changes/fix-auth/REJECTED.md` is created with the rejection reason
+- **AND** the base commit includes only that marker
+- **AND** the rejected worktree is deleted
 
 ### Requirement: Rejection Flow Execution
 
-The system SHALL execute a rejection flow when acceptance returns a `Gated` verdict, including compatibility inputs where legacy `Blocked` verdicts are parsed as acceptance-gated outcomes. The rejection flow MUST write and commit only `openspec/changes/<change_id>/REJECTED.md` on the base branch. The rejection flow MUST NOT stage, merge, or commit any other files from the rejected worktree, including proposal, tasks, spec deltas, or product code changes. The runtime SHALL treat the `REJECTED.md` marker commit itself as the durable rejection record and SHALL NOT require `openspec resolve <change_id>` as part of the rejection flow.
+The system SHALL execute the existing rejection flow when acceptance returns a `Blocked` verdict. The sole managed-worktree execution service SHALL own this flow and preserve its repository-verifiable marker, commit isolation, and worktree cleanup behavior.
 
-#### Scenario: rejection flow commits only REJECTED marker
+#### Scenario: Rejection flow commits only REJECTED.md and cleans worktree
 
-- **GIVEN** acceptance confirms a gated verdict for `fix-auth`
-- **WHEN** the rejection flow executes
-- **THEN** the base branch commit includes `openspec/changes/fix-auth/REJECTED.md`
-- **AND** no other files from the rejected worktree are staged or committed
-
-#### Scenario: rejection flow does not invoke openspec resolve
-
-- **GIVEN** acceptance confirms a gated verdict for `fix-auth`
-- **WHEN** the rejection flow executes
-- **THEN** `openspec resolve fix-auth` is not invoked
-- **AND** rejection completion does not depend on OpenSpec CLI availability
-
-#### Scenario: worktree cleanup occurs after reject marker commit
-
-- **GIVEN** the rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
-- **WHEN** the flow completes
-- **THEN** the rejected worktree is cleaned up
-- **AND** the rejected change remains represented by the base-side `REJECTED.md` marker
-
-## Requirements
+- **GIVEN** acceptance has returned `Blocked` for change `fix-auth`
+- **WHEN** the worktree execution service runs rejection handling
+- **THEN** `openspec/changes/fix-auth/REJECTED.md` is created with the rejection reason
+- **AND** the base commit includes only that marker
+- **AND** the rejected worktree is deleted
 
 ### Requirement: Force stop and dequeue returns a running change to not queued
 

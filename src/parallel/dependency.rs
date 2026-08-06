@@ -455,10 +455,9 @@ mod tests {
     #[tokio::test]
     async fn context_blocks_dependencies_when_lifecycle_evidence_lock_is_unavailable() {
         let temp_dir = TempDir::new().unwrap();
-        let state = std::sync::Arc::new(RwLock::new(OrchestratorState::with_mode(
+        let state = std::sync::Arc::new(RwLock::new(OrchestratorState::new(
             vec!["resolving-a".to_string()],
             1,
-            crate::orchestration::state::ExecutionMode::Parallel,
         )));
         let _write_guard = state.write().await;
         let context = DependencyContext::from_parts(
@@ -496,10 +495,9 @@ mod tests {
         .unwrap();
 
         let in_flight = HashSet::from(["flight-a".to_string()]);
-        let state = std::sync::Arc::new(RwLock::new(OrchestratorState::with_mode(
+        let state = std::sync::Arc::new(RwLock::new(OrchestratorState::new(
             vec!["resolving-a".to_string(), "resolve-wait-a".to_string()],
             1,
-            crate::orchestration::state::ExecutionMode::Parallel,
         )));
         let mut state_guard = state.write().await;
         state_guard.apply_execution_event(&crate::events::ExecutionEvent::ResolveStarted {

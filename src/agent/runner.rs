@@ -27,8 +27,8 @@ use tracing::{debug, info};
 
 /// Derive the pre-accept task-format repair context from workspace state.
 ///
-/// `cwd` is the apply workspace (worktree in parallel mode, repository root in
-/// serial mode). The diagnostics are recomputed from the workspace-local
+/// `cwd` is the change's managed worktree. The diagnostics are recomputed from
+/// the workspace-local
 /// `tasks.md` on every attempt, so a restart reproduces the same repair
 /// instruction without any durable runtime state.
 fn task_format_repair_context_for(cwd: Option<&Path>, change_id: &str) -> String {
@@ -734,6 +734,10 @@ impl AgentRunner {
         self.acceptance_history.format_context(change_id)
     }
 
+    /// Test-only: the shared apply loop records history through
+    /// `record_apply_attempt` and reads it back through the prompt builder, so
+    /// only coverage inspects the rendered context directly.
+    #[cfg(test)]
     pub fn format_apply_history(&self, change_id: &str) -> String {
         self.apply_history.format_context(change_id)
     }
@@ -1092,7 +1096,7 @@ impl AgentRunner {
             .map(|findings| crate::acceptance::finding_texts(&findings))
     }
 
-    #[allow(dead_code)] // Exposes restart-restored baseline for serial acceptance regression coverage.
+    #[allow(dead_code)] // Exposes restart-restored baseline for acceptance regression coverage.
     pub fn get_restored_acceptance_semantic_fingerprint(&self, change_id: &str) -> Option<String> {
         self.acceptance_history.semantic_fingerprint(change_id)
     }
@@ -1162,26 +1166,6 @@ impl AgentRunner {
         }
 
         context
-    }
-
-    /// Peek at the acceptance tail context without consuming the injection flag.
-    /// This is useful for display purposes (e.g., TUI command logging) where we want
-    /// to show what will be sent without affecting the actual execution.
-    pub fn peek_acceptance_tail_context_for_apply(&self, change_id: &str) -> String {
-        // Check if we've already injected the tail for this change
-        if self
-            .acceptance_tail_injected
-            .get(change_id)
-            .copied()
-            .unwrap_or(false)
-        {
-            return String::new();
-        }
-
-        self.acceptance_history
-            .last_follow_up_findings(change_id)
-            .map(|(_, findings)| super::prompt::build_acceptance_findings_context(&findings))
-            .unwrap_or_default()
     }
 
     /// Reset acceptance tail injection flag for a change.
@@ -1786,6 +1770,7 @@ impl AgentRunner {
     }
 
     /// Get the underlying configuration
+    #[cfg(test)]
     pub fn config(&self) -> &OrchestratorConfig {
         &self.config
     }

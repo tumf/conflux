@@ -3,7 +3,7 @@
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
-use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand, WaitState};
+use crate::orchestration::state::{OrchestratorState, ReducerCommand, WaitState};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
 use crate::parallel::dynamic_queue::ReanalysisReason;
 use crate::parallel::queue_state::ReanalysisDispatchContext;
@@ -385,10 +385,9 @@ async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action()
     );
     let (merge_result_tx, mut merge_result_rx) = tokio::sync::mpsc::channel(8);
 
-    let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;

@@ -50,8 +50,7 @@ const RUN_START_EVENT_TYPES: [&str; 5] = [
 ];
 
 /// Wire event types that end a timed run for a change.
-const RUN_END_EVENT_TYPES: [&str; 11] = [
-    "processing_completed",
+const RUN_END_EVENT_TYPES: [&str; 10] = [
     "processing_error",
     "apply_failed",
     "acceptance_failed",

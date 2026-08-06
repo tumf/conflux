@@ -63,7 +63,7 @@ pub enum OrchestratorError {
 
     #[error("Permission auto-rejected: {denied_path}\n{guidance}")]
     #[allow(dead_code)]
-    // Legacy soft-block variant retained for older serial/parallel apply paths.
+    // Legacy soft-block variant retained for older apply paths.
     PermissionBlocked {
         denied_path: String,
         guidance: String,
@@ -79,7 +79,7 @@ pub enum OrchestratorError {
     /// another dispatch because the positive `max_iterations` ceiling is spent.
     ///
     /// This is deliberately a distinct variant rather than an untyped
-    /// [`OrchestratorError::AgentCommand`]: serial CLI, TUI, and parallel run
+    /// [`OrchestratorError::AgentCommand`]: CLI, TUI, and remote-controlled run
     /// boundaries must preserve `iteration_limit` finish-status ownership rather
     /// than reclassify budget exhaustion as an ordinary agent-command crash.
     #[error("Max iterations ({max}) reached for change '{change_id}' after {attempts} Apply dispatch(es): {diagnostic}")]

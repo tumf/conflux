@@ -4,7 +4,7 @@
 //! ParallelEvent (from parallel execution) and OrchestratorEvent (from TUI) types.
 //!
 //! The ExecutionEvent enum represents all possible events that can occur during
-//! change processing, whether in serial or parallel mode.
+//! change processing across every frontend.
 
 use std::sync::OnceLock;
 
@@ -60,13 +60,13 @@ pub struct LogEntry {
     pub color: Color,
     /// Log level
     pub level: LogLevel,
-    /// Optional change_id for parallel mode logs
+    /// Optional change_id for change-scoped logs
     pub change_id: Option<String>,
     /// Optional operation type (apply, archive, resolve)
     pub operation: Option<String>,
     /// Optional iteration number (for apply operations)
     pub iteration: Option<u32>,
-    /// Optional workspace path (for parallel mode logs with workspace context)
+    /// Optional workspace path (for logs with workspace context)
     pub workspace_path: Option<String>,
 }
 
@@ -212,7 +212,7 @@ impl LogEntry {
         }
     }
 
-    /// Set change_id for parallel mode logs
+    /// Set change_id for change-scoped logs
     #[allow(dead_code)]
     pub fn with_change_id(mut self, change_id: impl Into<String>) -> Self {
         self.change_id = Some(change_id.into());
@@ -231,7 +231,7 @@ impl LogEntry {
         self
     }
 
-    /// Set workspace path (for parallel mode logs with workspace context)
+    /// Set workspace path (for logs with workspace context)
     #[allow(dead_code)]
     pub fn with_workspace_path(mut self, workspace_path: impl Into<String>) -> Self {
         self.workspace_path = Some(workspace_path.into());
@@ -241,7 +241,7 @@ impl LogEntry {
 
 /// Unified event type for all execution events
 ///
-/// This enum combines events from both serial and parallel execution modes,
+/// This enum combines every execution event a run can publish,
 /// providing a single interface for event handling across the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectionOutcome {
@@ -414,8 +414,6 @@ pub enum ExecutionEvent {
     // Lifecycle events
     /// Processing started for a change
     ProcessingStarted(String),
-    /// Processing completed for a change
-    ProcessingCompleted(String),
     /// Error occurred for a change
     ProcessingError { id: String, error: String },
 
@@ -530,7 +528,7 @@ pub enum ExecutionEvent {
         total: u32,
     },
 
-    // Workspace events (parallel mode)
+    // Workspace events
     /// Managed workspace preparation started for a scheduler-admitted change.
     ///
     /// Emitted after the execution-slot permit is acquired and the stop/terminal
@@ -555,7 +553,7 @@ pub enum ExecutionEvent {
         change_id: String,
         workspace: String,
     },
-    /// Workspace status synchronization for a specific change (parallel mode)
+    /// Workspace status synchronization for a specific change
     WorkspaceStatusUpdated {
         change_id: String,
         #[allow(dead_code)]
@@ -584,7 +582,7 @@ pub enum ExecutionEvent {
         workspace: String,
     },
 
-    // Merge events (parallel mode)
+    // Merge events
     /// Merge started
     #[allow(dead_code)]
     MergeStarted { revisions: Vec<String> },
@@ -674,7 +672,7 @@ pub enum ExecutionEvent {
         blocker: StalledBlocker,
     },
 
-    // Analysis events (parallel mode)
+    // Analysis events
     /// Analysis started for remaining changes.
     ///
     /// `attempt_id` is observability-only metadata used by UIs to distinguish
@@ -813,7 +811,6 @@ pub fn classify_event(event: &ExecutionEvent) -> (&'static str, EventOwnership) 
 
     match event {
         E::ProcessingStarted(_) => ("ProcessingStarted", State),
-        E::ProcessingCompleted(_) => ("ProcessingCompleted", State),
         E::ProcessingError { .. } => ("ProcessingError", State),
         E::ApplyStarted { .. } => ("ApplyStarted", State),
         E::ApplyCompleted { .. } => ("ApplyCompleted", State),
@@ -979,8 +976,10 @@ pub trait EventSink: Send + Sync {
 }
 
 /// No-op sink used for state-only update notifications.
+#[cfg(test)]
 pub struct NoopEventSink;
 
+#[cfg(test)]
 #[async_trait]
 impl EventSink for NoopEventSink {
     async fn on_event(&self, _event: &ExecutionEvent) {}
@@ -1064,7 +1063,7 @@ impl EventDispatcher {
     ///
     /// Hook runners, output handlers, and the parallel scheduler can only emit
     /// through an `mpsc::Sender`. Handing them a bridge instead of a raw
-    /// frontend channel is what stops serial-mode logs from reaching the TUI
+    /// frontend channel is what stops boundary logs from reaching the TUI
     /// while never reaching the remote projection.
     ///
     /// The forwarding task ends when every sender is dropped.
@@ -1083,7 +1082,8 @@ impl EventDispatcher {
     }
 }
 
-/// Build sink list for CLI mode (no frontend sink, reducer update only).
+/// Build a sink list with no frontend sink (reducer update only).
+#[cfg(test)]
 pub fn cli_event_sinks() -> Vec<std::sync::Arc<dyn EventSink>> {
     vec![std::sync::Arc::new(NoopEventSink)]
 }
@@ -1264,7 +1264,6 @@ pub(crate) mod ownership_fixtures {
         use ExecutionEvent as E;
         vec![
             E::ProcessingStarted("change-a".to_string()),
-            E::ProcessingCompleted("change-a".to_string()),
             E::ProcessingError {
                 id: "change-a".to_string(),
                 error: "boom".to_string(),
@@ -1545,7 +1544,7 @@ mod ownership_tests {
     /// `classify_event` at compile time; this constant then forces the fixture
     /// table — and therefore every ownership and projection assertion below —
     /// to grow with it instead of silently skipping the new variant.
-    const EXECUTION_EVENT_VARIANTS: usize = 71;
+    const EXECUTION_EVENT_VARIANTS: usize = 70;
 
     #[test]
     fn ownership_table_names_every_variant_exactly_once() {
@@ -1615,7 +1614,7 @@ mod ownership_tests {
 mod dispatch_tests {
     use super::ownership_fixtures::all_execution_events;
     use super::*;
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+    use crate::orchestration::state::OrchestratorState;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1646,19 +1645,10 @@ mod dispatch_tests {
         }
     }
 
-    fn parallel_state(ids: &[&str]) -> tokio::sync::RwLock<OrchestratorState> {
-        tokio::sync::RwLock::new(OrchestratorState::with_mode(
+    fn reducer_state(ids: &[&str]) -> tokio::sync::RwLock<OrchestratorState> {
+        tokio::sync::RwLock::new(OrchestratorState::new(
             ids.iter().map(|id| id.to_string()).collect(),
             10,
-            ExecutionMode::Parallel,
-        ))
-    }
-
-    fn serial_state(ids: &[&str]) -> tokio::sync::RwLock<OrchestratorState> {
-        tokio::sync::RwLock::new(OrchestratorState::with_mode(
-            ids.iter().map(|id| id.to_string()).collect(),
-            10,
-            ExecutionMode::Serial,
         ))
     }
 
@@ -1666,7 +1656,8 @@ mod dispatch_tests {
     /// however many frontends are attached.
     #[tokio::test]
     async fn one_event_is_one_transition_and_one_delivery_per_frontend() {
-        for state in [serial_state(&["change-a"]), parallel_state(&["change-a"])] {
+        {
+            let state = reducer_state(&["change-a"]);
             let first = Arc::new(CountingSink::default());
             let second = Arc::new(CountingSink::default());
             let sinks: Vec<Arc<dyn EventSink>> = vec![first.clone(), second.clone()];
@@ -1710,7 +1701,7 @@ mod dispatch_tests {
     /// recognise a repeated delivery instead of guessing from event content.
     #[tokio::test]
     async fn every_dispatch_carries_a_distinct_identity() {
-        let state = serial_state(&["change-a"]);
+        let state = reducer_state(&["change-a"]);
         let sink = Arc::new(CountingSink::default());
         let sinks: Vec<Arc<dyn EventSink>> = vec![sink.clone()];
 
@@ -1733,7 +1724,7 @@ mod dispatch_tests {
     /// not pay to clone the reducer for them.
     #[tokio::test]
     async fn only_state_owned_events_carry_reducer_output() {
-        let state = serial_state(&["change-a"]);
+        let state = reducer_state(&["change-a"]);
         let sink = Arc::new(CountingSink::default());
         let sinks: Vec<Arc<dyn EventSink>> = vec![sink.clone()];
 
@@ -1757,7 +1748,7 @@ mod dispatch_tests {
     async fn bridged_producers_reach_the_reducer_and_every_sink() {
         let sink = Arc::new(CountingSink::default());
         let dispatcher = Arc::new(EventDispatcher::new(
-            Arc::new(serial_state(&["change-a"])),
+            Arc::new(reducer_state(&["change-a"])),
             vec![sink.clone()],
         ));
         let (bridge, handle) = dispatcher.bridge(8);
@@ -1819,16 +1810,8 @@ mod dispatch_tests {
         ];
 
         for event in preapplied {
-            let mut once = OrchestratorState::with_mode(
-                vec!["change-a".to_string()],
-                10,
-                ExecutionMode::Parallel,
-            );
-            let mut twice = OrchestratorState::with_mode(
-                vec!["change-a".to_string()],
-                10,
-                ExecutionMode::Parallel,
-            );
+            let mut once = OrchestratorState::new(vec!["change-a".to_string()], 10);
+            let mut twice = OrchestratorState::new(vec!["change-a".to_string()], 10);
 
             once.apply_execution_event(&event);
             twice.apply_execution_event(&event);

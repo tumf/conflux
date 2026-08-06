@@ -2,7 +2,7 @@
 //!
 //! Upstream progress is reported through the existing log-event channel rather
 //! than through new reducer state. That is deliberate: observability must not
-//! become routing authority, and every excluded surface (serial mode, TUI,
+//! become routing authority, and every excluded surface (TUI,
 //! server `git-sync`, per-change pre-sync, `PushToRemote`) keeps its current
 //! routing because no new event variant reaches their reducers.
 //!

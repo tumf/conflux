@@ -1,8 +1,7 @@
 //! Common archive operation logic for OpenSpec Orchestrator.
 //!
-//! This module provides shared archive functionality used by both serial (TUI) and
-//! parallel execution modes. It consolidates duplicate code from:
-//! - `src/tui/orchestrator.rs::archive_single_change()`
+//! This module provides the shared archive functionality managed-worktree
+//! execution uses, consolidating what used to be duplicated between frontends:
 //! - `src/parallel/executor.rs::execute_archive_in_workspace()`
 //!
 //! # Common Operations
@@ -10,13 +9,6 @@
 //! - Task completion verification (100% check before archiving)
 //! - Archive path verification (change moved to archive directory)
 //! - Archive command execution with streaming output
-//!
-//! # Differences Between Modes
-//!
-//! | Aspect | Serial (TUI) | Parallel |
-//! |--------|--------------|----------|
-//! | Hooks  | Supported    | Not supported (future: add-parallel-hooks) |
-//! | Working directory | Current directory | Workspace path |
 
 use std::future::Future;
 use std::path::Path;
@@ -27,7 +19,6 @@ use tracing::{debug, info, warn};
 use crate::agent::{AgentRunner, OutputLine};
 use crate::archive_layout;
 use crate::error::{OrchestratorError, Result};
-use crate::hooks::HookContext;
 use crate::task_parser;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::VcsBackend;
@@ -675,8 +666,8 @@ where
 /// # Arguments
 ///
 /// * `change_id` - The ID of the change to delete
-/// * `base_path` - Base path to delete from. Pass `None` for current directory (serial mode),
-///   or `Some(path)` for workspace directory (parallel mode).
+/// * `base_path` - Base path to delete from. Pass `None` for the current directory,
+///   or `Some(path)` for a managed workspace directory.
 ///
 /// # Returns
 ///
@@ -737,8 +728,8 @@ pub fn delete_change_directory(change_id: &str, base_path: Option<&Path>) -> Res
 /// # Arguments
 ///
 /// * `change_id` - The ID of the change to verify
-/// * `base_path` - Base path to check from. Pass `None` for current directory (serial mode),
-///   or `Some(path)` for workspace directory (parallel mode).
+/// * `base_path` - Base path to check from. Pass `None` for the current directory,
+///   or `Some(path)` for a managed workspace directory.
 ///
 /// # Returns
 ///
@@ -748,10 +739,10 @@ pub fn delete_change_directory(change_id: &str, base_path: Option<&Path>) -> Res
 /// # Examples
 ///
 /// ```ignore
-/// // Serial mode - check in current directory
+/// // Current directory
 /// let result = verify_archive_completion("add-feature", None);
 ///
-/// // Parallel mode - check in workspace
+/// // Managed workspace
 /// let result = verify_archive_completion("add-feature", Some(&workspace_path));
 /// ```
 pub fn verify_archive_completion(
@@ -806,8 +797,8 @@ pub fn verify_archive_completion(
 /// # Arguments
 ///
 /// * `change_id` - The ID of the change to verify
-/// * `base_path` - Base path to check from. Pass `None` for current directory (serial mode),
-///   or `Some(path)` for workspace directory (parallel mode).
+/// * `base_path` - Base path to check from. Pass `None` for the current directory,
+///   or `Some(path)` for a managed workspace directory.
 ///
 /// # Returns
 ///
@@ -818,12 +809,12 @@ pub fn verify_archive_completion(
 /// # Examples
 ///
 /// ```ignore
-/// // Serial mode
+/// // Current directory
 /// if verify_task_completion("add-feature", None)? {
 ///     // Ready to archive
 /// }
 ///
-/// // Parallel mode
+/// // Managed workspace
 /// if verify_task_completion("add-feature", Some(&workspace_path))? {
 ///     // Ready to archive
 /// }
@@ -1041,82 +1032,6 @@ impl ArchiveEventHandler for NoOpArchiveEventHandler {
     fn on_hook_completed(&self, _change_id: &str, _hook_type: &str) {}
     fn on_hook_failed(&self, _change_id: &str, _hook_type: &str, _error: &str) {}
     fn on_archive_output(&self, _change_id: &str, _line: &OutputLine) {}
-}
-
-/// Context for building hook contexts in the archive loop
-#[allow(dead_code)]
-pub struct ArchiveLoopHookContext {
-    /// Changes processed so far
-    pub changes_processed: usize,
-    /// Total changes in this run
-    pub total_changes: usize,
-    /// Remaining changes
-    pub remaining_changes: usize,
-    /// Apply count for this change
-    pub apply_count: u32,
-    /// Workspace path for parallel mode (optional)
-    pub workspace_path: Option<String>,
-    /// Group index for parallel mode (optional)
-    pub group_index: Option<usize>,
-}
-
-#[allow(dead_code)]
-impl ArchiveLoopHookContext {
-    /// Create a new hook context for serial mode
-    pub fn serial(
-        changes_processed: usize,
-        total_changes: usize,
-        remaining_changes: usize,
-        apply_count: u32,
-    ) -> Self {
-        Self {
-            changes_processed,
-            total_changes,
-            remaining_changes,
-            apply_count,
-            workspace_path: None,
-            group_index: None,
-        }
-    }
-
-    /// Create a new hook context for parallel mode
-    pub fn parallel(
-        changes_processed: usize,
-        total_changes: usize,
-        remaining_changes: usize,
-        apply_count: u32,
-        workspace_path: String,
-        group_index: usize,
-    ) -> Self {
-        Self {
-            changes_processed,
-            total_changes,
-            remaining_changes,
-            apply_count,
-            workspace_path: Some(workspace_path),
-            group_index: Some(group_index),
-        }
-    }
-
-    /// Build a HookContext from this archive loop context
-    fn build_hook_context(&self, change_id: &str, completed: u32, total: u32) -> HookContext {
-        let mut ctx = HookContext::new(
-            self.changes_processed,
-            self.total_changes,
-            self.remaining_changes,
-            false,
-        )
-        .with_change(change_id, completed, total)
-        .with_apply_count(self.apply_count);
-
-        if let Some(ref workspace_path) = self.workspace_path {
-            if let Some(group_index) = self.group_index {
-                ctx = ctx.with_parallel_context(workspace_path, Some(group_index as u32));
-            }
-        }
-
-        ctx
-    }
 }
 
 /// Result of the unified archive loop

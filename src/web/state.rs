@@ -8,8 +8,7 @@ use crate::tui::types::WorktreeInfo;
 use crate::web::operator_facts::OperatorFactsStore;
 use crate::web::remote_control_api::dto::{
     AttentionState, BlockerKind as RemoteBlockerKind, ChangeActivity, ChangeBlocker, ChangeTiming,
-    ChangeWorktree, ParallelEligibility, ParallelMode, ParallelRuntimeState,
-    QueueIntent as RemoteQueueIntent,
+    ChangeWorktree, ParallelEligibility, ParallelRuntimeState, QueueIntent as RemoteQueueIntent,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -35,7 +34,7 @@ pub struct ChangeStatus {
     pub status: String,
     /// Dependencies on other changes
     pub dependencies: Vec<String>,
-    /// Queue status (for parallel/serial execution tracking)
+    /// Queue status (for worktree execution tracking)
     /// Aligned with canonical display taxonomy values: "not queued", "queued", "blocked", "stalled", "preparing",
     /// "applying", "accepting", "archiving", "archived", "merged", "pushed", "rejected", "merge wait", "resolving", "resolve pending", "reject pending", "error"
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -549,8 +548,6 @@ impl WebState {
             Some(runtime) => {
                 let facts = runtime.facts();
                 ParallelRuntimeState {
-                    mode: ParallelMode::from_enabled(facts.mode),
-                    available: facts.available,
                     max_concurrent: facts.max_concurrent,
                     vcs_backend: facts.vcs_backend,
                 }
@@ -821,17 +818,6 @@ impl WebState {
                         updated = true;
                     }
                     state.app_mode = "running".to_string();
-                }
-                ExecutionEvent::ProcessingCompleted(change_id) => {
-                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
-                        if change.completed_tasks < change.total_tasks {
-                            change.completed_tasks = change.total_tasks;
-                        }
-                        change.status = "complete".to_string();
-                        change.progress_percent =
-                            progress_percent(change.completed_tasks, change.total_tasks);
-                        updated = true;
-                    }
                 }
                 ExecutionEvent::ProcessingError { id, error: _ } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *id) {
@@ -2010,11 +1996,16 @@ mod tests {
         // Seed change_runtime entries
         shared.apply_command(ReducerCommand::AddToQueue("ch-queued".to_string()));
 
-        // Drive ch-archived through the terminal state
+        // Drive ch-archived through archive into post-archive handling, then to
+        // the terminal state that follows it.
         shared.apply_command(ReducerCommand::AddToQueue("ch-archived".to_string()));
         shared.apply_execution_event(&crate::events::ExecutionEvent::ChangeArchived(
             "ch-archived".to_string(),
         ));
+        shared.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
+            change_id: "ch-archived".to_string(),
+            revision: "rev".to_string(),
+        });
 
         let snapshot =
             OrchestratorStateSnapshot::from_changes_with_shared_state(&changes, Some(&shared));
@@ -2039,15 +2030,15 @@ mod tests {
         assert_eq!(queued.queue_status, Some("queued".to_string()));
         // "not queued" maps to None to keep payload minimal (no API shape change)
         assert_eq!(notqueued.queue_status, None);
-        assert_eq!(archived.queue_status, Some("archived".to_string()));
+        assert_eq!(archived.queue_status, Some("merged".to_string()));
     }
 
     #[test]
     fn pushed_status_web_snapshot_exposes_post_archive_statuses_from_reducer() {
         use crate::events::ExecutionEvent;
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use crate::orchestration::state::OrchestratorState;
 
-        let mut shared = OrchestratorState::with_mode(
+        let mut shared = OrchestratorState::new(
             vec![
                 "resolving-a".to_string(),
                 "resolve-b".to_string(),
@@ -2055,7 +2046,6 @@ mod tests {
                 "push-d".to_string(),
             ],
             0,
-            ExecutionMode::Parallel,
         );
         let changes = vec![
             create_test_change("resolving-a", 0, 1),
@@ -2102,11 +2092,8 @@ mod tests {
     fn test_web_snapshot_exposes_reject_pending_from_reducer() {
         use crate::orchestration::state::OrchestratorState;
 
-        let mut shared = OrchestratorState::with_mode(
-            vec!["lane-a".to_string(), "reject-b".to_string()],
-            0,
-            crate::orchestration::state::ExecutionMode::Parallel,
-        );
+        let mut shared =
+            OrchestratorState::new(vec!["lane-a".to_string(), "reject-b".to_string()], 0);
         let changes = vec![
             create_test_change("lane-a", 0, 1),
             create_test_change("reject-b", 0, 1),

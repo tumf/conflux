@@ -261,7 +261,7 @@ fn retained_web_bind_validation_still_refuses_an_unauthenticated_routable_listen
 }
 
 #[test]
-fn test_parallel_dry_run_uses_explicit_targets() {
+fn test_dry_run_uses_explicit_targets() {
     let tmp = tempfile::tempdir().unwrap();
     setup_empty_project(tmp.path());
     add_change(tmp.path(), "a");
@@ -273,13 +273,19 @@ fn test_parallel_dry_run_uses_explicit_targets() {
         .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_cflx"))
-        .args(["run", "a", "--parallel", "--dry-run"])
+        .args(["run", "a", "--dry-run"])
         .current_dir(tmp.path())
         .output()
         .unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // A single explicit target takes the same cumulative worktree planning path
+    // a multi-change run takes; there is no mode flag involved.
+    assert!(
+        stdout.contains("Parallel Execution Plan"),
+        "stdout={stdout}"
+    );
     assert!(stdout.contains("Total changes: 1"));
     assert!(stdout.contains("  - a"));
     assert!(!stdout.contains("  - c"));
@@ -297,7 +303,7 @@ fn test_run_stdout_keeps_info_and_suppresses_debug_trace_noise() {
         .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_cflx"))
-        .args(["run", "a", "--parallel", "--dry-run"])
+        .args(["run", "a", "--dry-run"])
         .current_dir(tmp.path())
         .output()
         .unwrap();
@@ -765,21 +771,33 @@ fn killing_the_lock_owner_releases_the_repository_lock() {
             .expect("failed to spawn cflx run"),
     );
 
-    // Wait until the child actually owns the lock, proven by a competing
-    // invocation being rejected with the conflict diagnostic.
+    // Wait until the child actually owns the lock, proven by the owner metadata
+    // naming its PID. Polling with a competing `run` instead would race the
+    // child for the lock: a probe that wins it orchestrates indefinitely behind
+    // an unbounded pipe read, hanging this test and the whole suite with it.
+    let owner_file = repo_lock::discover_common_dir(tmp.path())
+        .expect("git common dir")
+        .join(repo_lock::OWNER_FILE_NAME);
+    let owner_pid = owner.0.id();
     let start = Instant::now();
-    loop {
-        let output = cflx_output(tmp.path(), &["run", "--all"]);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() && stderr.contains(CONFLICT_HEADLINE) {
-            break;
-        }
+    while repo_lock::read_owner_metadata(&owner_file).and_then(|metadata| metadata.pid)
+        != Some(owner_pid)
+    {
         assert!(
             start.elapsed() < Duration::from_secs(30),
-            "the spawned owner never took the repository lock (stderr={stderr})"
+            "the spawned owner never took the repository lock"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+
+    // Ownership is exclusive while it lasts: with the child holding the lock, a
+    // competing invocation is rejected with the conflict diagnostic.
+    let output = cflx_output(tmp.path(), &["run", "--all"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains(CONFLICT_HEADLINE),
+        "a competing run must be rejected while the owner holds the lock (stderr={stderr})"
+    );
 
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
@@ -991,13 +1009,93 @@ fn a_non_git_invocation_refuses_before_any_orchestration_side_effect() {
     assert!(!adapter_ran.exists(), "no lifecycle adapter may start");
 }
 
-/// Both explicit choices stay usable outside Git; only the *default* is refused.
+/// Worktree orchestration is the only execution model, so an executable run
+/// outside Git is refused whatever the socket options say — and the refusal
+/// happens before any hook, lifecycle adapter, AI subprocess, or workspace
+/// mutation exists.
 #[test]
 #[cfg(all(unix, feature = "web-monitoring"))]
-fn outside_git_the_explicit_choices_still_start() {
+fn outside_git_every_executable_run_is_refused_before_side_effects() {
+    for socket_args in [
+        vec!["--no-web-unix-socket"],
+        vec!["--web-unix-socket", "explicit.sock"],
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (applied, adapter_ran) = setup_observable_project(tmp.path());
+        add_change(tmp.path(), "a");
+        assert!(repo_lock::discover_common_dir(tmp.path()).is_none());
+
+        let explicit_path = tmp.path().join("explicit.sock");
+        let mut args = vec!["run", "--all"];
+        let explicit = explicit_path.to_str().unwrap();
+        for arg in &socket_args {
+            args.push(if *arg == "explicit.sock" {
+                explicit
+            } else {
+                arg
+            });
+        }
+
+        let output = cflx_output_bounded(tmp.path(), &args, Duration::from_secs(30));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "an executable run outside Git must exit non-zero, got {:?} (stderr={stderr})",
+            output.status
+        );
+        assert!(
+            stderr.contains("git repository"),
+            "the error must name the missing repository, got stderr={stderr}"
+        );
+        assert!(!applied.exists(), "no AI subprocess may run");
+        assert!(!adapter_ran.exists(), "no lifecycle adapter may start");
+        assert!(
+            !explicit_path.exists(),
+            "a refused run must leave no socket behind"
+        );
+    }
+}
+
+/// The local TUI carries the same Git preflight as `cflx run`: it refuses to
+/// start outside a repository instead of degrading to another execution model,
+/// and nothing observable has started when it does.
+#[test]
+#[cfg(all(unix, feature = "web-monitoring"))]
+fn the_local_tui_outside_git_refuses_before_side_effects() {
+    for args in [
+        vec!["tui", "--no-web-unix-socket"],
+        vec!["--no-web-unix-socket"],
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (applied, adapter_ran) = setup_observable_project(tmp.path());
+        add_change(tmp.path(), "a");
+        assert!(repo_lock::discover_common_dir(tmp.path()).is_none());
+
+        let output = cflx_output_bounded(tmp.path(), &args, Duration::from_secs(30));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "cflx {} outside Git must exit non-zero, got {:?} (stderr={stderr})",
+            args.join(" "),
+            output.status
+        );
+        assert!(
+            stderr.contains("git repository"),
+            "the error must name the missing repository, got stderr={stderr}"
+        );
+        assert!(!applied.exists(), "no AI subprocess may run");
+        assert!(!adapter_ran.exists(), "no lifecycle adapter may start");
+    }
+}
+
+/// The socket options themselves still work; only the non-Git *workspace* is
+/// refused. Inside Git both explicit choices start and publish as declared.
+#[test]
+#[cfg(all(unix, feature = "web-monitoring"))]
+fn inside_git_the_explicit_socket_choices_still_start() {
     let tmp = tempfile::tempdir().unwrap();
     setup_empty_project(tmp.path());
-    assert!(repo_lock::discover_common_dir(tmp.path()).is_none());
+    init_git_repo(tmp.path());
 
     let opted_out = cflx_output(tmp.path(), &["run", "--all", "--no-web-unix-socket"]);
     assert!(
@@ -1387,14 +1485,17 @@ fn a_feature_disabled_build_keeps_its_api_free_behavior() {
         "a feature-disabled build must never create the default socket"
     );
 
-    // Outside Git it is equally unaffected.
+    // Outside Git it is refused by the Git preflight, not by a socket rule.
     let outside = tempfile::tempdir().unwrap();
     setup_empty_project(outside.path());
+    let refused = cflx_output(outside.path(), &["run", "--all"]);
     assert!(
-        cflx_output(outside.path(), &["run", "--all"])
-            .status
-            .success(),
-        "a feature-disabled run must not require a repository identity"
+        !refused.status.success(),
+        "worktree orchestration requires a Git repository in every build"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("git repository"),
+        "the refusal must name the missing repository"
     );
 }
 

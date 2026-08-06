@@ -1,10 +1,5 @@
-use crate::agent::AgentRunner;
-use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
-use crate::error_history::CircuitBreakerConfig;
-use crate::events::{cli_event_sinks, dispatch_event, ExecutionEvent};
-use crate::execution::apply::{check_task_progress, create_progress_commit};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::state::OrchestratorState;
@@ -15,17 +10,12 @@ use crate::orchestration::target_resolution::{
 use crate::orchestration::LogOutputHandler;
 use crate::parallel::PostArchiveAction;
 use crate::parallel_run_service::ParallelRunService;
-use crate::progress::ProgressDisplay;
-use crate::serial_run_service::SerialRunService;
-use crate::stall::StallDetector;
-use crate::task_parser::TaskProgress;
 use crate::tui::log_deduplicator;
 use crate::vcs::git::commands as git_commands;
-use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
-use std::collections::{HashMap, HashSet};
+use crate::vcs::VcsBackend;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 #[cfg(feature = "web-monitoring")]
@@ -33,16 +23,8 @@ use crate::web::WebState;
 #[cfg(feature = "web-monitoring")]
 use tokio::sync::mpsc;
 
-struct SerialSnapshot {
-    progress: crate::task_parser::TaskProgress,
-    empty_commit: Option<bool>,
-}
-
 pub struct Orchestrator {
-    agent: AgentRunner,
-    ai_runner: AiCommandRunner,
     config: OrchestratorConfig,
-    progress: Option<ProgressDisplay>,
     /// Target changes specified by --change option (comma-separated)
     target_changes: Option<Vec<String>>,
     /// Snapshot of change IDs captured at run start.
@@ -51,22 +33,18 @@ pub struct Orchestrator {
     initial_change_ids: Option<HashSet<String>>,
     /// Hook runner for executing hooks at various stages
     hooks: HookRunner,
-    /// Stall detector for empty WIP commit tracking
-    stall_detector: StallDetector,
     /// Maximum iterations limit (0 = no limit)
     max_iterations: u32,
-    /// Enable parallel execution mode
-    parallel: bool,
-    /// Maximum concurrent workspaces for parallel execution
+    /// Maximum concurrent workspaces
     max_concurrent: Option<usize>,
     /// Dry run mode (preview without execution)
     dry_run: bool,
-    /// VCS backend for parallel execution
+    /// VCS backend for worktree execution
     #[allow(dead_code)] // Will be passed to ParallelRunService in future
     vcs_backend: VcsBackend,
     /// Disable automatic workspace resume (always create new workspaces)
     no_resume: bool,
-    /// Terminal action after successful archive in parallel mode.
+    /// Terminal action after a successful archive.
     post_archive_action: PostArchiveAction,
     /// Shared orchestration state (single source of truth for state tracking)
     /// Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
@@ -74,10 +52,6 @@ pub struct Orchestrator {
     /// Web monitoring state (for broadcasting updates to WebSocket clients)
     #[cfg(feature = "web-monitoring")]
     web_state: Option<Arc<WebState>>,
-    /// Current execution mode for web monitoring app_mode
-    /// "select" | "running" | "stopped" | "stopping" | "error"
-    #[cfg(feature = "web-monitoring")]
-    execution_mode: String,
     /// Optional observability-only sink projecting execution events onto an
     /// external lifecycle adapter. It never participates in workflow routing.
     lifecycle_sink: Option<Arc<dyn crate::events::EventSink>>,
@@ -93,19 +67,6 @@ pub struct Orchestrator {
     /// change cannot silently move the completion evidence it was resolved
     /// against.
     captured_base_branch: Option<String>,
-}
-
-/// Control flow result indicating whether to continue or break the main loop
-#[derive(Debug)]
-enum LoopControl {
-    Continue,
-    Break {
-        finish_status: &'static str,
-        /// Cumulative Apply dispatches owned by the shared budget when the run
-        /// stops on `iteration_limit`. `None` for every other stop reason, which
-        /// keeps `on_finish`'s existing `apply_count` of `0`.
-        apply_count: Option<u32>,
-    },
 }
 
 /// How explicit targets were resolved for a cumulative parallel run.
@@ -153,7 +114,6 @@ impl Orchestrator {
         target_changes: Option<Vec<String>>,
         config_path: Option<PathBuf>,
         max_iterations_override: Option<u32>,
-        parallel: bool,
         max_concurrent: Option<usize>,
         dry_run: bool,
         vcs_override: Option<VcsBackend>,
@@ -170,14 +130,8 @@ impl Orchestrator {
         );
         // CLI override takes precedence over config file value
         let max_iterations = max_iterations_override.unwrap_or_else(|| config.get_max_iterations());
-        let agent = AgentRunner::new(config.clone());
         // VCS backend: CLI override takes precedence, then config, then auto
         let vcs_backend = vcs_override.unwrap_or_else(|| config.get_vcs_backend());
-        let stall_detector = StallDetector::new(config.get_stall_detection());
-
-        // Create AiCommandRunner for serial mode execution
-        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
-        let ai_runner = AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state);
 
         // Initialize shared state (will be populated when run() is called with actual changes)
         // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
@@ -187,16 +141,11 @@ impl Orchestrator {
         )));
 
         Ok(Self {
-            agent,
-            ai_runner,
             config,
-            progress: None,
             target_changes,
             initial_change_ids: None,
             hooks,
-            stall_detector,
             max_iterations,
-            parallel,
             max_concurrent,
             dry_run,
             vcs_backend,
@@ -205,8 +154,6 @@ impl Orchestrator {
             shared_state,
             #[cfg(feature = "web-monitoring")]
             web_state: None,
-            #[cfg(feature = "web-monitoring")]
-            execution_mode: "select".to_string(),
             lifecycle_sink: None,
             upstream_integration: None,
             captured_base_branch: None,
@@ -254,20 +201,6 @@ impl Orchestrator {
         self.web_state = Some(web_state);
     }
 
-    /// Broadcast state update to web monitoring clients
-    #[cfg(feature = "web-monitoring")]
-    async fn broadcast_state_update(&self, changes: &[Change]) {
-        if let Some(ref web_state) = self.web_state {
-            web_state
-                .update_with_mode(changes, &self.execution_mode)
-                .await;
-        }
-    }
-
-    /// No-op when web monitoring is disabled
-    #[cfg(not(feature = "web-monitoring"))]
-    async fn broadcast_state_update(&self, _changes: &[Change]) {}
-
     /// Create a new orchestrator with explicit configuration (for testing)
     #[cfg(test)]
     pub fn with_config(
@@ -282,12 +215,6 @@ impl Orchestrator {
             Arc::new(LogOutputHandler::new()),
         );
         let max_iterations = config.get_max_iterations();
-        let agent = AgentRunner::new(config.clone());
-        let stall_detector = StallDetector::new(config.get_stall_detection());
-
-        // Create AiCommandRunner for serial mode execution
-        let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
-        let ai_runner = AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state);
 
         // Initialize shared state (for testing, will use empty change list)
         // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
@@ -297,16 +224,11 @@ impl Orchestrator {
         )));
 
         Ok(Self {
-            agent,
-            ai_runner,
             config,
-            progress: None,
             target_changes,
             initial_change_ids: None,
             hooks,
-            stall_detector,
             max_iterations,
-            parallel: false,
             max_concurrent: None,
             dry_run: false,
             vcs_backend: VcsBackend::Auto,
@@ -315,394 +237,10 @@ impl Orchestrator {
             shared_state,
             #[cfg(feature = "web-monitoring")]
             web_state: None,
-            #[cfg(feature = "web-monitoring")]
-            execution_mode: "select".to_string(),
             lifecycle_sink: None,
             upstream_integration: None,
             captured_base_branch: None,
         })
-    }
-
-    /// Update execution mode and broadcast state (helper for mode transitions)
-    #[cfg(feature = "web-monitoring")]
-    async fn update_execution_mode(&mut self, mode: &str) {
-        self.execution_mode = mode.to_string();
-        let current_changes = openspec::list_changes_native().unwrap_or_default();
-        self.broadcast_state_update(&current_changes).await;
-    }
-
-    /// Check for graceful stop flag and update state accordingly
-    /// Returns LoopControl indicating whether to continue or break
-    async fn check_graceful_stop(
-        &mut self,
-        graceful_stop_flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-        previous_graceful_stop: &mut bool,
-    ) -> LoopControl {
-        if let Some(ref graceful_flag) = graceful_stop_flag {
-            let current_graceful_stop = graceful_flag.load(std::sync::atomic::Ordering::SeqCst);
-
-            // Detect transition from false to true (entering stopping state)
-            if current_graceful_stop && !*previous_graceful_stop {
-                info!("Graceful stop requested, entering stopping state");
-                #[cfg(feature = "web-monitoring")]
-                self.update_execution_mode("stopping").await;
-            }
-
-            // Detect transition from true to false (cancel stop - resume running)
-            if !current_graceful_stop && *previous_graceful_stop {
-                info!("Graceful stop cancelled, resuming running state");
-                #[cfg(feature = "web-monitoring")]
-                self.update_execution_mode("running").await;
-            }
-
-            *previous_graceful_stop = current_graceful_stop;
-
-            // If stop is still requested, exit loop
-            if current_graceful_stop {
-                info!("Graceful stop: stopping after current change");
-                #[cfg(feature = "web-monitoring")]
-                self.update_execution_mode("stopped").await;
-                if let Some(progress) = &mut self.progress {
-                    progress.complete_all();
-                }
-                return LoopControl::Break {
-                    finish_status: "graceful_stop",
-                    apply_count: None,
-                };
-            }
-        }
-        LoopControl::Continue
-    }
-
-    /// Check for cancellation token
-    /// Returns LoopControl indicating whether to continue or break
-    async fn check_cancellation(
-        &mut self,
-        cancel_token: &tokio_util::sync::CancellationToken,
-    ) -> LoopControl {
-        if cancel_token.is_cancelled() {
-            info!("Cancellation requested, stopping orchestration");
-            #[cfg(feature = "web-monitoring")]
-            self.update_execution_mode("stopped").await;
-            if let Some(progress) = &mut self.progress {
-                progress.complete_all();
-            }
-            return LoopControl::Break {
-                finish_status: "cancelled",
-                apply_count: None,
-            };
-        }
-        LoopControl::Continue
-    }
-
-    /// Advance the workflow-loop iteration counter used for shared-state
-    /// observability.
-    ///
-    /// This loop deliberately imposes no Apply ceiling of its own. `max_iterations`
-    /// has exactly one owner — the per-change [`ApplyBudget`] shared by serial CLI,
-    /// TUI, and parallel execution — which reserves before each configured Apply
-    /// dispatch, emits the single 80% warning, and returns a typed
-    /// `iteration_limit` outcome that reaches this loop as
-    /// [`ChangeProcessResult::IterationLimit`]. A second ceiling here would stop
-    /// runs early and duplicate the warning.
-    ///
-    /// [`ApplyBudget`]: crate::execution::apply::ApplyBudget
-    async fn check_max_iterations(&mut self) -> LoopControl {
-        self.shared_state.write().await.increment_iteration();
-        LoopControl::Continue
-    }
-
-    /// Check all loop control conditions (graceful stop, cancellation, max iterations).
-    /// Returns LoopControl indicating whether to continue or break.
-    async fn check_loop_controls(
-        &mut self,
-        graceful_stop_flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-        previous_graceful_stop: &mut bool,
-        cancel_token: &tokio_util::sync::CancellationToken,
-    ) -> LoopControl {
-        // Check for graceful stop
-        match self
-            .check_graceful_stop(graceful_stop_flag, previous_graceful_stop)
-            .await
-        {
-            LoopControl::Continue => {}
-            break_control => return break_control,
-        }
-
-        // Check for cancellation
-        match self.check_cancellation(cancel_token).await {
-            LoopControl::Continue => {}
-            break_control => return break_control,
-        }
-
-        // Check max iterations
-        self.check_max_iterations().await
-    }
-
-    /// Update shared state with an execution event
-    async fn update_shared_state(&self, event: ExecutionEvent) {
-        let mut sinks: Vec<std::sync::Arc<dyn crate::events::EventSink>> = cli_event_sinks();
-        // The lifecycle sink is appended last so it can only observe events that
-        // the reducer and existing sinks have already processed.
-        if let Some(lifecycle_sink) = &self.lifecycle_sink {
-            sinks.push(lifecycle_sink.clone());
-        }
-        dispatch_event(self.shared_state.as_ref(), &sinks, event).await;
-    }
-
-    /// Handle Archived result
-    async fn handle_archived(&mut self, next: &Change) {
-        self.update_shared_state(ExecutionEvent::ChangeArchived(next.id.clone()))
-            .await;
-        self.stall_detector.clear_change(&next.id);
-
-        if let Some(progress) = &mut self.progress {
-            progress.archive_change(&next.id);
-        }
-    }
-
-    /// Handle Stalled result
-    async fn handle_stalled(&mut self, next: &Change, error: &str) -> LoopControl {
-        warn!("Change stalled: {} - {}", next.id, error);
-        self.mark_change_stalled(&next.id, error).await;
-        LoopControl::Continue
-    }
-
-    /// Handle a validated acceptance stall.
-    ///
-    /// Unlike a generic stall this carries structured blocker evidence, so it is
-    /// published as the same `AcceptanceGated` lifecycle event parallel mode
-    /// emits. Serial must not degrade it into an opaque processing error, and
-    /// must not clear the hold it just recorded.
-    async fn handle_acceptance_stalled(
-        &mut self,
-        next: &Change,
-        events: Vec<ExecutionEvent>,
-        error: &str,
-    ) -> LoopControl {
-        warn!(
-            "Acceptance stalled for {} on a validated external blocker: {}",
-            next.id, error
-        );
-        {
-            let mut state = self.shared_state.write().await;
-            state.add_dynamic_change(next.id.clone());
-            state.mark_stalled(next.id.clone());
-            for event in events {
-                state.apply_execution_event(&event);
-            }
-        }
-        self.stall_detector.clear_change(&next.id);
-        if let Some(progress) = &mut self.progress {
-            progress.error(error);
-        }
-        LoopControl::Continue
-    }
-
-    /// Handle Failed result
-    async fn handle_failed(&mut self, next: &Change, error: &str) -> Result<()> {
-        error!("Change failed: {} - {}", next.id, error);
-        if let Some(progress) = &mut self.progress {
-            progress.error(&format!("Failed: {}", next.id));
-        }
-        #[cfg(feature = "web-monitoring")]
-        self.update_execution_mode("error").await;
-        Err(OrchestratorError::AgentCommand(error.to_string()))
-    }
-
-    /// Handle ApplySuccessIncomplete result
-    async fn handle_apply_success_incomplete(
-        &mut self,
-        next: &Change,
-        serial_service: &mut SerialRunService,
-    ) -> LoopControl {
-        self.update_shared_state(ExecutionEvent::ApplyCompleted {
-            change_id: next.id.clone(),
-            revision: "serial".to_string(),
-        })
-        .await;
-
-        // CLI-specific: Create WIP snapshot
-        let apply_count = serial_service.apply_count(&next.id);
-        let snapshot = match self.snapshot_serial_iteration(&next.id, apply_count).await {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
-                SerialSnapshot {
-                    progress: crate::task_parser::TaskProgress::default(),
-                    empty_commit: None,
-                }
-            }
-        };
-
-        // CLI-specific: Check for stall on empty commits
-        if let Some(stall_reason) = serial_service.check_stall_after_apply(
-            &next.id,
-            &snapshot.progress,
-            snapshot.empty_commit,
-        ) {
-            warn!("{}", stall_reason);
-            self.mark_change_stalled(&next.id, &stall_reason).await;
-            return LoopControl::Continue;
-        }
-
-        if let Some(progress) = &mut self.progress {
-            progress.complete_change(&next.id);
-        }
-        LoopControl::Continue
-    }
-
-    /// Handle ApplyFailed result
-    async fn handle_apply_failed(
-        &mut self,
-        next: &Change,
-        error: &str,
-        serial_service: &mut SerialRunService,
-    ) -> Result<()> {
-        self.update_shared_state(ExecutionEvent::ApplyStarted {
-            change_id: next.id.clone(),
-            command: "(placeholder)".to_string(),
-        })
-        .await;
-
-        // CLI-specific: Create WIP snapshot even on failure
-        let apply_count = serial_service.apply_count(&next.id);
-        if let Err(e) = self.snapshot_serial_iteration(&next.id, apply_count).await {
-            warn!("Failed to snapshot WIP commit for {}: {}", next.id, e);
-        }
-
-        // CLI-specific: Check circuit breaker
-        if self
-            .record_error_and_check_circuit_breaker(&next.id, error)
-            .await
-        {
-            let message = format!(
-                "Circuit breaker opened for '{}' due to repeated errors",
-                next.id
-            );
-            warn!("{}", message);
-            self.mark_change_stalled(&next.id, &message).await;
-            serial_service.mark_stalled(&next.id, &message);
-            return Ok(());
-        }
-
-        error!("Apply failed for {}: {}", next.id, error);
-        if let Some(progress) = &mut self.progress {
-            progress.error(&format!("Apply failed: {}", next.id));
-        }
-        #[cfg(feature = "web-monitoring")]
-        self.update_execution_mode("error").await;
-        Err(OrchestratorError::AgentCommand(error.to_string()))
-    }
-
-    /// Handle acceptance-related results (Passed, Continue, ContinueExceeded, Failed, CommandFailed, Blocked)
-    async fn handle_acceptance_result(
-        &mut self,
-        next: &Change,
-        serial_service: &mut SerialRunService,
-        result: &crate::serial_run_service::ChangeProcessResult,
-    ) {
-        use crate::serial_run_service::ChangeProcessResult;
-
-        // Common state update for all acceptance results
-        self.update_shared_state(ExecutionEvent::ApplyCompleted {
-            change_id: next.id.clone(),
-            revision: "serial".to_string(),
-        })
-        .await;
-
-        // Specific handling based on result type
-        match result {
-            ChangeProcessResult::AcceptancePassed => {
-                // CLI-specific: Squash WIP commits after acceptance pass
-                let apply_count = serial_service.apply_count(&next.id);
-                let _ = self.squash_serial_wip_commits(&next.id, apply_count).await;
-                info!("Acceptance passed for {}, ready for archive", next.id);
-            }
-            ChangeProcessResult::AcceptanceContinue => {
-                info!(
-                    "Acceptance requires continuation for {}, retrying...",
-                    next.id
-                );
-            }
-            ChangeProcessResult::AcceptanceContinueExceeded => {
-                warn!(
-                    "Acceptance CONTINUE limit exceeded for {}, treating as FAIL",
-                    next.id
-                );
-            }
-            ChangeProcessResult::Rejected { reason } => {
-                info!(
-                    "Acceptance gated for {} - rejected flow completed: {}",
-                    next.id, reason
-                );
-                self.update_shared_state(ExecutionEvent::ChangeRejected {
-                    change_id: next.id.clone(),
-                    reason: reason.clone(),
-                })
-                .await;
-            }
-            ChangeProcessResult::AcceptanceFailed { .. } => {
-                info!("Acceptance failed for {}, will retry apply", next.id);
-            }
-            ChangeProcessResult::AcceptanceCommandFailed { .. } => {
-                info!(
-                    "Acceptance command failed for {}, will retry apply",
-                    next.id
-                );
-            }
-            _ => {}
-        }
-
-        if let Some(progress) = &mut self.progress {
-            progress.complete_change(&next.id);
-        }
-    }
-
-    fn filter_requested_changes(&self, changes: &[Change]) -> Result<Vec<Change>> {
-        let Some(targets) = &self.target_changes else {
-            return Ok(changes.to_vec());
-        };
-
-        let by_id: HashMap<&str, &Change> = changes
-            .iter()
-            .map(|change| (change.id.as_str(), change))
-            .collect();
-        let mut seen = HashSet::new();
-        let mut missing = Vec::new();
-        let mut duplicates = Vec::new();
-        let mut filtered = Vec::new();
-
-        for target in targets {
-            let id = target.trim();
-            if id.is_empty() {
-                continue;
-            }
-            if !seen.insert(id.to_string()) {
-                duplicates.push(id.to_string());
-                continue;
-            }
-            match by_id.get(id) {
-                Some(change) => filtered.push((*change).clone()),
-                None => missing.push(id.to_string()),
-            }
-        }
-
-        if !duplicates.is_empty() || !missing.is_empty() {
-            let mut parts = Vec::new();
-            if !duplicates.is_empty() {
-                parts.push(format!("duplicate change IDs: {}", duplicates.join(", ")));
-            }
-            if !missing.is_empty() {
-                parts.push(format!("unknown change IDs: {}", missing.join(", ")));
-            }
-            return Err(OrchestratorError::Parse(format!(
-                "invalid run targets: {}",
-                parts.join("; ")
-            )));
-        }
-
-        Ok(filtered)
     }
 
     /// Capture the base identity attached at run start.
@@ -837,122 +375,10 @@ impl Orchestrator {
         Ok(ParallelTargets::Resolved(resolution))
     }
 
-    /// Initialize run loop state (shared state, progress display, serial service).
-    /// Returns (filtered_initial_changes, serial_service, total_changes).
-    async fn initialize_run_loop(
-        &mut self,
-        initial_changes: Vec<Change>,
-    ) -> Result<(Vec<Change>, SerialRunService, usize)> {
-        let filtered_initial = self.filter_requested_changes(&initial_changes)?;
-
-        if filtered_initial.is_empty() {
-            // Return empty result - caller will handle early exit
-            let repo_root = std::env::current_dir()?;
-            let serial_service = SerialRunService::new(repo_root, self.config.clone());
-            return Ok((filtered_initial, serial_service, 0));
-        }
-
-        // Store snapshot of change IDs (only the filtered ones)
-        let snapshot_ids: HashSet<String> = filtered_initial.iter().map(|c| c.id.clone()).collect();
-        info!(
-            "Captured snapshot of {} changes: {:?}",
-            snapshot_ids.len(),
-            snapshot_ids
-        );
-        self.initial_change_ids = Some(snapshot_ids.clone());
-
-        // Initialize shared orchestration state with filtered changes (serial mode)
-        let change_ids: Vec<String> = filtered_initial.iter().map(|c| c.id.clone()).collect();
-        *self.shared_state.write().await = OrchestratorState::new(change_ids, self.max_iterations);
-
-        // Initialize progress display
-        self.progress = Some(ProgressDisplay::new(filtered_initial.len()));
-
-        let total_changes = filtered_initial.len();
-
-        // Create serial run service for shared state and helpers
-        let repo_root = std::env::current_dir()?;
-        let serial_service = SerialRunService::new(repo_root, self.config.clone());
-
-        Ok((filtered_initial, serial_service, total_changes))
-    }
-
-    /// Handle ChangeProcessResult and return LoopControl
-    async fn handle_change_result(
-        &mut self,
-        result: crate::serial_run_service::ChangeProcessResult,
-        next: &Change,
-        serial_service: &mut SerialRunService,
-    ) -> Result<LoopControl> {
-        use crate::serial_run_service::ChangeProcessResult;
-
-        match result {
-            ChangeProcessResult::Archived => {
-                self.handle_archived(next).await;
-                Ok(LoopControl::Continue)
-            }
-            ChangeProcessResult::Stalled { error } => Ok(self.handle_stalled(next, &error).await),
-            ChangeProcessResult::AcceptanceStalled { ref error, .. } => {
-                let error = error.clone();
-                let events = result.stalled_lifecycle_events(&next.id);
-                Ok(self.handle_acceptance_stalled(next, events, &error).await)
-            }
-            ChangeProcessResult::Failed { error } => {
-                self.handle_failed(next, &error).await?;
-                Ok(LoopControl::Continue)
-            }
-            ChangeProcessResult::Cancelled => {
-                info!("Processing cancelled for {}", next.id);
-                Ok(LoopControl::Break {
-                    finish_status: "cancelled",
-                    apply_count: None,
-                })
-            }
-            ChangeProcessResult::ChangeStopped => {
-                // In CLI mode, single-change stop is not applicable (no TUI queue)
-                // Treat it as a global cancel
-                info!("Change {} stopped", next.id);
-                Ok(LoopControl::Break {
-                    finish_status: "stopped",
-                    apply_count: None,
-                })
-            }
-            ChangeProcessResult::ApplySuccessIncomplete => Ok(self
-                .handle_apply_success_incomplete(next, serial_service)
-                .await),
-            ChangeProcessResult::ApplyFailed { error } => {
-                self.handle_apply_failed(next, &error, serial_service)
-                    .await?;
-                Ok(LoopControl::Continue)
-            }
-            // Budget exhaustion is its own typed stop, not an agent crash: the
-            // run ends with the canonical `iteration_limit` finish status and
-            // the exact cumulative per-change dispatch count.
-            ChangeProcessResult::IterationLimit { attempts, error } => {
-                info!("{}", error);
-                self.mark_change_stalled(&next.id, &error).await;
-                if let Some(progress) = &mut self.progress {
-                    progress.complete_all();
-                }
-                Ok(LoopControl::Break {
-                    finish_status: "iteration_limit",
-                    apply_count: Some(attempts),
-                })
-            }
-            ChangeProcessResult::AcceptancePassed
-            | ChangeProcessResult::AcceptanceContinue
-            | ChangeProcessResult::AcceptanceContinueExceeded
-            | ChangeProcessResult::AcceptanceFailed { .. }
-            | ChangeProcessResult::AcceptanceCommandFailed { .. }
-            | ChangeProcessResult::Rejected { .. } => {
-                self.handle_acceptance_result(next, serial_service, &result)
-                    .await;
-                Ok(LoopControl::Continue)
-            }
-        }
-    }
-
-    /// Run the orchestration loop with cancellation support
+    /// Run cumulative worktree orchestration for the resolved targets.
+    ///
+    /// There is one execution path: every selected change — including a single
+    /// explicit target — is dispatched to the cumulative worktree scheduler.
     pub async fn run(
         &mut self,
         cancel_token: tokio_util::sync::CancellationToken,
@@ -960,434 +386,29 @@ impl Orchestrator {
     ) -> Result<()> {
         info!("Starting orchestration loop");
 
-        // Set execution mode to running (for web monitoring)
-        #[cfg(feature = "web-monitoring")]
-        {
-            self.execution_mode = "running".to_string();
-        }
-
         // Capture initial snapshot of change IDs at run start.
         // Only changes present at this point will be processed during the run.
         // This prevents mid-run proposals from being processed before they are ready.
         let initial_changes = openspec::list_changes_native()?;
 
-        // Cumulative parallel mode resolves explicit targets from repository
-        // evidence instead of the active list alone, so a repeated target set
-        // that already completed is skipped instead of rejected as unknown.
-        if self.parallel && self.dry_run {
+        // Explicit targets are resolved from repository evidence instead of the
+        // active list alone, so a repeated target set that already completed is
+        // skipped instead of rejected as unknown.
+        let targets = self.resolve_parallel_targets(&initial_changes).await?;
+
+        if self.dry_run {
             // Read-only classification against the current local base: no
             // network fetch and no workspace mutation or cleanup.
-            let targets = self.resolve_parallel_targets(&initial_changes).await?;
             return self
                 .run_parallel_dry_run(&targets.dispatch_changes(), targets.resolution())
                 .await;
         }
 
-        // Handle parallel execution mode
-        if self.parallel {
-            let targets = self.resolve_parallel_targets(&initial_changes).await?;
-            return self
-                .run_parallel(targets, cancel_token, graceful_stop_flag)
-                .await;
-        }
-
-        if initial_changes.is_empty() {
-            info!("No changes found");
-            return Ok(());
-        }
-
-        // Initialize run loop state (shared state, progress display, serial service)
-        let (filtered_initial, mut serial_service, total_changes) =
-            self.initialize_run_loop(initial_changes).await?;
-
-        if filtered_initial.is_empty() {
-            info!("No changes found matching specified targets");
-            return Ok(());
-        }
-
-        // Run on_start hook
-        let start_context = HookContext::new(0, total_changes, total_changes, false);
-        self.hooks
-            .run_hook(HookType::OnStart, &start_context)
-            .await?;
-
-        let finish_status;
-        // Cumulative Apply dispatches reported to `on_finish` when the run stops
-        // on `iteration_limit`; every other stop keeps the existing `0`.
-        let mut finish_apply_count = 0u32;
-
-        // Track previous graceful stop state to detect transitions (false -> true)
-        let mut previous_graceful_stop = false;
-
-        loop {
-            // Check all loop control conditions (graceful stop, cancellation, max iterations)
-            match self
-                .check_loop_controls(
-                    &graceful_stop_flag,
-                    &mut previous_graceful_stop,
-                    &cancel_token,
-                )
-                .await
-            {
-                LoopControl::Continue => {}
-                LoopControl::Break {
-                    finish_status: status,
-                    apply_count,
-                } => {
-                    finish_status = status;
-                    finish_apply_count = apply_count.unwrap_or(0);
-                    break;
-                }
-            }
-
-            // Refetch and select next change to process
-            let (next, remaining_changes) =
-                match self.refetch_and_select_change(&mut serial_service).await? {
-                    Some(result) => result,
-                    None => {
-                        // All changes processed or stalled
-                        finish_status = "completed";
-                        break;
-                    }
-                };
-
-            // Check if this is a new change (for state tracking)
-            let is_new_change = {
-                let state = self.shared_state.read().await;
-                state.current_change_id() != Some(&next.id)
-            };
-            if is_new_change {
-                // Update shared state: processing started
-                self.update_shared_state(ExecutionEvent::ProcessingStarted(next.id.clone()))
-                    .await;
-
-                // Note: OnChangeStart hook is called by process_change() internally
-            }
-
-            // Process the change through SerialRunService
-            let output = LogOutputHandler::new();
-            let cancel_check = || false; // No cancellation in CLI mode
-            let is_single_change_stopped = || false; // No single-change stop in CLI mode
-
-            let result = serial_service
-                .process_change(
-                    &next,
-                    &mut self.agent,
-                    &self.ai_runner,
-                    &self.hooks,
-                    &output,
-                    total_changes,
-                    remaining_changes,
-                    cancel_check,
-                    is_single_change_stopped,
-                    None, // No operation tracker in CLI mode
-                )
-                .await?;
-
-            // Handle mode-specific concerns based on result
-            match self
-                .handle_change_result(result, &next, &mut serial_service)
-                .await?
-            {
-                LoopControl::Continue => {}
-                LoopControl::Break {
-                    finish_status: status,
-                    apply_count,
-                } => {
-                    finish_status = status;
-                    finish_apply_count = apply_count.unwrap_or(0);
-                    break;
-                }
-            }
-        }
-
-        // Run on_finish hook exactly once for the run, carrying the typed finish
-        // status and — for `iteration_limit` — the exact cumulative count.
-        let processed = self.shared_state.read().await.changes_processed();
-        let finish_context = HookContext::new(processed, total_changes, 0, false)
-            .with_status(finish_status)
-            .with_apply_count(finish_apply_count);
-        self.hooks
-            .run_hook(HookType::OnFinish, &finish_context)
-            .await?;
-
-        // Set execution mode to stopped (for web monitoring)
-        #[cfg(feature = "web-monitoring")]
-        self.update_execution_mode("stopped").await;
-
-        info!("Orchestration completed");
-        Ok(())
-    }
-
-    async fn snapshot_serial_iteration(
-        &self,
-        change_id: &str,
-        iteration: u32,
-    ) -> Result<SerialSnapshot> {
-        let repo_root = std::env::current_dir()?;
-        let progress =
-            check_task_progress(&repo_root, change_id).unwrap_or_else(|_| TaskProgress::default());
-        let mut empty_commit = None;
-
-        if matches!(self.vcs_backend, VcsBackend::Git | VcsBackend::Auto) {
-            let is_git_repo = match git_commands::check_git_repo(&repo_root).await {
-                Ok(is_repo) => is_repo,
-                Err(e) => {
-                    warn!("Failed to check Git repository status: {}", e);
-                    false
-                }
-            };
-
-            if is_git_repo {
-                let workspace_manager = GitWorkspaceManager::new(
-                    repo_root.join(".openspec-worktrees"),
-                    repo_root.clone(),
-                    1,
-                    self.config.clone(),
-                );
-
-                if let Err(e) = create_progress_commit(
-                    &workspace_manager,
-                    &repo_root,
-                    change_id,
-                    &progress,
-                    iteration,
-                    None,
-                )
-                .await
-                {
-                    warn!(
-                        "Failed to create WIP commit for {} (apply#{}): {}",
-                        change_id, iteration, e
-                    );
-                } else {
-                    match git_commands::is_head_empty_commit(&repo_root).await {
-                        Ok(is_empty) => empty_commit = Some(is_empty),
-                        Err(e) => {
-                            warn!(
-                                "Failed to check WIP commit contents for {} (apply#{}): {}",
-                                change_id, iteration, e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(SerialSnapshot {
-            progress,
-            empty_commit,
-        })
-    }
-
-    async fn squash_serial_wip_commits(&self, change_id: &str, iteration: u32) -> Result<()> {
-        if !matches!(self.vcs_backend, VcsBackend::Git | VcsBackend::Auto) {
-            return Ok(());
-        }
-
-        let repo_root = std::env::current_dir()?;
-        let is_git_repo = match git_commands::check_git_repo(&repo_root).await {
-            Ok(is_repo) => is_repo,
-            Err(e) => {
-                warn!("Failed to check Git repository status: {}", e);
-                false
-            }
-        };
-
-        if !is_git_repo {
-            return Ok(());
-        }
-
-        let workspace_manager = GitWorkspaceManager::new(
-            repo_root.join(".openspec-worktrees"),
-            repo_root.clone(),
-            1,
-            self.config.clone(),
-        );
-
-        if let Err(e) = workspace_manager
-            .squash_wip_commits(&repo_root, change_id, iteration)
+        self.run_parallel(targets, cancel_token, graceful_stop_flag)
             .await
-        {
-            warn!(
-                "Failed to squash WIP commits for {} (apply#{}): {}",
-                change_id, iteration, e
-            );
-        }
-
-        Ok(())
     }
 
-    /// Filter changes to only include those present in the initial snapshot.
-    /// Returns an empty vector if no snapshot was captured.
-    fn filter_to_snapshot(&self, changes: &[Change]) -> Vec<Change> {
-        match &self.initial_change_ids {
-            Some(snapshot) => changes
-                .iter()
-                .filter(|c| snapshot.contains(&c.id))
-                .cloned()
-                .collect(),
-            None => changes.to_vec(),
-        }
-    }
-
-    /// Log any changes that were not present in the initial snapshot.
-    /// These are new changes added after the run started and will be ignored.
-    fn log_new_changes(&self, changes: &[Change]) {
-        if let Some(snapshot) = &self.initial_change_ids {
-            for change in changes {
-                if !snapshot.contains(&change.id) {
-                    warn!(
-                        "New change '{}' detected after run started - will be ignored",
-                        change.id
-                    );
-                }
-            }
-        }
-    }
-
-    /// Filter out stalled changes and those blocked by stalled dependencies.
-    async fn filter_stalled_changes(&mut self, changes: &[Change]) -> Vec<Change> {
-        let mut eligible = Vec::new();
-        let mut state = self.shared_state.write().await;
-
-        for change in changes {
-            if state.stalled_change_ids().contains(&change.id) {
-                continue;
-            }
-
-            if let Some(failed_dep) = change
-                .dependencies
-                .iter()
-                .find(|dep| state.stalled_change_ids().contains(*dep))
-            {
-                if state.mark_skipped(change.id.clone()) {
-                    warn!(
-                        "Skipping '{}' because dependency '{}' stalled",
-                        change.id, failed_dep
-                    );
-                }
-                continue;
-            }
-
-            eligible.push(change.clone());
-        }
-
-        eligible
-    }
-
-    /// Refetch and filter changes for the current iteration.
-    /// Returns None if loop should break (all changes processed or stalled).
-    /// Returns Some((next_change, remaining_count)) if a change was selected.
-    async fn refetch_and_select_change(
-        &mut self,
-        serial_service: &mut SerialRunService,
-    ) -> Result<Option<(Change, usize)>> {
-        // List all changes from openspec (to get updated progress)
-        let changes = openspec::list_changes_native()?;
-
-        // Broadcast state update to web monitoring clients
-        self.broadcast_state_update(&changes).await;
-
-        // Filter to only include changes from initial snapshot
-        let snapshot_changes = self.filter_to_snapshot(&changes);
-
-        // Log any new changes that appeared after run started
-        self.log_new_changes(&changes);
-
-        if snapshot_changes.is_empty() {
-            info!("All changes from initial snapshot processed");
-            if let Some(progress) = &mut self.progress {
-                progress.complete_all();
-            }
-            return Ok(None);
-        }
-
-        let eligible_changes = self.filter_stalled_changes(&snapshot_changes).await;
-        let remaining_changes = eligible_changes.len();
-
-        if eligible_changes.is_empty() {
-            info!("All remaining changes are blocked by stalled dependencies");
-            if let Some(progress) = &mut self.progress {
-                progress.complete_all();
-            }
-            return Ok(None);
-        }
-
-        // Select next change to process using serial service
-        let next = serial_service
-            .select_next_change(&eligible_changes)
-            .ok_or_else(|| {
-                OrchestratorError::AgentCommand("No eligible change found".to_string())
-            })?;
-        info!("Selected change: {}", next.id);
-
-        if let Some(progress) = &mut self.progress {
-            progress.update_change(next);
-        }
-
-        Ok(Some((next.clone(), remaining_changes)))
-    }
-
-    async fn mark_change_stalled(&mut self, change_id: &str, reason: &str) {
-        {
-            let mut state = self.shared_state.write().await;
-            state.add_dynamic_change(change_id.to_string());
-            state.mark_stalled(change_id.to_string());
-            state.clear_stalled_change(change_id);
-            state.clear_error_history(change_id);
-            state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
-                change_id: change_id.to_string(),
-                workspace_name: "serial-stalled".to_string(),
-                status: crate::vcs::WorkspaceStatus::Blocked,
-            });
-        }
-        self.stall_detector.clear_change(change_id);
-
-        if let Some(progress) = &mut self.progress {
-            progress.error(reason);
-        }
-    }
-
-    /// Record an error and check if circuit breaker should trip
-    /// Returns true if the change should be skipped due to repeated errors
-    async fn record_error_and_check_circuit_breaker(
-        &mut self,
-        change_id: &str,
-        error: &str,
-    ) -> bool {
-        let cb_config = self.config.get_error_circuit_breaker();
-        let circuit_breaker_config = CircuitBreakerConfig {
-            enabled: cb_config.enabled,
-            threshold: cb_config.threshold,
-        };
-
-        let mut state = self.shared_state.write().await;
-        if state.record_error_and_check_circuit_breaker(
-            change_id,
-            error,
-            circuit_breaker_config.clone(),
-        ) {
-            error!(
-                "Circuit breaker triggered for '{}': same error occurred {} times consecutively",
-                change_id, circuit_breaker_config.threshold
-            );
-            if let Some(last_err) = state.last_error(change_id) {
-                error!("Last error pattern: {}", last_err);
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Set initial change IDs snapshot directly (for testing purposes)
-    #[cfg(test)]
-    pub fn set_initial_change_ids(&mut self, ids: HashSet<String>) {
-        self.initial_change_ids = Some(ids);
-    }
-
-    /// Run parallel mode with dry run (preview parallelization groups)
+    /// Preview the execution plan without running anything (dry run)
     ///
     /// The optional resolution is the read-only explicit-target classification
     /// performed against the current local base. Dry run reports it without any
@@ -1397,7 +418,7 @@ impl Orchestrator {
         changes: &[Change],
         resolution: Option<&TargetResolution>,
     ) -> Result<()> {
-        info!("Running parallel mode dry run (preview only)");
+        info!("Running dry run (preview only)");
 
         if let Some(resolution) = resolution {
             println!("\n=== Explicit Target Classification (Dry Run) ===\n");
@@ -1458,8 +479,7 @@ impl Orchestrator {
     /// A change stopped by the shared Apply-dispatch ceiling was recorded by its
     /// workspace task as a typed observation, so the hook receives
     /// `iteration_limit` together with that change's exact cumulative dispatch
-    /// count — the same contract serial reports through `LoopControl::Break` —
-    /// instead of a status the hook would have to infer from log text.
+    /// count instead of a status the hook would have to infer from log text.
     async fn run_parallel_finish_hook(&self) -> Result<()> {
         let state = self.shared_state.read().await;
         let iteration_limit = state.apply_iteration_limits().first().cloned();
@@ -1527,11 +547,8 @@ impl Orchestrator {
         // Initialize shared orchestration state with parallel execution mode
         {
             let change_ids: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
-            *self.shared_state.write().await = OrchestratorState::with_mode(
-                change_ids,
-                self.max_iterations,
-                crate::orchestration::state::ExecutionMode::Parallel,
-            );
+            *self.shared_state.write().await =
+                OrchestratorState::new(change_ids, self.max_iterations);
         }
 
         // Use ParallelRunService for the common parallel execution flow
@@ -1576,7 +593,7 @@ impl Orchestrator {
         let web_event_sender = web_event_tx.clone();
 
         // Monitor graceful_stop_flag and trigger cancellation if set
-        // This allows Web control Stop to work in parallel mode
+        // This allows Web control Stop to work during orchestration
         if let Some(ref stop_flag) = graceful_stop_flag {
             let monitor_token = cancel_token.clone();
             let monitor_flag = stop_flag.clone();
@@ -1584,7 +601,7 @@ impl Orchestrator {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     if monitor_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                        info!("Graceful stop requested in parallel mode, cancelling execution");
+                        info!("Graceful stop requested, cancelling execution");
                         monitor_token.cancel();
                         break;
                     }
@@ -1804,7 +821,7 @@ impl Orchestrator {
             eprintln!(
                 "ERROR: No changes started: all {} requested change(s) were rejected by \
                  start-time eligibility filter (uncommitted or not in HEAD). \
-                 Commit your changes before running in parallel mode.",
+                 Commit your changes before running.",
                 total_requested
             );
         }
@@ -1820,6 +837,7 @@ mod tests {
     use crate::orchestration::target_resolution::{
         BaseCompletionEvidence, BaseEvidenceErrorKind, TargetEvidence, WorkspaceResumeEvidence,
     };
+    use std::collections::HashMap;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -1832,8 +850,9 @@ mod tests {
         }
     }
 
-    /// Parallel runs have no `LoopControl` return path, so the finish hook is
-    /// driven from the typed observation the workspace task recorded.
+    /// The run has no per-change return path for a typed Apply outcome, so the
+    /// finish hook is driven from the typed observation the workspace task
+    /// recorded on the reducer.
     mod parallel_finish_hook {
         use super::*;
         use crate::hooks::{HookConfig, HookConfigValue, HooksConfig};
@@ -1878,11 +897,7 @@ mod tests {
 
             {
                 let mut state = orchestrator.shared_state.write().await;
-                *state = OrchestratorState::with_mode(
-                    vec!["change-a".to_string()],
-                    7,
-                    crate::orchestration::state::ExecutionMode::Parallel,
-                );
+                *state = OrchestratorState::new(vec!["change-a".to_string()], 7);
                 // The workspace task's typed observation: the ceiling refused
                 // dispatch 8 after 7 cumulative dispatches.
                 state.record_apply_iteration_limit("change-a", 7, 7);
@@ -1911,11 +926,7 @@ mod tests {
 
             {
                 let mut state = orchestrator.shared_state.write().await;
-                *state = OrchestratorState::with_mode(
-                    vec!["change-a".to_string()],
-                    7,
-                    crate::orchestration::state::ExecutionMode::Parallel,
-                );
+                *state = OrchestratorState::new(vec!["change-a".to_string()], 7);
             }
 
             orchestrator
@@ -1925,55 +936,6 @@ mod tests {
 
             assert_eq!(lines(&log), vec!["completed 0".to_string()]);
         }
-    }
-
-    #[test]
-    fn test_filter_requested_changes_keeps_requested_order() {
-        let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config(
-            Some(vec!["change-c".to_string(), "change-a".to_string()]),
-            config,
-        )
-        .unwrap();
-        let changes = vec![
-            create_test_change("change-a", 0, 1),
-            create_test_change("change-b", 0, 1),
-            create_test_change("change-c", 0, 1),
-        ];
-
-        let filtered = orchestrator.filter_requested_changes(&changes).unwrap();
-
-        assert_eq!(
-            filtered
-                .iter()
-                .map(|change| change.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["change-c", "change-a"]
-        );
-    }
-
-    #[test]
-    fn test_filter_requested_changes_rejects_unknown_and_duplicate_ids() {
-        let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config(
-            Some(vec![
-                "change-a".to_string(),
-                "missing".to_string(),
-                "change-a".to_string(),
-            ]),
-            config,
-        )
-        .unwrap();
-        let changes = vec![
-            create_test_change("change-a", 0, 1),
-            create_test_change("change-c", 0, 1),
-        ];
-
-        let err = orchestrator.filter_requested_changes(&changes).unwrap_err();
-
-        let message = err.to_string();
-        assert!(message.contains("duplicate change IDs: change-a"));
-        assert!(message.contains("unknown change IDs: missing"));
     }
 
     /// In-memory evidence double.
@@ -2274,153 +1236,6 @@ mod tests {
         assert!(resolution.failure_error().is_none());
     }
 
-    #[test]
-    fn test_filter_to_snapshot_filters_new_changes() {
-        // Create orchestrator with mock config (won't be used in this test)
-        let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
-
-        // Set up snapshot with only change-a and change-b
-        let snapshot: HashSet<String> = ["change-a", "change-b"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        orchestrator.set_initial_change_ids(snapshot);
-
-        // Create changes list including new change-c
-        let all_changes = vec![
-            create_test_change("change-a", 2, 5),
-            create_test_change("change-b", 3, 5),
-            create_test_change("change-c", 0, 3), // New change, not in snapshot
-        ];
-
-        // Filter to snapshot
-        let filtered = orchestrator.filter_to_snapshot(&all_changes);
-
-        // Should only include change-a and change-b
-        assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().any(|c| c.id == "change-a"));
-        assert!(filtered.iter().any(|c| c.id == "change-b"));
-        assert!(!filtered.iter().any(|c| c.id == "change-c"));
-    }
-
-    #[test]
-    fn test_filter_to_snapshot_returns_all_when_no_snapshot() {
-        // Create orchestrator without setting snapshot
-        let config = OrchestratorConfig::default();
-        let orchestrator = Orchestrator::with_config(None, config).unwrap();
-
-        let all_changes = vec![
-            create_test_change("change-a", 2, 5),
-            create_test_change("change-b", 3, 5),
-        ];
-
-        // Should return all changes when no snapshot is set
-        let filtered = orchestrator.filter_to_snapshot(&all_changes);
-        assert_eq!(filtered.len(), 2);
-    }
-
-    #[test]
-    fn test_filter_to_snapshot_removes_archived_changes() {
-        let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
-
-        // Set up snapshot with change-a, change-b, change-c
-        let snapshot: HashSet<String> = ["change-a", "change-b", "change-c"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        orchestrator.set_initial_change_ids(snapshot);
-
-        // Simulate change-b being archived (no longer in list)
-        let current_changes = vec![
-            create_test_change("change-a", 2, 5),
-            create_test_change("change-c", 1, 5),
-        ];
-
-        // Filter should only return change-a and change-c (both in snapshot and in current list)
-        let filtered = orchestrator.filter_to_snapshot(&current_changes);
-        assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().any(|c| c.id == "change-a"));
-        assert!(filtered.iter().any(|c| c.id == "change-c"));
-    }
-
-    #[test]
-    fn test_filter_to_snapshot_handles_empty_changes() {
-        let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
-
-        let snapshot: HashSet<String> = ["change-a"].iter().map(|s| s.to_string()).collect();
-        orchestrator.set_initial_change_ids(snapshot);
-
-        // Empty changes list
-        let current_changes: Vec<Change> = vec![];
-
-        let filtered = orchestrator.filter_to_snapshot(&current_changes);
-        assert!(filtered.is_empty());
-    }
-
-    #[test]
-    fn test_snapshot_preserves_updated_progress() {
-        let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
-
-        // Set up snapshot with change-a
-        let snapshot: HashSet<String> = ["change-a"].iter().map(|s| s.to_string()).collect();
-        orchestrator.set_initial_change_ids(snapshot);
-
-        // Create changes with updated progress for change-a
-        let current_changes = vec![
-            create_test_change("change-a", 4, 5), // Progress updated from 2/5 to 4/5
-        ];
-
-        let filtered = orchestrator.filter_to_snapshot(&current_changes);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].completed_tasks, 4); // Progress should be updated
-    }
-
-    #[tokio::test]
-    async fn test_filter_stalled_changes_skips_dependencies() {
-        let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
-        orchestrator
-            .shared_state
-            .write()
-            .await
-            .mark_stalled("change-a".to_string());
-
-        let changes = vec![
-            Change {
-                id: "change-a".to_string(),
-                completed_tasks: 0,
-                total_tasks: 3,
-                last_modified: "now".to_string(),
-                dependencies: Vec::new(),
-                metadata: ProposalMetadata::default(),
-            },
-            Change {
-                id: "change-b".to_string(),
-                completed_tasks: 0,
-                total_tasks: 3,
-                last_modified: "now".to_string(),
-                dependencies: vec!["change-a".to_string()],
-                metadata: ProposalMetadata::default(),
-            },
-            Change {
-                id: "change-c".to_string(),
-                completed_tasks: 0,
-                total_tasks: 3,
-                last_modified: "now".to_string(),
-                dependencies: Vec::new(),
-                metadata: ProposalMetadata::default(),
-            },
-        ];
-
-        let eligible = orchestrator.filter_stalled_changes(&changes).await;
-        assert_eq!(eligible.len(), 1);
-        assert_eq!(eligible[0].id, "change-c");
-    }
-
     #[tokio::test]
     async fn test_orchestrator_creation() {
         let config = OrchestratorConfig::default();
@@ -2468,140 +1283,6 @@ mod tests {
                 "change-c".to_string()
             ])
         );
-    }
-
-    #[tokio::test]
-    async fn test_serial_shared_state_apply_count_and_iteration_increment() {
-        let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
-
-        {
-            let mut state = orchestrator.shared_state.write().await;
-            *state = crate::orchestration::state::OrchestratorState::new(
-                vec!["change-a".to_string()],
-                3,
-            );
-        }
-
-        // check_max_iterations increments iteration in shared state
-        match orchestrator.check_max_iterations().await {
-            super::LoopControl::Continue => {}
-            _ => panic!("iteration check should continue"),
-        }
-
-        {
-            let state = orchestrator.shared_state.read().await;
-            assert_eq!(state.iteration(), 1);
-            assert_eq!(state.apply_count("change-a"), 0);
-        }
-
-        // ApplyCompleted increments per-change apply count in shared state
-        orchestrator
-            .update_shared_state(crate::events::ExecutionEvent::ApplyCompleted {
-                change_id: "change-a".to_string(),
-                revision: "serial".to_string(),
-            })
-            .await;
-
-        let state = orchestrator.shared_state.read().await;
-        assert_eq!(state.apply_count("change-a"), 1);
-    }
-
-    #[tokio::test]
-    async fn test_stalled_result_marks_change_stalled_state() {
-        use crate::serial_run_service::ChangeProcessResult;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config(None, config.clone()).unwrap();
-        let mut serial_service = SerialRunService::new(temp_dir.path().to_path_buf(), config);
-
-        let blocked_change = create_test_change("blocked-change", 3, 5);
-
-        let result = ChangeProcessResult::Stalled {
-            error: "Acceptance gated with recoverable blocker".to_string(),
-        };
-
-        orchestrator
-            .handle_change_result(result, &blocked_change, &mut serial_service)
-            .await
-            .unwrap();
-
-        let state = orchestrator.shared_state.read().await;
-        assert_eq!(state.display_status(&blocked_change.id), "stalled");
-    }
-
-    /// The sole budget owner's typed exhaustion must survive the CLI run
-    /// boundary: the run stops with the canonical `iteration_limit` finish
-    /// status and the exact cumulative dispatch count, never as a generic crash.
-    #[tokio::test]
-    async fn test_iteration_limit_result_breaks_with_the_typed_finish_status() {
-        use crate::serial_run_service::ChangeProcessResult;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let config = OrchestratorConfig::default();
-        let mut orchestrator = Orchestrator::with_config(None, config.clone()).unwrap();
-        let mut serial_service = SerialRunService::new(temp_dir.path().to_path_buf(), config);
-
-        let change = create_test_change("spent-change", 1, 5);
-        let result = ChangeProcessResult::IterationLimit {
-            attempts: 7,
-            error: "Max iterations (7) reached for change 'spent-change' after 7 Apply dispatch(es): latest Apply failure".to_string(),
-        };
-
-        let control = orchestrator
-            .handle_change_result(result, &change, &mut serial_service)
-            .await
-            .expect("budget exhaustion is a stop, not an orchestration error");
-
-        match control {
-            super::LoopControl::Break {
-                finish_status,
-                apply_count,
-            } => {
-                assert_eq!(finish_status, "iteration_limit");
-                assert_eq!(
-                    apply_count,
-                    Some(7),
-                    "on_finish must receive the exact cumulative dispatch count"
-                );
-            }
-            other => panic!("expected a typed iteration-limit stop, got {other:?}"),
-        }
-
-        let state = orchestrator.shared_state.read().await;
-        assert_eq!(state.display_status(&change.id), "stalled");
-    }
-
-    /// The workflow loop imposes no second Apply ceiling: `max_iterations` has
-    /// exactly one owner, so this counter is observability only.
-    #[tokio::test]
-    async fn test_workflow_loop_never_imposes_a_second_apply_ceiling() {
-        let config = OrchestratorConfig {
-            max_iterations: Some(2),
-            ..OrchestratorConfig::default()
-        };
-        let mut orchestrator = Orchestrator::with_config(None, config).unwrap();
-        {
-            let mut state = orchestrator.shared_state.write().await;
-            *state = crate::orchestration::state::OrchestratorState::new(
-                vec!["change-a".to_string()],
-                2,
-            );
-        }
-
-        for _ in 0..5 {
-            assert!(
-                matches!(
-                    orchestrator.check_max_iterations().await,
-                    super::LoopControl::Continue
-                ),
-                "only the shared ApplyBudget may stop a run on max_iterations"
-            );
-        }
-        assert_eq!(orchestrator.shared_state.read().await.iteration(), 5);
     }
 
     /// Regression: when ALL requested changes are rejected by start-time eligibility filtering,

@@ -10,7 +10,7 @@ This directory contains the Terminal User Interface (TUI) for the Conflux orches
 - **state.rs**: Application state management
 - **render.rs**: UI rendering logic
 - **events.rs**: Event types and definitions
-- **orchestrator.rs**: Orchestration logic (sequential and parallel modes)
+- **orchestrator.rs**: Cumulative worktree orchestration logic
 - **queue.rs**: Dynamic queue for runtime change additions
 - **types.rs**: Type definitions (AppExecutionMode, ModalState, ViewMode, StopMode, etc.)
 - **utils.rs**: Utility functions (editor launch, terminal management, etc.)

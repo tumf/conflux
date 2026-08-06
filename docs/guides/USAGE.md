@@ -354,11 +354,11 @@ for change in $(openspec list --json | jq -r '.[].id'); do
 done
 ```
 
-### 4. Preview Before Running (Parallel Mode)
+### 4. Preview Before Running
 
 ```bash
-cflx run --parallel --dry-run
-cflx run --parallel
+cflx run --all --dry-run
+cflx run --all
 ```
 
 ### 5. Monitor with Web UI
@@ -378,7 +378,7 @@ cflx check-conflicts
 
 - Default mode is the TUI: `cflx`
 - Use `cflx run` for CI/CD and automated pipelines
-- Use `cflx run --parallel` for independent changes
+- Every run executes changes in managed git worktrees; use `--max-concurrent` to bound concurrency
 - Add `--web` for the HTTP dashboard
 - Use `RUST_LOG=debug` for detailed logs
 
@@ -408,10 +408,10 @@ fi
 cflx run --change urgent-fix,critical-update
 ```
 
-### Pattern 3: Parallel with Monitoring
+### Pattern 3: Concurrent Execution with Monitoring
 
 ```bash
-# Run parallel with web monitoring reachable from other hosts
+# Run with web monitoring reachable from other hosts
 export CFLX_WEB_TOKEN="$(openssl rand -hex 32)"
-cflx run --parallel --web --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKEN
+cflx run --all --web --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKEN
 ```

@@ -563,11 +563,8 @@ async fn per_change_upstream_base_lane_orders_merge_hook_verification_and_public
     // also emits per-change `ResolveCompleted`, which finalizes the reducer as
     // terminal `merged` just as effectively. Project every emitted event into the
     // real reducer, in order, and check what an operator would actually see.
-    let mut state = crate::orchestration::state::OrchestratorState::with_mode(
-        vec!["alpha".to_string()],
-        0,
-        crate::orchestration::state::ExecutionMode::Parallel,
-    );
+    let mut state =
+        crate::orchestration::state::OrchestratorState::new(vec!["alpha".to_string()], 0);
     state.apply_execution_event(&crate::parallel::ParallelEvent::ChangeArchived(
         "alpha".to_string(),
     ));

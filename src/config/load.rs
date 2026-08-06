@@ -15,6 +15,37 @@ use super::types::OrchestratorConfig;
 // Path helpers are defined in the parent (mod.rs) and accessed via super::
 use super::get_global_config_paths;
 
+/// Configuration keys that selected the removed serial execution mode.
+///
+/// Detection is limited to these known retired keys; the general unknown-key
+/// policy is unchanged. A silently ignored `parallel_mode` would let a stale
+/// config claim it still selects an execution mode that no longer exists.
+const RETIRED_KEYS: [(&str, &str); 1] = [(
+    "parallel_mode",
+    "cumulative Git-worktree orchestration is the only execution model; \
+     remove \"parallel_mode\" from your Conflux configuration",
+)];
+
+/// Reject a configuration document that still carries a retired key.
+fn reject_retired_keys(document: &str) -> Result<()> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(document)
+    else {
+        // Not an object, or not parseable: the ordinary parse below owns the
+        // diagnostic for that.
+        return Ok(());
+    };
+
+    for (key, guidance) in RETIRED_KEYS {
+        if map.contains_key(key) {
+            return Err(OrchestratorError::ConfigParse(format!(
+                "retired configuration key \"{key}\": {guidance}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 // ── OrchestratorConfig: file loading ──────────────────────────────────────
 
 impl OrchestratorConfig {
@@ -34,7 +65,12 @@ impl OrchestratorConfig {
     }
 
     /// Parse JSONC content (JSON with Comments)
+    ///
+    /// Retired keys are rejected here, before any caller can start orchestration
+    /// side effects with a configuration that names an execution mode.
     pub fn parse_jsonc(content: &str) -> Result<Self> {
+        let document = jsonc::strip_jsonc_features(content);
+        reject_retired_keys(&document)?;
         jsonc::parse(content)
     }
 

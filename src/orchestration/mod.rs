@@ -28,9 +28,7 @@ pub use blocker_classification::{
     ExternalBlockerClaim, LifecycleClassification,
 };
 #[allow(unused_imports)]
-pub use output::{
-    ChannelOutputHandler, ContextualOutputHandler, LogOutputHandler, OutputHandler, OutputMessage,
-};
+pub use output::{LogOutputHandler, OutputHandler};
 #[allow(unused_imports)]
 pub use rejection::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,

@@ -118,11 +118,10 @@ Command templates support these placeholders:
 | `completion_check_delay_ms` | integer | No | implementation default | Delay between completion checks |
 | `completion_check_max_retries` | integer | No | implementation default | Completion check retries |
 | `max_iterations` | integer | No | `50` | `0` disables the limit |
-| `parallel_mode` | boolean | No | auto by git detection | CLI `--parallel` still overrides |
-| `max_concurrent_workspaces` | integer | No | `3` | Parallel workspace limit |
+| `max_concurrent_workspaces` | integer | No | `3` | Concurrent managed-workspace limit |
 | `workspace_base_dir` | string | No | OS-specific data dir | Empty string behaves as unset |
 | `use_llm_analysis` | boolean | No | `true` | `false` skips dependency inference |
-| `vcs_backend` | `auto` or `git` | No | `auto` | Parallel execution backend |
+| `vcs_backend` | `auto` or `git` | No | `auto` | Worktree execution backend |
 | `propose_command` | string | No | unset | Enables proposal creation command |
 | `worktree_command` | string | No | unset | Enables proposal worktree command |
 | `command_queue_stagger_delay_ms` | integer | No | `2000` | Delay between command starts |

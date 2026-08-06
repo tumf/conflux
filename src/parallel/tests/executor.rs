@@ -7,7 +7,7 @@ use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
 use crate::orchestration::acceptance::MAX_ACCEPTANCE_RETRY_CYCLES;
-use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand, WaitState};
+use crate::orchestration::state::{OrchestratorState, ReducerCommand, WaitState};
 use crate::parallel::dedup::DiagnosticDeduplicationStore;
 use crate::parallel::dynamic_queue::ReanalysisReason;
 use crate::parallel::executor::{
@@ -495,14 +495,13 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
         }),
         Some(tx),
     );
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![
             "resolving".to_string(),
             "dependent".to_string(),
             "unrelated".to_string(),
         ],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -640,10 +639,9 @@ async fn resolving_dependency_diagnostic_dedupes_and_reemits_after_signature_cha
         create_test_config(),
         Some(event_tx),
     );
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["resolving-a".to_string(), "dependent".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -813,10 +811,9 @@ async fn test_terminal_error_change_is_not_selected_until_explicit_retry() {
         create_test_config(),
         Some(event_tx),
     );
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -862,10 +859,9 @@ async fn test_dependency_on_terminal_error_is_blocked_until_retry_and_success() 
         create_test_config(),
         Some(event_tx),
     );
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string(), "beta".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -994,11 +990,7 @@ async fn test_queue_reconciliation_skips_archived_dirty_candidate_when_post_arch
     // Explicit queue intent, so the post-archive-merge gate is what stops the
     // candidate rather than the absence of ordinary intent.
     let shared = Arc::new(tokio::sync::RwLock::new(
-        crate::orchestration::state::OrchestratorState::with_mode(
-            vec!["gamma".to_string()],
-            0,
-            crate::orchestration::state::ExecutionMode::Parallel,
-        ),
+        crate::orchestration::state::OrchestratorState::new(vec!["gamma".to_string()], 0),
     ));
     shared
         .write()
@@ -2326,12 +2318,12 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
     assert_eq!(progress.total, 3);
 }
 
-/// Parallel and serial dispatch both route acceptance follow-up persistence
-/// and PASS cleanup through the shared task-parser recovery path. This asserts
-/// the two call sequences produce byte-identical files, so recovery, warning,
-/// and cleanup behavior cannot diverge between execution modes.
+/// Two independent dispatches route acceptance follow-up persistence and PASS
+/// cleanup through the shared task-parser recovery path. This asserts the two
+/// call sequences produce byte-identical files, so recovery, warning, and
+/// cleanup behavior cannot diverge between workspaces.
 #[test]
-fn parallel_and_serial_follow_up_recovery_produce_identical_files() {
+fn repeated_follow_up_recovery_produces_identical_files() {
     const DRIFTED: &str = concat!(
         "## Implementation Tasks\n",
         "- [x] done\n",
@@ -2351,13 +2343,13 @@ fn parallel_and_serial_follow_up_recovery_produce_identical_files() {
         std::fs::write(change_dir.join("tasks.md"), DRIFTED).or_fail("unexpected error");
     };
 
-    let parallel_root = TempDir::new().or_fail("unexpected error");
-    let serial_root = TempDir::new().or_fail("unexpected error");
-    seed(parallel_root.path());
-    seed(serial_root.path());
+    let first_root = TempDir::new().or_fail("unexpected error");
+    let second_root = TempDir::new().or_fail("unexpected error");
+    seed(first_root.path());
+    seed(second_root.path());
 
     let mut rendered = Vec::new();
-    for root in [parallel_root.path(), serial_root.path()] {
+    for root in [first_root.path(), second_root.path()] {
         // FAIL persistence: identical resolver + shared recovery entry point.
         let tasks_path =
             crate::task_parser::resolve_acceptance_follow_up_tasks_path(change_id, root)
@@ -3014,7 +3006,7 @@ async fn test_blocked_only_classifier_distinguishes_scheduler_work_classes() {
         make_test_change("terminal-error"),
         dependency_blocked,
     ];
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![
             "dispatchable".to_string(),
             "manual-merge".to_string(),
@@ -3024,7 +3016,6 @@ async fn test_blocked_only_classifier_distinguishes_scheduler_work_classes() {
             "candidate-missing".to_string(),
         ],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -3094,10 +3085,9 @@ async fn queue_reconciliation_defers_missing_verdict_only_after_retry_exhaustion
 
     let change_id = "missing-verdict-queue";
     let queued = vec![make_test_change(change_id)];
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -3199,10 +3189,9 @@ async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["manual-merge".to_string(), "terminal-error".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -3682,10 +3671,9 @@ async fn dynamic_queue_ingestion_skips_final_terminal_merged_change() {
     let queue = Arc::new(DynamicQueue::new());
     queue.push("alpha".to_string()).await;
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     shared
         .write()
@@ -3724,10 +3712,9 @@ async fn final_terminal_dispatch_preflight_skips_before_workspace_execution() {
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     shared
         .write()
@@ -5605,10 +5592,9 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
     // Production order: an accepted queue addition records reducer intent
     // before the wake-up hint is published, and ingestion validates against that
     // intent rather than the catalog.
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.clone()],
         1,
-        ExecutionMode::Parallel,
     )));
     shared
         .write()
@@ -5939,10 +5925,9 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
         3,
-        crate::orchestration::state::ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -5981,10 +5966,9 @@ async fn handle_merge_result_releases_resolve_wait_retry_lane_on_auto_deferred()
     let mut executor = ParallelExecutor::new(repo_root, config, None);
     let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6031,10 +6015,9 @@ async fn handle_merge_result_releases_reject_wait_retry_lane_and_suppresses_dupl
     let mut executor = ParallelExecutor::new(repo_root, config, Some(event_tx));
     let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["lane".to_string(), "reject-a".to_string()],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6123,10 +6106,9 @@ async fn resolve_retry_workspace_lookup_failure_is_operator_visible() {
         Some(event_tx),
     );
     executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["missing-ws".to_string(), "next-ws".to_string()],
         0,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6206,14 +6188,13 @@ async fn reject_retry_workspace_lookup_failure_is_operator_visible() {
         Some(event_tx),
     );
     executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![
             "lane".to_string(),
             "missing-reject-ws".to_string(),
             "next-reject-ws".to_string(),
         ],
         0,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6288,10 +6269,9 @@ async fn resolve_give_up_promotes_next_waiter_without_user_action() {
         ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
     executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
     let (merge_result_tx, mut merge_result_rx) = mpsc::channel(8);
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["first".to_string(), "second".to_string()],
         0,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6362,10 +6342,9 @@ async fn retry_lane_busy_release_allows_subsequent_repromotion() {
     let mut executor = ParallelExecutor::new(repo_root, config, None);
     let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6448,10 +6427,9 @@ async fn deferred_retry_lane_repromotes_after_merge_completion_trigger() {
     let mut executor = ParallelExecutor::new(repo_root, config, None);
     let (merge_result_tx, mut merge_result_rx) = mpsc::channel(8);
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6516,10 +6494,9 @@ async fn finite_scheduler_does_not_drain_while_spawned_retry_is_pending() {
     let queued = Vec::new();
     let in_flight = HashSet::new();
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["retry-a".to_string(), "retry-b".to_string()],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6625,10 +6602,9 @@ async fn test_manual_resolve_wait_retries_after_in_flight_apply_completes() {
             .with_existing_workspace("change-a", workspace_dir.path().to_path_buf()),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["applying-change".to_string(), "change-a".to_string()],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6704,10 +6680,9 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
     let (tx, mut rx) = mpsc::channel(16);
     let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
         3,
-        crate::orchestration::state::ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6826,13 +6801,12 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
 
     let missing_change_id = "definitely-missing-candidate-for-reconciliation";
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![
             missing_change_id.to_string(),
             loadable_change_id.to_string(),
         ],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6919,10 +6893,9 @@ async fn test_reducer_visible_queue_addition_marks_reanalysis_timestamp_and_enqu
         .or_fail("write reducer-visible tasks");
 
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, None);
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -6967,10 +6940,9 @@ async fn test_reducer_visible_queue_addition_preserves_existing_reanalysis_times
         *last_change = Some(existing_timestamp);
     }
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -7042,10 +7014,9 @@ async fn test_archived_dirty_reconciliation_skips_workspace_already_merged_to_ba
     // The merged-evidence stop gate must hold *after* the explicit-intent
     // boundary is passed, so this fixture gives the change real reducer queue
     // intent instead of relying on the absence of intent.
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -7135,10 +7106,9 @@ async fn test_archived_dirty_reconciliation_skips_manual_merge_wait() {
             .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     // Explicit queue intent that survives into manual merge wait. A resolve
     // failure restores `MergeWait` without clearing `QueueIntent::Queued`, so
@@ -7270,10 +7240,9 @@ async fn test_archived_dirty_reconciliation_keeps_terminal_error_stopped_until_r
             .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -7647,10 +7616,9 @@ struct GatedDispatch {
 /// state models a restart and reusing one models a second dispatch inside the
 /// same process.
 fn new_process_state(change_id: &str) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
-    Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+    Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
         10,
-        crate::orchestration::state::ExecutionMode::Parallel,
     )))
 }
 
@@ -8177,10 +8145,6 @@ fn acceptance_stall_lifecycle_does_no_file_io() {
     for (label, source) in [
         ("parallel dispatch", include_str!("../dispatch.rs")),
         ("queue classification", include_str!("../queue_state.rs")),
-        (
-            "serial run service",
-            include_str!("../../serial_run_service.rs"),
-        ),
         ("reducer", include_str!("../../orchestration/state.rs")),
         ("cleanup", include_str!("../cleanup.rs")),
         ("merge", include_str!("../merge.rs")),
@@ -9122,10 +9086,9 @@ async fn test_missing_workspace_retry_clears_resolve_wait_in_reducer() {
     );
     executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -9189,10 +9152,9 @@ async fn test_stale_workspace_retry_clears_resolve_wait_in_reducer() {
             .with_existing_workspace("alpha", stale_path),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -9301,10 +9263,9 @@ async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_on
         repo_root,
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
         0,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -9453,10 +9414,9 @@ async fn test_stale_already_merged_resolve_wait_skips_merge_and_hook() {
         repo_root,
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["alpha".to_string()],
         0,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -9578,10 +9538,9 @@ async fn test_resumed_archived_dispatch_clears_reducer_queue_intent() {
         .await
         .or_fail("git commit archive in worktree");
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -9930,10 +9889,9 @@ async fn test_reject_wait_lane_clear_promotion_starts_rejection_review() {
             .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["lane-owner".to_string(), change_id.to_string()],
         2,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -10026,14 +9984,13 @@ async fn test_reject_wait_lane_clear_promotes_only_one_waiter() {
             .with_existing_workspace(second_id, second_workspace.path().to_path_buf()),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![
             "lane-owner".to_string(),
             first_id.to_string(),
             second_id.to_string(),
         ],
         2,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -10117,10 +10074,9 @@ async fn deferred_confirm_rejection_flow_failure_is_already_reported_not_merged(
             .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["lane-owner".to_string(), change_id.to_string()],
         2,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -10275,10 +10231,9 @@ async fn deferred_confirm_base_identity_failure_is_run_fatal_without_mutation() 
             .with_failing_original_branch(),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["lane-owner".to_string(), change_id.to_string()],
         2,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -10383,10 +10338,9 @@ async fn test_scheduler_does_not_busy_retry_unchanged_resolve_wait() {
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
         3,
-        crate::orchestration::state::ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -10431,10 +10385,9 @@ async fn test_dirty_to_clean_resolve_wait_wakes_retry_without_new_trigger() {
             .with_existing_workspace("change-a", workspace_dir.path().to_path_buf()),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["change-a".to_string()],
         3,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -12853,9 +12806,8 @@ async fn parallel_repeated_finding_id_stops_the_dispatch_cycle_before_a_second_r
 /// A genuinely new ID gets its own automatic repair apply — the prior ID's spent
 /// budget does not carry over — and that opportunity is likewise spent once.
 ///
-/// The serial counterpart covers the canonical PASS that follows two repaired
-/// IDs. Three real apply/acceptance cycles through managed worktrees put this
-/// one just over one second, so it belongs to the heavy tier.
+/// Three real apply/acceptance cycles through managed worktrees put this one
+/// just over one second, so it belongs to the heavy tier.
 #[cfg_attr(not(feature = "heavy-tests"), ignore)]
 #[tokio::test]
 async fn parallel_new_finding_id_receives_its_own_repair_apply_in_the_dispatch_cycle() {
@@ -12901,158 +12853,12 @@ async fn parallel_new_finding_id_receives_its_own_repair_apply_in_the_dispatch_c
     assert!(observed.result.final_revision.is_none());
 }
 
-/// Drive the same scripted repeated-ID scenario through the real serial cycle
-/// and return the stop diagnostic serial produced.
-async fn run_serial_repeated_cycle(change_id: &str, verdict: &str, apply_extra: &str) -> String {
-    use crate::hooks::{HookRunner, HooksConfig};
-    use crate::orchestration::output::NullOutputHandler;
-    use crate::serial_run_service::{ChangeProcessResult, SerialRunService};
-
-    let repo_dir = TempDir::new().or_fail("create temp serial repo");
-    let state_dir = TempDir::new().or_fail("create serial verdict state dir");
-    init_missing_verdict_repo(repo_dir.path(), change_id).await;
-
-    let verdict_path = state_dir.path().join("verdict.json");
-    std::fs::write(&verdict_path, verdict).or_fail("write serial verdict");
-    let verdict_path = verdict_path.display().to_string();
-
-    let config = create_test_config_with(OrchestratorConfig {
-        // Stages everything it produced, including `apply_extra`'s repair
-        // files: the finalization stage gate requires the Apply agent to
-        // select change-owned files itself.
-        apply_command: Some(format!(
-            "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
-             > openspec/changes/{change_id}/tasks.next \
-             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md; \
-             {apply_extra}; git add -A\""
-        )),
-        acceptance_command: Some(format!("sh -c 'cat \"{verdict_path}\"'")),
-        command_queue_stagger_delay_ms: Some(0),
-        command_queue_max_retries: Some(0),
-        command_queue_retry_delay_ms: Some(0),
-        command_queue_retry_if_duration_under_secs: Some(0),
-        ..Default::default()
-    });
-
-    let queue_config = CommandQueueConfig {
-        stagger_delay_ms: 0,
-        max_retries: 0,
-        retry_delay_ms: 0,
-        retry_error_patterns: default_retry_patterns(),
-        retry_if_duration_under_secs: 0,
-        inactivity_timeout_secs: 0,
-        inactivity_kill_grace_secs: 10,
-        inactivity_timeout_max_retries: 0,
-        strict_process_cleanup: true,
-    };
-    let ai_runner = AiCommandRunner::new(queue_config, Arc::new(Mutex::new(None)));
-    let mut agent = AgentRunner::new(config.clone());
-    let mut service = SerialRunService::new(repo_dir.path().to_path_buf(), config.clone());
-    let change = crate::openspec::list_changes_native_from(repo_dir.path())
-        .or_fail("list serial changes")
-        .into_iter()
-        .find(|change| change.id == change_id)
-        .or_fail("the scripted change exists");
-
-    let mut last = None;
-    for _ in 0..2 {
-        last = Some(
-            service
-                .process_change(
-                    &change,
-                    &mut agent,
-                    &ai_runner,
-                    &HookRunner::new(HooksConfig::default(), repo_dir.path()),
-                    &NullOutputHandler::new(),
-                    1,
-                    1,
-                    || false,
-                    || false,
-                    None,
-                )
-                .await
-                .or_fail("serial cycle should not error"),
-        );
-    }
-
-    match last.or_fail("two serial cycles ran") {
-        ChangeProcessResult::Stalled { error } => error,
-        other => panic!("expected a serial repeated-finding stop, got {other:?}"),
-    }
-}
-
 /// Parse the machine-readable diagnostics out of a repair stop summary.
 fn repair_stop_diagnostics(summary: &str) -> serde_json::Value {
     let (_, json) = summary
         .split_once("Diagnostics: ")
         .or_fail("a repair stop summary carries machine-readable diagnostics");
     serde_json::from_str(json).or_fail("repair stop diagnostics are valid JSON")
-}
-
-/// Equivalent observations in the two execution modes must produce equivalent
-/// operator evidence. Both sides here come from a real cycle — serial through
-/// `process_change`, parallel through `dispatch_change_to_workspace` — so this
-/// compares two independent runs rather than one function against itself.
-#[tokio::test]
-async fn serial_and_parallel_repeated_finding_stops_report_equivalent_diagnostics() {
-    let change_id = "parity-repeated";
-    let verdict = scripted_structured_fail(
-        "acceptance-secret-value-scan",
-        "src/relay.rs",
-        "tests/relay_test.rs",
-    );
-    let apply_extra =
-        "mkdir -p src tests && echo repair >> src/relay.rs && echo proof >> tests/relay_test.rs";
-
-    // The two runs are independent (separate repositories, workspaces, and
-    // scripted counters), so they run concurrently to keep this test inside the
-    // repository's one-second default-suite budget.
-    let (parallel, serial_error) = tokio::join!(
-        dispatch_scripted_repair_cycle(change_id, std::slice::from_ref(&verdict), apply_extra),
-        run_serial_repeated_cycle(change_id, &verdict, apply_extra),
-    );
-    // Serial reports the stop through `ChangeProcessResult::Stalled`; parallel
-    // reports the same evidence through its acceptance-phase hold. Both are
-    // non-error stalls, which is the parity this asserts.
-    let parallel_error =
-        parallel.assert_held_and_stop_summary("parallel must stop on the repeated ID");
-
-    let parallel_json = repair_stop_diagnostics(&parallel_error);
-    let serial_json = repair_stop_diagnostics(&serial_error);
-
-    // Revision identifiers and the raw delta are legitimately mode-specific:
-    // parallel commits apply inside its worktree, serial does not. Everything
-    // that explains *why* automation stopped must match exactly.
-    for field in [
-        "change_id",
-        "stop_reason",
-        "findings",
-        "finding_occurrences",
-        "repeated_identities",
-        "required_files",
-        "verification_files",
-        "uncovered_files",
-        "coverage_complete",
-        "legacy_findings_without_declared_paths",
-        "remediation_evidence",
-        "resumable",
-        "next_action",
-        "proves_completion",
-        "proves_acceptance_pass",
-        "proves_archive_readiness",
-    ] {
-        assert_eq!(
-            serial_json.get(field),
-            parallel_json.get(field),
-            "field `{field}` diverges between execution modes:\nserial={serial_json}\nparallel={parallel_json}"
-        );
-    }
-    assert_eq!(
-        serial_json
-            .get("stop_reason")
-            .and_then(|value| value.as_str()),
-        Some(crate::orchestration::acceptance::REPEATED_FINDING_REASON)
-    );
 }
 
 // === Parallel Apply hook wiring and typed iteration-limit propagation ===
@@ -13124,10 +12930,9 @@ async fn dispatch_with_hooks(
         },
         repo_dir.path(),
     ));
-    let shared_state = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared_state = Arc::new(RwLock::new(OrchestratorState::new(
         vec![change_id.to_string()],
         max_iterations,
-        ExecutionMode::Parallel,
     )));
     executor.set_shared_orchestrator_state(shared_state.clone());
 
@@ -13463,10 +13268,9 @@ async fn unselected_archived_dirty_worktree_never_reaches_analysis_execution_or_
 
     // Production startup order: shared state is initialised with the selected
     // targets only, and each selected target gets explicit queue intent.
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["fresh".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -13629,10 +13433,9 @@ async fn explicit_start_target_recovers_its_archived_dirty_workspace() {
     // Exactly what `initialize_parallel_shared_state` does for a TUI or remote
     // Start, and what `RunControlService::start_marked` does for the shared
     // boundary: the resolved targets become reducer queue intent.
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["stale".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     shared
         .write()
@@ -13686,10 +13489,9 @@ async fn queue_revocation_blocks_worktree_and_dynamic_reacquisition_until_explic
     let dynamic_queue = Arc::new(DynamicQueue::new());
     executor.set_dynamic_queue(dynamic_queue.clone());
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["stale".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     shared
         .write()
@@ -13812,10 +13614,9 @@ async fn revoked_queue_intent_stops_an_already_added_candidate_before_analysis_a
     let mut executor =
         ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["keeper".to_string(), "revoked".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -14028,10 +13829,9 @@ async fn reducer_unknown_dynamic_hint_never_enters_analysis_or_dispatch() {
         Some(tx),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["selected".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     shared
         .write()
@@ -14155,14 +13955,13 @@ async fn dynamic_hint_and_classification_fail_closed_under_reducer_lock_contenti
     let mut executor =
         ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![
             "revoked".to_string(),
             "queued-elsewhere".to_string(),
             "merge-waiting".to_string(),
         ],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -14294,14 +14093,13 @@ async fn empty_ordinary_queue_still_exposes_resolve_and_reject_lane_intent() {
             .with_existing_workspace("residue", workspace_dir.path().to_path_buf()),
     );
 
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
         vec![
             "lane-owner".to_string(),
             "resolver".to_string(),
             "rejector".to_string(),
         ],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
@@ -14553,10 +14351,9 @@ async fn preparing_is_visible_during_setup_and_a_retained_stop_prevents_agent_st
     });
 
     let (tx, rx) = mpsc::channel(256);
-    let reducer = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let reducer = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["admitted".to_string(), "waiting".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     {
         let mut guard = reducer.write().await;
@@ -14681,10 +14478,9 @@ async fn preparing_is_not_announced_for_a_change_stopped_before_dispatch() {
     });
 
     let (tx, rx) = mpsc::channel(64);
-    let reducer = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let reducer = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["stopped-early".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     reducer
         .write()
@@ -14909,10 +14705,9 @@ fn assert_no_preparation_happened(outcome: &WaitedDispatch, change_id: &str) {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn preparing_is_not_announced_for_a_change_stopped_while_waiting_for_a_slot() {
-    let reducer = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let reducer = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["stopped-late".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     reducer
         .write()
@@ -14955,10 +14750,9 @@ async fn preparing_is_not_announced_for_a_change_stopped_while_waiting_for_a_slo
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn preparing_is_not_announced_for_a_change_made_terminal_while_waiting_for_a_slot() {
-    let reducer = Arc::new(RwLock::new(OrchestratorState::with_mode(
+    let reducer = Arc::new(RwLock::new(OrchestratorState::new(
         vec!["failed-late".to_string()],
         1,
-        ExecutionMode::Parallel,
     )));
     reducer
         .write()

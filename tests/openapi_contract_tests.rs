@@ -1036,8 +1036,6 @@ fn state_response() -> StateResponse {
             is_resolving: false,
             process_error: Some("sanitized process failure".to_string()),
             parallel: ParallelRuntimeState {
-                mode: conflux::web::remote_control_api::dto::ParallelMode::Parallel,
-                available: true,
                 max_concurrent: 4,
                 vcs_backend: "git".to_string(),
             },

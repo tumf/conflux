@@ -297,6 +297,11 @@ fn resolve_archived_progress_location(
 /// Parse task progress for a change by its ID.
 ///
 /// Looks for tasks.md at `openspec/changes/{change_id}/tasks.md`.
+///
+/// Test-only: every execution path resolves progress against a managed
+/// workspace path through [`parse_change_with_worktree_fallback`], never against the
+/// process's current directory.
+#[cfg(test)]
 pub fn parse_change(change_id: &str) -> Result<TaskProgress> {
     let tasks_path = active_tasks_path(None, change_id);
 

@@ -257,15 +257,6 @@ pub enum CommandSpec {
         /// Target change.
         change_id: String,
     },
-    /// Turn parallel execution on or off for the whole process.
-    ///
-    /// Accepted only in Select or Stopped mode. Enabling it also clears the mark
-    /// and queue intent of every change parallel mode refuses, and the outcome
-    /// names them.
-    SetParallelMode {
-        /// Requested toggle value.
-        enabled: bool,
-    },
     /// Apply one derived execution-mark state to every eligible change.
     ///
     /// Deliberately parameterless: the target state is derived from the eligible
@@ -347,7 +338,6 @@ impl CommandSpec {
             Self::RetryErrors { .. } => "retry_errors",
             Self::StopAndDequeue { .. } => "stop_and_dequeue",
             Self::ResolveMerge { .. } => "resolve_merge",
-            Self::SetParallelMode { .. } => "set_parallel_mode",
             Self::SetAllExecutionMarks { .. } => "set_all_execution_marks",
             Self::CreateWorktree { .. } => "create_worktree",
             Self::DeleteWorktree { .. } => "delete_worktree",
@@ -367,9 +357,9 @@ impl CommandSpec {
             Self::CreateWorktree { target, .. } => Some(&target.change_id),
             Self::Start | Self::Stop | Self::CancelStop | Self::ForceStop => None,
             Self::RetryErrors { .. } => None,
-            // Process-wide mutations: they address the whole target set, never
+            // A process-wide mutation: it addresses the whole target set, never
             // one change.
-            Self::SetParallelMode { .. } | Self::SetAllExecutionMarks { .. } => None,
+            Self::SetAllExecutionMarks { .. } => None,
             // Worktree mutations are addressed by opaque ID, not by change.
             Self::DeleteWorktree { .. } | Self::MergeWorktree { .. } => None,
         }
@@ -377,7 +367,7 @@ impl CommandSpec {
 }
 
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 15] = [
+pub const SUPPORTED_COMMANDS: [&str; 14] = [
     "start",
     "stop",
     "cancel_stop",
@@ -388,7 +378,6 @@ pub const SUPPORTED_COMMANDS: [&str; 15] = [
     "retry_errors",
     "stop_and_dequeue",
     "resolve_merge",
-    "set_parallel_mode",
     "set_all_execution_marks",
     "create_worktree",
     "delete_worktree",
@@ -702,7 +691,7 @@ pub enum ActionBlockedReason {
     ChangeActive,
     /// The change is not waiting on a merge.
     NotMergeWaiting,
-    /// Parallel mode refuses a change that is not committed cleanly yet.
+    /// Worktree execution refuses a change that is not committed cleanly yet.
     ParallelIneligible,
 }
 
@@ -786,71 +775,33 @@ pub enum ParallelBlockedReason {
 /// Every parallel-eligibility blocked reason, in capability-advertised order.
 pub const ALL_PARALLEL_BLOCKED_REASONS: [&str; 2] = ["not_committed", "uncommitted_changes"];
 
-/// The sequential/parallel execution mode a run would use.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ParallelMode {
-    /// One change at a time, in the repository root.
-    #[default]
-    Sequential,
-    /// Multiple changes concurrently, each in its own worktree.
-    Parallel,
-}
-
-impl ParallelMode {
-    /// Resolve the mode from the shared runtime toggle.
-    pub fn from_enabled(enabled: bool) -> Self {
-        if enabled {
-            Self::Parallel
-        } else {
-            Self::Sequential
-        }
-    }
-
-    /// True when parallel execution is the active mode.
-    pub fn is_parallel(self) -> bool {
-        matches!(self, Self::Parallel)
-    }
-}
-
-/// Process-wide parallel execution runtime facts.
+/// Process-wide worktree execution runtime facts.
 ///
-/// A client reads this instead of inferring the mode from how many changes
-/// happen to be running: `available` distinguishes "parallel is off" from
-/// "parallel cannot be turned on here", which are different operator problems.
+/// There is one execution model, so nothing here names a mode: a client reads
+/// the concurrency and backend a run would use.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ParallelRuntimeState {
-    /// Active execution mode.
-    pub mode: ParallelMode,
-    /// True when parallel execution can be enabled at all (requires Git).
-    pub available: bool,
     /// Maximum number of concurrently executing changes.
     pub max_concurrent: usize,
     /// VCS backend a run would use.
     pub vcs_backend: String,
 }
 
-/// Parallel execution surface advertised by `/api/v2/capabilities`.
+/// Worktree execution surface advertised by `/api/v2/capabilities`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ParallelCapabilities {
-    /// True when parallel execution can be enabled at all.
-    pub available: bool,
-    /// Active execution mode at the moment capabilities were read.
-    pub mode: ParallelMode,
     /// Maximum number of concurrently executing changes.
     pub max_concurrent: usize,
     /// VCS backend a run would use.
     pub vcs_backend: String,
     /// Every machine-readable per-change eligibility blocked reason.
     pub blocked_reasons: Vec<String>,
-    /// Modes that accept `set_parallel_mode`.
-    pub toggle_modes: Vec<String>,
 }
 
 /// Server-observed parallel-execution eligibility.
 ///
 /// Present so a client never has to run Git itself to decide whether a change
-/// can be queued in parallel mode.
+/// can be queued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ParallelEligibility {
     /// True when the change may take part in parallel execution.

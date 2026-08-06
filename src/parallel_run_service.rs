@@ -65,11 +65,7 @@ impl ParallelRunService {
             AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
 
         let shared_orchestrator_state = Arc::new(tokio::sync::RwLock::new(
-            crate::orchestration::state::OrchestratorState::with_mode(
-                Vec::new(),
-                1,
-                crate::orchestration::state::ExecutionMode::Parallel,
-            ),
+            crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
         ));
 
         Self {
@@ -96,11 +92,7 @@ impl ParallelRunService {
             AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
 
         let shared_orchestrator_state = Arc::new(tokio::sync::RwLock::new(
-            crate::orchestration::state::OrchestratorState::with_mode(
-                Vec::new(),
-                1,
-                crate::orchestration::state::ExecutionMode::Parallel,
-            ),
+            crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
         ));
 
         Self {
@@ -178,13 +170,14 @@ impl ParallelRunService {
         self.shared_orchestrator_state = shared_state;
     }
 
-    /// Check if git is available for parallel execution
+    /// Check that a usable Git workspace is available for worktree execution.
     ///
-    /// Returns an error if git repository is not available for parallel execution.
+    /// Startup already refuses an unusable workspace; this is the executor's own
+    /// guard so a programmatic caller cannot bypass it.
     pub async fn check_vcs_available(&self) -> Result<()> {
-        if !crate::cli::check_parallel_available() {
+        if !crate::cli::check_git_workspace_usable() {
             return Err(crate::error::OrchestratorError::GitCommand(
-                "Git repository not available for parallel execution".to_string(),
+                "Git repository not available for worktree execution".to_string(),
             ));
         }
         Ok(())
@@ -275,10 +268,7 @@ impl ParallelRunService {
 
         // Send warning event BEFORE any state update to maintain event order
         if !skipped.is_empty() {
-            let message = format!(
-                "Skipping uncommitted changes in parallel mode: {}",
-                skipped.join(", ")
-            );
+            let message = format!("Skipping uncommitted changes: {}", skipped.join(", "));
             warn!("{}", message);
             let _ = event_tx
                 .send(ParallelEvent::Warning {
@@ -1742,7 +1732,7 @@ mod tests {
     #[tokio::test]
     async fn test_order_based_empty_resolve_wait_shared_state_enters_scheduler_path() {
         use crate::orchestration::state::{
-            ExecutionMode, OrchestratorState, ReducerCommand, WorkspaceObservation,
+            OrchestratorState, ReducerCommand, WorkspaceObservation,
         };
         use crate::parallel::ParallelExecutor;
         use std::sync::Arc;
@@ -1761,10 +1751,9 @@ mod tests {
 
         let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
-        let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        let shared = Arc::new(RwLock::new(OrchestratorState::new(
             vec!["alpha".to_string()],
             3,
-            ExecutionMode::Parallel,
         )));
         {
             let mut state = shared.write().await;

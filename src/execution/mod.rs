@@ -1,6 +1,6 @@
 //! Execution module for OpenSpec Orchestrator.
 //!
-//! Provides common execution logic shared between serial and parallel modes.
+//! Provides the common execution logic managed-worktree orchestration uses.
 //! This module serves as a foundation for consolidating duplicate implementations
 //! of archive, apply, and progress tracking operations.
 //!

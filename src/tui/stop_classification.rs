@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+use crate::orchestration::state::OrchestratorState;
 use crate::tui::queue::DynamicQueue;
 
 /// Evidence about registered per-change execution handles.
@@ -173,11 +173,9 @@ pub async fn collect_stop_activity_snapshot(
 
 /// [`collect_stop_activity_snapshot`] with an explicit reducer read deadline.
 ///
-/// Only parallel mode registers execution handles in [`DynamicQueue`]; any other
-/// execution mode reports [`ExecutionEvidence::Unavailable`] so its existing
-/// force-stop behavior is preserved unchanged. A reducer read that does not
-/// complete within `reducer_timeout` reports both execution and shutdown-work
-/// evidence as unavailable.
+/// Execution handles are registered in [`DynamicQueue`] by the worktree
+/// scheduler. A reducer read that does not complete within `reducer_timeout`
+/// reports both execution and shutdown-work evidence as unavailable.
 pub(crate) async fn collect_stop_activity_snapshot_within(
     dynamic_queue: &DynamicQueue,
     shared_state: &Arc<tokio::sync::RwLock<OrchestratorState>>,
@@ -191,19 +189,14 @@ pub(crate) async fn collect_stop_activity_snapshot_within(
             shutdown_work: ShutdownWorkEvidence::Unavailable,
         };
     };
-    let parallel = matches!(state.execution_mode(), ExecutionMode::Parallel);
     let reducer_agent_execution_active = state.is_agent_execution_active();
     let shutdown_work = ShutdownWorkEvidence::Known {
         pending: state.is_base_mutating_lane_occupied(),
     };
     drop(state);
 
-    let execution_handles = if parallel {
-        ExecutionEvidence::Known {
-            registered: dynamic_queue.registered_execution_count().await,
-        }
-    } else {
-        ExecutionEvidence::Unavailable
+    let execution_handles = ExecutionEvidence::Known {
+        registered: dynamic_queue.registered_execution_count().await,
     };
 
     StopActivitySnapshot {
@@ -313,9 +306,9 @@ mod tests {
     }
 
     fn parallel_state(change_ids: Vec<String>) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
-        let mut state = OrchestratorState::new(change_ids, 5);
-        state.set_execution_mode(ExecutionMode::Parallel);
-        Arc::new(tokio::sync::RwLock::new(state))
+        Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            change_ids, 5,
+        )))
     }
 
     #[tokio::test]
@@ -416,8 +409,11 @@ mod tests {
         assert_eq!(classification.shutdown_barrier, ShutdownBarrier::Required);
     }
 
+    /// With no execution handle registered, the evidence is a *known* zero
+    /// rather than "unavailable": there is one execution model, and its queue is
+    /// always the authority on how many changes hold a kill token.
     #[tokio::test]
-    async fn idle_parallel_stop_snapshot_treats_serial_mode_as_unavailable_evidence() {
+    async fn an_idle_scheduler_reports_a_known_zero_rather_than_unavailable() {
         let queue = DynamicQueue::new();
         let state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
             vec!["change-a".to_string()],
@@ -426,10 +422,13 @@ mod tests {
 
         let snapshot = collect_stop_activity_snapshot(&queue, &state).await;
 
-        assert_eq!(snapshot.execution_handles, ExecutionEvidence::Unavailable);
+        assert_eq!(
+            snapshot.execution_handles,
+            ExecutionEvidence::Known { registered: 0 }
+        );
         assert_eq!(
             snapshot.classify().process_report,
-            ProcessReport::ForceStopped
+            ProcessReport::OrdinaryStop
         );
     }
 }

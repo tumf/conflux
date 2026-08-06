@@ -1,13 +1,13 @@
-//! Remote parallel execution control.
+//! Remote worktree execution control.
 //!
 //! Two properties run through every test here:
 //!
 //! - a controller that has only `GET /api/v2/capabilities` and
-//!   `GET /api/v2/state` can tell sequential from parallel, available from
-//!   unavailable, and eligible from blocked — without running Git itself;
-//! - `set_parallel_mode` and `set_all_execution_marks` reach the *same* shared
-//!   application service a keypress reaches, so neither can grow its own
-//!   lifecycle matrix, its own exclusion vocabulary, or a partial target set.
+//!   `GET /api/v2/state` can tell eligible from blocked — without running Git
+//!   itself, and without any execution-mode dimension to read;
+//! - `set_all_execution_marks` reaches the *same* shared application service a
+//!   keypress reaches, so it cannot grow its own lifecycle matrix, its own
+//!   exclusion vocabulary, or a partial target set.
 //!
 //! Unit-scoped where the subject is classification or projection; the service
 //! tests use the real reducer and the in-memory `DynamicQueue`, with no
@@ -86,14 +86,12 @@ impl Wired {
     /// Same wiring, over a caller-supplied queue port so a test can suspend a
     /// mutation inside the queue effect and drive a real interleaving.
     async fn with_queue(change_ids: &[&str], queue: Arc<dyn QueuePort>) -> Self {
-        let reducer = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+        let reducer = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
             change_ids.iter().map(|id| id.to_string()).collect(),
             10,
-            crate::orchestration::state::ExecutionMode::Parallel,
         )));
         let marks = Arc::new(ExecutionMarkStore::new());
         let parallel = Arc::new(ParallelRuntime::new());
-        parallel.set_available(true);
         parallel.set_max_concurrent(4);
         parallel.set_vcs_backend("git");
 
@@ -188,34 +186,23 @@ impl Wired {
 // Discovery: the snapshot answers "what mode, and why is this row blocked"
 // ============================================================================
 
+/// The snapshot publishes worktree runtime facts and no execution-mode
+/// dimension at all.
 #[tokio::test]
-async fn the_snapshot_distinguishes_every_parallel_runtime_condition() {
-    use crate::web::remote_control_api::dto::ParallelMode;
-
+async fn the_snapshot_publishes_worktree_facts_without_a_mode_dimension() {
     let wired = Wired::new(&["c1"]).await;
     wired.observe(&["c1"], &["c1"], &[], "select").await;
 
-    // Sequential but available: the operator may turn it on.
     let parallel = wired.snapshot().parallel;
-    assert_eq!(parallel.mode, ParallelMode::Sequential);
-    assert!(parallel.available);
     assert_eq!(parallel.max_concurrent, 4);
     assert_eq!(parallel.vcs_backend, "git");
 
-    // Active parallel.
-    wired.parallel.set_parallel_mode(true);
-    wired.web_state.sync_remote_control_projection().await;
-    assert_eq!(wired.snapshot().parallel.mode, ParallelMode::Parallel);
-
-    // Unavailable parallel is a distinct third condition, not "off".
-    wired.parallel.set_parallel_mode(false);
-    wired.parallel.set_available(false);
-    wired.web_state.sync_remote_control_projection().await;
-    let parallel = wired.snapshot().parallel;
-    assert_eq!(parallel.mode, ParallelMode::Sequential);
-    assert!(
-        !parallel.available,
-        "'parallel is off' and 'parallel cannot be turned on' are different operator problems"
+    let serialized = serde_json::to_value(&parallel).expect("the runtime state serializes");
+    let object = serialized.as_object().expect("an object on the wire");
+    assert_eq!(
+        object.keys().cloned().collect::<Vec<_>>(),
+        vec!["max_concurrent".to_string(), "vcs_backend".to_string()],
+        "no execution-mode or availability dimension may be published"
     );
 }
 
@@ -281,8 +268,6 @@ async fn capabilities_and_state_never_disagree_about_parallel_execution() {
     let h = harness(None, &[]);
     let mut snapshot = crate::web::remote_control_api::dto::InstanceSnapshot::empty();
     snapshot.parallel = crate::web::remote_control_api::dto::ParallelRuntimeState {
-        mode: crate::web::remote_control_api::dto::ParallelMode::Parallel,
-        available: true,
         max_concurrent: 7,
         vcs_backend: "git".to_string(),
     };
@@ -292,20 +277,23 @@ async fn capabilities_and_state_never_disagree_about_parallel_execution() {
     let (status, capabilities) =
         status_and_json(send(&h.router, get("/api/v2/capabilities", None)).await).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(capabilities["parallel"]["mode"], "parallel");
-    assert_eq!(capabilities["parallel"]["available"], true);
+    assert!(
+        capabilities["parallel"].get("mode").is_none(),
+        "capabilities must not expose an execution-mode dimension"
+    );
     assert_eq!(capabilities["parallel"]["max_concurrent"], 7);
     assert_eq!(capabilities["parallel"]["vcs_backend"], "git");
     let reasons: Vec<String> =
         serde_json::from_value(capabilities["parallel"]["blocked_reasons"].clone()).unwrap();
     assert_eq!(reasons, vec!["not_committed", "uncommitted_changes"]);
-    let toggle_modes: Vec<String> =
-        serde_json::from_value(capabilities["parallel"]["toggle_modes"].clone()).unwrap();
-    assert_eq!(toggle_modes, vec!["select", "stopped"]);
+    assert!(
+        capabilities["parallel"].get("toggle_modes").is_none(),
+        "there is no mode to toggle, so no toggle modes may be advertised"
+    );
 
     let (_, state) = status_and_json(send(&h.router, get("/api/v2/state", None)).await).await;
     let published = &state["snapshot"]["parallel"];
-    for field in ["mode", "available", "max_concurrent", "vcs_backend"] {
+    for field in ["max_concurrent", "vcs_backend"] {
         assert_eq!(
             published[field], capabilities["parallel"][field],
             "'{field}' comes from one source, so the two resources cannot drift"
@@ -313,7 +301,10 @@ async fn capabilities_and_state_never_disagree_about_parallel_execution() {
     }
 
     let commands: Vec<String> = serde_json::from_value(capabilities["commands"].clone()).unwrap();
-    assert!(commands.contains(&"set_parallel_mode".to_string()));
+    assert!(
+        !commands.contains(&"set_parallel_mode".to_string()),
+        "the retired command must not be advertised"
+    );
     assert!(commands.contains(&"set_all_execution_marks".to_string()));
 }
 
@@ -323,16 +314,10 @@ async fn capabilities_and_state_never_disagree_about_parallel_execution() {
 
 #[tokio::test]
 async fn the_new_commands_are_admitted_delegated_and_replayed_like_every_other() {
-    for (body, expected) in [
-        (
-            json!({"type": "set_parallel_mode", "enabled": true}),
-            CommandSpec::SetParallelMode { enabled: true },
-        ),
-        (
-            json!({"type": "set_all_execution_marks"}),
-            CommandSpec::SetAllExecutionMarks {},
-        ),
-    ] {
+    for (body, expected) in [(
+        json!({"type": "set_all_execution_marks"}),
+        CommandSpec::SetAllExecutionMarks {},
+    )] {
         let h = harness(None, &[]);
         let mut envelope = body.as_object().unwrap().clone();
         envelope.insert("expected_revision".to_string(), json!(0));
@@ -371,8 +356,17 @@ async fn a_smuggled_parameter_is_a_schema_failure_not_a_silently_ignored_field()
         "the bulk mutation takes no client-supplied target state"
     );
 
-    let error = serde_json::from_str::<CommandSpec>(r#"{"type":"set_parallel_mode"}"#);
-    assert!(error.is_err(), "the toggle value is mandatory");
+    // The retired execution-mode command is not part of the closed enum any
+    // more, so it fails schema validation instead of reaching a service.
+    for body in [
+        r#"{"type":"set_parallel_mode","enabled":true}"#,
+        r#"{"type":"set_parallel_mode"}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<CommandSpec>(body).is_err(),
+            "the retired command must be a schema failure: {body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -403,83 +397,6 @@ async fn a_stale_revision_refuses_a_bulk_mutation_before_it_reaches_the_service(
 // ============================================================================
 
 #[tokio::test]
-async fn remote_parallel_toggle_clears_ineligible_intent_and_reports_it() {
-    let wired = Wired::new(&["committed", "uncommitted"]).await;
-    wired
-        .observe(&["committed", "uncommitted"], &["committed"], &[], "select")
-        .await;
-    wired
-        .marks
-        .replace(["committed".to_string(), "uncommitted".to_string()]);
-    wired.reducer.write().await.apply_command(
-        crate::orchestration::state::ReducerCommand::AddToQueue("uncommitted".to_string()),
-    );
-
-    let summary = wired
-        .executor
-        .execute(&CommandSpec::SetParallelMode { enabled: true })
-        .await
-        .expect("Select mode accepts the toggle");
-
-    assert!(summary.changed);
-    let detail = summary.detail.unwrap_or_default();
-    assert!(
-        detail.contains("parallel") && detail.contains("uncommitted"),
-        "the outcome must identify each excluded change: {detail}"
-    );
-    assert_eq!(wired.marks.marked_ids(), vec!["committed".to_string()]);
-    assert_eq!(wired.status("uncommitted").await, "not queued");
-    assert!(wired.parallel.parallel_mode());
-
-    // The mutation is readable at the revision the command settled at.
-    let snapshot = wired.snapshot();
-    assert_eq!(
-        snapshot.parallel.mode,
-        crate::web::remote_control_api::dto::ParallelMode::Parallel
-    );
-}
-
-#[tokio::test]
-async fn remote_parallel_toggle_is_refused_in_a_running_or_stopping_lifecycle() {
-    for app_mode in ["running", "stopping", "error"] {
-        let wired = Wired::new(&["c1"]).await;
-        wired.observe(&["c1"], &["c1"], &[], app_mode).await;
-
-        let failure = wired
-            .executor
-            .execute(&CommandSpec::SetParallelMode { enabled: true })
-            .await
-            .expect_err("a live lifecycle owns scheduling decisions the toggle would invalidate");
-
-        assert_eq!(
-            failure.error_code,
-            ErrorCode::LifecycleConflict,
-            "{app_mode}"
-        );
-        assert!(
-            !wired.parallel.parallel_mode(),
-            "{app_mode}: a refused toggle must change nothing"
-        );
-    }
-}
-
-#[tokio::test]
-async fn remote_parallel_toggle_without_git_is_target_ineligible_not_a_lifecycle_problem() {
-    let wired = Wired::new(&["c1"]).await;
-    wired.observe(&["c1"], &["c1"], &[], "select").await;
-    wired.parallel.set_available(false);
-
-    let failure = wired
-        .executor
-        .execute(&CommandSpec::SetParallelMode { enabled: true })
-        .await
-        .expect_err("parallel execution requires git");
-
-    assert_eq!(failure.error_code, ErrorCode::TargetIneligible);
-    assert!(!wired.parallel.parallel_mode());
-}
-
-#[tokio::test]
 async fn remote_bulk_mark_is_atomic_over_one_revision_and_names_its_exclusions() {
     // `dirty` is committed but has uncommitted proposal files; `absent` is
     // simply missing from HEAD. Both are refused, and the two must be named
@@ -494,7 +411,6 @@ async fn remote_bulk_mark_is_atomic_over_one_revision_and_names_its_exclusions()
             "running",
         )
         .await;
-    wired.parallel.set_parallel_mode(true);
     {
         let mut guard = wired.reducer.write().await;
         guard.apply_execution_event(&ExecutionEvent::ApplyStarted {
@@ -608,7 +524,6 @@ async fn one_ineligible_marked_target_rejects_a_remote_parallel_start_entirely()
     wired
         .observe(&["committed", "uncommitted"], &["committed"], &[], "select")
         .await;
-    wired.parallel.set_parallel_mode(true);
     wired
         .marks
         .replace(["committed".to_string(), "uncommitted".to_string()]);
@@ -744,31 +659,13 @@ async fn settled_early(
         })
 }
 
-/// Every ineligible row must end with neither a mark nor queue intent once
-/// parallel mode has settled on: that is the whole point of the toggle's
-/// cleanup, and it is exactly what an interleaved mutation can undo.
-async fn assert_parallel_settled_coherently(wired: &Wired) {
-    assert!(
-        wired.parallel.parallel_mode(),
-        "the toggle must have settled"
-    );
-    assert_eq!(
-        wired.marks.marked_ids(),
-        vec!["a_eligible".to_string()],
-        "parallel mode must not settle with an ineligible change marked"
-    );
-    assert_eq!(
-        wired.status("z_blocked").await,
-        "not queued",
-        "parallel mode must not settle with queue intent on an ineligible change"
-    );
-    assert_eq!(wired.status("a_eligible").await, "queued");
-}
-
+/// Two operator mutations must serialize under the shared mutation guard.
+///
+/// A bulk mark classifies against one observation and then awaits the queue.
+/// If a second mutation could interleave there, it would classify against a
+/// half-applied target set and the two would settle on different answers.
 #[tokio::test(start_paused = true)]
-async fn a_toggle_arriving_inside_a_bulk_mark_cannot_leave_an_ineligible_row_marked() {
-    // The dangerous order from the other direction is covered by
-    // `a_bulk_mark_arriving_inside_a_toggle_classifies_against_the_settled_mode`.
+async fn a_second_bulk_mark_waits_for_the_in_flight_one_instead_of_interleaving() {
     let queue = PausingQueue::new();
     let wired = Wired::with_queue(&["a_eligible", "z_blocked"], queue.clone()).await;
     wired
@@ -780,135 +677,68 @@ async fn a_toggle_arriving_inside_a_bulk_mark_cannot_leave_an_ineligible_row_mar
         )
         .await;
 
-    // The bulk mark classifies while the mode is still sequential, so both rows
-    // are in its target set, and then parks inside its first queue mutation.
-    let bulk = tokio::spawn({
+    // The first mutation parks inside its queue effect, holding the guard.
+    let first = tokio::spawn({
         let service = wired.service.clone();
         async move { service.set_all_execution_marks(OperatorMode::Running).await }
     });
     queue.parked().await;
 
-    // The toggle arrives mid-flight and must not observe, mutate, or clean up
-    // anything until the bulk mutation it would invalidate has finished. If it
-    // does slip in, its cleanup finds nothing to clear and the parked bulk
-    // mutation then marks and queues the ineligible row behind it.
-    let mut toggle = tokio::spawn({
+    let mut second = tokio::spawn({
         let service = wired.service.clone();
-        async move { service.set_parallel_mode(OperatorMode::Stopped, true).await }
+        async move { service.set_all_execution_marks(OperatorMode::Running).await }
     });
-    let raced = settled_early(&mut toggle, "Stopped mode accepts a toggle").await;
-    let interleaved = raced.is_some();
+    let raced = settled_early(&mut second, "Running mode accepts a bulk mark").await;
+    assert!(
+        raced.is_none(),
+        "the second mutation must wait for the in-flight one"
+    );
 
     queue.release();
-    let bulk = bulk
+    let first = first
         .await
         .unwrap()
         .expect("Running mode accepts a bulk mark");
-    let toggle = match raced {
-        Some(outcome) => outcome,
-        None => toggle
-            .await
-            .unwrap()
-            .expect("Stopped mode accepts a toggle"),
-    };
-
-    assert_parallel_settled_coherently(&wired).await;
-    assert!(
-        !interleaved,
-        "the toggle must wait for the in-flight bulk mutation instead of interleaving with it"
-    );
-    match bulk {
-        OperatorOutcome::BulkMarks { marked, .. } => assert!(marked),
-        other => panic!("the bulk mutation must complete in full: {other:?}"),
-    }
-    match toggle {
-        OperatorOutcome::ParallelMode { enabled, cleared } => {
-            assert!(enabled);
-            assert_eq!(
-                cleared,
-                vec!["z_blocked".to_string()],
-                "the cleanup must see the marks the bulk mutation had just applied"
-            );
-        }
-        other => panic!("the toggle must apply after the bulk mutation: {other:?}"),
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_bulk_mark_arriving_inside_a_toggle_classifies_against_the_settled_mode() {
-    let queue = PausingQueue::new();
-    let wired = Wired::with_queue(&["a_eligible", "z_blocked"], queue.clone()).await;
-    wired
-        .observe(
-            &["a_eligible", "z_blocked"],
-            &["a_eligible"],
-            &[],
-            "running",
-        )
-        .await;
-    wired.marks.replace(["z_blocked".to_string()]);
-    wired.reducer.write().await.apply_command(
-        crate::orchestration::state::ReducerCommand::AddToQueue("z_blocked".to_string()),
-    );
-
-    // The toggle parks inside the queue removal of its own cleanup.
-    let toggle = tokio::spawn({
-        let service = wired.service.clone();
-        async move { service.set_parallel_mode(OperatorMode::Stopped, true).await }
-    });
-    queue.parked().await;
-
-    let mut bulk = tokio::spawn({
-        let service = wired.service.clone();
-        async move { service.set_all_execution_marks(OperatorMode::Running).await }
-    });
-    let raced = settled_early(&mut bulk, "Running mode accepts a bulk mark").await;
-    let interleaved = raced.is_some();
-
-    queue.release();
-    toggle
+    let second = second
         .await
         .unwrap()
-        .expect("Stopped mode accepts a toggle");
-    let bulk = match raced {
-        Some(outcome) => outcome,
-        None => bulk
-            .await
-            .unwrap()
-            .expect("Running mode accepts a bulk mark"),
-    };
+        .expect("Running mode accepts a bulk mark");
 
-    assert_parallel_settled_coherently(&wired).await;
-    assert!(
-        !interleaved,
-        "a bulk mark must not classify against a toggle that is still applying"
-    );
-    match bulk {
+    match first {
         OperatorOutcome::BulkMarks {
-            marked,
-            changed,
-            excluded,
+            marked, excluded, ..
         } => {
             assert!(marked);
-            assert_eq!(changed, vec!["a_eligible".to_string()]);
             assert_eq!(
                 excluded,
                 vec![(
                     "z_blocked".to_string(),
                     MarkExclusion::ParallelProposalAbsent
                 )],
-                "the plan must be derived from the mode the toggle settled on"
+                "an ineligible row is excluded with no mode to turn the constraint off"
             );
         }
-        other => panic!("the bulk mutation must apply after the toggle: {other:?}"),
+        other => panic!("the first mutation must complete in full: {other:?}"),
     }
+    // The second observed the settled state, so it unmarks what the first marked.
+    match second {
+        OperatorOutcome::BulkMarks { marked, .. } => assert!(
+            !marked,
+            "the second mutation classified against the first one's settled result"
+        ),
+        other => panic!("the second mutation must complete in full: {other:?}"),
+    }
+    assert!(
+        wired.marks.marked_ids().is_empty(),
+        "an ineligible row is never left marked"
+    );
+    assert_eq!(wired.status("z_blocked").await, "not queued");
 }
 
 #[tokio::test]
-async fn a_fully_eligible_marked_set_starts_in_parallel_mode() {
+async fn a_fully_eligible_marked_set_starts() {
     let wired = Wired::new(&["a", "b"]).await;
     wired.observe(&["a", "b"], &["a", "b"], &[], "select").await;
-    wired.parallel.set_parallel_mode(true);
     wired.marks.replace(["a".to_string(), "b".to_string()]);
 
     let summary = wired

@@ -493,16 +493,15 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         ));
     }
 
-    // Add parallel mode badge if enabled
-    if app.parallel_mode {
-        header_spans.push(Span::raw(" "));
-        header_spans.push(Span::styled(
-            format!("[parallel:{}:{}]", app.max_concurrent, app.vcs_backend),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
+    // Worktree execution facts. This is not a mode indicator: there is one
+    // execution model, so the badge reports its concurrency and backend.
+    header_spans.push(Span::raw(" "));
+    header_spans.push(Span::styled(
+        format!("[workspaces:{}:{}]", app.max_concurrent, app.vcs_backend),
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    ));
 
     let header_text = Line::from(header_spans);
 
@@ -635,11 +634,10 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 // Note: 'selected' field indicates selection for next run
                 let is_archived =
                     matches!(change.display_status_cache.as_str(), "archived" | "merged");
-                // Every parallel-ineligible reason still blocks the row; only the
-                // badge narrows to the one reason that is actually a Git
+                // Every worktree-ineligible reason still blocks the row; only
+                // the badge narrows to the one reason that is actually a Git
                 // working-tree condition.
-                let is_parallel_blocked = app.parallel_mode
-                    && !change.is_parallel_eligible()
+                let is_parallel_blocked = !change.is_parallel_eligible()
                     && !is_archived
                     && matches!(
                         change.display_status_cache.as_str(),
@@ -816,8 +814,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     let mut keys = vec!["↑↓/jk: move".to_string()];
     if let Some(item) = current_item {
         // Show "K: kill" for active changes, otherwise describe the mark action.
-        // In parallel mode, don't show Space hints for uncommitted changes.
-        let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible();
+        // Don't show Space hints for worktree-ineligible changes.
+        let is_parallel_blocked = !item.is_parallel_eligible();
         if matches!(
             item.display_status_cache.as_str(),
             "preparing" | "applying" | "accepting" | "archiving" | "resolving"
@@ -864,14 +862,6 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
         keys.push("x: toggle all".to_string());
     }
     keys.push("Tab: worktrees".to_string());
-    // Show parallel toggle hint only if parallel execution is available
-    if app.parallel_available {
-        keys.push(if app.parallel_mode {
-            "=: sequential".to_string()
-        } else {
-            "=: parallel".to_string()
-        });
-    }
     // Show QR code hint if web server is enabled
     if app.web_url.is_some() {
         keys.push("w: QR".to_string());
@@ -936,11 +926,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 //   - Stopped: shows execution mark (selected=true, display_status_cache=NotQueued)
                 let is_archived =
                     matches!(change.display_status_cache.as_str(), "archived" | "merged");
-                // Every parallel-ineligible reason still blocks the row; only the
-                // badge narrows to the one reason that is actually a Git
+                // Every worktree-ineligible reason still blocks the row; only
+                // the badge narrows to the one reason that is actually a Git
                 // working-tree condition.
-                let is_parallel_blocked = app.parallel_mode
-                    && !change.is_parallel_eligible()
+                let is_parallel_blocked = !change.is_parallel_eligible()
                     && !is_archived
                     && matches!(
                         change.display_status_cache.as_str(),
@@ -1172,8 +1161,8 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     let mut keys = vec!["↑↓/jk: move".to_string()];
     if let Some(item) = current_item {
         // Show "K: kill" for active changes, otherwise describe the mark action.
-        // In parallel mode, don't show Space hints for uncommitted changes.
-        let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible();
+        // Don't show Space hints for worktree-ineligible changes.
+        let is_parallel_blocked = !item.is_parallel_eligible();
         if matches!(
             item.display_status_cache.as_str(),
             "preparing" | "applying" | "accepting" | "archiving" | "resolving"
@@ -2387,8 +2376,6 @@ mod tests {
     fn create_test_app(changes: Vec<Change>) -> AppState {
         let mut app = AppState::new(changes);
         app.logs.clear();
-        app.parallel_available = false;
-        app.parallel_mode = false;
         app.web_url = None;
         app
     }
@@ -2423,6 +2410,36 @@ mod tests {
             lines.push(line);
         }
         lines.join("\n")
+    }
+
+    /// Worktree orchestration is the only execution model, so the TUI exposes
+    /// no mode toggle and no mode badge — in any app mode.
+    #[test]
+    fn no_execution_mode_toggle_or_badge_is_ever_rendered() {
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            app.execution_mode = mode;
+
+            let buffer = render_buffer(&mut app, 120, 30);
+            let content = buffer_to_string(&buffer);
+
+            for forbidden in ["=: parallel", "=: sequential", "[parallel:"] {
+                assert!(
+                    !content.contains(forbidden),
+                    "{mode:?} must not render '{forbidden}':\n{content}"
+                );
+            }
+            // The worktree facts themselves stay visible, without naming a mode.
+            assert!(
+                content.contains("[workspaces:"),
+                "{mode:?} must still report concurrency and backend:\n{content}"
+            );
+        }
     }
 
     fn find_row_containing(buffer: &Buffer, needle: &str) -> Option<u16> {
@@ -3110,7 +3127,6 @@ mod tests {
     #[test]
     fn test_render_parallel_archived_row_does_not_show_uncommitted_badge() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.parallel_mode = true;
         app.changes[0].display_status_cache = "archived".to_string();
         app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
 
@@ -3124,7 +3140,6 @@ mod tests {
     #[test]
     fn test_render_parallel_uncommitted_queueable_row_shows_uncommitted_badge() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
 
@@ -3160,8 +3175,6 @@ mod tests {
     ) -> AppState {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.execution_mode = mode;
-        app.parallel_available = true;
-        app.parallel_mode = true;
         app.changes[0].display_status_cache = display_status.to_string();
         app.changes[0].parallel_eligibility = eligibility;
         app.changes[0].has_worktree = has_worktree;
@@ -3301,7 +3314,6 @@ mod tests {
         // Focused blocked row should use Gray (not DarkGray) so it's readable on the
         // DarkGray highlight background.
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
         app.cursor_index = 0; // cursor on the blocked row
@@ -3322,7 +3334,6 @@ mod tests {
             create_test_change("change-a"),
             create_test_change("change-b"),
         ]);
-        app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
         app.cursor_index = 1; // cursor on change-b, not on the blocked row
@@ -3341,7 +3352,6 @@ mod tests {
         // Same contrast rule applies in Running view.
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.execution_mode = AppExecutionMode::Running;
-        app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
         app.cursor_index = 0;
@@ -3362,7 +3372,6 @@ mod tests {
             create_test_change("change-b"),
         ]);
         app.execution_mode = AppExecutionMode::Running;
-        app.parallel_mode = true;
         app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
         app.cursor_index = 1;
@@ -3432,8 +3441,6 @@ mod tests {
     #[test]
     fn test_render_shows_uncommitted_badge() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.parallel_available = true;
-        app.parallel_mode = true;
         app.apply_parallel_eligibility(
             &HashSet::from(["change-a".to_string()]),
             &HashSet::from(["change-a".to_string()]),
@@ -4330,7 +4337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_mode_uncommitted_change_no_space_hint() {
+    fn test_uncommitted_change_no_space_hint() {
         use crate::openspec::Change;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -4349,8 +4356,6 @@ mod tests {
             metadata: ProposalMetadata::default(),
         }];
         let mut app = AppState::new(changes);
-        app.parallel_mode = true;
-        app.parallel_available = true;
 
         // Mark the change as uncommitted (not parallel eligible)
         app.changes[0].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
@@ -4373,14 +4378,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        // Verify that Space hints are NOT shown for uncommitted changes in parallel mode
+        // Verify that Space hints are NOT shown for uncommitted changes
         assert!(
             !content.contains("Space: queue"),
-            "Space: queue should not be shown for uncommitted changes in parallel mode"
+            "Space: queue should not be shown for uncommitted changes"
         );
         assert!(
             !content.contains("Space: unqueue"),
-            "Space: unqueue should not be shown for uncommitted changes in parallel mode"
+            "Space: unqueue should not be shown for uncommitted changes"
         );
 
         // Verify that UNCOMMITTED badge is shown
@@ -4391,7 +4396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_mode_committed_change_shows_space_hint() {
+    fn test_committed_change_shows_space_hint() {
         use crate::openspec::Change;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -4410,8 +4415,6 @@ mod tests {
             metadata: ProposalMetadata::default(),
         }];
         let mut app = AppState::new(changes);
-        app.parallel_mode = true;
-        app.parallel_available = true;
 
         // Mark the change as committed (parallel eligible) - this is the default
         app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
@@ -4434,10 +4437,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        // Verify that Space hints ARE shown for committed changes in parallel mode
+        // Verify that Space hints ARE shown for committed changes
         assert!(
             content.contains("Space: queue"),
-            "Space: queue should be shown for committed changes in parallel mode"
+            "Space: queue should be shown for committed changes"
         );
     }
 

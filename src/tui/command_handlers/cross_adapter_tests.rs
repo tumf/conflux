@@ -53,8 +53,6 @@ struct Effects {
     queued_resolves: Vec<String>,
     /// The authoritative marked target set.
     marks: Vec<String>,
-    /// The shared sequential/parallel toggle.
-    parallel_mode: bool,
 }
 
 async fn effects(harness: &AdapterHarness) -> Effects {
@@ -71,7 +69,6 @@ async fn effects(harness: &AdapterHarness) -> Effects {
         active_resolver: harness.resolves.active(),
         queued_resolves: harness.resolves.waiting(),
         marks: harness.marks.marked_ids(),
-        parallel_mode: harness.parallel.parallel_mode(),
     }
 }
 
@@ -122,8 +119,6 @@ enum Setup {
     MergeWaitAlreadyReserved,
     /// Both changes are marked and queued; `c2` is not parallel-eligible.
     MarkedWithIneligible,
-    /// Parallel mode is already on and nothing is ineligible.
-    ParallelAlreadyEnabled,
 }
 
 async fn arrange(harness: &AdapterHarness, setup: Setup) {
@@ -179,9 +174,6 @@ async fn arrange(harness: &AdapterHarness, setup: Setup) {
                 "c2".to_string(),
                 ParallelEligibility::UncommittedProposalFiles,
             )]);
-        }
-        Setup::ParallelAlreadyEnabled => {
-            harness.parallel.set_parallel_mode(true);
         }
     }
 }
@@ -474,43 +466,6 @@ fn rows() -> Vec<Row> {
             expect: Settlement::Failed(ErrorCode::TargetIneligible),
             notice: None,
         },
-        // ── parallel mode ───────────────────────────────────────────────────
-        Row {
-            name: "enabling parallel mode clears the mark and queue intent of an ineligible change",
-            setup: Setup::MarkedWithIneligible,
-            mode: AppExecutionMode::Select,
-            tui: TuiCommand::SetParallelMode(true),
-            v2: CommandSpec::SetParallelMode { enabled: true },
-            expect: Settlement::Changed,
-            notice: Some("c2"),
-        },
-        Row {
-            name: "enabling parallel mode from a stopped run is accepted",
-            setup: Setup::Marked,
-            mode: AppExecutionMode::Stopped,
-            tui: TuiCommand::SetParallelMode(true),
-            v2: CommandSpec::SetParallelMode { enabled: true },
-            expect: Settlement::Changed,
-            notice: None,
-        },
-        Row {
-            name: "the parallel toggle is refused while a run owns the lifecycle",
-            setup: Setup::LiveScheduler,
-            mode: AppExecutionMode::Running,
-            tui: TuiCommand::SetParallelMode(true),
-            v2: CommandSpec::SetParallelMode { enabled: true },
-            expect: Settlement::Failed(ErrorCode::LifecycleConflict),
-            notice: None,
-        },
-        Row {
-            name: "an idempotent parallel toggle replay changes nothing on either side",
-            setup: Setup::ParallelAlreadyEnabled,
-            mode: AppExecutionMode::Select,
-            tui: TuiCommand::SetParallelMode(true),
-            v2: CommandSpec::SetParallelMode { enabled: true },
-            expect: Settlement::NoOp,
-            notice: None,
-        },
     ]
 }
 
@@ -575,8 +530,7 @@ async fn tui_and_v2_settle_every_lifecycle_intent_identically() {
 type BulkRow = (&'static str, &'static str, bool);
 
 /// Arrange one bulk-mark case on a fresh harness.
-async fn arrange_bulk(harness: &AdapterHarness, rows: &[BulkRow], marked: &[&str], parallel: bool) {
-    harness.parallel.set_parallel_mode(parallel);
+async fn arrange_bulk(harness: &AdapterHarness, rows: &[BulkRow], marked: &[&str]) {
     harness
         .parallel
         .set_parallel_ineligible(rows.iter().filter(|(_, _, ok)| !ok).map(|(id, ..)| {
@@ -611,15 +565,10 @@ async fn arrange_bulk(harness: &AdapterHarness, rows: &[BulkRow], marked: &[&str
     }
 }
 
-async fn bulk_through_tui(
-    rows: &[BulkRow],
-    marked: &[&str],
-    parallel: bool,
-    mode: AppExecutionMode,
-) -> Effects {
+async fn bulk_through_tui(rows: &[BulkRow], marked: &[&str], mode: AppExecutionMode) -> Effects {
     let ids: Vec<&str> = rows.iter().map(|(id, ..)| *id).collect();
     let harness = AdapterHarness::new(&ids);
-    arrange_bulk(&harness, rows, marked, parallel).await;
+    arrange_bulk(&harness, rows, marked).await;
 
     let mut app = harness.app(&ids);
     app.execution_mode = mode;
@@ -646,12 +595,11 @@ async fn bulk_through_tui(
 async fn bulk_through_v2(
     rows: &[BulkRow],
     marked: &[&str],
-    parallel: bool,
     mode: AppExecutionMode,
 ) -> (Effects, Settlement) {
     let ids: Vec<&str> = rows.iter().map(|(id, ..)| *id).collect();
     let harness = AdapterHarness::new(&ids);
-    arrange_bulk(&harness, rows, marked, parallel).await;
+    arrange_bulk(&harness, rows, marked).await;
 
     let web_state = Arc::new(WebState::new(&[]));
     web_state.set_shared_state(harness.state.clone()).await;
@@ -689,7 +637,6 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
         name: &'static str,
         rows: Vec<BulkRow>,
         marked: Vec<&'static str>,
-        parallel: bool,
         mode: AppExecutionMode,
         expect: Settlement,
     }
@@ -699,7 +646,6 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             name: "select mode marks every eligible row and skips a final one",
             rows: vec![("c1", "not queued", true), ("c2", "rejected", true)],
             marked: vec![],
-            parallel: false,
             mode: AppExecutionMode::Select,
             expect: Settlement::Changed,
         },
@@ -707,15 +653,13 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             name: "a fully marked eligible set unmarks, ignoring the excluded row's mark state",
             rows: vec![("c1", "not queued", true), ("c2", "rejected", true)],
             marked: vec!["c1"],
-            parallel: false,
             mode: AppExecutionMode::Select,
             expect: Settlement::Changed,
         },
         Case {
-            name: "parallel mode excludes an uncommitted row from the target set",
+            name: "an uncommitted row is excluded from the target set",
             rows: vec![("c1", "not queued", true), ("c2", "not queued", false)],
             marked: vec![],
-            parallel: true,
             mode: AppExecutionMode::Select,
             expect: Settlement::Changed,
         },
@@ -723,7 +667,6 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             name: "running mode turns the mark into queue intent and skips the active row",
             rows: vec![("c1", "not queued", true), ("c2", "applying", true)],
             marked: vec![],
-            parallel: false,
             mode: AppExecutionMode::Running,
             expect: Settlement::Changed,
         },
@@ -731,7 +674,6 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             name: "running mode takes queue intent back out when unmarking",
             rows: vec![("c1", "queued", true), ("c2", "applying", true)],
             marked: vec!["c1"],
-            parallel: false,
             mode: AppExecutionMode::Running,
             expect: Settlement::Changed,
         },
@@ -739,16 +681,14 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             name: "a target set with no eligible row changes nothing on either side",
             rows: vec![("c1", "rejected", true), ("c2", "applying", true)],
             marked: vec![],
-            parallel: false,
             mode: AppExecutionMode::Running,
             expect: Settlement::NoOp,
         },
     ];
 
     for case in cases {
-        let tui = bulk_through_tui(&case.rows, &case.marked, case.parallel, case.mode).await;
-        let (v2, settlement) =
-            bulk_through_v2(&case.rows, &case.marked, case.parallel, case.mode).await;
+        let tui = bulk_through_tui(&case.rows, &case.marked, case.mode).await;
+        let (v2, settlement) = bulk_through_v2(&case.rows, &case.marked, case.mode).await;
 
         assert_eq!(
             settlement, case.expect,

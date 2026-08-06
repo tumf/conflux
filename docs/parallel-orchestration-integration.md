@@ -15,12 +15,12 @@ This document describes the integration between the parallel executor and the co
    - Location: `src/ai_command_runner.rs`, `src/command_queue.rs`
 
 2. **Hook Execution** (✓ Already integrated)
-   - Both serial and parallel modes use `HookRunner`
+   - Every frontend uses `HookRunner`
    - Hooks are passed through and executed consistently
    - Location: `src/hooks.rs`
 
 3. **VCS Operations** (✓ Already integrated)
-   - Both modes use VCS abstraction layer
+   - Every frontend uses the VCS abstraction layer
    - Workspace management is consistent
    - Location: `src/vcs/`
 
@@ -46,16 +46,12 @@ This document describes the integration between the parallel executor and the co
 
 ### Remaining Gaps
 
-1. **Apply History Tracking** (✗ Not integrated)
-   - Serial mode uses `ApplyHistory` to track retry attempts
-   - Parallel mode does not yet use this
-   - Impact: Parallel mode doesn't provide retry context to AI agents
+1. **Apply History Tracking**
+   - `ApplyHistory` tracks retry attempts for the worktree executor
    - Location: `src/history.rs`
 
-2. **Archive History Tracking** (✗ Not integrated)
-   - Serial mode uses `ArchiveHistory` to track retry attempts
-   - Parallel mode does not yet use this
-   - Impact: Parallel mode doesn't provide retry context to AI agents
+2. **Archive History Tracking**
+   - `ArchiveHistory` tracks retry attempts for the worktree executor
    - Location: `src/history.rs`
 
 3. **Full Loop Replacement** (✗ Partially done)
@@ -127,7 +123,7 @@ let result = apply_change_streaming(
 
 ## Benefits of Integration
 
-1. **Consistency**: Apply and archive operations behave the same in serial and parallel modes
+1. **Consistency**: Apply and archive operations behave the same across every frontend
 2. **Maintainability**: Shared code means fewer places to fix bugs
 3. **Retry Logic**: CommandQueue retry/stagger is used consistently
 4. **Hook Execution**: Hooks fire in the same order and context
