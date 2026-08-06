@@ -1007,6 +1007,8 @@ mod tests {
         pub(super) dispatcher: Arc<crate::events::EventDispatcher>,
         /// Frontends attached to that owner after construction.
         attached: Arc<AttachedSinks>,
+        /// The revision authority attached to that owner after construction.
+        revisions: Arc<AttachedRevisions>,
         pub(super) marks: Arc<ExecutionMarkStore>,
         /// The one parallel runtime store both adapters read and mutate.
         pub(super) parallel: Arc<crate::orchestration::operator_command::ParallelRuntime>,
@@ -1033,6 +1035,13 @@ mod tests {
     #[derive(Default)]
     pub(super) struct AttachedSinks {
         sinks: std::sync::Mutex<Vec<Arc<dyn crate::events::EventSink>>>,
+        /// How many authoritative dispatches this boundary has fanned out.
+        ///
+        /// Counted here rather than in a frontend because event *cardinality* is
+        /// a property of the dispatch owner: a command that published its effect
+        /// twice, or published nothing, is wrong regardless of what any
+        /// individual sink then did with it.
+        dispatches: std::sync::atomic::AtomicUsize,
     }
 
     impl AttachedSinks {
@@ -1051,9 +1060,42 @@ mod tests {
         async fn on_state_changed(&self, _state: &OrchestratorState) {}
 
         async fn on_dispatch(&self, dispatch: &crate::events::EventDispatch<'_>) {
+            self.dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             for sink in self.snapshot() {
                 sink.on_dispatch(dispatch).await;
             }
+        }
+    }
+
+    /// A revision source bound after the dispatch owner already exists.
+    ///
+    /// The coordinator reads its outcome revisions through this, and a `WebState`
+    /// is what answers — but the `WebState` needs the shared mark store, which is
+    /// built alongside the coordinator. One indirection resolves that ordering
+    /// without letting a test invent a second revision authority.
+    #[derive(Default)]
+    pub(super) struct AttachedRevisions {
+        inner: std::sync::Mutex<Option<Arc<dyn crate::events::OutcomeRevisions>>>,
+    }
+
+    impl AttachedRevisions {
+        fn inner(&self) -> Option<Arc<dyn crate::events::OutcomeRevisions>> {
+            self.inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl crate::events::OutcomeRevisions for AttachedRevisions {
+        fn revision_for_dispatch(&self, dispatch_id: u64) -> Option<u64> {
+            self.inner()
+                .and_then(|inner| inner.revision_for_dispatch(dispatch_id))
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner().map_or(0, |inner| inner.current_revision())
         }
     }
 
@@ -1118,11 +1160,17 @@ mod tests {
                 )
                 .with_core_mode(Some(core_mode.clone())),
             );
-            let application = Arc::new(OperatorApplication::new(
-                core_mode.clone(),
-                run_control.clone(),
-                dispatcher.clone(),
-            ));
+            let revisions = Arc::new(AttachedRevisions::default());
+            let application = Arc::new(
+                OperatorApplication::new(
+                    core_mode.clone(),
+                    run_control.clone(),
+                    dispatcher.clone(),
+                )
+                .with_revisions(Some(
+                    revisions.clone() as Arc<dyn crate::events::OutcomeRevisions>
+                )),
+            );
             let (submissions_tx, submissions_rx) = mpsc::channel(256);
             let (feedback_tx, feedback_rx) = mpsc::channel(256);
             let worktree_service = build_worktree_service(Path::new("."), &config, &tx);
@@ -1135,6 +1183,7 @@ mod tests {
                 core_mode,
                 dispatcher,
                 attached,
+                revisions,
                 marks,
                 parallel,
                 resolves,
@@ -1157,6 +1206,22 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(sink);
+        }
+
+        /// Bind the revision authority accepted outcomes are recorded against.
+        pub(super) fn attach_revisions(&self, revisions: Arc<dyn crate::events::OutcomeRevisions>) {
+            *self
+                .revisions
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(revisions);
+        }
+
+        /// How many authoritative dispatches this boundary has fanned out.
+        pub(super) fn dispatch_count(&self) -> usize {
+            self.attached
+                .dispatches
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         /// An `AppState` already bound to this harness's shared handles.

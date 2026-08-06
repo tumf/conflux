@@ -1092,7 +1092,7 @@ async fn operator_detail_is_sanitized_before_it_is_published() {
 async fn a_command_that_changes_a_decision_field_publishes_it_before_settling() {
     use crate::orchestration::operator_command::{NoopQueueHooks, OperatorCommandService};
     use crate::web::remote_control_api::dto::CommandSpec;
-    use crate::web::remote_control_api::executor::{RemoteControlExecutor, SharedServiceExecutor};
+    use crate::web::remote_control_api::executor::RemoteControlExecutor;
 
     let (web_state, reducer, marks) = wired_web_state(&["c1"]).await;
     let web_state = Arc::new(web_state);

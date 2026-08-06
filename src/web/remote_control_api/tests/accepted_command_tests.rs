@@ -28,7 +28,6 @@ use crate::orchestration::run_control::testing::RecordingScheduler;
 use crate::orchestration::run_control::{ResolveReservations, RunControlService};
 use crate::orchestration::state::OrchestratorState;
 use crate::web::remote_control_api::auth::RemoteControlAuth;
-use crate::web::remote_control_api::executor::SharedServiceExecutor;
 use crate::web::remote_control_api::projection::Projection;
 use crate::web::remote_control_api::{router, RemoteControlState};
 use crate::web::state::WebState;
@@ -55,13 +54,6 @@ fn change(id: &str) -> crate::openspec::Change {
 /// must stay small enough that a default-suite test does not sit out a real
 /// 30-second cancellation deadline.
 const TERMINATION_TIMEOUT: Duration = Duration::from_millis(400);
-
-/// How long an *unrelated* command may take while a termination is pending.
-///
-/// Comfortably below `TERMINATION_TIMEOUT`: the claim is that the second command
-/// does not queue behind the first, and a bound that overlapped the wait could
-/// not distinguish the two.
-const UNRELATED_COMMAND_BUDGET: Duration = Duration::from_millis(150);
 
 // ============================================================================
 // Scripted runtime
@@ -474,7 +466,6 @@ async fn accepted_operator_command_dequeue_liveness_keeps_the_process_admissible
     assert_eq!(pending.state(), "running");
 
     // An unrelated command must execute and settle while the wait is pending.
-    let started = std::time::Instant::now();
     let unrelated = wired
         .submit(
             json!({"type": "set_execution_mark", "change_id": "c2", "marked": true}),
@@ -482,25 +473,29 @@ async fn accepted_operator_command_dequeue_liveness_keeps_the_process_admissible
             "mark-c2",
         )
         .await;
-    let elapsed = started.elapsed();
     assert_eq!(
         unrelated.state(),
         "succeeded",
         "an unrelated command must not wait for the dequeue timeout: {:?}",
         unrelated.json
     );
-    assert!(
-        elapsed < UNRELATED_COMMAND_BUDGET,
-        "an unrelated command queued behind the pending termination ({elapsed:?})"
+    assert_eq!(
+        wired
+            .projection
+            .command(&pending.command_id())
+            .expect("pending command remains registered")
+            .state,
+        crate::web::remote_control_api::dto::CommandState::Running,
+        "the unrelated command must settle before the pending termination"
     );
     assert!(wired.marks.is_marked("c2"));
 
     // Force stop, specifically: the operator's escape hatch cannot be the thing
     // a stuck termination blocks.
     wired.scheduler.set_running(true);
-    wired.core_mode.set(
-        crate::orchestration::operator_command::OperatorMode::Running,
-    );
+    wired
+        .core_mode
+        .set(crate::orchestration::operator_command::OperatorMode::Running);
     let force_stop = wired
         .submit(json!({"type": "force_stop"}), wired.revision(), "force")
         .await;

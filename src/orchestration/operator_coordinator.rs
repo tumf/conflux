@@ -262,20 +262,6 @@ impl ApplicationResult {
             revision,
         }
     }
-
-    /// True when the command produced a real effect.
-    pub fn changed(&self) -> bool {
-        match &self.outcome {
-            Ok(ApplicationOutcome::Run(RunControlOutcome::NoOp { .. }))
-            | Ok(ApplicationOutcome::Operator(OperatorOutcome::NoOp { .. })) => false,
-            Ok(ApplicationOutcome::Operator(OperatorOutcome::Queue(queue))) => {
-                queue.reducer_changed || queue.dynamic_queue_mutated
-            }
-            Ok(ApplicationOutcome::Operator(OperatorOutcome::Retry(plan))) => !plan.is_empty(),
-            Ok(_) => true,
-            Err(_) => false,
-        }
-    }
 }
 
 /// Exclusive ownership of the application gate, held across one transaction.
@@ -334,11 +320,6 @@ impl OperatorApplication {
     /// submission and calls [`Self::apply_held`].
     pub fn gate(&self) -> Arc<tokio::sync::Mutex<()>> {
         self.gate.clone()
-    }
-
-    /// The current admission mode.
-    pub fn mode(&self) -> OperatorMode {
-        self.mode.get()
     }
 
     /// The shared run-lifecycle service.
