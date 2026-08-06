@@ -6,7 +6,7 @@ Acceptance has three distinct responsibilities:
 2. Conflux runtime parses the verdict and persists the latest repository-fixable findings.
 3. Apply consumes the runtime-owned follow-up and repairs the repository.
 
-The portable skill and canonical spec already enforce this boundary. Only the tracked OpenCode command adapter still assigns persistence to the reviewer.
+The portable skill and canonical spec already enforce this boundary. `src/config/defaults.rs` invokes the tracked OpenCode command by default, and `.opencode/commands/link.sh` exposes it through a symlink, so no generated or installed copy sits between the tracked adapter and execution. Only that adapter still assigns persistence to the reviewer.
 
 ## Decision
 
@@ -25,11 +25,11 @@ The adapter will name Conflux runtime as the owner of normalized `## Current Acc
 `src/embedded_skills.rs` already embeds `.opencode/commands/cflx-accept.md` under `#[cfg(test)]` and tests other prompt ownership guarantees. Extend that boundary with one test that:
 
 - requires explicit read-only and runtime-persistence language;
-- forbids the direct `tasks.md` update instruction;
-- forbids deriving the next Acceptance attempt number;
-- forbids creating numbered failure follow-up sections.
+- forbids exactly `After listing all findings, update openspec/changes/<change_id>/tasks.md`;
+- forbids exactly `Determine the next acceptance attempt number`;
+- forbids exactly `Append or create the section for that attempt`.
 
-The test verifies the actual tracked adapter consumed by OpenCode rather than a duplicate fixture.
+The test deliberately does not forbid broad substrings such as `update tasks.md` or the numbered follow-up heading because legitimate prohibition text may name them. It verifies the actual tracked adapter consumed by OpenCode rather than a duplicate fixture.
 
 ## Alternatives Rejected
 
@@ -49,4 +49,4 @@ Rejected because runtime already writes one latest-only `## Current Acceptance F
 
 The change preserves accepted JSON and legacy verdict forms and does not alter runtime parsing. Agents that already followed the portable skill see no behavior change. OpenCode reviewers stop producing their own numbered sections and rely on existing runtime handling.
 
-String-level prompt assertions can be brittle, so the test should check a small set of contract-bearing phrases rather than snapshotting the whole adapter.
+String-level prompt assertions can be brittle, so the test checks explicit positive ownership language and the three pre-change imperative anchors rather than snapshotting the whole adapter or matching broad words that can also appear in prohibitions. A reviewer verifies those assertions and the passing test from the current tree; it does not mutate the adapter to recreate the stale tail.
