@@ -15,6 +15,10 @@ IMPORTANT:
 
 Review the implementation to verify it meets the specification requirements.
 
+Acceptance review is read-only. Observe the repository and return a verdict with
+findings; do NOT modify the reviewed worktree. Conflux runtime owns persistence
+of repository-fixable findings.
+
 External dependency policy (production-first; mocks/stubs are test-only):
 - Any requirement that AI cannot resolve or verify autonomously is an external dependency
 - Production code MUST NOT rely on mocks/stubs/fakes as the default runtime implementation.
@@ -22,8 +26,8 @@ External dependency policy (production-first; mocks/stubs are test-only):
 - External dependencies SHOULD be verified via unit tests that mock the external system, but the production implementation MUST still exist and be wired into the real execution flow.
 - Missing secrets (API keys, credentials) MUST NOT be treated as a reason to output CONTINUE.
 - If verification would require secrets:
-  * Output FAIL with follow-up tasks that keep the real implementation and move mocking to tests (e.g., add a client interface, add unit tests with mocks/fixtures, and document configuration).
-  * If the feature truly requires a live external system at runtime, output FAIL with follow-up tasks to add clear fail-fast behavior + actionable configuration docs (do NOT ship a stub as the implementation).
+  * Output FAIL with actionable findings that keep the real implementation and move mocking to tests (e.g., add a client interface, add unit tests with mocks/fixtures, and document configuration).
+  * If the feature truly requires a live external system at runtime, output FAIL with actionable findings to add clear fail-fast behavior + actionable configuration docs (do NOT ship a stub as the implementation).
 
 Permission Error Acceptance:
 - If tasks.md contains a "## Future Work" section with permission-related tasks:
@@ -170,7 +174,12 @@ Correct fallback output:
 CRITICAL - When outputting FAIL:
 1. List ALL issues discovered in the FINDINGS section (for human readers) AND
    include them in the `findings` array of the JSON verdict (for the runtime).
-2. After listing all findings, update openspec/changes/<change_id>/tasks.md:
-   - Determine the next acceptance attempt number (check existing "## Acceptance #N Failure Follow-up" sections)
-   - Append or create the section for that attempt
-   - Add each finding as a separate unchecked task: "- [ ] <finding>"
+2. Acceptance review is read-only. Do NOT edit
+   `openspec/changes/<change_id>/tasks.md`, the runtime-owned
+   `## Current Acceptance Follow-up` section, or any other runtime-owned
+   follow-up state. Do NOT derive an acceptance attempt number and do NOT create
+   a numbered `## Acceptance #N Failure Follow-up` section.
+3. Conflux runtime persists normalized repository-fixable findings into the
+   single runtime-owned `## Current Acceptance Follow-up` section after the
+   verdict is observed. Every finding you want repaired MUST therefore be
+   complete and actionable inside the verdict itself.
