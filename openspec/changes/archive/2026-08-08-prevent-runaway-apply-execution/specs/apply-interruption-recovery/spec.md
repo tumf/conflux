@@ -1,38 +1,47 @@
 ## ADDED Requirements
 
-### Requirement: Interrupted Apply preserves workspace-local progress
+### Requirement: 中断されたApplyはworkspace-local progressを保存する
 
-After cancellation or absolute runtime-limit expiry of an active managed-worktree Apply, Conflux MUST first prove that the owned process group is quiescent and then MUST preserve dirty staged, unstaged, and untracked workspace progress through the existing Conflux-owned WIP snapshot path. The interruption outcome MUST stop the active run without same-run automatic redispatch. If cleanup or snapshot creation fails, Conflux MUST retain workspace contents, return actionable diagnostics, and MUST NOT report successful preservation or dispatch Acceptance.
+active managed-worktree Applyがcancelまたはabsolute runtime-limit expiryで終了する場合、Confluxは最初にowned process groupのquiescenceを証明し、その後にdirtyなstaged・unstaged・untracked workspace progressを既存Conflux-owned WIP snapshot pathで保存しなければならない（MUST）。interruption outcomeはsame-run automatic redispatchを行わずactive runを停止しなければならない（MUST）。cleanupまたはsnapshot creationが失敗した場合、Confluxはworkspace contentsを保持してactionable diagnosticsを返し、successful preservationを報告またはAcceptanceをdispatchしてはならない（MUST NOT）。
 
-#### Scenario: Operator cancellation preserves dirty Apply progress
+#### Scenario: Operator cancellationはdirty Apply progressを保存する
 
-**Given**: a managed Apply command has changed staged, unstaged, or untracked files
-**When**: the active Apply is cancelled
-**Then**: Conflux closes command admission and terminates the owned process group
-**And**: Conflux proves process-group quiescence before repository mutation
-**And**: Conflux creates a WIP snapshot containing the dirty workspace progress
-**And**: the active run stops without automatically redispatching Apply
+- **GIVEN** managed Apply commandがstaged、unstaged、untracked fileを変更している
+- **WHEN** active Applyがcancelされる
+- **THEN** Confluxはcommand admissionを閉じowned process groupを終了する
+- **AND** repository mutation前にprocess-group quiescenceを証明する
+- **AND** dirty workspace progressを含むWIP snapshotを作成する
+- **AND** Applyを同じrunで自動redispatchせずactive runを停止する
 
-#### Scenario: Runtime-limit expiry preserves dirty Apply progress
+#### Scenario: Runtime-limit expiryはdirty Apply progressを保存する
 
-**Given**: a managed Apply command has changed the workspace
-**And**: the command reaches its absolute runtime limit
-**When**: process-group cleanup confirms quiescence
-**Then**: Conflux creates one WIP snapshot through the existing workspace manager
-**And**: the runtime-limit outcome remains non-retryable within the active run
-**And**: Acceptance is not dispatched
+- **GIVEN** managed Apply commandがworkspaceを変更している
+- **AND** commandがabsolute runtime limitへ到達する
+- **WHEN** process-group cleanupがquiescenceを確認する
+- **THEN** Confluxは既存workspace managerでWIP snapshotを1つ作成する
+- **AND** runtime-limit outcomeはactive run内でnon-retryableである
+- **AND** Acceptanceをdispatchしない
 
-#### Scenario: Restart derives continuation from the preserved workspace
+#### Scenario: Clean interruptionはempty WIP snapshotを作らない
 
-**Given**: an interrupted Apply created a WIP snapshot
-**When**: Conflux starts in a fresh process after external state and logs are removed
-**Then**: the next action is derived from workspace files, Git history, and base comparison
-**And**: the change resumes as existing Apply work rather than an unstarted change
+- **GIVEN** active managed Applyがstaged、unstaged、untracked workspace stateを変更していない
+- **AND** commandがcancelまたはabsolute runtime limitへ到達する
+- **WHEN** process-group cleanupがquiescenceを確認する
+- **THEN** ConfluxはWIP snapshot pathを呼ばない
+- **AND** empty WIP commitを作成しない
+- **AND** same-run automatic redispatchを行わずactive runを停止する
 
-#### Scenario: Snapshot failure retains recoverable files
+#### Scenario: Restartは保存されたworkspaceからcontinuationを導出する
 
-**Given**: an interrupted Apply is dirty and its process group is quiescent
-**When**: WIP snapshot creation fails
-**Then**: Conflux leaves the workspace and index contents available for recovery
-**And**: it returns non-zero with snapshot diagnostics
-**And**: it does not report successful interruption recovery
+- **GIVEN** interrupted ApplyがWIP snapshotを作成している
+- **WHEN** external stateとlogを削除したfresh processでConfluxを起動する
+- **THEN** 次actionをworkspace file、Git history、base comparisonから導出する
+- **AND** changeを未開始ではなく既存Apply workとしてresumeする
+
+#### Scenario: Snapshot failureはrecoverable fileを保持する
+
+- **GIVEN** interrupted Applyがdirtyでprocess groupがquiescentである
+- **WHEN** WIP snapshot creationが失敗する
+- **THEN** Confluxはworkspaceとindex contentsをrecovery用に保持する
+- **AND** snapshot diagnosticsを伴うnon-zeroを返す
+- **AND** successful interruption recoveryを報告しない
