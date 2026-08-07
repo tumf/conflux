@@ -1074,6 +1074,7 @@ fn state_response() -> StateResponse {
         event_sequence: 12,
         snapshot: InstanceSnapshot {
             app_mode: "running".to_string(),
+            persistent_scheduler_idle: false,
             is_resolving: false,
             process_error: Some("sanitized process failure".to_string()),
             parallel: ParallelRuntimeState {

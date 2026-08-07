@@ -630,6 +630,27 @@ fn rows() -> Vec<Row> {
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
             notice: None,
         },
+        // Persistent-idle Ready is `select` over a scheduler that is still
+        // alive, so the stop family stays admitted there while pre-run Select
+        // (the two rows above and below, over `Setup::Bare`) stays refused.
+        Row {
+            name: "graceful stop from persistent-idle Ready addresses the live scheduler",
+            setup: Setup::LiveScheduler,
+            mode: AppExecutionMode::Select,
+            tui: TuiCommand::Stop,
+            v2: CommandSpec::Stop,
+            expect: Settlement::Changed,
+            notice: None,
+        },
+        Row {
+            name: "force stop from persistent-idle Ready cancels the live scheduler",
+            setup: Setup::LiveScheduler,
+            mode: AppExecutionMode::Select,
+            tui: TuiCommand::ForceStop,
+            v2: CommandSpec::ForceStop,
+            expect: Settlement::Changed,
+            notice: None,
+        },
         Row {
             name: "cancel stop while stopping withdraws the request",
             setup: Setup::LiveScheduler,
@@ -862,6 +883,327 @@ async fn tui_and_v2_settle_every_lifecycle_intent_identically() {
                 row.name
             );
         }
+    }
+}
+
+// ============================================================================
+// Persistent-idle Ready as a live run-control target
+// ============================================================================
+
+/// Verification `persistent-idle-ready-regressions`: Ready produced by a
+/// persistent-scheduler idle transition stays a live run-control target.
+///
+/// The parity table above already proves both adapters settle the stop family
+/// identically from this mode. What is left is the behaviour that is specific to
+/// it: Start notifies instead of spawning and does not claim Running, marks stay
+/// mark-only, graceful stop wakes the parked waiter, the controls stay
+/// discoverable, and an idle-origin cancel-stop returns to Ready.
+#[tokio::test]
+async fn persistent_idle_commands_use_live_scheduler() {
+    use crate::events::persistent_idle_may_project_ready;
+    use crate::tui::key_handlers::{esc_stop_action, EscStopAction};
+    use crate::tui::types::StopMode;
+
+    // ── Start wakes the same scheduler and does not claim Running ──────────
+    let harness = AdapterHarness::new(&CHANGES);
+    harness
+        .marks
+        .replace(CHANGES.iter().map(|id| id.to_string()));
+    harness.scheduler.set_running(true);
+
+    let mut app = harness.app(&CHANGES);
+    app.execution_mode = AppExecutionMode::Select;
+    app.persistent_scheduler_idle = true;
+
+    // A mark made while idle-Ready is a mark, not a queue mutation.
+    let statuses_before = harness.state.read().await.all_display_statuses();
+    harness
+        .run_control
+        .operator()
+        .set_execution_mark(AppExecutionMode::Select.operator_mode(), "c1", true)
+        .await
+        .expect("marking in Select is accepted");
+    assert_eq!(
+        harness.state.read().await.all_display_statuses(),
+        statuses_before,
+        "a mark made in idle Ready must not synthesize queue intent"
+    );
+
+    harness
+        .run(&mut app, TuiCommand::StartProcessing(Vec::new()))
+        .await;
+
+    assert!(
+        harness.scheduler.started_targets().is_empty(),
+        "Start against a live idle scheduler must not spawn a second run"
+    );
+    assert!(
+        harness.scheduler.calls().contains(&SchedulerCall::Notified),
+        "Start must wake the scheduler that is already alive"
+    );
+    for id in CHANGES {
+        assert_eq!(
+            harness.state.read().await.display_status(id),
+            "queued",
+            "Start applies the existing reducer queue intent for '{id}'"
+        );
+    }
+    assert_eq!(
+        app.execution_mode,
+        AppExecutionMode::Select,
+        "a notified Start has started nothing yet, so Ready stands"
+    );
+    assert!(
+        app.persistent_scheduler_idle,
+        "a Start notification does not close the idle episode"
+    );
+
+    // ── The controls are discoverable, and pre-run Select's are not ────────
+    assert_eq!(
+        esc_stop_action(&AppExecutionMode::Select, &StopMode::None, true),
+        EscStopAction::RequestGracefulStop,
+        "idle Ready keeps the first-Esc graceful stop"
+    );
+    assert_eq!(
+        esc_stop_action(&AppExecutionMode::Select, &StopMode::None, false),
+        EscStopAction::None,
+        "pre-run Select has no scheduler to stop"
+    );
+
+    // ── Graceful stop records the request, then wakes the parked waiter ────
+    let harness = AdapterHarness::new(&CHANGES);
+    harness.scheduler.set_running(true);
+    let mut app = harness.app(&CHANGES);
+    app.execution_mode = AppExecutionMode::Select;
+    app.persistent_scheduler_idle = true;
+
+    harness.run(&mut app, TuiCommand::Stop).await;
+
+    assert_eq!(
+        harness.scheduler.calls(),
+        vec![SchedulerCall::GracefulStop(true), SchedulerCall::Notified],
+        "the stop request is recorded before the idle waiter is woken"
+    );
+    assert_eq!(app.execution_mode, AppExecutionMode::Stopping);
+    assert_eq!(app.stop_mode, StopMode::GracefulPending);
+    assert!(
+        app.persistent_scheduler_idle,
+        "an idle-origin stop keeps its episode identity"
+    );
+
+    // The second Esc still escalates to the shared force stop.
+    assert_eq!(
+        esc_stop_action(&app.execution_mode, &app.stop_mode, true),
+        EscStopAction::RequestImmediateStop
+    );
+
+    // ── Cancel-stop returns to Ready, not to Running ───────────────────────
+    harness.run(&mut app, TuiCommand::CancelStop).await;
+    assert_eq!(
+        app.execution_mode,
+        AppExecutionMode::Select,
+        "withdrawing an idle-origin stop restores Ready"
+    );
+    assert_eq!(app.stop_mode, StopMode::None);
+    assert!(app.persistent_scheduler_idle);
+
+    // Once admitted work has closed the episode, cancel-stop restores Running.
+    app.handle_orchestrator_event(ExecutionEvent::WorkspacePreparationStarted {
+        change_id: "c1".to_string(),
+    });
+    assert_eq!(app.execution_mode, AppExecutionMode::Running);
+    assert!(!app.persistent_scheduler_idle);
+    harness.run(&mut app, TuiCommand::Stop).await;
+    harness.run(&mut app, TuiCommand::CancelStop).await;
+    assert_eq!(app.execution_mode, AppExecutionMode::Running);
+
+    // ── Force stop cancels the same scheduler ──────────────────────────────
+    let harness = AdapterHarness::new(&CHANGES);
+    harness.scheduler.set_running(true);
+    let mut app = harness.app(&CHANGES);
+    app.execution_mode = AppExecutionMode::Select;
+    app.persistent_scheduler_idle = true;
+
+    harness.run(&mut app, TuiCommand::ForceStop).await;
+    assert!(
+        harness
+            .scheduler
+            .calls()
+            .contains(&SchedulerCall::Cancelled),
+        "force stop must cancel the live scheduler behind idle Ready"
+    );
+    assert!(
+        harness.scheduler.started_targets().is_empty(),
+        "force stop never spawns anything"
+    );
+
+    // ── Liveness, not the presentation fact, is the admission authority ────
+    let harness = AdapterHarness::new(&CHANGES);
+    let mut app = harness.app(&CHANGES);
+    app.execution_mode = AppExecutionMode::Select;
+    // A stale client fact over a scheduler that already exited.
+    app.persistent_scheduler_idle = true;
+
+    harness.run(&mut app, TuiCommand::Stop).await;
+    assert!(
+        harness.scheduler.calls().is_empty(),
+        "a stale idle fact must not authorize a stop against an exited scheduler"
+    );
+    assert_eq!(app.execution_mode, AppExecutionMode::Select);
+    assert!(app
+        .warning_message
+        .as_deref()
+        .is_some_and(|message| message.contains("stop is not available")));
+
+    // Both frontends read the same guard for the same mode token.
+    assert!(persistent_idle_may_project_ready(
+        AppExecutionMode::Running.app_mode_token()
+    ));
+    for retained in [
+        AppExecutionMode::Select,
+        AppExecutionMode::Stopping,
+        AppExecutionMode::Stopped,
+        AppExecutionMode::Error,
+    ] {
+        assert!(
+            !persistent_idle_may_project_ready(retained.app_mode_token()),
+            "{retained:?} must not be turned into persistent-idle Ready"
+        );
+    }
+}
+
+/// Verification `persistent-idle-ready-regressions`: after Ready, the first
+/// typed admitted-work start — and nothing before it — restores Running.
+///
+/// The whole sequence is driven into a TUI `AppState` and a `WebState` from the
+/// *same* ordered events, and the two modes are compared at every step, so a
+/// frontend-local shortcut on either side fails the comparison.
+#[tokio::test]
+async fn admitted_work_restores_running_after_idle() {
+    use crate::events::EventSink;
+    use crate::orchestration::state::OrchestratorState;
+    use crate::web::state::WebEventSink;
+
+    /// One step: the event to deliver, and the mode both frontends must report.
+    struct Step {
+        what: &'static str,
+        event: ExecutionEvent,
+        mode: &'static str,
+        idle: bool,
+    }
+
+    let prepare = |id: &str| ExecutionEvent::WorkspacePreparationStarted {
+        change_id: id.to_string(),
+    };
+
+    let steps = vec![
+        Step {
+            what: "ordinary workspace preparation starts the run",
+            event: prepare("change-a"),
+            mode: "running",
+            idle: false,
+        },
+        Step {
+            what: "the scheduler parks with nothing to execute",
+            event: ExecutionEvent::PersistentSchedulerIdle,
+            mode: "select",
+            idle: true,
+        },
+        Step {
+            what: "a no-op wake analyses and admits nothing",
+            event: ExecutionEvent::AnalysisStarted {
+                remaining_changes: 1,
+                attempt_id: "attempt-1".to_string(),
+            },
+            mode: "select",
+            idle: true,
+        },
+        Step {
+            what: "a catalog refresh is not execution evidence either",
+            event: ExecutionEvent::WorktreesRefreshed {
+                worktrees: Vec::new(),
+            },
+            mode: "select",
+            idle: true,
+        },
+        Step {
+            what: "actual admitted work resumes Running and closes the episode",
+            event: prepare("change-a"),
+            mode: "running",
+            idle: false,
+        },
+        Step {
+            what: "the scheduler parks again: a second idle edge",
+            event: ExecutionEvent::PersistentSchedulerIdle,
+            mode: "select",
+            idle: true,
+        },
+        Step {
+            what: "scheduler-owned resolve work resumes Running",
+            event: ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "resolve".to_string(),
+            },
+            mode: "running",
+            idle: false,
+        },
+        Step {
+            what: "and parks once more",
+            event: ExecutionEvent::PersistentSchedulerIdle,
+            mode: "select",
+            idle: true,
+        },
+        Step {
+            what: "scheduler-owned base-lane rejection review resumes Running",
+            event: ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: "change-a".to_string(),
+                workspace_name: "ws-a".to_string(),
+                status: crate::vcs::WorkspaceStatus::Rejecting,
+            },
+            mode: "running",
+            idle: false,
+        },
+    ];
+
+    let reducer = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+        vec!["change-a".to_string()],
+        10,
+    )));
+    let web_state = Arc::new(WebState::new(&[]));
+    web_state.set_shared_state(reducer.clone()).await;
+    let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
+    let mut app = AppState::new(Vec::new());
+
+    for step in steps {
+        crate::events::dispatch_event(reducer.as_ref(), &sinks, step.event.clone()).await;
+        app.handle_orchestrator_event(step.event);
+
+        let web = web_state.get_state().await;
+        assert_eq!(web.app_mode, step.mode, "web: {}", step.what);
+        assert_eq!(
+            web.persistent_scheduler_idle, step.idle,
+            "web idle episode: {}",
+            step.what
+        );
+        assert_eq!(
+            app.execution_mode.app_mode_token(),
+            step.mode,
+            "tui: {}",
+            step.what
+        );
+        assert_eq!(
+            app.persistent_scheduler_idle, step.idle,
+            "tui idle episode: {}",
+            step.what
+        );
+        // The comparison itself: neither frontend may reach a conclusion the
+        // other does not.
+        assert_eq!(
+            (app.execution_mode == AppExecutionMode::Running),
+            (web.app_mode == "running"),
+            "tui/web divergence: {}",
+            step.what
+        );
     }
 }
 

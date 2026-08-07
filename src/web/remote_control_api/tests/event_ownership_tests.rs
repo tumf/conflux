@@ -80,6 +80,7 @@ fn change_addressed_variants_publish_their_change_id() {
         "Stopping",
         "Stopped",
         "AllCompleted",
+        "PersistentSchedulerIdle",
         "Error",
         "ChangesRefreshed",
         "WorktreesRefreshed",
@@ -494,6 +495,209 @@ async fn all_completed_still_completes_a_healthy_run() {
 
     dispatch(&reducer, &sinks, ExecutionEvent::AllCompleted).await;
     assert_eq!(web_state.get_state().await.app_mode, "select");
+}
+
+/// Verification `persistent-idle-ready-regressions`: the idle dispatch publishes
+/// one coherent Ready revision and no churn afterwards.
+///
+/// Everything here goes through the authoritative dispatch boundary and the
+/// shared `WebState`, never a hand-mutated snapshot, so what is asserted is what
+/// a `/api/v2` client would actually read.
+#[tokio::test]
+async fn persistent_idle_projects_api_ready_once() {
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
+    let projection = web_state.remote_control().projection();
+    let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
+
+    dispatch(
+        &reducer,
+        &sinks,
+        ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "change-a".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(web_state.get_state().await.app_mode, "running");
+
+    dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
+    let (snapshot, revision_after_idle, _) = projection.snapshot();
+    assert_eq!(snapshot.app_mode, "select");
+    assert!(
+        snapshot.persistent_scheduler_idle,
+        "the idle edge and its Ready snapshot share one revision"
+    );
+
+    // Duplicate and no-op idle observation is ordered but changes nothing a
+    // client reads, so it allocates no new revision.
+    dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
+    dispatch(
+        &reducer,
+        &sinks,
+        ExecutionEvent::AnalysisStarted {
+            remaining_changes: 1,
+            attempt_id: "attempt-1".to_string(),
+        },
+    )
+    .await;
+    let (snapshot, revision, sequence) = projection.snapshot();
+    assert_eq!(
+        revision, revision_after_idle,
+        "a duplicate or no-op idle observation advanced the revision"
+    );
+    assert_eq!(snapshot.app_mode, "select");
+    assert!(snapshot.persistent_scheduler_idle);
+    assert!(sequence > 0, "every delivery is still ordered");
+
+    // Admitted work clears the field in the same revision that reports Running.
+    dispatch(
+        &reducer,
+        &sinks,
+        ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "change-a".to_string(),
+        },
+    )
+    .await;
+    let (snapshot, _, _) = projection.snapshot();
+    assert_eq!(snapshot.app_mode, "running");
+    assert!(!snapshot.persistent_scheduler_idle);
+
+    // Both terminal outcomes clear it too.
+    for (terminal, expected_mode) in [
+        (ExecutionEvent::Stopped, "stopped"),
+        (
+            ExecutionEvent::Error {
+                message: "fatal".to_string(),
+            },
+            "error",
+        ),
+    ] {
+        let (web_state, reducer) = bound_web_state(&["change-a"]).await;
+        let projection = web_state.remote_control().projection();
+        let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
+
+        dispatch(
+            &reducer,
+            &sinks,
+            ExecutionEvent::WorkspacePreparationStarted {
+                change_id: "change-a".to_string(),
+            },
+        )
+        .await;
+        dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
+        assert!(projection.snapshot().0.persistent_scheduler_idle);
+
+        dispatch(&reducer, &sinks, terminal).await;
+        let (snapshot, _, _) = projection.snapshot();
+        assert_eq!(snapshot.app_mode, expected_mode);
+        assert!(
+            !snapshot.persistent_scheduler_idle,
+            "{expected_mode} must close the idle episode"
+        );
+    }
+}
+
+/// A late idle event never sets the field, so the two frontends cannot disagree
+/// about whether a stopped or failed run still has a scheduler to command.
+#[tokio::test]
+async fn late_persistent_idle_retains_transitional_and_terminal_modes() {
+    for (earlier, expected_mode) in [
+        (ExecutionEvent::Stopping, "stopping"),
+        (ExecutionEvent::Stopped, "stopped"),
+        (
+            ExecutionEvent::Error {
+                message: "fatal".to_string(),
+            },
+            "error",
+        ),
+    ] {
+        let (web_state, reducer) = bound_web_state(&["change-a"]).await;
+        let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
+
+        dispatch(&reducer, &sinks, earlier).await;
+        dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
+
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.app_mode, expected_mode,
+            "a late idle event overwrote {expected_mode}"
+        );
+        assert!(!state.persistent_scheduler_idle);
+        // The TUI reaches the same conclusion through the same predicate; its
+        // side of the agreement lives in `tui::state::event_handlers::completion`.
+        assert!(!crate::events::persistent_idle_may_project_ready(
+            expected_mode
+        ));
+    }
+
+    // Pre-run Select is already Ready and owns no live scheduler.
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
+    let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
+    dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
+    let state = web_state.get_state().await;
+    assert_eq!(state.app_mode, "select");
+    assert!(
+        !state.persistent_scheduler_idle,
+        "pre-run Select must not be turned into a live idle episode"
+    );
+}
+
+/// Verification `persistent-idle-ready-regressions`: an idle-origin stop keeps
+/// its episode identity, and cancel-stop returns to Ready rather than Running.
+#[tokio::test]
+async fn idle_origin_stop_and_cancel_preserve_ready() {
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
+    let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
+
+    dispatch(
+        &reducer,
+        &sinks,
+        ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "change-a".to_string(),
+        },
+    )
+    .await;
+    dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
+
+    // Both halves travel as authoritative dispatches — the exact existing
+    // `Stopping` event and the accepted cancel-stop outcome — so this is the
+    // same path a TUI keypress takes, not a web-only projection call.
+    dispatch(&reducer, &sinks, ExecutionEvent::Stopping).await;
+    let state = web_state.get_state().await;
+    assert_eq!(state.app_mode, "stopping");
+    assert!(
+        state.persistent_scheduler_idle,
+        "a stop requested from idle Ready is still the same episode"
+    );
+
+    dispatch(&reducer, &sinks, stop_cancelled()).await;
+    let state = web_state.get_state().await;
+    assert_eq!(state.app_mode, "select");
+    assert!(state.persistent_scheduler_idle);
+
+    // Work that wins the race before cancel-stop preserves Stopping, clears the
+    // episode, and makes the later cancel-stop restore Running instead.
+    dispatch(&reducer, &sinks, ExecutionEvent::Stopping).await;
+    dispatch(
+        &reducer,
+        &sinks,
+        ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "change-a".to_string(),
+        },
+    )
+    .await;
+    let state = web_state.get_state().await;
+    assert_eq!(state.app_mode, "stopping");
+    assert!(!state.persistent_scheduler_idle);
+
+    dispatch(&reducer, &sinks, stop_cancelled()).await;
+    assert_eq!(web_state.get_state().await.app_mode, "running");
+}
+
+/// The authoritative event an accepted cancel-stop publishes.
+fn stop_cancelled() -> ExecutionEvent {
+    ExecutionEvent::OperatorCommandApplied {
+        effect: crate::events::OperatorCommandEffect::StopCancelled,
+    }
 }
 
 /// A duplicate `Stopped` reconciles without doubling anything a client sees.

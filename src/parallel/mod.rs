@@ -255,6 +255,15 @@ pub struct ParallelExecutor {
     pending_merge_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Scheduler lifetime policy (finite for CLI run, persistent for loop-based frontends).
     scheduler_lifetime: SchedulerLifetime,
+    /// Edge-trigger latch for the persistent-idle transition.
+    ///
+    /// Set when the scheduler emits its one idle event for an episode and
+    /// cleared only when admitted work actually begins, so repeated loop
+    /// evaluations and wake notifications that start nothing cannot re-emit.
+    /// Shared with the dispatch paths that own those two rearm points, and
+    /// invocation-scoped like every other runtime latch here: a restart begins
+    /// with no open episode.
+    persistent_idle_latched: Arc<std::sync::atomic::AtomicBool>,
     /// Post-archive terminal action.
     post_archive_action: PostArchiveAction,
     /// Optional reducer shared state used for scheduler-owned resolve/merge retry intent.

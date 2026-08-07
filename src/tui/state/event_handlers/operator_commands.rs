@@ -19,12 +19,33 @@ impl AppState {
     /// Project one accepted operator command's decision facts.
     pub(crate) fn handle_operator_command_applied(&mut self, effect: OperatorCommandEffect) {
         match effect {
-            OperatorCommandEffect::RunDispatched { change_ids, .. } => {
-                self.begin_run(&change_ids);
+            // Which of the two run projections applies is carried by the
+            // dispatch, not re-derived here: only a newly spawned scheduler
+            // proves execution has begun, while a dispatch that woke a scheduler
+            // already alive — including one parked in persistent-idle Ready —
+            // leaves the execution axis to the first typed work-start event.
+            OperatorCommandEffect::RunDispatched {
+                change_ids,
+                scheduler_started,
+                ..
+            } => {
+                if scheduler_started {
+                    self.begin_run(&change_ids);
+                } else {
+                    self.queue_run(&change_ids);
+                }
             }
+            // Withdrawing a stop restores where the stop came from. A stop
+            // requested from persistent-idle Ready returns to Ready: nothing has
+            // started, and claiming Running would advertise execution no typed
+            // event ever proved.
             OperatorCommandEffect::StopCancelled => {
                 self.stop_mode = StopMode::None;
-                self.execution_mode = AppExecutionMode::Running;
+                self.execution_mode = if self.persistent_scheduler_idle {
+                    AppExecutionMode::Select
+                } else {
+                    AppExecutionMode::Running
+                };
             }
             OperatorCommandEffect::ForceStopAwaitingBoundary { force_stop } => {
                 if force_stop {

@@ -49,12 +49,13 @@
 use std::sync::{Arc, Mutex};
 
 use crate::events::{
-    all_completed_may_overwrite_mode, EventDispatcher, ExecutionEvent, OperatorCommandEffect,
-    OutcomeRevisions,
+    all_completed_may_overwrite_mode, is_admitted_work_start, persistent_idle_may_project_ready,
+    EventDispatcher, ExecutionEvent, OperatorCommandEffect, OutcomeRevisions,
 };
 use crate::orchestration::operator_command::{OperatorMode, OperatorOutcome, PendingTermination};
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
+    SchedulerEffect,
 };
 
 // ============================================================================
@@ -75,7 +76,20 @@ use crate::orchestration::run_control::{
 /// `Running` and a later Start would be refused forever.
 #[derive(Debug)]
 pub struct CoreMode {
-    mode: Mutex<OperatorMode>,
+    state: Mutex<CoreModeState>,
+}
+
+/// Admission mode plus the one qualifier that changes what `Select` means.
+#[derive(Debug, Clone, Copy)]
+struct CoreModeState {
+    mode: OperatorMode,
+    /// True while `Select` describes a live persistent-scheduler idle episode
+    /// rather than ordinary pre-run selection.
+    ///
+    /// Held next to the mode, under the same lock, because the two are read and
+    /// written as one decision: a cancel-stop that saw a stale value of either
+    /// would restore the wrong mode.
+    persistent_idle: bool,
 }
 
 impl Default for CoreMode {
@@ -91,27 +105,49 @@ impl CoreMode {
     /// admission history, and the next action is recomputed from the workspace.
     pub fn new() -> Self {
         Self {
-            mode: Mutex::new(OperatorMode::Select),
+            state: Mutex::new(CoreModeState {
+                mode: OperatorMode::Select,
+                persistent_idle: false,
+            }),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, OperatorMode> {
-        self.mode
+    fn lock(&self) -> std::sync::MutexGuard<'_, CoreModeState> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The current admission mode.
     pub fn get(&self) -> OperatorMode {
-        *self.lock()
+        self.lock().mode
     }
 
     /// Replace the admission mode, reporting whether it changed.
+    ///
+    /// The idle-episode fact qualifies `Select` and nothing else, so it travels
+    /// with the mode it qualifies — the same rule the `/api/v2` snapshot applies
+    /// when a caller publishes a different execution mode.
+    ///
+    /// Production moves the mode only through [`CoreMode::apply_event`]; this is
+    /// how a test arranges the process it is about to command.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set(&self, mode: OperatorMode) -> bool {
         let mut guard = self.lock();
-        let changed = *guard != mode;
-        *guard = mode;
+        let changed = guard.mode != mode;
+        guard.mode = mode;
+        guard.persistent_idle &= mode == OperatorMode::Select;
         changed
+    }
+
+    /// Arrange the idle-episode half of the mode directly.
+    ///
+    /// Production only ever moves this through [`CoreMode::apply_event`]; a test
+    /// that arranged a frontend in persistent-idle Ready without arranging Core
+    /// would be exercising a split state the process cannot be in.
+    #[cfg(test)]
+    pub fn set_persistent_idle(&self, persistent_idle: bool) {
+        self.lock().persistent_idle = persistent_idle;
     }
 
     /// Apply an authoritative lifecycle or command-outcome event.
@@ -122,7 +158,27 @@ impl CoreMode {
     /// `AllCompleted` may not overwrite a retained terminal mode, and a
     /// command-outcome effect that carries no mode meaning (a mark delta, a
     /// queued resolve) moves nothing.
+    ///
+    /// The persistent-idle episode is tracked here for the same reason: `Select`
+    /// over a live parked scheduler and `Select` before any run are different
+    /// admission states, and a frontend that projects this mode must not have to
+    /// re-derive which one it is holding.
     pub fn apply_event(&self, event: &ExecutionEvent) -> Option<OperatorMode> {
+        let mut guard = self.lock();
+
+        // One shared idle-episode rule, applied before the mode decision so an
+        // arm below already reads the settled episode fact. It is the same rule
+        // both frontends apply, over the same authoritative events, so the three
+        // copies cannot drift apart.
+        if is_admitted_work_start(event)
+            || matches!(
+                event,
+                ExecutionEvent::Stopped | ExecutionEvent::Error { .. }
+            )
+        {
+            guard.persistent_idle = false;
+        }
+
         let next = match event {
             // Typed run activation. The scheduler really started work, so the
             // process is Running whether or not a command put it there.
@@ -131,18 +187,45 @@ impl CoreMode {
             ExecutionEvent::Stopped => OperatorMode::Stopped,
             ExecutionEvent::Error { .. } => OperatorMode::Error,
             ExecutionEvent::ProcessingError { .. } => OperatorMode::Error,
+            // A persistent scheduler parked with nothing left to execute. Ready
+            // here describes a *live* scheduler, so the shared guard applies:
+            // only a running process becomes Ready, and pre-run Select, a
+            // pending stop, and both terminal modes are left exactly as they
+            // are.
+            ExecutionEvent::PersistentSchedulerIdle => {
+                if !persistent_idle_may_project_ready(guard.mode.as_app_mode()) {
+                    return None;
+                }
+                guard.persistent_idle = true;
+                OperatorMode::Select
+            }
             ExecutionEvent::AllCompleted => {
                 // Natural completion returns to Select and readmits a later
                 // Start; a late completion after a stop or a fatal error does
                 // not overwrite that terminal mode.
-                if !all_completed_may_overwrite_mode(self.get().as_app_mode()) {
+                if !all_completed_may_overwrite_mode(guard.mode.as_app_mode()) {
                     return None;
                 }
                 OperatorMode::Select
             }
             ExecutionEvent::OperatorCommandApplied { effect } => match effect {
-                OperatorCommandEffect::RunDispatched { .. }
-                | OperatorCommandEffect::StopCancelled => OperatorMode::Running,
+                // Only a newly spawned scheduler proves execution has begun. A
+                // dispatch that merely woke a scheduler which was already alive
+                // has admitted nothing yet, so the mode waits for the first
+                // typed work-start event rather than claiming Running here.
+                OperatorCommandEffect::RunDispatched {
+                    scheduler_started: true,
+                    ..
+                } => OperatorMode::Running,
+                OperatorCommandEffect::RunDispatched { .. } => return None,
+                // Withdrawing a stop restores where the stop came from. A stop
+                // requested from persistent-idle Ready returns to Ready with its
+                // episode intact; claiming Running would advertise execution no
+                // typed event ever proved.
+                OperatorCommandEffect::StopCancelled if guard.persistent_idle => {
+                    OperatorMode::Select
+                }
+                OperatorCommandEffect::StopCancelled => OperatorMode::Running,
                 OperatorCommandEffect::ForceStopAwaitingBoundary { .. } => OperatorMode::Stopping,
                 OperatorCommandEffect::ResolveReserved { active: true, .. } => {
                     OperatorMode::Running
@@ -153,9 +236,17 @@ impl CoreMode {
                 | OperatorCommandEffect::MarkDelta { .. }
                 | OperatorCommandEffect::QueueDelta { .. } => return None,
             },
+            // Work-start evidence other than `ProcessingStarted` resumes a
+            // parked Ready and nothing else: a graceful stop that arrived first
+            // is still owed, and a terminal mode stays terminal.
+            _ if is_admitted_work_start(event) && guard.mode == OperatorMode::Select => {
+                OperatorMode::Running
+            }
             _ => return None,
         };
-        self.set(next).then_some(next)
+        let changed = guard.mode != next;
+        guard.mode = next;
+        changed.then_some(next)
     }
 }
 
@@ -678,11 +769,12 @@ fn run_outcome_event(outcome: &RunControlOutcome) -> Option<ExecutionEvent> {
         RunControlOutcome::RunDispatched {
             change_ids,
             explicit_retry,
-            ..
+            scheduler,
         } => Some(ExecutionEvent::OperatorCommandApplied {
             effect: OperatorCommandEffect::RunDispatched {
                 change_ids: change_ids.clone(),
                 explicit_retry: *explicit_retry,
+                scheduler_started: matches!(scheduler, SchedulerEffect::Started),
             },
         }),
         RunControlOutcome::ResolveReserved {
@@ -738,6 +830,12 @@ fn operator_outcome_event(outcome: &OperatorOutcome) -> Option<ExecutionEvent> {
                 effect: OperatorCommandEffect::RunDispatched {
                     change_ids: plan.change_ids.clone(),
                     explicit_retry: plan.explicit_retry,
+                    // A plan is the reducer transition, not the dispatch that
+                    // makes it real: it carries no scheduler evidence at all.
+                    // Reporting "not started" is the only truthful reading, and
+                    // the run-control path — which does hold the scheduler
+                    // effect — is what publishes a started retry.
+                    scheduler_started: false,
                 },
             })
         }

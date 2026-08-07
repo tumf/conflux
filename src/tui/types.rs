@@ -91,11 +91,10 @@ impl AppExecutionMode {
 
     /// Canonical `app_mode` token shared with the Web/API surface.
     ///
-    /// Production reads this vocabulary in the other direction — the monitoring
-    /// snapshot carries the token and `OperatorMode::from_app_mode` resolves it —
-    /// so this side exists to pin that the TUI's execution axis and the canonical
-    /// token set stay the same execution-only vocabulary.
-    #[cfg(test)]
+    /// The monitoring snapshot carries the token in the other direction and
+    /// `OperatorMode::from_app_mode` resolves it, so this side is what lets the
+    /// TUI evaluate a shared mode rule — the persistent-idle guard, for one —
+    /// against exactly the vocabulary `/api/v2` evaluates it against.
     pub fn app_mode_token(self) -> &'static str {
         match self {
             AppExecutionMode::Select => "select",

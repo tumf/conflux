@@ -279,8 +279,9 @@ fn projected_snapshot_has_no_wall_clock_field() {
     assert!(!object.contains_key("timestamp"));
     assert_eq!(
         object.keys().collect::<Vec<_>>().len(),
-        6,
-        "snapshot fields: app_mode, is_resolving, process_error, parallel, changes, totals"
+        7,
+        "snapshot fields: app_mode, persistent_scheduler_idle, is_resolving, \
+         process_error, parallel, changes, totals"
     );
 }
 

@@ -523,6 +523,7 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
 
     InstanceSnapshot {
         app_mode: source.app_mode.clone(),
+        persistent_scheduler_idle: source.persistent_scheduler_idle,
         is_resolving: source.is_resolving,
         process_error: source.process_error.clone(),
         parallel: source.parallel.clone(),
@@ -1122,6 +1123,10 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
         E::Stopping => ("stopping", None, json!({})),
         E::Stopped => ("stopped", None, json!({})),
         E::AllCompleted => ("all_completed", None, json!({})),
+        // Stable vocabulary note for controllers: this is *not* a terminal
+        // event. The scheduler is alive and waiting; the snapshot at this
+        // revision reports `app_mode: select` with `persistent_scheduler_idle`.
+        E::PersistentSchedulerIdle => ("persistent_scheduler_idle", None, json!({})),
         E::Error { message } => ("process_error", None, json!({ "detail": detail(message) })),
         E::Log(entry) => ("log", entry.change_id.clone(), json!({})),
         E::ChangesRefreshed {
@@ -1218,9 +1223,11 @@ fn describe_operator_effect(effect: &crate::events::OperatorCommandEffect) -> se
         Effect::RunDispatched {
             change_ids,
             explicit_retry,
+            scheduler_started,
         } => {
             object.insert("change_ids".to_string(), json!(change_ids));
             object.insert("explicit_retry".to_string(), json!(explicit_retry));
+            object.insert("scheduler_started".to_string(), json!(scheduler_started));
         }
         Effect::StopCancelled => {}
         Effect::ForceStopAwaitingBoundary { force_stop } => {

@@ -1578,6 +1578,12 @@ impl ParallelExecutor {
         )
         .await;
 
+        // Admitted work has begun, so any persistent-idle episode this run was
+        // presenting is over: the next park is a new idle edge that must emit
+        // again. Paired with the event above rather than with the wake that led
+        // here, because a wake that admitted nothing must leave Ready standing.
+        self.rearm_persistent_idle();
+
         let force_recreate = self.force_recreate_worktree.remove(&change_id);
         if force_recreate {
             info!(

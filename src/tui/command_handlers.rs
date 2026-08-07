@@ -360,6 +360,10 @@ fn describe_start(retry: RetryContext) -> impl FnOnce(ApplicationResult) -> Comm
             scheduler,
             ..
         })) => {
+            // Wording only. Which of the two run projections the frontends apply
+            // — Running, or queued behind a scheduler that was merely woken — is
+            // carried by the authoritative `RunDispatched` effect, so a keypress
+            // and an `/api/v2` command cannot disagree about it.
             let verb = match scheduler {
                 SchedulerEffect::Started => "Starting",
                 _ => "Queued for the running scheduler:",
@@ -633,6 +637,10 @@ pub async fn handle_tui_command(
             });
         }
         TuiCommand::CancelStop => {
+            // Withdrawing a stop restores where the stop came from, and where
+            // that is — Running, or the persistent-idle Ready the stop was
+            // requested from — is decided once inside the dispatch boundary and
+            // projected onto every frontend from the accepted outcome.
             submit(ctx, OperatorIntent::CancelStop, |result| {
                 match result.outcome {
                     Ok(ApplicationOutcome::Run(RunControlOutcome::StopCancelled)) => {
@@ -1254,8 +1262,12 @@ mod tests {
         pub(super) async fn run(&self, app: &mut AppState, command: TuiCommand) {
             // The arranged frontend mode *is* the arranged process mode: the two
             // are one value in production, so a test that arranges only one of
-            // them would be exercising a state the process cannot be in.
+            // them would be exercising a state the process cannot be in. That
+            // includes the idle-episode qualifier — `Select` over a live parked
+            // scheduler and `Select` before any run admit different commands.
             self.core_mode.set(app.operator_mode());
+            self.core_mode
+                .set_persistent_idle(app.persistent_scheduler_idle);
 
             let mut ctx = self.context(app);
             handle_tui_command(command, &mut ctx, &self.state)
@@ -2607,16 +2619,18 @@ mod tests {
 
         assert_eq!(app.execution_mode, AppExecutionMode::Stopping);
         assert_eq!(app.stop_mode, StopMode::GracefulPending);
+        // The wake follows the request: a scheduler already parked in its
+        // event-driven idle wait has no timer to notice the flag on its own.
         assert_eq!(
             harness.scheduler.calls(),
-            vec![SchedulerCall::GracefulStop(true)]
+            vec![SchedulerCall::GracefulStop(true), SchedulerCall::Notified]
         );
 
         // A second stop in Stopping mode is refused without a further effect.
         harness.run(&mut app, TuiCommand::Stop).await;
         assert_eq!(
             harness.scheduler.calls(),
-            vec![SchedulerCall::GracefulStop(true)]
+            vec![SchedulerCall::GracefulStop(true), SchedulerCall::Notified]
         );
         assert!(app
             .warning_message

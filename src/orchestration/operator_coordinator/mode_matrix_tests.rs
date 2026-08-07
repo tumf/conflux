@@ -341,6 +341,7 @@ async fn accepted_operator_command_mode_matrix_outcome_event_reapplies_no_reduce
             effect: crate::events::OperatorCommandEffect::RunDispatched {
                 change_ids: vec!["c1".to_string()],
                 explicit_retry: false,
+                scheduler_started: true,
             },
         })
         .await;

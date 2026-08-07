@@ -160,6 +160,7 @@ pub(crate) fn harness_with_projection(
 pub(crate) fn snapshot_with(change_id: &str, display_status: &str) -> InstanceSnapshot {
     InstanceSnapshot {
         app_mode: "running".to_string(),
+        persistent_scheduler_idle: false,
         is_resolving: false,
         process_error: None,
         parallel: ParallelRuntimeState::default(),

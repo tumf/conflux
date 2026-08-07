@@ -430,6 +430,15 @@ pub enum OperatorCommandEffect {
         change_ids: Vec<String>,
         /// True when the run consumes reconciled holds instead of rerunning apply.
         explicit_retry: bool,
+        /// True only when a new scheduler run was actually spawned.
+        ///
+        /// False means a scheduler that was already alive — including one parked
+        /// in persistent-idle Ready — was merely woken. The queue intent is real
+        /// either way, but nothing has been admitted for execution yet, so a
+        /// frontend must not project Running off a wake. Carrying the fact here
+        /// rather than letting each frontend re-derive it from its own cache is
+        /// what keeps the TUI and `/api/v2` reporting the same run identically.
+        scheduler_started: bool,
     },
     /// A pending graceful stop was withdrawn.
     StopCancelled,
@@ -503,8 +512,12 @@ pub enum ExecutionEvent {
     ///
     /// Consumed, not synthesized: a frontend must never fabricate this to signal
     /// that a command was accepted, because it would set a current change and
-    /// activity before the scheduler actually started that target. Core mode and
-    /// every projection still classify it, so a real producer needs no new wiring.
+    /// activity before the scheduler actually started that target. The TUI's
+    /// cancel-stop projection likewise stopped borrowing it as a "return to
+    /// running" signal, so no production path emits it today. Core mode and every
+    /// projection still classify and reduce it, so the reducer contract stays
+    /// intact and a real producer needs no new wiring; dead-code analysis just
+    /// sees no constructor.
     #[allow(dead_code)]
     ProcessingStarted(String),
     /// Error occurred for a change
@@ -831,6 +844,15 @@ pub enum ExecutionEvent {
     Stopped,
     /// All processing completed
     AllCompleted,
+    /// A persistent scheduler parked with no executable work.
+    ///
+    /// Emitted once per continuous idle episode, immediately before the
+    /// scheduler enters its existing event-driven idle wait. It is a
+    /// process-level presentation transition, not a completion: the scheduler
+    /// stays alive, command-addressable, and resumable through its existing wake
+    /// sources, so this event deliberately carries no change ID, no outcome, and
+    /// no success claim.
+    PersistentSchedulerIdle,
     /// Error during execution
     Error { message: String },
     /// Changes list refreshed
@@ -962,6 +984,11 @@ pub fn classify_event(event: &ExecutionEvent) -> (&'static str, EventOwnership) 
         E::Stopping => ("Stopping", State),
         E::Stopped => ("Stopped", State),
         E::AllCompleted => ("AllCompleted", State),
+        // State-owning even though the reducer applies no workflow mutation for
+        // it: frontend `app_mode` and the operator snapshot's
+        // `persistent_scheduler_idle` field both change at this dispatch, so it
+        // owns one coherent revision like every other process-level mode event.
+        E::PersistentSchedulerIdle => ("PersistentSchedulerIdle", State),
         E::Error { .. } => ("Error", State),
         E::ChangesRefreshed { .. } => ("ChangesRefreshed", State),
         E::WorktreesRefreshed { .. } => ("WorktreesRefreshed", State),
@@ -1025,6 +1052,55 @@ pub const RETAINED_TERMINAL_MODES: [&str; 2] = ["error", "stopped"];
 /// through here so they cannot disagree about the same run.
 pub fn all_completed_may_overwrite_mode(current_mode: &str) -> bool {
     !RETAINED_TERMINAL_MODES.contains(&current_mode)
+}
+
+/// The one frontend mode a persistent-idle transition is allowed to leave.
+pub const PERSISTENT_IDLE_SOURCE_MODE: &str = "running";
+
+/// Whether a persistent-idle transition may project Ready over `current_mode`.
+///
+/// Only an actively running frontend becomes Ready. Pre-run `select` is already
+/// Ready and owns no idle episode; `stopping` describes an operator request that
+/// is still pending; `stopped` and `error` are authoritative terminal modes. A
+/// late idle event delivered in any of those must leave both the mode and the
+/// idle-episode fact exactly as they are, or a frontend would advertise
+/// live-scheduler controls for a run that already ended.
+///
+/// TUI and the `/api/v2` projection route the decision through here so they
+/// cannot disagree about the same dispatch.
+pub fn persistent_idle_may_project_ready(current_mode: &str) -> bool {
+    current_mode == PERSISTENT_IDLE_SOURCE_MODE
+}
+
+/// Whether this event is typed evidence that admitted work actually started.
+///
+/// This is the shared "the idle episode is over" trigger: it names the
+/// state-owning events a scheduler emits only after work has crossed an
+/// execution boundary — ordinary workspace preparation, the operation agents,
+/// and scheduler-owned resolve/rejection/base-lane work.
+///
+/// Deliberately excluded: `AnalysisStarted`, queue notification, catalog
+/// refresh, and a bare Start notification. None of them proves anything is
+/// executing, so none of them may take a frontend out of persistent-idle Ready.
+pub fn is_admitted_work_start(event: &ExecutionEvent) -> bool {
+    use ExecutionEvent as E;
+
+    match event {
+        E::ProcessingStarted(_)
+        | E::WorkspacePreparationStarted { .. }
+        | E::ApplyStarted { .. }
+        | E::AcceptanceStarted { .. }
+        | E::ArchiveStarted { .. }
+        | E::ArchiveResumed { .. }
+        | E::ResolveStarted { .. }
+        | E::PushStarted { .. } => true,
+        // The scheduler-owned rejection-review lane has no start event of its
+        // own: it announces itself by moving the workspace into an active
+        // status. A wait status published by the same event is the opposite
+        // evidence, so the active predicate — not the variant — decides.
+        E::WorkspaceStatusUpdated { status, .. } => status.is_active(),
+        _ => false,
+    }
 }
 
 /// One authoritative dispatch of an execution event.
@@ -1388,6 +1464,12 @@ pub fn lifecycle_event_for_execution_event(
         // Nothing is executing anymore.
         ExecutionEvent::AllCompleted | ExecutionEvent::Stopped => (LifecycleState::Idle, None),
 
+        // `PersistentSchedulerIdle` is deliberately absent: the variant alone
+        // carries no lifecycle meaning. Only its *accepted* Running-to-Ready
+        // transition is idle, and that decision belongs to
+        // [`LifecycleModeMirror`], which is what stops a late idle event from
+        // reporting `idle` over a stopping, stopped, or failed run.
+
         // Every other event is progress detail without semantic lifecycle meaning.
         _ => return None,
     };
@@ -1398,6 +1480,78 @@ pub fn lifecycle_event_for_execution_event(
     })
 }
 
+/// The app-mode token a fresh process starts in.
+const INITIAL_APP_MODE: &str = "select";
+
+/// Process-local mirror of frontend execution mode for the dispatch lifecycle
+/// projection.
+///
+/// The authoritative dispatch has no frontend to ask which mode an idle event
+/// arrived in, so it derives the same answer TUI and Web derive, from the same
+/// ordered events, through the same shared guard
+/// ([`persistent_idle_may_project_ready`]). It is observation state only: it
+/// never authorizes a command and never reaches the reducer.
+#[derive(Debug, Clone)]
+pub struct LifecycleModeMirror {
+    mode: String,
+}
+
+impl Default for LifecycleModeMirror {
+    fn default() -> Self {
+        Self {
+            mode: INITIAL_APP_MODE.to_string(),
+        }
+    }
+}
+
+impl LifecycleModeMirror {
+    /// The mirrored app-mode token.
+    ///
+    /// Production reads the mirror only through [`Self::absorb`]'s accept/reject
+    /// answer; this accessor exists so the tests can pin the intermediate modes
+    /// that answer is derived from.
+    #[cfg(test)]
+    pub fn app_mode(&self) -> &str {
+        &self.mode
+    }
+
+    /// Absorb one event, reporting whether it performed the guarded
+    /// Running-to-Ready persistent-idle transition.
+    ///
+    /// `true` is the *only* thing that authorizes an `idle` lifecycle
+    /// publication for a persistent scheduler: a late or duplicate idle event
+    /// leaves the mirrored mode untouched and reports `false`.
+    pub fn absorb(&mut self, event: &ExecutionEvent) -> bool {
+        match event {
+            ExecutionEvent::PersistentSchedulerIdle => {
+                if !persistent_idle_may_project_ready(&self.mode) {
+                    return false;
+                }
+                self.mode = INITIAL_APP_MODE.to_string();
+                return true;
+            }
+            ExecutionEvent::Stopping => self.mode = "stopping".to_string(),
+            // Both mean "this run is no longer executing"; the guard treats them
+            // the same, so they share one token rather than inviting a second
+            // terminal vocabulary here.
+            ExecutionEvent::Stopped | ExecutionEvent::AllCompleted => {
+                self.mode = "stopped".to_string()
+            }
+            ExecutionEvent::Error { .. } | ExecutionEvent::ProcessingError { .. } => {
+                self.mode = "error".to_string()
+            }
+            // A pending graceful stop outranks work that started after it was
+            // requested: the operator's stop is still owed. Every other mode
+            // yields to typed evidence that something is really executing.
+            event if is_admitted_work_start(event) && self.mode != "stopping" => {
+                self.mode = "running".to_string()
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
 /// `EventSink` adapter that projects orchestration events onto an external
 /// lifecycle adapter.
 ///
@@ -1406,6 +1560,8 @@ pub fn lifecycle_event_for_execution_event(
 pub struct LifecycleEventSink {
     handle: crate::lifecycle_integration::LifecycleHandle,
     workspace: Option<String>,
+    /// Execution-mode mirror backing the guarded persistent-idle projection.
+    mode: std::sync::Mutex<LifecycleModeMirror>,
 }
 
 impl LifecycleEventSink {
@@ -1414,13 +1570,37 @@ impl LifecycleEventSink {
         handle: crate::lifecycle_integration::LifecycleHandle,
         workspace: Option<String>,
     ) -> Self {
-        Self { handle, workspace }
+        Self {
+            handle,
+            workspace,
+            mode: std::sync::Mutex::new(LifecycleModeMirror::default()),
+        }
     }
 }
 
 #[async_trait]
 impl EventSink for LifecycleEventSink {
     async fn on_event(&self, event: &ExecutionEvent) {
+        // The mirror sees every event, so its answer for the next persistent-idle
+        // dispatch is derived from the same ordered stream the frontends read.
+        let accepted_persistent_idle = self
+            .mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .absorb(event);
+
+        if accepted_persistent_idle {
+            use crate::lifecycle_integration::{LifecycleEvent, LifecycleState};
+            self.handle.publish(LifecycleEvent::StateChanged {
+                state: LifecycleState::Idle,
+                context: crate::lifecycle_integration::LifecycleContext {
+                    workspace: self.workspace.clone(),
+                    ..Default::default()
+                },
+            });
+            return;
+        }
+
         if let Some(lifecycle_event) =
             lifecycle_event_for_execution_event(event, self.workspace.as_deref())
         {
@@ -1745,6 +1925,7 @@ pub(crate) mod ownership_fixtures {
             E::Stopping,
             E::Stopped,
             E::AllCompleted,
+            E::PersistentSchedulerIdle,
             E::Error {
                 message: "process boom".to_string(),
             },
@@ -1797,7 +1978,7 @@ mod ownership_tests {
     /// `classify_event` at compile time; this constant then forces the fixture
     /// table — and therefore every ownership and projection assertion below —
     /// to grow with it instead of silently skipping the new variant.
-    const EXECUTION_EVENT_VARIANTS: usize = 70;
+    const EXECUTION_EVENT_VARIANTS: usize = 71;
 
     #[test]
     fn ownership_table_names_every_variant_exactly_once() {
@@ -2345,6 +2526,189 @@ mod lifecycle_bridge_tests {
         // Must not panic and must remain a no-op.
         sink.on_event(&ExecutionEvent::ProcessingStarted("change-a".to_string()))
             .await;
+    }
+
+    /// The idle event carries no unconditional lifecycle meaning of its own:
+    /// only its accepted Running-to-Ready transition is `idle`.
+    #[test]
+    fn persistent_idle_event_alone_projects_no_lifecycle_state() {
+        assert_eq!(state_of(&ExecutionEvent::PersistentSchedulerIdle), None);
+    }
+
+    /// Only an admitted-work start begins a run for the mirror; a Start
+    /// notification, a queue notification, analysis, and a refresh do not.
+    #[test]
+    fn only_admitted_work_events_are_execution_evidence() {
+        for event in [
+            ExecutionEvent::WorkspacePreparationStarted {
+                change_id: "change-a".to_string(),
+            },
+            ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply".to_string(),
+            },
+            ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "resolve".to_string(),
+            },
+            ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: "change-a".to_string(),
+                workspace_name: "ws".to_string(),
+                status: crate::vcs::WorkspaceStatus::Rejecting,
+            },
+        ] {
+            assert!(
+                is_admitted_work_start(&event),
+                "{} must be admitted-work evidence",
+                event_variant_name(&event)
+            );
+        }
+
+        for event in [
+            ExecutionEvent::AnalysisStarted {
+                remaining_changes: 2,
+                attempt_id: "a1".to_string(),
+            },
+            ExecutionEvent::WorktreesRefreshed { worktrees: vec![] },
+            ExecutionEvent::Log(LogEntry::info("queued for the running scheduler")),
+            // A workspace that just entered a wait is the opposite of a start.
+            ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: "change-a".to_string(),
+                workspace_name: "ws".to_string(),
+                status: crate::vcs::WorkspaceStatus::MergeWait,
+            },
+        ] {
+            assert!(
+                !is_admitted_work_start(&event),
+                "{} must not claim execution started",
+                event_variant_name(&event)
+            );
+        }
+    }
+
+    /// Verification `persistent-idle-ready-regressions`: the authoritative
+    /// dispatch publishes `idle` for a persistent scheduler that parked, and
+    /// only when its guarded Running-to-Ready transition was accepted.
+    #[tokio::test]
+    async fn persistent_idle_lifecycle_is_idle() {
+        // An accepted transition out of a working run publishes exactly one idle.
+        let (dispatcher, sink) = mock_sink();
+        sink.on_event(&ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "change-a".to_string(),
+        })
+        .await;
+        sink.on_event(&ExecutionEvent::PersistentSchedulerIdle)
+            .await;
+        assert_eq!(
+            dispatcher.states(),
+            vec![LifecycleState::Working, LifecycleState::Idle],
+            "a parked persistent scheduler must report idle"
+        );
+
+        // The idle context is process-level: no change is executing, so none is
+        // attributed.
+        match dispatcher.published().last().expect("an idle event") {
+            LifecycleEvent::StateChanged { context, .. } => {
+                assert_eq!(context.workspace.as_deref(), Some("/repo"));
+                assert_eq!(context.change_id, None);
+            }
+            other => panic!("unexpected projection: {other:?}"),
+        }
+
+        // A duplicate idle edge and a no-op wake publish nothing further.
+        sink.on_event(&ExecutionEvent::PersistentSchedulerIdle)
+            .await;
+        sink.on_event(&ExecutionEvent::AnalysisStarted {
+            remaining_changes: 1,
+            attempt_id: "attempt-1".to_string(),
+        })
+        .await;
+        sink.on_event(&ExecutionEvent::PersistentSchedulerIdle)
+            .await;
+        assert_eq!(
+            dispatcher.states(),
+            vec![LifecycleState::Working, LifecycleState::Idle],
+            "a duplicate idle edge or a no-op wake must not publish again"
+        );
+
+        // Admitted work ends the episode and reports working again.
+        sink.on_event(&ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "change-b".to_string(),
+        })
+        .await;
+        assert_eq!(
+            dispatcher.states(),
+            vec![
+                LifecycleState::Working,
+                LifecycleState::Idle,
+                LifecycleState::Working
+            ],
+            "admitted work after idle must report working"
+        );
+
+        // A late event against every retained mode publishes no idle transition.
+        for terminal in [
+            ExecutionEvent::Stopping,
+            ExecutionEvent::Stopped,
+            ExecutionEvent::Error {
+                message: "boom".to_string(),
+            },
+        ] {
+            let (dispatcher, sink) = mock_sink();
+            sink.on_event(&ExecutionEvent::WorkspacePreparationStarted {
+                change_id: "change-a".to_string(),
+            })
+            .await;
+            sink.on_event(&terminal).await;
+            let before = dispatcher.states();
+            sink.on_event(&ExecutionEvent::PersistentSchedulerIdle)
+                .await;
+            assert_eq!(
+                dispatcher.states(),
+                before,
+                "a late idle event must not overwrite {}",
+                event_variant_name(&terminal)
+            );
+        }
+
+        // Pre-run Select is already Ready and owns no episode, so a late idle
+        // event against a process that never ran publishes nothing either.
+        let (dispatcher, sink) = mock_sink();
+        sink.on_event(&ExecutionEvent::PersistentSchedulerIdle)
+            .await;
+        assert!(
+            dispatcher.states().is_empty(),
+            "an idle event observed in pre-run Select must publish nothing"
+        );
+    }
+
+    /// The mirror's own token is the shared `app_mode` vocabulary, so its answer
+    /// is comparable with the one TUI and `/api/v2` evaluate.
+    #[test]
+    fn lifecycle_mode_mirror_tracks_the_shared_app_mode_vocabulary() {
+        let mut mirror = LifecycleModeMirror::default();
+        assert_eq!(mirror.app_mode(), "select");
+
+        assert!(
+            !mirror.absorb(&ExecutionEvent::WorkspacePreparationStarted {
+                change_id: "change-a".to_string(),
+            })
+        );
+        assert_eq!(mirror.app_mode(), "running");
+
+        assert!(mirror.absorb(&ExecutionEvent::PersistentSchedulerIdle));
+        assert_eq!(mirror.app_mode(), "select");
+
+        // A stop requested from idle Ready leaves Stopping, and work starting
+        // under a pending stop does not withdraw it.
+        assert!(!mirror.absorb(&ExecutionEvent::Stopping));
+        assert_eq!(mirror.app_mode(), "stopping");
+        assert!(
+            !mirror.absorb(&ExecutionEvent::WorkspacePreparationStarted {
+                change_id: "change-a".to_string(),
+            })
+        );
+        assert_eq!(mirror.app_mode(), "stopping");
     }
 }
 
