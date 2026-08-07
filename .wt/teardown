@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+worktree_root="$(pwd -P)"
+base_root="$(cd "${ROOT_WORKTREE_PATH}" && pwd -P)"
+
+if [ "${worktree_root}" = "${base_root}" ]; then
+  echo "Refusing to tear down the root worktree" 1>&2
+  exit 1
+fi
+
+rm -rf -- "${worktree_root}/target"
+rm -f -- "${worktree_root}/.cargo/config.toml" "${worktree_root}/.setup-completed"
+rmdir "${worktree_root}/.cargo" 2>/dev/null || true
