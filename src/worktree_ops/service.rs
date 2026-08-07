@@ -137,6 +137,14 @@ pub struct WorktreeFacts {
     pub dirty: DirtyState,
     /// Whether the base repository is sitting on an unresolved merge.
     pub base_merge_in_progress: SafetyFact,
+    /// Whether [`Self::has_commits_ahead`] and [`Self::conflict_files`] rest on
+    /// an inspection at all.
+    ///
+    /// An empty conflict list means "the simulation found nothing" only when
+    /// something was simulated. Periodic refresh deliberately skips worktrees
+    /// that back no current change, so this is what stops a skipped row from
+    /// being read as a clean, mergeable one.
+    pub inspection: crate::worktree_ops::InspectionState,
 }
 
 impl WorktreeFacts {
@@ -155,6 +163,7 @@ impl WorktreeFacts {
             conflict_files: Vec::new(),
             dirty: DirtyState::Clean,
             base_merge_in_progress: SafetyFact::No,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         }
     }
 }
@@ -681,6 +690,16 @@ pub fn classify_merge_eligibility(
             "a detached worktree has no branch to merge".to_string(),
         ));
     }
+    // An uninspected observation has no conflict evidence and no ahead evidence,
+    // only the *absence* of both. Refusing here — rather than falling through to
+    // the checks below — is what keeps "nobody looked" from being reported as
+    // "there is nothing to merge".
+    if !facts.inspection.is_inspected() {
+        return Err(WorktreeOpError::Ineligible(
+            "the worktree has not been inspected against base; a fresh inspection is required"
+                .to_string(),
+        ));
+    }
     // A pre-detected conflict refuses up front only when the caller would abort
     // anyway. The preserving caller runs the merge so the evidence it promises
     // its clients actually exists in the repository.
@@ -689,10 +708,21 @@ pub fn classify_merge_eligibility(
             "the worktree conflicts with base".to_string(),
         ));
     }
-    if !facts.has_commits_ahead.is_known_yes() {
-        return Err(WorktreeOpError::Ineligible(
-            "the worktree has no commits ahead of base".to_string(),
-        ));
+    match facts.has_commits_ahead {
+        SafetyFact::Yes => {}
+        SafetyFact::No => {
+            return Err(WorktreeOpError::Ineligible(
+                "the worktree has no commits ahead of base".to_string(),
+            ))
+        }
+        // The inspection ran and could not answer. That is not the same refusal
+        // as a confident "nothing to merge", and reporting it as one would send
+        // an operator looking for commits that may well exist.
+        SafetyFact::Unknown => {
+            return Err(WorktreeOpError::Ineligible(
+                "the worktree's commits-ahead state could not be determined".to_string(),
+            ))
+        }
     }
     Ok(())
 }
@@ -710,19 +740,7 @@ pub fn worktree_path_for_change(workspace_base_dir: &Path, change_id: &str) -> P
     workspace_base_dir.join(branch_name_for_change(change_id))
 }
 
-/// True when two paths name the same worktree.
-///
-/// Git reports canonical paths, while a server-derived path is whatever the
-/// configured workspace root produced. On platforms with symlinked temp or home
-/// directories those differ textually for the same directory, so a plain `==`
-/// would report a freshly created worktree as unobservable.
-fn same_path(a: &Path, b: &Path) -> bool {
-    a == b
-        || matches!(
-            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-            (Ok(a), Ok(b)) if a == b
-        )
-}
+use super::same_path;
 
 // ============================================================================
 // Boundaries
@@ -744,7 +762,15 @@ pub enum MergeAttempt {
 #[async_trait]
 pub trait WorktreeBackend: Send + Sync {
     /// Observe every current worktree, including dirty and conflict facts.
-    async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>>;
+    ///
+    /// `request` never decides *which* worktrees are reported — every
+    /// registered one always is. It decides how much Git work each row is worth
+    /// and whether an unchanged earlier answer may be reused; see
+    /// [`crate::worktree_ops::inspection`].
+    async fn observe(
+        &self,
+        request: crate::worktree_ops::ObservationRequest,
+    ) -> WorktreeOpResult<Vec<WorktreeFacts>>;
     /// Current managed base HEAD. Clients never choose a base commit.
     async fn base_head(&self) -> WorktreeOpResult<String>;
     /// Create a worktree at `path` on a new `branch` from `base_commit`.
@@ -890,8 +916,15 @@ impl WorktreeService {
     }
 
     /// Current worktree observations. Read-only; takes no mutation guard.
+    ///
+    /// This is a listing, so it runs under the same periodic policy the TUI and
+    /// Web/UDS refreshes use: a client polling `/api/v2/worktrees` must not be
+    /// able to buy an unbounded merge simulation for a stale worktree that
+    /// periodic refresh already declined to inspect.
     pub async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
-        self.backend.observe().await
+        self.backend
+            .observe(crate::worktree_ops::ObservationRequest::Periodic)
+            .await
     }
 
     /// Create the managed worktree for an eligible change.
@@ -906,7 +939,12 @@ impl WorktreeService {
         let branch = branch_name_for_change(change_id);
         let path = worktree_path_for_change(&self.workspace_base_dir, change_id);
 
-        let observed = self.backend.observe().await?;
+        // Existence is a structural question, so this observation buys no
+        // ahead/conflict inspection for any worktree.
+        let observed = self
+            .backend
+            .observe(crate::worktree_ops::ObservationRequest::Listing)
+            .await?;
         if observed
             .iter()
             .any(|facts| facts.branch == branch || same_path(&facts.path, &path))
@@ -929,7 +967,9 @@ impl WorktreeService {
         // Identity is only meaningful once the resource actually exists, so it is
         // read back from a fresh observation rather than predicted.
         self.backend
-            .observe()
+            .observe(crate::worktree_ops::ObservationRequest::Target(
+                path.clone(),
+            ))
             .await?
             .into_iter()
             .find(|facts| same_path(&facts.path, &path))
@@ -1273,9 +1313,18 @@ impl WorktreeService {
         })
     }
 
+    /// Observe one operator-addressed worktree from current repository evidence.
+    ///
+    /// Every mutation entry point goes through here, and it always asks for a
+    /// *targeted* observation: periodic refresh may have skipped this worktree,
+    /// and may have skipped it for a reason that has nothing to do with whether
+    /// an operator may act on it. Filtering decides what a refresh spends, never
+    /// what an operator is allowed to do.
     async fn locate(&self, path: &Path) -> WorktreeOpResult<WorktreeFacts> {
         self.backend
-            .observe()
+            .observe(crate::worktree_ops::ObservationRequest::Target(
+                path.to_path_buf(),
+            ))
             .await?
             .into_iter()
             .find(|facts| same_path(&facts.path, path))

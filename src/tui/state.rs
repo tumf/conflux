@@ -2067,7 +2067,7 @@ impl AppState {
 // Guard Logic
 // ============================================================================
 
-mod guards {
+pub(crate) mod guards {
     use super::{ChangeState, ParallelEligibility, TuiCommand, ViewMode, WorktreeInfo};
     use crate::orchestration::operator_command::{classify_mark_route, MarkRoute, OperatorMode};
 
@@ -2133,6 +2133,27 @@ mod guards {
             return MergeGuardResult::Blocked("Cannot merge detached HEAD".to_string());
         }
 
+        // Branch name must not be empty
+        if worktree.branch.is_empty() {
+            return MergeGuardResult::Blocked("Cannot merge: no branch name".to_string());
+        }
+
+        // Cannot merge if already merging
+        if worktree.is_merging {
+            return MergeGuardResult::Blocked(
+                "Cannot merge: merge already in progress".to_string(),
+            );
+        }
+
+        // A row periodic refresh skipped carries no ahead/conflict evidence, so
+        // there is nothing here to refuse *on*. Blocking it would make the
+        // filtering permanently unmergeable; instead the request goes through
+        // and the shared service decides from its own fresh targeted
+        // observation of this exact worktree.
+        if !worktree.inspection.is_inspected() {
+            return MergeGuardResult::Allowed;
+        }
+
         // Cannot merge if conflicts detected
         if worktree.has_merge_conflict() {
             return MergeGuardResult::Blocked(format!(
@@ -2141,23 +2162,10 @@ mod guards {
             ));
         }
 
-        // Branch name must not be empty
-        if worktree.branch.is_empty() {
-            return MergeGuardResult::Blocked("Cannot merge: no branch name".to_string());
-        }
-
         // Cannot merge if no commits ahead of base branch
         if !worktree.has_commits_ahead {
             return MergeGuardResult::Blocked(
                 "Cannot merge: no commits ahead of base branch".to_string(),
-            );
-        }
-
-        // Cannot merge if already merging (redundant check after has_commits_ahead,
-        // but kept for explicit validation)
-        if worktree.is_merging {
-            return MergeGuardResult::Blocked(
-                "Cannot merge: merge already in progress".to_string(),
             );
         }
 
@@ -2546,6 +2554,7 @@ mod tests {
             merge_conflict: None,
             has_commits_ahead: true,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         }
     }
 

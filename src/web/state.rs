@@ -1374,13 +1374,27 @@ impl WebState {
     }
 
     pub async fn refresh_from_disk(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use crate::openspec;
-
         let repo_root =
             std::env::current_dir().map_err(|e| format!("Failed to resolve repo root: {}", e))?;
+        self.refresh_from_disk_at(&repo_root).await
+    }
+
+    /// The periodic Web/UDS repository refresh, against an explicit root.
+    ///
+    /// [`Self::refresh_from_disk`] is this with the process working directory as
+    /// the root. Taking the root as a parameter is what lets the refresh be
+    /// exercised against a real temporary repository without moving the process
+    /// working directory out from under everything else running in it.
+    pub async fn refresh_from_disk_at(
+        &self,
+        repo_root: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::openspec;
+
+        let repo_root = repo_root.to_path_buf();
 
         // Read changes from disk using native parser
-        let mut changes = openspec::list_changes_native()
+        let mut changes = openspec::list_changes_native_from(&repo_root)
             .map_err(|e| format!("Failed to refresh changes from disk: {}", e))?;
 
         // Enrich progress from worktrees (uncommitted tasks.md)
@@ -1417,8 +1431,15 @@ impl WebState {
             }
         }
 
-        // Retrieve worktrees for TUI/Web parity
-        let worktrees = match crate::worktree_ops::get_worktrees(&repo_root).await {
+        // Retrieve worktrees for TUI/Web parity. The request is the same one the
+        // TUI's periodic refresh uses, so both frontends share one eligibility
+        // policy and one revision-keyed observation cache.
+        let worktrees = match crate::worktree_ops::get_worktrees(
+            &repo_root,
+            crate::worktree_ops::ObservationRequest::Periodic,
+        )
+        .await
+        {
             Ok(wts) => wts,
             Err(e) => {
                 tracing::debug!("Failed to retrieve worktrees: {}", e);

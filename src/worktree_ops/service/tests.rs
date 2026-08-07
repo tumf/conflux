@@ -43,6 +43,12 @@ enum Call {
 struct FakeBackend {
     calls: Mutex<Vec<Call>>,
     observations: Mutex<Vec<Vec<WorktreeFacts>>>,
+    /// Why each `observe()` said it was being taken.
+    ///
+    /// Recorded separately from [`Call`] so the existing call-ordering
+    /// assertions keep comparing the sequence of operations, while the tests
+    /// that care about *cost* can assert the intent each observation carried.
+    observe_requests: Mutex<Vec<crate::worktree_ops::ObservationRequest>>,
     merge: Mutex<WorktreeOpResult<MergeAttempt>>,
     on_merged: Mutex<WorktreeOpResult<()>>,
     teardown: Mutex<WorktreeOpResult<()>>,
@@ -71,6 +77,7 @@ impl FakeBackend {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
             observations: Mutex::new(vec![facts]),
+            observe_requests: Mutex::new(Vec::new()),
             merge: Mutex::new(Ok(MergeAttempt::Merged)),
             on_merged: Mutex::new(Ok(())),
             teardown: Mutex::new(Ok(())),
@@ -93,6 +100,10 @@ impl FakeBackend {
         self.calls.lock().unwrap().clone()
     }
 
+    fn observe_requests(&self) -> Vec<crate::worktree_ops::ObservationRequest> {
+        self.observe_requests.lock().unwrap().clone()
+    }
+
     fn record(&self, call: Call) {
         self.calls.lock().unwrap().push(call);
     }
@@ -113,8 +124,12 @@ impl FakeBackend {
 
 #[async_trait]
 impl WorktreeBackend for FakeBackend {
-    async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
+    async fn observe(
+        &self,
+        request: crate::worktree_ops::ObservationRequest,
+    ) -> WorktreeOpResult<Vec<WorktreeFacts>> {
         self.record(Call::Observe);
+        self.observe_requests.lock().unwrap().push(request);
         let mut script = self.observations.lock().unwrap();
         if script.len() > 1 {
             Ok(script.remove(0))
@@ -629,6 +644,138 @@ fn remote_worktree_merge_requires_a_branch_and_commits_ahead() {
         classify_merge_eligibility(&behind, ConflictPolicy::PreserveConflict),
         Err(WorktreeOpError::Ineligible(_))
     ));
+}
+
+#[test]
+fn an_uninspected_worktree_is_refused_for_inspection_not_for_being_behind() {
+    // What periodic refresh skipped looks exactly like a clean, not-ahead
+    // worktree: no conflict files, no commits ahead. The refusal must say which
+    // of the two it is, because "there is nothing to merge" sends an operator
+    // away and "nobody looked yet" does not.
+    let mut skipped = managed("/w/a", "a");
+    skipped.inspection = crate::worktree_ops::InspectionState::NotInspected;
+    skipped.has_commits_ahead = SafetyFact::Unknown;
+
+    let Err(WorktreeOpError::Ineligible(message)) =
+        classify_merge_eligibility(&skipped, ConflictPolicy::PreserveConflict)
+    else {
+        panic!("an uninspected worktree must not be merge-eligible");
+    };
+    assert!(
+        message.contains("not been inspected"),
+        "the refusal must name the missing inspection, got: {message}"
+    );
+    assert!(
+        !message.contains("no commits ahead"),
+        "an uninspected worktree must not be reported as having nothing to merge: {message}"
+    );
+
+    // Once it *is* inspected, an unobservable ahead state is still not the same
+    // refusal as a confident "behind".
+    let mut unobservable = managed("/w/a", "a");
+    unobservable.has_commits_ahead = SafetyFact::Unknown;
+    let Err(WorktreeOpError::Ineligible(message)) =
+        classify_merge_eligibility(&unobservable, ConflictPolicy::PreserveConflict)
+    else {
+        panic!("an unobservable ahead state must fail closed");
+    };
+    assert!(
+        message.contains("could not be determined"),
+        "an inspected-but-unanswerable state has its own refusal, got: {message}"
+    );
+
+    // And an inspected, ahead worktree still merges.
+    let mut ready = managed("/w/a", "a");
+    ready.has_commits_ahead = SafetyFact::Yes;
+    assert!(classify_merge_eligibility(&ready, ConflictPolicy::PreserveConflict).is_ok());
+}
+
+#[tokio::test]
+async fn operator_merge_and_delete_both_observe_their_own_target_freshly() {
+    // Periodic filtering decides what a *refresh* spends, never what an
+    // operator may do. Every mutation entry point therefore asks for a
+    // targeted observation of the exact worktree it was pointed at, including
+    // one whose branch maps to no change at all.
+    let mut session = managed("/workspaces/ws-session-a1b2c3", "ws-session-a1b2c3");
+    session.has_commits_ahead = SafetyFact::Yes;
+
+    let backend = FakeBackend::stable(vec![session.clone()]);
+    let (service, _sink) = service(backend.clone());
+    service
+        .merge_worktree(&session.path, ConflictPolicy::AbortOnConflict)
+        .await
+        .expect("an unmapped branch is still mergeable on operator request");
+
+    assert_eq!(
+        backend.observe_requests(),
+        vec![crate::worktree_ops::ObservationRequest::Target(
+            session.path.clone()
+        )],
+        "merge must re-derive its own evidence for the addressed worktree"
+    );
+}
+
+#[tokio::test]
+async fn operator_deletion_observes_its_own_target_freshly() {
+    // Same contract as the merge above, across the teardown boundary: both
+    // observations name the worktree being deleted, so periodic filtering can
+    // never make a stale worktree undeletable.
+    let backend = FakeBackend::stable(vec![managed("/workspaces/stale", "stale")]);
+    let (deleting_service, _sink) = service(backend.clone());
+    let target = PathBuf::from("/workspaces/stale");
+
+    deleting_service
+        .delete_worktree(
+            &target,
+            &ExpectedTarget::on_branch("stale"),
+            DeleteOptions::fail_closed(),
+        )
+        .await
+        .expect("a stale worktree stays deletable");
+
+    let requests = backend.observe_requests();
+    assert!(
+        requests.len() >= 2
+            && requests.iter().all(|request| *request
+                == crate::worktree_ops::ObservationRequest::Target(target.clone())),
+        "every deletion observation must target the worktree being deleted, got {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_listing_never_buys_inspection_it_does_not_need() {
+    // Creation only asks whether a branch or path is already taken, which is
+    // structural. Paying for a merge simulation of every registered worktree to
+    // answer it is exactly the cost this change exists to stop.
+    let backend = FakeBackend::scripted(vec![vec![], vec![managed("/workspaces/c1", "c1")]]);
+    let (service, _sink) = service(backend.clone());
+
+    service.create_change_worktree("c1").await.expect("created");
+
+    assert_eq!(
+        backend.observe_requests(),
+        vec![
+            crate::worktree_ops::ObservationRequest::Listing,
+            crate::worktree_ops::ObservationRequest::Target(PathBuf::from("/workspaces/c1")),
+        ],
+        "existence is a structural question; only the created worktree is inspected"
+    );
+}
+
+#[test]
+fn an_uninspected_worktree_never_reads_as_conflict_free() {
+    // The abort-on-conflict policy refuses on a non-empty conflict list. An
+    // uninspected observation has an empty one for the opposite reason, so it
+    // must be refused before that check can mistake it for a clean merge.
+    let mut skipped = managed("/w/a", "a");
+    skipped.inspection = crate::worktree_ops::InspectionState::NotInspected;
+    skipped.has_commits_ahead = SafetyFact::Yes;
+    assert!(skipped.conflict_files.is_empty());
+
+    assert!(
+        classify_merge_eligibility(&skipped, ConflictPolicy::AbortOnConflict).is_err(),
+        "an empty conflict list nobody produced must not authorize a merge"
+    );
 }
 
 // ── Server-derived naming ────────────────────────────────────────────────────

@@ -3358,3 +3358,572 @@ mod tui_dirty_worktree_delete_tests {
         );
     }
 }
+
+// ── Stale worktree refresh (real Git worktrees / real command counts) ─────────
+//
+// These cases prove `harden-stale-worktree-refresh` against a real repository:
+// which worktrees a periodic refresh actually spawns Git commands for, that the
+// TUI and Web/UDS paths share one observation, that a revision change
+// invalidates it, that an operator can still act on a worktree periodic refresh
+// skipped, that merge diagnostics stay bounded, and that none of it touches the
+// working trees.
+//
+// Command counts come from the inspection recorder, which attributes every
+// spawned ahead/conflict command to the worktree it ran for. Each case filters
+// to its own temporary repository, so the assertions are about what this test
+// caused and nothing else.
+
+mod stale_refresh_support {
+    use std::path::{Path, PathBuf};
+
+    pub use super::upstream_integration_support::{
+        configure_identity, git, git_allow_failure, write_and_commit,
+    };
+
+    /// A repository whose worktrees live outside it, so a worktree directory is
+    /// never itself untracked content in the tree under observation.
+    pub struct RefreshFixture {
+        pub _dir: tempfile::TempDir,
+        pub repo: PathBuf,
+        pub worktrees: PathBuf,
+    }
+
+    impl RefreshFixture {
+        /// Register a secondary worktree on a new branch at the current base tip.
+        pub fn add_worktree(&self, branch: &str) -> PathBuf {
+            let path = self.worktrees.join(branch);
+            git(
+                &self.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            path
+        }
+
+        /// Declare an active OpenSpec change, committed on the base branch.
+        pub fn declare_change(&self, change_id: &str) {
+            write_and_commit(
+                &self.repo,
+                &format!("openspec/changes/{}/proposal.md", change_id),
+                "# change\n",
+                &format!("Declare {}", change_id),
+            );
+        }
+
+        /// Declare a change and mark it rejected, the state an operator reviews
+        /// a retained worktree in.
+        pub fn declare_rejected_change(&self, change_id: &str) {
+            self.declare_change(change_id);
+            write_and_commit(
+                &self.repo,
+                &format!("openspec/changes/{}/REJECTED.md", change_id),
+                "# REJECTED\n",
+                &format!("Reject {}", change_id),
+            );
+        }
+    }
+
+    /// Build the fixture, or `None` when git is unavailable.
+    pub fn refresh_fixture() -> Option<RefreshFixture> {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktrees = dir.path().join("worktrees");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&worktrees).unwrap();
+
+        if !git_allow_failure(&repo, &["init", "-b", "main"]) {
+            return None;
+        }
+        configure_identity(&repo);
+        // Unique content, so two fixtures built in the same second cannot mint
+        // the same commit id and therefore cannot share a cache key.
+        write_and_commit(
+            &repo,
+            "README.md",
+            &format!("# base {}\n", uuid_like()),
+            "Initial commit",
+        );
+
+        Some(RefreshFixture {
+            _dir: dir,
+            repo,
+            worktrees,
+        })
+    }
+
+    /// A per-fixture discriminator. Not cryptographic: it only has to make two
+    /// fixtures' initial commits differ.
+    pub fn uuid_like() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    /// `git status --porcelain=v1 -uall` plus the bytes of every file in the tree.
+    ///
+    /// Refresh is supposed to be non-mutating, and "the index still agrees" is
+    /// only half of that: a check that rewrote a file would leave status clean.
+    pub fn tree_snapshot(worktree: &Path) -> (String, Vec<(PathBuf, Vec<u8>)>) {
+        let status = git(worktree, &["status", "--porcelain=v1", "-uall"]);
+        let mut files = Vec::new();
+        collect_files(worktree, worktree, &mut files);
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        (status, files)
+    }
+
+    fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            if path.is_dir() {
+                collect_files(root, &path, out);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.push((path.strip_prefix(root).unwrap().to_path_buf(), bytes));
+            }
+        }
+    }
+
+    /// The observed row for one worktree path.
+    pub fn row<'a>(
+        rows: &'a [conflux::tui::types::WorktreeInfo],
+        path: &Path,
+    ) -> &'a conflux::tui::types::WorktreeInfo {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        rows.iter()
+            .find(|row| {
+                std::fs::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone()) == canonical
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "every registered worktree must stay listed; {} is missing from {:?}",
+                    path.display(),
+                    rows.iter().map(|row| &row.path).collect::<Vec<_>>()
+                )
+            })
+    }
+}
+
+#[tokio::test]
+async fn stale_refresh_e2e_periodic_paths_inspect_only_current_change_worktrees() {
+    use conflux::worktree_ops::inspection::{
+        record_inspection_commands, recorded_inspection_count, InspectionCommand,
+    };
+    use conflux::worktree_ops::InspectionState;
+    use stale_refresh_support::*;
+
+    let Some(fx) = refresh_fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+    record_inspection_commands();
+
+    fx.declare_change("live-change");
+    fx.declare_rejected_change("rejected-change");
+    let live = fx.add_worktree("live-change");
+    let rejected = fx.add_worktree("rejected-change");
+    let stale = fx.add_worktree("stale-change");
+    let session = fx.add_worktree("ws-session-a1b2c3");
+    for (worktree, name) in [
+        (&live, "live"),
+        (&rejected, "rejected"),
+        (&stale, "stale"),
+        (&session, "session"),
+    ] {
+        write_and_commit(
+            worktree,
+            "work.txt",
+            &format!("{name}\n"),
+            "Work ahead of base",
+        );
+    }
+
+    // ── The TUI's periodic refresh ──────────────────────────────────────────
+    let rows = conflux::tui::load_worktrees_with_conflict_check(&fx.repo)
+        .await
+        .expect("the TUI periodic refresh reads the worktree list");
+
+    assert_eq!(
+        rows.len(),
+        5,
+        "every registered worktree stays visible: {:?}",
+        rows.iter().map(|row| &row.branch).collect::<Vec<_>>()
+    );
+
+    // A rejected change's worktree is retained on purpose and an operator
+    // reviewing it needs accurate guidance, so it stays automatically eligible.
+    assert_eq!(
+        row(&rows, &rejected).inspection,
+        InspectionState::Checked,
+        "a rejected change's retained worktree is still inspected"
+    );
+    assert_eq!(
+        recorded_inspection_count(&rejected, InspectionCommand::Conflicts),
+        1
+    );
+
+    let live_row = row(&rows, &live);
+    assert_eq!(live_row.inspection, InspectionState::Checked);
+    assert!(
+        live_row.has_commits_ahead,
+        "a current change worktree is still checked for commits ahead"
+    );
+    assert_eq!(
+        recorded_inspection_count(&live, InspectionCommand::Conflicts),
+        1,
+        "the current change worktree is simulated exactly once"
+    );
+    assert_eq!(
+        recorded_inspection_count(&live, InspectionCommand::CommitsAhead),
+        1
+    );
+
+    for (worktree, label) in [(&stale, "stale"), (&session, "ws-session")] {
+        let skipped = row(&rows, worktree);
+        assert_eq!(
+            skipped.inspection,
+            InspectionState::NotInspected,
+            "{label} must be reported as uninspected, not as clean"
+        );
+        assert!(
+            !skipped.has_commits_ahead && skipped.merge_conflict.is_none(),
+            "{label} carries no fabricated ahead/conflict evidence"
+        );
+        assert_ne!(
+            skipped.merge_status_label(),
+            "merged",
+            "{label} has commits ahead in reality; refresh must not claim otherwise"
+        );
+        assert_eq!(
+            recorded_inspection_count(worktree, InspectionCommand::Conflicts),
+            0,
+            "{label} must cost no merge simulation"
+        );
+        assert_eq!(
+            recorded_inspection_count(worktree, InspectionCommand::CommitsAhead),
+            0,
+            "{label} must cost no commits-ahead command"
+        );
+    }
+
+    // ── The Web/UDS periodic refresh, on the same unchanged revisions ───────
+    let web = conflux::web::WebState::new(&[]);
+    web.refresh_from_disk_at(&fx.repo)
+        .await
+        .expect("the Web/UDS periodic refresh reads the same repository");
+    let web_rows = web.get_state().await.worktrees;
+
+    assert_eq!(
+        recorded_inspection_count(&live, InspectionCommand::Conflicts),
+        1,
+        "an unchanged revision tuple is simulated once process-wide, not once per frontend"
+    );
+    assert_eq!(
+        row(&web_rows, &live).inspection,
+        InspectionState::Reused,
+        "the Web path reuses the observation the TUI path produced"
+    );
+    assert!(row(&web_rows, &live).has_commits_ahead);
+    assert_eq!(
+        row(&web_rows, &stale).inspection,
+        InspectionState::NotInspected,
+        "both periodic paths apply the same eligibility policy"
+    );
+    assert_eq!(
+        recorded_inspection_count(&stale, InspectionCommand::Conflicts)
+            + recorded_inspection_count(&session, InspectionCommand::Conflicts),
+        0
+    );
+
+    // ── A revision change invalidates the observation ───────────────────────
+    write_and_commit(&live, "work.txt", "live again\n", "Move the worktree HEAD");
+    let rows = conflux::tui::load_worktrees_with_conflict_check(&fx.repo)
+        .await
+        .expect("refresh after a revision change");
+
+    assert_eq!(
+        row(&rows, &live).inspection,
+        InspectionState::Checked,
+        "a moved worktree HEAD must be re-inspected, not reused"
+    );
+    assert_eq!(
+        recorded_inspection_count(&live, InspectionCommand::Conflicts),
+        2,
+        "exactly one fresh simulation follows the revision change"
+    );
+    assert_eq!(
+        recorded_inspection_count(&stale, InspectionCommand::Conflicts),
+        0,
+        "an ineligible worktree stays uninspected across revision changes"
+    );
+
+    // ── And a base-side change invalidates it too ───────────────────────────
+    write_and_commit(&fx.repo, "base.txt", "base moved\n", "Move base HEAD");
+    let rows = conflux::tui::load_worktrees_with_conflict_check(&fx.repo)
+        .await
+        .expect("refresh after a base change");
+
+    assert_eq!(row(&rows, &live).inspection, InspectionState::Checked);
+    assert_eq!(
+        recorded_inspection_count(&live, InspectionCommand::Conflicts),
+        3,
+        "a moved base HEAD is a different revision tuple and is simulated again"
+    );
+}
+
+#[tokio::test]
+async fn stale_refresh_e2e_operator_actions_reinspect_skipped_worktrees() {
+    use conflux::config::OrchestratorConfig;
+    use conflux::worktree_ops::inspection::{
+        record_inspection_commands, recorded_inspection_count, InspectionCommand,
+    };
+    use conflux::worktree_ops::service::{
+        DeleteOptions, ExpectedTarget, NullEventSink, WorktreeOpError, WorktreeService,
+    };
+    use conflux::worktree_ops::InspectionState;
+    use stale_refresh_support::*;
+    use std::sync::Arc;
+
+    let Some(fx) = refresh_fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+    record_inspection_commands();
+
+    let session = fx.add_worktree("ws-session-a1b2c3");
+    let stale = fx.add_worktree("stale-change");
+    write_and_commit(&session, "session.txt", "session\n", "Session work");
+    write_and_commit(&stale, "stale.txt", "stale\n", "Stale work");
+
+    // Periodic refresh declines both: neither branch maps to a current change.
+    let rows = conflux::tui::load_worktrees_with_conflict_check(&fx.repo)
+        .await
+        .expect("periodic refresh");
+    assert_eq!(
+        row(&rows, &session).inspection,
+        InspectionState::NotInspected
+    );
+    assert_eq!(row(&rows, &stale).inspection, InspectionState::NotInspected);
+    assert_eq!(
+        recorded_inspection_count(&session, InspectionCommand::Conflicts),
+        0
+    );
+
+    let service = WorktreeService::new(
+        Arc::new(conflux::worktree_ops::git_backend::GitWorktreeBackend::new(
+            fx.repo.clone(),
+            Arc::new(OrchestratorConfig::default()),
+        )),
+        Arc::new(NullEventSink),
+        fx.worktrees.clone(),
+    );
+
+    // ── Operator merge of an unclassified worktree ──────────────────────────
+    service
+        .merge_worktree(
+            &session,
+            conflux::worktree_ops::service::ConflictPolicy::AbortOnConflict,
+        )
+        .await
+        .expect("a ws-session worktree periodic refresh skipped is still mergeable");
+
+    assert_eq!(
+        recorded_inspection_count(&session, InspectionCommand::CommitsAhead),
+        1,
+        "the merge decided eligibility from a fresh targeted observation"
+    );
+    assert_eq!(
+        recorded_inspection_count(&stale, InspectionCommand::CommitsAhead),
+        0,
+        "a targeted observation pays for its target only"
+    );
+    assert_eq!(
+        git(&fx.repo, &["log", "--format=%s", "-1"]),
+        "Merge branch 'ws-session-a1b2c3'",
+        "the merge really happened"
+    );
+
+    // ── Operator deletion of a stale worktree ───────────────────────────────
+    // It carries unmerged commits, so a fail-closed deletion refuses — but it
+    // refuses on freshly observed evidence, which is the point: periodic
+    // filtering alone never makes a worktree permanently undeletable.
+    let refusal = service
+        .delete_worktree(
+            &stale,
+            &ExpectedTarget::on_branch("stale-change"),
+            DeleteOptions::fail_closed(),
+        )
+        .await
+        .expect_err("a worktree with unmerged commits fails closed");
+    assert!(
+        matches!(refusal, WorktreeOpError::CommitsAhead { .. }),
+        "the refusal must name the observed commits, not an uninspected state: {refusal:?}"
+    );
+    assert!(
+        recorded_inspection_count(&stale, InspectionCommand::CommitsAhead) >= 1,
+        "deletion re-observed the worktree periodic refresh had skipped"
+    );
+
+    // With the loss explicitly confirmed, the same worktree deletes.
+    service
+        .delete_worktree(
+            &stale,
+            &ExpectedTarget::on_branch("stale-change"),
+            DeleteOptions::local_discarding_ahead(true, false),
+        )
+        .await
+        .expect("an explicitly confirmed stale worktree is still deletable");
+    assert!(!stale.exists(), "the stale worktree was removed");
+}
+
+#[tokio::test]
+async fn stale_refresh_e2e_refresh_never_touches_worktree_state() {
+    use conflux::worktree_ops::inspection::record_inspection_commands;
+    use stale_refresh_support::*;
+
+    let Some(fx) = refresh_fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+    record_inspection_commands();
+
+    fx.declare_change("live-change");
+    let live = fx.add_worktree("live-change");
+    let stale = fx.add_worktree("stale-change");
+
+    // Both an inspected and an uninspected worktree carry every kind of dirt.
+    for worktree in [&live, &stale] {
+        write_and_commit(worktree, "tracked.txt", "committed\n", "Tracked file");
+        std::fs::write(worktree.join("tracked.txt"), "unstaged edit\n").unwrap();
+        std::fs::write(worktree.join("staged.txt"), "staged\n").unwrap();
+        git(worktree, &["add", "staged.txt"]);
+        std::fs::write(worktree.join("untracked.txt"), "untracked\n").unwrap();
+    }
+
+    let before: Vec<_> = [&live, &stale]
+        .iter()
+        .map(|worktree| tree_snapshot(worktree))
+        .collect();
+
+    conflux::tui::load_worktrees_with_conflict_check(&fx.repo)
+        .await
+        .expect("periodic refresh");
+    let web = conflux::web::WebState::new(&[]);
+    web.refresh_from_disk_at(&fx.repo)
+        .await
+        .expect("periodic refresh");
+
+    for (index, worktree) in [&live, &stale].iter().enumerate() {
+        let after = tree_snapshot(worktree);
+        assert_eq!(
+            before[index].0,
+            after.0,
+            "refresh changed the index/status of {}",
+            worktree.display()
+        );
+        assert_eq!(
+            before[index].1,
+            after.1,
+            "refresh changed file bytes in {}",
+            worktree.display()
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_refresh_e2e_large_conflict_diagnostics_stay_bounded() {
+    use conflux::worktree_ops::inspection::{
+        check_merge_conflicts, MAX_CONFLICT_SAMPLE, MAX_OUTPUT_PREFIX_BYTES,
+    };
+    use stale_refresh_support::*;
+
+    let Some(fx) = refresh_fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    // A conflict surface far wider than the sample bound: every one of these
+    // files is edited differently on base and on the branch.
+    const FILES: usize = 60;
+    for index in 0..FILES {
+        std::fs::write(fx.repo.join(format!("conflict_{index:03}.txt")), "shared\n").unwrap();
+    }
+    git(&fx.repo, &["add", "-A"]);
+    git(&fx.repo, &["commit", "-m", "Shared files"]);
+
+    let branch = fx.add_worktree("live-change");
+    for index in 0..FILES {
+        std::fs::write(
+            branch.join(format!("conflict_{index:03}.txt")),
+            format!("branch side {index}\n"),
+        )
+        .unwrap();
+    }
+    git(&branch, &["add", "-A"]);
+    git(&branch, &["commit", "-m", "Branch edits"]);
+
+    for index in 0..FILES {
+        std::fs::write(
+            fx.repo.join(format!("conflict_{index:03}.txt")),
+            format!("base side {index}\n"),
+        )
+        .unwrap();
+    }
+    git(&fx.repo, &["add", "-A"]);
+    git(&fx.repo, &["commit", "-m", "Base edits"]);
+
+    let simulation = check_merge_conflicts(&branch, "main")
+        .await
+        .expect("a conflicting merge is an observation, not a command failure");
+
+    assert!(simulation.conflicted, "the merge really does conflict");
+    assert_eq!(
+        simulation.conflict_count, FILES,
+        "the count of conflicting paths stays truthful"
+    );
+    assert_eq!(
+        simulation.conflict_sample.len(),
+        MAX_CONFLICT_SAMPLE,
+        "the sample is capped regardless of the conflict surface"
+    );
+    assert!(simulation.stdout_prefix.len() <= MAX_OUTPUT_PREFIX_BYTES);
+    assert!(simulation.stderr_prefix.len() <= MAX_OUTPUT_PREFIX_BYTES);
+    assert!(
+        simulation.stdout_bytes > MAX_OUTPUT_PREFIX_BYTES,
+        "this fixture is only meaningful if the raw output exceeds the bound, got {} bytes",
+        simulation.stdout_bytes
+    );
+
+    let summary = simulation.summary();
+    assert!(
+        summary.len() < 16 * 1024,
+        "a per-refresh diagnostic must stay small, got {} bytes",
+        summary.len()
+    );
+    assert!(
+        !summary.contains(&format!("conflict_{:03}.txt", FILES - 1)),
+        "the summary must not carry the complete conflict list: {summary}"
+    );
+    assert!(
+        summary.contains(&format!("stdout_bytes={}", simulation.stdout_bytes)),
+        "the summary still discloses how much output there was: {summary}"
+    );
+}
