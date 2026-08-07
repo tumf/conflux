@@ -41,7 +41,7 @@ verifications:
     trigger: pull-request-validation
     automation: tests/process_cleanup_test.rs
     evidence: 1秒未満のcontrolled process fixtureがtimeout、retry suppression、SIGTERM/SIGKILL escalation、quiescenceを短いwall-clock正否閾値なしで証明する
-    rerun: cargo test --locked --test process_cleanup_test
+    rerun: cargo test --locked --features heavy-tests --test process_cleanup_test
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -113,7 +113,7 @@ TUI internal stopはbounded process-group cleanupを所有するが、external S
 - timeout testはpaused timeまたはcontrolled sub-second process fixtureを使用し、短いwall-clock正否閾値ではなくstateとcleanup evidenceで判定する。default test targetは1秒未満を維持し、timeoutはhang防止の十分余裕ある安全弁だけに使う。
 - TUI signal testはoperator stopと同じsupervisor shutdown boundaryを実行し、登録executionまたはprocess identityが残らないこと、idle/background mutationの既存分類、second-signal escalationを検証する。
 - embedded skill sourceとinstalled-skill contract testがbounded verification、canonical blocker fields、heavy-gate ownershipを含む。
-- `cargo test --locked execution::apply::tests`、`cargo test --locked config`、`cargo test --locked --test process_cleanup_test`、`cargo test --locked tui::run_supervisor::tests`、`cargo test --locked --test install_skills_test`が成功する。
+- `cargo test --locked execution::apply::tests`、`cargo test --locked config`、`cargo test --locked --features heavy-tests --test process_cleanup_test`、`cargo test --locked tui::run_supervisor::tests`、`cargo test --locked --test install_skills_test`が成功する。`tests/process_cleanup_test.rs`は実プロセスグループを駆動するため`heavy-tests` featureでgateされており、rerun commandはzero testを黙って実行しないようそのfeatureを明示する。
 - Rust pathがstageされた場合のrepository-wide rustfmtとclippyは既存path-scoped pre-commit hookが所有し、本proposalは重複するApply checkbox taskを作らない。
 
 ## 対象外

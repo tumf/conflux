@@ -38,20 +38,31 @@ apply プロンプトは tasks.md のフォーマット修正と進捗更新の�
 
 ### Requirement: Apply system prompt MUST enforce non-interactive iteration
 
-The apply system prompt (`APPLY_SYSTEM_PROMPT`) MUST explicitly state that the agent cannot ask questions to the user and must continue working until MaxIteration is reached, making autonomous decisions under operational constraints.
+The Apply system prompt MUST explicitly state that the agent cannot ask questions and must make autonomous decisions under operational constraints. It MUST NOT interpret autonomy as permission for unbounded verification. Verification commands MUST run once by default. Re-execution of the identical command MUST be limited to at most three total executions within one Apply invocation and each retry MUST follow repository repair or concrete environment-recovery evidence. No-change stability loops MUST be prohibited. When bounded verification cannot complete or remains unstable, Apply MUST record structured `verification_timeout` or `verification_unstable` blocker facts and return control to Conflux rather than continue indefinitely.
 
-#### Scenario: Continue iteration without asking questions
+#### Scenario: Continue repository work without asking questions
 
-**Given:**
-- apply execution encounters an uncertain decision point
+**Given**: Apply encounters repository-fixable uncertainty
+**When**: a bounded implementation decision is available
+**Then**: the agent does not ask the user a question
+**And**: it makes the best repository-supported decision and proceeds
+**And**: it remains subject to verification retry and invocation runtime limits
 
-**When:**
-- apply agent processes tasks
+#### Scenario: Stability loop is prohibited
 
-**Then:**
-- Agent does not ask questions to the user
-- Agent makes best autonomous decision and proceeds
-- Agent continues iteration until MaxIteration is reached
+**Given**: a verification command has completed once
+**And**: no repository repair or concrete environment recovery has occurred
+**When**: the agent considers repeating the command only to prove stability
+**Then**: Apply guidance prohibits the repetition
+**And**: the agent records `verification_unstable` facts when flakiness prevents truthful completion
+
+#### Scenario: Verification retry follows new evidence
+
+**Given**: a verification command failed
+**And**: the agent changed repository code or captured concrete environment-recovery evidence
+**When**: the agent reruns the identical verification command
+**Then**: the rerun counts toward a maximum of three total executions
+**And**: reaching the limit requires blocker handoff rather than a fourth execution
 
 ### Requirement: Future Work restrictions MUST be strictly enforced
 Future Work への移動は、**人間の作業**、**外部システムのデプロイ/承認**、または**長時間待機が必要な検証**に限って許可されなければならない（MUST）。
@@ -253,44 +264,24 @@ acceptance_prompt_mode の `full` は互換エイリアスとして扱い、`con
 
 ### Requirement: Apply prompt MUST escalate implementation blockers
 
-Apply guidance MUST distinguish repository-fixable work, mockable dependencies, non-repository external prerequisites, and terminal rejection proposals.
+Apply guidance MUST distinguish repository-fixable work, mockable dependencies, non-repository external prerequisites, terminal rejection proposals, and bounded verification failures. When a required verification command cannot complete within the invocation budget, guidance MUST record a `verification_timeout` blocker. When verification remains nondeterministic after evidence-bearing retries, guidance MUST record a `verification_unstable` blocker. Both outcomes MUST carry concrete command, attempt, duration, output, repository-diff or recovery evidence, impact, unblock condition, next action, and resumability. They MUST NOT create `REJECTED.md` solely because verification timed out or was unstable.
 
-When Apply cannot proceed because of a recoverable prerequisite, it MUST append `## Implementation Blocker #<n>` to `openspec/changes/{change_id}/tasks.md`. The section MUST contain category, concrete file or log evidence, affected scope, prerequisite or owner, verifiable unblock condition, next action, and resumability, and its bullets MUST NOT use checkboxes. Apply MUST emit an `IMPLEMENTATION_BLOCKER:` stdout block with the same facts and return the compatible machine-readable `BLOCKED` outcome without creating `REJECTED.md`.
+#### Scenario: Apply records bounded verification timeout
 
-Apply guidance MUST state that the agent reports facts and that Conflux validates those facts and owns the final `blocked` versus `stalled` lifecycle classification. The agent MUST NOT claim canonical lifecycle status from prose or outcome token spelling. `REJECTED.md` is permitted only when Apply explicitly establishes why closing the whole change is more appropriate than recovery.
+**Given**: a required foreground verification cannot complete within the bounded Apply invocation
+**When**: no repository-only repair can produce timely evidence
+**Then**: tasks.md gains a narrative Implementation Blocker with category `verification_timeout`
+**And**: stdout contains matching structured blocker facts
+**And**: Apply returns control without leaving background verification running
+**And**: it does not create `REJECTED.md`
 
-#### Scenario: Apply records a recoverable prerequisite
+#### Scenario: Apply records unstable verification
 
-- **GIVEN** Apply verifies that repository-only work and test doubles cannot satisfy a current prerequisite
-- **WHEN** it escalates the blocker
-- **THEN** tasks.md gains `## Implementation Blocker #<n>` with category, evidence, affected scope, prerequisite or owner, unblock condition, next action, and resumability
-- **AND** the section contains no checkboxes
-- **AND** stdout contains the matching `IMPLEMENTATION_BLOCKER:` block
-- **AND** Apply emits the compatible machine-readable `BLOCKED` outcome
-- **AND** it does not create `REJECTED.md`
-- **AND** it leaves final lifecycle classification to Conflux
-
-#### Scenario: Apply does not externalize repository work
-
-- **GIVEN** code, tests, specs, tasks, documentation, fixtures, mocks, or stubs can resolve the finding
-- **WHEN** Apply evaluates whether to escalate
-- **THEN** it continues repository work or reports a repository-fixable failure
-- **AND** it does not label the finding as an external prerequisite
-
-#### Scenario: Apply distinguishes terminal rejection proposal
-
-- **GIVEN** Apply establishes that a proposal premise is invalid or superseded and the whole change should close
-- **WHEN** it proposes rejection
-- **THEN** stdout distinguishes the rejection proposal from a recoverable blocker outcome
-- **AND** worktree-local `REJECTED.md` is limited to this outcome
-
-#### Scenario: Infrastructure verification blocker is not terminal rejection
-
-- **GIVEN** Apply or verification observes Docker unavailability, image-pull DNS timeout, package-registry timeout, port conflict, third-party outage, rate limiting, or another infrastructure condition
-- **AND** no independent evidence shows that the proposal premise is invalid or obsolete
-- **WHEN** the agent records the blocker
-- **THEN** guidance directs it to record recoverable structured blocker facts
-- **AND** guidance does not direct it to create `REJECTED.md`
+**Given**: the same verification has reached the evidence-bearing retry limit
+**And**: results remain nondeterministic
+**When**: Apply cannot truthfully mark the task complete
+**Then**: it records category `verification_unstable` with all attempts and evidence
+**And**: it stops rather than starting another stability loop
 
 ### Requirement: Acceptance prompt MUST evaluate implementation blockers
 

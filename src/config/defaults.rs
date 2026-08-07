@@ -127,6 +127,12 @@ pub const DEFAULT_COMMAND_INACTIVITY_KILL_GRACE_SECS: u64 = 5;
 /// Default maximum number of retries after inactivity timeout (0 = disabled; set to 0 to opt out)
 pub const DEFAULT_COMMAND_INACTIVITY_TIMEOUT_MAX_RETRIES: u32 = 3;
 
+/// Default absolute runtime limit for one AI command invocation (seconds).
+///
+/// Measured from successful child spawn and never extended by stdout or stderr
+/// activity, so an agent that keeps printing is still bounded. `0` disables it.
+pub const DEFAULT_COMMAND_MAX_RUNTIME_SECS: u64 = 3600;
+
 /// Default enablement for stream-json output textification
 pub const DEFAULT_STREAM_JSON_TEXTIFY: bool = true;
 

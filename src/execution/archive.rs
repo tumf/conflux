@@ -1131,6 +1131,7 @@ mod tests {
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
             inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
             strict_process_cleanup: config.get_command_strict_process_cleanup(),
+            max_runtime_secs: config.get_command_max_runtime_secs(),
         };
         let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
         AiCommandRunner::new(queue_config, shared_stagger_state)

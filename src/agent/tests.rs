@@ -21,6 +21,7 @@ fn build_test_ai_runner() -> AiCommandRunner {
         inactivity_kill_grace_secs: 1,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     AiCommandRunner::new(queue_config, shared_stagger_state)

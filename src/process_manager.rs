@@ -62,6 +62,54 @@ pub enum TerminationOutcome {
     TimedOut,
 }
 
+/// Why one streaming command invocation ended.
+///
+/// The exit status alone cannot answer this: a SIGKILLed agent, an agent that
+/// crashed on its own, and an agent stopped by its absolute runtime limit all
+/// surface as an ordinary non-zero status. Callers that must not re-dispatch a
+/// deliberately terminated command read this instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandTermination {
+    /// The command reached its own exit — successfully or not.
+    Exited,
+    /// The no-output inactivity timeout terminated it.
+    InactivityTimeout,
+    /// The absolute runtime limit terminated it. Never retried.
+    RuntimeLimit,
+    /// Explicit cancellation or run-scope shutdown terminated it. Never retried.
+    Cancelled,
+    /// Shutdown refused the invocation, or it never reached a running process.
+    NotStarted,
+}
+
+impl CommandTermination {
+    /// Whether another attempt at the same invocation is admissible at all.
+    ///
+    /// A deliberate termination is a decision, not a transient failure: retrying
+    /// it would re-run exactly the work the boundary just stopped.
+    #[allow(dead_code)] // Read by termination-classification coverage, not by the binary.
+    pub fn permits_retry(self) -> bool {
+        matches!(self, Self::Exited | Self::InactivityTimeout)
+    }
+
+    /// Whether this invocation was stopped by its absolute runtime limit.
+    pub fn is_runtime_limit(self) -> bool {
+        matches!(self, Self::RuntimeLimit)
+    }
+
+    /// Short stable token for logs and diagnostics.
+    #[allow(dead_code)] // Read by termination-classification coverage, not by the binary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exited => "exited",
+            Self::InactivityTimeout => "inactivity_timeout",
+            Self::RuntimeLimit => "runtime_limit",
+            Self::Cancelled => "cancelled",
+            Self::NotStarted => "not_started",
+        }
+    }
+}
+
 impl ManagedChild {
     /// Creates a new managed child from a tokio Child process
     pub fn new(mut child: Child) -> io::Result<Self> {
@@ -153,6 +201,10 @@ pub struct StreamingChildHandle {
     cleanup_rx: tokio::sync::oneshot::Receiver<ProcessGroupCleanupReport>,
     /// Cached cleanup evidence so the outcome can be read more than once.
     cleanup_report: Option<ProcessGroupCleanupReport>,
+    /// Receives why this invocation ended, published before the final status.
+    termination_rx: tokio::sync::oneshot::Receiver<CommandTermination>,
+    /// Cached termination reason so the outcome can be read more than once.
+    termination: Option<CommandTermination>,
 }
 
 #[allow(dead_code)] // kill() and id() are part of the public lifecycle API; not all callers use both
@@ -164,6 +216,7 @@ impl StreamingChildHandle {
         current_pid: Arc<AtomicU32>,
         final_status_rx: tokio::sync::oneshot::Receiver<std::process::ExitStatus>,
         cleanup_rx: tokio::sync::oneshot::Receiver<ProcessGroupCleanupReport>,
+        termination_rx: tokio::sync::oneshot::Receiver<CommandTermination>,
     ) -> Self {
         Self {
             cancel_tx: Some(cancel_tx),
@@ -171,7 +224,54 @@ impl StreamingChildHandle {
             final_status_rx,
             cleanup_rx,
             cleanup_report: None,
+            termination_rx,
+            termination: None,
         }
+    }
+
+    /// Builds a handle whose evidence is already published.
+    ///
+    /// Callers that gate repository work on cleanup and termination evidence can
+    /// then be driven over every verdict — including the ones a real process
+    /// only produces by surviving SIGKILL — without spawning anything.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        cleanup: ProcessGroupCleanupReport,
+        termination: CommandTermination,
+        status: std::process::ExitStatus,
+    ) -> Self {
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
+        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel::<ProcessGroupCleanupReport>();
+        let (termination_tx, termination_rx) =
+            tokio::sync::oneshot::channel::<CommandTermination>();
+        let _ = status_tx.send(status);
+        let _ = cleanup_tx.send(cleanup);
+        let _ = termination_tx.send(termination);
+
+        Self::new(
+            cancel_tx,
+            Arc::new(AtomicU32::new(0)),
+            status_rx,
+            cleanup_rx,
+            termination_rx,
+        )
+    }
+
+    /// Awaits why this invocation ended.
+    ///
+    /// A runner that ended without publishing a reason cannot be assumed to have
+    /// exited on its own, so the missing case is reported as `NotStarted` rather
+    /// than as an ordinary exit.
+    pub async fn termination(&mut self) -> CommandTermination {
+        if let Some(termination) = self.termination {
+            return termination;
+        }
+        let termination = (&mut self.termination_rx)
+            .await
+            .unwrap_or(CommandTermination::NotStarted);
+        self.termination = Some(termination);
+        termination
     }
 
     /// Awaits the typed process-group cleanup evidence for this execution.

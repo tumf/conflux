@@ -582,6 +582,12 @@ async fn run_tui_loop(
         graceful_stop_flag.clone(),
     ));
 
+    // External SIGINT/SIGTERM become a quit *request* the event loop drains, so
+    // they leave through the same bounded shutdown boundary as a keypress
+    // instead of terminating the process on top of live agent descendants.
+    let external_shutdown = crate::tui::run_supervisor::ExternalShutdownRequest::new();
+    external_shutdown.install();
+
     // The single process-local application services every frontend commands
     // through. They are built once here, before the first keypress and before v2
     // is bound, so a remote command and a keypress cannot reach different
@@ -1061,6 +1067,12 @@ async fn run_tui_loop(
 
         publish_lifecycle_state(&app);
 
+        // An external SIGINT/SIGTERM is drained here as an ordinary quit
+        // request, so it reaches the same cleanup below that a keypress does.
+        if external_shutdown.is_requested() {
+            app.should_quit = true;
+        }
+
         if app.should_quit {
             break;
         }
@@ -1072,18 +1084,17 @@ async fn run_tui_loop(
     // Wait for tasks to finish gracefully. Remote mode has no local orchestrator handle here;
     // remote server-side work is stopped only by explicit Stop/ForceStop commands.
     refresh_handle.abort();
-    // Remote mode has no local run, so `take_run` yields no handle and no scope
-    // and this is a no-op: closing a remote TUI client still sends no stop.
-    let (orchestrator_handle, orchestrator_cancel, run_command_scope) = supervisor.take_run();
-    let _ = shutdown_local_orchestrator_task(
-        orchestrator_handle,
-        orchestrator_cancel,
-        run_command_scope,
-        LOCAL_ORCHESTRATOR_SHUTDOWN_GRACE,
-    )
-    .await;
-
-    Ok(())
+    // Remote mode has no local run, so the supervisor holds no handle and no
+    // scope and this is a no-op: closing a remote TUI client still sends no stop.
+    //
+    // The outcome is not discarded. Cleanup that could not prove the owned
+    // process groups empty means detached descendants may still be mutating the
+    // managed worktree, and reporting a clean exit there would tell the operator
+    // the opposite of what happened.
+    supervisor
+        .shutdown_run(LOCAL_ORCHESTRATOR_SHUTDOWN_GRACE)
+        .await
+        .into_exit_result()
 }
 
 #[cfg(test)]

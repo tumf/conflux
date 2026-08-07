@@ -8,8 +8,9 @@ use crate::command_queue::{CommandQueue, CommandQueueConfig};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::process_manager::{
-    cleanup_process_group_verified, ManagedChild, ProcessGroupCleanupReport, StreamingChildHandle,
-    DEFAULT_PROCESS_GROUP_CLEANUP_TIMEOUT_MS, DEFAULT_PROCESS_GROUP_SIGTERM_GRACE_MS,
+    cleanup_process_group_verified, CommandTermination, ManagedChild, ProcessGroupCleanupReport,
+    StreamingChildHandle, DEFAULT_PROCESS_GROUP_CLEANUP_TIMEOUT_MS,
+    DEFAULT_PROCESS_GROUP_SIGTERM_GRACE_MS,
 };
 use crate::stream_json_textifier::{process_stdout_line, StreamJsonTextBuffer};
 use std::collections::HashMap;
@@ -805,6 +806,13 @@ impl AiCommandRunner {
         // observe why cleanup succeeded or failed.
         let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel::<ProcessGroupCleanupReport>();
 
+        // Why this invocation ended: an ordinary exit, the inactivity timeout,
+        // the absolute runtime limit, or a deliberate termination. Published
+        // before the final status so a caller that observes completion can also
+        // decide whether another attempt is admissible at all.
+        let (termination_tx, termination_rx) =
+            tokio::sync::oneshot::channel::<CommandTermination>();
+
         // Clone values for the background task.
         let command_queue = self.command_queue.clone();
         let command_str = command.to_string();
@@ -833,10 +841,16 @@ impl AiCommandRunner {
             let kill_grace_secs = command_queue.config().inactivity_kill_grace_secs;
             let inactivity_timeout_max_retries =
                 command_queue.config().inactivity_timeout_max_retries;
+            // Absolute invocation deadline. `0` disables it; output never
+            // extends it, which is what bounds a continuously-printing agent.
+            let max_runtime_secs = command_queue.config().max_runtime_secs;
 
             // cancel_rx is wrapped in Option so we can neutralise it after first use.
             let mut cancel_rx_opt = Some(cancel_rx);
             let mut cancel_observed = false;
+
+            // Terminal reason for this invocation, published exactly once.
+            let mut termination_tx = Some(termination_tx);
 
             // Cleanup evidence for the attempt that ends this execution. A run
             // that never spawns a process has no owned group to prove quiescent.
@@ -848,6 +862,10 @@ impl AiCommandRunner {
             let mut attempt = 0u32;
             let mut inactivity_retries_used = 0u32;
             let mut final_exit_status: Option<std::process::ExitStatus> = None;
+            // Stays `NotStarted` for every `break 'retry` that never reached a
+            // completed attempt (refused admission, launch failure, unwaitable
+            // child), so those are never reported as an ordinary exit.
+            let mut final_termination = CommandTermination::NotStarted;
 
             'retry: loop {
                 // Shutdown recheck before every attempt. A scope that closed
@@ -973,6 +991,12 @@ impl AiCommandRunner {
                 // Publish the real PID so StreamingChildHandle.id() is accurate.
                 let pid = managed_child.id().unwrap_or(0);
                 pid_arc.store(pid, Ordering::SeqCst);
+
+                // The absolute deadline starts here — at successful child spawn
+                // — not at admission, stagger, or retry-delay time, so queueing
+                // never eats the agent's own budget.
+                let runtime_deadline = (max_runtime_secs > 0)
+                    .then(|| tokio::time::Instant::now() + Duration::from_secs(max_runtime_secs));
                 debug!(
                     pid,
                     op = ?operation_type_owned,
@@ -1089,6 +1113,10 @@ impl AiCommandRunner {
                                     execution.record_cleanup(pid, &report);
                                 }
                                 publish_cleanup_report(&mut cleanup_tx, report);
+                                publish_termination(
+                                    &mut termination_tx,
+                                    CommandTermination::Cancelled,
+                                );
                                 let _ = status_tx.send(make_fail_status());
                                 if let Some(execution) = &scope_execution {
                                     execution.finish();
@@ -1138,6 +1166,10 @@ impl AiCommandRunner {
                                         execution.record_cleanup(pid, &report);
                                     }
                                     publish_cleanup_report(&mut cleanup_tx, report);
+                                    publish_termination(
+                                        &mut termination_tx,
+                                        CommandTermination::Cancelled,
+                                    );
                                     let _ = status_tx.send(make_fail_status());
                                     if let Some(execution) = &scope_execution {
                                         execution.finish();
@@ -1145,6 +1177,63 @@ impl AiCommandRunner {
                                     return;
                                 }
                                 // Err = handle was dropped without calling terminate() — continue.
+                            }
+
+                            // Absolute runtime limit reached. Evaluated in the
+                            // same loop as the inactivity timer but from an
+                            // independent deadline, so a command that keeps
+                            // printing cannot postpone it.
+                            _ = wait_for_runtime_limit(runtime_deadline) => {
+                                warn!(
+                                    pid,
+                                    max_runtime_secs,
+                                    op = ?operation_type_owned,
+                                    change_id = ?change_id_owned,
+                                    cwd = ?cwd_owned,
+                                    "Absolute runtime limit reached, terminating process group \
+                                     (pid={}, limit={}s)",
+                                    pid, max_runtime_secs
+                                );
+                                let _ = out_tx
+                                    .send(OutputLine::Stderr(runtime_limit_line(
+                                        max_runtime_secs,
+                                        operation_type_owned.as_deref(),
+                                        change_id_owned.as_deref(),
+                                        pid,
+                                    )))
+                                    .await;
+                                if let Some(execution) = &scope_execution {
+                                    execution.mark_cleaning();
+                                }
+                                let _ = managed_child
+                                    .terminate_with_timeout(Duration::from_secs(5))
+                                    .await;
+                                let report = verify_owned_process_group(
+                                    pid,
+                                    cleanup_timeout_ms,
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                    &out_tx,
+                                )
+                                .await;
+                                pid_arc.store(0, Ordering::SeqCst);
+                                if let Some(execution) = &scope_execution {
+                                    execution.record_cleanup(pid, &report);
+                                }
+                                publish_cleanup_report(&mut cleanup_tx, report);
+                                // Retry admission for this invocation closes
+                                // here: the reason is published before the
+                                // status, and the task returns without ever
+                                // re-entering the retry loop.
+                                publish_termination(
+                                    &mut termination_tx,
+                                    CommandTermination::RuntimeLimit,
+                                );
+                                let _ = status_tx.send(make_fail_status());
+                                if let Some(execution) = &scope_execution {
+                                    execution.finish();
+                                }
+                                return;
                             }
 
                             // Output activity resets the inactivity timer.
@@ -1310,6 +1399,10 @@ impl AiCommandRunner {
                                     execution.record_cleanup(pid, &report);
                                 }
                                 publish_cleanup_report(&mut cleanup_tx, report);
+                                publish_termination(
+                                    &mut termination_tx,
+                                    CommandTermination::Cancelled,
+                                );
                                 let _ = status_tx.send(make_fail_status());
                                 if let Some(execution) = &scope_execution {
                                     execution.finish();
@@ -1352,12 +1445,68 @@ impl AiCommandRunner {
                                         execution.record_cleanup(pid, &report);
                                     }
                                     publish_cleanup_report(&mut cleanup_tx, report);
+                                    publish_termination(
+                                        &mut termination_tx,
+                                        CommandTermination::Cancelled,
+                                    );
                                     let _ = status_tx.send(make_fail_status());
                                     if let Some(execution) = &scope_execution {
                                         execution.finish();
                                     }
                                     return;
                                 }
+                            }
+
+                            // The absolute deadline is enforced whether or not
+                            // the inactivity timeout is configured: they are
+                            // independent limits.
+                            _ = wait_for_runtime_limit(runtime_deadline) => {
+                                warn!(
+                                    pid,
+                                    max_runtime_secs,
+                                    op = ?operation_type_owned,
+                                    change_id = ?change_id_owned,
+                                    cwd = ?cwd_owned,
+                                    "Absolute runtime limit reached, terminating process group \
+                                     (pid={}, limit={}s)",
+                                    pid, max_runtime_secs
+                                );
+                                let _ = out_tx
+                                    .send(OutputLine::Stderr(runtime_limit_line(
+                                        max_runtime_secs,
+                                        operation_type_owned.as_deref(),
+                                        change_id_owned.as_deref(),
+                                        pid,
+                                    )))
+                                    .await;
+                                if let Some(execution) = &scope_execution {
+                                    execution.mark_cleaning();
+                                }
+                                let _ = managed_child
+                                    .terminate_with_timeout(Duration::from_secs(5))
+                                    .await;
+                                let report = verify_owned_process_group(
+                                    pid,
+                                    cleanup_timeout_ms,
+                                    operation_type_owned.as_deref(),
+                                    change_id_owned.as_deref(),
+                                    &out_tx,
+                                )
+                                .await;
+                                pid_arc.store(0, Ordering::SeqCst);
+                                if let Some(execution) = &scope_execution {
+                                    execution.record_cleanup(pid, &report);
+                                }
+                                publish_cleanup_report(&mut cleanup_tx, report);
+                                publish_termination(
+                                    &mut termination_tx,
+                                    CommandTermination::RuntimeLimit,
+                                );
+                                let _ = status_tx.send(make_fail_status());
+                                if let Some(execution) = &scope_execution {
+                                    execution.finish();
+                                }
+                                return;
                             }
 
                             a = activity_rx.recv() => {
@@ -1471,6 +1620,7 @@ impl AiCommandRunner {
 
                     // Do not fall through to the crash/pattern retry check.
                     final_exit_status = Some(status);
+                    final_termination = CommandTermination::InactivityTimeout;
                     break 'retry;
                 }
 
@@ -1516,6 +1666,7 @@ impl AiCommandRunner {
                 }
 
                 final_exit_status = Some(status);
+                final_termination = CommandTermination::Exited;
                 break 'retry;
             }
 
@@ -1534,6 +1685,7 @@ impl AiCommandRunner {
                 final_status = make_fail_status();
             }
             publish_cleanup_report(&mut cleanup_tx, cleanup_report);
+            publish_termination(&mut termination_tx, final_termination);
             let _ = status_tx.send(final_status);
             // The registration is released only here: the runner task has
             // ended, and it disappears from the scope only when every owned
@@ -1544,7 +1696,13 @@ impl AiCommandRunner {
             // Dropping out_tx closes the output channel, signalling end-of-output to callers.
         });
 
-        let handle = StreamingChildHandle::new(cancel_tx, current_pid, status_rx, cleanup_rx);
+        let handle = StreamingChildHandle::new(
+            cancel_tx,
+            current_pid,
+            status_rx,
+            cleanup_rx,
+            termination_rx,
+        );
         Ok((handle, out_rx))
     }
 
@@ -1706,6 +1864,7 @@ fn refused_after_shutdown(
     let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let (status_tx, status_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel::<ProcessGroupCleanupReport>();
+    let (termination_tx, termination_rx) = tokio::sync::oneshot::channel::<CommandTermination>();
 
     let _ = out_tx.try_send(OutputLine::Stderr(shutdown_refusal_line(
         "admission",
@@ -1714,6 +1873,7 @@ fn refused_after_shutdown(
         1,
     )));
     let _ = cleanup_tx.send(ProcessGroupCleanupReport::not_applicable(reason));
+    let _ = termination_tx.send(CommandTermination::NotStarted);
     let _ = status_tx.send(make_fail_status());
     drop(out_tx);
 
@@ -1723,6 +1883,7 @@ fn refused_after_shutdown(
             Arc::new(AtomicU32::new(0)),
             status_rx,
             cleanup_rx,
+            termination_rx,
         ),
         out_rx,
     )
@@ -1733,6 +1894,47 @@ async fn wait_for_scope_shutdown(token: &Option<tokio_util::sync::CancellationTo
     match token {
         Some(token) => token.cancelled().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Await the absolute runtime deadline, or never resolve when it is disabled.
+///
+/// The deadline is absolute rather than a per-iteration duration, so re-entering
+/// the monitoring loop after each output line cannot push it further away.
+async fn wait_for_runtime_limit(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// One bounded stderr line describing an invocation stopped by its runtime limit.
+///
+/// It names the limit rather than the elapsed time so an operator can act on the
+/// configuration knob directly.
+fn runtime_limit_line(
+    max_runtime_secs: u64,
+    operation_type: Option<&str>,
+    change_id: Option<&str>,
+    pid: u32,
+) -> String {
+    format!(
+        "Command terminated by absolute runtime limit after {}s \
+         (op={}, change_id={}, pid={}); this invocation is not retried",
+        max_runtime_secs,
+        operation_type.unwrap_or("unknown"),
+        change_id.unwrap_or("none"),
+        pid
+    )
+}
+
+/// Publishes the terminal reason for this invocation exactly once.
+fn publish_termination(
+    termination_tx: &mut Option<tokio::sync::oneshot::Sender<CommandTermination>>,
+    termination: CommandTermination,
+) {
+    if let Some(tx) = termination_tx.take() {
+        let _ = tx.send(termination);
     }
 }
 
@@ -1799,6 +2001,144 @@ mod tests {
     use super::*;
     use crate::config::defaults::*;
 
+    /// The absolute deadline is a decision about *when*, so it is verified with
+    /// paused time rather than by waiting: nothing here spawns a process, and no
+    /// assertion depends on how long the test actually took.
+    mod absolute_runtime_deadline {
+        use super::*;
+
+        /// A disabled limit is a future that never resolves, which is what lets
+        /// it sit in the same `select!` as every other lifecycle arm without
+        /// needing a separate code path for "no deadline".
+        #[tokio::test(start_paused = true)]
+        async fn a_disabled_limit_never_fires() {
+            // A full simulated day passes and the arm still has not resolved.
+            let elapsed =
+                tokio::time::timeout(Duration::from_secs(86_400), wait_for_runtime_limit(None))
+                    .await;
+            assert!(
+                elapsed.is_err(),
+                "`0` must disable the deadline entirely, not defer it"
+            );
+        }
+
+        /// Re-entering the monitoring loop cannot postpone the deadline: it is
+        /// an absolute instant, so awaiting it repeatedly still resolves at the
+        /// same moment. This is precisely why output activity cannot extend it.
+        #[tokio::test(start_paused = true)]
+        async fn an_absolute_deadline_is_not_pushed_back_by_re_entry() {
+            let start = tokio::time::Instant::now();
+            let deadline = Some(start + Duration::from_secs(60));
+
+            // Ten monitoring-loop iterations, each one abandoning the wait after
+            // five seconds the way an output line does.
+            for _ in 0..10 {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), wait_for_runtime_limit(deadline))
+                        .await;
+            }
+
+            wait_for_runtime_limit(deadline).await;
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_secs(60),
+                "the deadline must fire 60s after it was set, regardless of how \
+                 many times the loop re-awaited it"
+            );
+        }
+
+        /// The runner reads the limit from its own queue config, so the
+        /// configured value is what an invocation is actually bounded by.
+        #[test]
+        fn the_runner_carries_the_configured_limit() {
+            let config = OrchestratorConfig {
+                command_max_runtime_secs: Some(120),
+                ..OrchestratorConfig::default()
+            };
+            let runner =
+                AiCommandRunner::from_orchestrator_config(&config, Arc::new(Mutex::new(None)));
+            assert_eq!(runner.queue_config().max_runtime_secs, 120);
+
+            let disabled = OrchestratorConfig {
+                command_max_runtime_secs: Some(0),
+                ..OrchestratorConfig::default()
+            };
+            let runner =
+                AiCommandRunner::from_orchestrator_config(&disabled, Arc::new(Mutex::new(None)));
+            assert_eq!(
+                runner.queue_config().max_runtime_secs,
+                0,
+                "an explicit disable must survive into the runner"
+            );
+        }
+
+        /// The operator-facing line names the limit rather than the elapsed
+        /// time, so the diagnostic points at the knob that has to change.
+        #[test]
+        fn the_runtime_limit_line_names_the_limit_and_the_no_retry_decision() {
+            let line = runtime_limit_line(3600, Some("apply"), Some("change-a"), 4242);
+            assert!(line.contains("3600s"), "the configured limit: {line}");
+            assert!(line.contains("op=apply"), "the operation: {line}");
+            assert!(line.contains("change_id=change-a"), "the change: {line}");
+            assert!(line.contains("pid=4242"), "the owned identity: {line}");
+            assert!(
+                line.contains("not retried"),
+                "the retry decision must be visible to the operator: {line}"
+            );
+        }
+    }
+
+    /// A termination reason exists to answer one question: may this invocation
+    /// be attempted again? A boundary decision may not; a command that ended on
+    /// its own may.
+    mod command_termination {
+        use crate::process_manager::CommandTermination;
+
+        #[test]
+        fn deliberate_terminations_never_permit_a_retry() {
+            for termination in [
+                CommandTermination::RuntimeLimit,
+                CommandTermination::Cancelled,
+                CommandTermination::NotStarted,
+            ] {
+                assert!(
+                    !termination.permits_retry(),
+                    "{} must not admit a retry",
+                    termination.as_str()
+                );
+            }
+        }
+
+        #[test]
+        fn command_owned_endings_stay_retryable() {
+            for termination in [
+                CommandTermination::Exited,
+                CommandTermination::InactivityTimeout,
+            ] {
+                assert!(
+                    termination.permits_retry(),
+                    "{} is a command outcome the existing retry policy owns",
+                    termination.as_str()
+                );
+            }
+        }
+
+        /// Only the runtime limit answers to `is_runtime_limit`, so an operator
+        /// stop and a runaway command stay distinguishable in reporting.
+        #[test]
+        fn only_the_runtime_limit_identifies_as_one() {
+            assert!(CommandTermination::RuntimeLimit.is_runtime_limit());
+            for other in [
+                CommandTermination::Exited,
+                CommandTermination::InactivityTimeout,
+                CommandTermination::Cancelled,
+                CommandTermination::NotStarted,
+            ] {
+                assert!(!other.is_runtime_limit(), "{}", other.as_str());
+            }
+        }
+    }
+
     #[test]
     fn configured_constructor_preserves_runner_settings() {
         let config = OrchestratorConfig {
@@ -1839,6 +2179,7 @@ mod tests {
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
 
         let runner1 = AiCommandRunner::new(config.clone(), shared_state.clone());
@@ -1875,6 +2216,7 @@ mod tests {
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let mut runner = AiCommandRunner::new(config, shared_state);
         runner.set_command_envs(HashMap::from([(
@@ -1914,6 +2256,7 @@ mod tests {
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -1957,6 +2300,7 @@ mod tests {
             inactivity_kill_grace_secs: 5,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -2082,6 +2426,7 @@ mod tests {
                 inactivity_kill_grace_secs: 1,
                 inactivity_timeout_max_retries: 0,
                 strict_process_cleanup: true,
+                max_runtime_secs: 0,
             };
             let (runner, scope) = scoped_runner(config, stagger);
 
@@ -2142,6 +2487,7 @@ mod tests {
                 inactivity_kill_grace_secs: 1,
                 inactivity_timeout_max_retries: 0,
                 strict_process_cleanup: true,
+                max_runtime_secs: 0,
             };
             let (runner, scope) = scoped_runner(config, Arc::new(Mutex::new(None)));
 
@@ -2311,6 +2657,7 @@ mod tests {
                 inactivity_kill_grace_secs: 1,
                 inactivity_timeout_max_retries: 0,
                 strict_process_cleanup: true,
+                max_runtime_secs: 0,
             };
             let (runner, scope) = scoped_runner(config, Arc::new(Mutex::new(None)));
 
@@ -2421,6 +2768,7 @@ mod tests {
                 inactivity_kill_grace_secs: 1,
                 inactivity_timeout_max_retries: 0,
                 strict_process_cleanup: true,
+                max_runtime_secs: 0,
             };
             let runner = AiCommandRunner::new(config, Arc::new(Mutex::new(None)));
 
@@ -2475,6 +2823,7 @@ mod tests {
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -2520,6 +2869,7 @@ mod tests {
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -2578,6 +2928,7 @@ mod tests {
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 3,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -2641,6 +2992,7 @@ mod tests {
             inactivity_kill_grace_secs: 5,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -2706,6 +3058,7 @@ mod tests {
             inactivity_kill_grace_secs: 5,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -2768,6 +3121,7 @@ mod tests {
             inactivity_kill_grace_secs: 5,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -2804,6 +3158,7 @@ mod tests {
             inactivity_kill_grace_secs: 5,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let mut runner = AiCommandRunner::new(config, shared_state);
         // Zero budget: a SIGTERM-immune descendant can never be proven gone.
@@ -2864,6 +3219,7 @@ mod tests {
             inactivity_kill_grace_secs: 5,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 
@@ -2914,6 +3270,7 @@ mod tests {
             inactivity_kill_grace_secs: 5,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let runner = AiCommandRunner::new(config, shared_state);
 

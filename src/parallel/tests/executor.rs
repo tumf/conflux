@@ -1035,6 +1035,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
     let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
     let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
@@ -1193,6 +1194,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
     let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
     let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
@@ -1367,6 +1369,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
     let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
     let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
@@ -1595,6 +1598,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
@@ -1816,6 +1820,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
@@ -2043,6 +2048,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let run_command_scope = crate::ai_command_runner::RunCommandScope::new();
@@ -2173,6 +2179,7 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -2288,6 +2295,7 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -2464,6 +2472,7 @@ async fn test_acceptance_history_records_end_revision_when_head_changes() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -2552,6 +2561,7 @@ async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -2671,6 +2681,7 @@ async fn test_archive_guard_allows_archive_after_acceptance_head_change_pass() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -11475,6 +11486,7 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -11584,6 +11596,7 @@ async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -11670,6 +11683,7 @@ async fn test_acceptance_cancels_while_waiting_for_silent_streaming_output() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
     let shared_stagger_state = Arc::new(Mutex::new(None));
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
@@ -11753,6 +11767,7 @@ async fn test_archive_cancels_while_waiting_for_silent_streaming_output() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
     let shared_stagger_state = Arc::new(Mutex::new(None));
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
@@ -11831,6 +11846,7 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -11923,6 +11939,7 @@ async fn test_acceptance_status_only_exit_is_missing_verdict_not_continue() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -12039,6 +12056,7 @@ async fn test_acceptance_explicit_continue_verdict_retains_continue_routing() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -12137,6 +12155,7 @@ async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -12273,6 +12292,7 @@ exit 0\n",
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
@@ -12417,6 +12437,7 @@ async fn test_archived_dirty_finalization_resume_does_not_rerun_archive_command(
         inactivity_kill_grace_secs: 10,
         inactivity_timeout_max_retries: 0,
         strict_process_cleanup: true,
+        max_runtime_secs: 0,
     };
     let shared_stagger_state = Arc::new(Mutex::new(None));
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());

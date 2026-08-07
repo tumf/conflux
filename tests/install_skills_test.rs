@@ -246,6 +246,173 @@ fn test_embedded_install_without_skills_dir() {
 }
 
 // ---------------------------------------------------------------------------
+// Bounded verification contract
+// ---------------------------------------------------------------------------
+
+/// Install the embedded skills and return the directory they landed in.
+fn install_embedded_skills(workdir: &TempDir) -> std::path::PathBuf {
+    let opts = InstallSkillsOptions {
+        global: false,
+        target: InstallTarget::Agents,
+        project_root: Some(workdir.path().to_path_buf()),
+    };
+    run_install_skills(opts).unwrap();
+    workdir.path().join(".agents/skills")
+}
+
+/// The bounded-verification contract must survive installation.
+///
+/// These are the rules that keep an Apply agent from inventing its own
+/// unbounded work: verification runs once, a re-run needs new evidence, the
+/// identical command is capped, and a command that cannot finish becomes a
+/// structured blocker instead of more waiting. Guidance is the only thing that
+/// bounds work *inside* the agent — the runtime limit bounds only the outer
+/// invocation — so a regression that drops a rule here is silent until an agent
+/// burns a whole invocation proving a green test is still green.
+#[test]
+fn installed_apply_skill_retains_bounded_verification_guidance() {
+    let workdir = TempDir::new().unwrap();
+    let skills_base = install_embedded_skills(&workdir);
+
+    let skill = fs::read_to_string(skills_base.join("cflx-apply/SKILL.md")).unwrap();
+    let reference = fs::read_to_string(skills_base.join("cflx-apply/references/cflx-apply.md"))
+        .expect("cflx-apply must ship its reference guidance");
+
+    for required in [
+        "Bounded Verification Discipline",
+        "Single-run by default",
+        "No-change stability loops are PROHIBITED",
+        "at most three times within one Apply invocation",
+        "repository repair",
+        "environment recovery",
+        "verification_timeout",
+        "verification_unstable",
+        "command_max_runtime_secs",
+    ] {
+        assert!(
+            skill.contains(required),
+            "cflx-apply SKILL.md must retain the bounded-verification rule: {required}"
+        );
+    }
+
+    // The portable reference carries the same contract, because a harness that
+    // reads only the reference must not get the permissive older rules.
+    for required in [
+        "single-run by default",
+        "no-change stability loops are prohibited",
+        "at most three times within one Apply invocation",
+        "verification_timeout",
+        "verification_unstable",
+        "command_max_runtime_secs",
+    ] {
+        assert!(
+            reference.to_lowercase().contains(&required.to_lowercase()),
+            "cflx-apply reference must retain the bounded-verification rule: {required}"
+        );
+    }
+
+    // A recoverable verification hold is never a rejection proposal: the change
+    // intent is untouched by a suite that timed out or flaked.
+    assert!(
+        skill.contains("Neither may create `REJECTED.md`"),
+        "cflx-apply must keep bounded verification blockers out of terminal rejection"
+    );
+}
+
+/// Bounded blocker handoff must stay complete.
+///
+/// A blocker Conflux cannot classify is a blocker that stops the loop with no
+/// route back, so the fields an observer needs are part of the contract rather
+/// than a formatting preference.
+#[test]
+fn installed_apply_skill_requires_bounded_blocker_handoff_fields() {
+    let workdir = TempDir::new().unwrap();
+    let skills_base = install_embedded_skills(&workdir);
+    let skill = fs::read_to_string(skills_base.join("cflx-apply/SKILL.md")).unwrap();
+
+    assert!(
+        skill.contains("|verification_timeout|verification_unstable>"),
+        "the blocker category list must offer both bounded-verification categories"
+    );
+    for required in [
+        "- unblock_condition:",
+        "- unblock_actions:",
+        "- prerequisite_owner:",
+        "- resumable:",
+        "each attempt with its duration and outcome",
+    ] {
+        assert!(
+            skill.contains(required),
+            "cflx-apply must keep the blocker handoff field: {required}"
+        );
+    }
+}
+
+/// Heavy and non-local gates must stay off Apply's critical path.
+///
+/// A Docker or deployed-service suite attached to a checkbox is the shape that
+/// turns one Apply invocation into an unbounded wait, so the proposal guidance
+/// has to name both the prohibition and the bounded repository-local exception
+/// that replaces it.
+#[test]
+fn installed_proposal_skill_keeps_heavy_gates_off_apply_checkboxes() {
+    let workdir = TempDir::new().unwrap();
+    let skills_base = install_embedded_skills(&workdir);
+    let skill = fs::read_to_string(skills_base.join("cflx-proposal/SKILL.md")).unwrap();
+
+    for required in [
+        "Apply-Blocking Verification Must Be Bounded and Repository-Local",
+        "bounded to one direct execution by default",
+        "Never write a checkbox whose",
+        "only purpose is repeated execution of the same command",
+        "command_max_runtime_secs",
+    ] {
+        assert!(
+            skill.contains(required),
+            "cflx-proposal must retain the bounded Apply-verification rule: {required}"
+        );
+    }
+
+    // Every non-local gate class keeps a named non-Apply owner.
+    for gate in [
+        "Docker",
+        "Database",
+        "Credentialed",
+        "Deployed-service",
+        "Physical-device",
+        "External approval",
+    ] {
+        assert!(
+            skill.contains(gate),
+            "cflx-proposal must name the non-Apply gate class: {gate}"
+        );
+    }
+    for owner in [
+        "repository automation (CI) or Acceptance",
+        "operational observation",
+        "narrative `## Future Work` (no checkbox)",
+    ] {
+        assert!(
+            skill.contains(owner),
+            "cflx-proposal must assign non-local gates an owner: {owner}"
+        );
+    }
+
+    // The exception has to survive too, or the rule reads as "no integration
+    // test may ever block a change" and proposals lose their bounded proof.
+    for required in [
+        "a bounded repository-local path may block completion",
+        "`pre-integration`, `repository-local`, and `change-blocking`",
+        "Never hide a non-local outcome in task prose",
+    ] {
+        assert!(
+            skill.contains(required),
+            "cflx-proposal must retain the bounded repository-local exception: {required}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Regression test: embedded skills win even when a local skills/ directory exists
 // ---------------------------------------------------------------------------
 
