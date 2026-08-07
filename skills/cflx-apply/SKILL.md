@@ -29,6 +29,7 @@ Implement the approved change fully, updating `tasks.md` as progress is made, an
 - **COMMIT WHEN INSTRUCTED** - If an explicit commit instruction exists in context or current task, perform *that* commit. This never authorizes the final Apply commit, which Conflux alone creates
 - **FINISH WITH A CLEAN WORKSPACE** - `git status --porcelain` must report no unstaged changes and no untracked files when you return. Staged entries are expected; a dirty worktree column or a `??` entry is not
 - **WAIT FOR VERIFICATION IN THE FOREGROUND** - Never return a final response while a verification command is still running in the background. Wait for it, or record a valid blocker under the rules below
+- **VERIFY ONCE, BOUNDED** - Run each verification command once by default. No-change stability loops are prohibited, the identical command may run at most three times per Apply invocation, and every re-execution requires new repository-repair or environment-recovery evidence. Bounded verification that cannot complete or stays unstable is recorded as a `verification_timeout` or `verification_unstable` blocker, never as more waiting. See [Bounded Verification Discipline](#bounded-verification-discipline)
 - **NO UNCHECKED TASKS** - Apply MUST NOT declare completion or exit while any `[ ]` unchecked tasks remain in tasks.md; all must be `[x]` or moved to Future Work before finishing
 - **PRESERVE ACCEPTANCE FOLLOW-UP** - The runtime-owned acceptance follow-up is the authoritative retry checklist. Do not delete or move it. Its finding text is immutable identity metadata and is exempt from the general task-description refinement rule: do not rewrite, split, or refine it. Inside that section, only change an existing finding checkbox and add separate indented lines in the exact form `  evidence: <one-line evidence>`. Do not add ordinary paragraphs, headings, fenced blocks, unindented `Evidence:` labels, or any other notes inside the runtime-owned section. Put longer notes outside it in a non-checkbox notes section. After each finding is fixed and verified, immediately mark each existing finding `[x]`; the runtime clears the section only after acceptance PASS.
 - **ACCEPTANCE REPAIR MODE IS THE PRIMARY SCOPE** - When the prompt carries `<acceptance_findings_json>`, the open findings in that block are your work, ranked above completed proposal tasks, prior implementation narrative, and other context. Completed proposal tasks are constraints, not new work candidates: do not re-open or re-explore them.
@@ -128,6 +129,68 @@ Never mark a task complete based only on any of the following:
 - code was discussed but no runtime/test artifact was added
 - a stub placeholder was added where a real execution path was required
 
+## Bounded Verification Discipline
+
+Autonomy is not permission for unbounded verification. Apply runs inside a
+bounded invocation whose absolute runtime limit Conflux enforces
+(`command_max_runtime_secs`, default 3600s, `0` disables it). A verification
+loop that outlives that budget produces no evidence at all: the process group is
+terminated, and the next iteration sees unchanged tasks with nothing to consume.
+
+**Single-run by default.** Run a verification command once. Its first completed
+result is the evidence. Re-running a command that already passed adds no
+evidence and consumes the invocation budget that remaining tasks need.
+
+**No-change stability loops are PROHIBITED.** Never re-run a command "to confirm
+it is stable", "to make sure", or "a few more times" when nothing in the
+repository or environment changed between runs. Identical input produces
+identical evidence; the repetition only burns the budget.
+
+**At most three evidence-bearing executions.** The identical verification
+command may run at most three times within one Apply invocation, and every
+re-execution after the first MUST be justified by new evidence recorded before
+it starts:
+
+- a repository repair (a concrete code, test, config, or fixture diff), or
+- a concrete environment recovery (a named prerequisite that was unavailable and
+  is now verifiably available).
+
+A retry with neither justification is a prohibited stability loop. Reaching the
+third execution without a truthful result requires blocker handoff, never a
+fourth execution.
+
+**Use the runtime's managed execution facility.** When the harness provides one
+(for example a managed background/exec tool), run long verification through it
+so the command is owned and bounded. This skill does not depend on any specific
+timeout wrapper. When bounded execution cannot be guaranteed at all, stop with
+structured blocker evidence rather than starting an unbounded command.
+
+**Non-completing verification is a blocker, not more waiting.** When a required
+verification cannot finish inside the bounded invocation, or remains
+nondeterministic after evidence-bearing retries, record the matching
+Implementation Blocker and return control to Conflux:
+
+| Situation | Blocker category |
+| --- | --- |
+| Command cannot complete within the bounded invocation budget | `verification_timeout` |
+| Command reached the execution limit with nondeterministic results | `verification_unstable` |
+
+Both are recoverable holds. They MUST carry the command, each attempt with its
+duration and outcome, the bounded output evidence, the repository-diff or
+environment-recovery evidence for each retry, impact, unblock condition, next
+action, and resumability. Neither may create `REJECTED.md`: a verification that
+timed out or flaked says nothing about whether the change intent is valid.
+
+Never end a response while a verification command is still running, and never
+report "tests are running" as a result. See
+[Background Verification Is Never Complete Work](#background-verification-is-never-complete-work).
+
+**Heavy gates stay where the proposal put them.** Docker, database, heavy,
+credentialed, deployed-service, and long-running repository-wide suites belong
+to repository automation, Acceptance, or operational observation. Do not adopt
+one as Apply-blocking work that the proposal did not declare as a bounded
+repository-local verification.
+
 ## Task Management
 
 **Move to Future Work ONLY if**:
@@ -194,17 +257,18 @@ Do not confuse the two evidence forms:
 
 If apply determines the change is currently impossible to implement because the change intent is terminally invalid (for example: spec contradiction or policy/constitution constraint), do not loop blindly.
 
-Recoverable infrastructure blockers MUST NOT be escalated as terminal rejection proposals. Docker daemon unavailable, Docker image pull DNS/network timeout, package registry timeout, external service outage, missing non-mockable external credential, rate limit, port conflict, and managed verification jobs that are still running/pending are non-terminal recoverable holds. Record concrete blocker details in `tasks.md` and use the runtime's blocker handoff artifacts; do not create `REJECTED.md` for these recoverable cases.
+Recoverable infrastructure blockers MUST NOT be escalated as terminal rejection proposals. Docker daemon unavailable, Docker image pull DNS/network timeout, package registry timeout, external service outage, missing non-mockable external credential, rate limit, port conflict, managed verification jobs that are still running/pending, verification that cannot complete inside the bounded invocation (`verification_timeout`), and verification that stays nondeterministic after evidence-bearing retries (`verification_unstable`) are non-terminal recoverable holds. Record concrete blocker details in `tasks.md` and use the runtime's blocker handoff artifacts; do not create `REJECTED.md` for these recoverable cases.
 
 **You report facts; Conflux owns the lifecycle classification.** Conflux validates what you record and decides whether the change becomes operator-facing `blocked` (a validated non-repository prerequisite with a verifiable unblock condition) or `stalled` (no semantic progress, repeated findings, or an exhausted retry budget). Never assert a canonical lifecycle status in prose, and never treat the `BLOCKED` outcome token spelling as the classification itself. Repository-fixable work and anything a mock, fake, stub, or fixture can satisfy is not an external prerequisite — keep working on it instead.
 
 1. Add a new section to `openspec/changes/<change-id>/tasks.md`:
    ```markdown
    ## Implementation Blocker #<n>
-   - category: <credential|external_approval|policy|external_service|pending_verification|infrastructure|schema_incompatibility|human_decision>
+   - category: <credential|external_approval|policy|external_service|pending_verification|infrastructure|schema_incompatibility|human_decision|verification_timeout|verification_unstable>
    - summary: <one-line human-facing blocker summary>
    - evidence:
       - <file/path:line or concrete command output>
+      - <for verification_timeout/verification_unstable: the exact command, each attempt with its duration and outcome, and the repository-diff or environment-recovery evidence that justified each retry>
    - impact: <what cannot be completed>
    - prerequisite_owner: <team_or_role that owns the prerequisite>
    - unblock_condition: <verifiable condition whose satisfaction clears the wait>

@@ -58,6 +58,16 @@ pub struct CommandQueueConfig {
     /// spawned process group with SIGTERM → SIGKILL to prevent orphaned processes.
     #[allow(dead_code)]
     pub strict_process_cleanup: bool,
+
+    /// Absolute runtime limit for one command invocation (seconds).
+    /// 0 = disabled.
+    ///
+    /// Measured from successful child spawn. Output activity extends the
+    /// inactivity deadline only, so a command that keeps printing is still
+    /// bounded by this value.
+    #[allow(dead_code)]
+    // Used by execute_streaming_with_retry for absolute-runtime enforcement.
+    pub max_runtime_secs: u64,
 }
 
 impl From<&OrchestratorConfig> for CommandQueueConfig {
@@ -83,6 +93,7 @@ impl From<&OrchestratorConfig> for CommandQueueConfig {
             inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
             inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
             strict_process_cleanup: config.get_command_strict_process_cleanup(),
+            max_runtime_secs: config.get_command_max_runtime_secs(),
         }
     }
 }
@@ -728,6 +739,7 @@ mod tests {
             command_inactivity_kill_grace_secs: Some(16),
             command_inactivity_timeout_max_retries: Some(17),
             command_strict_process_cleanup: Some(false),
+            command_max_runtime_secs: Some(18),
             ..OrchestratorConfig::default()
         };
 
@@ -741,6 +753,7 @@ mod tests {
         assert_eq!(queue.inactivity_kill_grace_secs, 16);
         assert_eq!(queue.inactivity_timeout_max_retries, 17);
         assert!(!queue.strict_process_cleanup);
+        assert_eq!(queue.max_runtime_secs, 18);
 
         let defaults = CommandQueueConfig::from(&OrchestratorConfig::default());
         assert_eq!(defaults.stagger_delay_ms, DEFAULT_STAGGER_DELAY_MS);
@@ -767,6 +780,15 @@ mod tests {
             defaults.strict_process_cleanup,
             DEFAULT_COMMAND_STRICT_PROCESS_CLEANUP
         );
+        assert_eq!(defaults.max_runtime_secs, DEFAULT_COMMAND_MAX_RUNTIME_SECS);
+
+        // `0` is a configured value, not "unset": it must survive the
+        // conversion as the explicit disable it is.
+        let disabled = CommandQueueConfig::from(&OrchestratorConfig {
+            command_max_runtime_secs: Some(0),
+            ..OrchestratorConfig::default()
+        });
+        assert_eq!(disabled.max_runtime_secs, 0);
     }
 
     fn test_config() -> CommandQueueConfig {
@@ -783,6 +805,7 @@ mod tests {
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         }
     }
 
@@ -966,6 +989,7 @@ mod tests {
             inactivity_kill_grace_secs: 10,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let queue = CommandQueue::new(config);
 
@@ -1004,6 +1028,7 @@ mod tests {
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let queue = CommandQueue::new(config);
 
@@ -1054,6 +1079,7 @@ mod tests {
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let queue = CommandQueue::new(config);
 
@@ -1094,6 +1120,7 @@ mod tests {
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let queue = CommandQueue::new(config);
 
@@ -1132,6 +1159,7 @@ mod tests {
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let queue = CommandQueue::new(config);
 
@@ -1188,6 +1216,7 @@ mod tests {
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let queue = CommandQueue::new(config);
 
@@ -1232,6 +1261,7 @@ mod tests {
             inactivity_kill_grace_secs: 1,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         let queue = CommandQueue::new(config);
 

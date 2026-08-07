@@ -346,6 +346,245 @@ mod apply_completion_cleanup {
     }
 }
 
+/// The absolute per-invocation runtime limit, proven against real process groups.
+///
+/// The unit coverage in `src/` proves the deadline is computed from child spawn
+/// and that a disabled limit never resolves. These prove the half that only a
+/// real process can show: that a command which never stops *talking* is still
+/// stopped, that its owned group is actually empty afterwards, and that the
+/// reason it ended is reported as a boundary decision rather than as a crash the
+/// run could retry.
+///
+/// Every assertion path force-kills the group first, so a failure cannot leak a
+/// `sleep` into the test runner's process table.
+#[cfg(unix)]
+mod absolute_runtime_limit {
+    use conflux::ai_command_runner::{AiCommandRunner, OutputLine, RunCommandScope};
+    use conflux::config::OrchestratorConfig;
+    use conflux::process_manager::CommandTermination;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    /// A command that never stops emitting output and never exits.
+    ///
+    /// Output is what an inactivity timeout watches, so a group shaped like this
+    /// is invisible to every existing limit: only an absolute deadline can end it.
+    const CHATTY_FOREVER: &str = "while :; do echo tick; sleep 0.05; done";
+
+    /// The same, plus a descendant that ignores SIGTERM.
+    ///
+    /// Graceful termination alone cannot clear this group, so it distinguishes
+    /// "we signalled" from "we verified".
+    const CHATTY_FOREVER_SIGTERM_IMMUNE: &str =
+        "sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' >/dev/null 2>&1 </dev/null & \
+         while :; do echo tick; sleep 0.05; done";
+
+    /// Generous safety bound. Nothing asserts *when* the limit fires — only that
+    /// it does — so this exists purely to fail a hang instead of hanging CI.
+    const SAFETY: Duration = Duration::from_secs(60);
+
+    fn group_has_members(pgid: i32) -> bool {
+        unsafe { libc::killpg(pgid, 0) == 0 }
+    }
+
+    fn reap_and_report_survival(pgid: i32) -> bool {
+        let survived = group_has_members(pgid);
+        if survived {
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+        survived
+    }
+
+    /// A run-owned runner with the absolute limit set and every other lifecycle
+    /// limit disabled, so a terminated command is unambiguous evidence.
+    fn runner_with_limit(scope: &RunCommandScope, max_runtime_secs: u64) -> AiCommandRunner {
+        let config = OrchestratorConfig {
+            command_queue_stagger_delay_ms: Some(0),
+            command_queue_max_retries: Some(1),
+            command_queue_retry_delay_ms: Some(0),
+            // Disabled: only the absolute deadline may end these commands.
+            command_inactivity_timeout_secs: Some(0),
+            command_inactivity_timeout_max_retries: Some(0),
+            command_max_runtime_secs: Some(max_runtime_secs),
+            ..OrchestratorConfig::default()
+        };
+        AiCommandRunner::for_run(&config, Arc::new(Mutex::new(None)), scope.clone())
+    }
+
+    /// Wait until the leader PID is published, so the PGID is recorded before
+    /// anything can terminate it.
+    async fn wait_for_pgid(handle: &conflux::process_manager::StreamingChildHandle) -> i32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = handle.id() {
+                return pid as i32;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command never reported a real pid"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Continuous output cannot postpone the absolute deadline, and the owned
+    /// group is empty once it fires.
+    #[tokio::test]
+    async fn continuous_output_does_not_extend_the_absolute_deadline() {
+        let scope = RunCommandScope::new();
+        let runner = runner_with_limit(&scope, 1);
+
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry(CHATTY_FOREVER, None, Some("apply"), Some("change-a"))
+            .await
+            .expect("an open scope admits the command");
+        let pgid = wait_for_pgid(&handle).await;
+
+        // Drain so the runner task is never blocked on a full output channel:
+        // a command that cannot write is a command that stopped talking, which
+        // is the one thing this test must not accidentally arrange.
+        let mut lines = 0usize;
+        let drain = tokio::spawn(async move {
+            while let Some(line) = rx.recv().await {
+                if matches!(line, OutputLine::Stdout(_)) {
+                    lines += 1;
+                }
+            }
+            lines
+        });
+
+        let status = tokio::time::timeout(SAFETY, handle.wait())
+            .await
+            .expect("the absolute limit must end a command that never stops emitting output")
+            .expect("the runner publishes a final status");
+        let termination = handle.termination().await;
+        let cleanup = handle.process_group_cleanup().await;
+        let emitted = drain.await.expect("the drain task joins");
+
+        let survived = reap_and_report_survival(pgid);
+        assert!(
+            emitted > 0,
+            "arrangement failed: the command must have been emitting output"
+        );
+        assert!(
+            !status.success(),
+            "a command stopped by its runtime limit is not a success"
+        );
+        assert_eq!(
+            termination,
+            CommandTermination::RuntimeLimit,
+            "the reason must be the runtime limit, not an ordinary exit"
+        );
+        assert!(
+            !termination.permits_retry(),
+            "runtime-limit termination closes retry admission for the invocation"
+        );
+        assert!(
+            cleanup.is_confirmed(),
+            "the owned group must be proven quiescent: {}",
+            cleanup.diagnostics()
+        );
+        assert!(!survived, "process group {pgid} survived its runtime limit");
+    }
+
+    /// `0` is an explicit disable: total elapsed runtime alone never ends the
+    /// command, and cancellation stays independently effective.
+    #[tokio::test]
+    async fn zero_disables_the_absolute_deadline() {
+        let scope = RunCommandScope::new();
+        let runner = runner_with_limit(&scope, 0);
+
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry(CHATTY_FOREVER, None, Some("apply"), Some("change-a"))
+            .await
+            .expect("an open scope admits the command");
+        let pgid = wait_for_pgid(&handle).await;
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        // Long enough to be past any plausible accidental default, short enough
+        // to stay a bounded test. Nothing here asserts a duration threshold: the
+        // claim is that the command is *still alive*, which the group probe proves.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            group_has_members(pgid),
+            "a disabled deadline must not terminate the command"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), handle.wait())
+                .await
+                .is_err(),
+            "a disabled deadline must leave the invocation running"
+        );
+
+        // Explicit cancellation remains enforceable while the deadline is off.
+        handle.terminate().expect("cancellation is admissible");
+        let _ = tokio::time::timeout(SAFETY, handle.wait())
+            .await
+            .expect("cancellation must end the command");
+        let termination = handle.termination().await;
+        drain.await.expect("the drain task joins");
+
+        let survived = reap_and_report_survival(pgid);
+        assert_eq!(
+            termination,
+            CommandTermination::Cancelled,
+            "with the deadline disabled the command ends by cancellation, not by runtime limit"
+        );
+        assert!(!survived, "process group {pgid} survived cancellation");
+    }
+
+    /// Cleanup that cannot be proven is reported as unconfirmed, and the
+    /// invocation still admits no retry.
+    #[tokio::test]
+    async fn runtime_limit_without_provable_cleanup_reports_diagnostics() {
+        let scope = RunCommandScope::new();
+        let mut runner = runner_with_limit(&scope, 1);
+        // Zero verification budget: a SIGTERM-immune descendant can never be
+        // proven gone inside it.
+        runner.set_process_group_cleanup_timeout_ms(0);
+
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry(
+                CHATTY_FOREVER_SIGTERM_IMMUNE,
+                None,
+                Some("apply"),
+                Some("change-a"),
+            )
+            .await
+            .expect("an open scope admits the command");
+        let pgid = wait_for_pgid(&handle).await;
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let _ = tokio::time::timeout(SAFETY, handle.wait())
+            .await
+            .expect("the absolute limit must still end the invocation");
+        let termination = handle.termination().await;
+        let cleanup = handle.process_group_cleanup().await;
+        drain.await.expect("the drain task joins");
+
+        reap_and_report_survival(pgid);
+        assert_eq!(
+            termination,
+            CommandTermination::RuntimeLimit,
+            "the reason stays the runtime limit even when cleanup is unprovable"
+        );
+        assert!(
+            !termination.permits_retry(),
+            "no retry may be admitted for an invocation stopped by its runtime limit"
+        );
+        assert!(
+            !cleanup.is_confirmed(),
+            "an unswept group must never be acknowledged as terminated: {}",
+            cleanup.diagnostics()
+        );
+        assert!(
+            !cleanup.diagnostics().is_empty(),
+            "unconfirmed cleanup must carry actionable diagnostics"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_process_group_isolation() {

@@ -377,6 +377,15 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub command_inactivity_timeout_max_retries: Option<u32>,
 
+    /// Absolute runtime limit for one AI command invocation (seconds).
+    ///
+    /// Measured from successful child spawn and evaluated independently of the
+    /// inactivity timeout: stdout/stderr activity extends the inactivity
+    /// deadline only, never this one. `0` disables it.
+    /// Default: 3600 (1 hour)
+    #[serde(default)]
+    pub command_max_runtime_secs: Option<u64>,
+
     /// Enable stream-json output textification.
     /// When true (default), stdout lines that are Claude Code stream-json (NDJSON) events
     /// are converted to human-readable text before being emitted to logs.
@@ -601,6 +610,7 @@ impl OrchestratorConfig {
             command_inactivity_timeout_secs,
             command_inactivity_kill_grace_secs,
             command_inactivity_timeout_max_retries,
+            command_max_runtime_secs,
             stream_json_textify,
             command_strict_process_cleanup,
             lifecycle_integration,
@@ -701,6 +711,7 @@ impl OrchestratorConfig {
             &mut self.command_inactivity_timeout_max_retries,
             command_inactivity_timeout_max_retries,
         );
+        overwrite_if_some(&mut self.command_max_runtime_secs, command_max_runtime_secs);
         overwrite_if_some(&mut self.stream_json_textify, stream_json_textify);
         overwrite_if_some(
             &mut self.command_strict_process_cleanup,
@@ -975,6 +986,16 @@ impl OrchestratorConfig {
     pub fn get_command_inactivity_timeout_max_retries(&self) -> u32 {
         self.command_inactivity_timeout_max_retries
             .unwrap_or(defaults::DEFAULT_COMMAND_INACTIVITY_TIMEOUT_MAX_RETRIES)
+    }
+
+    /// Get the absolute runtime limit for one AI command invocation (seconds).
+    ///
+    /// Returns 0 when disabled. Default: 3600 (1 hour). The value is independent
+    /// of [`Self::get_command_inactivity_timeout_secs`]: output activity resets
+    /// the inactivity deadline only.
+    pub fn get_command_max_runtime_secs(&self) -> u64 {
+        self.command_max_runtime_secs
+            .unwrap_or(defaults::DEFAULT_COMMAND_MAX_RUNTIME_SECS)
     }
 
     /// Get whether stream-json output textification is enabled.

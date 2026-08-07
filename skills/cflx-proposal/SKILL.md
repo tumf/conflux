@@ -525,6 +525,50 @@ When a gate is delegated, say so once in the proposal (for example under
 `Out of Scope` or the verification plan) naming the tracked hook that owns it,
 so a reviewer can check the same evidence.
 
+## Apply-Blocking Verification Must Be Bounded and Repository-Local
+
+An active checkbox task is work Apply must finish inside one bounded invocation.
+Conflux enforces an absolute runtime limit on that invocation
+(`command_max_runtime_secs`, default 3600s), so a checkbox that requires a gate
+Apply cannot finish does not produce late evidence — it produces a terminated
+command and no evidence at all.
+
+**Keep Apply-blocking verification bounded to one direct execution by default.**
+Name exactly one rerun command per verification. Never write a checkbox whose
+only purpose is repeated execution of the same command ("run the suite three
+times", "confirm stability", "verify it is not flaky"). Stability repetition is
+not verification planning; it is an unbounded loop with a task number.
+
+**These gates are NOT Apply-blocking checkbox work**, because none of them can be
+guaranteed to complete inside one bounded repository-local invocation:
+
+| Gate | Assign ownership to |
+| --- | --- |
+| Docker / container orchestration suites | repository automation (CI) or Acceptance |
+| Database or data-migration suites needing a real server | repository automation or Acceptance |
+| `heavy`-marked or full repository-wide long-running suites | repository automation or Acceptance |
+| Credentialed or networked external-service checks | Acceptance or operational observation |
+| Deployed-service, staging, or production checks | operational observation (`post-integration`) |
+| Physical-device or hardware-in-the-loop checks | manual, with a named owner |
+| External approval or human sign-off | narrative `## Future Work` (no checkbox) |
+
+Give each one a structured `verifications:` entry with its own `phase`, `owner`,
+`trigger`, `rerun`, `execution_class`, and `completion_role`. Do not omit it, and
+do not bury it in task prose where it would silently become Apply's problem.
+
+**Exception — a bounded repository-local path may block completion.** When the
+same requirement can be proven by a local fixture, fake, in-memory double, or
+testcontainer-free harness that completes in one direct command, declare *that*
+as `pre-integration`, `repository-local`, and `change-blocking`, and attach it to
+the implementation task. The heavy suite keeps its own separate non-blocking
+ownership. This is the preferred shape: requirement-specific bounded proof
+blocks the change, and the broad suite guards the integration.
+
+**Never hide a non-local outcome in task prose.** If the outcome needs
+credentials, a deployment, hardware, or an approval, it does not become
+Apply-blocking by being phrased as "verify that ...". Move it to its structured
+verification owner or to narrative Future Work.
+
 ## Task Classification
 
 **AI-Executable Tasks** (include with checkbox):

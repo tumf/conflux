@@ -103,6 +103,23 @@ pub enum OrchestratorError {
         change_id: String,
         workspace: String,
     },
+
+    /// An owned command was terminated by its absolute runtime limit.
+    ///
+    /// Typed rather than an ordinary non-zero exit because the exit status of a
+    /// SIGKILLed agent is indistinguishable from a crash. A crash is retryable
+    /// evidence; this is a boundary decision, and retrying it in the same run
+    /// would re-run exactly the work the limit just stopped.
+    #[error(
+        "{operation} for '{change_id}' in workspace '{workspace}' was terminated by its \
+         absolute runtime limit of {limit_secs}s; this invocation is not retried in this run"
+    )]
+    RuntimeLimit {
+        operation: String,
+        change_id: String,
+        workspace: String,
+        limit_secs: u64,
+    },
 }
 
 impl OrchestratorError {
@@ -119,10 +136,45 @@ impl OrchestratorError {
         }
     }
 
+    /// An owned command stopped by its absolute runtime limit.
+    pub fn runtime_limit(
+        operation: impl Into<String>,
+        change_id: impl Into<String>,
+        workspace: &std::path::Path,
+        limit_secs: u64,
+    ) -> Self {
+        OrchestratorError::RuntimeLimit {
+            operation: operation.into(),
+            change_id: change_id.into(),
+            workspace: workspace.display().to_string(),
+            limit_secs,
+        }
+    }
+
     /// True when this error is an explicit operator/queue cancellation rather
     /// than a failure.
     pub fn is_cancellation(&self) -> bool {
         matches!(self, OrchestratorError::Cancelled { .. })
+    }
+
+    /// True when this error is absolute-runtime-limit termination.
+    ///
+    /// Kept separate from [`Self::is_cancellation`] so an operator stop and a
+    /// runaway command that Conflux stopped by itself stay distinguishable in
+    /// reporting, even though neither may be retried in the same run.
+    #[allow(dead_code)] // Read by apply-interruption coverage, not by the binary.
+    pub fn is_runtime_limit(&self) -> bool {
+        matches!(self, OrchestratorError::RuntimeLimit { .. })
+    }
+
+    /// True when a boundary deliberately terminated the invocation.
+    ///
+    /// A deliberate termination is a decision, not a transient failure: the run
+    /// may report it and stop, but it must never turn it back into another
+    /// dispatch of the same work.
+    #[allow(dead_code)] // Read by apply-interruption coverage, not by the binary.
+    pub fn is_terminal_interruption(&self) -> bool {
+        self.is_cancellation() || self.is_runtime_limit()
     }
 }
 

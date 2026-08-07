@@ -258,6 +258,269 @@ pub(crate) fn evaluate_process_group_barrier(
     )))
 }
 
+/// Why an active Apply invocation stopped before it could finish its work.
+///
+/// Both variants are boundary decisions rather than command failures, so both
+/// share the same termination sequence and neither may be turned back into a
+/// dispatch of the same work inside the active run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyInterruption {
+    /// Operator stop, run cancellation, or TUI shutdown.
+    Cancelled,
+    /// The absolute runtime limit expired for this invocation.
+    RuntimeLimit { limit_secs: u64 },
+}
+
+impl ApplyInterruption {
+    /// Short stable token for logs and diagnostics.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::RuntimeLimit { .. } => "runtime_limit",
+        }
+    }
+
+    /// The typed terminal error this interruption returns to the run boundary.
+    fn terminal_error(self, change_id: &str, workspace_path: &Path) -> OrchestratorError {
+        match self {
+            Self::Cancelled => OrchestratorError::cancelled("apply", change_id, workspace_path),
+            Self::RuntimeLimit { limit_secs } => {
+                OrchestratorError::runtime_limit("apply", change_id, workspace_path, limit_secs)
+            }
+        }
+    }
+}
+
+/// What the managed worktree looked like when the interruption was observed.
+///
+/// Separated from the read itself so the preservation decision is verifiable
+/// without a repository: the decision is the part that can be wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorktreeDirtiness {
+    /// Staged, unstaged, or untracked entries exist and would be lost.
+    Dirty,
+    /// Nothing is left in the worktree that a snapshot could preserve.
+    Clean,
+    /// The status query itself failed, so dirtiness is unknown.
+    Unreadable,
+}
+
+/// Classify an interrupted worktree from one porcelain status read.
+///
+/// Every porcelain entry counts, not only the unstaged and untracked ones the
+/// finalization stage gate cares about: an interrupted Apply that staged its
+/// work and never got to commit has real progress to preserve, and the run is
+/// ending either way, so there is no later iteration that could pick it up.
+pub(crate) fn classify_interrupted_worktree(porcelain: &str) -> WorktreeDirtiness {
+    if porcelain.trim().is_empty() {
+        WorktreeDirtiness::Clean
+    } else {
+        WorktreeDirtiness::Dirty
+    }
+}
+
+/// The one repository action an interrupted Apply is allowed to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptedApplyPlan {
+    /// Cleanup was not proven quiescent: no owned Git work may start at all.
+    RefuseUnconfirmedCleanup,
+    /// Preserve the dirty worktree with one WIP snapshot.
+    Snapshot,
+    /// There is nothing to preserve; return the terminal outcome directly.
+    NothingToPreserve,
+}
+
+/// Decide what an interrupted Apply does, from evidence alone.
+///
+/// Ordering is the invariant this encodes: quiescence outranks preservation,
+/// because a snapshot that races a surviving descendant can commit a
+/// half-written worktree or fail on a held `index.lock`. An unreadable status is
+/// treated as dirty rather than clean — refusing to snapshot on a failed read
+/// would silently discard the very progress this path exists to keep, and the
+/// snapshot itself is harmless when there turns out to be nothing to record.
+pub(crate) fn plan_interrupted_apply(
+    cleanup_confirmed: bool,
+    snapshot_supported: bool,
+    dirtiness: WorktreeDirtiness,
+) -> InterruptedApplyPlan {
+    if !cleanup_confirmed {
+        return InterruptedApplyPlan::RefuseUnconfirmedCleanup;
+    }
+    if !snapshot_supported {
+        return InterruptedApplyPlan::NothingToPreserve;
+    }
+    match dirtiness {
+        WorktreeDirtiness::Dirty | WorktreeDirtiness::Unreadable => InterruptedApplyPlan::Snapshot,
+        WorktreeDirtiness::Clean => InterruptedApplyPlan::NothingToPreserve,
+    }
+}
+
+/// Read the interrupted worktree's dirtiness.
+///
+/// Non-Git backends have no snapshot path at all, so they never reach here.
+async fn read_interrupted_worktree_dirtiness(
+    workspace_path: &Path,
+    change_id: &str,
+) -> WorktreeDirtiness {
+    match crate::vcs::git::commands::porcelain_status(workspace_path).await {
+        Ok(porcelain) => classify_interrupted_worktree(&porcelain),
+        Err(error) => {
+            warn!(
+                change_id = change_id,
+                workspace = %workspace_path.display(),
+                error = %error,
+                "Could not read the interrupted workspace status; attempting the WIP snapshot \
+                 anyway rather than risk discarding unpreserved Apply progress"
+            );
+            WorktreeDirtiness::Unreadable
+        }
+    }
+}
+
+/// Terminate, prove quiescence, preserve progress, and return the typed
+/// terminal outcome for an interrupted Apply invocation.
+///
+/// This is the single sequence shared by operator cancellation, TUI external
+/// shutdown, and absolute-runtime-limit expiry. It never returns `Ok`: an
+/// interrupted Apply always ends the active run, and the returned error is what
+/// the run boundary reports.
+///
+/// Failure is never reported as successful preservation. A group that cannot be
+/// proven quiescent returns the barrier error with no repository mutation
+/// attempted; a snapshot that fails returns snapshot diagnostics and leaves the
+/// worktree and index exactly as the agent left them, so the files stay
+/// recoverable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn preserve_interrupted_apply_progress(
+    interruption: ApplyInterruption,
+    child: &mut crate::process_manager::StreamingChildHandle,
+    workspace_manager: Option<&dyn WorkspaceManager>,
+    is_git: bool,
+    workspace_path: &Path,
+    change_id: &str,
+    progress_at_dispatch: &TaskProgress,
+    iteration: u32,
+) -> OrchestratorError {
+    warn!(
+        change_id = change_id,
+        iteration = iteration,
+        interruption = interruption.as_str(),
+        workspace = %workspace_path.display(),
+        "Apply interrupted; terminating the owned process group before touching the repository"
+    );
+
+    // Step 1-5 of the unified termination sequence: signal the runner, then wait
+    // for its typed cleanup evidence. The runner owns SIGTERM/SIGKILL
+    // escalation, so this awaits proof rather than re-implementing it.
+    let _ = child.terminate();
+    let cleanup_report = child.process_group_cleanup().await;
+
+    let snapshot_supported = is_git && workspace_manager.is_some();
+    let plan = if cleanup_report.is_confirmed() && snapshot_supported {
+        plan_interrupted_apply(
+            true,
+            true,
+            read_interrupted_worktree_dirtiness(workspace_path, change_id).await,
+        )
+    } else {
+        // No status read is attempted when the plan cannot depend on it: a
+        // worktree with surviving descendants must not even be inspected as if
+        // finalization were about to start.
+        plan_interrupted_apply(
+            cleanup_report.is_confirmed(),
+            snapshot_supported,
+            WorktreeDirtiness::Clean,
+        )
+    };
+
+    match plan {
+        InterruptedApplyPlan::RefuseUnconfirmedCleanup => {
+            warn!(
+                change_id = change_id,
+                iteration = iteration,
+                interruption = interruption.as_str(),
+                quiescence = cleanup_report.quiescence().as_str(),
+                "Interrupted Apply could not prove process-group quiescence; no WIP snapshot was \
+                 attempted and the workspace is left untouched"
+            );
+            match evaluate_process_group_barrier(
+                &cleanup_report,
+                change_id,
+                workspace_path,
+                iteration,
+            ) {
+                Err(barrier_error) => barrier_error,
+                // Unreachable in practice: the barrier and the plan read the
+                // same evidence. Reporting the terminal outcome is still the
+                // honest fallback — it never claims preservation happened.
+                Ok(()) => interruption.terminal_error(change_id, workspace_path),
+            }
+        }
+        InterruptedApplyPlan::NothingToPreserve => {
+            debug!(
+                change_id = change_id,
+                iteration = iteration,
+                interruption = interruption.as_str(),
+                "Interrupted Apply had no unpreserved workspace progress to snapshot"
+            );
+            interruption.terminal_error(change_id, workspace_path)
+        }
+        InterruptedApplyPlan::Snapshot => {
+            let ws_mgr = workspace_manager.expect("snapshot_supported implies a workspace manager");
+            // Progress is re-read after quiescence so the snapshot message
+            // reports what the interrupted agent actually left behind rather
+            // than what `tasks.md` said before it started.
+            let progress = check_task_progress(workspace_path, change_id)
+                .unwrap_or_else(|_| progress_at_dispatch.clone());
+            // No cancellation token: the token that caused this interruption is
+            // already cancelled, and passing it would abort the very snapshot
+            // that exists to preserve the work.
+            match create_progress_commit(
+                ws_mgr,
+                workspace_path,
+                change_id,
+                &progress,
+                iteration,
+                None,
+            )
+            .await
+            {
+                Ok(()) => {
+                    info!(
+                        change_id = change_id,
+                        iteration = iteration,
+                        interruption = interruption.as_str(),
+                        completed = progress.completed,
+                        total = progress.total,
+                        "Preserved interrupted Apply progress in a WIP snapshot"
+                    );
+                    interruption.terminal_error(change_id, workspace_path)
+                }
+                Err(snapshot_error) => {
+                    error!(
+                        change_id = change_id,
+                        iteration = iteration,
+                        interruption = interruption.as_str(),
+                        workspace = %workspace_path.display(),
+                        error = %snapshot_error,
+                        "Could not preserve interrupted Apply progress; the workspace and index \
+                         contents are left in place for recovery"
+                    );
+                    OrchestratorError::AgentCommand(format!(
+                        "Apply for '{}' in workspace '{}' was interrupted ({}) and its progress \
+                         could not be preserved: {}. The workspace and index contents were left \
+                         untouched for recovery; commit or stash them before retrying apply.",
+                        change_id,
+                        workspace_path.display(),
+                        interruption.as_str(),
+                        snapshot_error
+                    ))
+                }
+            }
+        }
+    }
+}
+
 /// Which completion conditions may arm the completion grace for one dispatched
 /// Apply command.
 ///
@@ -1808,13 +2071,15 @@ where
         // reserves its own attempt number.
         let attempts_so_far = budget.attempts(change_id);
 
-        // Check cancellation
+        // Check cancellation. No dispatch has started for this iteration, so
+        // there is no owned process group to prove quiescent and no unpreserved
+        // agent progress: the previous iteration's snapshot already ran.
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
-            return Err(OrchestratorError::AgentCommand(format!(
-                "Cancelled apply for '{}' in workspace '{}'",
+            return Err(OrchestratorError::cancelled(
+                "apply",
                 change_id,
-                workspace_path.display()
-            )));
+                workspace_path,
+            ));
         }
 
         ensure_runtime_acceptance_follow_up(workspace_path, change_id, agent)?;
@@ -2108,6 +2373,11 @@ where
         let mut completion_kind: Option<ApplyCompletionKind> = None;
         let mut completion_deadline: Option<tokio::time::Instant> = None;
         let mut early_terminated = false;
+        // Set when a boundary decision — not the command itself — ended this
+        // dispatch. It routes past every retry, stall, and finalization branch
+        // to the one interruption sequence, so an operator stop and a runtime
+        // limit can never be mistaken for an ordinary failed attempt.
+        let mut interruption: Option<ApplyInterruption> = None;
         let mut next_check_at = tokio::time::Instant::now() + check_interval;
 
         loop {
@@ -2143,10 +2413,10 @@ where
                             change_id = change_id,
                             iteration = iteration,
                             workspace = %workspace_path.display(),
-                            "Apply cancellation observed while waiting for streaming output; terminating child"
+                            "Apply cancellation observed while waiting for streaming output; \
+                             entering the interruption sequence"
                         );
-                        let _ = child.terminate();
-                        early_terminated = true;
+                        interruption = Some(ApplyInterruption::Cancelled);
                         break;
                     }
                     result = tokio::time::timeout_at(wait_deadline, rx.recv()) => result,
@@ -2212,23 +2482,27 @@ where
         // Wait for child process. After an early grace-driven terminate this
         // returns the signalled exit status, which is success-equivalent only
         // when we observed a completion condition (see below).
-        let status = if let Some(token) = cancel_token {
+        //
+        // An interruption already observed above skips the wait entirely: the
+        // interruption sequence signals the runner itself and awaits its typed
+        // cleanup evidence, and there is no exit status this loop could still
+        // act on.
+        let status = if interruption.is_some() {
+            None
+        } else if let Some(token) = cancel_token {
             tokio::select! {
                 _ = token.cancelled() => {
                     warn!(
                         change_id = change_id,
                         iteration = iteration,
                         workspace = %workspace_path.display(),
-                        "Apply cancellation observed while waiting for child status; terminating child"
+                        "Apply cancellation observed while waiting for child status; \
+                         entering the interruption sequence"
                     );
-                    let _ = child.terminate();
-                    return Err(OrchestratorError::AgentCommand(format!(
-                        "Cancelled apply for '{}' in workspace '{}'",
-                        change_id,
-                        workspace_path.display()
-                    )));
+                    interruption = Some(ApplyInterruption::Cancelled);
+                    None
                 }
-                status = child.wait() => status.map_err(|e| {
+                status = child.wait() => Some(status.map_err(|e| {
                     OrchestratorError::AgentCommand(format!(
                         "Failed to wait for apply command for '{}' in workspace '{}' (iteration {}): {}",
                         change_id,
@@ -2236,10 +2510,10 @@ where
                         iteration,
                         e
                     ))
-                })?,
+                })?),
             }
         } else {
-            child.wait().await.map_err(|e| {
+            Some(child.wait().await.map_err(|e| {
                 OrchestratorError::AgentCommand(format!(
                     "Failed to wait for apply command for '{}' in workspace '{}' (iteration {}): {}",
                     change_id,
@@ -2247,16 +2521,44 @@ where
                     iteration,
                     e
                 ))
-            })?
+            })?)
         };
 
-        if cancel_token.is_some_and(|token| token.is_cancelled()) {
-            return Err(OrchestratorError::AgentCommand(format!(
-                "Cancelled apply for '{}' in workspace '{}'",
-                change_id,
-                workspace_path.display()
-            )));
+        if interruption.is_none() && cancel_token.is_some_and(|token| token.is_cancelled()) {
+            interruption = Some(ApplyInterruption::Cancelled);
         }
+
+        // Absolute runtime limit. A SIGKILLed agent reports the same non-zero
+        // status a crash does, so the reason is read from the runner's typed
+        // termination rather than inferred from the exit code. Cancellation
+        // already observed above keeps precedence: the operator's stop is the
+        // more specific fact about why this invocation ended.
+        if interruption.is_none() {
+            let termination = child.termination().await;
+            if termination.is_runtime_limit() {
+                interruption = Some(ApplyInterruption::RuntimeLimit {
+                    limit_secs: config.get_command_max_runtime_secs(),
+                });
+            }
+        }
+
+        if let Some(interruption) = interruption {
+            return Err(preserve_interrupted_apply_progress(
+                interruption,
+                &mut child,
+                workspace_manager,
+                is_git,
+                workspace_path,
+                change_id,
+                &progress,
+                iteration,
+            )
+            .await);
+        }
+
+        // Past the interruption gate every remaining branch acts on a real exit
+        // status, so the `Option` is discharged once here rather than at each use.
+        let status = status.expect("a non-interrupted dispatch always has an exit status");
 
         // Completion-finalized run: non-zero exit produced by our own terminate
         // after observing tasks-complete or blocked-handoff. Only this path is
@@ -2931,6 +3233,460 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// What an interrupted Apply owes the operator.
+    ///
+    /// An Apply that is cancelled or stopped by its runtime limit has usually
+    /// already changed the managed worktree. Nothing downstream will pick that
+    /// work up — the run is ending — so if this path returns before preserving
+    /// it, the next process sees a workspace that looks like a first attempt and
+    /// the agent's work is silently redone. These tests pin the two invariants
+    /// that make that impossible: quiescence is proven before any repository
+    /// mutation, and a failure to preserve is never reported as preservation.
+    mod interrupted_apply {
+        use super::*;
+        use crate::process_manager::{
+            CommandTermination, ProcessGroupCleanupReport, ProcessGroupQuiescence,
+            StreamingChildHandle,
+        };
+
+        fn exit_status(code: i32) -> std::process::ExitStatus {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(code << 8)
+            }
+            #[cfg(not(unix))]
+            {
+                use std::os::windows::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(code as u32)
+            }
+        }
+
+        fn confirmed_cleanup() -> ProcessGroupCleanupReport {
+            ProcessGroupCleanupReport::for_test(
+                ProcessGroupQuiescence::Confirmed,
+                Some(4242),
+                "no owned members remain",
+            )
+        }
+
+        fn surviving_cleanup() -> ProcessGroupCleanupReport {
+            ProcessGroupCleanupReport::for_test(
+                ProcessGroupQuiescence::MembersRemain,
+                Some(4242),
+                "cleanup budget expired with members remaining",
+            )
+        }
+
+        fn interrupted_child(cleanup: ProcessGroupCleanupReport) -> StreamingChildHandle {
+            StreamingChildHandle::for_test(cleanup, CommandTermination::Cancelled, exit_status(1))
+        }
+
+        // -- The porcelain classification ---------------------------------
+
+        /// Staged work counts. The finalization stage gate deliberately ignores
+        /// staged entries, because a later iteration commits them — but there is
+        /// no later iteration here, so treating "staged" as "clean" would throw
+        /// the work away.
+        #[test]
+        fn every_kind_of_leftover_work_counts_as_dirty() {
+            for (label, porcelain) in [
+                ("staged", "M  src/lib.rs\n"),
+                ("unstaged", " M src/lib.rs\n"),
+                ("untracked", "?? src/new.rs\n"),
+                ("staged and re-edited", "MM src/lib.rs\n"),
+                ("added", "A  src/added.rs\n"),
+                ("mixed", "M  src/lib.rs\n M src/other.rs\n?? src/new.rs\n"),
+            ] {
+                assert_eq!(
+                    classify_interrupted_worktree(porcelain),
+                    WorktreeDirtiness::Dirty,
+                    "{label} progress must be preserved"
+                );
+            }
+        }
+
+        #[test]
+        fn an_empty_status_is_clean() {
+            for porcelain in ["", "\n", "   \n"] {
+                assert_eq!(
+                    classify_interrupted_worktree(porcelain),
+                    WorktreeDirtiness::Clean
+                );
+            }
+        }
+
+        // -- The plan ------------------------------------------------------
+
+        /// Quiescence outranks preservation. A snapshot taken while a descendant
+        /// is still running can commit a half-written tree or fail on a held
+        /// `index.lock`, so an unproven group refuses the snapshot outright — no
+        /// matter how much work is sitting in the worktree.
+        #[test]
+        fn unproven_cleanup_refuses_the_snapshot_however_dirty_the_worktree_is() {
+            for dirtiness in [
+                WorktreeDirtiness::Dirty,
+                WorktreeDirtiness::Clean,
+                WorktreeDirtiness::Unreadable,
+            ] {
+                assert_eq!(
+                    plan_interrupted_apply(false, true, dirtiness),
+                    InterruptedApplyPlan::RefuseUnconfirmedCleanup,
+                    "{dirtiness:?} must not authorize repository mutation"
+                );
+            }
+        }
+
+        #[test]
+        fn a_quiescent_dirty_worktree_is_snapshotted() {
+            assert_eq!(
+                plan_interrupted_apply(true, true, WorktreeDirtiness::Dirty),
+                InterruptedApplyPlan::Snapshot
+            );
+        }
+
+        /// A failed status read is not evidence of a clean worktree. Skipping the
+        /// snapshot on an unreadable status would discard exactly the progress
+        /// this path exists to keep, while an unnecessary snapshot costs nothing.
+        #[test]
+        fn an_unreadable_status_still_snapshots() {
+            assert_eq!(
+                plan_interrupted_apply(true, true, WorktreeDirtiness::Unreadable),
+                InterruptedApplyPlan::Snapshot
+            );
+        }
+
+        #[test]
+        fn a_clean_quiescent_worktree_has_nothing_to_preserve() {
+            assert_eq!(
+                plan_interrupted_apply(true, true, WorktreeDirtiness::Clean),
+                InterruptedApplyPlan::NothingToPreserve
+            );
+        }
+
+        /// A wiring with no snapshot path (non-Git, or no workspace manager)
+        /// still reaches a terminal outcome rather than pretending to preserve.
+        #[test]
+        fn a_wiring_without_a_snapshot_path_preserves_nothing() {
+            for dirtiness in [WorktreeDirtiness::Dirty, WorktreeDirtiness::Clean] {
+                assert_eq!(
+                    plan_interrupted_apply(true, false, dirtiness),
+                    InterruptedApplyPlan::NothingToPreserve
+                );
+            }
+        }
+
+        // -- The terminal outcome -------------------------------------------
+
+        /// Cancellation and runtime-limit expiry are both boundary decisions,
+        /// and both must be distinguishable from an ordinary crash so no caller
+        /// turns either back into another dispatch of the same work.
+        #[tokio::test]
+        async fn both_interruptions_return_typed_non_retryable_outcomes() {
+            let workspace = Path::new("/tmp/managed-workspace");
+
+            let mut child = interrupted_child(confirmed_cleanup());
+            let cancelled = preserve_interrupted_apply_progress(
+                ApplyInterruption::Cancelled,
+                &mut child,
+                None,
+                false,
+                workspace,
+                "change-a",
+                &TaskProgress::new(),
+                2,
+            )
+            .await;
+            assert!(cancelled.is_cancellation(), "got: {cancelled}");
+            assert!(!cancelled.is_runtime_limit());
+            assert!(cancelled.is_terminal_interruption());
+
+            let mut child = interrupted_child(confirmed_cleanup());
+            let limited = preserve_interrupted_apply_progress(
+                ApplyInterruption::RuntimeLimit { limit_secs: 3600 },
+                &mut child,
+                None,
+                false,
+                workspace,
+                "change-a",
+                &TaskProgress::new(),
+                2,
+            )
+            .await;
+            assert!(limited.is_runtime_limit(), "got: {limited}");
+            assert!(
+                !limited.is_cancellation(),
+                "an operator stop and a runaway command must stay distinguishable"
+            );
+            assert!(limited.is_terminal_interruption());
+            assert!(
+                limited.to_string().contains("3600"),
+                "the limit that fired must be named: {limited}"
+            );
+        }
+
+        /// Unprovable cleanup returns the barrier's own diagnostics, and never
+        /// the interruption outcome — the operator has to be able to tell "we
+        /// stopped cleanly" from "we could not confirm anything stopped".
+        #[tokio::test]
+        async fn unprovable_cleanup_returns_actionable_diagnostics() {
+            let mut child = interrupted_child(surviving_cleanup());
+            let error = preserve_interrupted_apply_progress(
+                ApplyInterruption::Cancelled,
+                &mut child,
+                None,
+                false,
+                Path::new("/tmp/managed-workspace"),
+                "change-a",
+                &TaskProgress::new(),
+                3,
+            )
+            .await;
+
+            let rendered = error.to_string();
+            assert!(
+                !error.is_terminal_interruption(),
+                "an unprovable cleanup is not a clean stop: {rendered}"
+            );
+            assert!(
+                rendered.contains("cleanup could not be confirmed"),
+                "the failure must name what could not be proven: {rendered}"
+            );
+            assert!(
+                rendered.contains("members_remain"),
+                "the evidence must travel with the error: {rendered}"
+            );
+        }
+    }
+
+    /// What a *restart* sees after an interruption.
+    ///
+    /// The tests above pin the decision; these pin the repository outcome that
+    /// decision produces, against a real Git worktree and the real workspace
+    /// manager. That boundary is the point: the claim is not "we called
+    /// snapshot", it is "a new process, with no logs and no retained state, can
+    /// still find the interrupted agent's work and continue from it".
+    ///
+    /// Evidence class: integration-shaped (real Git), kept in this module
+    /// because it is the Apply interruption contract it verifies.
+    #[cfg(unix)]
+    mod interrupted_apply_restart {
+        use super::*;
+        use crate::process_manager::{
+            CommandTermination, ProcessGroupCleanupReport, ProcessGroupQuiescence,
+            StreamingChildHandle,
+        };
+        use crate::vcs::GitWorkspaceManager;
+
+        fn git_out(repo: &Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+
+        fn quiescent_child() -> StreamingChildHandle {
+            let status = {
+                use std::os::unix::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(1 << 8)
+            };
+            StreamingChildHandle::for_test(
+                ProcessGroupCleanupReport::for_test(
+                    ProcessGroupQuiescence::Confirmed,
+                    Some(4242),
+                    "no owned members remain",
+                ),
+                CommandTermination::Cancelled,
+                status,
+            )
+        }
+
+        fn workspace_manager(repo: &Path) -> GitWorkspaceManager {
+            GitWorkspaceManager::new(
+                repo.to_path_buf(),
+                repo.to_path_buf(),
+                1,
+                OrchestratorConfig::default(),
+            )
+        }
+
+        /// Arrange a worktree that holds one of each kind of unpreserved work,
+        /// which is what an interrupted agent actually leaves behind.
+        fn arrange_interrupted_worktree(workspace: &Path, change_id: &str) {
+            init_git_repo(workspace);
+
+            let change_dir = workspace.join("openspec").join("changes").join(change_id);
+            std::fs::create_dir_all(&change_dir).unwrap();
+            std::fs::write(
+                change_dir.join("tasks.md"),
+                "## Implementation Tasks\n- [x] first\n- [ ] second\n- [ ] third\n",
+            )
+            .unwrap();
+
+            // Staged: the agent ran `git add` and never reached a commit.
+            std::fs::write(workspace.join("staged.rs"), "staged work\n").unwrap();
+            stage_all(workspace);
+
+            // Unstaged: an edit to a tracked file after that staging.
+            std::fs::write(workspace.join("README.md"), "edited by the agent\n").unwrap();
+            // Untracked: a brand new file the agent never staged.
+            std::fs::write(workspace.join("untracked.rs"), "untracked work\n").unwrap();
+        }
+
+        /// Staged, unstaged, and untracked progress all reach the WIP commit,
+        /// and the worktree comes back clean — so nothing is left to be lost.
+        #[tokio::test]
+        async fn interruption_preserves_staged_unstaged_and_untracked_progress() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            let change_id = "interrupted-change";
+            arrange_interrupted_worktree(workspace, change_id);
+
+            let manager = workspace_manager(workspace);
+            let mut child = quiescent_child();
+
+            let error = preserve_interrupted_apply_progress(
+                ApplyInterruption::Cancelled,
+                &mut child,
+                Some(&manager),
+                true,
+                workspace,
+                change_id,
+                &TaskProgress::new(),
+                4,
+            )
+            .await;
+
+            assert!(
+                error.is_cancellation(),
+                "the interruption still ends the run: {error}"
+            );
+
+            // Every kind of leftover work is in the commit.
+            let committed = git_out(workspace, &["show", "--name-only", "--format=", "HEAD"]);
+            for path in [
+                "staged.rs",
+                "README.md",
+                "untracked.rs",
+                "openspec/changes/interrupted-change/tasks.md",
+            ] {
+                assert!(
+                    committed.contains(path),
+                    "the WIP snapshot must contain {path}, got:\n{committed}"
+                );
+            }
+            assert_eq!(
+                git_out(workspace, &["show", "HEAD:untracked.rs"]),
+                "untracked work\n",
+                "content, not just the path, must survive"
+            );
+            assert_eq!(
+                git_out(workspace, &["show", "HEAD:README.md"]),
+                "edited by the agent\n",
+                "the unstaged edit must be the version that survived"
+            );
+
+            // Nothing is left behind that a later step could still drop.
+            assert!(
+                git_out(workspace, &["status", "--porcelain"])
+                    .trim()
+                    .is_empty(),
+                "the preserved worktree must be clean afterwards"
+            );
+
+            // The snapshot is an ordinary workspace-local WIP commit — no
+            // marker, no counter, nothing persisted outside Git.
+            let subject = git_out(workspace, &["log", "-1", "--format=%s"]);
+            assert!(
+                subject.starts_with(&format!("WIP: {change_id} (")),
+                "the snapshot keeps the existing WIP identity: {subject}"
+            );
+            assert!(
+                subject.contains("apply#4"),
+                "the interrupted iteration is recorded: {subject}"
+            );
+        }
+
+        /// A fresh process derives Apply continuation from the workspace alone.
+        ///
+        /// The environment is stripped down to what a restart actually has:
+        /// files on disk and Git history. No log file, no state file, and no
+        /// in-memory evidence from the interrupted process is consulted.
+        #[tokio::test]
+        async fn a_restart_derives_apply_continuation_from_the_preserved_workspace() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            let change_id = "interrupted-change";
+            arrange_interrupted_worktree(workspace, change_id);
+
+            let manager = workspace_manager(workspace);
+            let mut child = quiescent_child();
+            let _ = preserve_interrupted_apply_progress(
+                ApplyInterruption::RuntimeLimit { limit_secs: 3600 },
+                &mut child,
+                Some(&manager),
+                true,
+                workspace,
+                change_id,
+                &TaskProgress::new(),
+                4,
+            )
+            .await;
+
+            // Everything the interrupted process knew is gone; only the
+            // repository is left.
+            drop(manager);
+            drop(child);
+
+            // Task evidence: the agent's partial progress is what the next
+            // process reads, so the change resumes as existing Apply work
+            // rather than as an unstarted change.
+            let progress = check_task_progress(workspace, change_id)
+                .expect("a restart reads task progress from the workspace");
+            assert_eq!(
+                (progress.completed, progress.total),
+                (1, 3),
+                "the interrupted agent's partial progress must be visible"
+            );
+            assert!(
+                !is_progress_complete(&progress),
+                "incomplete tasks route the change back to apply"
+            );
+
+            // Git evidence: the preserved work is reachable from HEAD, and the
+            // interruption left no handoff marker that would route elsewhere.
+            let subject = git_out(workspace, &["log", "-1", "--format=%s"]);
+            assert!(
+                subject.starts_with(&format!("WIP: {change_id} (")),
+                "the restart finds the preserved snapshot at HEAD: {subject}"
+            );
+            assert!(
+                detect_apply_blocked_handoff(workspace, change_id).is_none(),
+                "an interruption is not a blocked handoff"
+            );
+            assert!(
+                detect_apply_rejected_handoff(workspace, change_id).is_none(),
+                "an interruption is not a rejection"
+            );
+
+            // Base comparison: the interrupted work is ahead of the initial
+            // commit, which is what makes it recoverable rather than discarded.
+            let ahead = git_out(workspace, &["rev-list", "--count", "HEAD"]);
+            assert_eq!(
+                ahead.trim(),
+                "2",
+                "the initial commit plus exactly one preserved WIP snapshot"
+            );
+        }
+    }
+
     /// Change-level apply hooks always carry managed-worktree identity, and the
     /// run-level context stays workspace-neutral.
     ///
@@ -3602,6 +4358,7 @@ mod tests {
             inactivity_kill_grace_secs: 0,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: false,
+            max_runtime_secs: 0,
         };
         let shared_state = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         crate::ai_command_runner::AiCommandRunner::new(queue_config, shared_state)
@@ -7382,6 +8139,7 @@ mod apply_budget_recovery {
             inactivity_kill_grace_secs: 0,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: false,
+            max_runtime_secs: 0,
         };
         let ai_runner = crate::ai_command_runner::AiCommandRunner::new(
             queue_config,

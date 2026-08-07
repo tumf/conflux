@@ -30,7 +30,7 @@ verifications:
     trigger: pull-request-validation
     automation: tests/process_cleanup_test.rs
     evidence: Process cleanup integration tests prove timeout, SIGTERM/SIGKILL escalation, and quiescence
-    rerun: cargo test --locked --test process_cleanup_test
+    rerun: cargo test --locked --features heavy-tests --test process_cleanup_test
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -98,7 +98,7 @@ These behaviors ship together because a deadline without progress preservation l
 - Timeout tests use deterministic paused time or controlled process fixtures rather than short wall-clock correctness assertions.
 - TUI signal tests exercise the same supervisor shutdown boundary used by operator stop and verify no registered execution or process identity remains.
 - Embedded skill source and installed-skill contract tests contain the bounded verification and heavy-gate ownership rules.
-- `cargo test --locked execution::apply::tests`, `cargo test --locked --test process_cleanup_test`, `cargo test --locked tui::run_supervisor::tests`, and `cargo test --locked --test install_skills_test` pass.
+- `cargo test --locked execution::apply::tests`, `cargo test --locked --features heavy-tests --test process_cleanup_test`, `cargo test --locked tui::run_supervisor::tests`, and `cargo test --locked --test install_skills_test` pass. `tests/process_cleanup_test.rs` is gated behind the `heavy-tests` feature because it drives real process groups, so its rerun command carries that feature explicitly rather than silently running zero tests.
 - Existing path-scoped pre-commit hooks remain responsible for repository-wide rustfmt and clippy when Rust paths are staged; this proposal does not duplicate them as Apply checkbox tasks.
 
 ## Out of Scope

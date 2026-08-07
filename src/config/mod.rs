@@ -1281,6 +1281,89 @@ mod tests {
         assert_eq!(config.get_command_inactivity_timeout_max_retries(), 3);
     }
 
+    // === Absolute command runtime limit ===
+
+    #[test]
+    fn command_max_runtime_defaults_to_one_hour() {
+        let config = OrchestratorConfig::default();
+        assert!(config.command_max_runtime_secs.is_none());
+        assert_eq!(
+            config.get_command_max_runtime_secs(),
+            3600,
+            "the absolute command runtime limit defaults to 3600 seconds"
+        );
+    }
+
+    #[test]
+    fn command_max_runtime_zero_disables_the_deadline() {
+        let config = OrchestratorConfig::parse_jsonc(
+            r#"{
+            "command_max_runtime_secs": 0
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(config.command_max_runtime_secs, Some(0));
+        assert_eq!(
+            config.get_command_max_runtime_secs(),
+            0,
+            "`0` is an explicit disable, never a fallback to the default"
+        );
+    }
+
+    /// The knob follows the same precedence every other command setting does:
+    /// a higher-priority `Some` wins, and `None` preserves what is already set.
+    #[test]
+    fn command_max_runtime_follows_normal_config_precedence() {
+        let mut base = OrchestratorConfig {
+            command_max_runtime_secs: Some(120),
+            ..OrchestratorConfig::default()
+        };
+        base.merge(OrchestratorConfig::default());
+        assert_eq!(
+            base.get_command_max_runtime_secs(),
+            120,
+            "an unset higher-priority layer must not erase the configured value"
+        );
+
+        base.merge(OrchestratorConfig {
+            command_max_runtime_secs: Some(0),
+            ..OrchestratorConfig::default()
+        });
+        assert_eq!(
+            base.get_command_max_runtime_secs(),
+            0,
+            "a higher-priority layer may disable the deadline"
+        );
+    }
+
+    /// The absolute deadline and the inactivity timeout are independent knobs:
+    /// configuring one must never move the other.
+    #[test]
+    fn command_max_runtime_is_independent_of_inactivity_timeout() {
+        let config = OrchestratorConfig::parse_jsonc(
+            r#"{
+            "command_max_runtime_secs": 30,
+            "command_inactivity_timeout_secs": 900
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(config.get_command_max_runtime_secs(), 30);
+        assert_eq!(config.get_command_inactivity_timeout_secs(), 900);
+
+        let inactivity_only = OrchestratorConfig::parse_jsonc(
+            r#"{
+            "command_inactivity_timeout_secs": 0
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(inactivity_only.get_command_inactivity_timeout_secs(), 0);
+        assert_eq!(
+            inactivity_only.get_command_max_runtime_secs(),
+            3600,
+            "disabling the inactivity timeout must not disable the absolute deadline"
+        );
+    }
+
     // === Tests for XDG config path precedence ===
 
     #[test]
@@ -2134,6 +2217,7 @@ mod tests {
         assert_eq!(config.get_command_inactivity_timeout_secs(), 900);
         assert_eq!(config.get_command_inactivity_kill_grace_secs(), 5);
         assert_eq!(config.get_command_inactivity_timeout_max_retries(), 3);
+        assert_eq!(config.get_command_max_runtime_secs(), 3600);
         assert!(config.use_llm_analysis());
         assert!(config.get_stream_json_textify());
         assert!(config.get_command_strict_process_cleanup());

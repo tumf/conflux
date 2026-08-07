@@ -1578,6 +1578,7 @@ mod tests {
             inactivity_kill_grace_secs: 0,
             inactivity_timeout_max_retries: 0,
             strict_process_cleanup: true,
+            max_runtime_secs: 0,
         };
         AiCommandRunner::new(queue_config, Arc::new(tokio::sync::Mutex::new(None)))
     }
