@@ -1021,41 +1021,35 @@ apply 履歴コンテキストは、archive と resolve の履歴フォーマッ
 
 ### Requirement: TUI Stop Processing with Escape Key
 
-TUIはEsc二度押しによる停止時、現在の実行活動を確認しなければならない（SHALL）。現在のエージェントプロセスまたはin-flight実行が存在する場合は、そのプロセスと子プロセスを確実に終了しなければならない（SHALL）。実行活動が存在せずparallel schedulerが待機しているだけの場合は、scheduler/orchestratorを停止しなければならず（SHALL）、プロセスを強制終了したと表示してはならない（MUST NOT）。進行中のbackground mergeまたはbase-lane mutationは安全な停止境界まで完了を待たなければならないが（SHALL）、それ自体をエージェントプロセスのforce stopと表示してはならない（MUST NOT）。
+The TUI MUST converge keyboard stop, SIGINT, and SIGTERM on the same bounded run-supervisor shutdown boundary. When agent execution is active, shutdown MUST close command admission, cancel the run, terminate owned process groups, prove quiescence, preserve dirty Apply progress through the interruption-recovery policy, and only then exit. External signals MUST NOT bypass child cleanup or WIP preservation. If cleanup or preservation cannot be proven, the TUI process MUST exit non-zero with actionable diagnostics.
 
 #### Scenario: 強制停止で子プロセスが残らない
 
 - **GIVEN** 現在のエージェントプロセスまたはin-flight実行が存在する
 - **WHEN** TUIがStoppingモードでユーザーがEscを再度押す
-- **THEN** 現在のエージェントプロセスとその子プロセスが終了する
-- **AND** 終了待機がタイムアウトした場合でも、追加の終了処理が行われる
-- **AND** ログは実際のforce stopを表示する
+- **THEN** command admission が閉じられる
+- **AND** 現在のエージェントプロセスとその子プロセスが終了する
+- **AND** process-group quiescence が確認される
+- **AND** dirty Apply progress は終了前にWIP snapshotへ保存される
 - **AND** 変更の状態はNotQueuedに戻る
 - **AND** 実行マークは保持される
 
-#### Scenario: 実行プロセスがない待機状態を通常停止する
+#### Scenario: SIGTERM uses the TUI shutdown boundary
 
-- **GIVEN** parallel orchestratorは動作中である
-- **AND** 対象changeは`MergeWait`、`ResolveWait`、deferred merge、またはscheduler idleで待機している
-- **AND** 現在のエージェントプロセスおよびin-flight実行は存在しない
-- **WHEN** TUIがStoppingモードでユーザーがEscを再度押す
-- **THEN** scheduler/orchestratorは停止する
-- **AND** ログは`Processing stopped`を一度だけ表示する
-- **AND** `Force stopped`またはプロセス終了を主張するログを表示しない
-- **AND** 存在しないプロセスへの終了要求を行わない
-- **AND** 遅延した停止イベントが到着しても`Processing stopped`を重複表示しない
-- **AND** 変更の状態はNotQueuedに戻る
-- **AND** 実行マークは保持される
+**Given**: `cflx tui` owns an active Apply command and descendant processes
+**When**: the TUI process receives SIGTERM
+**Then**: the signal requests supervisor cancellation instead of immediate process exit
+**And**: retry and spawn admission are closed
+**And**: all owned process groups are terminated and proven quiescent
+**And**: dirty Apply progress is preserved before the TUI exits
 
-#### Scenario: 進行中background mergeを安全に停止する
+#### Scenario: SIGINT cleanup failure is visible
 
-- **GIVEN** parallel orchestratorは進行中のbackground mergeまたはbase-lane mutationを所有している
-- **AND** 現在のエージェントプロセスおよびin-flight agent executionは存在しない
-- **WHEN** TUIがStoppingモードでユーザーがEscを再度押す
-- **THEN** operator cancellationが要求される
-- **AND** terminal stopはmergeまたはbase-lane operationが既存の安全な結果境界へ到達するまで待つ
-- **AND** ログは`Force stopped`またはエージェントプロセス終了を主張しない
-- **AND** cancellation待機が有界期限へ到達してもexecution failureとは分類しない
+**Given**: `cflx tui` receives SIGINT during active execution
+**When**: bounded cleanup cannot prove that the owned process group is empty
+**Then**: the TUI exits non-zero with cleanup diagnostics
+**And**: it does not claim that processing stopped cleanly
+**And**: it retains workspace contents for recovery
 
 ### Requirement: TUI Stopped Mode
 
