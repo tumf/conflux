@@ -88,4 +88,6 @@ The skill files are embedded into the Rust binary via `include_str!` at compile 
 
 Tests taking over 1 second must either be optimized to run in under 1 second or, if that is not practical, marked with `#[cfg_attr(not(feature = "heavy"), ignore)]`. Heavy tests must not run as part of the default test suite.
 
+The one-second rule is a target for total test runtime, not permission to use short wall-clock thresholds as correctness assertions. Verify liveness, concurrency, and non-blocking behavior deterministically with event ordering, channels, barriers, or state transitions. Use timeouts only as generous safeguards against hangs, accounting for loaded CI and slow platforms; verify performance requirements in dedicated benchmarks.
+
 Use `bd` for task tracking.
