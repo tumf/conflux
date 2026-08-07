@@ -693,12 +693,20 @@ impl WebState {
     /// event's ownership class — not its variant, read a second time here —
     /// decides whether a revision, a retained log, or only a sequence is
     /// allocated, so every internal event produces exactly one ordered v2 event.
+    ///
+    /// Returns the revision *this* application produced, taken from the envelope
+    /// the projection transaction returned rather than from a later read of
+    /// `state_revision`. A log or presentation event carries the unchanged
+    /// current revision; a state event carries the one it just allocated. The
+    /// caller binds that value to the dispatch identity, so a concurrent
+    /// dispatch that lands between this transaction and the recording cannot
+    /// donate its revision to this command.
     async fn project_execution_event(
         &self,
         event: &ExecutionEvent,
         ownership: EventOwnership,
         authoritative: Option<&crate::orchestration::state::OrchestratorState>,
-    ) {
+    ) -> u64 {
         use crate::web::remote_control_api::projection as v2;
 
         let projection = self.remote_control.projection();
@@ -708,19 +716,23 @@ impl WebState {
                 // exactly one retained entry.
                 let ExecutionEvent::Log(entry) = event else {
                     debug_assert!(false, "log ownership without a log payload: {event:?}");
-                    return;
+                    return projection.revision();
                 };
-                projection.apply_log(entry.clone());
+                projection.apply_log(entry.clone()).state_revision
             }
             EventOwnership::Presentation => {
                 let (event_type, change_id, payload) = v2::describe_event(event);
-                projection.apply_presentation(event_type, change_id, payload);
+                projection
+                    .apply_presentation(event_type, change_id, payload)
+                    .state_revision
             }
             EventOwnership::State => {
                 let (event_type, change_id, payload) = v2::describe_event(event);
                 let candidate =
                     v2::project_snapshot(&self.operator_snapshot_with(authoritative).await);
-                projection.apply_state(event_type, change_id, payload, candidate);
+                projection
+                    .apply_state(event_type, change_id, payload, candidate)
+                    .state_revision
             }
         }
     }
@@ -1235,17 +1247,20 @@ impl WebState {
 
         // Project into `/api/v2` last, so the candidate snapshot it compares
         // against is the one this event just produced.
-        self.project_execution_event(event, dispatch.ownership, dispatch.state)
+        let produced = self
+            .project_execution_event(event, dispatch.ownership, dispatch.state)
             .await;
 
-        // Bind the revision this dispatch produced to its identity. A command
-        // coordinator settles its record from *this* value rather than from a
-        // later read of `state_revision`, which is what stops unrelated
-        // scheduler progress from becoming a command's `result_revision`.
+        // Bind the revision this dispatch produced to its identity. The value
+        // comes out of the projection transaction itself, not from a later read
+        // of `state_revision`: sink fan-out runs with no reducer or mark lock
+        // held, so another dispatch may apply between the two, and re-reading
+        // would hand this command that unrelated progress as its
+        // `result_revision`.
         self.dispatch_revisions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .record(dispatch.id, self.remote_control.projection().revision());
+            .record(dispatch.id, produced);
     }
 
     /// Update the process-local operator facts from one execution event.

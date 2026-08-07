@@ -1785,10 +1785,7 @@ impl AppState {
     /// live TUI and the `/api/v2` `app_mode` could describe the same process
     /// differently after an accepted command. Core owns admission now; this
     /// frontend renders it.
-    pub fn adopt_core_mode(
-        &mut self,
-        mode: crate::orchestration::operator_command::OperatorMode,
-    ) {
+    pub fn adopt_core_mode(&mut self, mode: crate::orchestration::operator_command::OperatorMode) {
         self.execution_mode = AppExecutionMode::from_operator_mode(mode);
     }
 

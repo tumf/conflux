@@ -9,8 +9,7 @@ use crate::orchestration::operator_coordinator::{
     ApplicationOutcome, ApplicationResult, OperatorApplication, OperatorIntent,
 };
 use crate::orchestration::run_control::{
-    ResolveReservation, RunControlError, RunControlOutcome, RunNoOpReason,
-    SchedulerEffect,
+    ResolveReservation, RunControlError, RunControlOutcome, RunNoOpReason, SchedulerEffect,
 };
 #[cfg(test)]
 use crate::parallel::PostArchiveAction;
@@ -346,10 +345,7 @@ fn submit(
     intent: OperatorIntent,
     describe: impl FnOnce(ApplicationResult) -> CommandFeedback + Send + 'static,
 ) {
-    if let Err(error) = ctx
-        .submissions
-        .try_send(Submission::new(intent, describe))
-    {
+    if let Err(error) = ctx.submissions.try_send(Submission::new(intent, describe)) {
         let message = format!("Command could not be queued right now: {error}");
         ctx.app.warning_message = Some(message.clone());
         ctx.app.add_log(LogEntry::warn(message));
@@ -565,9 +561,7 @@ pub async fn handle_tui_command(
                 queued: true,
             };
             submit(ctx, intent, move |result| match result.outcome {
-                Err(error) => {
-                    CommandFeedback::refused(format!("Queue add rejected: {}", error))
-                }
+                Err(error) => CommandFeedback::refused(format!("Queue add rejected: {}", error)),
                 Ok(ApplicationOutcome::Operator(OperatorOutcome::Queue(queue)))
                     if !queue.reducer_changed =>
                 {
@@ -596,9 +590,7 @@ pub async fn handle_tui_command(
                 queued: false,
             };
             submit(ctx, intent, move |result| match result.outcome {
-                Err(error) => {
-                    CommandFeedback::refused(format!("Queue remove rejected: {}", error))
-                }
+                Err(error) => CommandFeedback::refused(format!("Queue remove rejected: {}", error)),
                 Ok(ApplicationOutcome::Operator(OperatorOutcome::Queue(queue))) => {
                     debug_assert_eq!(queue.mutation, QueueMutation::Removed);
                     let suffix = if queue.dynamic_queue_mutated {
@@ -769,7 +761,8 @@ pub async fn handle_tui_command(
             let intent = OperatorIntent::ResolveMerge {
                 change_id: id.clone(),
             };
-            submit(ctx, intent, move |result| match result.outcome {
+            submit(ctx, intent, move |result| {
+                match result.outcome {
                 Ok(ApplicationOutcome::Run(RunControlOutcome::ResolveReserved {
                     change_id,
                     reservation,
@@ -810,6 +803,7 @@ pub async fn handle_tui_command(
                     ))
                 }
                 Err(error) => CommandFeedback::refused(error.to_string()),
+            }
             });
         }
     }
@@ -833,12 +827,12 @@ mod tests {
         ExecutionMarkStore, HookRunnerQueueHooks, OperatorCommandService,
     };
     use crate::orchestration::operator_coordinator::CoreMode;
-    use crate::orchestration::run_control::RunControlService;
-    use crate::tui::types::{AppExecutionMode, StopMode};
     use crate::orchestration::run_control::testing::{RecordingScheduler, SchedulerCall};
+    use crate::orchestration::run_control::RunControlService;
     use crate::orchestration::run_control::{ResolveReservations, StartEligibility};
     use crate::orchestration::state::OrchestratorState;
     use crate::tui::types::WorktreeInfo;
+    use crate::tui::types::{AppExecutionMode, StopMode};
     use std::path::{Path, PathBuf};
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
@@ -2814,8 +2808,8 @@ mod run_supervisor_tests {
         ResolveReservations, RunControlService, RunSchedulerPort, StartEligibility,
     };
     use crate::orchestration::state::OrchestratorState;
-    use crate::tui::types::AppExecutionMode;
     use crate::tui::run_supervisor::TuiRunSupervisor;
+    use crate::tui::types::AppExecutionMode;
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
     use tokio::sync::RwLock;

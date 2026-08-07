@@ -78,9 +78,7 @@ impl AppExecutionMode {
     /// The exact inverse of [`Self::operator_mode`]. It is total for the same
     /// reason: this frontend's mode is a *projection* of the Core value, so
     /// there is no Core state it could refuse to render.
-    pub fn from_operator_mode(
-        mode: crate::orchestration::operator_command::OperatorMode,
-    ) -> Self {
+    pub fn from_operator_mode(mode: crate::orchestration::operator_command::OperatorMode) -> Self {
         use crate::orchestration::operator_command::OperatorMode;
         match mode {
             OperatorMode::Select => AppExecutionMode::Select,

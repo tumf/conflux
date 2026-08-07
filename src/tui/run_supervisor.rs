@@ -229,9 +229,9 @@ impl RunSchedulerPort for TuiRunSupervisor {
 mod tests {
     use super::*;
     use crate::events::ExecutionEvent;
+    use crate::orchestration::state::ReducerCommand;
     use crate::tui::events::OrchestratorEvent;
     use tokio::sync::mpsc;
-    use crate::orchestration::state::ReducerCommand;
 
     /// Marker the worktree orchestrator emits before it touches anything else,
     /// which is what makes the dispatched path observable from outside.

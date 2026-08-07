@@ -643,7 +643,9 @@ impl RunControlService {
         targets: Vec<String>,
         explicit_retry: bool,
     ) -> RunControlResult<SchedulerEffect> {
-        let prepared = self.prepare_dispatch(command, targets, explicit_retry).await?;
+        let prepared = self
+            .prepare_dispatch(command, targets, explicit_retry)
+            .await?;
         let effect = prepared.effect();
         prepared.activate(self.scheduler.as_ref()).await;
         Ok(effect)
@@ -941,10 +943,7 @@ impl RunControlService {
     /// Validate a Start (or, in `Error` mode, a retry) and reserve its dispatch.
     ///
     /// Read-only: a refusal here has changed nothing.
-    pub async fn prepare_start(
-        &self,
-        mode: OperatorMode,
-    ) -> RunControlResult<PreparedRunCommand> {
+    pub async fn prepare_start(&self, mode: OperatorMode) -> RunControlResult<PreparedRunCommand> {
         match mode {
             OperatorMode::Running | OperatorMode::Stopping => Err(RunControlError::InvalidMode {
                 command: RunCommandKind::Start,
@@ -1214,6 +1213,13 @@ pub(crate) mod testing {
         GracefulStop(bool),
     }
 
+    /// Observer a test installs to witness the moment a permit is activated.
+    ///
+    /// It receives the launch's change IDs and explicit-retry flag, and runs on
+    /// the activating task, so a hook can assert what is true *at* activation —
+    /// for example that the application gate is still held.
+    type ActivationHook = Arc<dyn Fn(Vec<String>, bool) + Send + Sync>;
+
     /// Everything an activated launch writes, shared so a permit can own a clone.
     ///
     /// A permit outlives the `&self` borrow that produced it, so the recorder
@@ -1228,7 +1234,7 @@ pub(crate) mod testing {
         /// accepted command outcome: the launch emits nothing until its permit
         /// is activated, and the permit is activated only after the outcome has
         /// already been dispatched.
-        on_activate: Mutex<Option<Arc<dyn Fn(Vec<String>, bool) + Send + Sync>>>,
+        on_activate: Mutex<Option<ActivationHook>>,
     }
 
     impl std::fmt::Debug for SchedulerRecorder {
@@ -1300,10 +1306,7 @@ pub(crate) mod testing {
         /// The hook stands in for the first progress a real scheduler would
         /// publish, which is what makes activation ordering observable.
         #[cfg_attr(not(test), allow(dead_code))]
-        pub(crate) fn on_activate(
-            &self,
-            hook: Arc<dyn Fn(Vec<String>, bool) + Send + Sync>,
-        ) {
+        pub(crate) fn on_activate(&self, hook: ActivationHook) {
             *self.recorder.on_activate.lock().unwrap() = Some(hook);
         }
 

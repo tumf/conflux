@@ -847,7 +847,9 @@ async fn tui_and_v2_settle_every_lifecycle_intent_identically() {
         if let Some(cleared) = row.notice {
             // Naming the change is the point: an operator whose intent vanished
             // must be able to tell that from a lost command, on both adapters.
-            let tui_message = tui.report.expect("a consequence row surfaces a TUI message");
+            let tui_message = tui
+                .report
+                .expect("a consequence row surfaces a TUI message");
             assert!(
                 tui_message.contains(cleared),
                 "{}: the TUI must name '{cleared}', got {tui_message:?}",
@@ -975,8 +977,7 @@ async fn bulk_through_v2(
     mode: AppExecutionMode,
 ) -> (SharedEffects, Settlement) {
     let mut wired = arranged_bulk(rows, marked, mode).await;
-    let executor =
-        SharedServiceExecutor::new(wired.harness.application.clone(), wired.web.clone());
+    let executor = SharedServiceExecutor::new(wired.harness.application.clone(), wired.web.clone());
 
     let settlement = match executor
         .execute(&CommandSpec::SetAllExecutionMarks {})

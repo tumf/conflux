@@ -1764,7 +1764,10 @@ impl OperatorCommandService {
                 display_status,
             });
         };
-        Ok(self.route_is_committable(change_id, route).await.then_some(route))
+        Ok(self
+            .route_is_committable(change_id, route)
+            .await
+            .then_some(route))
     }
 
     /// Classify every retryable change in `change_ids`, skipping the rest.

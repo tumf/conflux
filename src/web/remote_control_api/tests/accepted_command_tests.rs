@@ -302,6 +302,71 @@ async fn accepted_command_revision_records_the_outcome_dispatch() {
     assert_eq!(replay.command_id(), response.command_id());
 }
 
+/// Every dispatch records the revision *its own* projection application
+/// produced, not whatever the projection reached by the time recording ran.
+///
+/// Sink fan-out holds no reducer or mark lock, so on a multi-threaded runtime a
+/// second dispatch can apply between one dispatch's projection transaction and
+/// the moment its revision is bound to its identity. Re-reading `state_revision`
+/// there would hand a command that unrelated progress as its `result_revision`.
+/// Each dispatch here names a different change, so the envelope it published is
+/// the one authority on the revision it produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepted_command_revision_binds_each_dispatch_to_its_own_projection() {
+    use crate::events::{EventDispatch, OutcomeRevisions};
+
+    let change_ids: Vec<String> = (0..8).map(|index| format!("c{index}")).collect();
+    let borrowed: Vec<&str> = change_ids.iter().map(String::as_str).collect();
+    let wired = Wired::new(&borrowed).await;
+    let mut published = wired.projection.subscribe();
+
+    let mut dispatched = Vec::new();
+    let mut tasks = Vec::new();
+    for change_id in &change_ids {
+        let dispatch_id = crate::events::next_dispatch_id();
+        dispatched.push((change_id.clone(), dispatch_id));
+        let web_state = wired.web_state.clone();
+        let change_id = change_id.clone();
+        tasks.push(tokio::spawn(async move {
+            let event = crate::events::ExecutionEvent::ProcessingStarted(change_id);
+            web_state
+                .apply_dispatch(&EventDispatch {
+                    id: dispatch_id,
+                    event: &event,
+                    ownership: crate::events::event_ownership(&event),
+                    state: None,
+                })
+                .await;
+        }));
+    }
+    for task in tasks {
+        task.await.expect("a dispatch must not panic");
+    }
+
+    // The revision each projection application actually produced, read from the
+    // published envelope rather than inferred from ordering.
+    let mut produced = HashMap::new();
+    while let Ok(envelope) = published.try_recv() {
+        if let Some(change_id) = envelope.change_id.clone() {
+            produced.insert(change_id, envelope.state_revision);
+        }
+    }
+
+    for (change_id, dispatch_id) in dispatched {
+        let expected = produced
+            .get(&change_id)
+            .copied()
+            .unwrap_or_else(|| panic!("{change_id} published no projection event"));
+        assert_eq!(
+            wired.web_state.revision_for_dispatch(dispatch_id),
+            Some(expected),
+            "the revision bound to {change_id}'s dispatch must be the one its own \
+             projection application returned, not a later sample taken while \
+             concurrent dispatches were advancing the projection"
+        );
+    }
+}
+
 /// A no-op and an ordinary failure both settle at the unchanged admitted revision.
 #[tokio::test]
 async fn accepted_command_revision_no_op_and_failure_keep_the_admitted_revision() {

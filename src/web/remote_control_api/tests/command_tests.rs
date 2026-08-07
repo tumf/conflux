@@ -534,11 +534,23 @@ fn shared_service_outcomes_distinguish_real_effects_from_no_ops() {
 #[test]
 fn application_mode_strings_map_onto_the_shared_operator_mode() {
     assert_eq!(OperatorMode::from_app_mode("select"), OperatorMode::Select);
-    assert_eq!(OperatorMode::from_app_mode("running"), OperatorMode::Running);
-    assert_eq!(OperatorMode::from_app_mode("stopping"), OperatorMode::Stopping);
-    assert_eq!(OperatorMode::from_app_mode("stopped"), OperatorMode::Stopped);
+    assert_eq!(
+        OperatorMode::from_app_mode("running"),
+        OperatorMode::Running
+    );
+    assert_eq!(
+        OperatorMode::from_app_mode("stopping"),
+        OperatorMode::Stopping
+    );
+    assert_eq!(
+        OperatorMode::from_app_mode("stopped"),
+        OperatorMode::Stopped
+    );
     assert_eq!(OperatorMode::from_app_mode("error"), OperatorMode::Error);
-    assert_eq!(OperatorMode::from_app_mode("something-new"), OperatorMode::Select);
+    assert_eq!(
+        OperatorMode::from_app_mode("something-new"),
+        OperatorMode::Select
+    );
 }
 
 #[test]

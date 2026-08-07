@@ -11,8 +11,8 @@
 //!   -> reserve every fallible runtime capability (nothing mutated yet)
 //!   -> commit the staged decision state
 //!   -> dispatch one authoritative outcome and capture its exact revision
-//! release the gate
 //!   -> activate the infallible scheduler permit, or issue its wake
+//! release the gate
 //! ```
 //!
 //! Two properties follow from that shape and are the reason it exists.
@@ -26,6 +26,14 @@
 //! never emit an event before the command's own accepted effect. A frontend
 //! observing the run therefore cannot see `ProcessingStarted` before it sees the
 //! Start that caused it.
+//!
+//! Activation is nevertheless *inside* the gate, after the outcome dispatch and
+//! revision capture, not after the release. Activation is infallible, so it
+//! cannot fail the transaction; releasing first would only open a window in
+//! which a force stop is admitted against a run whose permit has not spawned
+//! yet, so its `cancel_run` finds no handle, no-ops, and the run spawns anyway
+//! immediately afterwards. Holding the gate across the activation makes the
+//! admitted-to-spawned interval indivisible to every other command.
 //!
 //! A command that must await confirmed runtime termination is the explicit
 //! two-phase exception: it holds the gate only for admission and cancellation
@@ -44,9 +52,7 @@ use crate::events::{
     all_completed_may_overwrite_mode, EventDispatcher, ExecutionEvent, OperatorCommandEffect,
     OutcomeRevisions,
 };
-use crate::orchestration::operator_command::{
-    OperatorMode, OperatorOutcome, PendingTermination,
-};
+use crate::orchestration::operator_command::{OperatorMode, OperatorOutcome, PendingTermination};
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
 };
@@ -374,16 +380,18 @@ impl OperatorApplication {
     /// Reacquires the gate, revalidates the target's current runtime state, and
     /// commits — or settles with the explicit unchanged revision observed under
     /// the reacquired boundary, without publishing a dequeue event.
-    pub async fn settle_stop_and_dequeue(
-        &self,
-        pending: PendingTermination,
-    ) -> ApplicationResult {
+    pub async fn settle_stop_and_dequeue(&self, pending: PendingTermination) -> ApplicationResult {
         let change_id = pending.change_id().to_string();
         if let Err(error) = pending.confirm_termination().await {
             // Cancellation was already issued and is not rollbackable, but no
             // dequeue decision state may be committed. The settlement revision
             // is read explicitly rather than assumed to be the admitted one:
-            // unrelated commands may have advanced it during the wait.
+            // unrelated commands may have advanced it during the wait. It is
+            // read under the *reacquired* gate for the same reason the
+            // post-wait commit path holds it — a revision sampled outside the
+            // boundary is a sample of mutable global state, which is exactly
+            // what a settled record may not contain.
+            let _guard = self.gate.clone().lock_owned().await;
             return ApplicationResult {
                 outcome: Err(RunControlError::Operator(error)),
                 revision: Some(self.current_revision()),
@@ -444,7 +452,10 @@ impl OperatorApplication {
     ) -> ApplicationResult {
         let mode = self.mode.get();
         match intent {
-            OperatorIntent::Start => self.apply_prepared(self.run_control.prepare_start(mode).await).await,
+            OperatorIntent::Start => {
+                self.apply_prepared(self.run_control.prepare_start(mode).await)
+                    .await
+            }
             OperatorIntent::RetryChange { change_id } => {
                 self.apply_prepared(self.run_control.prepare_retry_change(&change_id).await)
                     .await
@@ -465,9 +476,9 @@ impl OperatorApplication {
             }
             OperatorIntent::SetAllExecutionMarks => self.apply_bulk_marks(mode).await,
             // Routed before the gate was taken.
-            OperatorIntent::StopAndDequeue { .. } => unreachable!(
-                "a two-phase intent is routed through apply_stop_and_dequeue"
-            ),
+            OperatorIntent::StopAndDequeue { .. } => {
+                unreachable!("a two-phase intent is routed through apply_stop_and_dequeue")
+            }
         }
     }
 
@@ -604,7 +615,10 @@ impl OperatorApplication {
             service.remove_from_queue(change_id).await
         };
         match result {
-            Ok(queue) => self.publish_operator_outcome(OperatorOutcome::Queue(queue)).await,
+            Ok(queue) => {
+                self.publish_operator_outcome(OperatorOutcome::Queue(queue))
+                    .await
+            }
             Err(error) => ApplicationResult::failed(RunControlError::Operator(error)),
         }
     }
@@ -719,14 +733,14 @@ fn operator_outcome_event(outcome: &OperatorOutcome) -> Option<ExecutionEvent> {
                     ),
                 },
             }),
-        OperatorOutcome::Retry(plan) => (!plan.is_empty()).then(|| {
-            ExecutionEvent::OperatorCommandApplied {
+        OperatorOutcome::Retry(plan) => {
+            (!plan.is_empty()).then(|| ExecutionEvent::OperatorCommandApplied {
                 effect: OperatorCommandEffect::RunDispatched {
                     change_ids: plan.change_ids.clone(),
                     explicit_retry: plan.explicit_retry,
                 },
-            }
-        }),
+            })
+        }
         // `ChangeDequeued` already means exactly this and is published by the
         // two-phase settlement path.
         OperatorOutcome::Dequeued { .. } => None,

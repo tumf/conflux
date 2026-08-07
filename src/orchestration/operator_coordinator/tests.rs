@@ -11,14 +11,17 @@
 //! Unit-scoped: the scheduler is the shared recording double, the queue is the
 //! in-memory `DynamicQueue`, and no process, repository, or network is touched.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use super::*;
-use crate::events::{EventSink, ExecutionEvent};
+use crate::events::{EventSink, ExecutionEvent, OutcomeRevisions};
 use crate::orchestration::operator_command::{
-    ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, ParallelRuntime,
+    ExecutionMarkStore, NoopQueueHooks, OperatorCommandError, OperatorCommandService,
+    ParallelRuntime, QueuePort, TerminationWaiter,
 };
 use crate::orchestration::run_control::testing::{RecordingScheduler, SchedulerCall};
 use crate::orchestration::run_control::{ResolveReservations, RunCommandKind, SchedulerEffect};
@@ -81,8 +84,7 @@ pub(super) struct RecordingSink {
 #[async_trait]
 impl EventSink for RecordingSink {
     async fn on_event(&self, event: &ExecutionEvent) {
-        self.timeline
-            .push(crate::events::classify_event(event).0);
+        self.timeline.push(crate::events::classify_event(event).0);
     }
 
     async fn on_state_changed(&self, _state: &OrchestratorState) {}
@@ -169,7 +171,11 @@ impl Harness {
     }
 
     pub(super) async fn status(&self, change_id: &str) -> String {
-        self.state.read().await.display_status(change_id).to_string()
+        self.state
+            .read()
+            .await
+            .display_status(change_id)
+            .to_string()
     }
 
     /// Every mutable axis a failed command must leave untouched.
@@ -256,7 +262,10 @@ async fn accepted_operator_command_transaction_start_commits_and_projects_once()
         panic!("a marked, startable target must dispatch a run: {result:?}");
     };
     assert_eq!(change_ids, vec!["c1".to_string()]);
-    assert!(!explicit_retry, "an ordinary start is not an explicit retry");
+    assert!(
+        !explicit_retry,
+        "an ordinary start is not an explicit retry"
+    );
     assert_eq!(scheduler, SchedulerEffect::Started);
 
     assert_eq!(
@@ -301,10 +310,7 @@ async fn accepted_operator_command_transaction_invalid_mode_has_no_effect() {
         let result = harness.apply(intent.clone()).await;
 
         assert!(
-            matches!(
-                result.outcome,
-                Err(RunControlError::InvalidMode { .. })
-            ),
+            matches!(result.outcome, Err(RunControlError::InvalidMode { .. })),
             "{intent:?} in {mode:?} must be refused for the mode: {result:?}"
         );
         assert_eq!(
@@ -356,11 +362,13 @@ async fn accepted_operator_command_transaction_resolve_projects_only_the_active_
     assert!(
         matches!(
             &first.outcome,
-            Ok(ApplicationOutcome::Run(RunControlOutcome::ResolveReserved {
-                reservation: ResolveReservation::Active,
-                scheduler: SchedulerEffect::Started,
-                ..
-            }))
+            Ok(ApplicationOutcome::Run(
+                RunControlOutcome::ResolveReserved {
+                    reservation: ResolveReservation::Active,
+                    scheduler: SchedulerEffect::Started,
+                    ..
+                }
+            ))
         ),
         "the first valid resolve becomes the active resolver: {first:?}"
     );
@@ -375,11 +383,13 @@ async fn accepted_operator_command_transaction_resolve_projects_only_the_active_
     assert!(
         matches!(
             &queued.outcome,
-            Ok(ApplicationOutcome::Run(RunControlOutcome::ResolveReserved {
-                reservation: ResolveReservation::Queued { position: 1 },
-                scheduler: SchedulerEffect::None,
-                ..
-            }))
+            Ok(ApplicationOutcome::Run(
+                RunControlOutcome::ResolveReserved {
+                    reservation: ResolveReservation::Queued { position: 1 },
+                    scheduler: SchedulerEffect::None,
+                    ..
+                }
+            ))
         ),
         "a second resolve waits in FIFO order without dispatching: {queued:?}"
     );
@@ -507,7 +517,9 @@ async fn accepted_operator_command_transaction_lifecycle_events_keep_core_admiss
     assert!(
         matches!(
             restart.outcome,
-            Ok(ApplicationOutcome::Run(RunControlOutcome::RunDispatched { .. }))
+            Ok(ApplicationOutcome::Run(
+                RunControlOutcome::RunDispatched { .. }
+            ))
         ),
         "natural completion must readmit a later Start without frontend repair: {restart:?}"
     );
@@ -612,10 +624,7 @@ async fn accepted_operator_command_scheduler_order_preparation_failure_rolls_bac
     let result = harness.apply(OperatorIntent::Start).await;
 
     assert!(
-        matches!(
-            result.outcome,
-            Err(RunControlError::DispatchFailed { .. })
-        ),
+        matches!(result.outcome, Err(RunControlError::DispatchFailed { .. })),
         "a runtime that refuses the launch must fail the command: {result:?}"
     );
     assert_eq!(
@@ -657,6 +666,50 @@ async fn accepted_operator_command_scheduler_order_refused_resolve_rolls_back_it
     assert_eq!(harness.axes(&["c1"]).await, before);
 }
 
+/// Activation happens *inside* the gate, after the outcome dispatch.
+///
+/// Both halves matter and neither implies the other. Activating after the
+/// dispatch is what keeps scheduler progress from preceding the command that
+/// enabled it; activating before the release is what makes "admitted" and
+/// "spawned" one indivisible interval, so a force stop cannot be admitted
+/// against a run whose permit has not spawned yet, `cancel_run` nothing, and
+/// leave the run to spawn immediately afterwards.
+#[tokio::test]
+async fn accepted_operator_command_scheduler_order_activation_runs_under_the_gate() {
+    let harness = Harness::new(&["c1"]);
+    harness.marks.set("c1", true);
+
+    let gate_held_at_activation = Arc::new(AtomicBool::new(false));
+    {
+        let gate = harness.application.gate();
+        let timeline = harness.timeline.clone();
+        let observed = gate_held_at_activation.clone();
+        harness.scheduler.on_activate(Arc::new(move |_, _| {
+            // The transaction gate is the only thing that could be holding this
+            // lock at activation time: nothing else in this test takes it.
+            observed.store(gate.try_lock().is_err(), Ordering::SeqCst);
+            timeline.push_public(SCHEDULER_ACTIVATED);
+        }));
+    }
+
+    harness.apply(OperatorIntent::Start).await;
+
+    assert!(
+        gate_held_at_activation.load(Ordering::SeqCst),
+        "the prepared permit must be activated while the application gate is \
+         still held, so no command is admitted between the accepted run \
+         decision and the spawn it authorized"
+    );
+    assert_eq!(
+        harness.timeline.entries(),
+        vec![
+            "OperatorCommandApplied".to_string(),
+            SCHEDULER_ACTIVATED.to_string()
+        ],
+        "activation is inside the gate but still strictly after the outcome"
+    );
+}
+
 /// An immediate terminal completion cannot reorder itself before the outcome.
 #[tokio::test]
 async fn accepted_operator_command_scheduler_order_immediate_completion_follows_the_outcome() {
@@ -673,7 +726,9 @@ async fn accepted_operator_command_scheduler_order_immediate_completion_follows_
     assert!(
         matches!(
             result.outcome,
-            Ok(ApplicationOutcome::Run(RunControlOutcome::RunDispatched { .. }))
+            Ok(ApplicationOutcome::Run(
+                RunControlOutcome::RunDispatched { .. }
+            ))
         ),
         "the command still settles as dispatched: {result:?}"
     );
@@ -690,5 +745,183 @@ async fn accepted_operator_command_scheduler_order_immediate_completion_follows_
         harness.core.get(),
         OperatorMode::Select,
         "the completion is still authoritative for Core mode once it arrives"
+    );
+}
+
+// ============================================================================
+// The two-phase transaction
+// ============================================================================
+
+/// A queue whose cancellation is issued but never confirmed.
+#[derive(Default)]
+struct StuckQueue {
+    cancellations: Mutex<Vec<String>>,
+}
+
+impl StuckQueue {
+    fn cancellations(&self) -> Vec<String> {
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+#[async_trait]
+impl QueuePort for StuckQueue {
+    async fn add(&self, _change_id: &str) -> bool {
+        true
+    }
+
+    async fn remove(&self, _change_id: &str) -> bool {
+        true
+    }
+
+    async fn request_cancellation(
+        &self,
+        change_id: &str,
+    ) -> std::result::Result<Option<TerminationWaiter>, String> {
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(change_id.to_string());
+        Ok(Some(TerminationWaiter::never()))
+    }
+
+    async fn notify_scheduler(&self) {}
+}
+
+/// A projection double that reports whether the gate was held when it was read.
+///
+/// The contract under test is *where* a settlement revision is sampled, not
+/// which number comes back, so the double answers that question directly
+/// instead of the test trying to win a timing race against the coordinator.
+struct GateWatchingRevisions {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    revision: AtomicU64,
+    gate_held_at_read: AtomicBool,
+    reads: AtomicU64,
+}
+
+impl GateWatchingRevisions {
+    fn new(gate: Arc<tokio::sync::Mutex<()>>) -> Self {
+        Self {
+            gate,
+            revision: AtomicU64::new(0),
+            gate_held_at_read: AtomicBool::new(false),
+            reads: AtomicU64::new(0),
+        }
+    }
+
+    fn set(&self, revision: u64) {
+        self.revision.store(revision, Ordering::SeqCst);
+    }
+}
+
+impl OutcomeRevisions for GateWatchingRevisions {
+    fn revision_for_dispatch(&self, _dispatch_id: u64) -> Option<u64> {
+        None
+    }
+
+    fn current_revision(&self) -> u64 {
+        self.gate_held_at_read
+            .store(self.gate.try_lock().is_err(), Ordering::SeqCst);
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.revision.load(Ordering::SeqCst)
+    }
+}
+
+/// A timed-out stop-and-dequeue reads its settlement revision under the
+/// reacquired gate, and commits nothing.
+///
+/// The delta permits no command to sample mutable global state after releasing
+/// its boundary, and the timeout path is the one that leaves the boundary and
+/// then still has to settle. Nothing else in this test holds the gate, so an
+/// unlockable gate at read time can only mean the settlement is holding it.
+#[tokio::test]
+async fn accepted_operator_command_dequeue_liveness_timeout_settles_under_the_gate() {
+    let state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+        vec!["c1".to_string()],
+        10,
+    )));
+    let marks = Arc::new(ExecutionMarkStore::new());
+    let parallel = Arc::new(ParallelRuntime::new());
+    let queue = Arc::new(StuckQueue::default());
+    let scheduler = Arc::new(RecordingScheduler::new());
+    let timeline = Arc::new(Timeline::default());
+    let operator = Arc::new(
+        OperatorCommandService::new(
+            state.clone(),
+            queue.clone(),
+            Arc::new(NoopQueueHooks),
+            marks.clone(),
+        )
+        .with_parallel(parallel.clone())
+        // A safety valve for the never-confirmed waiter, not a performance
+        // assertion: the settlement's ordering is proven by the gate
+        // observation below, never by how long this took.
+        .with_cancellation_timeout(Duration::from_millis(20)),
+    );
+    let run_control = Arc::new(RunControlService::new(
+        state.clone(),
+        operator,
+        scheduler,
+        Arc::new(ResolveReservations::new()),
+        parallel,
+    ));
+    let dispatcher = Arc::new(crate::events::EventDispatcher::new(
+        state.clone(),
+        vec![Arc::new(RecordingSink {
+            timeline: timeline.clone(),
+        })],
+    ));
+    let application = OperatorApplication::new(Arc::new(CoreMode::new()), run_control, dispatcher);
+    let revisions = Arc::new(GateWatchingRevisions::new(application.gate()));
+    let application = application.with_revisions(Some(revisions.clone()));
+
+    let pending = application
+        .begin_stop_and_dequeue("c1")
+        .await
+        .expect("phase one issues cancellation for a registered handle");
+    // Unrelated progress during the wait: the settlement must report *this*,
+    // read under the reacquired boundary, not the revision it was admitted at.
+    revisions.set(41);
+
+    let result = application.settle_stop_and_dequeue(pending).await;
+
+    assert!(
+        matches!(
+            result.outcome,
+            Err(RunControlError::Operator(
+                OperatorCommandError::TerminationTimeout { .. }
+            ))
+        ),
+        "an unconfirmed termination must fail rather than certify a dequeue: {result:?}"
+    );
+    assert!(
+        revisions.gate_held_at_read.load(Ordering::SeqCst),
+        "the settlement revision must be read under the reacquired application \
+         gate, not sampled from global state after the boundary was released"
+    );
+    assert_eq!(
+        result.revision,
+        Some(41),
+        "the explicit unchanged revision observed at settlement is what the \
+         record settles with"
+    );
+    assert_eq!(
+        queue.cancellations(),
+        vec!["c1".to_string()],
+        "the already-issued cancellation is neither repeated nor rolled back"
+    );
+    assert!(
+        timeline.entries().is_empty(),
+        "a timed-out dequeue publishes no outcome event: {:?}",
+        timeline.entries()
+    );
+    assert_eq!(
+        state.read().await.display_status("c1"),
+        "not queued",
+        "a timed-out dequeue commits no reducer mutation"
     );
 }

@@ -185,27 +185,27 @@ pub async fn submit_command(
     // through settlement, while a two-phase one drops it before waiting. Keeping
     // a copy here and re-entering the coordinator would deadlock on a lock this
     // request already owns.
-    let settlement: Option<PendingCommand> = match state.executor.begin(&request.command, gate).await
-    {
-        // The gate travels into the spawned task, so an ordinary command is
-        // serialized through settlement while still reporting through its record
-        // rather than pinning the connection.
-        Applied::Ordinary(gate) => {
-            let executor = state.executor.clone();
-            let spec = request.command.clone();
-            Some(Box::pin(
-                async move { executor.execute_held(&spec, gate).await },
-            ))
-        }
-        // A two-phase command keeps its record Running while confirmation is
-        // pending; the executor already released the gate.
-        Applied::Pending(pending) => Some(pending),
-        // Refused before any effect: nothing to run.
-        Applied::Settled(result) => {
-            settle(&projection, &command_id, result);
-            None
-        }
-    };
+    let settlement: Option<PendingCommand> =
+        match state.executor.begin(&request.command, gate).await {
+            // The gate travels into the spawned task, so an ordinary command is
+            // serialized through settlement while still reporting through its record
+            // rather than pinning the connection.
+            Applied::Ordinary(gate) => {
+                let executor = state.executor.clone();
+                let spec = request.command.clone();
+                Some(Box::pin(
+                    async move { executor.execute_held(&spec, gate).await },
+                ))
+            }
+            // A two-phase command keeps its record Running while confirmation is
+            // pending; the executor already released the gate.
+            Applied::Pending(pending) => Some(pending),
+            // Refused before any effect: nothing to run.
+            Applied::Settled(result) => {
+                settle(&projection, &command_id, result);
+                None
+            }
+        };
 
     if let Some(pending) = settlement {
         let settle_id = command_id.clone();

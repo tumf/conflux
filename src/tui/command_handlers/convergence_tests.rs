@@ -36,9 +36,7 @@ impl Converged {
     async fn new(change_ids: &[&str]) -> Self {
         let harness = AdapterHarness::new(change_ids);
         let mut app = harness.app(change_ids);
-        app.apply_display_statuses_from_reducer(
-            &harness.state.read().await.all_display_statuses(),
-        );
+        app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
 
         let web = Arc::new(WebState::new(&[]));
         web.set_shared_state(harness.state.clone()).await;
@@ -128,7 +126,9 @@ async fn accepted_operator_command_tui_convergence_local_run_reaches_web() {
     let mut converged = Converged::new(&["alpha"]).await;
     converged.harness.marks.set("alpha", true);
 
-    converged.local(TuiCommand::StartProcessing(Vec::new())).await;
+    converged
+        .local(TuiCommand::StartProcessing(Vec::new()))
+        .await;
 
     assert_eq!(
         converged.app.execution_mode,
@@ -244,7 +244,9 @@ async fn accepted_operator_command_tui_convergence_dequeue_clears_only_its_targe
     assert!(
         matches!(
             &result.outcome,
-            Ok(ApplicationOutcome::Operator(OperatorOutcome::Dequeued { .. }))
+            Ok(ApplicationOutcome::Operator(
+                OperatorOutcome::Dequeued { .. }
+            ))
         ),
         "an idle queued row dequeues once cancellation confirms: {result:?}"
     );

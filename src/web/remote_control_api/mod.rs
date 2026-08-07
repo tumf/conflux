@@ -191,7 +191,6 @@ impl RemoteControlExecutor for RemoteControlRuntime {
         }
     }
 
-
     async fn execute_held(
         &self,
         command: &CommandSpec,

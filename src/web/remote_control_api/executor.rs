@@ -463,10 +463,7 @@ impl SharedServiceExecutor {
     /// Repository mutations do not travel through the operator outcome
     /// vocabulary, so this is the one path that still refreshes the projection
     /// itself before the record settles.
-    async fn worktree(
-        &self,
-        command: &CommandSpec,
-    ) -> Result<ExecutionSummary, CommandFailure> {
+    async fn worktree(&self, command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure> {
         let outcome = match command {
             CommandSpec::CreateWorktree { target, .. } => {
                 self.worktrees.create(&target.change_id).await

@@ -1207,9 +1207,7 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
 ///
 /// The `effect` token is the stable branch key; the remaining members are the
 /// facts a controller would otherwise have to re-derive by diffing snapshots.
-fn describe_operator_effect(
-    effect: &crate::events::OperatorCommandEffect,
-) -> serde_json::Value {
+fn describe_operator_effect(effect: &crate::events::OperatorCommandEffect) -> serde_json::Value {
     use crate::events::OperatorCommandEffect as Effect;
 
     let mut payload = json!({ "effect": effect.as_str() });
@@ -1229,10 +1227,7 @@ fn describe_operator_effect(
             object.insert("force_stop".to_string(), json!(force_stop));
             object.insert("awaiting_safe_boundary".to_string(), json!(true));
         }
-        Effect::MarkDelta {
-            change_ids,
-            marked,
-        } => {
+        Effect::MarkDelta { change_ids, marked } => {
             object.insert("change_ids".to_string(), json!(change_ids));
             object.insert("marked".to_string(), json!(marked));
         }

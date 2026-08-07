@@ -136,12 +136,19 @@ async fn accepted_operator_command_mode_matrix_projects_every_accepted_effect() 
     let start = harness.apply(OperatorIntent::Start).await;
     assert!(matches!(
         start.outcome,
-        Ok(ApplicationOutcome::Run(RunControlOutcome::RunDispatched { .. }))
+        Ok(ApplicationOutcome::Run(
+            RunControlOutcome::RunDispatched { .. }
+        ))
     ));
     assert_eq!(harness.core.get(), OperatorMode::Running);
     assert_eq!(bound.app_mode().await, "running");
-    let dispatched = start.revision.expect("a changed command records a revision");
-    assert!(dispatched > before, "the accepted outcome advances revision");
+    let dispatched = start
+        .revision
+        .expect("a changed command records a revision");
+    assert!(
+        dispatched > before,
+        "the accepted outcome advances revision"
+    );
     assert_eq!(
         dispatched,
         bound.revision(),
@@ -201,11 +208,13 @@ async fn accepted_operator_command_mode_matrix_projects_resolve_reservations() {
         .await;
     assert!(matches!(
         &active.outcome,
-        Ok(ApplicationOutcome::Run(RunControlOutcome::ResolveReserved {
-            reservation: ResolveReservation::Active,
-            scheduler: SchedulerEffect::Started,
-            ..
-        }))
+        Ok(ApplicationOutcome::Run(
+            RunControlOutcome::ResolveReserved {
+                reservation: ResolveReservation::Active,
+                scheduler: SchedulerEffect::Started,
+                ..
+            }
+        ))
     ));
     assert!(
         bound.is_resolving().await,
@@ -226,11 +235,13 @@ async fn accepted_operator_command_mode_matrix_projects_resolve_reservations() {
         .await;
     assert!(matches!(
         &queued.outcome,
-        Ok(ApplicationOutcome::Run(RunControlOutcome::ResolveReserved {
-            reservation: ResolveReservation::Queued { .. },
-            scheduler: SchedulerEffect::None,
-            ..
-        }))
+        Ok(ApplicationOutcome::Run(
+            RunControlOutcome::ResolveReserved {
+                reservation: ResolveReservation::Queued { .. },
+                scheduler: SchedulerEffect::None,
+                ..
+            }
+        ))
     ));
     assert_eq!(
         bound.app_mode().await,
