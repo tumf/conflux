@@ -4,7 +4,7 @@
 
 Conflux observability MUST distinguish recoverable degraded execution paths from terminal workflow failures across tracing records and runtime events. Equivalent recoverable fallback diagnostics MUST be deduplicated consistently across both tracing records and runtime events during the existing deduplication lifetime. The bundled log mining helper MUST remain observability-only and MUST NOT influence scheduler decisions, resume routing, acceptance, archive, merge, or next-action behavior.
 
-VCS simulation diagnostics whose child output size is not intrinsically bounded MUST record structured summaries instead of complete raw stdout/stderr. A summary SHALL retain command outcome, output byte counts, worktree or branch identity when available, conflict count, and a deterministic bounded sample sufficient for diagnosis. Known merge conflicts SHALL remain ordinary conflict observations and SHALL NOT emit unbounded fallback output on each refresh.
+VCS simulation diagnostics whose child output size is not intrinsically bounded MUST record structured summaries instead of complete raw stdout/stderr. A summary SHALL retain command outcome, output byte counts, worktree or branch identity when available, conflict count, at most 20 deterministic conflict paths, and at most 4096 bytes of each stdout/stderr prefix. Known merge conflicts SHALL remain ordinary conflict observations and SHALL NOT emit unbounded fallback output on each refresh.
 
 <!-- Expected canonical result after archive: observability retains actionable merge-simulation evidence without allowing repeated child output to grow persistent logs without bound. -->
 

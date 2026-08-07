@@ -8,6 +8,11 @@ references:
   - openspec/specs/tui-worktree-merge/spec.md
   - openspec/specs/observability/spec.md
   - src/tui/worktrees.rs
+  - src/tui/runner.rs
+  - src/worktree_ops.rs
+  - src/worktree_ops/git_backend.rs
+  - src/web/mod.rs
+  - src/web/state.rs
   - src/vcs/git/commands/merge.rs
 verifications:
   - id: stale-worktree-refresh-regression
@@ -16,7 +21,7 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: tests/e2e_git_worktree_tests.rs
-    evidence: Rust tests prove eligibility filtering, revision-keyed reuse, active revision invalidation, bounded diagnostics, and unchanged worktree state
+    evidence: Rust tests prove filtering across TUI and Web/UDS periodic paths, shared revision-keyed reuse, active revision invalidation, operator-targeted reinspection, truthful not-inspected diagnostics, bounded diagnostics, and unchanged worktree state
     rerun: cargo test --locked --test e2e_git_worktree_tests
     prerequisites: []
     execution_class: repository-local
@@ -35,9 +40,9 @@ This caused one stale Corvus worktree to monopolize refresh work, repeatedly gen
 
 ## Proposed Solution
 
-Keep all registered worktrees visible and manually manageable, but classify conflict-inspection eligibility from current repository evidence. Only the main worktree and worktrees whose branch maps to a currently active or rejected OpenSpec change participate in automatic conflict simulation. Unrelated, completed, archived, or otherwise non-active worktrees remain listed with an explicit not-inspected state and never influence scheduler or workflow decisions.
+Keep all registered worktrees visible and manually manageable, but classify conflict-inspection eligibility from current repository evidence. Both periodic TUI refresh and periodic Web/UDS refresh apply the same policy: only the main worktree and worktrees whose branch maps to a currently active or rejected OpenSpec change participate in automatic conflict simulation. Unrelated, completed, archived, or otherwise non-active worktrees remain listed with an explicit not-inspected state and never influence scheduler or workflow decisions. Operator-initiated merge and deletion perform a fresh targeted observation before eligibility is decided, including for branches that do not map to an OpenSpec change.
 
-Cache conflict/ahead observations in process memory by the repository-verifiable tuple of base HEAD, worktree HEAD, merge base, and branch identity. A refresh with the same tuple reuses the observation; any tuple change invalidates it and reruns inspection. The cache is non-authoritative and disposable, consistent with the workspace-local workflow-state constitution.
+Cache conflict/ahead observations in one process-local observation layer shared by TUI and Web/UDS refresh, keyed by the repository-verifiable tuple of base HEAD, worktree HEAD, merge base, and branch identity. A refresh with the same tuple reuses the observation; any tuple change invalidates it and reruns inspection. The cache is non-authoritative and disposable, consistent with the workspace-local workflow-state constitution.
 
 Bound `merge-tree` diagnostics. Conflict results retain the conflict count and a small deterministic file sample; parser fallback and command failure logs report byte counts plus bounded prefixes rather than complete stdout/stderr.
 
@@ -47,17 +52,18 @@ Bound `merge-tree` diagnostics. Conflict results retain the conflict count and a
 - A current change worktree is still checked for commits ahead and merge conflict eligibility.
 - Repeated refresh with unchanged base HEAD, worktree HEAD, merge base, and branch identity performs no duplicate merge simulation.
 - Changing base HEAD, worktree HEAD, merge base, or branch identity invalidates the cached observation and performs a fresh check.
-- Skipped or cached observations are transient UI metadata only and do not affect dispatch, resume, acceptance, archive, merge, or next-action selection.
+- Skipped or cached observations are transient presentation metadata only and do not affect dispatch, resume, acceptance, archive, merge execution, deletion execution, or next-action selection; merge affordances may use a current-keyed cached observation, but operator execution revalidates repository state.
 - Conflict and command-failure diagnostics are bounded independently of raw `merge-tree` output size while retaining exit status, output byte counts, worktree identity, conflict count, and a deterministic file sample.
 - Refresh inspection never modifies a worktree, its index, or uncommitted files.
 
 ## Explicit Completion Conditions
 
-- Worktree refresh receives the current active/rejected change identities and decides inspection eligibility before spawning ahead/conflict Git commands.
-- Worktree rows distinguish checked, cached, and not-inspected observations without treating not-inspected as conflict-free and mergeable.
-- An in-memory observation cache uses only current Git-derived identity/revision inputs, is discarded at process exit, and cannot become workflow-control state.
+- Both TUI and Web/UDS periodic refresh receive the current active/rejected change identities and decide inspection eligibility before spawning ahead/conflict Git commands.
+- Worktree rows distinguish checked, cached, and not-inspected observations without treating not-inspected as conflict-free and mergeable or reporting that an uninspected branch has no commits ahead.
+- Operator-initiated merge and deletion perform a fresh targeted observation before eligibility is decided, including for worktrees that periodic refresh skips.
+- One shared in-memory observation cache serves both periodic refresh paths, uses only current Git-derived identity/revision inputs, is discarded at process exit, and cannot become workflow-control state.
 - `check_merge_conflicts` returns structured bounded conflict evidence and never interpolates complete unbounded stdout/stderr into tracing records or operator errors.
-- `tests/e2e_git_worktree_tests.rs` records Git command execution or equivalent observable calls and proves stale worktrees are skipped, unchanged active worktrees are reused, revision changes rerun checks, large outputs remain bounded, and tracked/dirty files remain unchanged.
+- `tests/e2e_git_worktree_tests.rs` uses an injected command recorder or PATH-scoped Git shim to count actual ahead/conflict invocations across both periodic paths and proves stale worktrees are skipped, unchanged active worktrees are reused once process-wide, revision changes rerun checks, operator actions revalidate skipped worktrees, large outputs remain bounded, and tracked/dirty files remain unchanged.
 - `cargo test --locked --test e2e_git_worktree_tests` passes without network access or external credentials.
 
 ## Out of Scope

@@ -4,7 +4,7 @@
 
 Worktreeリスト SHALL be automatically refreshed without modifying tracked files in worktrees.
 
-All Git-registered worktrees SHALL remain visible. Automatic ahead/conflict inspection SHALL run only for the main worktree and secondary worktrees whose branch identity maps to a currently active or rejected OpenSpec change. A worktree that is not eligible for automatic inspection SHALL expose an explicit not-inspected state and MUST NOT be treated as conflict-free or mergeable.
+All Git-registered worktrees SHALL remain visible. Both periodic TUI refresh and periodic Web/UDS repository refresh SHALL use one shared automatic observation policy. Automatic ahead/conflict inspection SHALL run only for the main worktree and secondary worktrees whose branch identity maps to a currently active or rejected OpenSpec change. A worktree that is not eligible for automatic inspection SHALL expose an explicit not-inspected state and MUST NOT be treated as conflict-free or mergeable during periodic presentation.
 
 衝突チェックは作業ツリーに影響を与えないGit手法で実行し、worktree上の作業状態を変更してはならない。
 
@@ -17,18 +17,18 @@ Inspection observations MAY be reused only while branch identity, base HEAD, wor
 #### Scenario: Non-active worktree remains visible without merge simulation
 
 - **GIVEN** a registered secondary worktree branch does not map to a current active or rejected change
-- **WHEN** the periodic Worktrees refresh runs
+- **WHEN** either the periodic TUI refresh or periodic Web/UDS repository refresh runs
 - **THEN** the worktree remains present in the listing
 - **AND** no ahead or conflict simulation command is spawned for that worktree
 - **AND** its observation is marked not inspected rather than conflict-free
 
-#### Scenario: Unchanged active worktree reuses observation
+#### Scenario: TUI and Web refresh share an unchanged observation
 
-- **GIVEN** an active change worktree has a completed ahead/conflict observation
+- **GIVEN** an active change worktree has a completed ahead/conflict observation from either periodic refresh path
 - **AND** its branch identity, base HEAD, worktree HEAD, and merge base remain unchanged
-- **WHEN** another periodic refresh runs
-- **THEN** the previous observation is reused
-- **AND** no duplicate merge simulation is executed
+- **WHEN** the periodic TUI and Web/UDS refresh paths run again in either order
+- **THEN** the previous observation is reused by both paths
+- **AND** only one merge simulation has been executed for that revision tuple in the process
 
 #### Scenario: Revision change invalidates observation
 
