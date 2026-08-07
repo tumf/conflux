@@ -1,56 +1,59 @@
-# Design: Bounded Apply execution and interruption recovery
+# 設計: Apply実行の有限化と中断時recovery
 
 ## Safety invariant
 
-Conflux-owned repository mutation may begin only after the active agent process group is proven quiescent. If Apply is interrupted after changing a managed workspace, Conflux must preserve those repository-visible changes before ending the run. The preserved Git/workspace state, not logs or process-local counters, determines the next action after restart.
+Conflux-owned repository mutationは、active agent process groupのquiescenceを証明した後にだけ開始できる。Applyがmanaged workspaceを変更した後に中断された場合、Confluxはrun終了前にrepository-visible changeを保存する。restart後の次actionはlogやprocess-local counterではなく、保存されたGit/workspace stateから決定する。
 
-## Unified termination sequence
+## 統一termination sequence
 
-Cancellation, TUI external shutdown, and absolute runtime timeout use one ordered sequence:
+cancellation、TUI external shutdown、absolute runtime timeoutは次の順序を共有する。
 
-1. Close run-command-scope spawn and retry admission.
-2. Cancel the active runner task.
-3. Send SIGTERM to the owned process group.
-4. Escalate to SIGKILL after the existing grace period.
-5. Prove process-group quiescence with the existing typed cleanup report.
-6. Inspect managed-worktree status.
-7. If dirty, create one Conflux-owned WIP iteration snapshot.
-8. Return a typed terminal outcome that does not permit same-run automatic redispatch.
+1. run-command-scopeのspawnとretry admissionを閉じる。
+2. active runner taskをcancelする。
+3. owned process groupへSIGTERMを送る。
+4. 既存grace period後にSIGKILLへescalateする。
+5. 既存typed cleanup reportでprocess-group quiescenceを証明する。
+6. managed-worktree statusを確認する。
+7. dirtyの場合だけConflux-owned WIP iteration snapshotを1つ作成する。cleanの場合はsnapshot pathを呼ばず、空WIP commitを作らない。
+8. same-run automatic redispatchを許可しないtyped terminal outcomeを返す。
 
-A cleanup failure stops before step 6. A snapshot failure keeps the workspace untouched and returns actionable diagnostics. Neither failure may be reported as successful shutdown.
+cleanup failureはstep 6より前で停止する。snapshot failureはworkspaceを変更せず保持し、actionable diagnosticsを返す。いずれもsuccessful shutdownとして報告してはならない。
 
 ## Absolute runtime limit
 
-`command_max_runtime_secs` belongs to the common command-runner configuration because every AI command uses the same process ownership boundary. The deadline is measured from successful child spawn and is not reset by stdout or stderr. `0` disables it. The default is 3,600 seconds.
+`command_max_runtime_secs`は全AI commandが同じprocess ownership boundaryを使うため、common command-runner configurationへ置く。1つのdeadlineがlogical invocation全体を覆い、最初のchild spawn成功時に開始し、transport retry、inactivity retry、retry delay、child respawnを跨いで継続する。stdout、stderr、後続attemptでresetしない。`0`は無効化、defaultは3,600秒とする。
 
-The timeout outcome is not an inactivity timeout, transient error, or generic non-zero crash. It closes retry admission for that invocation. Apply additionally preserves WIP progress and stops the active run so an operator can inspect and explicitly retry.
+runtime-limit outcomeはinactivity timeout、transient error、generic non-zero crashではない。invocationの全後続retry admissionを閉じる。ApplyはさらにWIP progressを保存してactive runを停止し、operatorのinspectと明示的retryを待つ。
 
-## WIP identity and restart
+## WIP identityとrestart
 
-The WIP commit remains a normal workspace-local `WIP: <change-id> (...)` commit created by the existing `WorkspaceManager::create_iteration_snapshot` path. No timeout marker, retry counter, or lifecycle state is persisted outside Git/workspace files. A new Conflux process recomputes routing from the preserved worktree and base comparison.
+WIP commitは既存`WorkspaceManager::create_iteration_snapshot` pathが作る通常のworkspace-local `WIP: <change-id> (...)` commitとする。timeout marker、retry counter、lifecycle stateをGit/workspace外へ保存しない。新しいConflux processは保存されたworktreeとbase comparisonからroutingを再計算する。
 
 ## Verification discipline
 
-Runtime enforcement bounds the outer agent invocation. Portable skills bound work inside the agent:
+runtime enforcementはouter agent invocationを制限し、portable skillはagent内部のworkを制限する。
 
-- Run a verification command once by default.
-- A retry is justified only by a repository repair or concrete environment recovery since the previous execution.
-- The identical command may run at most three times within one Apply invocation.
-- A suspected flaky test is reported as `verification_unstable`; a command that cannot complete within the invocation budget is reported as `verification_timeout`.
-- Heavy or non-local gates are proposal-owned CI, Acceptance, or operational observations, not accidental Apply loops.
+- verification commandはdefaultで1回実行する。
+- retryは前回実行後のrepository repairまたは具体的なenvironment recoveryだけを根拠とする。
+- 同一commandは1 Apply invocation内で最大3回まで実行できる。
+- flaky testが疑われる場合は`verification_unstable`、invocation budget内に完了しない場合は`verification_timeout`を報告する。
+- 両categoryは既存Implementation Blocker fact schemaとcompatible `BLOCKED` handoffを拡張する。Applyはfactsだけを報告し、ConfluxとAcceptanceがfinal `blocked`または`stalled` lifecycle classificationを所有する。
+- heavyまたはnon-local gateはproposal-owned CI、Acceptance、operational observationへ割り当て、Apply loopへ置かない。
 
-The skill does not depend on a specific harness timeout command. It requires the agent to use the runtime's managed execution facility when available and to stop with structured blocker evidence when bounded execution cannot be guaranteed.
+skillは特定harnessのtimeout commandへ依存しない。利用可能な場合はruntimeのmanaged execution facilityを使い、bounded executionを保証できない場合はstructured blocker evidenceとともに停止する。
 
 ## TUI signal integration
 
-TUI keyboard stop and external SIGINT/SIGTERM converge on `TuiRunSupervisor` and `RunCommandScope`. Signal handling must not directly exit the process while a run is active. The TUI waits for the same bounded cleanup barrier, then shuts down lifecycle adapters and exits. A second signal may request forceful escalation but cannot bypass quiescence evidence or WIP preservation.
+TUI keyboard stopとexternal SIGINT/SIGTERMは`TuiRunSupervisor`と`RunCommandScope`へ収束する。active runがある間、signal handlingはprocessを直接exitしてはならない。TUIは同じbounded cleanup barrierを待ち、lifecycle adapterをshutdownしてから終了する。二度目のsignalはforceful escalationを要求できるが、quiescence evidenceまたはWIP preservationを迂回できない。active runがないsignalは既存ordinary-stop classificationを維持する。
 
-## Testing strategy
+headless `cflx run`のsignal-driven cancellationはこのchangeの対象外とする。common command-runnerのabsolute runtime limitとApply WIP preservationはfrontend非依存だが、SIGINT/SIGTERM wiringはTUIだけに追加する。
 
-Tests avoid short wall-clock correctness thresholds:
+## Test strategy
 
-- Command deadlines use paused Tokio time or an injected clock plus controlled child fixtures.
-- Process cleanup uses existing real process-group integration fixtures with generous safety timeouts.
-- Apply WIP preservation uses fake workspace managers for ordering and Git-backed tests for restart-visible commits.
-- TUI signal behavior drives the supervisor boundary directly and verifies scope/registry state transitions.
-- Skill contract tests inspect embedded source text and blocker schema requirements.
+短いwall-clock閾値をcorrectness assertionに使わない。
+
+- command deadlineはpaused Tokio timeまたはinjected clockとcontrolled sub-second child fixtureを使い、stateとcleanup evidenceで判定する。
+- process cleanupは既存real process-group integration fixtureと十分余裕あるhang safeguardを使い、default target全体を1秒未満に保つ。
+- Apply WIP preservationはordering用fake workspace managerとrestart-visible commit用Git-backed testを使い、clean worktreeでempty WIPを作らないcaseも検証する。
+- TUI signal behaviorはsupervisor boundaryを直接driveし、scope/registry state transition、idle/background mutation classification、second-signal escalationを検証する。
+- skill contract testはembedded source textと既存＋追加blocker schema fieldを検証する。

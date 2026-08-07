@@ -1,28 +1,28 @@
 ## ADDED Requirements
 
-### Requirement: Proposal verification plans bound Apply-owned work
+### Requirement: Proposal verification planはApply-owned workを有限化する
 
-Bundled proposal guidance MUST keep Apply-blocking verification repository-local and bounded to one direct execution by default. Docker, database, heavy, credentialed, deployed-service, physical-device, external-approval, and long-running repository-wide gates MUST be assigned to repository automation, Acceptance, benchmark, manual, or operational-observation ownership unless the proposal declares a bounded repository-local path that can complete within one Apply invocation. Proposal guidance MUST NOT create checkbox tasks whose sole purpose is repeated stability execution of the same verification command.
+bundled proposal guidanceはApply-blocking verificationをrepository-localかつdefaultで1回のdirect executionに制限しなければならない（MUST）。Docker、database、heavy、credentialed、deployed-service、physical-device、external-approval、long-running repository-wide gateは、1 Apply invocation内で完了するbounded repository-local pathをproposalが宣言しない限り、repository automation、Acceptance、benchmark、manual、operational-observation ownershipへ割り当てなければならない（MUST）。proposal guidanceは同一verification commandのstability executionだけを目的とするcheckbox taskを作成してはならない（MUST NOT）。
 
-#### Scenario: Heavy repository gate is not an Apply checkbox
+#### Scenario: Heavy repository gateはApply checkboxにしない
 
-**Given**: a change requires a Docker and database repository-wide validation suite
-**And**: requirement-specific repository-local tests can prove implementation before integration
-**When**: bundled proposal guidance creates the verification plan
-**Then**: active implementation checkboxes reference the bounded repository-local tests
-**And**: the heavy suite is assigned to repository automation, Acceptance, or operational observation
-**And**: no checkbox requires repeated execution of the heavy suite
+- **GIVEN** changeがDockerとdatabaseを使用するrepository-wide validation suiteを必要とする
+- **AND** requirement-specific repository-local testがintegration前にimplementationを証明できる
+- **WHEN** bundled proposal guidanceがverification planを作成する
+- **THEN** active implementation checkboxはbounded repository-local testを参照する
+- **AND** heavy suiteはrepository automation、Acceptance、operational observationへ割り当てる
+- **AND** heavy suiteの反復実行をcheckboxへ要求しない
 
-#### Scenario: Bounded repository-local integration test may block completion
+#### Scenario: Bounded repository-local integration testはcompletionをblockできる
 
-**Given**: a database behavior can be verified with a local fixture in one direct bounded command
-**When**: proposal guidance declares that verification
-**Then**: it may be `pre-integration`, `repository-local`, and `change-blocking`
-**And**: the task names one rerun command and does not prescribe a stability loop
+- **GIVEN** database behaviorを1つのdirect bounded commandとlocal fixtureで検証できる
+- **WHEN** proposal guidanceがverificationを宣言する
+- **THEN** `pre-integration`、`repository-local`、`change-blocking`として宣言できる
+- **AND** taskは1つのrerun commandを指定しstability loopを要求しない
 
-#### Scenario: Non-local verification cannot be hidden in task prose
+#### Scenario: Non-local verificationをtask proseへ隠さない
 
-**Given**: an outcome requires credentials, deployment, physical hardware, or external approval
-**When**: proposal guidance writes tasks and structured verifications
-**Then**: the outcome is not attached to an Apply-blocking checkbox
-**And**: its structured verification role is operational observation or narrative Future Work
+- **GIVEN** outcomeがcredential、deployment、physical hardware、external approvalを必要とする
+- **WHEN** proposal guidanceがtaskとstructured verificationを書く
+- **THEN** outcomeをApply-blocking checkboxへ紐付けない
+- **AND** structured verification roleをoperational observationまたはnarrative Future Workとする

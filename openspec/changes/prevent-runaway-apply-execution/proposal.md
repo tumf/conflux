@@ -13,98 +13,114 @@ references:
   - skills/cflx-proposal/SKILL.md
 verifications:
   - id: apply-interruption-tests
-    requirement: Interrupted and runtime-limited Apply preserves repository progress without automatic redispatch
+    requirement: 中断または実行時間上限に達したApplyが自動再投入なしでrepository progressを保存する
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: src/execution/apply.rs
-    evidence: Apply-loop unit tests prove cleanup, WIP snapshot, terminal classification, and restart-visible progress
+    evidence: Apply loop unit testがcleanup、WIP snapshot、terminal classification、restart-visible progressを証明する
     rerun: cargo test --locked execution::apply::tests
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
+  - id: config-runtime-tests
+    requirement: 絶対実行時間設定のdefault、precedence、disable semantics、生成例が安定している
+    phase: pre-integration
+    owner: conflux-acceptance
+    trigger: pull-request-validation
+    automation: src/config/mod.rs
+    evidence: configuration unit testがdefault、custom-project-global precedence、zero-disable、生成例を証明する
+    rerun: cargo test --locked config
+    prerequisites: []
+    execution_class: repository-local
+    completion_role: change-blocking
   - id: command-runtime-tests
-    requirement: Absolute runtime limits terminate owned process groups independently of output activity
+    requirement: invocation全体で単一の絶対実行時間上限が出力とretry attemptに依存せずowned process groupを終了する
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: tests/process_cleanup_test.rs
-    evidence: Process cleanup integration tests prove timeout, SIGTERM/SIGKILL escalation, and quiescence
+    evidence: 1秒未満のcontrolled process fixtureがtimeout、retry suppression、SIGTERM/SIGKILL escalation、quiescenceを短いwall-clock正否閾値なしで証明する
     rerun: cargo test --locked --test process_cleanup_test
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
   - id: tui-shutdown-tests
-    requirement: TUI external shutdown drains the run command scope and leaves no owned descendants
+    requirement: TUI external shutdownがrun command scopeをdrainしてowned descendantを残さない
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: src/tui/run_supervisor.rs
-    evidence: TUI supervisor tests prove SIGINT/SIGTERM share the bounded shutdown boundary
+    evidence: TUI supervisor testがSIGINTとSIGTERMで共通のbounded shutdown boundaryを使用することを証明する
     rerun: cargo test --locked tui::run_supervisor::tests
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
   - id: skill-contract-tests
-    requirement: Apply and proposal guidance prevent unbounded or duplicated verification work
+    requirement: Applyとproposal guidanceが無制限または重複したverification workを防ぐ
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: tests/install_skills_test.rs
-    evidence: Embedded skill contract tests assert bounded verification retries, blocker handoff, and heavy-gate ownership guidance
+    evidence: embedded skill contract testがbounded verification retry、blocker handoff、heavy-gate ownershipを検証する
     rerun: cargo test --locked --test install_skills_test
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
 ---
 
-# Prevent runaway Apply execution
+# 暴走するApply実行を防止する
 
 **Change Type**: hybrid
 
-## Problem / Context
+## 問題と背景
 
-A managed Apply command can continue indefinitely while emitting output because Conflux only enforces inactivity timeout, not an absolute invocation deadline. If an operator interrupts that work, the Apply cancellation path can return before preserving dirty workspace progress, so a later run re-enters from workspace evidence that still looks like the first Apply attempt. The portable Apply skill also requires foreground verification and repeated repair without defining a finite retry boundary, which permits self-invented stability loops and multi-hour repository gates.
+Confluxは無出力timeoutだけを適用しており、invocation全体の絶対実行時間上限を持たないため、managed Apply commandが出力を続ける限り無期限に実行され得る。operatorがこの作業を中断すると、Apply cancellation pathがdirty workspace progressを保存する前にreturnし、次のrunがworkspace evidence上で最初のApply attemptに見える状態から再開する場合がある。portable Apply skillもforeground verificationと修正後の再実行を要求する一方、有限なretry境界を定めておらず、agentが独自のstability loopや数時間のrepository gateを作る余地がある。
 
-TUI internal stop already owns bounded process-group cleanup, but an external SIGINT or SIGTERM must reach the same run cancellation, process quiescence, and progress-preservation boundary. Otherwise the TUI process can exit while detached agent, shell, Cargo, or test descendants remain active.
+TUI internal stopはbounded process-group cleanupを所有するが、external SIGINTまたはSIGTERMも同じrun cancellation、process quiescence、progress preservation境界へ到達する必要がある。これがないと、TUI process終了後もdetached agent、shell、Cargo、test descendantが残り得る。
 
-## Proposed Solution
+## 提案する解決策
 
-Create one atomic Apply safety boundary with four coordinated behaviors:
+次の4つを1つのApply safety boundaryとして導入する。
 
-1. Preserve dirty managed-worktree progress as a Conflux WIP snapshot after owned process-group quiescence whenever Apply is cancelled, externally terminated, or stopped by its absolute runtime limit.
-2. Add a configurable `command_max_runtime_secs` absolute deadline, defaulting to 3,600 seconds and disabled by `0`, independent of output activity and inactivity timeout.
-3. Update `cflx-apply` and `cflx-proposal` guidance so verification is single-run by default, unchanged stability loops are prohibited, retries require new repair or environment-recovery evidence, and non-completing verification produces a structured blocker rather than indefinite work.
-4. Route TUI SIGINT and SIGTERM through the same bounded shutdown boundary as operator stop, closing command admission, terminating and proving quiescence for owned process groups, preserving Apply progress, then exiting.
+1. Applyがcancel、TUI external signal、absolute runtime limitで停止した場合、owned process-group quiescence確認後にdirty managed-worktree progressをConflux WIP snapshotとして保存する。
+2. output activityとinactivity timeoutから独立した`command_max_runtime_secs`を追加する。defaultは3,600秒、`0`は無効化であり、最初のchild spawnからretryを跨ぐlogical invocation全体を覆う。
+3. `cflx-apply`と`cflx-proposal` guidanceを更新し、verificationはdefaultで1回、無変更stability loopは禁止、retryは新しいrepairまたはenvironment-recovery evidenceの後だけ許可し、完了しないverificationは既存schema互換のstructured blockerとして返す。
+4. TUI SIGINTとSIGTERMをoperator stopと同じbounded shutdown boundaryへ接続し、command admission停止、owned process group終了とquiescence証明、Apply progress保存後に終了する。
 
-These behaviors ship together because a deadline without progress preservation loses work, preservation without process quiescence races repository mutation, and guidance without runtime enforcement cannot bound a misbehaving agent.
+これらは一体で提供する。progress保存のないdeadlineは作業を失い、quiescenceのない保存はrepository mutationと競合し、runtime enforcementのないguidanceだけではmisbehaving agentを有限時間に制限できないためである。
 
-## Acceptance Criteria
+## 受け入れ基準
 
-- Cancelling a dirty managed Apply terminates its owned process group, proves quiescence, creates a WIP snapshot containing staged, unstaged, and untracked change-owned progress, and does not dispatch Acceptance.
-- A fresh process derives the next action from the preserved workspace and Git state without consulting logs or other external durable state.
-- `command_max_runtime_secs` defaults to 3,600 seconds, accepts `0` as disabled, follows normal configuration precedence, and is independent of output activity.
-- An agent that continuously emits output is terminated when the absolute deadline expires.
-- Runtime-limit termination is classified distinctly from an ordinary crash and is not automatically retried in the same run.
-- TUI SIGINT and SIGTERM close run command admission, cancel the run, terminate owned process groups through the existing graceful-then-forceful path, prove quiescence, preserve dirty Apply progress, and leave no owned descendants.
-- If process quiescence or WIP preservation cannot be proven, Conflux exits non-zero with actionable diagnostics and retains workspace contents without reporting successful cleanup.
-- `cflx-apply` prohibits no-change stability loops, permits at most three executions of the same verification command only when each retry follows repository repair or concrete environment recovery, and records `verification_timeout` or `verification_unstable` blocker evidence when bounded verification cannot complete.
-- `cflx-proposal` keeps Docker, database, heavy, credentialed, deployed, and long-running repository-wide gates out of Apply-blocking checkbox tasks unless a bounded repository-local verification path exists.
+- dirty managed Applyをcancelすると、owned process groupを終了してquiescenceを証明し、staged・unstaged・untrackedのchange-owned progressを含むWIP snapshotを作成し、Acceptanceをdispatchしない。
+- clean managed Applyのcancelまたはruntime-limit expiryでは空WIP commitを作成しない。
+- fresh processはlogや外部durable stateを参照せず、保存されたworkspaceとGit stateから次のactionを導出する。
+- `command_max_runtime_secs`はdefault 3,600秒、`0`で無効、custom > project > globalのprecedenceに従い、生成configuration exampleへ含まれ、output activityと独立する。
+- 1つのabsolute deadlineがcommand-queue retry attempt全体を覆い、retryまたはrespawnでreset・乗算されない。
+- 継続的に出力するagentもinvocation-wide absolute deadlineで終了する。
+- runtime-limit terminationはordinary crashと区別され、同じrunで自動retryされない。
+- TUI SIGINTとSIGTERMはrun command admissionを閉じ、runをcancelし、既存のgraceful-then-forceful pathでowned process groupを終了してquiescenceを証明し、dirty Apply progressを保存し、owned descendantを残さない。
+- active runがないTUI signalは通常停止として扱われ、存在しないprocessのforce stopを主張しない。
+- 二度目のsignalによるforceful escalationもquiescence証明とWIP保存を迂回しない。
+- process quiescenceまたはWIP preservationを証明できない場合、Confluxはactionable diagnosticsを伴うnon-zeroで終了し、workspace contentsを保持し、正常cleanupを報告しない。
+- `cflx-apply`はno-change stability loopを禁止し、同一verification commandをrepository repairまたは具体的なenvironment recovery後に限り最大3回実行できる。完了できない場合は、既存structured Implementation Blocker schemaとcompatible `BLOCKED` handoffで`verification_timeout`または`verification_unstable` factsを記録し、final `blocked`または`stalled` lifecycle stateを主張しない。
+- `cflx-proposal`はbounded repository-local verification pathがないDocker、database、heavy、credentialed、deployed、long-running repository-wide gateをApply-blocking checkbox taskへ置かない。
 
-## Explicit Completion Conditions
+## 明示的な完了条件
 
-- Apply cancellation and absolute-timeout branches share a tested helper that performs process-group cleanup before any WIP snapshot and returns a typed terminal outcome that suppresses same-run redispatch.
-- Configuration types, merge behavior, defaults, generated examples, and command-runner wiring expose `command_max_runtime_secs` consistently.
-- Timeout tests use deterministic paused time or controlled process fixtures rather than short wall-clock correctness assertions.
-- TUI signal tests exercise the same supervisor shutdown boundary used by operator stop and verify no registered execution or process identity remains.
-- Embedded skill source and installed-skill contract tests contain the bounded verification and heavy-gate ownership rules.
-- `cargo test --locked execution::apply::tests`, `cargo test --locked --test process_cleanup_test`, `cargo test --locked tui::run_supervisor::tests`, and `cargo test --locked --test install_skills_test` pass.
-- Existing path-scoped pre-commit hooks remain responsible for repository-wide rustfmt and clippy when Rust paths are staged; this proposal does not duplicate them as Apply checkbox tasks.
+- Apply cancellationとabsolute-timeout branchは、WIP snapshot前にprocess-group cleanupを行い、same-run redispatchを抑止するtyped terminal outcomeを返すtested helperを共有する。
+- configuration type、merge、default、generated example、command-runner wiringが`command_max_runtime_secs`を一貫して公開し、`cargo test --locked config`がconfiguration contractを証明する。
+- timeout testはpaused timeまたはcontrolled sub-second process fixtureを使用し、短いwall-clock正否閾値ではなくstateとcleanup evidenceで判定する。default test targetは1秒未満を維持し、timeoutはhang防止の十分余裕ある安全弁だけに使う。
+- TUI signal testはoperator stopと同じsupervisor shutdown boundaryを実行し、登録executionまたはprocess identityが残らないこと、idle/background mutationの既存分類、second-signal escalationを検証する。
+- embedded skill sourceとinstalled-skill contract testがbounded verification、canonical blocker fields、heavy-gate ownershipを含む。
+- `cargo test --locked execution::apply::tests`、`cargo test --locked config`、`cargo test --locked --test process_cleanup_test`、`cargo test --locked tui::run_supervisor::tests`、`cargo test --locked --test install_skills_test`が成功する。
+- Rust pathがstageされた場合のrepository-wide rustfmtとclippyは既存path-scoped pre-commit hookが所有し、本proposalは重複するApply checkbox taskを作らない。
 
-## Out of Scope
+## 対象外
 
-- Changing Corvus Cargo profiles, build parallelism, or test implementation.
-- Detecting semantic repetition by parsing arbitrary agent shell commands.
-- Persisting process-local retry counters or execution state outside the workspace.
-- Changing Acceptance, Archive, Resolve, or Analyze operation-specific runtime limits beyond their use of the common command deadline.
-- Adding deployed-service or credentialed post-integration verification.
+- CorvusのCargo profile、build parallelism、test implementationの変更。
+- 任意のagent shell commandをparseしてsemantic repetitionを検出すること。
+- process-local retry counterまたはexecution stateをworkspace外へ永続化すること。
+- common command deadlineを利用する範囲を超えてAcceptance、Archive、Resolve、Analyze固有のruntime limitを変更すること。
+- headless `cflx run`へsignal-driven cancellationを追加すること。本changeのSIGINT/SIGTERM収束はTUIだけを対象とし、common absolute-runtime expiryはfrontend非依存とする。
+- deployed-serviceまたはcredentialed post-integration verificationの追加。
