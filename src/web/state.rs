@@ -447,6 +447,57 @@ pub struct WebState {
     /// sequence, a doubled revision, and a doubled retained log. Remembering the
     /// identity makes that repeat a no-op instead.
     projected_dispatches: Mutex<RecentDispatchIds>,
+    /// The projection revision each recent dispatch produced.
+    ///
+    /// A `std::sync::Mutex` rather than the async one every other field uses,
+    /// because [`crate::events::OutcomeRevisions`] is a synchronous lookup: a
+    /// coordinator asking "which revision did *my* dispatch produce" must not
+    /// have to await anything that could reorder it against another command.
+    dispatch_revisions: std::sync::Mutex<DispatchRevisions>,
+}
+
+/// Bounded map from dispatch identity to the revision that dispatch produced.
+///
+/// Bounded for the same reason [`RecentDispatchIds`] is: identities are
+/// unbounded and the process is long-lived. The window only has to outlive the
+/// gap between a command dispatching its outcome and settling its record, which
+/// is a few statements.
+#[derive(Default)]
+struct DispatchRevisions {
+    order: std::collections::VecDeque<u64>,
+    revisions: std::collections::HashMap<u64, u64>,
+}
+
+impl DispatchRevisions {
+    const CAPACITY: usize = 256;
+
+    fn record(&mut self, dispatch_id: u64, revision: u64) {
+        if self.revisions.insert(dispatch_id, revision).is_none() {
+            self.order.push_back(dispatch_id);
+        }
+        while self.order.len() > Self::CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.revisions.remove(&evicted);
+            }
+        }
+    }
+
+    fn get(&self, dispatch_id: u64) -> Option<u64> {
+        self.revisions.get(&dispatch_id).copied()
+    }
+}
+
+impl crate::events::OutcomeRevisions for WebState {
+    fn revision_for_dispatch(&self, dispatch_id: u64) -> Option<u64> {
+        self.dispatch_revisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(dispatch_id)
+    }
+
+    fn current_revision(&self) -> u64 {
+        self.remote_control.projection().revision()
+    }
 }
 
 /// Bounded set of recently projected dispatch identities.
@@ -492,6 +543,7 @@ impl WebState {
             run_boundary: tokio::sync::RwLock::new(None),
             operator_facts: tokio::sync::RwLock::new(OperatorFactsStore::new()),
             projected_dispatches: Mutex::new(RecentDispatchIds::default()),
+            dispatch_revisions: std::sync::Mutex::new(DispatchRevisions::default()),
         }
     }
 
@@ -651,12 +703,20 @@ impl WebState {
     /// event's ownership class — not its variant, read a second time here —
     /// decides whether a revision, a retained log, or only a sequence is
     /// allocated, so every internal event produces exactly one ordered v2 event.
+    ///
+    /// Returns the revision *this* application produced, taken from the envelope
+    /// the projection transaction returned rather than from a later read of
+    /// `state_revision`. A log or presentation event carries the unchanged
+    /// current revision; a state event carries the one it just allocated. The
+    /// caller binds that value to the dispatch identity, so a concurrent
+    /// dispatch that lands between this transaction and the recording cannot
+    /// donate its revision to this command.
     async fn project_execution_event(
         &self,
         event: &ExecutionEvent,
         ownership: EventOwnership,
         authoritative: Option<&crate::orchestration::state::OrchestratorState>,
-    ) {
+    ) -> u64 {
         use crate::web::remote_control_api::projection as v2;
 
         let projection = self.remote_control.projection();
@@ -666,19 +726,23 @@ impl WebState {
                 // exactly one retained entry.
                 let ExecutionEvent::Log(entry) = event else {
                     debug_assert!(false, "log ownership without a log payload: {event:?}");
-                    return;
+                    return projection.revision();
                 };
-                projection.apply_log(entry.clone());
+                projection.apply_log(entry.clone()).state_revision
             }
             EventOwnership::Presentation => {
                 let (event_type, change_id, payload) = v2::describe_event(event);
-                projection.apply_presentation(event_type, change_id, payload);
+                projection
+                    .apply_presentation(event_type, change_id, payload)
+                    .state_revision
             }
             EventOwnership::State => {
                 let (event_type, change_id, payload) = v2::describe_event(event);
                 let candidate =
                     v2::project_snapshot(&self.operator_snapshot_with(authoritative).await);
-                projection.apply_state(event_type, change_id, payload, candidate);
+                projection
+                    .apply_state(event_type, change_id, payload, candidate)
+                    .state_revision
             }
         }
     }
@@ -1188,6 +1252,55 @@ impl WebState {
                     state.app_mode = "error".to_string();
                 }
 
+                // One accepted operator command's decision facts. The reducer
+                // transitions this command implied were already applied by the
+                // shared services; what is projected here is the process-level
+                // state no reducer owns — admission mode and resolver ownership
+                // — so the snapshot a client reads at `result_revision` really
+                // contains the command's synchronous effect.
+                ExecutionEvent::OperatorCommandApplied { effect } => {
+                    use crate::events::OperatorCommandEffect as Effect;
+                    match effect {
+                        // Only a newly spawned scheduler proves execution has
+                        // begun; a dispatch that merely woke a live scheduler —
+                        // including one parked in persistent-idle Ready — has
+                        // admitted nothing yet and leaves the mode alone.
+                        Effect::RunDispatched {
+                            scheduler_started, ..
+                        } => {
+                            if *scheduler_started {
+                                state.app_mode = "running".to_string();
+                            }
+                        }
+                        // Withdrawing a stop restores where the stop came from:
+                        // Ready with its episode intact when the stop was
+                        // requested from persistent-idle Ready, Running when
+                        // admitted work had already closed the episode.
+                        Effect::StopCancelled => {
+                            state.app_mode = if state.persistent_scheduler_idle {
+                                "select".to_string()
+                            } else {
+                                "running".to_string()
+                            };
+                        }
+                        Effect::ForceStopAwaitingBoundary { .. } => {
+                            state.app_mode = "stopping".to_string();
+                        }
+                        Effect::ResolveReserved { active, .. } => {
+                            if *active {
+                                state.is_resolving = true;
+                                state.app_mode = "running".to_string();
+                            }
+                        }
+                        // Orthogonal to the run lifecycle: the reducer-derived
+                        // statuses re-read below carry the queue delta, and the
+                        // mark delta is read from the shared store when the
+                        // snapshot is built.
+                        Effect::MarkDelta { .. } | Effect::QueueDelta { .. } => {}
+                    }
+                    updated = true;
+                }
+
                 _ => {}
             }
 
@@ -1215,43 +1328,20 @@ impl WebState {
 
         // Project into `/api/v2` last, so the candidate snapshot it compares
         // against is the one this event just produced.
-        self.project_execution_event(event, dispatch.ownership, dispatch.state)
+        let produced = self
+            .project_execution_event(event, dispatch.ownership, dispatch.state)
             .await;
-    }
 
-    /// Project an accepted cancel-stop onto the monitoring snapshot.
-    ///
-    /// Cancel-stop withdraws a request; it does not start anything. Where the
-    /// frontend returns to therefore depends on where the stop came from: a stop
-    /// requested from persistent-idle Ready returns to Ready with its episode
-    /// intact, while a stop requested from a genuinely running scheduler returns
-    /// to Running. Claiming Running for the first case would advertise execution
-    /// that no typed work-start event has ever proved.
-    ///
-    /// Every frontend that can accept a cancel-stop routes it through here, so
-    /// TUI keypresses and `/api/v2` commands cannot disagree about the same run.
-    pub async fn project_stop_cancelled(&self) {
-        {
-            let mut state = self.state.write().await;
-            if state.app_mode != "stopping" {
-                return;
-            }
-            state.app_mode = if state.persistent_scheduler_idle {
-                "select".to_string()
-            } else {
-                "running".to_string()
-            };
-        }
-        self.sync_remote_control_projection().await;
-    }
-
-    /// Project an accepted graceful-stop request onto the monitoring snapshot.
-    ///
-    /// Routed through the ordinary dispatch so the stop reaches `/api/v2` as one
-    /// ordered `stopping` event at one revision, exactly as it does when the
-    /// request comes from a TUI keypress.
-    pub async fn project_stop_requested(&self) {
-        self.apply_execution_event(&ExecutionEvent::Stopping).await;
+        // Bind the revision this dispatch produced to its identity. The value
+        // comes out of the projection transaction itself, not from a later read
+        // of `state_revision`: sink fan-out runs with no reducer or mark lock
+        // held, so another dispatch may apply between the two, and re-reading
+        // would hand this command that unrelated progress as its
+        // `result_revision`.
+        self.dispatch_revisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(dispatch.id, produced);
     }
 
     /// Update the process-local operator facts from one execution event.

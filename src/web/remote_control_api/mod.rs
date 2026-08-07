@@ -87,6 +87,36 @@ pub struct RemoteControlRuntime {
     /// Worktree reads are bound separately from commands because the read routes
     /// are mounted before any orchestration runtime exists.
     worktrees: tokio::sync::RwLock<Option<Arc<dyn WorktreeOperations>>>,
+    /// The process-local application gate, bound with the executor.
+    gate: Arc<CommandGate>,
+}
+
+/// Late-bound handle to the process-local operator application gate.
+///
+/// The endpoint holds this gate from final admission through settlement, which
+/// is the whole fix for the concurrency hole optimistic revisions had on their
+/// own: admission was atomic for the *record*, but the effect that consumes the
+/// revision landed after the lock was already released, so two new commands
+/// could each pass the revision check.
+///
+/// Unbound until an orchestration runtime exists — a process that cannot execute
+/// a command has no transaction to serialize.
+#[derive(Default)]
+pub struct CommandGate {
+    inner: tokio::sync::RwLock<Option<Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl CommandGate {
+    /// Bind the coordinator's gate.
+    pub async fn bind(&self, gate: Arc<tokio::sync::Mutex<()>>) {
+        *self.inner.write().await = Some(gate);
+    }
+
+    /// Hold the gate for one submission, if a coordinator is bound.
+    pub async fn hold(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let gate = self.inner.read().await.clone()?;
+        Some(gate.lock_owned().await)
+    }
 }
 
 impl Default for RemoteControlRuntime {
@@ -102,6 +132,7 @@ impl RemoteControlRuntime {
             projection: Arc::new(Projection::new()),
             executor: tokio::sync::RwLock::new(None),
             worktrees: tokio::sync::RwLock::new(None),
+            gate: Arc::new(CommandGate::default()),
         }
     }
 
@@ -110,9 +141,19 @@ impl RemoteControlRuntime {
         self.projection.clone()
     }
 
+    /// The application gate the command endpoint serializes submissions with.
+    pub fn gate(&self) -> Arc<CommandGate> {
+        self.gate.clone()
+    }
+
     /// Bind the delegation target once an orchestration runtime exists.
     pub async fn bind(&self, executor: Arc<dyn RemoteControlExecutor>) {
         *self.executor.write().await = Some(executor);
+    }
+
+    /// Bind the process-local application gate once a coordinator exists.
+    pub async fn bind_gate(&self, gate: Arc<tokio::sync::Mutex<()>>) {
+        self.gate.bind(gate).await;
     }
 
     /// Bind the worktree port once a repository-backed service exists.
@@ -134,12 +175,44 @@ impl RemoteControlExecutor for RemoteControlRuntime {
         let bound = self.executor.read().await.clone();
         match bound {
             Some(executor) => executor.execute(command).await,
-            None => Err(CommandFailure::new(
-                ErrorCode::LifecycleConflict,
-                "this instance has no orchestration runtime bound yet",
-            )),
+            None => Err(unbound_runtime()),
         }
     }
+
+    async fn begin(
+        &self,
+        command: &CommandSpec,
+        gate: Option<executor::GateGuard>,
+    ) -> executor::Applied {
+        let bound = self.executor.read().await.clone();
+        match bound {
+            Some(executor) => executor.begin(command, gate).await,
+            None => executor::Applied::Settled(Err(unbound_runtime())),
+        }
+    }
+
+    async fn execute_held(
+        &self,
+        command: &CommandSpec,
+        gate: Option<executor::GateGuard>,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        let bound = self.executor.read().await.clone();
+        match bound {
+            Some(executor) => executor.execute_held(command, gate).await,
+            None => Err(unbound_runtime()),
+        }
+    }
+}
+
+/// The refusal a process with no orchestration runtime returns.
+///
+/// A refusal rather than a queue: a controller must not be told a command was
+/// accepted by a process that cannot act on it.
+fn unbound_runtime() -> CommandFailure {
+    CommandFailure::new(
+        ErrorCode::LifecycleConflict,
+        "this instance has no orchestration runtime bound yet",
+    )
 }
 
 /// Delegate worktree reads to the bound port, refusing before one exists.
@@ -185,6 +258,11 @@ pub struct RemoteControlState {
     pub executor: Arc<dyn RemoteControlExecutor>,
     /// Worktree reads. Defaults to the unbound port, which refuses.
     pub worktrees: Arc<dyn WorktreeOperations>,
+    /// The application gate one submission is serialized by.
+    ///
+    /// Defaults to unbound, which is a process with no coordinator and therefore
+    /// no transaction to serialize.
+    pub gate: Arc<CommandGate>,
 }
 
 impl RemoteControlState {
@@ -199,7 +277,14 @@ impl RemoteControlState {
             auth,
             executor,
             worktrees: Arc::new(UnboundWorktreeOperations),
+            gate: Arc::new(CommandGate::default()),
         }
+    }
+
+    /// Attach the application gate this router serializes submissions with.
+    pub fn with_gate(mut self, gate: Arc<CommandGate>) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Attach the worktree read port.

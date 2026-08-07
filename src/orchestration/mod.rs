@@ -9,6 +9,7 @@ pub mod blocker_classification;
 pub mod hooks;
 pub mod mark_reconciliation;
 pub mod operator_command;
+pub mod operator_coordinator;
 pub mod output;
 pub mod rejection;
 pub mod run_control;

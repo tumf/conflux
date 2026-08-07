@@ -15,53 +15,46 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::ai_command_runner::RunCommandScope;
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
-use crate::orchestration::mark_reconciliation::ExecutionMarkReconciler;
-use crate::orchestration::run_control::RunSchedulerPort;
+use crate::events::EventDispatcher;
+use crate::orchestration::run_control::{RunPermit, RunSchedulerPort};
 use crate::orchestration::state::OrchestratorState;
 use crate::parallel::PostArchiveAction;
-use crate::tui::events::OrchestratorEvent;
 use crate::tui::orchestrator::run_orchestrator_parallel;
 use crate::tui::queue::DynamicQueue;
 use crate::tui::stop_classification::{collect_stop_activity_snapshot, StopActivitySnapshot};
 
 /// Immutable launch context for a local orchestrator run.
+#[derive(Clone)]
 struct LaunchContext {
     repo_root: PathBuf,
     config: OrchestratorConfig,
-    /// The frontend *delivery* channel a spawned run publishes to.
+    /// The process-lifetime authoritative dispatch owner every run publishes to.
     ///
-    /// A run owns its own dispatch: it applies each event to the reducer and
-    /// projects it to `/api/v2` before handing it to this sink. Wiring the TUI's
-    /// producer channel here instead would route every one of those events back
-    /// through the TUI's producer boundary and apply it to the reducer a second
-    /// time — a doubled apply count, a doubled event sequence.
-    tx: mpsc::Sender<OrchestratorEvent>,
+    /// A spawned run does not build a dispatcher of its own: runner-local
+    /// producers, accepted command outcomes, and orchestration runs share one
+    /// owner, so one internal event is one reducer transition, one core mode
+    /// transition, and one delivery per frontend regardless of who raised it.
+    dispatcher: Arc<EventDispatcher>,
     dynamic_queue: DynamicQueue,
     shared_state: Arc<tokio::sync::RwLock<OrchestratorState>>,
     manual_resolve_counter: Arc<std::sync::atomic::AtomicUsize>,
     post_archive_action: PostArchiveAction,
     upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
-    /// The process-local execution-mark reconciler a spawned run's dispatch owner
-    /// binds.
-    ///
-    /// The *same* handle the operator command service mutates. A run that bound
-    /// its own store would give `/api/v2` and the TUI two different answers to
-    /// "which targets are marked".
-    marks: Option<ExecutionMarkReconciler>,
-    #[cfg(feature = "web-monitoring")]
-    web_state: Option<Arc<crate::web::WebState>>,
 }
 
-/// Owns the local orchestrator task, its cancellation token, and the flags that
-/// steer it.
-pub struct TuiRunSupervisor {
-    launch: LaunchContext,
+/// The live run's task, cancellation token, and command scope.
+///
+/// Shared behind an `Arc` so a prepared launch can install them at *activation*
+/// time without borrowing the supervisor: preparation must leave no observable
+/// trace, which includes not claiming the run slots for a launch that may still
+/// be rolled back.
+#[derive(Default)]
+struct RunSlots {
     handle: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     cancel: Mutex<Option<CancellationToken>>,
     /// The live run's command scope, retained *outside* the spawned
@@ -71,6 +64,13 @@ pub struct TuiRunSupervisor {
     /// only from inside it would take the run's process identities with it.
     /// This clone is what still lets local shutdown force-clean them.
     scope: Mutex<Option<RunCommandScope>>,
+}
+
+/// Owns the local orchestrator task, its cancellation token, and the flags that
+/// steer it.
+pub struct TuiRunSupervisor {
+    launch: LaunchContext,
+    slots: Arc<RunSlots>,
     graceful_stop: Arc<AtomicBool>,
 }
 
@@ -80,33 +80,26 @@ impl TuiRunSupervisor {
     pub fn new(
         repo_root: PathBuf,
         config: OrchestratorConfig,
-        tx: mpsc::Sender<OrchestratorEvent>,
+        dispatcher: Arc<EventDispatcher>,
         dynamic_queue: DynamicQueue,
         shared_state: Arc<tokio::sync::RwLock<OrchestratorState>>,
         manual_resolve_counter: Arc<std::sync::atomic::AtomicUsize>,
         post_archive_action: PostArchiveAction,
         upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
         graceful_stop: Arc<AtomicBool>,
-        marks: Option<ExecutionMarkReconciler>,
-        #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
     ) -> Self {
         Self {
             launch: LaunchContext {
                 repo_root,
                 config,
-                tx,
+                dispatcher,
                 dynamic_queue,
                 shared_state,
                 manual_resolve_counter,
                 post_archive_action,
                 upstream_runtime,
-                marks,
-                #[cfg(feature = "web-monitoring")]
-                web_state,
             },
-            handle: Mutex::new(None),
-            cancel: Mutex::new(None),
-            scope: Mutex::new(None),
+            slots: Arc::new(RunSlots::default()),
             graceful_stop,
         }
     }
@@ -119,71 +112,69 @@ impl TuiRunSupervisor {
         Option<CancellationToken>,
         Option<RunCommandScope>,
     ) {
-        let handle = lock(&self.handle).take();
-        let cancel = lock(&self.cancel).take();
-        let scope = lock(&self.scope).take();
+        let handle = lock(&self.slots.handle).take();
+        let cancel = lock(&self.slots.cancel).take();
+        let scope = lock(&self.slots.scope).take();
         (handle, cancel, scope)
     }
 
     /// The command scope of the live run, if any.
     #[cfg(test)]
     pub fn run_command_scope(&self) -> Option<RunCommandScope> {
-        lock(&self.scope).clone()
+        lock(&self.slots.scope).clone()
     }
 
     /// The cancellation token of the live run, if any.
     pub fn cancel_token(&self) -> Option<CancellationToken> {
-        lock(&self.cancel).clone()
+        lock(&self.slots.cancel).clone()
     }
 
-    fn spawn(&self, targets: Vec<String>, explicit_retry: bool) -> CancellationToken {
-        let cancel = CancellationToken::new();
-        // One fresh scope per run start. A closed scope is never reused, so a
-        // restarted run always begins with open admission.
-        let scope = RunCommandScope::new();
-        scope.link_cancellation(cancel.clone());
-
-        let repo_root = self.launch.repo_root.clone();
-        let config = self.launch.config.clone();
-        let tx = self.launch.tx.clone();
-        let dynamic_queue = self.launch.dynamic_queue.clone();
-        let shared_state = self.launch.shared_state.clone();
-        let manual_resolve_counter = self.launch.manual_resolve_counter.clone();
-        let post_archive_action = self.launch.post_archive_action.clone();
-        let upstream_runtime = self.launch.upstream_runtime.clone();
-        let marks = self.launch.marks.clone();
+    /// Build the closure that actually launches the run.
+    ///
+    /// Everything it needs is cloned here; running it is a pure `spawn` with no
+    /// fallible step left, which is what makes activation infallible.
+    fn launcher(&self, targets: Vec<String>, explicit_retry: bool) -> impl FnOnce() + Send {
+        let launch = self.launch.clone();
+        let slots = self.slots.clone();
         let graceful_stop = self.graceful_stop.clone();
-        let run_cancel = cancel.clone();
-        let run_scope = scope.clone();
-        #[cfg(feature = "web-monitoring")]
-        let web_state = self.launch.web_state.clone();
 
-        let handle = tokio::spawn(async move {
-            run_orchestrator_parallel(
-                targets,
-                explicit_retry,
-                repo_root,
-                config,
-                tx,
-                run_cancel,
-                run_scope,
-                dynamic_queue,
-                graceful_stop,
-                shared_state,
-                manual_resolve_counter,
-                post_archive_action,
-                upstream_runtime,
-                marks,
-                #[cfg(feature = "web-monitoring")]
-                web_state,
-            )
-            .await
-        });
+        move || {
+            let cancel = CancellationToken::new();
+            // One fresh scope per run start. A closed scope is never reused, so
+            // a restarted run always begins with open admission.
+            let scope = RunCommandScope::new();
+            scope.link_cancellation(cancel.clone());
 
-        *lock(&self.handle) = Some(handle);
-        *lock(&self.cancel) = Some(cancel.clone());
-        *lock(&self.scope) = Some(scope);
-        cancel
+            // Every launch — selected targets and scheduler-owned resolve alike
+            // — dispatches the cumulative worktree scheduler, so an opted-in
+            // upstream session always reaches the path its publication contract
+            // is defined on.
+            graceful_stop.store(false, Ordering::SeqCst);
+
+            let run_cancel = cancel.clone();
+            let run_scope = scope.clone();
+            let handle = tokio::spawn(async move {
+                run_orchestrator_parallel(
+                    targets,
+                    explicit_retry,
+                    launch.repo_root,
+                    launch.config,
+                    launch.dispatcher,
+                    run_cancel,
+                    run_scope,
+                    launch.dynamic_queue,
+                    launch.shared_state,
+                    launch.manual_resolve_counter,
+                    launch.post_archive_action,
+                    launch.upstream_runtime,
+                )
+                .await
+            });
+
+            *lock(&slots.handle) = Some(handle);
+            *lock(&slots.cancel) = Some(cancel);
+            *lock(&slots.scope) = Some(scope);
+        }
     }
 }
 
@@ -196,22 +187,23 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[async_trait]
 impl RunSchedulerPort for TuiRunSupervisor {
     fn is_running(&self) -> bool {
-        lock(&self.handle)
+        lock(&self.slots.handle)
             .as_ref()
             .is_some_and(|handle| !handle.is_finished())
     }
 
-    async fn start_run(
+    /// Reserve a launch without spawning it.
+    ///
+    /// There is no fallible step: the orchestrator task is spawned by the
+    /// returned permit, so nothing exists to emit an event, claim the run slots,
+    /// or be observed as running until the accepted command outcome has already
+    /// been published.
+    async fn prepare_run(
         &self,
         targets: Vec<String>,
         explicit_retry: bool,
-    ) -> std::result::Result<(), String> {
-        // Every launch — selected targets and scheduler-owned resolve alike —
-        // dispatches the cumulative worktree scheduler, so an opted-in upstream
-        // session always reaches the path its publication contract is defined on.
-        self.graceful_stop.store(false, Ordering::SeqCst);
-        self.spawn(targets, explicit_retry);
-        Ok(())
+    ) -> std::result::Result<RunPermit, String> {
+        Ok(RunPermit::new(self.launcher(targets, explicit_retry)))
     }
 
     async fn notify_scheduler(&self) {
@@ -238,6 +230,8 @@ mod tests {
     use super::*;
     use crate::events::ExecutionEvent;
     use crate::orchestration::state::ReducerCommand;
+    use crate::tui::events::OrchestratorEvent;
+    use tokio::sync::mpsc;
 
     /// Marker the worktree orchestrator emits before it touches anything else,
     /// which is what makes the dispatched path observable from outside.
@@ -250,6 +244,21 @@ mod tests {
         )))
     }
 
+    /// The process-lifetime dispatch owner a spawned run publishes through.
+    ///
+    /// Built here rather than inside the supervisor because production builds
+    /// exactly one for the whole process and hands it in; a supervisor that made
+    /// its own would be the per-run dispatcher this change removed.
+    fn dispatcher(
+        tx: mpsc::Sender<OrchestratorEvent>,
+        state: Arc<tokio::sync::RwLock<OrchestratorState>>,
+    ) -> Arc<EventDispatcher> {
+        Arc::new(EventDispatcher::new(
+            state,
+            vec![Arc::new(crate::tui::events::TuiEventSink::new(tx))],
+        ))
+    }
+
     fn supervisor(
         repo_root: PathBuf,
         tx: mpsc::Sender<OrchestratorEvent>,
@@ -259,16 +268,13 @@ mod tests {
         TuiRunSupervisor::new(
             repo_root,
             OrchestratorConfig::default(),
-            tx,
+            dispatcher(tx, state.clone()),
             DynamicQueue::new(),
             state,
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             PostArchiveAction::MergeToBase,
             upstream_runtime,
             Arc::new(AtomicBool::new(false)),
-            None,
-            #[cfg(feature = "web-monitoring")]
-            None,
         )
     }
 

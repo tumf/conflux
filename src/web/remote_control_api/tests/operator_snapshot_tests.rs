@@ -1092,7 +1092,7 @@ async fn operator_detail_is_sanitized_before_it_is_published() {
 async fn a_command_that_changes_a_decision_field_publishes_it_before_settling() {
     use crate::orchestration::operator_command::{NoopQueueHooks, OperatorCommandService};
     use crate::web::remote_control_api::dto::CommandSpec;
-    use crate::web::remote_control_api::executor::{RemoteControlExecutor, SharedServiceExecutor};
+    use crate::web::remote_control_api::executor::RemoteControlExecutor;
 
     let (web_state, reducer, marks) = wired_web_state(&["c1"]).await;
     let web_state = Arc::new(web_state);
@@ -1114,8 +1114,12 @@ async fn a_command_that_changes_a_decision_field_publishes_it_before_settling() 
         Arc::new(crate::orchestration::run_control::StartEligibility::new()),
     ));
     let projection = web_state.remote_control().projection();
-    let executor =
-        SharedServiceExecutor::new(service, run_control, web_state.clone(), projection.clone());
+    let (executor, _application) = crate::web::remote_control_api::executor::wired_for_test(
+        reducer.clone(),
+        run_control,
+        web_state.clone(),
+        Arc::new(crate::orchestration::operator_coordinator::CoreMode::new()),
+    );
 
     let revision_before = projection.revision();
     let summary = executor

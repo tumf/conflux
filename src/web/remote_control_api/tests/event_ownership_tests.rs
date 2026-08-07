@@ -658,7 +658,10 @@ async fn idle_origin_stop_and_cancel_preserve_ready() {
     .await;
     dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
 
-    web_state.project_stop_requested().await;
+    // Both halves travel as authoritative dispatches — the exact existing
+    // `Stopping` event and the accepted cancel-stop outcome — so this is the
+    // same path a TUI keypress takes, not a web-only projection call.
+    dispatch(&reducer, &sinks, ExecutionEvent::Stopping).await;
     let state = web_state.get_state().await;
     assert_eq!(state.app_mode, "stopping");
     assert!(
@@ -666,14 +669,14 @@ async fn idle_origin_stop_and_cancel_preserve_ready() {
         "a stop requested from idle Ready is still the same episode"
     );
 
-    web_state.project_stop_cancelled().await;
+    dispatch(&reducer, &sinks, stop_cancelled()).await;
     let state = web_state.get_state().await;
     assert_eq!(state.app_mode, "select");
     assert!(state.persistent_scheduler_idle);
 
     // Work that wins the race before cancel-stop preserves Stopping, clears the
     // episode, and makes the later cancel-stop restore Running instead.
-    web_state.project_stop_requested().await;
+    dispatch(&reducer, &sinks, ExecutionEvent::Stopping).await;
     dispatch(
         &reducer,
         &sinks,
@@ -686,8 +689,15 @@ async fn idle_origin_stop_and_cancel_preserve_ready() {
     assert_eq!(state.app_mode, "stopping");
     assert!(!state.persistent_scheduler_idle);
 
-    web_state.project_stop_cancelled().await;
+    dispatch(&reducer, &sinks, stop_cancelled()).await;
     assert_eq!(web_state.get_state().await.app_mode, "running");
+}
+
+/// The authoritative event an accepted cancel-stop publishes.
+fn stop_cancelled() -> ExecutionEvent {
+    ExecutionEvent::OperatorCommandApplied {
+        effect: crate::events::OperatorCommandEffect::StopCancelled,
+    }
 }
 
 /// A duplicate `Stopped` reconciles without doubling anything a client sees.

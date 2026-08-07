@@ -184,13 +184,17 @@ const EVENT_BRIDGE_BUFFER: usize = 100;
 /// publishes its terminal event.
 const EVENT_BRIDGE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Build the frontend sinks attached to one orchestration boundary run.
+/// Build the frontend sinks attached to the process-lifetime dispatch owner.
 ///
 /// The TUI channel and the web monitoring state are peers here: both are
 /// frontends of the same dispatch owner, neither reapplies the event to the
 /// reducer, and adding or removing one cannot change how many times a counter
 /// advances.
-fn boundary_event_sinks(
+///
+/// `tx` must be the TUI's *delivery* channel, never its producer channel: an
+/// event handed back to the producer boundary would be applied to the reducer a
+/// second time.
+pub fn process_event_sinks(
     tx: &mpsc::Sender<OrchestratorEvent>,
     #[cfg(feature = "web-monitoring")] web_state: Option<&Arc<crate::web::WebState>>,
 ) -> Vec<Arc<dyn EventSink>> {
@@ -252,43 +256,24 @@ pub async fn run_orchestrator_parallel(
     explicit_retry: bool,
     repo_root: PathBuf,
     config: OrchestratorConfig,
-    tx: mpsc::Sender<OrchestratorEvent>,
+    // The process-lifetime authoritative dispatch owner. A boundary run used to
+    // build one of its own, which made "how many frontends see this event" a
+    // per-run decision and left runner-local producers on a separate path
+    // entirely. Sharing the process owner is what makes the reducer transition,
+    // the core mode transition, the mark reconciliation, and the frontend fan-out
+    // one transaction for every producer in the process.
+    dispatcher: Arc<EventDispatcher>,
     cancel_token: CancellationToken,
     run_command_scope: crate::ai_command_runner::RunCommandScope,
     dynamic_queue: DynamicQueue,
-    _graceful_stop_flag: Arc<AtomicBool>,
     shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     manual_resolve_counter: Arc<std::sync::atomic::AtomicUsize>,
     post_archive_action: PostArchiveAction,
     upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
-    marks: Option<crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
-    #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native_from;
     use crate::parallel::ParallelEvent;
     use crate::parallel_run_service::ParallelRunService;
-
-    // One dispatch owner for the whole boundary run. This used to reach the TUI,
-    // the reducer, and the web state through three hand-written paths with
-    // different membership per event; routing the scheduler's event stream and
-    // the boundary's own events through one owner is what makes every frontend
-    // receive the same events.
-    // The boundary's dispatch owner also owns execution-mark reconciliation: it
-    // is the only place that sees the reducer immediately before and after each
-    // transition, which is what a mark-revoking *edge* is defined by. Binding the
-    // shared reconciler here — not a new store — is what keeps the TUI row, the
-    // `/api/v2` snapshot, and Start target resolution one value.
-    let dispatcher = Arc::new(
-        EventDispatcher::new(
-            shared_state.clone(),
-            boundary_event_sinks(
-                &tx,
-                #[cfg(feature = "web-monitoring")]
-                web_state.as_ref(),
-            ),
-        )
-        .with_mark_reconciler(marks),
-    );
 
     dispatcher
         .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(

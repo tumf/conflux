@@ -4,10 +4,12 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
-use crate::orchestration::operator_command::QueueMutation;
+use crate::orchestration::operator_command::{OperatorOutcome, QueueMutation};
+use crate::orchestration::operator_coordinator::{
+    ApplicationOutcome, ApplicationResult, OperatorApplication, OperatorIntent,
+};
 use crate::orchestration::run_control::{
-    ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
-    SchedulerEffect,
+    ResolveReservation, RunControlError, RunControlOutcome, RunNoOpReason, SchedulerEffect,
 };
 #[cfg(test)]
 use crate::parallel::PostArchiveAction;
@@ -15,7 +17,7 @@ use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
 #[cfg(test)]
 use crate::tui::queue::DynamicQueue;
 use crate::tui::state::AppState;
-use crate::tui::types::{AppExecutionMode, DeleteIntent, StopMode};
+use crate::tui::types::DeleteIntent;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -26,6 +28,10 @@ use tracing::{debug, info, warn};
 /// TUI ↔ `/api/v2` parity, verified over one recording runtime.
 #[cfg(all(test, feature = "web-monitoring"))]
 mod cross_adapter_tests;
+
+/// Same-process convergence: one command, both frontends, next frame.
+#[cfg(all(test, feature = "web-monitoring"))]
+mod convergence_tests;
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -241,80 +247,159 @@ pub(crate) fn build_worktree_service(
     ))
 }
 
+/// Operator-facing feedback from a command that settled off the event loop.
+///
+/// The accepted *state* never travels this way — it reaches the TUI through the
+/// authoritative dispatch, exactly as a remote command's would. What travels
+/// here is only wording: the log line and, when the command did not do what the
+/// operator asked, the message the status bar surfaces.
+#[derive(Debug, Clone)]
+pub struct CommandFeedback {
+    /// The line to append to the operator log.
+    pub log: LogEntry,
+    /// Set when the operator must be told the command was refused or changed
+    /// nothing.
+    pub warning: Option<String>,
+}
+
+impl CommandFeedback {
+    /// A command that did what it was asked to do.
+    fn accepted(log: LogEntry) -> Self {
+        Self { log, warning: None }
+    }
+
+    /// A refusal or a no-op, surfaced as well as logged.
+    fn refused(message: String) -> Self {
+        Self {
+            log: LogEntry::warn(message.clone()),
+            warning: Some(message),
+        }
+    }
+}
+
+/// One operator intent queued for the shared transaction, with the wording its
+/// settlement produces.
+///
+/// Queued rather than executed inline because the coordinator gate is a real
+/// lock a remote command can be holding: awaiting it inside the TUI's
+/// event-processing loop would stall rendering and event drain behind another
+/// frontend's command.
+pub struct Submission {
+    intent: OperatorIntent,
+    describe: Box<dyn FnOnce(ApplicationResult) -> CommandFeedback + Send>,
+}
+
+impl Submission {
+    /// Build a submission from an intent and its settlement wording.
+    pub fn new(
+        intent: OperatorIntent,
+        describe: impl FnOnce(ApplicationResult) -> CommandFeedback + Send + 'static,
+    ) -> Self {
+        Self {
+            intent,
+            describe: Box::new(describe),
+        }
+    }
+
+    /// Run this submission against the shared transaction.
+    ///
+    /// The worker that drives these is single-consumer, so keypresses reach the
+    /// coordinator in the order the operator made them.
+    pub async fn run(self, application: &OperatorApplication) -> CommandFeedback {
+        let result = application.apply(self.intent).await;
+        (self.describe)(result)
+    }
+}
+
 /// Context for TuiCommand handling
 pub struct TuiCommandContext<'a> {
     pub app: &'a mut AppState,
     pub tx: &'a mpsc::Sender<OrchestratorEvent>,
-    /// The single process-local run-lifecycle service shared with `/api/v2`.
+    /// The single process-local application transaction shared with `/api/v2`.
     ///
-    /// Every start, stop, retry, and resolve in this module goes through it, so a
-    /// keypress and a remote command cannot resolve the same intent differently.
-    pub run_control: &'a Arc<RunControlService>,
+    /// Every start, stop, retry, mark, queue, dequeue, and resolve in this module
+    /// goes through it, so a keypress and a remote command cannot resolve the
+    /// same intent differently — and neither can apply a lifecycle transition the
+    /// coordinator has not accepted.
+    pub application: &'a Arc<OperatorApplication>,
+    /// Ordered submission queue drained by a worker outside the render loop.
+    pub submissions: &'a mpsc::Sender<Submission>,
+    /// Feedback channel the worker reports settlement wording on.
+    pub feedback: &'a mpsc::Sender<CommandFeedback>,
     /// The single process-local worktree service shared with `/api/v2`.
     ///
     /// One instance means one repository mutation guard, which is what makes a
     /// keypress and a remote command serialize against each other instead of
     /// racing through two independent guards over the same repository.
     pub worktree_service: &'a Arc<WorktreeService>,
-    #[cfg(feature = "web-monitoring")]
-    pub web_state: &'a Option<Arc<crate::web::WebState>>,
 }
 
-/// Handle TuiCommand::StartProcessing.
+/// Queue one intent for the shared transaction.
 ///
-/// The TUI is an adapter here: it hands the shared service the mode it is in and
-/// projects the returned outcome onto its own presentation state. It does not
-/// choose targets, apply queue intent, or decide whether the scheduler should be
-/// spawned or woken — the service owns all three, so `/api/v2` start reaches the
-/// same decision.
-///
-/// A non-empty `ids` list records those targets in the authoritative mark store
-/// first, one change at a time, so even an explicit selection is started through
-/// it. The write is target-scoped on purpose: replacing the whole store from a
-/// caller-supplied list would also clear marks this frontend never observed.
-pub async fn handle_start_processing_command(ids: Vec<String>, ctx: &mut TuiCommandContext<'_>) {
-    if !ids.is_empty() {
-        let service = ctx.run_control.operator();
-        for id in &ids {
-            service.apply_execution_mark(id, true).await;
-        }
-        ctx.app.sync_execution_marks_from_store();
+/// A full queue is the one case where the TUI answers for itself, and it answers
+/// with a bounded typed refusal rather than by blocking: an operator whose
+/// keypress could not be queued is told so immediately instead of watching the
+/// interface freeze.
+fn submit(
+    ctx: &mut TuiCommandContext<'_>,
+    intent: OperatorIntent,
+    describe: impl FnOnce(ApplicationResult) -> CommandFeedback + Send + 'static,
+) {
+    if let Err(error) = ctx.submissions.try_send(Submission::new(intent, describe)) {
+        let message = format!("Command could not be queued right now: {error}");
+        ctx.app.warning_message = Some(message.clone());
+        ctx.app.add_log(LogEntry::warn(message));
     }
+}
 
-    let mode = ctx.app.operator_mode();
-    match ctx.run_control.start(mode).await {
-        Ok(RunControlOutcome::RunDispatched {
+/// How the shared transaction's settlement of a Start reads to an operator.
+fn describe_start(retry: RetryContext) -> impl FnOnce(ApplicationResult) -> CommandFeedback {
+    move |result| match result.outcome {
+        Ok(ApplicationOutcome::Run(RunControlOutcome::RunDispatched {
             change_ids,
             scheduler,
             ..
-        }) => {
-            // Only a newly spawned scheduler proves execution has begun. A
-            // notification woke a scheduler that was already alive — including
-            // one parked in persistent-idle Ready — and the work it will admit
-            // has not started yet, so the execution axis waits for the first
-            // typed work-start event instead of claiming Running here.
-            match scheduler {
-                SchedulerEffect::Started => ctx.app.begin_run(&change_ids),
-                _ => ctx.app.queue_run(&change_ids),
-            }
+        })) => {
+            // Wording only. Which of the two run projections the frontends apply
+            // — Running, or queued behind a scheduler that was merely woken — is
+            // carried by the authoritative `RunDispatched` effect, so a keypress
+            // and an `/api/v2` command cannot disagree about it.
             let verb = match scheduler {
                 SchedulerEffect::Started => "Starting",
                 _ => "Queued for the running scheduler:",
             };
-            ctx.app.add_log(LogEntry::info(format!(
+            CommandFeedback::accepted(LogEntry::info(format!(
                 "{} processing {} change(s)",
                 verb,
                 change_ids.len()
-            )));
+            )))
         }
-        Ok(RunControlOutcome::NoOp { reason }) => {
-            report_run_no_op(ctx.app, &reason);
+        Ok(ApplicationOutcome::Run(RunControlOutcome::NoOp { reason })) => {
+            CommandFeedback::refused(no_op_message(&reason, retry))
         }
         Ok(other) => {
             debug!("Start produced an unexpected outcome: {:?}", other);
+            CommandFeedback::accepted(LogEntry::info("Start produced no reportable effect"))
         }
-        Err(error) => {
-            report_run_error(ctx.app, &error);
+        Err(error) => CommandFeedback::refused(error.to_string()),
+    }
+}
+
+/// The Apply-ceiling facts a retry refusal has to be worded against.
+///
+/// Captured at submission time because the message is produced on a worker task
+/// that has no access to this frontend's rows.
+#[derive(Debug, Clone, Copy)]
+struct RetryContext {
+    active_limit: bool,
+    admissible_target: bool,
+}
+
+impl RetryContext {
+    fn observe(app: &AppState) -> Self {
+        Self {
+            active_limit: app.has_active_apply_iteration_limit(),
+            admissible_target: app.has_admissible_retry_target(),
         }
     }
 }
@@ -323,8 +408,8 @@ pub async fn handle_start_processing_command(ids: Vec<String>, ctx: &mut TuiComm
 ///
 /// `NoRetryableTarget` is truthful but not actionable when the reason is an
 /// active-run Apply ceiling, so the active condition is named when one exists.
-fn no_retryable_target_message(app: &AppState) -> String {
-    if app.has_active_apply_iteration_limit() && !app.has_admissible_retry_target() {
+fn no_retryable_target_message(retry: RetryContext) -> String {
+    if retry.active_limit && !retry.admissible_target {
         return format!(
             "Retry is unavailable: every candidate is {}",
             crate::tui::state::ACTIVE_APPLY_LIMIT_EXPLANATION
@@ -333,25 +418,37 @@ fn no_retryable_target_message(app: &AppState) -> String {
     "No marked change carries retryable evidence".to_string()
 }
 
-/// Surface a refusal from the shared run-control service.
-///
-/// A refusal is never silent: the operator gets the same actionable detail the
-/// v2 command record carries.
-fn report_run_error(app: &mut AppState, error: &RunControlError) {
-    let message = error.to_string();
-    app.warning_message = Some(message.clone());
-    app.add_log(LogEntry::warn(message));
-}
-
-fn report_run_no_op(app: &mut AppState, reason: &RunNoOpReason) {
-    let message = match reason {
+fn no_op_message(reason: &RunNoOpReason, retry: RetryContext) -> String {
+    match reason {
         RunNoOpReason::ResolveAlreadyReserved { change_id } => {
             format!("Change '{}' is already queued for resolve", change_id)
         }
-        RunNoOpReason::NoRetryableTarget => no_retryable_target_message(app),
-    };
-    app.warning_message = Some(message.clone());
-    app.add_log(LogEntry::warn(message));
+        RunNoOpReason::NoRetryableTarget => no_retryable_target_message(retry),
+    }
+}
+
+/// Handle TuiCommand::StartProcessing.
+///
+/// The TUI is an adapter here: it queues the intent and words what the shared
+/// transaction settled. It does not choose targets, apply queue intent, decide
+/// the mode, or decide whether the scheduler should be spawned or woken — the
+/// coordinator owns all four, so `/api/v2` start reaches the same decision.
+///
+/// A non-empty `ids` list records those targets in the authoritative mark store
+/// first, one change at a time, so even an explicit selection is started through
+/// it. The write is target-scoped on purpose: replacing the whole store from a
+/// caller-supplied list would also clear marks this frontend never observed.
+pub async fn handle_start_processing_command(ids: Vec<String>, ctx: &mut TuiCommandContext<'_>) {
+    if !ids.is_empty() {
+        let service = ctx.application.run_control().operator();
+        for id in &ids {
+            service.apply_execution_mark(id, true).await;
+        }
+        ctx.app.sync_execution_marks_from_store();
+    }
+
+    let retry = RetryContext::observe(ctx.app);
+    submit(ctx, OperatorIntent::Start, describe_start(retry));
 }
 
 /// Handle a confirmed worktree deletion.
@@ -449,174 +546,141 @@ async fn handle_delete_worktree_command(intent: DeleteIntent, ctx: &mut TuiComma
 pub async fn handle_tui_command(
     cmd: TuiCommand,
     ctx: &mut TuiCommandContext<'_>,
-    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    // Retained so a handler that needs a reducer read has one without reaching
+    // through the coordinator. No current handler does: every lifecycle decision
+    // is the shared transaction's, and every reducer-derived row refresh happens
+    // on the authoritative dispatch path.
+    _shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
 ) -> Result<()> {
     match cmd {
         TuiCommand::StartProcessing(ids) => {
             handle_start_processing_command(ids, ctx).await;
         }
         TuiCommand::AddToQueue(id) => {
-            // Adapter only: the shared service owns reducer ordering, dynamic
-            // queue mutation, and on_queue_add cardinality.
-            let service = ctx.run_control.operator();
-            let outcome = match service.add_to_queue(&id).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    ctx.app
-                        .add_log(LogEntry::warn(format!("Queue add rejected: {}", error)));
-                    return Ok(());
-                }
+            // Adapter only: the shared transaction owns reducer ordering, dynamic
+            // queue mutation, on_queue_add cardinality, and the outcome dispatch
+            // that carries the delta to every other frontend.
+            let intent = OperatorIntent::SetQueueIntent {
+                change_id: id.clone(),
+                queued: true,
             };
-            if !outcome.reducer_changed {
-                ctx.app.add_log(LogEntry::warn(format!(
-                    "Queue add ignored by reducer: {}",
-                    id
-                )));
-                return Ok(());
-            }
-            ctx.app.apply_display_statuses_from_reducer(
-                &shared_state.read().await.all_display_statuses(),
-            );
-            if outcome.dynamic_queue_mutated {
-                ctx.app
-                    .add_log(LogEntry::info(format!("Added to dynamic queue: {}", id)));
-            } else {
-                ctx.app
-                    .add_log(LogEntry::warn(format!("Already in dynamic queue: {}", id)));
-            }
+            submit(ctx, intent, move |result| match result.outcome {
+                Err(error) => CommandFeedback::refused(format!("Queue add rejected: {}", error)),
+                Ok(ApplicationOutcome::Operator(OperatorOutcome::Queue(queue)))
+                    if !queue.reducer_changed =>
+                {
+                    CommandFeedback::refused(format!("Queue add ignored by reducer: {}", id))
+                }
+                Ok(ApplicationOutcome::Operator(OperatorOutcome::Queue(queue))) => {
+                    if queue.dynamic_queue_mutated {
+                        CommandFeedback::accepted(LogEntry::info(format!(
+                            "Added to dynamic queue: {}",
+                            id
+                        )))
+                    } else {
+                        CommandFeedback::refused(format!("Already in dynamic queue: {}", id))
+                    }
+                }
+                Ok(other) => {
+                    debug!("Queue add produced an unexpected outcome: {:?}", other);
+                    CommandFeedback::accepted(LogEntry::info(format!("Queue add settled: {}", id)))
+                }
+            });
         }
         TuiCommand::RemoveFromQueue(id) => {
-            // Adapter only: the shared service owns reducer ordering, dynamic
-            // queue mutation, and on_queue_remove cardinality.
-            let service = ctx.run_control.operator();
-            let outcome = match service.remove_from_queue(&id).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    ctx.app
-                        .add_log(LogEntry::warn(format!("Queue remove rejected: {}", error)));
-                    return Ok(());
+            // Adapter only, for the same reason as the addition above.
+            let intent = OperatorIntent::SetQueueIntent {
+                change_id: id.clone(),
+                queued: false,
+            };
+            submit(ctx, intent, move |result| match result.outcome {
+                Err(error) => CommandFeedback::refused(format!("Queue remove rejected: {}", error)),
+                Ok(ApplicationOutcome::Operator(OperatorOutcome::Queue(queue))) => {
+                    debug_assert_eq!(queue.mutation, QueueMutation::Removed);
+                    let suffix = if queue.dynamic_queue_mutated {
+                        " (dynamic queue updated)"
+                    } else {
+                        ""
+                    };
+                    CommandFeedback::accepted(LogEntry::info(format!(
+                        "Removed from queue: {}{}",
+                        id, suffix
+                    )))
                 }
-            };
-            ctx.app.apply_display_statuses_from_reducer(
-                &shared_state.read().await.all_display_statuses(),
-            );
-            let suffix = if outcome.dynamic_queue_mutated {
-                " (dynamic queue updated)"
-            } else {
-                ""
-            };
-            ctx.app.add_log(LogEntry::info(format!(
-                "Removed from queue: {}{}",
-                id, suffix
-            )));
-            debug_assert_eq!(outcome.mutation, QueueMutation::Removed);
+                Ok(other) => {
+                    debug!("Queue remove produced an unexpected outcome: {:?}", other);
+                    CommandFeedback::accepted(LogEntry::info(format!(
+                        "Queue remove settled: {}",
+                        id
+                    )))
+                }
+            });
         }
         TuiCommand::DeleteWorktree(intent) => {
             handle_delete_worktree_command(intent, ctx).await;
         }
         TuiCommand::Stop => {
-            // Adapter only: the shared service owns the mode matrix and the
-            // graceful-stop request. The TUI projects the accepted outcome onto
-            // its own mode and reports refusals verbatim.
-            match ctx.run_control.stop(ctx.app.operator_mode()).await {
-                Ok(RunControlOutcome::StopRequested) => {
-                    ctx.app.stop_mode = StopMode::GracefulPending;
-                    ctx.app.execution_mode = AppExecutionMode::Stopping;
-                    ctx.app
-                        .add_log(LogEntry::warn("Stopping after current change completes..."));
-                    // Emit Stopping event for web clients
-                    ctx.app
-                        .handle_orchestrator_event(OrchestratorEvent::Stopping);
-                    // Forward to web state immediately for web control API
-                    #[cfg(feature = "web-monitoring")]
-                    if let Some(ref web_state) = ctx.web_state {
-                        web_state
-                            .apply_execution_event(&OrchestratorEvent::Stopping)
-                            .await;
-                    }
+            // Adapter only: the shared transaction owns the mode matrix, the
+            // graceful-stop request, and the `Stopping` dispatch that moves every
+            // frontend's mode. The TUI reports refusals verbatim and nothing else.
+            submit(ctx, OperatorIntent::Stop, |result| match result.outcome {
+                Ok(ApplicationOutcome::Run(RunControlOutcome::StopRequested)) => {
+                    CommandFeedback::accepted(LogEntry::warn(
+                        "Stopping after current change completes...",
+                    ))
                 }
-                Ok(other) => debug!("Stop produced an unexpected outcome: {:?}", other),
-                Err(error) => report_run_error(ctx.app, &error),
-            }
+                Ok(other) => {
+                    debug!("Stop produced an unexpected outcome: {:?}", other);
+                    CommandFeedback::accepted(LogEntry::info("Stop settled"))
+                }
+                Err(error) => CommandFeedback::refused(error.to_string()),
+            });
         }
         TuiCommand::CancelStop => {
-            match ctx.run_control.cancel_stop(ctx.app.operator_mode()).await {
-                Ok(RunControlOutcome::StopCancelled) => {
-                    ctx.app.stop_mode = StopMode::None;
-                    // Withdrawing a stop restores where the stop came from. A
-                    // stop requested from persistent-idle Ready returns to
-                    // Ready — nothing has started, and claiming Running would
-                    // advertise execution no typed event ever proved.
-                    ctx.app.execution_mode = if ctx.app.persistent_scheduler_idle {
-                        AppExecutionMode::Select
-                    } else {
-                        AppExecutionMode::Running
-                    };
-                    ctx.app
-                        .add_log(LogEntry::info("Stop canceled, continuing..."));
-                    // Forward to web state immediately for web control API
-                    #[cfg(feature = "web-monitoring")]
-                    if let Some(ref web_state) = ctx.web_state {
-                        web_state.project_stop_cancelled().await;
+            // Withdrawing a stop restores where the stop came from, and where
+            // that is — Running, or the persistent-idle Ready the stop was
+            // requested from — is decided once inside the dispatch boundary and
+            // projected onto every frontend from the accepted outcome.
+            submit(ctx, OperatorIntent::CancelStop, |result| {
+                match result.outcome {
+                    Ok(ApplicationOutcome::Run(RunControlOutcome::StopCancelled)) => {
+                        CommandFeedback::accepted(LogEntry::info("Stop canceled, continuing..."))
                     }
+                    Ok(other) => {
+                        debug!("Cancel stop produced an unexpected outcome: {:?}", other);
+                        CommandFeedback::accepted(LogEntry::info("Cancel stop settled"))
+                    }
+                    Err(error) => CommandFeedback::refused(error.to_string()),
                 }
-                Ok(other) => debug!("Cancel stop produced an unexpected outcome: {:?}", other),
-                Err(error) => report_run_error(ctx.app, &error),
-            }
+            });
         }
         TuiCommand::ForceStop => {
-            // Immediate stop. `AppExecutionMode::Stopping` describes TUI lifecycle only, so
-            // the force-vs-ordinary decision comes from the one runtime activity
-            // snapshot the shared service takes, and cancellation is issued there
-            // for both reporting classes.
-            match ctx.run_control.force_stop(ctx.app.operator_mode()).await {
-                Ok(RunControlOutcome::ForceStopped {
-                    classification,
-                    awaiting_safe_boundary,
-                }) => {
-                    if classification.process_report.is_force_stop() {
-                        ctx.app.stop_mode = StopMode::ForceStopped;
-                        ctx.app.add_log(LogEntry::warn("Force stopped"));
+            // Immediate stop. The force-vs-ordinary decision comes from the one
+            // runtime activity snapshot the shared service takes, and cancellation
+            // is issued there for both reporting classes. Which authoritative
+            // event that produces — a waiting `OperatorCommandApplied` or a
+            // settled `Stopped` — is the coordinator's call, so the row lifecycle
+            // for a process stop keeps exactly one authority.
+            submit(ctx, OperatorIntent::ForceStop, |result| {
+                match result.outcome {
+                    Ok(ApplicationOutcome::Run(RunControlOutcome::ForceStopped {
+                        classification,
+                        ..
+                    })) => {
+                        let message = if classification.process_report.is_force_stop() {
+                            "Force stopped"
+                        } else {
+                            "Run cancelled; no agent execution was active"
+                        };
+                        CommandFeedback::accepted(LogEntry::warn(message))
                     }
-
-                    // A live parallel scheduler with in-flight execution or
-                    // pending background merge/base-lane work owns the terminal
-                    // stop: it must reach its cancellation-safe boundary first.
-                    if awaiting_safe_boundary {
-                        ctx.app.add_log(LogEntry::info(
-                            "Waiting for in-flight work to reach a safe stop boundary...",
-                        ));
-                    } else {
-                        // No live scheduler will emit this run's terminal stop,
-                        // so this command is its dispatch owner. The reducer
-                        // transition comes first and the frontends read it back:
-                        // the row lifecycle for a process stop has exactly one
-                        // authority, and a TUI-local reset would diverge from
-                        // what `/api/v2` publishes for the same event.
-                        use crate::events::ExecutionEvent;
-                        shared_state
-                            .write()
-                            .await
-                            .apply_execution_event(&ExecutionEvent::Stopped);
-                        ctx.app.apply_display_statuses_from_reducer(
-                            &shared_state.read().await.all_display_statuses(),
-                        );
-                        ctx.app
-                            .handle_orchestrator_event(OrchestratorEvent::Stopped);
-                        ctx.app.current_change = None;
-
-                        // Forward stopped event to web state
-                        #[cfg(feature = "web-monitoring")]
-                        if let Some(ref web_state) = ctx.web_state {
-                            web_state
-                                .apply_execution_event(&ExecutionEvent::Stopped)
-                                .await;
-                        }
+                    Ok(other) => {
+                        debug!("Force stop produced an unexpected outcome: {:?}", other);
+                        CommandFeedback::accepted(LogEntry::info("Force stop settled"))
                     }
+                    Err(error) => CommandFeedback::refused(error.to_string()),
                 }
-                Ok(other) => debug!("Force stop produced an unexpected outcome: {:?}", other),
-                Err(error) => report_run_error(ctx.app, &error),
-            }
+            });
         }
         TuiCommand::MergeWorktreeBranch {
             worktree_path,
@@ -655,91 +719,112 @@ pub async fn handle_tui_command(
             });
         }
         TuiCommand::DequeueChange(id) => {
-            // Cancellation-first: the shared service issues cancellation, waits for
-            // confirmed task termination, and only then applies DequeueChange.
-            // The wait is bounded but can take seconds, so it runs off the TUI
-            // input loop and reports its outcome through the event channel.
-            let service = ctx.run_control.operator();
-            let result_tx = ctx.tx.clone();
+            // The two-phase intent. Its confirmation wait is bounded but can take
+            // seconds, so the whole submission runs off this loop: awaiting the
+            // application gate or a termination waiter inside event processing
+            // would stall rendering and event fan-out for every other change.
+            //
+            // The accepted state reaches this frontend through the authoritative
+            // dispatch like any other command's; only the operator-facing wording
+            // comes back on the log channel.
+            //
+            // It gets its *own* task rather than the ordered submission queue:
+            // queueing it would let one never-completing waiter hold every later
+            // keypress, which is the exact monopoly the two-phase split exists to
+            // prevent.
+            let application = ctx.application.clone();
+            let feedback = ctx.feedback.clone();
             ctx.app.add_log(LogEntry::info(format!(
                 "Stop-and-dequeue request received for: {}",
                 id
             )));
             tokio::spawn(async move {
-                let entry = match service.stop_and_dequeue(&id).await {
-                    Ok(crate::orchestration::operator_command::OperatorOutcome::Dequeued {
-                        change_id,
-                    }) => LogEntry::success(format!(
-                        "Stopped and dequeued after confirmed termination: {}",
-                        change_id
-                    )),
-                    Ok(_) => LogEntry::warn(format!("Stop-and-dequeue ignored for: {}", id)),
+                let intent = OperatorIntent::StopAndDequeue {
+                    change_id: id.clone(),
+                };
+                let settled = match application.apply(intent).await.outcome {
+                    Ok(ApplicationOutcome::Operator(OperatorOutcome::Dequeued { change_id })) => {
+                        CommandFeedback::accepted(LogEntry::success(format!(
+                            "Stopped and dequeued after confirmed termination: {}",
+                            change_id
+                        )))
+                    }
+                    Ok(_) => {
+                        CommandFeedback::refused(format!("Stop-and-dequeue ignored for: {}", id))
+                    }
                     Err(error) => {
                         warn!("Stop-and-dequeue failed for {}: {}", id, error);
-                        LogEntry::error(format!("Stop-and-dequeue failed: {}", error))
+                        CommandFeedback::refused(format!("Stop-and-dequeue failed: {}", error))
                     }
                 };
-                let _ = result_tx.send(OrchestratorEvent::Log(entry)).await;
+                let _ = feedback.send(settled).await;
             });
         }
         TuiCommand::ResolveMerge(id) => {
-            // Adapter only: the shared service owns the reducer intent, the
+            // Adapter only: the shared transaction owns the reducer intent, the
             // single-resolver reservation, FIFO ordering, duplicate rejection,
-            // and whether the scheduler is started or merely woken.
-            match ctx.run_control.resolve_merge(&id).await {
-                Ok(RunControlOutcome::ResolveReserved {
+            // the mode transition, and whether the scheduler is started or merely
+            // woken.
+            let retry = RetryContext::observe(ctx.app);
+            let intent = OperatorIntent::ResolveMerge {
+                change_id: id.clone(),
+            };
+            submit(ctx, intent, move |result| {
+                match result.outcome {
+                Ok(ApplicationOutcome::Run(RunControlOutcome::ResolveReserved {
                     change_id,
                     reservation,
                     scheduler,
-                }) => {
-                    if let Some(change) = ctx.app.changes.iter_mut().find(|c| c.id == change_id) {
-                        change.set_display_status_cache("resolve pending");
+                })) => match reservation {
+                    ResolveReservation::Active => {
+                        let how = match scheduler {
+                            SchedulerEffect::Started => "started scheduler for manual resolve",
+                            _ => "notified existing scheduler",
+                        };
+                        CommandFeedback::accepted(LogEntry::info(format!(
+                            "Scheduled merge-wait retry intent for '{}'; {}",
+                            change_id, how
+                        )))
                     }
-                    match reservation {
-                        ResolveReservation::Active => {
-                            if matches!(
-                                ctx.app.execution_mode,
-                                AppExecutionMode::Select | AppExecutionMode::Stopped
-                            ) {
-                                ctx.app.execution_mode = AppExecutionMode::Running;
-                            }
-                            let how = match scheduler {
-                                SchedulerEffect::Started => "started scheduler for manual resolve",
-                                _ => "notified existing scheduler",
-                            };
-                            ctx.app.add_log(LogEntry::info(format!(
-                                "Scheduled merge-wait retry intent for '{}'; {}",
-                                change_id, how
-                            )));
-                        }
-                        ResolveReservation::Queued { position } => {
-                            ctx.app.add_log(LogEntry::info(format!(
-                                "Queued '{}' for resolve (position: {})",
-                                change_id, position
-                            )));
-                        }
+                    ResolveReservation::Queued { position } => {
+                        CommandFeedback::accepted(LogEntry::info(format!(
+                            "Queued '{}' for resolve (position: {})",
+                            change_id, position
+                        )))
                     }
+                },
+                Ok(ApplicationOutcome::Run(RunControlOutcome::NoOp { reason })) => {
+                    CommandFeedback::refused(no_op_message(&reason, retry))
                 }
-                Ok(RunControlOutcome::NoOp { reason }) => report_run_no_op(ctx.app, &reason),
-                Ok(other) => debug!("Resolve produced an unexpected outcome: {:?}", other),
+                Ok(other) => {
+                    debug!("Resolve produced an unexpected outcome: {:?}", other);
+                    CommandFeedback::accepted(LogEntry::info("Resolve settled"))
+                }
+                // A stale resolve target gets a resolve-specific message, but it
+                // is still surfaced the way every other refusal is: the operator
+                // must not have to read the log panel to learn that `/api/v2`
+                // would have reported `target_ineligible` here.
                 Err(RunControlError::TargetIneligible { change_id, .. }) => {
-                    // A stale resolve target gets a resolve-specific message, but
-                    // it is still surfaced the way every other refusal is: the
-                    // operator must not have to read the log panel to learn that
-                    // `/api/v2` would have reported `target_ineligible` here.
-                    let message = format!(
+                    CommandFeedback::refused(format!(
                         "Manual merge-wait retry intent for '{}' was not accepted by scheduler state",
                         change_id
-                    );
-                    ctx.app.warning_message = Some(message.clone());
-                    ctx.app.add_log(LogEntry::warn(message));
+                    ))
                 }
-                Err(error) => report_run_error(ctx.app, &error),
+                Err(error) => CommandFeedback::refused(error.to_string()),
             }
+            });
         }
     }
 
     Ok(())
+}
+
+/// Apply one settled command's operator-facing wording to this frontend.
+pub fn apply_command_feedback(app: &mut AppState, feedback: CommandFeedback) {
+    if let Some(warning) = feedback.warning {
+        app.warning_message = Some(warning);
+    }
+    app.add_log(feedback.log);
 }
 
 #[cfg(test)]
@@ -749,10 +834,13 @@ mod tests {
     use crate::orchestration::operator_command::{
         ExecutionMarkStore, HookRunnerQueueHooks, OperatorCommandService,
     };
+    use crate::orchestration::operator_coordinator::CoreMode;
     use crate::orchestration::run_control::testing::{RecordingScheduler, SchedulerCall};
+    use crate::orchestration::run_control::RunControlService;
     use crate::orchestration::run_control::{ResolveReservations, StartEligibility};
     use crate::orchestration::state::OrchestratorState;
     use crate::tui::types::WorktreeInfo;
+    use crate::tui::types::{AppExecutionMode, StopMode};
     use std::path::{Path, PathBuf};
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
@@ -913,6 +1001,16 @@ mod tests {
         pub(super) queue: DynamicQueue,
         pub(super) scheduler: Arc<RecordingScheduler>,
         pub(super) run_control: Arc<RunControlService>,
+        /// The one application transaction both adapters submit to.
+        pub(super) application: Arc<OperatorApplication>,
+        /// The process lifecycle mode the transaction validates against.
+        pub(super) core_mode: Arc<CoreMode>,
+        /// The process-lifetime dispatch owner accepted outcomes travel through.
+        pub(super) dispatcher: Arc<crate::events::EventDispatcher>,
+        /// Frontends attached to that owner after construction.
+        attached: Arc<AttachedSinks>,
+        /// The revision authority attached to that owner after construction.
+        revisions: Arc<AttachedRevisions>,
         pub(super) marks: Arc<ExecutionMarkStore>,
         /// The one parallel runtime store both adapters read and mutate.
         pub(super) parallel: Arc<crate::orchestration::operator_command::ParallelRuntime>,
@@ -920,8 +1018,87 @@ mod tests {
         pub(super) config: OrchestratorConfig,
         pub(super) tx: mpsc::Sender<OrchestratorEvent>,
         pub(super) rx: mpsc::Receiver<OrchestratorEvent>,
+        /// Authoritative deliveries the dispatch owner fans out to this frontend.
+        frontend_rx: std::sync::Mutex<mpsc::Receiver<OrchestratorEvent>>,
+        submissions_tx: mpsc::Sender<Submission>,
+        submissions_rx: std::sync::Mutex<mpsc::Receiver<Submission>>,
+        feedback_tx: mpsc::Sender<CommandFeedback>,
+        feedback_rx: std::sync::Mutex<mpsc::Receiver<CommandFeedback>>,
         /// The one shared worktree service, built the same way production does.
         pub(super) worktree_service: Arc<WorktreeService>,
+    }
+
+    /// Frontends attached to the dispatch owner after it was built.
+    ///
+    /// A convergence test has to bind a `WebState` to the *same* boundary the
+    /// TUI is on, and the `WebState` cannot exist before the shared mark store
+    /// it reads. One indirection sink resolves that ordering without giving the
+    /// two frontends two owners, which is the exact arrangement under test.
+    #[derive(Default)]
+    pub(super) struct AttachedSinks {
+        sinks: std::sync::Mutex<Vec<Arc<dyn crate::events::EventSink>>>,
+        /// How many authoritative dispatches this boundary has fanned out.
+        ///
+        /// Counted here rather than in a frontend because event *cardinality* is
+        /// a property of the dispatch owner: a command that published its effect
+        /// twice, or published nothing, is wrong regardless of what any
+        /// individual sink then did with it.
+        dispatches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AttachedSinks {
+        fn snapshot(&self) -> Vec<Arc<dyn crate::events::EventSink>> {
+            self.sinks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::events::EventSink for AttachedSinks {
+        async fn on_event(&self, _event: &crate::events::ExecutionEvent) {}
+
+        async fn on_state_changed(&self, _state: &OrchestratorState) {}
+
+        async fn on_dispatch(&self, dispatch: &crate::events::EventDispatch<'_>) {
+            self.dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for sink in self.snapshot() {
+                sink.on_dispatch(dispatch).await;
+            }
+        }
+    }
+
+    /// A revision source bound after the dispatch owner already exists.
+    ///
+    /// The coordinator reads its outcome revisions through this, and a `WebState`
+    /// is what answers — but the `WebState` needs the shared mark store, which is
+    /// built alongside the coordinator. One indirection resolves that ordering
+    /// without letting a test invent a second revision authority.
+    #[derive(Default)]
+    pub(super) struct AttachedRevisions {
+        inner: std::sync::Mutex<Option<Arc<dyn crate::events::OutcomeRevisions>>>,
+    }
+
+    impl AttachedRevisions {
+        fn inner(&self) -> Option<Arc<dyn crate::events::OutcomeRevisions>> {
+            self.inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl crate::events::OutcomeRevisions for AttachedRevisions {
+        fn revision_for_dispatch(&self, dispatch_id: u64) -> Option<u64> {
+            self.inner()
+                .and_then(|inner| inner.revision_for_dispatch(dispatch_id))
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner().map_or(0, |inner| inner.current_revision())
+        }
     }
 
     impl AdapterHarness {
@@ -968,20 +1145,85 @@ mod tests {
                 resolves.clone(),
                 parallel.clone(),
             ));
+            // The same three-part wiring production builds: one core mode, one
+            // dispatch owner over the shared reducer, and one coordinator. A test
+            // that stubbed any of them would stop proving the thing these tests
+            // exist for.
+            let core_mode = Arc::new(CoreMode::new());
+            let (frontend_tx, frontend_rx) = mpsc::channel(256);
+            let attached = Arc::new(AttachedSinks::default());
+            let dispatcher = Arc::new(
+                crate::events::EventDispatcher::new(
+                    state.clone(),
+                    vec![
+                        Arc::new(crate::tui::events::TuiEventSink::new(frontend_tx)),
+                        attached.clone(),
+                    ],
+                )
+                .with_core_mode(Some(core_mode.clone())),
+            );
+            let revisions = Arc::new(AttachedRevisions::default());
+            let application = Arc::new(
+                OperatorApplication::new(
+                    core_mode.clone(),
+                    run_control.clone(),
+                    dispatcher.clone(),
+                )
+                .with_revisions(Some(
+                    revisions.clone() as Arc<dyn crate::events::OutcomeRevisions>
+                )),
+            );
+            let (submissions_tx, submissions_rx) = mpsc::channel(256);
+            let (feedback_tx, feedback_rx) = mpsc::channel(256);
             let worktree_service = build_worktree_service(Path::new("."), &config, &tx);
             Self {
                 state,
                 queue,
                 scheduler,
                 run_control,
+                application,
+                core_mode,
+                dispatcher,
+                attached,
+                revisions,
                 marks,
                 parallel,
                 resolves,
                 config,
                 tx,
                 rx,
+                frontend_rx: std::sync::Mutex::new(frontend_rx),
+                submissions_tx,
+                submissions_rx: std::sync::Mutex::new(submissions_rx),
+                feedback_tx,
+                feedback_rx: std::sync::Mutex::new(feedback_rx),
                 worktree_service,
             }
+        }
+
+        /// Attach another frontend to the shared dispatch owner.
+        pub(super) fn attach(&self, sink: Arc<dyn crate::events::EventSink>) {
+            self.attached
+                .sinks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(sink);
+        }
+
+        /// Bind the revision authority accepted outcomes are recorded against.
+        pub(super) fn attach_revisions(&self, revisions: Arc<dyn crate::events::OutcomeRevisions>) {
+            *self
+                .revisions
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(revisions);
+        }
+
+        /// How many authoritative dispatches this boundary has fanned out.
+        pub(super) fn dispatch_count(&self) -> usize {
+            self.attached
+                .dispatches
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         /// An `AppState` already bound to this harness's shared handles.
@@ -1003,19 +1245,100 @@ mod tests {
             TuiCommandContext {
                 app,
                 tx: &self.tx,
-                run_control: &self.run_control,
+                application: &self.application,
+                submissions: &self.submissions_tx,
+                feedback: &self.feedback_tx,
                 worktree_service: &self.worktree_service,
-                #[cfg(feature = "web-monitoring")]
-                web_state: &None,
             }
         }
 
-        /// Run one command through the TUI adapter.
+        /// Run one command through the TUI adapter and settle the frame it produced.
+        ///
+        /// This is deliberately a whole runner frame rather than just the handler:
+        /// submission, coordinator execution, authoritative dispatch delivery, and
+        /// mode adoption are what the TUI actually shows an operator, and a test
+        /// that stopped after the handler would be asserting on a frontend state
+        /// that no longer exists by the time anything is rendered.
         pub(super) async fn run(&self, app: &mut AppState, command: TuiCommand) {
+            // The arranged frontend mode *is* the arranged process mode: the two
+            // are one value in production, so a test that arranges only one of
+            // them would be exercising a state the process cannot be in. That
+            // includes the idle-episode qualifier — `Select` over a live parked
+            // scheduler and `Select` before any run admit different commands.
+            self.core_mode.set(app.operator_mode());
+            self.core_mode
+                .set_persistent_idle(app.persistent_scheduler_idle);
+
             let mut ctx = self.context(app);
             handle_tui_command(command, &mut ctx, &self.state)
                 .await
                 .expect("tui command should succeed");
+            self.settle(app).await;
+        }
+
+        /// Wait for one settlement that a command handled on its own task.
+        ///
+        /// `stop_and_dequeue` is the only such command: it must not occupy the
+        /// ordered submission queue, so its result arrives asynchronously and a
+        /// test frame has to join it before asserting.
+        pub(super) async fn await_feedback(&self, app: &mut AppState, within: std::time::Duration) {
+            let deadline = std::time::Instant::now() + within;
+            while std::time::Instant::now() < deadline {
+                let settled = self
+                    .feedback_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .try_recv()
+                    .ok();
+                if let Some(settled) = settled {
+                    apply_command_feedback(app, settled);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            self.deliver(app).await;
+        }
+
+        /// Drain the submission queue, the dispatch deliveries, and the feedback.
+        pub(super) async fn settle(&self, app: &mut AppState) {
+            loop {
+                let next = self
+                    .submissions_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .try_recv()
+                    .ok();
+                let Some(submission) = next else { break };
+                let settled = submission.run(&self.application).await;
+                let _ = self.feedback_tx.send(settled).await;
+            }
+            self.deliver(app).await;
+        }
+
+        /// Apply everything a runner frame would apply after commands were handled.
+        pub(super) async fn deliver(&self, app: &mut AppState) {
+            loop {
+                let next = self
+                    .frontend_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .try_recv()
+                    .ok();
+                let Some(event) = next else { break };
+                crate::tui::runner::sync_reducer_display_caches(app, &self.state, &event).await;
+                app.handle_orchestrator_event(event);
+            }
+            loop {
+                let next = self
+                    .feedback_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .try_recv()
+                    .ok();
+                let Some(settled) = next else { break };
+                apply_command_feedback(app, settled);
+            }
+            app.adopt_core_mode(self.core_mode.get());
         }
 
         pub(super) async fn status(&self, change_id: &str) -> String {
@@ -2494,11 +2817,13 @@ mod run_supervisor_tests {
     use crate::orchestration::operator_command::{
         ExecutionMarkStore, NoopQueueHooks, OperatorCommandService,
     };
+    use crate::orchestration::operator_coordinator::{CoreMode, OperatorApplication};
     use crate::orchestration::run_control::{
-        ResolveReservations, RunSchedulerPort, StartEligibility,
+        ResolveReservations, RunControlService, RunSchedulerPort, StartEligibility,
     };
     use crate::orchestration::state::OrchestratorState;
     use crate::tui::run_supervisor::TuiRunSupervisor;
+    use crate::tui::types::AppExecutionMode;
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
     use tokio::sync::RwLock;
@@ -2611,19 +2936,27 @@ mod run_supervisor_tests {
         let queue = DynamicQueue::new();
         let marks = Arc::new(ExecutionMarkStore::new());
         marks.set("alpha", true);
+        // The process-lifetime dispatch owner, exactly as production builds it:
+        // the supervisor publishes a spawned run's events through it, and the
+        // coordinator publishes accepted command outcomes through the same one.
+        let core_mode = Arc::new(CoreMode::new());
+        let dispatcher = Arc::new(
+            crate::events::EventDispatcher::new(
+                shared_state.clone(),
+                vec![Arc::new(crate::tui::events::TuiEventSink::new(tx.clone()))],
+            )
+            .with_core_mode(Some(core_mode.clone())),
+        );
         let supervisor = Arc::new(TuiRunSupervisor::new(
             root.clone(),
             config.clone(),
-            tx.clone(),
+            dispatcher.clone(),
             queue.clone(),
             shared_state.clone(),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             PostArchiveAction::MergeToBase,
             Some(upstream_runtime()),
             Arc::new(AtomicBool::new(false)),
-            None,
-            #[cfg(feature = "web-monitoring")]
-            None,
         ));
         let run_control = Arc::new(RunControlService::new(
             shared_state.clone(),
@@ -2637,12 +2970,20 @@ mod run_supervisor_tests {
             Arc::new(ResolveReservations::new()),
             Arc::new(StartEligibility::new()),
         ));
+        let application = Arc::new(OperatorApplication::new(
+            core_mode.clone(),
+            run_control.clone(),
+            dispatcher.clone(),
+        ));
+        let (submissions_tx, mut submissions_rx) = mpsc::channel::<Submission>(16);
+        let (feedback_tx, _feedback_rx) = mpsc::channel::<CommandFeedback>(16);
 
         let mut app = AppState::new(vec![create_test_change("alpha")]);
         app.set_shared_state(shared_state.clone());
         app.apply_display_statuses_from_reducer(&shared_state.read().await.all_display_statuses());
         assert_eq!(app.changes[0].display_status_cache, "error");
         app.execution_mode = AppExecutionMode::Error;
+        core_mode.set(app.operator_mode());
         app.changes[0].selected = true;
         let worktree_service = build_worktree_service(&root, &config, &tx);
 
@@ -2650,15 +2991,21 @@ mod run_supervisor_tests {
             let mut ctx = TuiCommandContext {
                 app: &mut app,
                 tx: &tx,
-                run_control: &run_control,
+                application: &application,
+                submissions: &submissions_tx,
+                feedback: &feedback_tx,
                 worktree_service: &worktree_service,
-                #[cfg(feature = "web-monitoring")]
-                web_state: &None,
             };
             // A remote `start` carries no IDs either; Error mode turns both into
             // the same explicit retry.
             handle_start_processing_command(Vec::new(), &mut ctx).await;
         }
+        // The runner's submission worker, inline: the command was queued off the
+        // event loop, so the run only really starts once that queue is drained.
+        let queued = submissions_rx
+            .try_recv()
+            .expect("start must be queued for the shared transaction");
+        queued.run(&application).await;
         assert!(
             supervisor.is_running(),
             "explicit retry must start a local orchestrator run"

@@ -11,12 +11,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::orchestration::operator_command::{
-    MarkExclusion, MarkRoute, NoOpReason, OperatorCommandError, OperatorCommandService,
-    OperatorMode, OperatorOutcome,
+    MarkExclusion, MarkRoute, NoOpReason, OperatorCommandError, OperatorOutcome,
+};
+use crate::orchestration::operator_coordinator::{
+    ApplicationOutcome, ApplicationResult, OperatorApplication, OperatorIntent,
 };
 use crate::orchestration::run_control::{
-    ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
-    SchedulerEffect,
+    ResolveReservation, RunControlError, RunControlOutcome, RunNoOpReason, SchedulerEffect,
 };
 use crate::web::state::WebState;
 
@@ -29,6 +30,13 @@ pub struct ExecutionSummary {
     pub changed: bool,
     /// Sanitized operator-facing detail.
     pub detail: Option<String>,
+    /// The revision this command's own outcome dispatch produced.
+    ///
+    /// `None` means "no outcome was dispatched", which the endpoint settles as
+    /// the unchanged admitted revision. It is never a sampled current revision:
+    /// sampling is exactly how unrelated later scheduler progress used to become
+    /// a command's recorded `result_revision`.
+    pub result_revision: Option<u64>,
 }
 
 impl ExecutionSummary {
@@ -37,6 +45,7 @@ impl ExecutionSummary {
         Self {
             changed: true,
             detail: Some(detail.into()),
+            result_revision: None,
         }
     }
 
@@ -45,7 +54,14 @@ impl ExecutionSummary {
         Self {
             changed: false,
             detail: Some(detail.into()),
+            result_revision: None,
         }
+    }
+
+    /// Bind the revision this command's outcome dispatch produced.
+    pub fn at_revision(mut self, revision: Option<u64>) -> Self {
+        self.result_revision = revision;
+        self
     }
 }
 
@@ -56,6 +72,14 @@ pub struct CommandFailure {
     pub error_code: ErrorCode,
     /// Sanitized message.
     pub message: String,
+    /// The revision to settle this refusal at.
+    ///
+    /// `None` for an ordinary failure, which has no effect and therefore settles
+    /// at the unchanged admitted revision. A two-phase refusal after the
+    /// termination wait carries the explicit unchanged revision observed under
+    /// the reacquired settlement boundary, because unrelated commands may have
+    /// advanced projection while it waited.
+    pub result_revision: Option<u64>,
 }
 
 impl CommandFailure {
@@ -64,15 +88,84 @@ impl CommandFailure {
         Self {
             error_code,
             message: message.into(),
+            result_revision: None,
         }
     }
+
+    /// Bind the revision this refusal settles at.
+    pub fn at_revision(mut self, revision: Option<u64>) -> Self {
+        self.result_revision = revision;
+        self
+    }
 }
+
+/// A command whose second phase settles after the endpoint released the gate.
+pub type PendingCommand = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ExecutionSummary, CommandFailure>> + Send>,
+>;
+
+/// What admitting one command decided about how it will be executed.
+pub enum Applied {
+    /// Nothing special. The caller executes it, still holding the returned gate.
+    ///
+    /// Execution runs on its own task so a slow command reports through its
+    /// record instead of pinning the connection; the gate travels with it, so
+    /// the command is still serialized through settlement.
+    Ordinary(Option<GateGuard>),
+    /// Phase one already ran under the gate and released it. The continuation
+    /// waits for confirmed termination *outside* the gate, reacquires it,
+    /// revalidates, and settles.
+    ///
+    /// Returning this instead of blocking is what keeps force stop, unrelated
+    /// operator commands, event fan-out, and TUI rendering live while a
+    /// stop-and-dequeue is pending.
+    Pending(PendingCommand),
+    /// Phase one refused before any effect. Settle the record immediately.
+    Settled(Result<ExecutionSummary, CommandFailure>),
+}
+
+/// Exclusive ownership of the application gate, handed from the endpoint to the
+/// executor.
+///
+/// It is *moved*, not borrowed, because the executor decides when it is
+/// released: an ordinary command holds it through settlement, while a two-phase
+/// command must drop it before waiting for confirmed termination. The gate is
+/// not reentrant, so a caller that kept its own copy and then re-entered the
+/// coordinator would deadlock.
+pub type GateGuard = tokio::sync::OwnedMutexGuard<()>;
 
 /// The port the command endpoint calls once a command has been admitted.
 #[async_trait]
 pub trait RemoteControlExecutor: Send + Sync {
     /// Execute an admitted command. Called at most once per command record.
+    ///
+    /// Acquires the application gate itself, so it is the entry point for a
+    /// caller that holds none.
     async fn execute(&self, command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure>;
+
+    /// Decide how an admitted command will be executed, under the caller's gate.
+    ///
+    /// This is *not* where the command runs. It exists so a command that must
+    /// issue cancellation inside the gate and then wait outside it can do the
+    /// first half here; everything else hands the gate straight back.
+    async fn begin(&self, _command: &CommandSpec, gate: Option<GateGuard>) -> Applied {
+        Applied::Ordinary(gate)
+    }
+
+    /// Execute under a gate the caller already holds.
+    ///
+    /// The default releases the guard first, which is right for a port with no
+    /// coordinator behind it: there is nothing to serialize, and holding a
+    /// process-wide lock across an unrelated implementation would only make one
+    /// slow port block every command.
+    async fn execute_held(
+        &self,
+        command: &CommandSpec,
+        gate: Option<GateGuard>,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        drop(gate);
+        self.execute(command).await
+    }
 }
 
 /// Map an operator-service refusal onto a v2 error code.
@@ -284,45 +377,32 @@ pub fn summarize_run_outcome(outcome: &RunControlOutcome) -> ExecutionSummary {
     }
 }
 
-/// Map the operator-facing application mode string onto the shared enum.
+/// Production executor over the shared process-local application transaction.
 ///
-/// Delegates to the enum's own parser: the snapshot projection resolves the same
-/// token when it decides which actions to advertise, and two copies of that
-/// mapping could disagree about what an instance will accept.
-pub fn operator_mode(app_mode: &str) -> OperatorMode {
-    OperatorMode::from_app_mode(app_mode)
-}
-
-/// Production executor over the two shared process-local application services.
+/// There is no control channel here on purpose, and no lifecycle decision
+/// either. Every operator command is translated into an [`OperatorIntent`] and
+/// handed to the *same* coordinator a keypress reaches, which is what makes
+/// "equivalent intent takes the same path" structural rather than a property two
+/// implementations have to keep agreeing about.
 ///
-/// There is no control channel here on purpose. A run lifecycle command reaches
-/// the same [`RunControlService`] a keypress reaches and returns only after that
-/// service produced a real outcome, so a command record can never settle as
-/// succeeded because a message was enqueued.
+/// It is also why this adapter no longer publishes a projection refresh of its
+/// own: the coordinator dispatches one authoritative outcome and reports the
+/// exact revision that dispatch produced, so a client reading `result_revision`
+/// finds the command's synchronous effect there by construction.
 pub struct SharedServiceExecutor {
-    service: Arc<OperatorCommandService>,
-    run_control: Arc<RunControlService>,
+    application: Arc<OperatorApplication>,
     web_state: Arc<WebState>,
-    projection: Arc<super::projection::Projection>,
     /// The same worktree port the read routes use, so a client cannot be told a
     /// worktree exists by one half of the API and denied by the other.
     worktrees: Arc<dyn super::worktrees::WorktreeOperations>,
 }
 
 impl SharedServiceExecutor {
-    /// Wire the executor to the shared services and the projection it reads the
-    /// current mode from.
-    pub fn new(
-        service: Arc<OperatorCommandService>,
-        run_control: Arc<RunControlService>,
-        web_state: Arc<WebState>,
-        projection: Arc<super::projection::Projection>,
-    ) -> Self {
+    /// Wire the executor to the shared application transaction.
+    pub fn new(application: Arc<OperatorApplication>, web_state: Arc<WebState>) -> Self {
         Self {
-            service,
-            run_control,
+            application,
             web_state,
-            projection,
             worktrees: Arc::new(super::worktrees::UnboundWorktreeOperations),
         }
     }
@@ -335,112 +415,56 @@ impl SharedServiceExecutor {
         self.worktrees = worktrees;
         self
     }
-}
 
-#[async_trait]
-impl RemoteControlExecutor for SharedServiceExecutor {
-    async fn execute(&self, command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure> {
-        let mode = operator_mode(&self.projection.snapshot().0.app_mode);
-
-        let outcome = self.dispatch(mode, command).await;
-
-        // A command that changed an in-scope decision field has to be readable
-        // before its record settles: the record's `result_revision` is taken
-        // after this returns, and a client that reads that revision must find
-        // the mark, queue intent, and eligibility the command produced. Marks
-        // and reducer intent do not emit execution events, so without this
-        // publication they would sit unpublished until unrelated activity
-        // happened to move the snapshot.
-        if matches!(&outcome, Ok(summary) if summary.changed) {
-            self.web_state.sync_remote_control_projection().await;
-        }
-        outcome
-    }
-}
-
-impl SharedServiceExecutor {
-    /// Project a run-control result onto the v2 summary/failure vocabulary.
-    fn run(
-        &self,
-        result: Result<RunControlOutcome, RunControlError>,
-    ) -> Result<ExecutionSummary, CommandFailure> {
-        result
-            .map(|outcome| summarize_run_outcome(&outcome))
-            .map_err(|error| map_run_control_error(&error))
-    }
-
-    async fn dispatch(
-        &self,
-        mode: OperatorMode,
-        command: &CommandSpec,
-    ) -> Result<ExecutionSummary, CommandFailure> {
-        match command {
-            CommandSpec::Start => self.run(self.run_control.start(mode).await),
-            // Both stop-family projections mirror what the TUI adapter does for
-            // the same accepted outcome, so a remote command and a keypress
-            // leave the instance reporting the same mode. Projecting only after
-            // the service accepted keeps a refused command invisible.
-            CommandSpec::Stop => {
-                let outcome = self.run(self.run_control.stop(mode).await);
-                if outcome.is_ok() {
-                    self.web_state.project_stop_requested().await;
+    /// Translate a v2 command into the shared intent vocabulary.
+    ///
+    /// `None` for the worktree commands, which are repository operations rather
+    /// than operator lifecycle intent and own their own guards.
+    fn intent(command: &CommandSpec) -> Option<OperatorIntent> {
+        Some(match command {
+            CommandSpec::Start => OperatorIntent::Start,
+            CommandSpec::Stop => OperatorIntent::Stop,
+            CommandSpec::CancelStop => OperatorIntent::CancelStop,
+            CommandSpec::ForceStop => OperatorIntent::ForceStop,
+            CommandSpec::SetExecutionMark { change_id, marked } => {
+                OperatorIntent::SetExecutionMark {
+                    change_id: change_id.clone(),
+                    marked: *marked,
                 }
-                outcome
             }
-            CommandSpec::CancelStop => {
-                let outcome = self.run(self.run_control.cancel_stop(mode).await);
-                if outcome.is_ok() {
-                    self.web_state.project_stop_cancelled().await;
-                }
-                outcome
-            }
-            CommandSpec::ForceStop => self.run(self.run_control.force_stop(mode).await),
-            CommandSpec::SetExecutionMark { change_id, marked } => self
-                .service
-                .set_execution_mark(mode, change_id, *marked)
-                .await
-                .map(|outcome| summarize_outcome(&outcome))
-                .map_err(|error| map_operator_error(&error)),
-            CommandSpec::SetQueueIntent { change_id, queued } => {
-                let outcome = if *queued {
-                    self.service.add_to_queue(change_id).await
-                } else {
-                    self.service.remove_from_queue(change_id).await
-                };
-                outcome
-                    .map(|queue| summarize_outcome(&OperatorOutcome::Queue(queue)))
-                    .map_err(|error| map_operator_error(&error))
-            }
+            CommandSpec::SetQueueIntent { change_id, queued } => OperatorIntent::SetQueueIntent {
+                change_id: change_id.clone(),
+                queued: *queued,
+            },
             // Retry routes through run control rather than the per-change
             // service so the reducer transition and the scheduler dispatch that
             // makes it real settle together.
-            CommandSpec::RetryChange { change_id } => {
-                self.run(self.run_control.retry_change(change_id).await)
-            }
-            CommandSpec::RetryErrors { change_ids } => {
-                self.run(self.run_control.retry_errors(change_ids).await)
-            }
-            CommandSpec::StopAndDequeue { change_id } => self
-                .service
-                .stop_and_dequeue(change_id)
-                .await
-                .map(|outcome| summarize_outcome(&outcome))
-                .map_err(|error| map_operator_error(&error)),
-            CommandSpec::ResolveMerge { change_id } => {
-                self.run(self.run_control.resolve_merge(change_id).await)
-            }
-            // The process-wide mutation routes through the same per-change
-            // service the TUI uses, so the bulk classification has exactly one
-            // implementation.
-            CommandSpec::SetAllExecutionMarks {} => self
-                .service
-                .set_all_execution_marks(mode)
-                .await
-                .map(|outcome| summarize_outcome(&outcome))
-                .map_err(|error| map_operator_error(&error)),
-            // Worktree commands carry no parameters, so there is nothing to
-            // translate here: the closed target is passed straight to the shared
-            // service, which owns every guard.
+            CommandSpec::RetryChange { change_id } => OperatorIntent::RetryChange {
+                change_id: change_id.clone(),
+            },
+            CommandSpec::RetryErrors { change_ids } => OperatorIntent::RetryErrors {
+                change_ids: change_ids.clone(),
+            },
+            CommandSpec::StopAndDequeue { change_id } => OperatorIntent::StopAndDequeue {
+                change_id: change_id.clone(),
+            },
+            CommandSpec::ResolveMerge { change_id } => OperatorIntent::ResolveMerge {
+                change_id: change_id.clone(),
+            },
+            CommandSpec::SetAllExecutionMarks {} => OperatorIntent::SetAllExecutionMarks,
+            CommandSpec::CreateWorktree { .. }
+            | CommandSpec::DeleteWorktree { .. }
+            | CommandSpec::MergeWorktree { .. } => return None,
+        })
+    }
+
+    /// Run a worktree command and republish the monitoring snapshot.
+    ///
+    /// Repository mutations do not travel through the operator outcome
+    /// vocabulary, so this is the one path that still refreshes the projection
+    /// itself before the record settles.
+    async fn worktree(&self, command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure> {
+        let outcome = match command {
             CommandSpec::CreateWorktree { target, .. } => {
                 self.worktrees.create(&target.change_id).await
             }
@@ -450,6 +474,134 @@ impl SharedServiceExecutor {
             CommandSpec::MergeWorktree { target, .. } => {
                 self.worktrees.merge(&target.worktree_id).await
             }
+            other => {
+                debug_assert!(false, "not a worktree command: {other:?}");
+                return Err(CommandFailure::new(
+                    ErrorCode::InternalError,
+                    "command is not a worktree operation",
+                ));
+            }
+        };
+        if matches!(&outcome, Ok(summary) if summary.changed) {
+            self.web_state.sync_remote_control_projection().await;
         }
+        outcome
+    }
+}
+
+/// Wire an executor the way production wires one: one core mode, one
+/// process-lifetime dispatch owner over the shared reducer, one coordinator.
+///
+/// Test-only, and deliberately *not* a stub. A test that assembled a different
+/// shape here would stop covering the property these tests exist for — that a
+/// remote command takes the same path a keypress takes.
+///
+/// `core_mode` is supplied rather than created here because it is the admission
+/// authority: a test that let this build a second one would arrange a mode the
+/// transaction never sees, and every lifecycle assertion would silently become
+/// an assertion about `Select`.
+#[cfg(test)]
+pub fn wired_for_test(
+    reducer: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    run_control: Arc<crate::orchestration::run_control::RunControlService>,
+    web_state: Arc<WebState>,
+    core_mode: Arc<crate::orchestration::operator_coordinator::CoreMode>,
+) -> (SharedServiceExecutor, Arc<OperatorApplication>) {
+    let dispatcher = Arc::new(
+        crate::events::EventDispatcher::new(
+            reducer,
+            vec![Arc::new(crate::web::state::WebEventSink::new(
+                web_state.clone(),
+            ))],
+        )
+        .with_core_mode(Some(core_mode.clone())),
+    );
+    let revisions: Arc<dyn crate::events::OutcomeRevisions> = web_state.clone();
+    let application = Arc::new(
+        OperatorApplication::new(core_mode.clone(), run_control, dispatcher)
+            .with_revisions(Some(revisions)),
+    );
+    (
+        SharedServiceExecutor::new(application.clone(), web_state),
+        application,
+    )
+}
+
+/// Project one settled application result onto the v2 vocabulary.
+pub fn summarize_application(
+    result: ApplicationResult,
+) -> Result<ExecutionSummary, CommandFailure> {
+    let ApplicationResult { outcome, revision } = result;
+    match outcome {
+        Ok(ApplicationOutcome::Run(outcome)) => {
+            Ok(summarize_run_outcome(&outcome).at_revision(revision))
+        }
+        Ok(ApplicationOutcome::Operator(outcome)) => {
+            Ok(summarize_outcome(&outcome).at_revision(revision))
+        }
+        Err(error) => Err(map_run_control_error(&error).at_revision(revision)),
+    }
+}
+
+#[async_trait]
+impl RemoteControlExecutor for SharedServiceExecutor {
+    async fn execute(&self, command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure> {
+        match Self::intent(command) {
+            Some(intent) => summarize_application(self.application.apply(intent).await),
+            None => self.worktree(command).await,
+        }
+    }
+
+    /// Execute under the endpoint's gate rather than acquiring a second one.
+    ///
+    /// The gate is a plain mutex and is not reentrant: re-acquiring it here
+    /// would deadlock against the endpoint that is holding it through
+    /// settlement.
+    async fn execute_held(
+        &self,
+        command: &CommandSpec,
+        gate: Option<GateGuard>,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        match (Self::intent(command), gate) {
+            (Some(intent), Some(gate)) => {
+                summarize_application(self.application.apply_held(intent, gate).await)
+            }
+            (Some(intent), None) => summarize_application(self.application.apply(intent).await),
+            // A worktree operation is a repository mutation, not operator
+            // lifecycle intent; the gate is released before it runs so a long
+            // merge cannot monopolize command admission.
+            (None, gate) => {
+                drop(gate);
+                self.worktree(command).await
+            }
+        }
+    }
+
+    async fn begin(&self, command: &CommandSpec, gate: Option<GateGuard>) -> Applied {
+        // A stop-and-dequeue is the only two-phase command: it issues
+        // cancellation under the caller's gate and settles later, so the gate
+        // and the TUI event loop are both free while termination confirms.
+        let CommandSpec::StopAndDequeue { change_id } = command else {
+            return Applied::Ordinary(gate);
+        };
+
+        let pending = match self.application.begin_stop_and_dequeue(change_id).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                // Phase one refused before cancellation was issued, so this is
+                // an ordinary failure with no effect and no revision.
+                return Applied::Settled(Err(map_run_control_error(&error)));
+            }
+        };
+
+        // Phase one is over. Releasing the gate here — before the wait, not
+        // during it — is what keeps force stop, unrelated commands, event
+        // fan-out, and rendering live while confirmation is pending.
+        drop(gate);
+
+        let application = self.application.clone();
+        Applied::Pending(Box::pin(async move {
+            summarize_application(application.settle_stop_and_dequeue(pending).await)
+        }))
     }
 }

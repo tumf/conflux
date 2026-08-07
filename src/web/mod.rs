@@ -258,6 +258,10 @@ pub fn remote_control_router(
             Arc::new(auth),
             runtime.clone(),
         )
+        // The runtime holds the late-bound application gate, so the router
+        // serializes submissions through the same gate a keypress takes as soon
+        // as an orchestration runtime binds one.
+        .with_gate(runtime.gate())
         // The runtime is both the command target and the worktree read port, so
         // both halves of the API see the same late binding.
         .with_worktrees(runtime),

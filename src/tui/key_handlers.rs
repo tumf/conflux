@@ -974,21 +974,22 @@ mod tests {
     /// token, so an unstarted supervisor is the whole surface these tests need.
     fn idle_supervisor() -> Arc<crate::tui::run_supervisor::TuiRunSupervisor> {
         let (tx, _rx) = mpsc::channel(1);
+        let state = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+        ));
         Arc::new(crate::tui::run_supervisor::TuiRunSupervisor::new(
             PathBuf::from("."),
             OrchestratorConfig::default(),
-            tx,
-            crate::tui::queue::DynamicQueue::new(),
-            Arc::new(tokio::sync::RwLock::new(
-                crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+            Arc::new(crate::events::EventDispatcher::new(
+                state.clone(),
+                vec![Arc::new(crate::tui::events::TuiEventSink::new(tx))],
             )),
+            crate::tui::queue::DynamicQueue::new(),
+            state,
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             crate::parallel::PostArchiveAction::MergeToBase,
             None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            None,
-            #[cfg(feature = "web-monitoring")]
-            None,
         ))
     }
 
