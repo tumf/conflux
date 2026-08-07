@@ -874,7 +874,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl WorktreeBackend for StubWorktreeBackend {
-        async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
+        async fn observe(
+            &self,
+            _request: crate::worktree_ops::ObservationRequest,
+        ) -> WorktreeOpResult<Vec<WorktreeFacts>> {
             Ok(DELETE_WORKTREE_TEST_OUTCOMES
                 .lock()
                 .expect("delete worktree test outcomes lock")
@@ -988,6 +991,7 @@ mod tests {
             merge_conflict: None,
             has_commits_ahead: true,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         }
     }
 

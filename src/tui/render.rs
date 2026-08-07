@@ -13,7 +13,7 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
 use super::state::{
-    AppState, ChangeState, CopyFeedback, ErrorDetailsPopup, ERROR_DETAILS_UNAVAILABLE,
+    guards, AppState, ChangeState, CopyFeedback, ErrorDetailsPopup, ERROR_DETAILS_UNAVAILABLE,
 };
 use super::types::{AppExecutionMode, ModalState};
 use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
@@ -1842,12 +1842,26 @@ fn render_worktree_list(frame: &mut Frame, app: &mut AppState, area: Rect) {
             } else {
                 String::new()
             };
+            // Where the row's ahead/conflict facts came from. A checked row says
+            // nothing, so only a reused or skipped observation is called out.
+            let inspection_status = wt.inspection_label();
+            let inspection_indicator = if inspection_status.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", inspection_status)
+            };
             let deleting = app.is_worktree_deleting(&wt.path);
             let delete_indicator = if deleting { " [Deleting...]" } else { "" };
 
             let line = format!(
-                "{} → {}{}{}{}{}",
-                label, branch, indicator, merge_indicator, conflict_badge, delete_indicator
+                "{} → {}{}{}{}{}{}",
+                label,
+                branch,
+                indicator,
+                merge_indicator,
+                inspection_indicator,
+                conflict_badge,
+                delete_indicator
             );
 
             // Style based on conflict and selection
@@ -1900,20 +1914,15 @@ fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
             key_hints.push(("D", "delete"));
         }
 
-        // Show M (merge) key only if:
-        // - Not main worktree
-        // - Not detached HEAD
-        // - No merge conflicts
-        // - Has a branch name
-        // - Has commits ahead of base branch
-        // - No resolve operation in progress
-        if !wt.is_main
-            && !wt.is_detached
-            && !wt.has_merge_conflict()
-            && !wt.branch.is_empty()
-            && wt.has_commits_ahead
-            && !app.is_resolving()
-            && !wt.is_merging
+        // Show M (merge) key exactly when the request would be accepted. The
+        // guard is the single source of that answer, so an uninspected row keeps
+        // its affordance and is resolved by the service's fresh observation
+        // rather than being hidden by a check that never ran.
+        if !app.is_resolving()
+            && matches!(
+                guards::validate_worktree_mergeable(wt),
+                guards::MergeGuardResult::Allowed
+            )
         {
             key_hints.push(("M", "merge"));
         }
@@ -2434,6 +2443,7 @@ mod tests {
             merge_conflict: None,
             has_commits_ahead: true,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         }
     }
 

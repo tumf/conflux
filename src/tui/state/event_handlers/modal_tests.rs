@@ -33,6 +33,7 @@ fn worktree(path: &str, branch: &str) -> WorktreeInfo {
         merge_conflict: None,
         has_commits_ahead: false,
         is_merging: false,
+        inspection: crate::worktree_ops::InspectionState::Checked,
     }
 }
 

@@ -148,6 +148,7 @@ mod tests {
             merge_conflict: None,
             has_commits_ahead: false,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         }
     }
 
@@ -182,6 +183,51 @@ mod tests {
                 "{name}: the refusal must name the missing identity"
             );
         }
+    }
+
+    #[test]
+    fn periodic_filtering_never_hides_the_merge_affordance() {
+        use crate::worktree_ops::InspectionState;
+
+        // A row periodic refresh skipped carries no evidence either way. Judging
+        // it here would turn "we did not look" into "there is nothing to merge"
+        // and make every filtered worktree permanently unmergeable from the TUI,
+        // so the request goes through and the service decides from its own fresh
+        // observation of that worktree.
+        let mut skipped = worktree("/tmp/ws-session-a1b2c3", "ws-session-a1b2c3");
+        skipped.inspection = InspectionState::NotInspected;
+        assert!(
+            matches!(
+                guards::validate_worktree_mergeable(&skipped),
+                guards::MergeGuardResult::Allowed
+            ),
+            "an uninspected worktree must still be able to reach the service"
+        );
+
+        // An *inspected* row that really has nothing ahead is still refused, and
+        // for that reason.
+        let mut inspected = skipped.clone();
+        inspected.inspection = InspectionState::Checked;
+        let guards::MergeGuardResult::Blocked(message) =
+            guards::validate_worktree_mergeable(&inspected)
+        else {
+            panic!("an inspected branch with nothing ahead of base is not mergeable");
+        };
+        assert!(message.contains("no commits ahead"), "got: {message}");
+
+        // Structural refusals do not depend on inspection at all.
+        let mut merging = skipped.clone();
+        merging.is_merging = true;
+        assert!(matches!(
+            guards::validate_worktree_mergeable(&merging),
+            guards::MergeGuardResult::Blocked(_)
+        ));
+        let mut main = skipped.clone();
+        main.is_main = true;
+        assert!(matches!(
+            guards::validate_worktree_mergeable(&main),
+            guards::MergeGuardResult::Blocked(_)
+        ));
     }
 
     #[test]

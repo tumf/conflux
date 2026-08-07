@@ -1181,6 +1181,7 @@ fn worktree_response() -> WorktreeResponse {
             is_detached: false,
             dirty: Some(true),
             has_commits_ahead: true,
+            inspection: conflux::worktree_ops::InspectionState::Checked,
             conflict: Some(WorktreeConflict::new(vec!["src/lib.rs".to_string()])),
             operations: WorktreeEligibility {
                 deletable: false,

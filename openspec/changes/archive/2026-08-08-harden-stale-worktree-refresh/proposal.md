@@ -22,7 +22,7 @@ verifications:
     trigger: pull-request-validation
     automation: tests/e2e_git_worktree_tests.rs
     evidence: Rust tests prove filtering across TUI and Web/UDS periodic paths, shared revision-keyed reuse, active revision invalidation, operator-targeted reinspection, truthful not-inspected diagnostics, bounded diagnostics, and unchanged worktree state
-    rerun: cargo test --locked --test e2e_git_worktree_tests
+    rerun: cargo test --locked --features heavy-tests --test e2e_git_worktree_tests
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -64,7 +64,7 @@ Bound `merge-tree` diagnostics. Conflict results retain the conflict count and a
 - One shared in-memory observation cache serves both periodic refresh paths, uses only current Git-derived identity/revision inputs, is discarded at process exit, and cannot become workflow-control state.
 - `check_merge_conflicts` returns structured bounded conflict evidence and never interpolates complete unbounded stdout/stderr into tracing records or operator errors.
 - `tests/e2e_git_worktree_tests.rs` uses an injected command recorder or PATH-scoped Git shim to count actual ahead/conflict invocations across both periodic paths and proves stale worktrees are skipped, unchanged active worktrees are reused once process-wide, revision changes rerun checks, operator actions revalidate skipped worktrees, large outputs remain bounded, and tracked/dirty files remain unchanged.
-- `cargo test --locked --test e2e_git_worktree_tests` passes without network access or external credentials.
+- `cargo test --locked --features heavy-tests --test e2e_git_worktree_tests` passes without network access or external credentials. The target is gated by `#![cfg(feature = "heavy-tests")]`, so the feature flag is required for the suite to execute any cases at all.
 
 ## Out of Scope
 

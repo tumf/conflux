@@ -11,18 +11,137 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tracing::debug;
 
-#[allow(dead_code)]
+/// How many conflicting paths a diagnostic may name.
+pub const MAX_CONFLICT_SAMPLE: usize = 20;
+
+/// How many bytes of each raw output stream a diagnostic may quote.
+pub const MAX_OUTPUT_PREFIX_BYTES: usize = 4096;
+
+/// The bounded evidence one `git merge-tree` simulation produced.
+///
+/// `merge-tree` output size is a function of the conflict surface, and nothing
+/// bounds that: one stale branch far behind base can emit megabytes, on every
+/// refresh, forever. So the raw streams never leave this module. What leaves is
+/// this — the facts an operator or a bug report actually needs (what the command
+/// decided, how much it said, which paths it named) plus a deterministic sample
+/// small enough to log unconditionally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeSimulation {
+    /// True when `merge-tree` reported the merge would conflict.
+    pub conflicted: bool,
+    /// Process exit status, `-1` when the process was signalled.
+    pub exit_code: i32,
+    /// Total stdout size, including everything not quoted.
+    pub stdout_bytes: usize,
+    /// Total stderr size, including everything not quoted.
+    pub stderr_bytes: usize,
+    /// Number of distinct conflicting paths parsed out of the output.
+    pub conflict_count: usize,
+    /// At most [`MAX_CONFLICT_SAMPLE`] of those paths, deterministically chosen.
+    pub conflict_sample: Vec<String>,
+    /// At most [`MAX_OUTPUT_PREFIX_BYTES`] of stdout.
+    pub stdout_prefix: String,
+    /// At most [`MAX_OUTPUT_PREFIX_BYTES`] of stderr.
+    pub stderr_prefix: String,
+}
+
+impl MergeSimulation {
+    /// The conflicting paths to present, or `None` for a clean merge.
+    ///
+    /// A conflict whose paths could not be parsed still returns `Some`: the exit
+    /// status is the authoritative conflict signal, and answering `None` there
+    /// would report an unmergeable branch as clean.
+    pub fn conflict_files(&self) -> Option<Vec<String>> {
+        if !self.conflicted {
+            return None;
+        }
+        if self.conflict_sample.is_empty() {
+            return Some(vec!["<unknown>".to_string()]);
+        }
+        Some(self.conflict_sample.clone())
+    }
+
+    /// One-line diagnostic. Bounded by construction, so it is safe to log on
+    /// every refresh and safe to hand to an operator as an error message.
+    pub fn summary(&self) -> String {
+        format!(
+            "merge-tree exit={} conflicted={} conflicts={} sample={:?} stdout_bytes={} stderr_bytes={} stdout_prefix={:?} stderr_prefix={:?}",
+            self.exit_code,
+            self.conflicted,
+            self.conflict_count,
+            self.conflict_sample,
+            self.stdout_bytes,
+            self.stderr_bytes,
+            self.stdout_prefix,
+            self.stderr_prefix,
+        )
+    }
+}
+
+/// Return at most `limit` bytes of `text`, never splitting a character.
+///
+/// The inputs are `from_utf8_lossy` conversions of child output, so a naive byte
+/// slice can land inside a multi-byte character and panic.
+pub fn bounded_prefix(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Reduce one raw `merge-tree` result to bounded evidence.
+///
+/// Pure, so the bounds are provable without spawning Git.
+pub fn summarize_merge_tree(exit_code: i32, stdout: &str, stderr: &str) -> MergeSimulation {
+    // The structured section of stdout is the primary source. `merge-tree`
+    // writes its informational `CONFLICT (...)` messages to the *end of stdout*,
+    // not to stderr, so that section is the first fallback and stderr only the
+    // last — reading them in the other order is how a real conflict ends up
+    // recorded as an unknown file.
+    let mut files = parse_conflict_files_from_stdout(stdout);
+    if files.is_empty() {
+        files = parse_conflict_files_from_stderr(stdout);
+    }
+    if files.is_empty() {
+        files = parse_conflict_files_from_stderr(stderr);
+    }
+
+    // Sorted, then truncated: the sample must name the same paths every refresh
+    // for the same conflict, and Git's own emission order is not something this
+    // module gets to depend on.
+    files.sort();
+    files.dedup();
+    let conflict_count = files.len();
+    files.truncate(MAX_CONFLICT_SAMPLE);
+
+    MergeSimulation {
+        conflicted: exit_code == 1,
+        exit_code,
+        stdout_bytes: stdout.len(),
+        stderr_bytes: stderr.len(),
+        conflict_count,
+        conflict_sample: files,
+        stdout_prefix: bounded_prefix(stdout, MAX_OUTPUT_PREFIX_BYTES).to_string(),
+        stderr_prefix: bounded_prefix(stderr, MAX_OUTPUT_PREFIX_BYTES).to_string(),
+    }
+}
+
 /// Check for merge conflicts without modifying the working tree.
 ///
 /// Uses `git merge-tree` to simulate a merge and detect conflicts without touching
 /// the working directory or index. This is safe to run while agents are working
 /// in the worktree.
 ///
-/// Returns Ok(Some(conflict_files)) if conflicts are detected, Ok(None) if no conflicts.
+/// Returns the bounded [`MergeSimulation`] for a decided merge; an `Err` only
+/// for a command that failed to decide at all.
 pub async fn check_merge_conflicts<P: AsRef<Path>>(
     cwd: P,
     branch_name: &str,
-) -> VcsResult<Option<Vec<String>>> {
+) -> VcsResult<MergeSimulation> {
     let cwd = cwd.as_ref();
 
     // Get the current HEAD commit
@@ -66,58 +185,34 @@ pub async fn check_merge_conflicts<P: AsRef<Path>>(
     // - Exit code 0 means clean merge (no conflicts)
     // - Other exit codes indicate command failure
 
-    if exit_code == 1 {
-        // Conflicts detected - parse stdout for conflicted file info
-        // Stdout format: tree OID on line 1, then conflicted file info, then messages
-        let conflict_files = parse_conflict_files_from_stdout(&stdout);
+    let simulation = summarize_merge_tree(exit_code, &stdout, &stderr);
 
-        // If stdout parsing didn't find files, fall back to stderr parsing
-        let conflict_files = if conflict_files.is_empty() {
-            parse_conflict_files_from_stderr(&stderr)
-        } else {
-            conflict_files
-        };
-
-        debug!(
-            "Detected {} conflicts in worktree at {} (exit_code: {}, files: {:?})",
-            conflict_files.len(),
-            cwd.display(),
-            exit_code,
-            conflict_files
-        );
-
-        // Even if we can't parse specific files, exit code 1 means conflicts exist
-        // Return a generic indicator if no files were parsed
-        if conflict_files.is_empty() {
+    // Every branch below logs the same bounded summary. A known conflict is an
+    // ordinary observation, not a degraded path, so repeating it on each refresh
+    // must cost a fixed number of bytes no matter how large the conflict is.
+    match exit_code {
+        0 | 1 => {
             debug!(
-                "Exit code 1 but no conflict files parsed. stdout: {}, stderr: {}",
-                stdout.trim(),
-                stderr.trim()
+                worktree = %cwd.display(),
+                base = branch_name,
+                "merge simulation completed: {}",
+                simulation.summary()
             );
-            Ok(Some(vec!["<unknown>".to_string()]))
-        } else {
-            Ok(Some(conflict_files))
+            Ok(simulation)
         }
-    } else if exit_code == 0 {
-        // No conflicts - merge would succeed cleanly
-        debug!(
-            "No conflicts detected for {} in {}",
-            branch_name,
-            cwd.display()
-        );
-        Ok(None)
-    } else {
-        // merge-tree failed for another reason (not conflict-related)
-        debug!(
-            "Merge tree command failed: exit_code={}, stdout={}, stderr={}",
-            exit_code,
-            stdout.trim(),
-            stderr.trim()
-        );
-        Err(VcsError::git_command(format!(
-            "Merge tree simulation failed (exit {}): {}",
-            exit_code, stderr
-        )))
+        _ => {
+            // merge-tree failed for another reason (not conflict-related).
+            debug!(
+                worktree = %cwd.display(),
+                base = branch_name,
+                "merge simulation failed: {}",
+                simulation.summary()
+            );
+            Err(VcsError::git_command(format!(
+                "Merge tree simulation failed: {}",
+                simulation.summary()
+            )))
+        }
     }
 }
 
@@ -140,39 +235,65 @@ fn parse_conflict_files_from_stdout(stdout: &str) -> Vec<String> {
     }
 
     // Parse conflicted file info section
-    // Format: <mode> <object> <stage> <filename>
-    // Example: 100644 abc123... 2 src/main.rs
     for line in lines {
-        let line = line.trim();
-
         // Empty line or start of informational messages section
-        if line.is_empty() {
+        if line.trim().is_empty() {
             break;
         }
 
-        // Check if line matches conflicted file info format
-        // Format: <mode> <object> <stage> <filename>
-        let parts: Vec<&str> = line.splitn(4, ' ').collect();
-        if parts.len() == 4 {
-            // parts[0] = mode (e.g., "100644")
-            // parts[1] = object (e.g., "abc123...")
-            // parts[2] = stage (e.g., "1", "2", "3")
-            // parts[3] = filename
-
-            // Validate stage is a number (1, 2, or 3 for conflicts)
-            if let Ok(stage) = parts[2].parse::<u8>() {
-                if (1..=3).contains(&stage) {
-                    let filename = parts[3].trim();
-                    // Avoid duplicates
-                    if !files.contains(&filename.to_string()) {
-                        files.push(filename.to_string());
-                    }
-                }
+        if let Some(filename) = parse_conflicted_file_record(line) {
+            // Avoid duplicates
+            if !files.iter().any(|existing| existing == filename) {
+                files.push(filename.to_string());
             }
         }
     }
 
     files
+}
+
+/// One `<mode> <object> <stage>` + path record from the conflicted-file section.
+///
+/// Git separates the path with a tab, the same way `ls-files --stage` does, but
+/// the section has historically been read here as plain space-separated fields.
+/// Both are accepted: a parser that recognises only one of them silently degrades
+/// every conflict to "unknown file", which is exactly the evidence a bounded
+/// diagnostic is supposed to retain.
+fn parse_conflicted_file_record(line: &str) -> Option<&str> {
+    let (mode, object, stage, path) = match line.split_once('\t') {
+        Some((meta, path)) => {
+            let mut fields = meta.split_whitespace();
+            let mode = fields.next()?;
+            let object = fields.next()?;
+            let stage = fields.next()?;
+            if fields.next().is_some() {
+                return None;
+            }
+            (mode, object, stage, path)
+        }
+        None => {
+            let mut fields = line.trim_start().splitn(4, ' ');
+            (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            )
+        }
+    };
+
+    if !valid_conflict_stage(mode, object, stage) {
+        return None;
+    }
+    let path = path.trim();
+    (!path.is_empty()).then_some(path)
+}
+
+/// True when the three metadata fields describe a stage 1/2/3 conflict entry.
+fn valid_conflict_stage(mode: &str, object: &str, stage: &str) -> bool {
+    !mode.is_empty()
+        && !object.is_empty()
+        && matches!(stage.parse::<u8>(), Ok(stage) if (1..=3).contains(&stage))
 }
 
 /// Parse conflict files from git merge-tree stderr (fallback).
@@ -636,6 +757,124 @@ pub async fn commit_diff_entries<P: AsRef<Path>>(
 pub async fn is_clean_including_untracked<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
     let output = run_git(&read_only_status_argv(PORCELAIN_UNTRACKED_STATUS_ARGS), cwd).await?;
     Ok(output.trim().is_empty())
+}
+
+#[cfg(test)]
+mod bounded_diagnostics_tests {
+    use super::*;
+
+    /// A conflicted `merge-tree` stdout naming `count` paths.
+    fn conflicted_stdout(count: usize) -> String {
+        let mut out = String::from("0123456789abcdef0123456789abcdef01234567\n");
+        for index in 0..count {
+            out.push_str(&format!(
+                "100644 {:040x} 2\tsrc/generated/module_{:05}.rs\n",
+                index, index
+            ));
+        }
+        out.push('\n');
+        for index in 0..count {
+            out.push_str(&format!(
+                "CONFLICT (content): Merge conflict in src/generated/module_{:05}.rs\n",
+                index
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn a_huge_conflict_is_summarized_within_fixed_bounds() {
+        let stdout = conflicted_stdout(5_000);
+        let stderr = "E".repeat(200_000);
+
+        let simulation = summarize_merge_tree(1, &stdout, &stderr);
+
+        assert!(simulation.conflicted);
+        assert_eq!(simulation.exit_code, 1);
+        assert_eq!(simulation.conflict_count, 5_000, "the count stays truthful");
+        assert_eq!(
+            simulation.conflict_sample.len(),
+            MAX_CONFLICT_SAMPLE,
+            "the sample is capped no matter how many paths conflict"
+        );
+        assert_eq!(
+            simulation.stdout_bytes,
+            stdout.len(),
+            "the total size is retained even though the content is not"
+        );
+        assert_eq!(simulation.stderr_bytes, stderr.len());
+        assert!(simulation.stdout_prefix.len() <= MAX_OUTPUT_PREFIX_BYTES);
+        assert!(simulation.stderr_prefix.len() <= MAX_OUTPUT_PREFIX_BYTES);
+
+        let summary = simulation.summary();
+        assert!(
+            summary.len() < 16 * 1024,
+            "a diagnostic logged on every refresh must stay small, got {} bytes",
+            summary.len()
+        );
+        assert!(
+            !summary.contains("module_04999"),
+            "the summary must not carry the complete raw output"
+        );
+        assert!(
+            summary.contains("stdout_bytes=") && summary.contains("stderr_bytes="),
+            "the summary must still disclose how much output was produced: {summary}"
+        );
+    }
+
+    #[test]
+    fn the_conflict_sample_is_deterministic_across_output_orderings() {
+        let stdout = conflicted_stdout(200);
+        let reordered: String = {
+            let mut lines: Vec<&str> = stdout.lines().skip(1).filter(|l| !l.is_empty()).collect();
+            lines.reverse();
+            let mut out = String::from("0123456789abcdef0123456789abcdef01234567\n");
+            out.push_str(&lines.join("\n"));
+            out
+        };
+
+        assert_eq!(
+            summarize_merge_tree(1, &stdout, "").conflict_sample,
+            summarize_merge_tree(1, &reordered, "").conflict_sample,
+            "the same conflict must sample the same paths whichever order Git emitted them in"
+        );
+    }
+
+    #[test]
+    fn a_clean_simulation_reports_no_conflict_files() {
+        let simulation = summarize_merge_tree(0, "0123456789abcdef\n", "");
+
+        assert!(!simulation.conflicted);
+        assert_eq!(simulation.conflict_count, 0);
+        assert_eq!(simulation.conflict_files(), None);
+    }
+
+    #[test]
+    fn an_unparsed_conflict_is_still_reported_as_conflicted() {
+        let simulation = summarize_merge_tree(1, "", "something unrecognized\n");
+
+        assert!(simulation.conflicted);
+        assert_eq!(simulation.conflict_count, 0);
+        assert_eq!(
+            simulation.conflict_files(),
+            Some(vec!["<unknown>".to_string()]),
+            "an unparseable conflict must never read as a clean merge"
+        );
+    }
+
+    #[test]
+    fn output_prefixes_never_split_a_character() {
+        let multibyte = "日本語テキスト".repeat(2_000);
+
+        let simulation = summarize_merge_tree(0, &multibyte, &multibyte);
+
+        assert!(simulation.stdout_prefix.len() <= MAX_OUTPUT_PREFIX_BYTES);
+        assert!(
+            multibyte.starts_with(&simulation.stdout_prefix),
+            "the prefix must be a real prefix of the output"
+        );
+        assert_eq!(bounded_prefix("short", MAX_OUTPUT_PREFIX_BYTES), "short");
+    }
 }
 
 #[cfg(test)]

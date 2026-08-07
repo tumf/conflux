@@ -39,3 +39,8 @@ pub use runner::{
     shutdown_local_orchestrator_task, LocalOrchestratorShutdownOutcome,
     LOCAL_ORCHESTRATOR_SHUTDOWN_GRACE,
 };
+
+/// The TUI's periodic worktree refresh, for the regressions that must drive the
+/// real entry point rather than the shared layer underneath it.
+#[allow(unused_imports)] // The binary target compiles this tree privately.
+pub use worktrees::load_worktrees_with_conflict_check;

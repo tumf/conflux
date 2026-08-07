@@ -55,8 +55,11 @@ impl GitWorktreeBackend {
 
 #[async_trait]
 impl WorktreeBackend for GitWorktreeBackend {
-    async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
-        let enriched = super::observe_worktrees(&self.repo_root)
+    async fn observe(
+        &self,
+        request: crate::worktree_ops::ObservationRequest,
+    ) -> WorktreeOpResult<Vec<WorktreeFacts>> {
+        let enriched = super::observe_worktrees(&self.repo_root, request)
             .await
             .map_err(|e| WorktreeOpError::Internal(format!("failed to list worktrees: {e}")))?;
 
@@ -67,6 +70,7 @@ impl WorktreeBackend for GitWorktreeBackend {
 
         let mut facts = Vec::with_capacity(enriched.len());
         for observation in enriched {
+            let inspection = observation.info.inspection;
             let worktree = observation.info;
             let dirty = match commands::has_uncommitted_changes(&worktree.path).await {
                 Ok((true, _)) => DirtyState::Dirty,
@@ -93,6 +97,7 @@ impl WorktreeBackend for GitWorktreeBackend {
                     .unwrap_or_default(),
                 dirty,
                 base_merge_in_progress,
+                inspection,
             });
         }
         Ok(facts)

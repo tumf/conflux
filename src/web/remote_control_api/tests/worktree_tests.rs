@@ -775,7 +775,10 @@ async fn remote_worktree_adapters_share_one_service_implementation() {
 
     #[async_trait]
     impl WorktreeBackend for ParityBackend {
-        async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
+        async fn observe(
+            &self,
+            _request: crate::worktree_ops::ObservationRequest,
+        ) -> WorktreeOpResult<Vec<WorktreeFacts>> {
             let mut wt = WorktreeFacts::new("/srv/workspaces/change-a", "change-a");
             // Merging is what makes the worktree deletable, so the observation
             // has to move with it or the second half of the run is untestable.
@@ -1060,7 +1063,10 @@ async fn remote_worktree_dirty_discard_is_never_granted_by_the_remote_port() {
 
     #[async_trait]
     impl WorktreeBackend for DirtyBackend {
-        async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
+        async fn observe(
+            &self,
+            _request: crate::worktree_ops::ObservationRequest,
+        ) -> WorktreeOpResult<Vec<WorktreeFacts>> {
             let mut wt = facts("/srv/workspaces/change-a", "change-a");
             wt.dirty = DirtyState::Dirty;
             Ok(vec![wt])
@@ -1326,7 +1332,10 @@ async fn remote_worktree_ahead_discard_is_never_granted_by_the_remote_port() {
 
     #[async_trait]
     impl WorktreeBackend for AheadBackend {
-        async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
+        async fn observe(
+            &self,
+            _request: crate::worktree_ops::ObservationRequest,
+        ) -> WorktreeOpResult<Vec<WorktreeFacts>> {
             let mut wt = ahead_facts("/srv/workspaces/change-a", "change-a");
             wt.dirty = DirtyState::Dirty;
             Ok(vec![wt])

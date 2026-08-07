@@ -913,6 +913,7 @@ async fn parallel_eligibility_and_worktree_relation_come_from_the_workspace_obse
                 merge_conflict: None,
                 has_commits_ahead: true,
                 is_merging: false,
+                inspection: crate::worktree_ops::InspectionState::Checked,
             }],
         })
         .await;

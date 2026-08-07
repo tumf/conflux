@@ -261,6 +261,14 @@ pub struct WorktreeInfo {
     pub has_commits_ahead: bool,
     /// Whether a merge operation is in progress for this worktree
     pub is_merging: bool,
+    /// Whether the two fields above rest on an actual inspection.
+    ///
+    /// `merge_conflict: None` and `has_commits_ahead: false` are what both a
+    /// clean worktree and an uninspected one look like. Without this field a row
+    /// that periodic refresh deliberately skipped would render as merged and
+    /// conflict-free, which is the one thing skipping it must not imply.
+    #[serde(default)]
+    pub inspection: crate::worktree_ops::InspectionState,
 }
 
 /// Merge conflict information for a worktree

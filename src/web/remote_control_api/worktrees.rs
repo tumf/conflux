@@ -293,6 +293,15 @@ pub struct WorktreeResource {
     // it is not evidence *for* the condition — and is reported where it matters,
     // as an undeletable `operations.deletable` with a reason.
     pub has_commits_ahead: bool,
+    /// How the two fields above were obtained.
+    ///
+    /// `not_inspected` means periodic refresh deliberately spent no Git
+    /// commands on this worktree, so `has_commits_ahead: false` and an absent
+    /// `conflict` are the *absence* of evidence rather than evidence of
+    /// absence. A client that renders either fact reads this first; the
+    /// operations below already fail closed on it.
+    #[serde(default)]
+    pub inspection: crate::worktree_ops::InspectionState,
     /// Conflict evidence, when a base merge would conflict or already has.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflict: Option<WorktreeConflict>,
@@ -320,6 +329,7 @@ impl WorktreeResource {
             is_detached: facts.is_detached,
             dirty: facts.dirty.as_option(),
             has_commits_ahead: facts.has_commits_ahead.is_known_yes(),
+            inspection: facts.inspection,
             conflict: if facts.conflict_files.is_empty() {
                 None
             } else {

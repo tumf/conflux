@@ -274,6 +274,7 @@ mod tests {
             merge_conflict: None,
             has_commits_ahead: false,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         }
     }
 

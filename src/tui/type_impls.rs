@@ -46,15 +46,35 @@ impl WorktreeInfo {
     }
 
     /// Get merge status label for display
-    /// Returns "merging" if merge in progress, "merged" if not ahead of base, empty otherwise
+    ///
+    /// Returns "merging" if merge in progress, "merged" if the branch was
+    /// inspected and carries nothing base does not already have, empty
+    /// otherwise. An uninspected row never reports "merged": nothing measured
+    /// it, and saying so would be the false no-commits-ahead claim a skipped
+    /// inspection must not produce.
     pub fn merge_status_label(&self) -> &str {
         if self.is_merging {
             "merging"
-        } else if !self.has_commits_ahead && !self.is_main && !self.is_detached {
+        } else if !self.has_commits_ahead
+            && !self.is_main
+            && !self.is_detached
+            && self.inspection.is_inspected()
+        {
             "merged"
         } else {
             ""
         }
+    }
+
+    /// Badge naming how this row's ahead/conflict facts were obtained.
+    ///
+    /// Empty for the main worktree, which is the base and has nothing to be
+    /// inspected against, and for an ordinary freshly checked row.
+    pub fn inspection_label(&self) -> &'static str {
+        if self.is_main {
+            return "";
+        }
+        self.inspection.label()
     }
 }
 
@@ -74,6 +94,7 @@ mod tests {
             merge_conflict: None,
             has_commits_ahead: false,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         };
         assert_eq!(wt.display_label(), "worktree");
     }
@@ -89,6 +110,7 @@ mod tests {
             merge_conflict: None,
             has_commits_ahead: true,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         };
         assert_eq!(wt.display_branch(), "feature-branch");
     }
@@ -104,6 +126,7 @@ mod tests {
             merge_conflict: None,
             has_commits_ahead: false,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         };
         assert_eq!(wt.display_branch(), "(detached: abc123)");
     }
@@ -119,6 +142,7 @@ mod tests {
             merge_conflict: None,
             has_commits_ahead: false,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         };
         assert!(!wt_no_conflict.has_merge_conflict());
 
@@ -133,8 +157,66 @@ mod tests {
             }),
             has_commits_ahead: true,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         };
         assert!(wt_with_conflict.has_merge_conflict());
+    }
+
+    #[test]
+    fn an_uninspected_row_is_never_labelled_merged() {
+        use crate::worktree_ops::InspectionState;
+
+        let mut wt = WorktreeInfo {
+            path: PathBuf::from("/path/to/worktree"),
+            head: "abc123".to_string(),
+            branch: "stale-change".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: false,
+            is_merging: false,
+            inspection: InspectionState::Checked,
+        };
+        assert_eq!(
+            wt.merge_status_label(),
+            "merged",
+            "an inspected branch with nothing ahead of base really is merged"
+        );
+
+        // Same row, same fields, one difference: nobody measured it.
+        wt.inspection = InspectionState::NotInspected;
+        assert_eq!(
+            wt.merge_status_label(),
+            "",
+            "a skipped inspection must not be reported as a completed merge"
+        );
+        assert_eq!(wt.inspection_label(), "not inspected");
+
+        wt.inspection = InspectionState::Reused;
+        assert_eq!(wt.merge_status_label(), "merged");
+        assert_eq!(
+            wt.inspection_label(),
+            "cached",
+            "a reused observation is distinguishable from a freshly checked one"
+        );
+
+        wt.inspection = InspectionState::Checked;
+        assert_eq!(
+            wt.inspection_label(),
+            "",
+            "the ordinary checked row carries no extra badge"
+        );
+
+        let main = WorktreeInfo {
+            is_main: true,
+            inspection: InspectionState::NotInspected,
+            ..wt.clone()
+        };
+        assert_eq!(
+            main.inspection_label(),
+            "",
+            "the main worktree is the base and is never inspected against itself"
+        );
     }
 
     #[test]
@@ -150,6 +232,7 @@ mod tests {
             }),
             has_commits_ahead: true,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         };
         assert_eq!(wt.conflict_file_count(), 2);
     }

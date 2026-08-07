@@ -3,6 +3,7 @@
 ## Purpose
 TBD - created by archiving change add-worktree-view-with-merge. Update Purpose after archive.
 ## Requirements
+
 ### Requirement: Merge Error Handling
 
 マージ失敗時 SHALL provide clear error messages and recovery guidance.
@@ -89,29 +90,43 @@ When merge request fails validation, TUI SHALL display clear warning message ind
 
 ### Requirement: Worktree Commits Ahead Detection
 
-TUI SHALL detect whether worktree branch has commits ahead of base branch during worktree list loading.
+TUI SHALL detect whether an automatically inspectable worktree branch has commits ahead of the base branch during worktree list loading.
 
-Detection SHALL run in parallel with conflict checking for performance.
+Detection SHALL run in parallel with conflict checking for eligible cache misses. Both periodic TUI and periodic Web/UDS refresh SHALL share the same observation cache. Ineligible worktrees and unchanged cache hits SHALL NOT spawn duplicate ahead/conflict commands. A skipped observation MUST NOT be represented as `has_commits_ahead = false` when that value would enable or suppress a merge action incorrectly.
 
-#### Scenario: Detect commits ahead of base
+Periodic filtering MUST NOT remove operator control. An operator-initiated merge or deletion SHALL perform a fresh targeted observation of the selected worktree before eligibility is decided, including branches such as `ws-session-*` that do not map to an OpenSpec change. A not-inspected periodic row SHALL receive an inspection-required diagnostic rather than the false message that it has no commits ahead.
 
-- **GIVEN** a worktree with branch that has 2 commits ahead of base
-- **WHEN** worktree list is loaded with ahead detection
-- **THEN** WorktreeInfo.has_commits_ahead SHALL be true
+<!-- Expected canonical result after archive: commits-ahead and conflict checks remain parallel for eligible cache misses but are not executed for stale/non-active worktrees or unchanged observations. -->
 
-#### Scenario: Detect no commits ahead
+#### Scenario: Eligible active worktree is inspected
 
-- **GIVEN** a worktree with branch at same commit as base
-- **WHEN** worktree list is loaded with ahead detection
-- **THEN** WorktreeInfo.has_commits_ahead SHALL be false
+- **GIVEN** a secondary worktree maps to a current active or rejected change
+- **AND** no matching cached observation exists
+- **WHEN** the worktree list is loaded
+- **THEN** commits-ahead detection and conflict checking run in parallel
+- **AND** both complete before the checked observation is returned
 
-#### Scenario: Parallel execution of commits ahead check
+#### Scenario: Ineligible worktree is fail-closed during periodic refresh
 
-- **GIVEN** multiple worktrees exist
-- **WHEN** worktree list is loaded
-- **THEN** commits ahead detection SHALL run in parallel using JoinSet
-- **AND** conflict checking SHALL also run in parallel
-- **AND** both checks SHALL complete before worktree list is returned
+- **GIVEN** a secondary worktree does not map to a current active or rejected change
+- **WHEN** either periodic refresh path loads the worktree list
+- **THEN** commits-ahead and conflict commands are not executed for it
+- **AND** merge eligibility does not infer clean or not-ahead status from the skipped checks
+- **AND** the presentation reports that inspection is required rather than reporting no commits ahead
+
+#### Scenario: Operator merge reinspects an unclassified worktree
+
+- **GIVEN** a `ws-session-*` or other selected worktree was not inspected by periodic refresh
+- **WHEN** the operator requests its merge
+- **THEN** Conflux performs a fresh targeted ahead/conflict observation
+- **AND** decides merge eligibility from that current repository evidence
+
+#### Scenario: Operator deletion reinspects a stale worktree
+
+- **GIVEN** a stale selected worktree was not inspected by periodic refresh
+- **WHEN** the operator requests its deletion
+- **THEN** Conflux performs a fresh targeted observation before deletion eligibility is decided
+- **AND** periodic filtering alone does not make the worktree permanently undeletable
 
 ### Requirement: Merge Execution on Base Repository
 

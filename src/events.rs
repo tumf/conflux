@@ -1670,6 +1670,7 @@ pub(crate) mod ownership_fixtures {
             merge_conflict: None,
             has_commits_ahead: true,
             is_merging: false,
+            inspection: crate::worktree_ops::InspectionState::Checked,
         }
     }
 

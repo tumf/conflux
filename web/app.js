@@ -1961,12 +1961,25 @@ export class OperatorConsole {
           ? 'Yes'
           : 'No',
     );
+    // A worktree periodic refresh skipped has no ahead/conflict evidence at
+    // all, and `has_commits_ahead: false` there means "nobody looked", not
+    // "nothing to merge". Rendering that as "No" would be the false claim the
+    // skip is explicitly not allowed to make.
+    const inspected = worktree.inspection !== 'not_inspected';
     appendDetail(
       this.doc,
       facts,
       'Commits ahead of base',
-      worktree.has_commits_ahead ? 'Yes' : 'No',
+      inspected ? (worktree.has_commits_ahead ? 'Yes' : 'No') : 'Not inspected',
     );
+    if (!inspected) {
+      appendDetail(
+        this.doc,
+        facts,
+        'Conflict',
+        'Not inspected — this worktree backs no current change, so periodic refresh does not simulate its merge.',
+      );
+    }
     if (worktree.conflict) {
       appendDetail(
         this.doc,
