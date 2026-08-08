@@ -39,6 +39,15 @@ This diagnostic presentation is UI observability behavior only and MUST NOT be u
 - **AND** no warning popup SHALL be opened
 - **AND** the existing explicit merge retry action for `alpha` SHALL remain available
 
+#### Scenario: operator-initiated resolve failure is also non-modal
+
+- **GIVEN** the operator requests explicit merge resolution for change `alpha`
+- **AND** the manual resolve emits change-scoped `ResolveFailed` and returns `alpha` to `MergeWait`
+- **WHEN** the TUI handles the failure
+- **THEN** no warning popup SHALL be opened
+- **AND** the structured diagnostic SHALL remain visible in the bounded TUI log
+- **AND** the existing explicit merge retry action for `alpha` SHALL remain available
+
 #### Scenario: genuine global failure keeps fatal presentation
 
 - **GIVEN** orchestration encounters a typed `RunFatal` failure with no safe scheduler continuation
@@ -46,3 +55,49 @@ This diagnostic presentation is UI observability behavior only and MUST NOT be u
 - **THEN** the TUI execution lifecycle SHALL become `Error`
 - **AND** new scheduler dispatch SHALL have stopped
 - **AND** the non-modal treatment of change-scoped `ResolveFailed` SHALL NOT downgrade or suppress the fatal event
+
+#### Scenario: successful analysis fallback preserves Running header
+
+- **GIVEN** the TUI execution mode is `Running`
+- **AND** dependency analysis rejects an LLM response
+- **AND** the scheduler successfully continues with metadata-dependency-only fallback
+- **WHEN** the TUI receives the fallback warning event
+- **THEN** the execution mode remains `Running`
+- **AND** the status/header retains running controls and elapsed orchestration presentation
+- **AND** error-mode retry controls are not shown
+- **AND** the fallback reason and continued metadata execution are visible as a warning
+
+#### Scenario: fatal error quoting fallback text still enters Error mode
+
+- **GIVEN** the TUI is running
+- **AND** orchestration encounters a genuine global failure with no safe continuation
+- **AND** the fatal diagnostic contains or quotes recoverable dependency-analysis fallback wording
+- **WHEN** the TUI receives the global fatal error event
+- **THEN** the execution mode becomes `Error`
+- **AND** the diagnostic remains error-level
+- **AND** the status/header shows retry controls
+- **AND** message text does not override the fatal event classification
+
+#### Scenario: finite completion with errors is not fatal
+
+- **GIVEN** finite execution has preserved `alpha` in manual `MergeWait`
+- **AND** the scheduler reports `CompletedWithErrors` after eligible work drains
+- **WHEN** the TUI boundary emits warning plus `AllCompleted`
+- **THEN** the TUI SHALL NOT display a success completion message
+- **AND** it SHALL NOT enter Error
+- **AND** `alpha` SHALL remain available for explicit retry
+
+#### Scenario: repeated identical merge-deferred warning is bounded
+
+- **GIVEN** the TUI has already logged a `MergeDeferred` warning for change `alpha`
+- **AND** the warning reason and `auto_resumable` classification are unchanged
+- **WHEN** subsequent identical `MergeDeferred` events arrive during retry convergence
+- **THEN** the TUI SHALL NOT append an unbounded number of identical warning log entries
+- **AND** the execution mode SHALL NOT transition to fatal error solely because of the repeated warning
+
+#### Scenario: changed merge-deferred reason remains visible
+
+- **GIVEN** the TUI previously suppressed or logged a `MergeDeferred` warning for change `alpha`
+- **WHEN** a later `MergeDeferred` event for `alpha` has a different reason or retry classification
+- **THEN** the TUI SHALL append a new visible warning log entry
+- **AND** the new diagnostic SHALL preserve enough content for the operator to identify the current blocker

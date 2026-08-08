@@ -33,6 +33,7 @@ verifications:
 - Bounded post-archive resolve exhaustion is already classified as `ResolveExhausted` with scheduler disposition `ContinueWithErrors`; only `RunFatal` maps to `AbortRun`.
 - Canonical `tui-error-handling` requires `ResolveFailed` to keep the affected change in `merge wait` without entering global TUI Error, while unrelated active work continues.
 - `src/tui/state/event_handlers/errors.rs` currently calls `show_warning_popup` for every `ResolveFailed`. The popup owns input until dismissed, which makes a change-local recoverable failure feel like a whole-run stop even though scheduler execution continues.
+- Removing that popup also removes persistent full-diagnostic access inside the TUI after the bounded log entry scrolls out; the process file log remains the durable diagnostic source.
 - Warning-popup presentation is explicitly non-authoritative under the constitution and canonical specs; removing this popup does not change merge safety, retry routing, or repository evidence.
 
 ## Problem / Context
@@ -46,7 +47,8 @@ The diagnostic must remain visible and attributable to the failed change. Removi
 Change the TUI handling of change-scoped `ResolveFailed` so it:
 
 - keeps the affected row in `merge wait` and preserves the existing explicit retry path;
-- records a structured change-associated warning diagnostic in the TUI log;
+- retains the existing structured change-associated error-level diagnostic in the bounded TUI log and process file log;
+- applies the same non-modal behavior to automatic post-archive exhaustion and operator-initiated manual resolve failures that emit change-scoped `ResolveFailed`;
 - does not open `warning_popup`, does not consume popup input, and does not request graceful or immediate global stop;
 - preserves `Running` while other active work exists and preserves the existing transition to `Select` when no active work remains;
 - leaves typed `RunFatal` handling unchanged, including global Error presentation and stop/abort semantics;
@@ -80,6 +82,7 @@ This is one presentation-layer correction. Scheduler disposition, reducer transi
 - Changing scheduler `ContinueWithErrors`, `CompletedWithErrors`, or `AbortRun` semantics.
 - Removing warning popups for hooks, destructive actions, or genuine global failures.
 - Adding new popup buttons, stop controls, configuration, or durable UI workflow state.
+- Adding persistent full-diagnostic storage or a new details view inside the TUI; after bounded log eviction, operators use the existing process file log.
 
 ## Verification Ownership
 
