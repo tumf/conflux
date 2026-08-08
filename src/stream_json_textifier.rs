@@ -144,7 +144,11 @@ fn extract_from_codex_item_completed(value: &serde_json::Value) -> Option<String
 ///
 /// Format:
 /// - `tool_use`: `[tool_use:<name>] key=value ...`
-/// - `tool_result`: `[tool_result:<name>] content (truncated if too long)`
+/// - `tool_result`: `[tool_result:<tool_use_id>] content`
+///
+/// The summary is built at full retained length and is bounded exactly once, by
+/// [`finalize_tool_summary`], after its prefix is in place. No fixed display
+/// length is applied here, so a wider terminal can reveal more content.
 pub fn extract_tool_summary_from_stream_json(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if !trimmed.starts_with('{') {
@@ -153,13 +157,15 @@ pub fn extract_tool_summary_from_stream_json(line: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
     let event_type = value.get("type")?.as_str()?;
 
-    match event_type {
+    let summary = match event_type {
         "item.completed" => extract_codex_item_summary(&value),
         "tool_use" => extract_tool_use_summary(&value),
         "tool_result" => extract_tool_result_summary(&value),
         "assistant" => extract_assistant_tool_summary(&value),
         _ => None,
-    }
+    }?;
+
+    Some(finalize_tool_summary(summary))
 }
 
 fn extract_codex_item_summary(value: &serde_json::Value) -> Option<String> {
@@ -213,7 +219,7 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
                     .or_else(|| obj.get("path"))
                     .and_then(|v| v.as_str());
                 if let Some(fp) = file_path {
-                    parts.push(format!("filePath={}", truncate_string(fp, 100)));
+                    parts.push(format!("filePath={}", fp));
                 }
                 // Optional offset/limit for partial reads.
                 if let Some(offset) = obj.get("offset").and_then(|v| v.as_i64()) {
@@ -231,7 +237,7 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
                     .or_else(|| obj.get("path"))
                     .and_then(|v| v.as_str());
                 if let Some(fp) = file_path {
-                    parts.push(format!("filePath={}", truncate_string(fp, 100)));
+                    parts.push(format!("filePath={}", fp));
                 }
                 // Do NOT include raw body content (text/content/old_string/new_string).
                 // Emit safe metadata: chars=<n> lines=<n> derived from body fields.
@@ -247,13 +253,13 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
             }
             "grep" => {
                 if let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()) {
-                    parts.push(format!("pattern={}", truncate_string(pattern, 80)));
+                    parts.push(format!("pattern={}", pattern));
                 }
                 if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
-                    parts.push(format!("path={}", truncate_string(path, 80)));
+                    parts.push(format!("path={}", path));
                 }
                 if let Some(glob) = obj.get("glob").and_then(|v| v.as_str()) {
-                    parts.push(format!("glob={}", truncate_string(glob, 80)));
+                    parts.push(format!("glob={}", glob));
                 }
                 if let Some(mode) = obj.get("output_mode").and_then(|v| v.as_str()) {
                     parts.push(format!("output_mode={}", mode));
@@ -261,10 +267,10 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
             }
             "glob" => {
                 if let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()) {
-                    parts.push(format!("pattern={}", truncate_string(pattern, 80)));
+                    parts.push(format!("pattern={}", pattern));
                 }
                 if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
-                    parts.push(format!("path={}", truncate_string(path, 80)));
+                    parts.push(format!("path={}", path));
                 }
             }
             "todowrite" => {
@@ -289,10 +295,10 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
             }
             "webfetch" => {
                 if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
-                    parts.push(format!("url={}", truncate_string(url, 100)));
+                    parts.push(format!("url={}", url));
                 }
                 if let Some(prompt) = obj.get("prompt").and_then(|v| v.as_str()) {
-                    parts.push(format!("prompt={}", truncate_string(prompt, 60)));
+                    parts.push(format!("prompt={}", prompt));
                 }
             }
             "skill" => {
@@ -303,10 +309,10 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
                     .and_then(|v| v.as_str())
                     .or_else(|| obj.get("skill").and_then(|v| v.as_str()));
                 if let Some(skill_name) = skill_name {
-                    parts.push(format!("name={}", truncate_string(skill_name, 80)));
+                    parts.push(format!("name={}", skill_name));
                 }
                 if let Some(args) = obj.get("args").and_then(|v| v.as_str()) {
-                    parts.push(format!("args={}", truncate_string(args, 80)));
+                    parts.push(format!("args={}", args));
                 }
             }
             _ => {
@@ -329,8 +335,7 @@ fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
                             serde_json::Value::String(s) => s.clone(),
                             _ => val.to_string(),
                         };
-                        let truncated = truncate_string(&val_str, 100);
-                        parts.push(format!("{}={}", key, truncated));
+                        parts.push(format!("{}={}", key, val_str));
                     }
                 }
             }
@@ -357,8 +362,7 @@ fn extract_tool_result_summary(value: &serde_json::Value) -> Option<String> {
             serde_json::Value::String(s) => s.clone(),
             _ => content_val.to_string(),
         };
-        let truncated = truncate_string(&content_str, 200);
-        parts.push(truncated);
+        parts.push(content_str);
     }
 
     Some(parts.join(" "))
@@ -376,14 +380,18 @@ fn extract_assistant_tool_summary(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn truncate_string(s: &str, max_len: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max_len {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len).collect();
-        format!("{}...", truncated)
-    }
+/// Apply the shared operator-facing policy to a *complete* tool-event summary
+/// exactly once, before CLI and TUI consumers diverge.
+///
+/// Producer-side fixed display cutoffs (60/80/100/200 characters) are gone: the
+/// only length policy left is [`crate::events::sanitize_detail`], which strips
+/// ANSI/control content and enforces the shared 8,192-byte operator-facing
+/// bound over the whole prefixed summary. Because that function returns any
+/// input already within the bound unchanged, the later `LogEntry` construction
+/// is idempotent and cannot replace a truthful omitted-byte marker with a
+/// second one that only accounts for prefix overflow.
+fn finalize_tool_summary(summary: String) -> String {
+    crate::events::sanitize_detail(&summary)
 }
 
 /// Line-oriented buffer for stream-json text output.
@@ -813,21 +821,87 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_tool_use_summary_truncates_long_values() {
+    fn test_extract_tool_use_summary_retains_values_past_former_cutoffs() {
+        // 150 chars exceeds the former 100-char generic-scalar cutoff.
         let long_cmd = "a".repeat(150);
         let line = format!(
             r#"{{"type":"tool_use","name":"bash","input":{{"command":"{}"}}}}"#,
             long_cmd
         );
-        let summary = extract_tool_summary_from_stream_json(&line);
-        assert!(summary.is_some());
-        let s = summary.unwrap();
-        assert!(s.len() < line.len());
-        assert!(s.contains("..."));
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+
+        assert_eq!(summary, format!("[tool_use:bash] command={}", long_cmd));
+        assert!(!summary.contains("..."));
+    }
+
+    /// Every former per-field cutoff (60/80/100) must be gone, not just the
+    /// generic fallback one.
+    #[test]
+    fn test_extract_tool_use_summary_retains_every_former_field_cutoff() {
+        let value_101 = "a".repeat(101); // > former 100 (read/write filePath, webfetch url)
+        let value_81 = "b".repeat(81); // > former 80 (grep/glob/skill fields)
+        let value_61 = "c".repeat(61); // > former 60 (webfetch prompt)
+
+        let read = format!(
+            r#"{{"type":"tool_use","name":"read","input":{{"filePath":"{}"}}}}"#,
+            value_101
+        );
+        assert_eq!(
+            extract_tool_summary_from_stream_json(&read).unwrap(),
+            format!("[tool_use:read] filePath={}", value_101)
+        );
+
+        let write = format!(
+            r#"{{"type":"tool_use","name":"write","input":{{"filePath":"{}"}}}}"#,
+            value_101
+        );
+        assert_eq!(
+            extract_tool_summary_from_stream_json(&write).unwrap(),
+            format!("[tool_use:write] filePath={}", value_101)
+        );
+
+        let grep = format!(
+            r#"{{"type":"tool_use","name":"grep","input":{{"pattern":"{}","path":"{}","glob":"{}"}}}}"#,
+            value_81, value_81, value_81
+        );
+        assert_eq!(
+            extract_tool_summary_from_stream_json(&grep).unwrap(),
+            format!(
+                "[tool_use:grep] pattern={} path={} glob={}",
+                value_81, value_81, value_81
+            )
+        );
+
+        let glob = format!(
+            r#"{{"type":"tool_use","name":"glob","input":{{"pattern":"{}","path":"{}"}}}}"#,
+            value_81, value_81
+        );
+        assert_eq!(
+            extract_tool_summary_from_stream_json(&glob).unwrap(),
+            format!("[tool_use:glob] pattern={} path={}", value_81, value_81)
+        );
+
+        let webfetch = format!(
+            r#"{{"type":"tool_use","name":"webfetch","input":{{"url":"{}","prompt":"{}"}}}}"#,
+            value_101, value_61
+        );
+        assert_eq!(
+            extract_tool_summary_from_stream_json(&webfetch).unwrap(),
+            format!("[tool_use:webfetch] url={} prompt={}", value_101, value_61)
+        );
+
+        let skill = format!(
+            r#"{{"type":"tool_use","name":"skill","input":{{"name":"{}","args":"{}"}}}}"#,
+            value_81, value_81
+        );
+        assert_eq!(
+            extract_tool_summary_from_stream_json(&skill).unwrap(),
+            format!("[tool_use:skill] name={} args={}", value_81, value_81)
+        );
     }
 
     #[test]
-    fn test_extract_tool_use_summary_truncates_utf8_values_safely() {
+    fn test_extract_tool_use_summary_retains_multibyte_values_safely() {
         let long_pattern = "あ".repeat(120);
         let line = format!(
             r#"{{"type":"tool_use","name":"grep","input":{{"pattern":"{}"}}}}"#,
@@ -835,10 +909,25 @@ mod tests {
         );
         let summary = extract_tool_summary_from_stream_json(&line).unwrap();
 
-        assert!(summary.starts_with("[tool_use:grep]"));
-        assert!(summary.contains("pattern="));
-        assert!(summary.ends_with("..."));
+        assert_eq!(summary, format!("[tool_use:grep] pattern={}", long_pattern));
+        assert!(!summary.contains("..."));
         assert!(summary.is_char_boundary(summary.len()));
+    }
+
+    /// Privacy redaction is orthogonal to display length: removing the cutoffs
+    /// must not start leaking write/edit body content.
+    #[test]
+    fn test_write_body_stays_metadata_only_without_cutoffs() {
+        let body = "secret-line\n".repeat(50);
+        let line = format!(
+            r#"{{"type":"tool_use","name":"write","input":{{"filePath":"/tmp/a.txt","content":"{}"}}}}"#,
+            body.replace('\n', "\\n")
+        );
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+
+        assert!(!summary.contains("secret-line"));
+        assert!(summary.contains("chars="));
+        assert!(summary.contains("lines=50"));
     }
 
     #[test]
@@ -853,21 +942,20 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_tool_result_truncates_long_content() {
+    fn test_extract_tool_result_retains_content_past_former_cutoff() {
         let long_content = "x".repeat(300);
         let line = format!(
             r#"{{"type":"tool_result","tool_use_id":"tool_456","content":"{}"}}"#,
             long_content
         );
-        let summary = extract_tool_summary_from_stream_json(&line);
-        assert!(summary.is_some());
-        let s = summary.unwrap();
-        assert!(s.len() < line.len());
-        assert!(s.contains("..."));
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+
+        assert_eq!(summary, format!("[tool_result:tool_456] {}", long_content));
+        assert!(!summary.contains("..."));
     }
 
     #[test]
-    fn test_extract_tool_result_truncates_utf8_content_safely() {
+    fn test_extract_tool_result_retains_multibyte_content_safely() {
         let long_content = "界".repeat(260);
         let line = format!(
             r#"{{"type":"tool_result","tool_use_id":"tool_utf8","content":"{}"}}"#,
@@ -875,9 +963,79 @@ mod tests {
         );
         let summary = extract_tool_summary_from_stream_json(&line).unwrap();
 
-        assert!(summary.starts_with("[tool_result:tool_utf8]"));
-        assert!(summary.ends_with("..."));
+        assert_eq!(summary, format!("[tool_result:tool_utf8] {}", long_content));
+        assert!(!summary.contains("..."));
         assert!(summary.is_char_boundary(summary.len()));
+    }
+
+    /// The shared 8,192-byte operator-facing bound is the only length policy
+    /// left, and it accounts for the *complete prefixed* summary.
+    #[test]
+    fn test_oversized_summary_is_bounded_once_with_truthful_accounting() {
+        const BOUND: usize = 8_192;
+        let content = "y".repeat(20_000);
+        let line = format!(
+            r#"{{"type":"tool_result","tool_use_id":"tool_big","content":"{}"}}"#,
+            content
+        );
+        let complete = format!("[tool_result:tool_big] {}", content);
+
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+
+        assert_eq!(summary.len(), BOUND, "final size must be the shared bound");
+        assert!(summary.starts_with("[tool_result:tool_big] yyy"));
+
+        let marker_start = summary.find("…[truncated ").unwrap();
+        let omitted: usize = summary[marker_start + "…[truncated ".len()..]
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // The marker must report bytes omitted from the complete prefixed
+        // summary, not from the bare content.
+        assert_eq!(omitted, complete.len() - marker_start);
+
+        // `LogEntry` re-applies the same policy and must leave it alone.
+        let entry = crate::events::LogEntry::info(summary.clone());
+        assert_eq!(entry.message, summary);
+        assert_eq!(entry.message.matches("…[truncated ").count(), 1);
+    }
+
+    #[test]
+    fn test_oversized_multibyte_summary_keeps_utf8_boundaries() {
+        const BOUND: usize = 8_192;
+        let content = "漢".repeat(9_000);
+        let line = format!(
+            r#"{{"type":"tool_result","tool_use_id":"tool_cjk","content":"{}"}}"#,
+            content
+        );
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+
+        assert!(summary.len() <= BOUND);
+        assert!(summary.is_char_boundary(summary.len()));
+        assert!(summary.contains("…[truncated "));
+        assert_eq!(
+            crate::events::LogEntry::info(summary.clone()).message,
+            summary
+        );
+    }
+
+    /// Control characters and ANSI escapes are still removed by the shared
+    /// sanitizer even though the fixed cutoffs are gone.
+    #[test]
+    fn test_summary_sanitizes_ansi_and_control_content() {
+        let line = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "t1",
+            "content": "\u{1b}[31mred\u{1b}[0m\nnext\ttab",
+        })
+        .to_string();
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+
+        assert_eq!(summary, "[tool_result:t1] red\\nnext\\ttab");
+        assert!(!summary.contains('\u{1b}'));
+        assert!(!summary.contains('\n'));
     }
 
     #[test]
@@ -1170,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skill_tool_truncates_long_args() {
+    fn test_skill_tool_retains_long_args() {
         let long_args = "x".repeat(150);
         let json_val = serde_json::json!({
             "type": "tool_use",
@@ -1182,9 +1340,10 @@ mod tests {
         });
         let line = json_val.to_string();
         let summary = extract_tool_summary_from_stream_json(&line).unwrap();
-        assert!(summary.starts_with("[tool_use:skill]"));
-        assert!(summary.contains("name=my-skill"));
-        assert!(summary.contains("..."));
+        assert_eq!(
+            summary,
+            format!("[tool_use:skill] name=my-skill args={}", long_args)
+        );
     }
 
     #[test]

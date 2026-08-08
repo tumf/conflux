@@ -993,36 +993,181 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn log_navigation_state_methods_preserve_existing_key_semantics() {
+    /// Logs panel wide enough that each short entry is exactly one display line.
+    const LOG_VIEWPORT_WIDTH: usize = 60;
+    /// Panel height 7 => 5 usable rows.
+    const LOG_VIEWPORT_HEIGHT: usize = 7;
+
+    fn log_nav_app(entries: usize) -> AppState {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
-        for index in 0..12 {
+        app.logs.clear();
+        app.set_log_viewport(LOG_VIEWPORT_WIDTH, LOG_VIEWPORT_HEIGHT);
+        for index in 0..entries {
             app.add_log(LogEntry::info(format!("log {index}")));
         }
-        assert_eq!(app.log_scroll_offset, 0);
+        app
+    }
+
+    /// Messages rendered by the current anchor, oldest first.
+    fn visible_log_text(app: &AppState) -> Vec<String> {
+        let lines = app.log_display_lines();
+        let start = app.log_start_line(&lines);
+        let end = lines.len().min(start + app.log_viewport.visible_height());
+        lines[start..end]
+            .iter()
+            .map(|line| line.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn log_navigation_state_methods_preserve_existing_key_semantics() {
+        // 12 short entries => 12 display lines, 5 visible rows.
+        let mut app = log_nav_app(12);
+        assert_eq!(app.log_anchor, None);
         assert!(app.log_auto_scroll);
+        assert_eq!(visible_log_text(&app).first().unwrap(), "log 7");
 
         app.scroll_logs_up(5);
-        assert_eq!(app.log_scroll_offset, 5);
         assert!(!app.log_auto_scroll);
+        assert_eq!(visible_log_text(&app).first().unwrap(), "log 2");
 
         app.scroll_logs_down(5);
-        assert_eq!(app.log_scroll_offset, 0);
+        assert_eq!(app.log_anchor, None);
         assert!(app.log_auto_scroll);
+        assert_eq!(visible_log_text(&app).first().unwrap(), "log 7");
 
         app.scroll_logs_to_top();
-        assert_eq!(app.log_scroll_offset, 11);
         assert!(!app.log_auto_scroll);
+        assert_eq!(visible_log_text(&app).first().unwrap(), "log 0");
 
         app.scroll_logs_to_bottom();
-        assert_eq!(app.log_scroll_offset, 0);
+        assert_eq!(app.log_anchor, None);
         assert!(app.log_auto_scroll);
+        assert_eq!(visible_log_text(&app).first().unwrap(), "log 7");
 
         assert!(app.logs_panel_enabled);
         app.toggle_logs_panel();
         assert!(!app.logs_panel_enabled);
         app.toggle_logs_panel();
         assert!(app.logs_panel_enabled);
+    }
+
+    /// A single entry whose wrapped height far exceeds the viewport.
+    ///
+    /// 60 columns - 2 borders - 9 timestamp = 49 message columns on the first
+    /// line and 58 on every continuation line, so 1,000 characters wrap to 18
+    /// display lines against 5 visible rows.
+    fn oversized_entry_app() -> AppState {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        app.logs.clear();
+        app.set_log_viewport(LOG_VIEWPORT_WIDTH, LOG_VIEWPORT_HEIGHT);
+        let message: String = (0..1000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        app.add_log(LogEntry::info(message));
+        app
+    }
+
+    #[test]
+    fn page_keys_move_inside_one_entry_taller_than_the_viewport() {
+        let mut app = oversized_entry_app();
+        let total = app.log_display_lines().len();
+        assert_eq!(total, 18);
+        assert!(total > app.log_viewport.visible_height());
+
+        // Auto-scroll shows the tail of the entry, not its head.
+        assert_eq!(app.log_start_line(&app.log_display_lines()), 13);
+
+        // Home reaches the first wrapped segment of that same entry.
+        app.scroll_logs_to_top();
+        assert_eq!(app.log_start_line(&app.log_display_lines()), 0);
+        assert_eq!(app.log_anchor.unwrap().source_byte_offset, 0);
+        assert!(!app.log_auto_scroll);
+
+        // PgDn walks forward one display page at a time, still inside the entry.
+        app.scroll_logs_down(5);
+        assert_eq!(app.log_start_line(&app.log_display_lines()), 5);
+        assert!(!app.log_auto_scroll);
+
+        // PgUp walks back to the line it came from.
+        app.scroll_logs_up(5);
+        assert_eq!(app.log_start_line(&app.log_display_lines()), 0);
+
+        // Reaching the newest line re-enables auto-scroll.
+        app.scroll_logs_down(total);
+        assert!(app.log_auto_scroll);
+        assert_eq!(app.log_anchor, None);
+    }
+
+    #[tokio::test]
+    async fn routed_page_keys_navigate_display_lines_without_changing_assignments() {
+        let mut app = oversized_entry_app();
+
+        route_key_event(&mut app, key(KeyCode::Home)).await;
+        assert_eq!(app.log_start_line(&app.log_display_lines()), 0);
+
+        route_key_event(&mut app, key(KeyCode::PageDown)).await;
+        assert_eq!(app.log_start_line(&app.log_display_lines()), 5);
+
+        route_key_event(&mut app, key(KeyCode::PageUp)).await;
+        assert_eq!(app.log_start_line(&app.log_display_lines()), 0);
+
+        route_key_event(&mut app, key(KeyCode::End)).await;
+        assert!(app.log_auto_scroll);
+        assert_eq!(app.log_start_line(&app.log_display_lines()), 13);
+    }
+
+    #[test]
+    fn anchor_survives_a_width_change_and_stays_on_the_same_source_content() {
+        let mut app = oversized_entry_app();
+        app.scroll_logs_to_top();
+        app.scroll_logs_down(3);
+        let anchored_offset = app.log_anchor.unwrap().source_byte_offset;
+        assert_eq!(anchored_offset, 49 + 2 * 58);
+
+        // A wider panel re-wraps everything; the anchor keeps the same source
+        // position rather than resetting to the newest line.
+        app.set_log_viewport(120, LOG_VIEWPORT_HEIGHT);
+        let lines = app.log_display_lines();
+        let start = app.log_start_line(&lines);
+        let line = &lines[start];
+        assert!(line.source_byte_offset <= anchored_offset);
+        assert!(anchored_offset < line.source_byte_offset + line.text.len());
+        assert!(!app.log_auto_scroll);
+    }
+
+    #[test]
+    fn appending_logs_keeps_a_manual_anchor_and_a_stale_one_clamps() {
+        let mut app = log_nav_app(12);
+        app.scroll_logs_to_top();
+        let anchor = app.log_anchor.unwrap();
+
+        app.add_log(LogEntry::info("newest"));
+        assert_eq!(
+            app.log_anchor,
+            Some(anchor),
+            "append must not move a manual anchor"
+        );
+        assert_eq!(visible_log_text(&app).first().unwrap(), "log 0");
+        assert!(!app.log_auto_scroll);
+
+        // An anchor newer than every surviving line clamps to the last page
+        // instead of overrunning, and never silently resumes auto-scroll.
+        app.log_anchor = Some(crate::tui::state::log_logic::LogViewAnchor {
+            entry_seq: u64::MAX - 1,
+            source_byte_offset: 0,
+        });
+        let lines = app.log_display_lines();
+        assert_eq!(
+            app.log_start_line(&lines),
+            lines
+                .len()
+                .saturating_sub(app.log_viewport.visible_height())
+        );
+        assert!(
+            !app.log_auto_scroll,
+            "clamping must not re-enable auto-scroll"
+        );
     }
 
     fn log_filter_app() -> AppState {
@@ -1100,7 +1245,7 @@ mod tests {
         app.scroll_logs_up(5);
         assert!(!app.log_auto_scroll);
         handle_selected_proposal_log_filter_key(&mut app);
-        assert_eq!(app.log_scroll_offset, 0);
+        assert_eq!(app.log_anchor, None);
         assert!(app.log_auto_scroll);
     }
 
@@ -2679,7 +2824,7 @@ mod tests {
             app.scroll_logs_up(3);
             assert!(app.open_error_details_popup());
             let before = UnderlyingState::capture(&app);
-            let log_scroll_before = app.log_scroll_offset;
+            let log_anchor_before = app.log_anchor;
 
             let commands = route_key_event(&mut app, key(code)).await;
 
@@ -2696,7 +2841,7 @@ mod tests {
                 "{code:?} moved the Changes list underneath the popup"
             );
             assert_eq!(
-                app.log_scroll_offset, log_scroll_before,
+                app.log_anchor, log_anchor_before,
                 "{code:?} moved the Logs panel underneath the popup"
             );
         }

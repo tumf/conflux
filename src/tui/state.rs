@@ -33,7 +33,7 @@ use tracing::{error, info, warn};
 
 #[cfg(test)]
 mod execution_mark_tests;
-mod log_logic;
+pub(crate) mod log_logic;
 pub(crate) mod modal_logic;
 mod processing_logic;
 mod selection_logic;
@@ -246,8 +246,20 @@ pub struct AppState {
     clipboard: std::sync::Arc<dyn crate::tui::clipboard::Clipboard>,
     /// Current spinner animation frame
     pub spinner_frame: usize,
-    /// Log scroll offset (0 = show most recent at bottom)
-    pub log_scroll_offset: usize,
+    /// Process-local sequence number of `logs[0]`.
+    ///
+    /// Buffer trimming shifts indices, so the Logs anchor cannot use them as
+    /// identity. This counter gives every retained entry a stable process-local
+    /// ID (`log_seq_base + index`) without adding a field to `LogEntry`.
+    log_seq_base: u64,
+    /// Top visible Logs display line, in source coordinates.
+    ///
+    /// `None` means "follow the newest line" — the auto-scroll position.
+    /// Ephemeral in-process presentation state only; it is discarded on restart
+    /// and never used as workflow-control input.
+    pub(crate) log_anchor: Option<log_logic::LogViewAnchor>,
+    /// Last Logs-panel geometry the renderer observed.
+    pub(crate) log_viewport: log_logic::LogViewport,
     /// Whether to auto-scroll logs to bottom on new entries
     pub log_auto_scroll: bool,
     /// Current stop mode
@@ -537,7 +549,9 @@ impl AppState {
             error_details_popup: None,
             clipboard: crate::tui::clipboard::default_clipboard(),
             spinner_frame: 0,
-            log_scroll_offset: 0,
+            log_seq_base: 0,
+            log_anchor: None,
+            log_viewport: log_logic::LogViewport::default(),
             log_auto_scroll: true,
             stop_mode: StopMode::None,
             persistent_scheduler_idle: false,
@@ -1915,45 +1929,88 @@ impl AppState {
 
         self.logs.push(entry);
 
-        // Handle buffer trimming when exceeding max entries
+        // Handle buffer trimming when exceeding max entries. The sequence base
+        // moves with the evicted entry so surviving anchors keep their identity.
         if log_logic::apply_log_buffer_limit(self.logs.len(), MAX_LOG_ENTRIES) {
             self.logs.remove(0);
+            self.log_seq_base = self.log_seq_base.saturating_add(1);
         }
 
-        // Auto-scroll to bottom if enabled, otherwise freeze view position
-        self.log_scroll_offset = log_logic::next_log_offset_on_append(
-            self.log_auto_scroll,
-            self.log_scroll_offset,
-            self.logs.len(),
-        );
+        // The anchor is stored in source coordinates, so an append or a trim
+        // needs no adjustment here: the next projection re-derives the top line
+        // from the current wrapped sequence, and auto-scroll (`log_anchor ==
+        // None`) keeps following the newest line.
     }
 
-    /// Scroll logs up by a page (show older entries)
+    /// Record the Logs-panel geometry the renderer just used.
+    ///
+    /// Navigation needs the same width the renderer wrapped with, otherwise the
+    /// display-line indices the two compute would disagree.
+    pub(crate) fn set_log_viewport(&mut self, width: usize, height: usize) {
+        self.log_viewport = log_logic::LogViewport { width, height };
+    }
+
+    /// Visible entries paired with their process-local sequence numbers.
+    pub(crate) fn visible_log_entries(&self) -> Vec<(u64, &LogEntry)> {
+        self.logs
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| self.log_entry_visible_for_selected_proposal_filter(entry))
+            .map(|(index, entry)| (self.log_seq_base + index as u64, entry))
+            .collect()
+    }
+
+    /// Current wrapped display-line sequence for the Logs panel.
+    pub(crate) fn log_display_lines(&self) -> Vec<log_logic::LogDisplayLine> {
+        log_logic::build_log_display_lines(&self.visible_log_entries(), self.log_viewport.width)
+    }
+
+    /// Index of the top visible display line under the current anchor.
+    pub(crate) fn log_start_line(&self, lines: &[log_logic::LogDisplayLine]) -> usize {
+        log_logic::resolve_start_line(lines, self.log_anchor, self.log_viewport.visible_height())
+    }
+
+    /// Scroll logs up by a page of display lines (show older content).
+    ///
+    /// A page is measured in display lines, so a single entry taller than the
+    /// viewport is traversed line by line instead of being skipped whole.
     pub fn scroll_logs_up(&mut self, page_size: usize) {
-        self.log_scroll_offset =
-            log_logic::scroll_logs_up(self.log_scroll_offset, self.logs.len(), page_size);
+        let lines = self.log_display_lines();
+        let start = self.log_start_line(&lines);
+        let next = start.saturating_sub(page_size.max(1));
+        self.log_anchor = log_logic::anchor_at_line(&lines, next);
         // Disable auto-scroll when user scrolls up
         self.log_auto_scroll = false;
     }
 
-    /// Scroll logs down by a page (show newer entries)
+    /// Scroll logs down by a page of display lines (show newer content).
     pub fn scroll_logs_down(&mut self, page_size: usize) {
-        self.log_scroll_offset = log_logic::scroll_logs_down(self.log_scroll_offset, page_size);
-        // Re-enable auto-scroll when at bottom
-        if self.log_scroll_offset == 0 {
-            self.log_auto_scroll = true;
+        let lines = self.log_display_lines();
+        let max_start = lines
+            .len()
+            .saturating_sub(self.log_viewport.visible_height());
+        let start = self.log_start_line(&lines);
+        let next = start.saturating_add(page_size.max(1));
+
+        // Re-enable auto-scroll once the newest line is back in view.
+        if next >= max_start {
+            self.scroll_logs_to_bottom();
+        } else {
+            self.log_anchor = log_logic::anchor_at_line(&lines, next);
+            self.log_auto_scroll = false;
         }
     }
 
-    /// Jump to the oldest log entry (top of history)
+    /// Jump to the oldest display line (top of history)
     pub fn scroll_logs_to_top(&mut self) {
-        self.log_scroll_offset = log_logic::scroll_logs_to_top(self.logs.len());
+        let lines = self.log_display_lines();
+        self.log_anchor = log_logic::anchor_at_line(&lines, 0);
         self.log_auto_scroll = false;
     }
 
-    /// Jump to the newest log entry (bottom) and re-enable auto-scroll
+    /// Jump to the newest display line (bottom) and re-enable auto-scroll
     pub fn scroll_logs_to_bottom(&mut self) {
-        self.log_scroll_offset = 0;
+        self.log_anchor = None;
         self.log_auto_scroll = true;
     }
 
@@ -1975,8 +2032,8 @@ impl AppState {
 
     /// Toggle the presentation-only selected-proposal log filter.
     ///
-    /// Filtering changes which entries are visible, so the entry-based scroll
-    /// offset is no longer meaningful; return to the newest visible output with
+    /// Filtering changes which entries are visible, so the current display-line
+    /// anchor is no longer meaningful; return to the newest visible output with
     /// auto-scroll enabled. `AppState::logs` is never modified.
     pub fn toggle_selected_proposal_log_filter(&mut self) {
         self.selected_proposal_log_filter =
@@ -2420,6 +2477,37 @@ mod tests {
         app
     }
 
+    /// Buffer trimming evicts the anchored entry, so the anchor must clamp to
+    /// the oldest surviving display line without resuming auto-scroll.
+    #[test]
+    fn trimming_the_anchored_entry_clamps_to_the_oldest_surviving_line() {
+        let mut app = AppState::new(vec![create_test_change("alpha", 0, 1)]);
+        app.logs.clear();
+        app.set_log_viewport(60, 7);
+        for index in 0..MAX_LOG_ENTRIES {
+            app.add_log(LogEntry::info(format!("log {index}")));
+        }
+
+        app.scroll_logs_to_top();
+        let anchored = app.log_anchor.unwrap();
+        assert_eq!(anchored.entry_seq, 0);
+
+        // Five more entries evict the five oldest, including the anchored one.
+        for index in 0..5 {
+            app.add_log(LogEntry::info(format!("overflow {index}")));
+        }
+        assert_eq!(app.logs.len(), MAX_LOG_ENTRIES);
+        assert_eq!(app.logs[0].message, "log 5");
+
+        // The anchor object is untouched, but it now resolves to the oldest
+        // surviving line rather than to a stale index or to the newest output.
+        assert_eq!(app.log_anchor, Some(anchored));
+        let lines = app.log_display_lines();
+        assert_eq!(app.log_start_line(&lines), 0);
+        assert_eq!(lines[0].text, "log 5");
+        assert!(!app.log_auto_scroll);
+    }
+
     #[test]
     fn selected_proposal_log_filter_defaults_off_and_shows_every_entry() {
         let app = app_with_mixed_proposal_logs();
@@ -2446,26 +2534,27 @@ mod tests {
     fn selected_proposal_log_filter_follows_cursor_and_resets_to_newest() {
         let mut app = app_with_mixed_proposal_logs();
         app.toggle_selected_proposal_log_filter();
-        app.log_scroll_offset = 2;
-        app.log_auto_scroll = false;
+        app.scroll_logs_to_top();
+        assert!(app.log_anchor.is_some());
 
         app.cursor_down();
 
         assert_eq!(app.selected_proposal_log_filter_target(), Some("beta"));
         assert_eq!(visible_filtered_messages(&app), vec!["beta apply"]);
-        assert_eq!(app.log_scroll_offset, 0);
+        assert_eq!(app.log_anchor, None);
         assert!(app.log_auto_scroll);
     }
 
     #[test]
     fn cursor_move_keeps_log_position_when_filter_is_off() {
         let mut app = app_with_mixed_proposal_logs();
-        app.log_scroll_offset = 2;
-        app.log_auto_scroll = false;
+        app.scroll_logs_to_top();
+        let anchored = app.log_anchor;
+        assert!(anchored.is_some());
 
         app.cursor_down();
 
-        assert_eq!(app.log_scroll_offset, 2);
+        assert_eq!(app.log_anchor, anchored);
         assert!(!app.log_auto_scroll);
     }
 
@@ -2489,12 +2578,12 @@ mod tests {
     #[test]
     fn toggling_selected_proposal_log_filter_returns_to_newest_output() {
         let mut app = app_with_mixed_proposal_logs();
-        app.log_scroll_offset = 2;
-        app.log_auto_scroll = false;
+        app.scroll_logs_to_top();
+        assert!(app.log_anchor.is_some());
 
         app.toggle_selected_proposal_log_filter();
 
-        assert_eq!(app.log_scroll_offset, 0);
+        assert_eq!(app.log_anchor, None);
         assert!(app.log_auto_scroll);
     }
 

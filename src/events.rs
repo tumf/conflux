@@ -2798,6 +2798,43 @@ mod tests {
         assert!(entry.message.contains("[truncated "));
     }
 
+    /// Tool-event summaries are sanitized and bounded by the producer before
+    /// they reach CLI/TUI consumers, so `LogEntry` construction must be a no-op
+    /// for them. A second pass that re-truncated would replace the truthful
+    /// omitted-byte marker with one accounting only for prefix overflow.
+    #[test]
+    fn sanitizing_an_already_bounded_message_is_idempotent() {
+        let complete = format!("[tool_result:tool_x] {}", "x".repeat(1_000_000));
+        let once = sanitize_detail(&complete);
+        assert_eq!(once.len(), 8_192);
+
+        let twice = sanitize_detail(&once);
+        assert_eq!(twice, once);
+
+        let entry = LogEntry::info(once.clone());
+        assert_eq!(entry.message, once);
+        assert_eq!(entry.message.matches("…[truncated ").count(), 1);
+
+        // The marker still reports what was omitted from the complete summary.
+        let marker_start = once.find("…[truncated ").unwrap();
+        let omitted = once[marker_start + "…[truncated ".len()..]
+            .trim_end_matches(" bytes]")
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(omitted, complete.len() - marker_start);
+    }
+
+    #[test]
+    fn sanitizing_an_already_bounded_multibyte_message_is_idempotent() {
+        let complete = format!("[tool_result:tool_cjk] {}", "漢".repeat(9_000));
+        let once = sanitize_detail(&complete);
+
+        assert!(once.len() <= 8_192);
+        assert!(once.is_char_boundary(once.len()));
+        assert_eq!(sanitize_detail(&once), once);
+        assert_eq!(LogEntry::info(once.clone()).message, once);
+    }
+
     #[test]
     fn test_log_entry_with_change_id() {
         let entry = LogEntry::info("test").with_change_id("test-change");
