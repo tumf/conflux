@@ -10,10 +10,10 @@ use ratatui::{
     Frame,
 };
 use std::time::Duration;
-use unicode_width::UnicodeWidthChar;
 
 use super::state::{
-    guards, AppState, ChangeState, CopyFeedback, ErrorDetailsPopup, ERROR_DETAILS_UNAVAILABLE,
+    guards, log_logic, AppState, ChangeState, CopyFeedback, ErrorDetailsPopup,
+    ERROR_DETAILS_UNAVAILABLE,
 };
 use super::types::{AppExecutionMode, ModalState};
 use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
@@ -392,7 +392,7 @@ mod status_logs {
         super::render_status(frame, app, area);
     }
 
-    pub(super) fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
+    pub(super) fn render_logs(frame: &mut Frame, app: &mut AppState, area: Rect) {
         super::render_logs(frame, app, area);
     }
 }
@@ -1365,42 +1365,6 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(status, area);
 }
 
-/// Wrap a log message for the Logs view.
-///
-/// The first line starts at column 0 (after timestamp+header prefix).
-/// Continuation lines are NOT indented and use the full available width
-/// (including the timestamp column area), so more text is visible.
-///
-/// `available_width` is the width available after subtracting borders and timestamp.
-/// `header_width` is the width of the header (e.g., "[change-id:operation]").
-/// `prefix_width` is timestamp_width + header_width (used to compute continuation width).
-///
-/// Returns a vector of display lines (wrapped output).
-/// Split `s` into `(prefix, remainder)` where `prefix` occupies at most
-/// `max_width` terminal display columns and never cuts inside a UTF-8 codepoint.
-///
-/// If the very first character is wider than `max_width` (e.g. a wide CJK
-/// character when `max_width` is 1) it is included anyway to prevent an
-/// infinite loop in the caller.
-fn take_chars_by_display_width(s: &str, max_width: usize) -> (&str, &str) {
-    let mut current_width = 0usize;
-    let mut byte_pos = 0usize;
-    for ch in s.chars() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(1);
-        if current_width + char_width > max_width {
-            // If no character has been consumed yet, take this one anyway to
-            // avoid an infinite loop caused by a wide char exceeding max_width.
-            if current_width == 0 {
-                byte_pos += ch.len_utf8();
-            }
-            break;
-        }
-        current_width += char_width;
-        byte_pos += ch.len_utf8();
-    }
-    (&s[..byte_pos], &s[byte_pos..])
-}
-
 fn log_navigation_hint() -> &'static str {
     "PgUp/PgDn: older/newer Home/End: oldest/newest l: hide"
 }
@@ -1425,9 +1389,12 @@ fn compact_selected_proposal_filter_hint(filter_enabled: bool) -> &'static str {
 
 /// Inputs the Logs panel title is derived from.
 ///
-/// All line/range values are already computed from the filtered entry set.
+/// All line/range values are already computed from the filtered, wrapped
+/// display-line sequence, so the indicator describes what navigation actually
+/// moves through rather than a count of skipped entries.
 struct LogsPanelTitle<'a> {
-    log_scroll_offset: usize,
+    /// Display lines between the last visible line and the newest line.
+    lines_below: usize,
     log_auto_scroll: bool,
     total_display_lines: usize,
     visible_height: usize,
@@ -1447,19 +1414,19 @@ fn logs_panel_title(params: LogsPanelTitle<'_>) -> String {
             let visible_start = params.start_line + 1;
             let visible_end = params.end_line;
             format!(
-                " Logs [{}-{}/{}] logs_off={} {} ({} | {}) ",
+                " Logs [{}-{}/{} lines] lines_below={} {} ({} | {}) ",
                 visible_start,
                 visible_end,
                 params.total_display_lines,
-                params.log_scroll_offset,
+                params.lines_below,
                 auto_scroll_indicator,
                 filter_hint,
                 help
             )
         } else {
             format!(
-                " Logs logs_off={} {} ({} | {}) ",
-                params.log_scroll_offset, auto_scroll_indicator, filter_hint, help
+                " Logs lines_below={} {} ({} | {}) ",
+                params.lines_below, auto_scroll_indicator, filter_hint, help
             )
         }
     };
@@ -1478,65 +1445,16 @@ fn logs_panel_title(params: LogsPanelTitle<'_>) -> String {
     title
 }
 
-fn wrap_log_message(
-    message: &str,
-    available_width: usize,
-    header_width: usize,
-    prefix_width: usize,
-) -> Vec<String> {
-    if available_width == 0 {
-        return vec![message.to_string()];
-    }
-
-    let mut lines = Vec::new();
-    let mut remaining = message;
-
-    // First line: available_width - header_width (since line is [header][message])
-    let first_width = available_width.saturating_sub(header_width);
-    if first_width == 0 {
-        lines.push(remaining.to_string());
-        return lines;
-    }
-
-    // Split using display width so multi-byte chars are never broken.
-    let (first_part, rest) = take_chars_by_display_width(remaining, first_width);
-    lines.push(first_part.to_string());
-    remaining = rest;
-
-    if remaining.is_empty() {
-        return lines;
-    }
-
-    // Continuation lines: no indent, use full width (available_width + timestamp_width).
-    // timestamp_width = prefix_width - header_width, so continuation_width = available_width + (prefix_width - header_width).
-    let continuation_width =
-        available_width.saturating_add(prefix_width.saturating_sub(header_width));
-
-    while !remaining.is_empty() {
-        if continuation_width == 0 {
-            // No space for continuation, append as-is
-            lines.push(remaining.to_string());
-            break;
-        }
-
-        let (chunk, rest) = take_chars_by_display_width(remaining, continuation_width);
-        lines.push(chunk.to_string());
-        remaining = rest;
-    }
-
-    lines
-}
-
-/// Render logs panel with scroll support
-fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
-    // Calculate available width for message (subtract borders, timestamp, and padding)
-    // Timestamp format: "HH:MM:SS " = 9 chars, borders = 2 chars
-    let timestamp_width = 9; // "HH:MM:SS "
-    let border_width = 2;
-    let available_width = (area.width as usize).saturating_sub(border_width + timestamp_width);
-
-    // Calculate visible area height (subtract borders)
-    let visible_height = (area.height as usize).saturating_sub(2);
+/// Render logs panel with display-line scroll support.
+///
+/// Width ownership stays here: the panel wraps the retained message across as
+/// many lines as its current inner width needs, and it records that geometry on
+/// `AppState` so navigation moves through exactly the same display-line
+/// sequence this function draws.
+fn render_logs(frame: &mut Frame, app: &mut AppState, area: Rect) {
+    // Publish the geometry navigation must wrap with before reading any lines.
+    app.set_log_viewport(area.width as usize, area.height as usize);
+    let visible_height = app.log_viewport.visible_height();
 
     // Colors for change_id prefixes (cycling through distinct colors)
     let change_colors = [
@@ -1549,31 +1467,29 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         Color::LightCyan,
     ];
 
-    // Pre-render all logs to calculate total display lines
-    // Each entry stores: (timestamp, header_spans, message_lines, color)
-    struct RenderedLog {
+    /// Per-entry chrome; the wrapped text itself lives in the display-line list.
+    struct RenderedLogChrome {
         timestamp: String,
         timestamp_style: Style,
         header: String,
         header_style: Style,
-        message_lines: Vec<String>,
         message_style: Style,
     }
 
     // Select the visible entry set BEFORE any wrapping, line counting, visible
     // range, or scroll math so every downstream calculation is derived from the
     // filtered set (including the zero-match case). `app.logs` is never mutated.
-    let rendered_logs: Vec<RenderedLog> = app
-        .logs
-        .iter()
-        .filter(|entry| app.log_entry_visible_for_selected_proposal_filter(entry))
-        .map(|entry| {
-            let timestamp = format!("{} ", entry.timestamp);
-            let timestamp_style = Style::default().fg(Color::DarkGray);
+    let entries = app.visible_log_entries();
 
-            // Build header and calculate prefix width
-            let (header, header_style, prefix_width) = if let Some(ref operation) = entry.operation
-            {
+    let chrome: Vec<RenderedLogChrome> = entries
+        .iter()
+        .map(|(_, entry)| {
+            let timestamp = format!("{} ", entry.timestamp);
+            let header = log_logic::logs_panel_header(entry);
+
+            let header_style = if header.is_empty() {
+                Style::default()
+            } else {
                 // Use hash of change_id (if present) to pick a consistent color
                 let color_index = if let Some(ref change_id) = entry.change_id {
                     change_id
@@ -1583,120 +1499,55 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
                 } else {
                     0
                 };
-                let prefix_color = change_colors[color_index];
-
-                // Build header with change_id when present
-                let header = match (&entry.change_id, entry.iteration) {
-                    (Some(change_id), Some(iter)) => {
-                        format!("[{}:{}:{}] ", change_id, operation, iter)
-                    }
-                    (Some(change_id), None) => format!("[{}:{}] ", change_id, operation),
-                    (None, Some(iter)) => format!("[{}:{}] ", operation, iter),
-                    (None, None) => {
-                        // Analysis logs must always have iteration
-                        if operation == "analysis" {
-                            format!("[{}:1] ", operation)
-                        } else {
-                            format!("[{}] ", operation)
-                        }
-                    }
-                };
-
-                let prefix_width = timestamp.len() + header.len();
-                let header_style = Style::default()
-                    .fg(prefix_color)
-                    .add_modifier(Modifier::BOLD);
-
-                (header, header_style, prefix_width)
-            } else {
-                let prefix_width = timestamp.len();
-                (String::new(), Style::default(), prefix_width)
+                Style::default()
+                    .fg(change_colors[color_index])
+                    .add_modifier(Modifier::BOLD)
             };
 
-            // Wrap message with indentation
-            // available_width is already (total_width - border - timestamp)
-            // Pass header.len() separately to avoid double-subtraction in continuation lines
-            let message_lines =
-                wrap_log_message(&entry.message, available_width, header.len(), prefix_width);
-            let message_style = Style::default().fg(entry.color);
-
-            RenderedLog {
+            RenderedLogChrome {
                 timestamp,
-                timestamp_style,
+                timestamp_style: Style::default().fg(Color::DarkGray),
                 header,
                 header_style,
-                message_lines,
-                message_style,
+                message_style: Style::default().fg(entry.color),
             }
         })
         .collect();
 
-    // Calculate total display lines (sum of all wrapped lines)
-    let total_display_lines: usize = rendered_logs.iter().map(|r| r.message_lines.len()).sum();
+    // One wrapped display-line sequence, shared with navigation.
+    let lines = log_logic::build_log_display_lines(&entries, area.width as usize);
+    let total_display_lines = lines.len();
 
-    // Convert log_scroll_offset (log-count-based) to display-line-based offset
-    // log_scroll_offset = 0 means show the most recent logs at the bottom
-    // log_scroll_offset = N means skip N logs from the bottom
-    let total_logs = rendered_logs.len();
-    let skipped_logs = app.log_scroll_offset.min(total_logs);
+    let start_line = app.log_start_line(&lines);
+    let end_line = total_display_lines.min(start_line + visible_height);
 
-    // Calculate display line offset by summing up the wrapped lines of the skipped logs
-    let display_line_offset: usize = rendered_logs
+    let log_items: Vec<Line> = lines[start_line..end_line]
         .iter()
-        .rev()
-        .take(skipped_logs)
-        .map(|r| r.message_lines.len())
-        .sum();
+        .map(|line| {
+            let chrome = &chrome[line.entry_index];
+            let mut spans = Vec::new();
 
-    // Calculate visible range based on display lines
-    let end_line = total_display_lines.saturating_sub(display_line_offset);
-    let start_line = end_line.saturating_sub(visible_height);
-
-    // Convert line range to log entries and build Line widgets
-    let mut log_items: Vec<Line> = Vec::new();
-    let mut current_line = 0;
-
-    for rendered in &rendered_logs {
-        let entry_line_count = rendered.message_lines.len();
-        let entry_end = current_line + entry_line_count;
-
-        // Check if this entry overlaps with visible range
-        if entry_end > start_line && current_line < end_line {
-            // Determine which lines of this entry are visible
-            let visible_start_in_entry = start_line.saturating_sub(current_line);
-            let visible_end_in_entry = entry_line_count.min(end_line.saturating_sub(current_line));
-
-            for (line_idx, message_line) in rendered.message_lines.iter().enumerate() {
-                if line_idx >= visible_start_in_entry && line_idx < visible_end_in_entry {
-                    let mut spans = Vec::new();
-
-                    if line_idx == 0 {
-                        // First line: include timestamp and header
-                        spans.push(Span::styled(
-                            rendered.timestamp.clone(),
-                            rendered.timestamp_style,
-                        ));
-                        if !rendered.header.is_empty() {
-                            spans
-                                .push(Span::styled(rendered.header.clone(), rendered.header_style));
-                        }
-                        spans.push(Span::styled(message_line.clone(), rendered.message_style));
-                    } else {
-                        // Continuation line: message_line already has indentation
-                        spans.push(Span::styled(message_line.clone(), rendered.message_style));
-                    }
-
-                    log_items.push(Line::from(spans));
+            if line.is_first {
+                // First line: timestamp and header, then the message remainder.
+                spans.push(Span::styled(
+                    chrome.timestamp.clone(),
+                    chrome.timestamp_style,
+                ));
+                if !chrome.header.is_empty() {
+                    spans.push(Span::styled(chrome.header.clone(), chrome.header_style));
                 }
             }
-        }
+            // Continuation lines start at column zero and use the full inner width.
+            spans.push(Span::styled(line.text.clone(), chrome.message_style));
 
-        current_line = entry_end;
-    }
+            Line::from(spans)
+        })
+        .collect();
 
-    // Build title with scroll position indicator, auto-scroll status, and compact navigation help.
+    // Build title with display-line position indicator, auto-scroll status, and
+    // compact navigation help.
     let title = logs_panel_title(LogsPanelTitle {
-        log_scroll_offset: app.log_scroll_offset,
+        lines_below: total_display_lines.saturating_sub(end_line),
         log_auto_scroll: app.log_auto_scroll,
         total_display_lines,
         visible_height,
@@ -2403,6 +2254,7 @@ fn render_qr_popup(frame: &mut Frame, app: &AppState, area: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use super::log_logic::wrap_log_message;
     use super::*;
     use crate::openspec::Change;
     use crate::openspec::ProposalMetadata;
@@ -4176,7 +4028,7 @@ mod tests {
         app.logs
             .retain(|entry| entry.change_id.as_deref() != Some("alpha"));
         app.toggle_selected_proposal_log_filter();
-        app.log_scroll_offset = 40;
+        app.scroll_logs_up(40);
 
         let content = logs_panel_content(&render_buffer(&mut app, 140, 24));
 
@@ -4231,7 +4083,7 @@ mod tests {
     /// Title params for a panel that fits its content on screen.
     fn title_params(filter_enabled: bool, filter_target: Option<&str>) -> LogsPanelTitle<'_> {
         LogsPanelTitle {
-            log_scroll_offset: 0,
+            lines_below: 0,
             log_auto_scroll: true,
             total_display_lines: 4,
             visible_height: 10,
@@ -4246,7 +4098,7 @@ mod tests {
     #[test]
     fn logs_panel_title_preserves_position_and_shows_navigation_guidance() {
         let title = logs_panel_title(LogsPanelTitle {
-            log_scroll_offset: 3,
+            lines_below: 12,
             log_auto_scroll: false,
             total_display_lines: 42,
             visible_height: 10,
@@ -4257,8 +4109,8 @@ mod tests {
             panel_width: 200,
         });
 
-        assert!(title.contains("Logs [21-30/42]"));
-        assert!(title.contains("logs_off=3"));
+        assert!(title.contains("Logs [21-30/42 lines]"));
+        assert!(title.contains("lines_below=12"));
         assert!(title.contains("⏸"));
         assert!(title.contains("PgUp/PgDn: older/newer"));
         assert!(title.contains("Home/End: oldest/newest"));
@@ -4371,6 +4223,441 @@ mod tests {
                 "Should never return empty string for width {}",
                 width
             );
+        }
+    }
+
+    // === Tests for fix-width-aware-tui-log-display ===
+
+    /// Render only the Logs panel, so width and height are exactly the values
+    /// under test instead of whatever the running-mode layout happens to give.
+    fn render_logs_panel(app: &mut AppState, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal init");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_logs(frame, app, area);
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Text of one buffer row between `[from, to)` columns.
+    ///
+    /// A wide symbol occupies one cell and blanks the cells it spans, so those
+    /// filler cells must be skipped or the reconstructed text would gain a space
+    /// after every CJK character.
+    fn buffer_row_text(buffer: &Buffer, y: u16, from: u16, to: u16) -> String {
+        let mut text = String::new();
+        let mut x = from;
+        while x < to {
+            let symbol = buffer[(x, y)].symbol();
+            text.push_str(symbol);
+            let width = unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+            x += width;
+        }
+        text
+    }
+
+    /// Inner rows of a Logs panel buffer, borders excluded, right padding trimmed.
+    fn logs_panel_rows(buffer: &Buffer) -> Vec<String> {
+        (1..buffer.area.height.saturating_sub(1))
+            .map(|y| {
+                buffer_row_text(buffer, y, 1, buffer.area.width.saturating_sub(1))
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Deterministic long message: 26-character cycles make every wrapped
+    /// segment identifiable without depending on word boundaries.
+    fn long_ascii_message(len: usize) -> String {
+        (0..len)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect()
+    }
+
+    fn app_with_single_log(message: &str) -> AppState {
+        let mut app = create_test_app(vec![create_test_change("alpha")]);
+        app.execution_mode = AppExecutionMode::Running;
+        app.add_log(LogEntry::info(message));
+        app
+    }
+
+    /// The message part of the first Logs row, i.e. everything after the
+    /// `HH:MM:SS ` timestamp column.
+    fn first_row_message(rows: &[String]) -> String {
+        rows[0].chars().skip(9).collect()
+    }
+
+    #[test]
+    fn wider_logs_panel_shows_more_retained_content_per_line() {
+        let message = long_ascii_message(400);
+
+        let narrow = logs_panel_rows(&render_logs_panel(
+            &mut app_with_single_log(&message),
+            60,
+            12,
+        ));
+        let wide = logs_panel_rows(&render_logs_panel(
+            &mut app_with_single_log(&message),
+            120,
+            12,
+        ));
+
+        let narrow_first = first_row_message(&narrow);
+        let wide_first = first_row_message(&wide);
+
+        // 60 - 2 borders - 9 timestamp = 49; 120 - 2 - 9 = 109.
+        assert_eq!(narrow_first.chars().count(), 49);
+        assert_eq!(wide_first.chars().count(), 109);
+        assert!(wide_first.starts_with(&narrow_first));
+        // Nothing was cut at a producer-fixed position.
+        assert!(!wide_first.contains("..."));
+    }
+
+    #[test]
+    fn logs_panel_renders_the_whole_retained_message_when_it_fits() {
+        let message = long_ascii_message(400);
+        let rows = logs_panel_rows(&render_logs_panel(
+            &mut app_with_single_log(&message),
+            120,
+            12,
+        ));
+
+        let rebuilt: String = std::iter::once(first_row_message(&rows))
+            .chain(rows[1..].iter().cloned())
+            .collect();
+        assert_eq!(rebuilt, message);
+    }
+
+    #[test]
+    fn navigation_reaches_every_wrapped_segment_of_an_oversized_entry() {
+        // 60 columns => 49 first-line columns and 58 continuation columns, so
+        // 1,000 characters wrap to 18 lines against a 5-row viewport.
+        let message = long_ascii_message(1000);
+        let mut app = app_with_single_log(&message);
+
+        // Establish the geometry the key handlers navigate with.
+        let mut seen: Vec<String> = Vec::new();
+        // The top rendered row only carries a timestamp when it is an entry's
+        // first line; a continuation row starts at column zero.
+        let record = |app: &mut AppState, seen: &mut Vec<String>| {
+            let rows = logs_panel_rows(&render_logs_panel(app, 60, 7));
+            let lines = app.log_display_lines();
+            let top_is_entry_head = lines
+                .get(app.log_start_line(&lines))
+                .is_some_and(|line| line.is_first);
+
+            let mut merged = String::new();
+            for (index, row) in rows.iter().enumerate() {
+                if index == 0 && top_is_entry_head {
+                    merged.extend(row.chars().skip(9));
+                } else {
+                    merged.push_str(row);
+                }
+            }
+            seen.push(merged);
+        };
+
+        record(&mut app, &mut seen);
+        assert!(
+            !seen[0].starts_with(&message[..49]),
+            "auto-scroll starts at the tail of the entry"
+        );
+
+        app.scroll_logs_to_top();
+        record(&mut app, &mut seen);
+        // Home shows the first five wrapped segments: 49 + 4 * 58 = 281 chars,
+        // which covers at least the first 200 source characters.
+        assert_eq!(seen[1], message[..281]);
+        assert!(seen[1].contains(&message[..200]));
+
+        // Walk forward one page at a time until auto-scroll resumes.
+        for _ in 0..5 {
+            app.scroll_logs_down(5);
+            record(&mut app, &mut seen);
+        }
+        assert!(
+            app.log_auto_scroll,
+            "PgDn eventually reaches the newest line"
+        );
+
+        // Every wrapped segment appeared in some rendered buffer.
+        let lines = {
+            app.set_log_viewport(60, 7);
+            app.log_display_lines()
+        };
+        assert_eq!(lines.len(), 18);
+        for line in &lines {
+            assert!(
+                seen.iter().any(|frame| frame.contains(&line.text)),
+                "wrapped segment at offset {} never reached a rendered buffer",
+                line.source_byte_offset
+            );
+        }
+
+        // PgUp walks back to the head again.
+        app.scroll_logs_to_top();
+        record(&mut app, &mut seen);
+        assert_eq!(seen.last().unwrap(), &message[..281]);
+    }
+
+    #[test]
+    fn logs_panel_continuation_rows_use_the_full_inner_width_without_indent() {
+        let message = long_ascii_message(400);
+        let mut app = app_with_single_log(&message);
+        app.scroll_logs_to_top();
+
+        let rows = logs_panel_rows(&render_logs_panel(&mut app, 60, 7));
+
+        assert_eq!(first_row_message(&rows), message[..49]);
+        for (index, row) in rows[1..].iter().enumerate() {
+            assert!(
+                !row.starts_with(' '),
+                "continuation row {index} must not be indented: {row:?}"
+            );
+            let start = 49 + index * 58;
+            assert_eq!(row, &message[start..start + 58]);
+        }
+    }
+
+    #[test]
+    fn auto_scroll_keeps_the_newest_line_visible_behind_a_tall_entry() {
+        let mut app = app_with_single_log(&long_ascii_message(1000));
+        app.add_log(LogEntry::info("newest-line-marker"));
+
+        let rows = logs_panel_rows(&render_logs_panel(&mut app, 60, 7));
+
+        assert!(
+            rows.last().unwrap().contains("newest-line-marker"),
+            "auto-scroll must keep the newest line in view: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn resizing_keeps_the_anchor_on_the_same_source_content() {
+        let message = long_ascii_message(1000);
+        let mut app = app_with_single_log(&message);
+
+        // Navigate inside the entry at the narrow width.
+        let _ = render_logs_panel(&mut app, 60, 7);
+        app.scroll_logs_to_top();
+        app.scroll_logs_down(3);
+        let anchored = app.log_anchor.unwrap().source_byte_offset;
+        assert_eq!(anchored, 49 + 2 * 58);
+
+        // A resize re-wraps everything; the top rendered row must still contain
+        // the anchored source position, and auto-scroll must stay off.
+        let rows = logs_panel_rows(&render_logs_panel(&mut app, 120, 7));
+        assert!(!app.log_auto_scroll);
+
+        let lines = app.log_display_lines();
+        let top = &lines[app.log_start_line(&lines)];
+        assert!(top.source_byte_offset <= anchored);
+        assert!(anchored < top.source_byte_offset + top.text.len());
+        assert_eq!(rows[0], top.text, "the anchored line is the one drawn");
+    }
+
+    #[test]
+    fn logs_panel_title_reports_display_lines_not_entry_offsets() {
+        let mut app = app_with_single_log(&long_ascii_message(1000));
+        app.scroll_logs_to_top();
+
+        let buffer = render_logs_panel(&mut app, 120, 7);
+        let title: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+
+        assert!(
+            title.contains("lines"),
+            "title must count display lines: {title}"
+        );
+        assert!(!title.contains("logs_off="));
+    }
+
+    #[test]
+    fn logs_panel_wraps_cjk_and_emoji_within_the_inner_display_width() {
+        let message = "漢字テスト🎉".repeat(40);
+        let mut app = app_with_single_log(&message);
+        app.scroll_logs_to_top();
+
+        for width in [41u16, 60, 121] {
+            let buffer = render_logs_panel(&mut app, width, 10);
+            let rows = logs_panel_rows(&buffer);
+            let inner_width = (width - 2) as usize;
+
+            for row in &rows {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(row.as_str()) <= inner_width,
+                    "row exceeds inner width {inner_width}: {row:?}"
+                );
+            }
+
+            let rebuilt: String = std::iter::once(first_row_message(&rows))
+                .chain(rows[1..].iter().cloned())
+                .collect();
+            assert!(
+                message.starts_with(&rebuilt),
+                "width {width} lost retained content: {rebuilt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filtering_returns_the_logs_panel_to_the_newest_matching_line() {
+        let message = long_ascii_message(1000);
+        let mut app = create_test_app(vec![
+            create_test_change("alpha"),
+            create_test_change("beta"),
+        ]);
+        app.execution_mode = AppExecutionMode::Running;
+        app.add_log(LogEntry::info(message.clone()).with_change_id("alpha"));
+        app.add_log(LogEntry::info("beta-only-line").with_change_id("beta"));
+
+        let _ = render_logs_panel(&mut app, 60, 7);
+        app.scroll_logs_to_top();
+        assert!(!app.log_auto_scroll);
+
+        // Toggling the filter re-targets the visible set, so the anchor is
+        // discarded rather than left pointing at a hidden entry.
+        app.toggle_selected_proposal_log_filter();
+        assert!(app.log_auto_scroll);
+        assert_eq!(app.log_anchor, None);
+
+        let rows = logs_panel_rows(&render_logs_panel(&mut app, 60, 7));
+        assert!(
+            !rows.iter().any(|row| row.contains("beta-only-line")),
+            "filtered-out entries must not render: {rows:?}"
+        );
+        // The newest matching line is the tail of the alpha entry.
+        assert!(rows
+            .last()
+            .unwrap()
+            .ends_with(&message[message.len() - 5..]));
+    }
+
+    #[test]
+    fn buffer_trimming_keeps_the_anchored_view_on_a_rendered_line() {
+        let mut app = create_test_app(vec![create_test_change("alpha")]);
+        app.execution_mode = AppExecutionMode::Running;
+        for index in 0..crate::tui::state::MAX_LOG_ENTRIES {
+            app.add_log(LogEntry::info(format!("log-{index}")));
+        }
+
+        let _ = render_logs_panel(&mut app, 60, 7);
+        app.scroll_logs_to_top();
+
+        // Overflow evicts the anchored entry.
+        for index in 0..5 {
+            app.add_log(LogEntry::info(format!("overflow-{index}")));
+        }
+
+        let rows = logs_panel_rows(&render_logs_panel(&mut app, 60, 7));
+        assert!(
+            rows[0].contains("log-5"),
+            "the view must clamp to the oldest surviving line: {rows:?}"
+        );
+        assert!(!app.log_auto_scroll, "trimming must not resume auto-scroll");
+    }
+
+    /// Changes-row preview policy: one line, current remaining width, no wrap.
+    fn preview_app(mode: AppExecutionMode, message: &str) -> AppState {
+        let mut app = create_test_app(vec![
+            create_test_change("alpha"),
+            create_test_change("beta"),
+        ]);
+        app.execution_mode = mode;
+        app.add_log(
+            LogEntry::info(message)
+                .with_change_id("alpha")
+                .with_operation("apply")
+                .with_iteration(1),
+        );
+        app
+    }
+
+    fn row_index_containing(buffer: &Buffer, needle: &str) -> u16 {
+        find_row_containing(buffer, needle).expect("row present")
+    }
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        buffer_row_text(buffer, y, 0, buffer.area.width)
+    }
+
+    #[test]
+    fn wider_change_row_reveals_more_retained_preview_content() {
+        for mode in [AppExecutionMode::Select, AppExecutionMode::Running] {
+            let message = long_ascii_message(300);
+
+            let mut narrow_app = preview_app(mode, &message);
+            let narrow = render_buffer(&mut narrow_app, 110, 24);
+            let narrow_row = row_text(&narrow, row_index_containing(&narrow, "alpha"));
+
+            let mut wide_app = preview_app(mode, &message);
+            let wide = render_buffer(&mut wide_app, 200, 24);
+            let wide_row = row_text(&wide, row_index_containing(&wide, "alpha"));
+
+            let narrow_preview = narrow_row.matches('a').count()
+                + narrow_row.matches('b').count()
+                + narrow_row.matches('c').count();
+            let wide_preview = wide_row.matches('a').count()
+                + wide_row.matches('b').count()
+                + wide_row.matches('c').count();
+
+            assert!(
+                wide_preview > narrow_preview,
+                "{mode:?}: a wider row must reveal more retained preview content"
+            );
+            assert!(
+                narrow_row.contains('…'),
+                "{mode:?}: a narrow row truncates at its actual width"
+            );
+            assert!(
+                !wide_row.contains("..."),
+                "{mode:?}: no producer-fixed cutoff may reach the preview"
+            );
+        }
+    }
+
+    #[test]
+    fn change_row_preview_never_wraps_or_shifts_the_following_row() {
+        for mode in [AppExecutionMode::Select, AppExecutionMode::Running] {
+            let mut without = preview_app(mode, "short");
+            without.logs.clear();
+            let baseline = render_buffer(&mut without, 110, 24);
+            let beta_without = row_index_containing(&baseline, "beta");
+
+            let mut with = preview_app(mode, &long_ascii_message(400));
+            let buffer = render_buffer(&mut with, 110, 24);
+            let alpha = row_index_containing(&buffer, "alpha");
+            let beta = row_index_containing(&buffer, "beta");
+
+            assert_eq!(
+                beta, beta_without,
+                "{mode:?}: an oversized preview must not move the next row"
+            );
+            assert_eq!(beta, alpha + 1, "{mode:?}: no continuation row is created");
+        }
+    }
+
+    #[test]
+    fn change_row_preview_truncates_cjk_and_emoji_within_the_row_width() {
+        for mode in [AppExecutionMode::Select, AppExecutionMode::Running] {
+            for width in [90u16, 110, 160] {
+                let mut app = preview_app(mode, &"日本語ログ🎉".repeat(40));
+                let buffer = render_buffer(&mut app, width, 24);
+                let alpha = row_index_containing(&buffer, "alpha");
+                let row = row_text(&buffer, alpha);
+
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(row.trim_end()) <= width as usize,
+                    "{mode:?} at {width}: preview overflowed the row"
+                );
+                // Still exactly one row: the next change keeps its position.
+                assert_eq!(row_index_containing(&buffer, "beta"), alpha + 1);
+            }
         }
     }
 

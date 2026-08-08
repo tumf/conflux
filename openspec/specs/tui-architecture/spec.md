@@ -280,40 +280,67 @@ subcommand の出力ログは対応する operation を付与して記録され�
 - Logsビュー（ログパネル）では、operation を持つログは change_id がある場合に iteration があれば `[{change_id}:{operation}:{iteration}]`、iteration がない場合に `[{change_id}:{operation}]` 形式で表示しなければならない。
 - 変更一覧のログプレビューでは、operation を持つログは iteration がある場合に `[operation:{iteration}]`、iteration がない場合に `[operation]` 形式で表示し、change_id を表示してはならない。
 - change_id を持たない analysis のログ出力は必ず iteration number を含み、ヘッダは `[analysis:{iteration}]` 形式で表示されなければならない。
-- Logsビューで表示幅を超えるメッセージは、timestamp とログヘッダの幅を維持したインデントで折り返し表示されなければならない。
-- Logsビューの表示範囲は折り返し後の表示行数で計算され、長文ログの折り返しによって最新ログが画面外になることがあってはならない。
-- auto-scroll が無効な場合、TUI はユーザーが閲覧しているログ範囲を維持し、表示行は新しいログ追加やログバッファのトリミングで移動してはならない。表示行がトリミングされた場合は、最も古い残存ログ行にクランプされなければならず、auto-scroll は自動的に再有効化されてはならない。
+- Logsビューの1行目は timestamp とログヘッダの直後から現在のパネル内側右端までを使用し、表示幅を超えるメッセージの2行目以降はインデントせずにパネル内側の横幅全体を用いて折り返さなければならない。
+- Logsビューは保持済みmessageをproducer固定位置で再省略してはならない。`PgUp`、`PgDn`、`Home`、`End` の既存key assignmentは、entry境界だけでなく、viewportより高い単一entry内の折り返し表示行にも到達できなければならない (MUST)。source messageが200文字以上保持されている場合、狭い端末でもこれらの操作により先頭200文字を含む全折り返しsegmentを実際の描画bufferへ表示できなければならない (MUST)。
+- Logsビューの表示範囲とnavigation rangeは折り返し後の表示行数で計算され、長文ログの折り返しによって最新ログがauto-scroll viewport外になることがあってはならない。
+- auto-scrollが無効な場合、TUIは現在閲覧中のentryとsource-content位置をprocess-local anchorとして維持しなければならない (MUST)。新しいログ追加、filter変更、横幅変更、またはログバッファのtrim後は、そのanchorを現在のfiltered/wrapped sequenceへ決定的に再投影しなければならない (MUST)。anchor対象がtrimされた場合は最も古い残存表示行へclampし、auto-scrollを自動的に再有効化してはならない (MUST NOT)。
+- 折り返し、表示行数、末尾省略は Unicode display width で計算され、CJKまたはemojiのUTF-8境界を壊してはならない。
 
 #### Scenario: apply/archive/acceptance/resolve の command が表示される
+
 - **GIVEN** change_id が設定され、apply/archive/acceptance/resolve の開始イベントに command が含まれている
 - **WHEN** TUI が開始イベントを処理する
 - **THEN** ログに `Command:` 行が追加される
 - **AND** ログは対応する operation 付きで記録される
 
 #### Scenario: LogsビューのArchiveログヘッダはchange_idとiterationを含む
+
 - **GIVEN** `change_id="test-change"`、`operation="archive"`、`iteration=2` のログエントリが作成される
 - **WHEN** TUI が Logs ビューのログを描画する
 - **THEN** ログヘッダは `[test-change:archive:2]` として表示される
 - **AND** retry の順序が判別できる
 
 #### Scenario: Analysis ログは iteration 付きで表示される
+
 - **GIVEN** `change_id=None`、`operation="analysis"`、`iteration=3` のログエントリが作成される
 - **WHEN** TUI が Logs ビューのログを描画する
 - **THEN** ログヘッダは `[analysis:3]` として表示される
 - **AND** analysis の再実行が区別できる
 
-#### Scenario: auto-scroll が無効なとき表示範囲が固定される
-- **GIVEN** ユーザーがログをスクロール済みで auto-scroll が無効になっている
-- **WHEN** 新しいログが追加される（必要に応じて古いログがトリミングされる）
-- **THEN** 表示範囲は同じログ行を指し続ける
-- **AND** 表示範囲がトリミングされた場合、最も古い残存ログ行にクランプされる
-- **AND** auto-scroll は自動的に再有効化されない
+#### Scenario: auto-scroll が無効なとき閲覧中content位置が維持される
 
-#### Scenario: 長文ログの折り返しでも表示行がずれない
-- **GIVEN** Logsビューに表示幅を超える長文ログが含まれている
-- **WHEN** TUI が Logs ビューのログを描画する
-- **THEN** 折り返し行は timestamp とヘッダ幅を維持したインデントで表示される
-- **AND** 最新ログが表示範囲から外れない
+- **GIVEN** ユーザーがログをスクロール済みで auto-scroll が無効になっている
+- **AND** process-local anchorが現在のentryとsource-content位置を指している
+- **WHEN** 新しいログ追加、filter変更、横幅変更、またはログバッファtrimにより表示行sequenceが再計算される
+- **THEN** anchorは同じentryとsource-content位置を含む新しい表示行へ再投影される
+- **AND** anchor対象がtrimされた場合、最も古い残存表示行へclampされる
+- **AND** auto-scrollは自動的に再有効化されない
+
+#### Scenario: 幅の広いLogsパネルは追加の内容を表示する
+
+- **GIVEN** 200文字を超える保持済みログメッセージがある
+- **WHEN** 同じログを狭いLogsパネルと広いLogsパネルで描画する
+- **THEN** 各行はそれぞれの現在のパネル内側幅を使用する
+- **AND** 広いパネルの1行は狭いパネルより多くのmessage contentを表示する
+- **AND** 200文字等のproducer固定位置に不要なellipsisは表示されない
+
+#### Scenario: 狭く低いLogsパネルで単一entry内を移動できる
+
+- **GIVEN** 200文字以上の保持済みログメッセージがある
+- **AND** 1行に200文字を表示できず、entry全体もviewport高に収まらないLogsパネルである
+- **WHEN** TUIがログを描画し、ユーザーが `Home`、`PgDn`、`PgUp`、`End` を操作する
+- **THEN** 先頭行はtimestampとheader後の利用可能幅を使用する
+- **AND** 継続行はインデントせずパネル内側幅全体を使用する
+- **AND** operation sequenceを通して少なくとも先頭200文字を含む全折り返しsegmentが実際の描画bufferに現れる
+- **AND** `End` またはauto-scroll有効時には最新ログ行が表示範囲から外れない
+
+#### Scenario: Unicodeログの折り返しは表示幅と文字境界を守る
+
+- **GIVEN** CJKとemojiを含む長いログメッセージがある
+- **WHEN** TUI が異なる幅のLogsパネルで折り返す
+- **THEN** 各表示行はパネル内側のdisplay widthを超えない
+- **AND** UTF-8文字境界は壊れない
+- **AND** 折り返し部分を結合すると共有安全上限内の保持済みmessage contentが失われていない
 
 ### Requirement: Reflect tasks.md progress in all states
 The TUI MUST continue to display progress obtained from tasks.md even during archive/resolving. If reading tasks.md fails and returns 0/0, the previous progress MUST NOT be overwritten.
@@ -353,90 +380,38 @@ In auto-refresh processing, if 0/0 is returned from the active location, the arc
 
 ### Requirement: Change List Log Preview
 
-The TUI change list MUST display a single-line preview in the remaining space on the right side of each change row. For a change whose display status is `error`, the preview MUST prefer the retained final change-level diagnostic over every buffered log entry and MUST format it as `Error: <diagnostic>`. This error preview MUST remain available independently of bounded log retention. If the status is `error` but no diagnostic is available, the preview MUST use an explicit fallback such as `Error details unavailable` and MUST NOT present an unrelated ordinary log as the failure reason. For every non-error change, the preview MUST display the latest log entry and include its relative time (`just now` for less than 1 minute; `<n><unit> ago` for 1 minute or more, e.g., `2m ago`, `3h ago`, with values truncated (no rounding up)), the shortened header format `[operation:{iteration}]` or `[operation]`, and the message.
+The TUI change list MUST display a single-line preview in the remaining space on the right side of each change row. For a change whose display status is `error`, the preview MUST prefer the retained final change-level diagnostic over every buffered log entry and MUST format it as `Error: <diagnostic>`. This error preview MUST remain available independently of bounded log retention. If the status is `error` but no diagnostic is available, the preview MUST use an explicit fallback such as `Error details unavailable` and MUST NOT present an unrelated ordinary log as the failure reason. For every non-error change, the preview MUST display the latest retained log entry and include its relative time (`just now` for less than 1 minute; `<n><unit> ago` for 1 minute or more), the shortened header format `[operation:{iteration}]` or `[operation]`, and the message.
 
-Every preview MUST remain single-line and be truncated without wrapping to fit the available display width. Truncation MUST NOT break Unicode character boundaries and MUST NOT panic, even when the content contains CJK characters or emoji. Error previews MUST use readable error styling in both focused and unfocused rows.
+Every preview MUST remain exactly one display line and MUST NOT wrap or increase the change-row height. The renderer MUST use all actual remaining row width and truncate with an ellipsis only when the retained preview does not fit that width. Producer retention is governed by the observability capability; this renderer MUST apply no additional fixed-position cutoff. Truncation MUST use Unicode display width, MUST NOT break UTF-8 character boundaries, and MUST NOT panic for CJK or emoji. Error previews MUST use readable error styling in both focused and unfocused rows.
 
 - For relative times of 1 minute or more on non-error log previews, the display MUST include up to 2 units. Units MUST be `d` / `h` / `m`, formatted as space-separated units such as `1d 12h ago` or `3h 20m ago`. Values MUST be truncated (no rounding up).
 - If no log entry exists for a non-error change, the preview MUST NOT be displayed.
 - If the available width for the preview is less than 10 characters, the preview MUST NOT be displayed.
 - The relative time for a non-error log preview MUST be computed at render time from the log entry creation time and the current time, and the display MUST update at 1-second granularity.
 
-<!-- Expected canonical result after archive: `Change List Log Preview` will prefer retained final diagnostics for error rows while preserving existing latest-log previews for non-error rows. -->
+#### Scenario: Wider change row reveals more retained preview content
 
-#### Scenario: Error preview survives log eviction
+- **GIVEN** a non-error change has a latest retained log message longer than 200 characters
+- **WHEN** the same change row is rendered at two widths that both leave at least 10 preview columns
+- **THEN** each preview remains one display line
+- **AND** the wider row displays more retained message content than the narrower row
+- **AND** ellipsis appears only where that row's actual remaining width cannot contain the retained preview
 
-- **GIVEN** a change is displayed with status `error`
-- **AND** its retained final diagnostic is `Apply failed: stalled after 5 empty WIP commits`
-- **AND** the bounded log buffer no longer contains the failure entry
+#### Scenario: Narrow change row never wraps its preview
+
+- **GIVEN** a retained log or error preview does not fit the remaining change-row width
 - **WHEN** the TUI renders the Changes list
-- **THEN** the row SHALL display `Error: Apply failed: stalled after 5 empty WIP commits` within the available width
-- **AND** no retained `LogEntry` SHALL be required to produce that preview
+- **THEN** the preview is truncated to the remaining display width with an ellipsis
+- **AND** no continuation line is created
+- **AND** the following change or project header retains its expected visual row position
 
-#### Scenario: Error preview takes precedence over ordinary latest log
+#### Scenario: Unicode preview truncation is width-safe
 
-- **GIVEN** a change is displayed with status `error`
-- **AND** the change retains a final diagnostic
-- **AND** its latest buffered log is an unrelated ordinary message
+- **GIVEN** the retained preview contains CJK and emoji
+- **AND** the available preview width cannot contain the full value
 - **WHEN** the TUI renders the Changes list
-- **THEN** the retained final diagnostic SHALL be shown as the preview
-- **AND** the unrelated log SHALL NOT be presented as the error reason
-
-#### Scenario: Missing diagnostic is explicit
-
-- **GIVEN** a change is displayed with status `error`
-- **AND** no final diagnostic is available
-- **WHEN** the TUI renders the Changes list with sufficient preview width
-- **THEN** the preview SHALL state that error details are unavailable
-- **AND** it SHALL NOT infer an error reason from an ordinary log
-
-#### Scenario: Error preview truncation is Unicode-safe
-
-- **GIVEN** an error row retains a diagnostic containing Japanese text or emoji
-- **AND** the available preview width cannot contain the full diagnostic
-- **WHEN** the TUI renders the Changes list
-- **THEN** the preview SHALL be truncated to the available display width without wrapping
-- **AND** truncation SHALL NOT split a Unicode character or panic
-
-#### Scenario: Change list displays preview with relative time for latest log
-
-- **GIVEN** a non-error change has a log entry from 2 minutes ago (`operation="resolve"`, `iteration=1`)
-- **WHEN** the TUI renders the change list
-- **THEN** the change row SHALL display `2m ago [resolve:1]` and the latest log message on the same line
-
-#### Scenario: Change list does not display preview when no logs exist
-
-- **GIVEN** a non-error change has no log entries
-- **WHEN** the TUI renders the change list
-- **THEN** the change row SHALL NOT display a log preview
-
-#### Scenario: Change list does not display preview when preview width is insufficient
-
-- **GIVEN** the available width for the log or error preview is less than 10 characters
-- **WHEN** the TUI renders the change list
-- **THEN** the change list SHALL NOT display a preview
-
-#### Scenario: Change list displays up to two units for relative time
-
-- **GIVEN** a non-error change has a log entry from 1 day and 12 hours ago (`operation="apply"`, `iteration=3`)
-- **WHEN** the TUI renders the change list
-- **THEN** the change row SHALL display `1d 12h ago [apply:3]` and the latest log message on the same line
-
-#### Scenario: Relative time updates as time elapses
-
-- **GIVEN** a non-error change has a log entry from 59 seconds ago
-- **WHEN** the TUI renders the change list
-- **THEN** the change row SHALL display `just now` as the relative time
-- **WHEN** 2 seconds pass and the TUI re-renders the change list
-- **THEN** the change row SHALL display `1m ago` as the relative time
-
-#### Scenario: Log preview truncation is Unicode-safe for Japanese text
-
-- **GIVEN** the latest log message for a non-error change contains Japanese text such as `追記済みです。`
-- **AND** the available preview width is insufficient to display the full message
-- **WHEN** the TUI renders the change list
-- **THEN** the log preview SHALL be truncated without breaking Unicode character boundaries
-- **AND** the TUI SHALL continue rendering without panicking
+- **THEN** the preview remains one line within the available display width
+- **AND** truncation does not split a UTF-8 character or panic
 
 ### Requirement: MergeDeferred の待ち状態判定
 

@@ -2009,6 +2009,68 @@ mod tests {
         assert!(std::env::var("CFLX_AGENT_RUNNER_DIR_ENV").is_err());
     }
 
+    /// A permitted tool-event value well past the former 200-character cutoff
+    /// must survive the runner's `process_stdout_line` consumption boundary and
+    /// reach the operator unchanged.
+    ///
+    /// This drives the real streaming path — child process, textify callback,
+    /// output channel — because that is where an intermediate re-truncation
+    /// would have been reintroduced. The same emitted line is then fed to
+    /// `LogEntry`, proving non-TUI CLI output and the TUI entry carry one
+    /// identical sanitized representation.
+    #[tokio::test]
+    async fn stream_json_tool_events_reach_the_output_boundary_untruncated() {
+        let content = "z".repeat(1200);
+        let json = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "tool_wide",
+            "content": content,
+        })
+        .to_string();
+        let expected = format!("[tool_result:tool_wide] {}", content);
+
+        let config = OrchestratorConfig {
+            stream_json_textify: Some(true),
+            command_queue_stagger_delay_ms: Some(0),
+            ..OrchestratorConfig::default()
+        };
+        let runner = AgentRunner::new(config);
+
+        // A quoted heredoc emits the stream-json line byte-for-byte, exactly as
+        // an agent's `--output-format stream-json` stdout would.
+        let command = format!("cat <<'CFLX_STREAM_JSON'\n{}\nCFLX_STREAM_JSON", json);
+        let (_child, mut rx) = runner
+            .execute_shell_command_streaming(&command, None, None)
+            .await
+            .expect("streaming execution starts");
+
+        let mut stdout_lines = Vec::new();
+        while let Some(line) = rx.recv().await {
+            if let OutputLine::Stdout(text) = line {
+                stdout_lines.push(text);
+            }
+        }
+
+        assert!(
+            stdout_lines.iter().any(|line| line == &expected),
+            "the retained summary never reached the output channel: {stdout_lines:?}"
+        );
+        assert!(
+            !stdout_lines
+                .iter()
+                .any(|line| line.contains("\"tool_use_id\"")),
+            "raw stream JSON must stay hidden: {stdout_lines:?}"
+        );
+        assert!(
+            !stdout_lines.iter().any(|line| line.contains("...")),
+            "no fixed-length cutoff may reach the operator: {stdout_lines:?}"
+        );
+
+        // The TUI builds its entry from the same line, with no second bound.
+        let entry = crate::events::LogEntry::info(expected.clone());
+        assert_eq!(entry.message, expected);
+    }
+
     #[test]
     fn analyze_append_prompt_is_appended_once_during_command_expansion() {
         let command = expand_analyze_command_with_append(
