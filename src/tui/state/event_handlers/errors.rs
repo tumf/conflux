@@ -47,6 +47,15 @@ impl AppState {
         );
     }
 
+    /// Paint a change-scoped resolve failure without taking the screen.
+    ///
+    /// Bounded post-archive exhaustion is `ContinueWithErrors` at the scheduler:
+    /// only this one change returns to manual `merge wait`, and every other change
+    /// keeps running. A modal warning popup would own input until dismissed, so a
+    /// change-local recoverable failure would read — and behave — like a whole-run
+    /// stop. The structured error log entry plus the `merge wait` row carry the
+    /// diagnostic instead; the process file log remains the durable full record
+    /// once the bounded TUI log evicts the entry.
     pub(crate) fn handle_resolve_failed(&mut self, change_id: String, error: String) {
         self.reset_analysis_log_dedupe();
         self.clear_resolving();
@@ -67,7 +76,6 @@ impl AppState {
             }
         }
         let message = format!("Failed to resolve merge for '{}': {}", change_id, error);
-        self.show_warning_popup("Merge resolve failed", message.clone());
         self.add_log(LogEntry::error(message).with_change_id(&change_id));
 
         self.try_transition_to_select();
@@ -260,7 +268,8 @@ mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
     use crate::tui::events::OrchestratorEvent;
-    use crate::tui::types::AppExecutionMode;
+    use crate::tui::types::{AppExecutionMode, StopMode};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
@@ -1048,6 +1057,159 @@ mod tests {
         );
     }
 
+    /// Automatic bounded exhaustion must stay a change-local notification.
+    ///
+    /// The popup this asserts against owned input until dismissed, which made an
+    /// explicitly `ContinueWithErrors` failure interrupt monitoring and control of
+    /// every unrelated change that was still running.
+    #[test]
+    fn exhausted_post_archive_resolve_is_non_modal_and_leaves_other_work_operable() {
+        let mut app = AppState::new(vec![
+            create_test_change("alpha", 3, 3),
+            create_test_change("beta", 0, 1),
+        ]);
+        app.execution_mode = AppExecutionMode::Running;
+        app.current_change = Some("beta".to_string());
+        app.changes[0].set_display_status_cache("resolving");
+        app.changes[1].set_display_status_cache("applying");
+        app.set_resolving("alpha");
+
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveFailed {
+            change_id: "alpha".to_string(),
+            error: exhaustion_detail(),
+        });
+
+        assert!(
+            app.warning_popup.is_none(),
+            "a change-scoped resolve failure must not open a blocking overlay"
+        );
+        assert!(
+            !crate::tui::key_handlers::handle_warning_popup_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            ),
+            "no popup may claim operator input ahead of the underlying screen"
+        );
+        assert_eq!(
+            app.stop_mode,
+            StopMode::None,
+            "a change-local failure must not request graceful or immediate global stop"
+        );
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Running,
+            "unrelated active work keeps the run alive"
+        );
+        assert_eq!(
+            app.changes[0].display_status_cache, "merge wait",
+            "the affected row stays retryable rather than terminal"
+        );
+        assert_eq!(app.changes[1].display_status_cache, "applying");
+        assert_eq!(
+            change_ids_for_message(&app, "Failed to resolve merge for 'alpha'"),
+            vec![Some("alpha".to_string())],
+            "the retained diagnostic must identify the affected change"
+        );
+    }
+
+    /// The same failure with nothing else active: the pre-existing non-fatal
+    /// `Select` transition still applies, and the row is still retryable.
+    #[test]
+    fn idle_change_scoped_resolve_failure_stays_retryable_without_a_popup() {
+        let mut app = AppState::new(vec![create_test_change("alpha", 3, 3)]);
+        app.execution_mode = AppExecutionMode::Running;
+        app.changes[0].set_display_status_cache("resolving");
+        app.cursor_index = 0;
+        app.set_resolving("alpha");
+
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveFailed {
+            change_id: "alpha".to_string(),
+            error: exhaustion_detail(),
+        });
+
+        assert!(app.warning_popup.is_none());
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Select,
+            "the existing no-active-work transition remains valid"
+        );
+        assert_ne!(app.execution_mode, AppExecutionMode::Error);
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+        assert!(
+            matches!(app.resolve_merge(), Some(TuiCommand::ResolveMerge(ref id)) if id == "alpha"),
+            "the explicit merge retry action must remain available"
+        );
+    }
+
+    /// Operator-initiated resolve takes the same handler, so `M` followed by a
+    /// failure must not be modal either — and must leave `M` usable again.
+    #[test]
+    fn operator_initiated_resolve_failure_is_also_non_modal_and_retryable() {
+        let mut app = AppState::new(vec![create_test_change("alpha", 3, 3)]);
+        app.execution_mode = AppExecutionMode::Running;
+        app.changes[0].set_display_status_cache("merge wait");
+        app.cursor_index = 0;
+        app.clear_resolving();
+
+        assert!(
+            matches!(app.resolve_merge(), Some(TuiCommand::ResolveMerge(ref id)) if id == "alpha")
+        );
+        // What the shared run-control service and the adapter do with that command.
+        app.set_resolving("alpha");
+        app.changes[0].set_display_status_cache("resolve pending");
+
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveFailed {
+            change_id: "alpha".to_string(),
+            error: exhaustion_detail(),
+        });
+
+        assert!(
+            app.warning_popup.is_none(),
+            "a manual resolve failure is still change-scoped, not a run stop"
+        );
+        assert_eq!(app.stop_mode, StopMode::None);
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+        assert_eq!(
+            change_ids_for_message(&app, "Failed to resolve merge for 'alpha'"),
+            vec![Some("alpha".to_string())],
+            "the bounded TUI log keeps the structured diagnostic"
+        );
+        assert!(
+            matches!(app.resolve_merge(), Some(TuiCommand::ResolveMerge(ref id)) if id == "alpha"),
+            "a second explicit retry must remain possible without a restart"
+        );
+    }
+
+    /// Severity comes from the event type, not from the diagnostic text: the same
+    /// wording is non-modal as `ResolveFailed` and still modal as an `on_merged`
+    /// hook failure, which is specified separately and keeps its popup.
+    #[test]
+    fn unrelated_warning_class_keeps_its_popup_for_the_same_diagnostic_text() {
+        let detail = exhaustion_detail();
+
+        let mut app = AppState::new(vec![create_test_change("alpha", 3, 3)]);
+        app.changes[0].set_display_status_cache("resolving");
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveFailed {
+            change_id: "alpha".to_string(),
+            error: detail.clone(),
+        });
+        assert!(app.warning_popup.is_none());
+
+        let mut app = AppState::new(vec![create_test_change("alpha", 3, 3)]);
+        app.changes[0].set_display_status_cache("archived");
+        app.handle_orchestrator_event(OrchestratorEvent::HookFailed {
+            change_id: "alpha".to_string(),
+            hook_type: "on_merged".to_string(),
+            error: detail,
+        });
+
+        let popup = app
+            .warning_popup
+            .as_ref()
+            .expect("on_merged hook failure keeps its popup");
+        assert!(popup.message.contains("merged transition blocked"));
+    }
+
     /// A run-fatal global Error is still fatal. Change-local suppression must not
     /// downgrade the one event that means the run was actually invalidated.
     #[test]
@@ -1060,6 +1222,10 @@ mod tests {
             error: exhaustion_detail(),
         });
         assert_ne!(app.execution_mode, AppExecutionMode::Error);
+        assert!(
+            app.warning_popup.is_none(),
+            "the non-modal change-scoped path must not leave an overlay behind"
+        );
 
         app.handle_orchestrator_event(OrchestratorEvent::Error {
             message: "Background merge failed for 'alpha' (workspace 'ws-alpha'): base branch could not be identified".to_string(),
