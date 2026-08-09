@@ -1164,6 +1164,17 @@ mod tests {
                         attached.clone(),
                     ],
                 )
+                // Production binds both halves to this one owner, and mark
+                // reconciliation is what makes an event-driven revocation and an
+                // operator mark write the same value. A harness that bound only
+                // the mode would let a test assert a mark state the process
+                // never actually reaches.
+                .with_mark_reconciler(Some(
+                    crate::orchestration::mark_reconciliation::ExecutionMarkReconciler::new(
+                        marks.clone(),
+                        parallel.clone(),
+                    ),
+                ))
                 .with_core_mode(Some(core_mode.clone())),
             );
             let revisions = Arc::new(AttachedRevisions::default());

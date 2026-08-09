@@ -165,6 +165,14 @@ struct Effects {
 }
 
 impl Wired {
+    fn row(&self, change_id: &str) -> &crate::tui::state::ChangeState {
+        self.app
+            .changes
+            .iter()
+            .find(|change| change.id == change_id)
+            .expect("the arranged change exists")
+    }
+
     async fn shared_effects(&self) -> SharedEffects {
         let (statuses, reducer_queue) = {
             let guard = self.harness.state.read().await;
@@ -1404,4 +1412,146 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             case.name
         );
     }
+}
+
+// ============================================================================
+// Change-scoped failure vs. process mode
+// ============================================================================
+
+/// One change failing must not disable the mark controls of the whole process.
+///
+/// Driven through the authoritative dispatcher and a whole runner frame — event
+/// dispatch, reducer transition, mark reconciliation, frontend delivery, Core
+/// mode adoption — because the incident lived *between* those steps: the TUI row
+/// handler already kept the mode, and the next frame then adopted a Core mode
+/// that had promoted the change-scoped failure to process-wide Error. Calling
+/// the row handler alone would have passed throughout the bug.
+#[tokio::test]
+async fn processing_error_keeps_bulk_mark_available() {
+    const RUNNING_RUN: [&str; 3] = ["alpha", "beta", "gamma"];
+
+    let harness = AdapterHarness::new(&RUNNING_RUN);
+    {
+        let mut guard = harness.state.write().await;
+        for id in ["alpha", "beta"] {
+            guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                id.to_string(),
+            ));
+        }
+        // `alpha` is the change that is really executing when it fails.
+        guard.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "alpha".to_string(),
+            command: "apply".to_string(),
+        });
+    }
+    harness
+        .marks
+        .replace(["alpha".to_string(), "beta".to_string()]);
+
+    let mut app = harness.app(&RUNNING_RUN);
+    app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
+    app.sync_execution_marks_from_store();
+    let mut wired = wired(&RUNNING_RUN, AppExecutionMode::Running, harness, app).await;
+
+    // The authoritative dispatch: one reducer transition, one mark
+    // reconciliation, one delivery to each frontend.
+    wired
+        .harness
+        .dispatcher
+        .dispatch(ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "acceptance command attempts exhausted".to_string(),
+        })
+        .await;
+    // The rest of the frame, including the per-frame Core-mode adoption that
+    // used to overwrite the row handler's correct answer.
+    wired.harness.deliver(&mut wired.app).await;
+
+    assert_eq!(
+        wired.harness.core_mode.get(),
+        crate::orchestration::operator_command::OperatorMode::Running,
+        "a change-scoped failure leaves the one process mode alone"
+    );
+    assert_eq!(
+        wired.app.execution_mode,
+        AppExecutionMode::Running,
+        "so the frame the TUI adopts stays Running"
+    );
+    assert_eq!(
+        wired.web.get_state().await.app_mode,
+        "running",
+        "and the other frontend agrees at the same dispatch"
+    );
+    assert_eq!(
+        wired.harness.status("alpha").await,
+        "error",
+        "the failed change still receives its change-level Error transition"
+    );
+    assert!(
+        !wired.harness.marks.is_marked("alpha"),
+        "and its stale execution intent is revoked by the same dispatch"
+    );
+    assert!(
+        !wired.row("alpha").selected,
+        "the row follows the reconciled store rather than its stale cache"
+    );
+    assert!(
+        wired.harness.marks.is_marked("beta"),
+        "an unrelated change's mark is untouched by another change's failure"
+    );
+
+    // `x`, exactly as the runner drives it: the key handler plans and records
+    // target-scoped mark writes, the loop applies them through the shared
+    // service, then feeds the emitted queue commands back through it.
+    let commands = wired.app.toggle_all_marks();
+    for (change_id, marked) in wired.app.take_pending_mark_writes() {
+        wired
+            .harness
+            .run_control
+            .operator()
+            .apply_execution_mark(&change_id, marked)
+            .await;
+    }
+    wired.app.sync_execution_marks_from_store();
+    for command in commands {
+        wired.harness.run(&mut wired.app, command).await;
+    }
+
+    let report = wired.app.warning_message.clone().unwrap_or_default();
+    assert!(
+        !report.contains("recovery is owned by retry"),
+        "the Error-mode bulk rejection must not fire for a change-scoped failure: {report}"
+    );
+    assert!(
+        !report.contains("Error mode"),
+        "and no Error-mode block of any wording may be reported: {report}"
+    );
+
+    // The unrelated eligible row really moved, under the ordinary Running plan:
+    // `gamma` was the one unmarked eligible row, so the plan marks every
+    // eligible row and carries its queue intent with it.
+    assert!(
+        wired.harness.marks.is_marked("gamma"),
+        "an unrelated eligible row is still bulk-markable"
+    );
+    assert!(wired.row("gamma").selected);
+    assert_eq!(
+        wired.harness.status("gamma").await,
+        "queued",
+        "and its Running-mode queue intent was committed too"
+    );
+    assert!(
+        wired.harness.marks.is_marked("beta"),
+        "an already-marked eligible row keeps its mark"
+    );
+
+    // `alpha` is governed by the existing Running-mode rules for an error row —
+    // the explicit-retry mark alias — rather than by anything this change added.
+    // What the change removed is the process-wide Error mode that would have
+    // refused the whole operation before any row was classified.
+    assert_eq!(
+        wired.harness.status("alpha").await,
+        "error",
+        "the failed change stays in change-level Error"
+    );
 }

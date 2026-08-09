@@ -186,7 +186,13 @@ impl CoreMode {
             ExecutionEvent::Stopping => OperatorMode::Stopping,
             ExecutionEvent::Stopped => OperatorMode::Stopped,
             ExecutionEvent::Error { .. } => OperatorMode::Error,
-            ExecutionEvent::ProcessingError { .. } => OperatorMode::Error,
+            // A change-scoped failure. The reducer records terminal Error on
+            // that one change and mark reconciliation revokes its stale
+            // execution intent; the *process* is not what failed, so admission
+            // mode is left exactly where it was. Promoting it here is what made
+            // one exhausted acceptance command disable ordinary mark controls
+            // for every unrelated change still running.
+            ExecutionEvent::ProcessingError { .. } => return None,
             // A persistent scheduler parked with nothing left to execute. Ready
             // here describes a *live* scheduler, so the shared guard applies:
             // only a running process becomes Ready, and pre-run Select, a
@@ -247,6 +253,100 @@ impl CoreMode {
         let changed = guard.mode != next;
         guard.mode = next;
         changed.then_some(next)
+    }
+}
+
+/// The typed scope of the two failure events, at the one place that decides it.
+///
+/// Unit-scoped: [`CoreMode`] alone, over constructed events. No reducer, no
+/// frontend, no process, no repository.
+#[cfg(test)]
+mod core_mode_scope_tests {
+    use super::*;
+
+    fn processing_error() -> ExecutionEvent {
+        ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "acceptance command attempts exhausted".to_string(),
+        }
+    }
+
+    /// A change-scoped failure preserves whatever process mode it arrived in.
+    ///
+    /// Every mode is exercised, not just Running: the incident was Running, but
+    /// a mapping that promoted the event from one mode and not another would be
+    /// a second, quieter version of the same bug.
+    #[test]
+    fn processing_error_preserves_shared_mode() {
+        for mode in [
+            OperatorMode::Select,
+            OperatorMode::Running,
+            OperatorMode::Stopping,
+            OperatorMode::Stopped,
+            OperatorMode::Error,
+        ] {
+            let core = CoreMode::new();
+            core.set(mode);
+
+            assert_eq!(
+                core.apply_event(&processing_error()),
+                None,
+                "a change-scoped failure moves no process mode (from {mode:?})"
+            );
+            assert_eq!(
+                core.get(),
+                mode,
+                "the process mode must be exactly the one that existed before the event"
+            );
+        }
+    }
+
+    /// The idle-episode qualifier is a process fact too, so it survives as well.
+    ///
+    /// Observed through the command it actually qualifies: a stop withdrawn from
+    /// persistent-idle Ready returns to Ready, and would claim Running instead if
+    /// a change-local failure had closed the episode.
+    #[test]
+    fn processing_error_preserves_shared_mode_persistent_idle_episode() {
+        let core = CoreMode::new();
+        core.set(OperatorMode::Select);
+        core.set_persistent_idle(true);
+
+        assert_eq!(core.apply_event(&processing_error()), None);
+
+        assert_eq!(
+            core.apply_event(&ExecutionEvent::OperatorCommandApplied {
+                effect: OperatorCommandEffect::StopCancelled,
+            }),
+            None,
+            "the withdrawn stop returns to the Ready the episode still describes"
+        );
+        assert_eq!(core.get(), OperatorMode::Select);
+    }
+
+    /// The fatal control: suppressing every Error transition would also pass the
+    /// test above, so the one event that really means the run died is asserted
+    /// from the same starting modes.
+    #[test]
+    fn processing_error_preserves_shared_mode_fatal_control_still_transitions() {
+        for mode in [
+            OperatorMode::Select,
+            OperatorMode::Running,
+            OperatorMode::Stopping,
+            OperatorMode::Stopped,
+        ] {
+            let core = CoreMode::new();
+            core.set(mode);
+
+            assert_eq!(
+                core.apply_event(&ExecutionEvent::Error {
+                    message: "the orchestrator could not start".to_string(),
+                }),
+                Some(OperatorMode::Error),
+                "a global Error is process-fatal (from {mode:?})"
+            );
+            assert_eq!(core.get(), OperatorMode::Error);
+        }
     }
 }
 
