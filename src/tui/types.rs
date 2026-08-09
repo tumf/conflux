@@ -37,6 +37,53 @@ pub enum StopMode {
     ForceStopped,
 }
 
+/// Workspace dirty observation the local TUI header reports.
+///
+/// Three states, because "not observed yet" and "observed clean" are different
+/// facts. Collapsing them into a boolean would make an unfinished — or failed —
+/// `git status` read indistinguishable from a repository that was actually
+/// checked and found clean, and the badge's whole job is to be truthful about
+/// what was observed.
+///
+/// Process-local presentation state only, in the sense the constitution allows:
+/// it is discarded on restart and never reaches the orchestration reducer,
+/// durable state, command admission, queue selection, scheduler dispatch,
+/// resume routing, acceptance, archive, or merge decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceDirtyState {
+    /// No successful observation has completed yet.
+    ///
+    /// This is not a cleanliness claim, and it must never be read as one.
+    #[default]
+    Unknown,
+    /// The last successful observation found no staged, unstaged, or untracked change.
+    Clean,
+    /// The last successful observation found staged, unstaged, or untracked work.
+    Dirty,
+}
+
+impl WorkspaceDirtyState {
+    /// Classify one *successful* dirty-state read.
+    ///
+    /// Only a completed observation reaches this constructor: a failed read has
+    /// no answer to classify, so it must leave the previous value alone instead.
+    pub fn observed(dirty: bool) -> Self {
+        if dirty {
+            WorkspaceDirtyState::Dirty
+        } else {
+            WorkspaceDirtyState::Clean
+        }
+    }
+
+    /// Whether the header renders the `[dirty]` badge.
+    ///
+    /// `Unknown` omits it exactly like `Clean` does, but for the opposite
+    /// reason: there is nothing to report yet, not nothing to report.
+    pub fn shows_dirty_badge(self) -> bool {
+        matches!(self, WorkspaceDirtyState::Dirty)
+    }
+}
+
 /// Orchestration execution mode of the TUI.
 ///
 /// This axis carries lifecycle state only. Transient overlays that own input and

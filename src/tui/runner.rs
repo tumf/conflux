@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::command_handlers::{handle_tui_command, TuiCommandContext};
-use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
+use super::events::{LogEntry, OrchestratorEvent, TuiCommand, TuiRefreshObservation};
 use super::key_handlers::{handle_key_event, KeyEventContext};
 use super::lifecycle::TuiLifecycleSnapshot;
 use super::log_deduplicator;
@@ -51,6 +51,44 @@ fn should_skip_local_refresh(repo_root: &Path, stale_refresh_root_warned: &mut b
 
     *stale_refresh_root_warned = false;
     false
+}
+
+/// Observe workspace dirty state for one auto-refresh tick.
+///
+/// The predicate is the shared read-only one
+/// ([`crate::vcs::git::commands::has_uncommitted_changes`]), so the header
+/// counts staged, unstaged, and untracked work and excludes ignored files under
+/// the same explicit untracked/ignored modes every other dirty-state consumer
+/// gets — repository or user `status.showUntrackedFiles` configuration cannot
+/// make untracked work report as clean here either.
+///
+/// A failed read returns `None` rather than a value. There is no third answer to
+/// publish: the caller keeps its last successful observation instead of turning
+/// an unobservable workspace into a clean one. The warning is bounded the same
+/// way the stale-root warning above is — once per failure episode, cleared by
+/// the next success — so a persistently unreadable repository cannot fill the
+/// log at the refresh cadence.
+async fn observe_workspace_dirty(
+    repo_root: &Path,
+    dirty_observation_warned: &mut bool,
+) -> Option<TuiRefreshObservation> {
+    match crate::vcs::git::commands::has_uncommitted_changes(repo_root).await {
+        Ok((dirty, _status)) => {
+            *dirty_observation_warned = false;
+            Some(TuiRefreshObservation::WorkspaceDirty { dirty })
+        }
+        Err(err) => {
+            if !*dirty_observation_warned {
+                *dirty_observation_warned = true;
+                warn!(
+                    repo_root = %repo_root.display(),
+                    error = %err,
+                    "Failed to observe workspace dirty state: keeping the last successful observation"
+                );
+            }
+            None
+        }
+    }
 }
 
 fn refresh_local_changes(repo_root: &Path) -> Result<(Vec<Change>, Vec<Change>)> {
@@ -722,6 +760,12 @@ async fn run_tui_loop(
     let refresh_repo_root = repo_root.clone();
     let refresh_worktree_base_dir = worktree_base_dir.clone();
     let refresh_config = config.clone();
+    // Presentation-only observations from the same refresh tick. They travel on
+    // their own channel rather than as an `ExecutionEvent` precisely because
+    // they are not workflow facts: no reducer transition, no operator snapshot
+    // revision, and no `/api/v2` event is owed for them.
+    let (refresh_observation_tx, mut refresh_observation_rx) =
+        mpsc::channel::<TuiRefreshObservation>(16);
     let refresh_handle = tokio::spawn(async move {
         let worktree_manager = GitWorkspaceManager::new(
             refresh_worktree_base_dir,
@@ -730,6 +774,7 @@ async fn run_tui_loop(
             refresh_config,
         );
         let mut stale_refresh_root_warned = false;
+        let mut dirty_observation_warned = false;
         let mut interval = tokio::time::interval(Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS));
         loop {
             tokio::select! {
@@ -742,6 +787,21 @@ async fn run_tui_loop(
                         &mut stale_refresh_root_warned,
                     ) {
                         continue;
+                    }
+
+                    // The captured startup root, not the process current
+                    // directory: a `cd` elsewhere in this process must not
+                    // silently retarget what the header reports.
+                    if let Some(observation) = observe_workspace_dirty(
+                        &refresh_repo_root,
+                        &mut dirty_observation_warned,
+                    )
+                    .await
+                    {
+                        // A closed receiver means the render loop is gone, so
+                        // the badge has no consumer left; the refresh task keeps
+                        // serving its orchestration duties regardless.
+                        let _ = refresh_observation_tx.send(observation).await;
                     }
 
                     match refresh_local_changes(&refresh_repo_root) {
@@ -1011,6 +1071,13 @@ async fn run_tui_loop(
             app.handle_orchestrator_event(event);
         }
 
+        // Presentation-only refresh observations. They are drained on their own
+        // because they own no reducer transition: nothing above needs to run for
+        // them, and nothing below may change because of them.
+        while let Ok(observation) = refresh_observation_rx.try_recv() {
+            app.adopt_workspace_dirty_observation(observation);
+        }
+
         // TUI command submissions. The coordinator work runs off this loop, so
         // neither the application gate nor a termination waiter is ever awaited
         // inside event processing or rendering; accepted outcomes return through
@@ -1100,15 +1167,16 @@ async fn run_tui_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_refresh_root_usable, refresh_local_changes, should_apply_event_to_tui_reducer,
-        shutdown_local_orchestrator_task, LocalOrchestratorShutdownOutcome,
+        is_refresh_root_usable, observe_workspace_dirty, refresh_local_changes,
+        should_apply_event_to_tui_reducer, shutdown_local_orchestrator_task,
+        LocalOrchestratorShutdownOutcome,
     };
-    use super::{AppState, OrchestratorEvent};
+    use super::{AppState, OrchestratorEvent, TuiRefreshObservation};
     use crate::events::{ExecutionEvent, RejectionOutcome, StalledBlocker};
     use crate::openspec::{Change, ProposalMetadata};
     use crate::vcs::WorkspaceStatus;
     use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -1682,6 +1750,202 @@ mod tests {
         assert_eq!(
             rejected.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["change-rejected"]
+        );
+    }
+
+    async fn run_git_ok(cwd: &Path, args: &[&str]) {
+        let output = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .await
+            .expect("git command should start");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A committed repository with deterministic identity, so `git status` has a
+    /// HEAD to compare against and inherits no developer configuration.
+    async fn init_dirty_state_repo(root: &Path) {
+        run_git_ok(root, &["init", "-b", "main"]).await;
+        run_git_ok(root, &["config", "user.email", "test@example.com"]).await;
+        run_git_ok(root, &["config", "user.name", "Test User"]).await;
+        std::fs::write(root.join("tracked.txt"), "base\n").expect("tracked file");
+        run_git_ok(root, &["add", "."]).await;
+        run_git_ok(root, &["commit", "-m", "base"]).await;
+    }
+
+    /// One refresh tick's observation, reduced to the fact the header renders.
+    async fn observed_dirty(root: &Path) -> Option<bool> {
+        let mut warned = false;
+        observe_workspace_dirty(root, &mut warned)
+            .await
+            .map(|observation| match observation {
+                TuiRefreshObservation::WorkspaceDirty { dirty } => dirty,
+            })
+    }
+
+    /// Every form of operator work the badge is supposed to catch, and the
+    /// return to clean that removes it again — on one real repository.
+    #[tokio::test]
+    async fn refresh_workspace_dirty_observes_staged_unstaged_and_untracked_work() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        init_dirty_state_repo(repo.path()).await;
+
+        assert_eq!(
+            observed_dirty(repo.path()).await,
+            Some(false),
+            "a freshly committed repository is clean"
+        );
+
+        // Staged.
+        std::fs::write(repo.path().join("staged.txt"), "staged\n").expect("staged file");
+        run_git_ok(repo.path(), &["add", "staged.txt"]).await;
+        assert_eq!(
+            observed_dirty(repo.path()).await,
+            Some(true),
+            "a staged change is dirty"
+        );
+
+        run_git_ok(repo.path(), &["reset"]).await;
+        std::fs::remove_file(repo.path().join("staged.txt")).expect("remove staged file");
+        assert_eq!(observed_dirty(repo.path()).await, Some(false));
+
+        // Unstaged tracked-file change, then the clean-after-dirty transition.
+        std::fs::write(repo.path().join("tracked.txt"), "edited\n").expect("edit tracked file");
+        assert_eq!(
+            observed_dirty(repo.path()).await,
+            Some(true),
+            "an unstaged tracked-file change is dirty"
+        );
+        run_git_ok(repo.path(), &["checkout", "--", "tracked.txt"]).await;
+        assert_eq!(
+            observed_dirty(repo.path()).await,
+            Some(false),
+            "a later successful observation reports the workspace clean again"
+        );
+
+        // Untracked, under configuration that would otherwise suppress it.
+        run_git_ok(repo.path(), &["config", "status.showUntrackedFiles", "no"]).await;
+        std::fs::write(repo.path().join("untracked.txt"), "new\n").expect("untracked file");
+        assert_eq!(
+            observed_dirty(repo.path()).await,
+            Some(true),
+            "status.showUntrackedFiles=no must not make untracked work report as clean"
+        );
+    }
+
+    /// Generated content is not operator work, so it must not raise the badge.
+    #[tokio::test]
+    async fn refresh_workspace_dirty_excludes_ignored_files() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        init_dirty_state_repo(repo.path()).await;
+        std::fs::write(repo.path().join(".gitignore"), "generated/\n").expect("gitignore");
+        run_git_ok(repo.path(), &["add", ".gitignore"]).await;
+        run_git_ok(repo.path(), &["commit", "-m", "ignore generated"]).await;
+
+        std::fs::create_dir_all(repo.path().join("generated")).expect("generated dir");
+        std::fs::write(repo.path().join("generated").join("out.txt"), "built\n")
+            .expect("generated file");
+
+        assert_eq!(
+            observed_dirty(repo.path()).await,
+            Some(false),
+            "ignored files alone are not dirty"
+        );
+    }
+
+    /// The badge reports the root the TUI captured at startup. A later process
+    /// current-directory change is not allowed to retarget it.
+    // The guard must span the awaits: it is what keeps a concurrent test from
+    // seeing the process current directory this test moves.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn refresh_workspace_dirty_uses_the_captured_root_not_the_process_cwd() {
+        let _lock = crate::test_support::cwd_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let captured = tempfile::tempdir().expect("captured tempdir");
+        let other = tempfile::tempdir().expect("other tempdir");
+        init_dirty_state_repo(captured.path()).await;
+        init_dirty_state_repo(other.path()).await;
+        std::fs::write(captured.path().join("untracked.txt"), "work\n").expect("dirty file");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(other.path()).expect("set cwd elsewhere");
+
+        let from_captured = observed_dirty(captured.path()).await;
+        let from_other = observed_dirty(other.path()).await;
+
+        std::env::set_current_dir(original_dir).expect("restore cwd");
+
+        assert_eq!(
+            from_captured,
+            Some(true),
+            "the captured root is dirty and must be what the header reports"
+        );
+        assert_eq!(
+            from_other,
+            Some(false),
+            "the process current directory is clean, which is not the observed fact"
+        );
+    }
+
+    /// A failed read has no answer, so it publishes nothing and the last
+    /// successful observation stands. The warning is bounded per failure episode.
+    #[tokio::test]
+    async fn refresh_workspace_dirty_failure_preserves_the_last_successful_observation() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        init_dirty_state_repo(repo.path()).await;
+        std::fs::write(repo.path().join("untracked.txt"), "work\n").expect("dirty file");
+
+        let mut app = AppState::new(vec![sample_change()]);
+        let mut warned = false;
+        let observation = observe_workspace_dirty(repo.path(), &mut warned)
+            .await
+            .expect("a readable repository observes");
+        app.adopt_workspace_dirty_observation(observation);
+        assert_eq!(
+            app.workspace_dirty(),
+            crate::tui::types::WorkspaceDirtyState::Dirty
+        );
+        assert!(!warned, "a successful read never warns");
+
+        // A directory that is not a Git repository at all: the read fails.
+        let unreadable = tempfile::tempdir().expect("non-repo tempdir");
+        assert!(
+            observe_workspace_dirty(unreadable.path(), &mut warned)
+                .await
+                .is_none(),
+            "a failed read must publish no observation"
+        );
+        assert!(warned, "the first failure of an episode warns");
+        assert!(observe_workspace_dirty(unreadable.path(), &mut warned)
+            .await
+            .is_none());
+        assert!(
+            warned,
+            "the repeated failure stays inside the same bounded warning"
+        );
+        assert_eq!(
+            app.workspace_dirty(),
+            crate::tui::types::WorkspaceDirtyState::Dirty,
+            "the failed reads must not have replaced the observation with clean"
+        );
+
+        // Recovery re-arms the bound, so a new failure episode is reported.
+        let recovered = observe_workspace_dirty(repo.path(), &mut warned)
+            .await
+            .expect("the readable repository observes again");
+        app.adopt_workspace_dirty_observation(recovered);
+        assert!(!warned, "a success closes the failure episode");
+        assert_eq!(
+            app.workspace_dirty(),
+            crate::tui::types::WorkspaceDirtyState::Dirty
         );
     }
 
