@@ -42,6 +42,19 @@ const MERGE_WAIT_STATUS: &str = "merge wait";
 /// Display status a change must carry before it can be started.
 const NOT_QUEUED_STATUS: &str = "not queued";
 
+/// Name every excluded target with the status that excluded it.
+///
+/// Target-specific by construction: a marked row an operator can see excluded
+/// has to be identifiable, or the diagnostic only says that *something* was
+/// dropped.
+fn describe_exclusions(excluded: &[(String, String)]) -> String {
+    excluded
+        .iter()
+        .map(|(id, status)| format!("{id} ({status})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // ============================================================================
 // Vocabulary
 // ============================================================================
@@ -677,13 +690,31 @@ impl RunControlService {
     ///
     /// This is the authoritative target set: it reads the shared execution-mark
     /// store and the reducer's display status, never a frontend's row cache.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn start_targets(&self) -> Vec<String> {
+        self.classify_start_targets().await.0
+    }
+
+    /// Split the coherent mark snapshot into startable rows and exclusions.
+    ///
+    /// Marks carry no eligibility of their own — an operator may mark any
+    /// non-terminal row at any time — so the whole run-target decision is made
+    /// here, from current reducer facts, and every excluded target is named with
+    /// the status that excluded it.
+    async fn classify_start_targets(&self) -> (Vec<String>, Vec<(String, String)>) {
         let marked = self.operator.marks().marked_ids();
         let guard = self.state.read().await;
-        marked
-            .into_iter()
-            .filter(|id| guard.display_status(id) == NOT_QUEUED_STATUS)
-            .collect()
+        let mut startable = Vec::new();
+        let mut excluded = Vec::new();
+        for id in marked {
+            let status = guard.display_status(&id);
+            if status == NOT_QUEUED_STATUS {
+                startable.push(id);
+            } else {
+                excluded.push((id, status.to_string()));
+            }
+        }
+        (startable, excluded)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -712,13 +743,15 @@ impl RunControlService {
             });
         }
 
-        let targets = self.start_targets().await;
+        let (targets, excluded) = self.classify_start_targets().await;
         if targets.is_empty() {
             return Err(RunControlError::NoEligibleTarget {
                 command: RunCommandKind::Start,
                 detail: format!(
-                    "no marked change is startable ({} marked, none with status '{NOT_QUEUED_STATUS}')",
-                    marked.len()
+                    "no marked change is startable ({} marked, none with status \
+                     '{NOT_QUEUED_STATUS}'); excluded: {}",
+                    marked.len(),
+                    describe_exclusions(&excluded)
                 ),
             });
         }
@@ -751,7 +784,24 @@ impl RunControlService {
                 detail: "no change carries an execution mark".to_string(),
             });
         }
-        self.retry_errors(&marked).await
+
+        // Only marked retry-eligible rows are routed; every other marked row is
+        // named as excluded rather than silently dropped, and a request with no
+        // runnable target is rejected before any effect.
+        let routes = self.operator.plan_retry_errors(&marked).await;
+        if routes.is_empty() {
+            let excluded = self.describe_non_retryable(&marked, &routes).await;
+            return Err(RunControlError::NoEligibleTarget {
+                command: RunCommandKind::Start,
+                detail: format!(
+                    "no marked change carries retryable evidence ({} marked); excluded: {}",
+                    marked.len(),
+                    describe_exclusions(&excluded)
+                ),
+            });
+        }
+        let plan = self.operator.commit_retry_routes(&routes).await;
+        self.dispatch_retry(plan).await
     }
 
     // ------------------------------------------------------------------
@@ -972,18 +1022,52 @@ impl RunControlService {
                 command: RunCommandKind::Start,
                 mode,
             }),
-            OperatorMode::Error => {
-                let marked = self.operator.marks().marked_ids();
-                if marked.is_empty() {
-                    return Err(RunControlError::NoEligibleTarget {
-                        command: RunCommandKind::Start,
-                        detail: "no change carries an execution mark".to_string(),
-                    });
-                }
-                self.prepare_retry_errors(&marked).await
-            }
+            OperatorMode::Error => self.prepare_start_retry().await,
             OperatorMode::Select | OperatorMode::Stopped => self.prepare_start_marked().await,
         }
+    }
+
+    /// Validate an `Error`-mode Start: route only marked retry-eligible targets.
+    ///
+    /// A marked row that carries no retryable evidence is reported as excluded
+    /// rather than silently dropped, and a request where nothing is retryable is
+    /// rejected before any reducer, retry-edge, queue, or scheduler effect.
+    async fn prepare_start_retry(&self) -> RunControlResult<PreparedRunCommand> {
+        let marked = self.operator.marks().marked_ids();
+        if marked.is_empty() {
+            return Err(RunControlError::NoEligibleTarget {
+                command: RunCommandKind::Start,
+                detail: "no change carries an execution mark".to_string(),
+            });
+        }
+
+        let routes = self.operator.plan_retry_errors(&marked).await;
+        if routes.is_empty() {
+            let excluded = self.describe_non_retryable(&marked, &routes).await;
+            return Err(RunControlError::NoEligibleTarget {
+                command: RunCommandKind::Start,
+                detail: format!(
+                    "no marked change carries retryable evidence ({} marked); excluded: {}",
+                    marked.len(),
+                    describe_exclusions(&excluded)
+                ),
+            });
+        }
+        self.prepare_routes(routes).await
+    }
+
+    /// Name every marked target the retry classification did not accept.
+    async fn describe_non_retryable(
+        &self,
+        marked: &[String],
+        routes: &[(String, RetryRoute)],
+    ) -> Vec<(String, String)> {
+        let guard = self.state.read().await;
+        marked
+            .iter()
+            .filter(|id| !routes.iter().any(|(routed, _)| routed == *id))
+            .map(|id| (id.clone(), guard.display_status(id).to_string()))
+            .collect()
     }
 
     async fn prepare_start_marked(&self) -> RunControlResult<PreparedRunCommand> {
@@ -1011,13 +1095,18 @@ impl RunControlService {
             });
         }
 
-        let targets = self.start_targets().await;
+        // Status classification happens here, at final admission, from current
+        // reducer facts — never from an eligibility result recorded at mark
+        // time. Excluded rows are named but do not block the runnable subset.
+        let (targets, excluded) = self.classify_start_targets().await;
         if targets.is_empty() {
             return Err(RunControlError::NoEligibleTarget {
                 command: RunCommandKind::Start,
                 detail: format!(
-                    "no marked change is startable ({} marked, none with status '{NOT_QUEUED_STATUS}')",
-                    marked.len()
+                    "no marked change is startable ({} marked, none with status \
+                     '{NOT_QUEUED_STATUS}'); excluded: {}",
+                    marked.len(),
+                    describe_exclusions(&excluded)
                 ),
             });
         }

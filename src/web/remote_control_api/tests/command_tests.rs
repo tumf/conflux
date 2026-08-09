@@ -7,7 +7,7 @@ use chrono::Utc;
 use serde_json::json;
 
 use crate::orchestration::operator_command::{
-    MarkRoute, OperatorCommandError, OperatorMode, OperatorOutcome, QueueMutation, QueueOutcome,
+    OperatorCommandError, OperatorMode, OperatorOutcome, QueueMutation, QueueOutcome,
     RetryPlan,
 };
 use crate::web::remote_control_api::dto::{
@@ -439,30 +439,6 @@ async fn commands_are_refused_while_no_orchestration_runtime_is_bound() {
 
 #[test]
 fn shared_service_refusals_map_to_distinguishable_error_codes() {
-    let mark_in_error_mode = OperatorCommandError::MarkNotAllowed {
-        change_id: "c1".to_string(),
-        mode: OperatorMode::Error,
-        route: MarkRoute::RetryRequired,
-        display_status: "error".to_string(),
-    };
-    assert_eq!(
-        map_operator_error(&mark_in_error_mode).error_code,
-        ErrorCode::LifecycleConflict,
-        "Error mode is a run-level condition the operator resolves with retry"
-    );
-
-    let immutable_row = OperatorCommandError::MarkNotAllowed {
-        change_id: "c1".to_string(),
-        mode: OperatorMode::Running,
-        route: MarkRoute::Immutable,
-        display_status: "archived".to_string(),
-    };
-    assert_eq!(
-        map_operator_error(&immutable_row).error_code,
-        ErrorCode::TargetIneligible,
-        "an immutable row is about the target, not the run"
-    );
-
     assert_eq!(
         map_operator_error(&OperatorCommandError::MissingCancellationHandle {
             change_id: "c1".to_string()

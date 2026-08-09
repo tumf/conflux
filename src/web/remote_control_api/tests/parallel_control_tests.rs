@@ -702,13 +702,13 @@ async fn a_second_bulk_mark_waits_for_the_in_flight_one_instead_of_interleaving(
     // The first mutation parks inside its queue effect, holding the guard.
     let first = tokio::spawn({
         let service = wired.service.clone();
-        async move { service.set_all_execution_marks(OperatorMode::Running).await }
+        async move { service.set_all_execution_marks().await }
     });
     queue.parked().await;
 
     let mut second = tokio::spawn({
         let service = wired.service.clone();
-        async move { service.set_all_execution_marks(OperatorMode::Running).await }
+        async move { service.set_all_execution_marks().await }
     });
     let raced = settled_early(&mut second, "Running mode accepts a bulk mark").await;
     assert!(

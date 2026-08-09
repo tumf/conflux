@@ -866,9 +866,9 @@ pub async fn handle_key_event(
             handle_cursor_movement(ctx.app, false);
         }
         (KeyCode::Char(' '), _) => {
-            if let Some(cmd) = ctx.app.toggle_selection() {
-                let _ = ctx.cmd_tx.send(cmd).await;
-            }
+            // Marks are process-local intent, so this emits no command at all:
+            // the pending mark write is drained through the shared store.
+            ctx.app.toggle_selection();
         }
         (KeyCode::Char('x'), _) => {
             for cmd in handle_bulk_toggle_key(ctx.app) {

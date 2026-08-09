@@ -335,7 +335,7 @@ async fn duplicate_failure_after_remark_preserves_fresh_intent() {
         let operator_mode = harness.app.operator_mode();
         harness
             .operator
-            .set_execution_mark(operator_mode, "alpha", true)
+            .set_execution_mark("alpha", true)
             .await
             .unwrap_or_else(|error| {
                 panic!("{name}: a steady recovery row must accept a fresh mark: {error}")

@@ -200,56 +200,96 @@ impl OperatorMode {
     }
 }
 
-/// How an execution-mark request must be routed for a mode/status pair.
+/// Whether one row accepts execution-mark mutation.
+///
+/// This is the *whole* mark admission rule. Execution mode, active/retry/wait
+/// status, Apply iteration-limit evidence, queue intent, and parallel
+/// eligibility are deliberately absent: a mark says nothing more than "consider
+/// this change the next time a run command evaluates targets", and whether that
+/// run may actually start is decided at final start/retry admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MarkRoute {
-    /// Mutate the process-local execution mark only; no reducer or queue effect.
-    MarkOnly,
-    /// Translate the mark into dynamic queue intent (add/remove).
-    QueueIntent,
+pub enum MarkAdmission {
+    /// A visible non-terminal target: mark mutation is allowed.
+    Allowed,
+    /// Archived, merged, pushed, or rejected: the row is not a run candidate.
+    TerminalTarget,
+}
+
+impl MarkAdmission {
+    /// True when the row accepts mark mutation.
+    pub fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
+/// Decide whether an execution-mark request may mutate this row.
+///
+/// The single classifier shared by TUI single-row marks, TUI bulk marks, and
+/// the `/api/v2` `set_execution_mark` / `set_all_execution_marks` commands, so
+/// no frontend can hold a second markability table.
+pub fn classify_mark_admission(display_status: &str) -> MarkAdmission {
+    if is_final_status(display_status) {
+        MarkAdmission::TerminalTarget
+    } else {
+        MarkAdmission::Allowed
+    }
+}
+
+/// True when the row is a visible non-terminal execution-mark target.
+pub fn is_markable_status(display_status: &str) -> bool {
+    classify_mark_admission(display_status).is_allowed()
+}
+
+/// How an *explicit* queue command must be routed for a mode/status pair.
+///
+/// This is the DynamicQueue lifecycle matrix, and it is reachable only from a
+/// client that intentionally invokes a queue command. Execution marks no longer
+/// alias onto it: Space and bulk `x` write marks and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueIntentRoute {
+    /// The mode/status pair has no runtime queue membership to mutate.
+    NoQueueEffect,
+    /// Dynamic queue intent (add/remove) may be mutated.
+    Mutable,
     /// Reject: recovery in this mode is owned by retry commands.
     RetryRequired,
-    /// Reject: the row cannot be mutated by mark or queue intent.
+    /// Reject: the row's queue membership cannot be mutated.
     Immutable,
 }
 
-/// Decide how an execution-mark request must be handled.
-///
-/// This is the single lifecycle matrix shared by every frontend. It mirrors the
-/// TUI key semantics that existed before the service was introduced, so moving
-/// a frontend onto the service cannot silently change operator behavior.
-pub fn classify_mark_route(mode: OperatorMode, display_status: &str) -> MarkRoute {
+/// Decide how an explicit queue-intent request must be handled.
+pub fn classify_queue_intent_route(mode: OperatorMode, display_status: &str) -> QueueIntentRoute {
     if is_final_status(display_status) {
-        return MarkRoute::Immutable;
+        return QueueIntentRoute::Immutable;
     }
 
     match mode {
-        // Error mode never mutates marks: `retry_change` / `retry_errors` own recovery.
-        OperatorMode::Error => MarkRoute::RetryRequired,
-        // Select mode has no runtime queue yet, so marks are pure operator intent.
-        OperatorMode::Select => MarkRoute::MarkOnly,
-        // A pending graceful stop is a transition; intent changes wait for it.
-        OperatorMode::Stopping => MarkRoute::Immutable,
+        // Error mode never mutates queue intent: `retry_change` / `retry_errors` own recovery.
+        OperatorMode::Error => QueueIntentRoute::RetryRequired,
+        // Select mode has no runtime queue yet.
+        OperatorMode::Select => QueueIntentRoute::NoQueueEffect,
+        // A pending graceful stop is a transition; queue changes wait for it.
+        OperatorMode::Stopping => QueueIntentRoute::Immutable,
         OperatorMode::Stopped => {
             if matches!(display_status, "not queued" | "error")
                 || MARK_ONLY_WAIT_STATUSES.contains(&display_status)
             {
-                MarkRoute::MarkOnly
+                QueueIntentRoute::NoQueueEffect
             } else {
-                MarkRoute::Immutable
+                QueueIntentRoute::Immutable
             }
         }
         OperatorMode::Running => {
             if MARK_ONLY_WAIT_STATUSES.contains(&display_status) {
-                return MarkRoute::MarkOnly;
+                return QueueIntentRoute::NoQueueEffect;
             }
             if is_active_status(display_status) {
-                // Active rows are stopped through `StopAndDequeue`, not through marks.
-                return MarkRoute::Immutable;
+                // Active rows are stopped through `StopAndDequeue`.
+                return QueueIntentRoute::Immutable;
             }
             match display_status {
-                "not queued" | "queued" | "error" => MarkRoute::QueueIntent,
-                _ => MarkRoute::Immutable,
+                "not queued" | "queued" | "error" => QueueIntentRoute::Mutable,
+                _ => QueueIntentRoute::Immutable,
             }
         }
     }
@@ -314,8 +354,12 @@ impl ParallelEligibility {
         matches!(self, Self::UncommittedProposalFiles)
     }
 
-    /// The bulk-mark exclusion this reason produces; `None` when eligible.
-    pub fn mark_exclusion(self) -> Option<MarkExclusion> {
+    /// The action-blocked reason this observation produces; `None` when eligible.
+    ///
+    /// Execution marks no longer consult it — a temporarily ineligible row still
+    /// accepts future run intent — but explicit queue commands and start
+    /// admission do.
+    pub fn queue_exclusion(self) -> Option<MarkExclusion> {
         match self {
             Self::Eligible => None,
             Self::ProposalAbsentFromHead => Some(MarkExclusion::ParallelProposalAbsent),
@@ -400,23 +444,16 @@ impl MarkExclusion {
 
 /// One candidate row for a bulk execution-mark mutation.
 ///
-/// The caller supplies the three facts the decision needs — the reducer's
-/// display status, the server-observed parallel eligibility, and the current
-/// mark — so the classification itself stays a pure function every frontend can
-/// call with its own view of the same state.
+/// The caller supplies exactly the two facts the decision needs — the reducer's
+/// display status and the current mark. Worktree eligibility and Apply-limit
+/// evidence are deliberately *not* carried here: a classifier that cannot see
+/// them cannot let them exclude a non-terminal row from mark intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarkTargetRow<'a> {
     /// Target change.
     pub change_id: &'a str,
     /// Reducer-derived display status.
     pub display_status: &'a str,
-    /// Server-observed parallel eligibility, with its reason.
-    pub parallel_eligibility: ParallelEligibility,
-    /// True when the active run owns this change's exhausted Apply ceiling.
-    ///
-    /// Carried on the row rather than queried per row so one bulk operation
-    /// classifies against one liveness observation.
-    pub apply_iteration_limit_active: bool,
     /// Current execution mark.
     pub marked: bool,
 }
@@ -459,56 +496,14 @@ impl BulkMarkPlan {
     }
 }
 
-/// Modes where a bulk execution-mark mutation is meaningful.
-///
-/// `Error` and `Stopping` are excluded for the same reason the per-change matrix
-/// refuses them: recovery is owned by retry, and a pending stop is a transition.
-pub fn supports_bulk_marks(mode: OperatorMode) -> bool {
-    matches!(
-        mode,
-        OperatorMode::Select | OperatorMode::Running | OperatorMode::Stopped
-    )
-}
-
 /// Classify one bulk-mark candidate; `None` means it is part of the target set.
 ///
-/// Eligibility is derived from the same [`classify_mark_route`] matrix a
-/// single-row mark request goes through, so a bulk mutation can never touch a
-/// row an individual command would refuse.
-pub fn classify_bulk_mark_row(
-    mode: OperatorMode,
-    display_status: &str,
-    parallel_eligibility: ParallelEligibility,
-    apply_iteration_limit_active: bool,
-) -> Option<MarkExclusion> {
-    // Before anything else: a bulk mark that admitted this row would route it
-    // through the terminal-error `RetryError` alias, which the shared guard
-    // refuses. Excluding it here is what keeps that refusal from aborting a
-    // partially applied bulk mutation.
-    if apply_iteration_limit_active && display_status == "error" {
-        return Some(MarkExclusion::ApplyIterationLimitActive);
-    }
-
-    if !is_final_status(display_status) {
-        // The refusal is identical for every ineligible reason; only the reason
-        // reported back to the operator differs.
-        if let Some(exclusion) = parallel_eligibility.mark_exclusion() {
-            return Some(exclusion);
-        }
-    }
-
-    match classify_mark_route(mode, display_status) {
-        MarkRoute::MarkOnly | MarkRoute::QueueIntent => None,
-        MarkRoute::RetryRequired => Some(MarkExclusion::RetryRequired),
-        MarkRoute::Immutable => Some(if is_final_status(display_status) {
-            MarkExclusion::FinalStatus
-        } else if matches!(mode, OperatorMode::Stopping) {
-            MarkExclusion::StopPending
-        } else if is_active_status(display_status) {
-            MarkExclusion::ChangeActive
-        } else {
-            MarkExclusion::StatusImmutable
-        }),
+/// Exactly the same rule a single-row mark request goes through, so a bulk
+/// mutation and an individual command can never disagree about one row.
+pub fn classify_bulk_mark_row(display_status: &str) -> Option<MarkExclusion> {
+    match classify_mark_admission(display_status) {
+        MarkAdmission::Allowed => None,
+        MarkAdmission::TerminalTarget => Some(MarkExclusion::FinalStatus),
     }
 }
 
@@ -517,26 +512,13 @@ pub fn classify_bulk_mark_row(
 /// One classification pass over one coherent set of rows is what makes a bulk
 /// mutation atomic in meaning: the target state cannot shift halfway through
 /// because a row was re-read at a different instant.
-pub fn plan_bulk_marks(mode: OperatorMode, rows: &[MarkTargetRow<'_>]) -> BulkMarkPlan {
+pub fn plan_bulk_marks(rows: &[MarkTargetRow<'_>]) -> BulkMarkPlan {
     let mut eligible = Vec::new();
     let mut excluded = Vec::new();
     let mut any_unmarked = false;
 
-    if !supports_bulk_marks(mode) {
-        return BulkMarkPlan {
-            target_state: false,
-            eligible,
-            excluded,
-        };
-    }
-
     for row in rows {
-        match classify_bulk_mark_row(
-            mode,
-            row.display_status,
-            row.parallel_eligibility,
-            row.apply_iteration_limit_active,
-        ) {
+        match classify_bulk_mark_row(row.display_status) {
             Some(reason) => excluded.push((row.change_id.to_string(), reason)),
             None => {
                 any_unmarked |= !row.marked;
@@ -810,6 +792,9 @@ pub struct QueueOutcome {
 pub enum NoOpReason {
     /// The execution mark already had the requested value.
     MarkUnchanged,
+    /// The target is archived, merged, pushed, or rejected and carries no
+    /// next-run intent, so the request settles unchanged rather than failing.
+    TerminalMarkTarget,
     /// The reducer rejected the intent in the current lifecycle state.
     ReducerRejected,
     /// Every eligible row already carried the derived target mark.
@@ -881,17 +866,6 @@ impl RetryPlan {
 /// Why a command was rejected without side effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatorCommandError {
-    /// Mark mutation is not allowed for this mode/status pair.
-    MarkNotAllowed {
-        /// Target change.
-        change_id: String,
-        /// Mode the request arrived in.
-        mode: OperatorMode,
-        /// Route that rejected the request.
-        route: MarkRoute,
-        /// Display status at rejection time.
-        display_status: String,
-    },
     /// The change is active but has no registered cancellation handle.
     MissingCancellationHandle {
         /// Target change.
@@ -918,11 +892,6 @@ pub enum OperatorCommandError {
         /// Display status that carries no retryable evidence.
         display_status: String,
     },
-    /// Bulk execution-mark mutation is not available in this mode.
-    BulkMarksNotAllowed {
-        /// Mode the request arrived in.
-        mode: OperatorMode,
-    },
     /// The active run owns the change's exhausted Apply-dispatch ceiling.
     ///
     /// Refused *before* any mutation: retry cannot create budget inside the
@@ -941,16 +910,6 @@ pub enum OperatorCommandError {
 impl std::fmt::Display for OperatorCommandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MarkNotAllowed {
-                change_id,
-                mode,
-                route,
-                display_status,
-            } => write!(
-                f,
-                "execution mark for '{change_id}' is not allowed in {mode:?} mode \
-                 (status '{display_status}', route {route:?})"
-            ),
             // Inline workspace preparation is the common way to reach this: the
             // worktree is being created or `.wt/setup` is running, and neither
             // is killable. The stop request itself is still recorded, so saying
@@ -973,10 +932,6 @@ impl std::fmt::Display for OperatorCommandError {
             } => write!(
                 f,
                 "retry is not supported for '{change_id}' with status '{display_status}'"
-            ),
-            Self::BulkMarksNotAllowed { mode } => write!(
-                f,
-                "bulk execution-mark mutation is not available in {mode:?} mode"
             ),
             Self::ApplyIterationLimitActive {
                 change_id,
@@ -1333,14 +1288,17 @@ impl OperatorCommandService {
     }
 
     /// Execute a typed operator command.
+    ///
+    /// `mode` is retained for the queue and retry commands; execution marks are
+    /// lifecycle-independent and never consult it.
     pub async fn execute(
         &self,
-        mode: OperatorMode,
+        _mode: OperatorMode,
         command: OperatorCommand,
     ) -> OperatorResult<OperatorOutcome> {
         match command {
             OperatorCommand::SetExecutionMark { change_id, marked } => {
-                self.set_execution_mark(mode, &change_id, marked).await
+                self.set_execution_mark(&change_id, marked).await
             }
             OperatorCommand::AddToQueue { change_id } => self
                 .add_to_queue(&change_id)
@@ -1357,7 +1315,7 @@ impl OperatorCommandService {
                 .retry_change(&change_id)
                 .await
                 .map(OperatorOutcome::Retry),
-            OperatorCommand::SetAllExecutionMarks => self.set_all_execution_marks(mode).await,
+            OperatorCommand::SetAllExecutionMarks => self.set_all_execution_marks().await,
         }
     }
 
@@ -1377,46 +1335,38 @@ impl OperatorCommandService {
         self.marks.set(change_id, marked)
     }
 
-    /// Apply an execution-mark request through the shared lifecycle matrix.
+    /// Apply an execution-mark request.
+    ///
+    /// The only thing this touches is [`ExecutionMarkStore`]. No queue, hook,
+    /// cancellation, retry, resolve, scheduler, reducer, or mode effect exists
+    /// on this path at all — which is what makes "unmarking cannot disturb the
+    /// current run" structural rather than a rule to be re-checked.
+    ///
+    /// A terminal target settles as a reasoned unchanged no-op rather than a
+    /// refusal: the row is simply not a run candidate any more.
     pub async fn set_execution_mark(
         &self,
-        mode: OperatorMode,
         change_id: &str,
         marked: bool,
     ) -> OperatorResult<OperatorOutcome> {
         let _mutation = self.parallel.lock_mutations().await;
         let display_status = self.display_status(change_id).await;
-        match classify_mark_route(mode, &display_status) {
-            MarkRoute::MarkOnly => {
-                if self.marks.set(change_id, marked) {
-                    Ok(OperatorOutcome::MarkSet {
-                        change_id: change_id.to_string(),
-                        marked,
-                    })
-                } else {
-                    Ok(OperatorOutcome::NoOp {
-                        change_id: change_id.to_string(),
-                        reason: NoOpReason::MarkUnchanged,
-                    })
-                }
-            }
-            MarkRoute::QueueIntent => {
-                let outcome = if marked {
-                    self.add_to_queue(change_id).await?
-                } else {
-                    self.remove_from_queue(change_id).await?
-                };
-                self.marks.set(change_id, marked);
-                Ok(OperatorOutcome::Queue(outcome))
-            }
-            route @ (MarkRoute::RetryRequired | MarkRoute::Immutable) => {
-                Err(OperatorCommandError::MarkNotAllowed {
-                    change_id: change_id.to_string(),
-                    mode,
-                    route,
-                    display_status,
-                })
-            }
+        if !is_markable_status(&display_status) {
+            return Ok(OperatorOutcome::NoOp {
+                change_id: change_id.to_string(),
+                reason: NoOpReason::TerminalMarkTarget,
+            });
+        }
+        if self.marks.set(change_id, marked) {
+            Ok(OperatorOutcome::MarkSet {
+                change_id: change_id.to_string(),
+                marked,
+            })
+        } else {
+            Ok(OperatorOutcome::NoOp {
+                change_id: change_id.to_string(),
+                reason: NoOpReason::MarkUnchanged,
+            })
         }
     }
 
@@ -1429,52 +1379,38 @@ impl OperatorCommandService {
     /// silently skipped.
     ///
     /// Classification and application are one mutation under the shared guard,
-    /// so the toggle this reads cannot move — and its cleanup cannot run —
-    /// while the plan derived from it is still being applied.
-    pub async fn set_all_execution_marks(
-        &self,
-        mode: OperatorMode,
-    ) -> OperatorResult<OperatorOutcome> {
-        if !supports_bulk_marks(mode) {
-            return Err(OperatorCommandError::BulkMarksNotAllowed { mode });
-        }
-
+    /// so the row set this reads cannot move — and event reconciliation cannot
+    /// run — while the plan derived from it is still being applied.
+    ///
+    /// Like the single-row path, this writes marks and nothing else, in every
+    /// execution mode.
+    pub async fn set_all_execution_marks(&self) -> OperatorResult<OperatorOutcome> {
         let _mutation = self.parallel.lock_mutations().await;
 
         // One read, one classification: re-reading per row could observe two
-        // different instants and derive a target state from neither. The
-        // active-limit set is taken from the same read for the same reason.
-        let observed: Vec<(String, String, ParallelEligibility, bool, bool)> = {
+        // different instants and derive a target state from neither.
+        let observed: Vec<(String, String, bool)> = {
             let guard = self.state.read().await;
-            let limited = active_apply_iteration_limited_ids(&guard, self.boundary());
             guard
                 .tracked_change_ids()
                 .into_iter()
                 .map(|change_id| {
                     let display_status = guard.display_status(&change_id).to_string();
-                    let eligibility = self.parallel.eligibility(&change_id);
                     let marked = self.marks.is_marked(&change_id);
-                    let limit_active = limited.contains(&change_id);
-                    (change_id, display_status, eligibility, limit_active, marked)
+                    (change_id, display_status, marked)
                 })
                 .collect()
         };
 
         let rows: Vec<MarkTargetRow<'_>> = observed
             .iter()
-            .map(
-                |(change_id, display_status, parallel_eligibility, limit_active, marked)| {
-                    MarkTargetRow {
-                        change_id,
-                        display_status,
-                        parallel_eligibility: *parallel_eligibility,
-                        apply_iteration_limit_active: *limit_active,
-                        marked: *marked,
-                    }
-                },
-            )
+            .map(|(change_id, display_status, marked)| MarkTargetRow {
+                change_id,
+                display_status,
+                marked: *marked,
+            })
             .collect();
-        let plan = plan_bulk_marks(mode, &rows);
+        let plan = plan_bulk_marks(&rows);
 
         if plan.is_empty() {
             return Ok(OperatorOutcome::NoOp {
@@ -1485,33 +1421,8 @@ impl OperatorCommandService {
 
         let mut changed = Vec::new();
         for change_id in &plan.eligible {
-            let display_status = observed
-                .iter()
-                .find(|(id, ..)| id == change_id)
-                .map(|(_, status, ..)| status.as_str())
-                .unwrap_or("not queued");
-            // The route comes from the classified snapshot, not from a second
-            // read, so a status that moved mid-operation cannot reroute a row
-            // the plan already accepted.
-            match classify_mark_route(mode, display_status) {
-                MarkRoute::MarkOnly => {
-                    if self.marks.set(change_id, plan.target_state) {
-                        changed.push(change_id.clone());
-                    }
-                }
-                MarkRoute::QueueIntent => {
-                    let outcome = if plan.target_state {
-                        self.add_to_queue(change_id).await?
-                    } else {
-                        self.remove_from_queue(change_id).await?
-                    };
-                    let mark_changed = self.marks.set(change_id, plan.target_state);
-                    if mark_changed || outcome.reducer_changed || outcome.dynamic_queue_mutated {
-                        changed.push(change_id.clone());
-                    }
-                }
-                // `plan_bulk_marks` only admits the two routes above.
-                MarkRoute::RetryRequired | MarkRoute::Immutable => {}
+            if self.marks.set(change_id, plan.target_state) {
+                changed.push(change_id.clone());
             }
         }
 

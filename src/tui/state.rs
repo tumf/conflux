@@ -1503,50 +1503,40 @@ impl AppState {
         worktree_action_logic::request_merge_worktree_branch(self)
     }
 
-    /// Toggle selection of the current change
+    /// Toggle the cursor row's execution mark.
     ///
-    /// In Select mode:
-    /// - Changes can be toggled between selected/unselected
-    ///
-    /// In Running/Completed mode:
-    /// - Changes can be added to or removed from the queue
-    pub fn toggle_selection(&mut self) -> Option<TuiCommand> {
+    /// Available for every visible non-terminal row in every execution mode. It
+    /// writes only process-local next-run intent: no queue mutation, no stop,
+    /// no retry, no display-status transition. Terminal rows are silent no-ops.
+    pub fn toggle_selection(&mut self) {
         selection_logic::toggle_selection(self)
     }
 
     fn can_bulk_toggle_change(&self, change: &ChangeState) -> bool {
-        selection_logic::can_bulk_toggle_change(self.execution_mode, change)
+        selection_logic::can_bulk_toggle_change(change)
     }
 
     /// Returns true when at least one change can be targeted by bulk toggle.
     ///
     /// Mirrors the admission `toggle_all_marks` enforces — Changes view, no
-    /// overlay owning input, and a mode the shared lifecycle matrix admits — so
-    /// the `x` hint is never offered for a key that would be refused.
+    /// overlay owning input, and at least one visible non-terminal row — so the
+    /// `x` hint is never offered for a key that would do nothing. Execution mode
+    /// is deliberately not part of it.
     pub fn has_bulk_toggle_targets(&self) -> bool {
         self.view_mode == ViewMode::Changes
             && !self.has_overlay()
-            && selection_logic::is_bulk_toggle_mode(&self.execution_mode)
             && self
                 .changes
                 .iter()
                 .any(|change| self.can_bulk_toggle_change(change))
     }
 
-    /// Toggle all marks (select/unselect all eligible changes)
+    /// Apply one derived execution-mark state to every visible non-terminal row.
     ///
-    /// In Select/Stopped/Running modes:
-    /// - If any eligible unmarked change exists, mark all eligible changes
-    /// - Otherwise, unmark all eligible changes
-    ///
-    /// Running mode excludes active rows to avoid emitting stop requests.
-    /// Running mode emits `AddToQueue`/`RemoveFromQueue` commands for
-    /// `NotQueued`/`Queued` rows (same semantics as single-row Space).
-    /// `MergeWait`/`ResolveWait` rows only toggle the execution mark.
-    /// Uncommitted changes remain excluded.
-    ///
-    /// Excluded rows and an empty target set are always reported so the
-    /// operation never looks like it silently stopped halfway.
+    /// If any target row is unmarked, mark them all; otherwise unmark them all.
+    /// Available in every execution mode, and mark-only: work already admitted
+    /// to the current run is never queued, dequeued, stopped, or retried by it.
+    /// Terminal rows are excluded without a refusal warning.
     pub fn toggle_all_marks(&mut self) -> Vec<TuiCommand> {
         selection_logic::toggle_all_marks(self)
     }
@@ -2149,8 +2139,8 @@ impl AppState {
 // ============================================================================
 
 pub(crate) mod guards {
-    use super::{ChangeState, ParallelEligibility, TuiCommand, ViewMode, WorktreeInfo};
-    use crate::orchestration::operator_command::{classify_mark_route, MarkRoute, OperatorMode};
+    use super::{ChangeState, ViewMode, WorktreeInfo};
+    use crate::orchestration::operator_command::is_markable_status;
 
     /// Result type for merge validation
     pub enum MergeGuardResult {
@@ -2253,196 +2243,35 @@ pub(crate) mod guards {
         MergeGuardResult::Allowed
     }
 
-    /// Result type for toggle selection validation
-    pub enum ToggleGuardResult {
-        /// Operation is allowed
-        Allowed,
-        /// Operation is blocked with a warning message
-        Blocked(String),
-    }
-
-    /// Why a change cannot be toggled for selection.
+    /// Toggle the execution mark for one row, in every execution mode.
     ///
-    /// Single-row toggle renders this as a warning message, while bulk toggle
-    /// groups rows by reason to explain what was excluded.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ToggleBlockReason {
-        /// A change with uncommitted proposal files cannot be queued.
-        ParallelUncommitted,
-        /// A change absent from the `HEAD` tree cannot be queued.
-        ParallelProposalAbsent,
-        /// Rejected proposals are read-only.
-        Rejected,
-    }
-
-    /// Classifies why a change is not toggleable, or `None` when it is.
+    /// A mark is process-local next-run target intent, so this touches
+    /// `selected` and the NEW badge and nothing else: no queue command, no
+    /// display-status transition, no retry or stop request. Terminal rows are
+    /// filtered out by the caller and never reach here.
     ///
-    /// This is the single source of truth shared by the single-row guard and
-    /// the bulk toggle classification, so both paths stay consistent.
-    pub fn classify_toggle_block(
-        parallel_eligibility: ParallelEligibility,
-        display_status_cache: &str,
-    ) -> Option<ToggleBlockReason> {
-        // Active (in-flight) changes can be stopped via Space key in Running mode
-        // This is allowed and handled by handle_toggle_running_mode
-        // No need to block here
-
-        // Worktree execution refuses every ineligible change (only applies to
-        // non-active states); the reason only decides what the operator is told.
-        if !matches!(
-            display_status_cache,
-            "preparing" | "applying" | "accepting" | "archiving" | "resolving"
-        ) {
-            match parallel_eligibility {
-                ParallelEligibility::UncommittedProposalFiles => {
-                    return Some(ToggleBlockReason::ParallelUncommitted)
-                }
-                ParallelEligibility::ProposalAbsentFromHead => {
-                    return Some(ToggleBlockReason::ParallelProposalAbsent)
-                }
-                ParallelEligibility::Eligible => {}
-            }
-        }
-
-        if display_status_cache == "rejected" {
-            return Some(ToggleBlockReason::Rejected);
-        }
-
-        // MergeWait and ResolveWait can toggle execution mark (selected)
-        // but cannot change display_status_cache or modify DynamicQueue
-        // This is handled by the mode-specific handlers
-        None
-    }
-
-    /// Validates that a change can be toggled for selection
-    pub fn validate_change_toggleable(
-        parallel_eligibility: ParallelEligibility,
-        display_status_cache: &str,
-        change_id: &str,
-    ) -> ToggleGuardResult {
-        match classify_toggle_block(parallel_eligibility, display_status_cache) {
-            Some(ToggleBlockReason::ParallelUncommitted) => ToggleGuardResult::Blocked(format!(
-                "Cannot queue uncommitted change '{}'. Commit it first.",
-                change_id
-            )),
-            // No dirty content exists to commit here, so the message names the
-            // condition that is actually observable instead of asking for one.
-            Some(ToggleBlockReason::ParallelProposalAbsent) => ToggleGuardResult::Blocked(format!(
-                "Cannot queue change '{}': it is not present in HEAD.",
-                change_id
-            )),
-            Some(ToggleBlockReason::Rejected) => ToggleGuardResult::Blocked(format!(
-                "Change '{}' is rejected and read-only",
-                change_id
-            )),
-            None => ToggleGuardResult::Allowed,
-        }
-    }
-
-    /// Result of toggle selection action
-    pub enum ToggleActionResult {
-        /// No command needed (state change only), with optional log message
-        StateOnly(Option<String>),
-        /// Return a TuiCommand, with optional log message
-        Command(TuiCommand, Option<String>),
-        /// Do nothing (no state change, no command)
-        None,
-    }
-
-    /// Clear the NEW flag once the operator has interacted with a change.
-    fn consume_new_flag(change: &mut ChangeState, new_change_count: &mut usize) {
+    /// Returns the operator-facing log line for the mutation.
+    pub fn toggle_execution_mark(change: &mut ChangeState, new_change_count: &mut usize) -> String {
+        change.selected = !change.selected;
         if change.is_new {
             change.is_new = false;
             *new_change_count = new_change_count.saturating_sub(1);
         }
-    }
-
-    /// Toggle the execution mark only, without touching queue or display state.
-    fn toggle_mark_only(
-        change: &mut ChangeState,
-        new_change_count: &mut usize,
-        log: bool,
-    ) -> ToggleActionResult {
-        change.selected = !change.selected;
-        consume_new_flag(change, new_change_count);
-        if !log {
-            return ToggleActionResult::StateOnly(None);
-        }
-        let log_msg = if change.selected {
+        if change.selected {
             format!("Marked for execution: {}", change.id)
         } else {
             format!("Unmarked: {}", change.id)
-        };
-        ToggleActionResult::StateOnly(Some(log_msg))
-    }
-
-    /// Handle toggle selection in Select mode
-    pub fn handle_toggle_select_mode(
-        change: &mut ChangeState,
-        new_change_count: &mut usize,
-    ) -> ToggleActionResult {
-        match classify_mark_route(OperatorMode::Select, &change.display_status_cache) {
-            MarkRoute::MarkOnly => toggle_mark_only(change, new_change_count, false),
-            _ => ToggleActionResult::None,
         }
     }
 
-    /// Handle toggle selection in Running mode
+    /// True when Space and bulk `x` may mutate this row's execution mark.
     ///
-    /// Routing comes from the shared operator command matrix; this function only
-    /// projects the decision onto TUI state and log messages.
-    pub fn handle_toggle_running_mode(
-        change: &mut ChangeState,
-        new_change_count: &mut usize,
-    ) -> ToggleActionResult {
-        match classify_mark_route(OperatorMode::Running, &change.display_status_cache) {
-            MarkRoute::QueueIntent => {
-                // Queue intent decides the new mark: unqueued rows are added,
-                // queued rows are removed, and error rows mirror the same pair.
-                let is_error = change.display_status_cache == "error";
-                let add = match change.display_status_cache.as_str() {
-                    "not queued" => true,
-                    "queued" => false,
-                    _ => !change.selected,
-                };
-                // Do NOT assign display_status_cache here: the shared service applies
-                // the reducer transition and the TUI derives display status from it.
-                change.selected = add;
-                consume_new_flag(change, new_change_count);
-                let id = change.id.clone();
-                let log_msg = match (is_error, add) {
-                    (true, true) => format!("Marked for retry and added to queue: {}", id),
-                    (true, false) => format!("Retry mark cleared and removed from queue: {}", id),
-                    (false, true) => format!("Added to queue: {}", id),
-                    (false, false) => format!("Removed from queue: {}", id),
-                };
-                if add {
-                    ToggleActionResult::Command(TuiCommand::AddToQueue(id), Some(log_msg))
-                } else {
-                    ToggleActionResult::Command(TuiCommand::RemoveFromQueue(id), Some(log_msg))
-                }
-            }
-            // MergeWait/ResolveWait rows accept mark-only mutation.
-            MarkRoute::MarkOnly => toggle_mark_only(change, new_change_count, true),
-            // Active rows are stopped with the force-kill control, not with Space;
-            // final rows and retry-owned rows cannot change here.
-            MarkRoute::Immutable | MarkRoute::RetryRequired => ToggleActionResult::None,
-        }
-    }
-
-    /// Handle toggle selection in Stopped mode
-    ///
-    /// In Stopped mode only the execution mark changes. For wait states
-    /// (MergeWait/ResolveWait) and NotQueued, `display_status_cache` MUST remain
-    /// unchanged until the run resumes.
-    pub fn handle_toggle_stopped_mode(
-        change: &mut ChangeState,
-        new_change_count: &mut usize,
-    ) -> ToggleActionResult {
-        match classify_mark_route(OperatorMode::Stopped, &change.display_status_cache) {
-            MarkRoute::MarkOnly => toggle_mark_only(change, new_change_count, true),
-            _ => ToggleActionResult::None,
-        }
+    /// Derived from the shared classifier alone, so the TUI cannot hold a second
+    /// markability table. Worktree eligibility and Apply-limit evidence are not
+    /// consulted: they decide whether a *run* may start, not whether an operator
+    /// may express intent.
+    pub fn is_mark_target(change: &ChangeState) -> bool {
+        is_markable_status(&change.display_status_cache)
     }
 }
 
@@ -3477,68 +3306,42 @@ mod tests {
         assert_eq!(runtime.eligibility("clean"), ParallelEligibility::Eligible);
     }
 
-    /// Both refusals block the toggle; each one names what was observed.
+    /// Worktree ineligibility is a *run* refusal, not a mark refusal.
+    ///
+    /// Both reasons still exist and still refuse a start; neither may stop an
+    /// operator from expressing next-run intent, and neither may make the
+    /// checkbox lie about the mark that was set.
     #[test]
-    fn single_row_toggle_refusals_distinguish_dirty_content_from_absence() {
-        let cases = [
-            (
-                ParallelEligibility::UncommittedProposalFiles,
-                guards::ToggleBlockReason::ParallelUncommitted,
-                "Commit it first",
-            ),
-            (
-                ParallelEligibility::ProposalAbsentFromHead,
-                guards::ToggleBlockReason::ParallelProposalAbsent,
-                "not present in HEAD",
-            ),
-        ];
-
-        for (eligibility, expected_reason, expected_text) in cases {
-            assert_eq!(
-                guards::classify_toggle_block(eligibility, "not queued"),
-                Some(expected_reason),
-                "{eligibility:?} must block the toggle"
-            );
-
-            let guards::ToggleGuardResult::Blocked(message) =
-                guards::validate_change_toggleable(eligibility, "not queued", "change-a")
-            else {
-                panic!("{eligibility:?} must be refused");
-            };
-            assert!(
-                message.contains(expected_text),
-                "{eligibility:?} must be explained as '{expected_text}': {message}"
-            );
-        }
-
-        // An absent proposal has nothing to commit, so it is never described as
-        // uncommitted.
-        let guards::ToggleGuardResult::Blocked(absent) = guards::validate_change_toggleable(
-            ParallelEligibility::ProposalAbsentFromHead,
-            "not queued",
-            "change-a",
-        ) else {
-            panic!("an absent proposal must be refused");
-        };
-        assert!(!absent.to_lowercase().contains("uncommitted"), "{absent}");
-
-        // An eligible row is never refused on eligibility grounds.
-        assert_eq!(
-            guards::classify_toggle_block(ParallelEligibility::Eligible, "not queued"),
-            None
-        );
-        // An in-flight row is judged by its activity, not by eligibility.
+    fn single_row_toggle_admits_both_parallel_ineligible_reasons() {
         for eligibility in [
             ParallelEligibility::UncommittedProposalFiles,
             ParallelEligibility::ProposalAbsentFromHead,
         ] {
-            assert_eq!(guards::classify_toggle_block(eligibility, "applying"), None);
+            let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+            app.changes[0].parallel_eligibility = eligibility;
+
+            app.toggle_selection();
+
+            assert!(
+                app.changes[0].selected,
+                "{eligibility:?} must still accept mark intent"
+            );
+            assert!(
+                app.warning_message.is_none(),
+                "{eligibility:?} must not refuse the mark: {:?}",
+                app.warning_message
+            );
+            assert_eq!(
+                app.take_pending_mark_writes(),
+                vec![("change-a".to_string(), true)]
+            );
         }
     }
 
-    /// A bulk toggle reports each excluded row with the reason it was observed.
+    /// A bulk toggle covers every visible non-terminal row, whatever its
+    /// worktree eligibility, and never reports an exclusion for one.
     #[test]
-    fn bulk_toggle_exclusion_summary_names_each_parallel_reason() {
+    fn bulk_toggle_covers_parallel_ineligible_rows_without_a_warning() {
         let changes = vec![
             create_test_change("eligible", 0, 1),
             create_test_change("dirty", 0, 1),
@@ -3553,21 +3356,11 @@ mod tests {
 
         app.toggle_all_marks();
 
-        assert!(app.changes[0].selected);
-        assert!(!app.changes[1].selected, "a dirty proposal is excluded");
-        assert!(!app.changes[2].selected, "an absent proposal is excluded");
-
-        let summary = app
-            .warning_message
-            .clone()
-            .expect("excluded rows are reported");
+        assert!(app.changes.iter().all(|change| change.selected));
         assert!(
-            summary.contains("uncommitted (commit first)"),
-            "the dirty row keeps its actionable instruction: {summary}"
-        );
-        assert!(
-            summary.contains("not present in HEAD (cannot queue)"),
-            "the absent row is named for what it is: {summary}"
+            app.warning_message.is_none(),
+            "no row was excluded, so nothing is reported: {:?}",
+            app.warning_message
         );
     }
 
@@ -4018,59 +3811,10 @@ mod tests {
             .is_some_and(|msg| msg.contains("no changes to toggle")));
     }
 
+    /// Every execution mode admits the bulk toggle now: a pending stop and an
+    /// error hold gate *dispatch*, never the operator's next-run intent.
     #[test]
-    fn test_toggle_all_marks_in_error_mode_reports_retry_ownership() {
-        let (app, commands) =
-            run_bulk_toggle_case(AppExecutionMode::Error, &[("a", "error", true, false)]);
-
-        assert!(commands.is_empty());
-        assert!(!app.changes[0].selected);
-        let message = app.warning_message.clone().expect("rejection is reported");
-        assert!(
-            message.contains("Error mode") && message.contains("retry"),
-            "Error rejection must name the execution mode and retry ownership: {message}"
-        );
-    }
-
-    #[test]
-    fn test_toggle_all_marks_in_stopping_mode_reports_immutability() {
-        let (app, commands) = run_bulk_toggle_case(
-            AppExecutionMode::Stopping,
-            &[("a", "not queued", true, false)],
-        );
-
-        assert!(commands.is_empty());
-        assert!(!app.changes[0].selected);
-        let message = app.warning_message.clone().expect("rejection is reported");
-        assert!(
-            message.contains("Stopping mode") && message.contains("immutable"),
-            "Stopping rejection must name the execution mode and immutability: {message}"
-        );
-    }
-
-    /// The original incident: a fatal `ExecutionEvent::Error` put the TUI in
-    /// `Error`, and `x` reported a generic mode list that named modal variants as
-    /// execution states. Rejection text must now name only execution modes.
-    #[test]
-    fn bulk_mark_rejection_never_describes_a_modal_as_an_execution_mode() {
-        for mode in [AppExecutionMode::Stopping, AppExecutionMode::Error] {
-            let (app, commands) = run_bulk_toggle_case(mode, &[("a", "not queued", true, false)]);
-
-            assert!(commands.is_empty());
-            let message = app.warning_message.clone().expect("rejection is reported");
-            for modal_word in ["QR", "Confirm", "popup", "ConfirmForceKill"] {
-                assert!(
-                    !message.contains(modal_word),
-                    "{mode:?} rejection must not mention modal presentation: {message}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn bulk_mark_admission_is_derived_from_the_shared_lifecycle_matrix() {
-        use crate::orchestration::operator_command::{classify_mark_route, MarkRoute};
-
+    fn bulk_mark_is_admitted_in_every_execution_mode() {
         for mode in [
             AppExecutionMode::Select,
             AppExecutionMode::Running,
@@ -4078,17 +3822,38 @@ mod tests {
             AppExecutionMode::Stopped,
             AppExecutionMode::Error,
         ] {
-            let shared_admits = !matches!(
-                classify_mark_route(mode.operator_mode(), "not queued"),
-                MarkRoute::Immutable | MarkRoute::RetryRequired
+            let (app, commands) = run_bulk_toggle_case(mode, &[("a", "error", true, false)]);
+
+            assert!(commands.is_empty(), "{mode:?} must emit no queue command");
+            assert!(app.changes[0].selected, "{mode:?} must mark the row");
+            assert!(
+                app.warning_message.is_none(),
+                "{mode:?} must not refuse the bulk mark: {:?}",
+                app.warning_message
             );
+        }
+    }
+
+    #[test]
+    fn bulk_mark_targets_are_derived_from_visible_non_terminal_rows() {
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
             let mut app = AppState::new(vec![create_test_change("a", 0, 1)]);
             app.execution_mode = mode;
-
-            assert_eq!(
+            assert!(
                 app.has_bulk_toggle_targets(),
-                shared_admits,
-                "{mode:?} must follow the shared operator lifecycle matrix"
+                "{mode:?} must offer the bulk toggle for a non-terminal row"
+            );
+
+            app.changes[0].set_display_status_cache("archived");
+            assert!(
+                !app.has_bulk_toggle_targets(),
+                "{mode:?} must not offer the bulk toggle for terminal rows only"
             );
         }
     }
@@ -4183,6 +3948,9 @@ mod tests {
         assert_eq!(app.selected_count(), 1);
     }
 
+    /// Space on a Running-mode error row records retry *intent* and nothing
+    /// else: the queue alias it used to carry is gone, and the retry itself is
+    /// decided at final start/retry admission.
     #[test]
     fn test_running_mode_error_change_toggle_sets_retry_mark() {
         let changes = vec![create_test_change("test-change", 0, 1)];
@@ -4191,48 +3959,29 @@ mod tests {
         app.changes[0].set_error_message_cache("boom".to_string());
         app.changes[0].selected = false;
 
-        let command = app.toggle_selection();
+        app.toggle_selection();
 
-        assert!(
-            matches!(command, Some(TuiCommand::AddToQueue(ref id)) if id == "test-change"),
-            "error retry mark should emit AddToQueue command"
-        );
         assert!(
             app.changes[0].selected,
             "Space should set retry mark on error change"
         );
-        assert!(app.logs.iter().any(|log| log
-            .message
-            .contains("Marked for retry and added to queue: test-change")));
-    }
-
-    #[test]
-    fn test_running_mode_error_change_toggle_queue() {
-        let changes = vec![create_test_change("test-change", 0, 1)];
-        let mut app = AppState::new(changes);
-        app.execution_mode = AppExecutionMode::Running;
-        app.changes[0].set_error_message_cache("boom".to_string());
-        app.changes[0].selected = false;
-
-        // First space: mark retry and add to queue
-        let first_command = app.toggle_selection();
-        assert!(
-            matches!(first_command, Some(TuiCommand::AddToQueue(ref id)) if id == "test-change")
+        assert_eq!(app.changes[0].display_status_cache, "error");
+        assert_eq!(
+            app.take_pending_mark_writes(),
+            vec![("test-change".to_string(), true)]
         );
-        assert!(app.changes[0].selected);
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Marked for execution: test-change")));
 
-        // Simulate queue state reflected by reducer
-        app.changes[0].set_display_status_cache("error");
-
-        // Second space: clear retry mark and remove from queue
-        let second_command = app.toggle_selection();
-        assert!(
-            matches!(second_command, Some(TuiCommand::RemoveFromQueue(ref id)) if id == "test-change")
-        );
+        app.toggle_selection();
         assert!(!app.changes[0].selected);
-        assert!(app.logs.iter().any(|log| log
-            .message
-            .contains("Retry mark cleared and removed from queue: test-change")));
+        assert_eq!(app.changes[0].display_status_cache, "error");
+        assert_eq!(
+            app.take_pending_mark_writes(),
+            vec![("test-change".to_string(), false)]
+        );
     }
 
     #[test]
@@ -4241,8 +3990,7 @@ mod tests {
         let mut app = AppState::new(changes.clone());
         app.execution_mode = AppExecutionMode::Running;
 
-        let command = app.toggle_selection();
-        assert!(matches!(command, Some(TuiCommand::AddToQueue(ref id)) if id == "dynamic-change"));
+        app.toggle_selection();
         assert!(app.changes[0].selected);
         // The interaction records a target-scoped write; the run loop applies it
         // through the shared service before the next event is projected.
@@ -4304,10 +4052,7 @@ mod tests {
         app.sync_execution_marks_from_store();
         assert!(app.changes[0].selected);
 
-        let command = app.toggle_selection();
-        assert!(
-            matches!(command, Some(TuiCommand::RemoveFromQueue(ref id)) if id == "queued-change")
-        );
+        app.toggle_selection();
         assert!(!app.changes[0].selected);
         app.flush_pending_mark_writes();
         assert!(app.execution_marks().marked_ids().is_empty());
@@ -4349,12 +4094,8 @@ mod tests {
         app.changes[0].set_error_message_cache("boom".to_string());
         app.changes[0].selected = false;
 
-        let command = app.toggle_selection();
+        app.toggle_selection();
 
-        assert!(
-            command.is_none(),
-            "stopped retry mark should be local state only"
-        );
         assert!(
             app.changes[0].selected,
             "Space should set retry mark in stopped mode"
@@ -5180,24 +4921,26 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_selection_blocks_rejected_row() {
+    fn test_toggle_selection_ignores_rejected_row_silently() {
         let changes = vec![create_test_change("change-a", 1, 1)];
         let mut app = AppState::new(changes);
         app.changes[0].display_status_cache = "rejected".to_string();
         app.execution_mode = AppExecutionMode::Select;
 
-        let cmd = app.toggle_selection();
+        app.toggle_selection();
 
-        assert!(cmd.is_none(), "rejected row must not emit toggle commands");
         assert!(
             !app.changes[0].selected,
             "rejected row must remain unselected"
         );
         assert!(
+            app.take_pending_mark_writes().is_empty(),
+            "rejected row must queue no mark write"
+        );
+        assert!(
+            app.warning_message.is_none(),
+            "a terminal row is a silent no-op, not a refusal: {:?}",
             app.warning_message
-                .as_deref()
-                .is_some_and(|m| m.contains("read-only")),
-            "rejected toggle should explain read-only guard"
         );
     }
 
@@ -5341,7 +5084,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_running_mode_toggle_emits_commands_without_local_status_mutation() {
+    fn test_running_mode_toggle_writes_marks_without_local_status_mutation() {
         let changes = vec![
             create_test_change("c1", 0, 3),
             create_test_change("c2", 0, 3),
@@ -5352,12 +5095,12 @@ mod tests {
         // Simulate c1 in NotQueued state.
         app.changes[0].display_status_cache = "not queued".to_string();
 
-        // toggle_selection should return AddToQueue command and NOT mutate display_status_cache.
-        let cmd = app.toggle_selection();
-        assert!(
-            matches!(cmd, Some(TuiCommand::AddToQueue(ref id)) if id == "c1"),
-            "expected AddToQueue command, got {:?}",
-            cmd
+        // toggle_selection writes only the mark; no queue command is produced.
+        app.toggle_selection();
+        assert!(app.changes[0].selected);
+        assert_eq!(
+            app.take_pending_mark_writes(),
+            vec![("c1".to_string(), true)]
         );
         // display_status_cache must NOT have been locally changed to Queued.
         assert_eq!(
@@ -5368,11 +5111,12 @@ mod tests {
         // Simulate c2 already Queued.
         app.cursor_index = 1;
         app.changes[1].display_status_cache = "queued".to_string();
-        let cmd2 = app.toggle_selection();
-        assert!(
-            matches!(cmd2, Some(TuiCommand::RemoveFromQueue(ref id)) if id == "c2"),
-            "expected RemoveFromQueue command, got {:?}",
-            cmd2
+        app.changes[1].selected = true;
+        app.toggle_selection();
+        assert!(!app.changes[1].selected);
+        assert_eq!(
+            app.take_pending_mark_writes(),
+            vec![("c2".to_string(), false)]
         );
         // display_status_cache must NOT have been locally changed to NotQueued.
         assert_eq!(
@@ -5392,11 +5136,14 @@ mod tests {
         app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "applying".to_string();
 
-        let cmd = app.toggle_selection();
+        app.toggle_selection();
         assert!(
-            cmd.is_none(),
-            "Space on active change must NOT issue any command, got {:?}",
-            cmd
+            app.changes[0].selected,
+            "Space on an active change records next-run intent"
+        );
+        assert_eq!(
+            app.changes[0].display_status_cache, "applying",
+            "Space on an active change must not stop or move it"
         );
     }
 
@@ -5407,11 +5154,14 @@ mod tests {
         app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "accepting".to_string();
 
-        let cmd = app.toggle_selection();
+        app.toggle_selection();
         assert!(
-            cmd.is_none(),
-            "Space on accepting change must NOT issue any command, got {:?}",
-            cmd
+            app.changes[0].selected,
+            "Space on an accepting change records next-run intent"
+        );
+        assert_eq!(
+            app.changes[0].display_status_cache, "accepting",
+            "Space on an accepting change must not stop or move it"
         );
     }
 
@@ -5426,17 +5176,9 @@ mod tests {
         app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
 
-        // Space on MergeWait toggles selection only (no queue change).
-        let cmd = app.toggle_selection();
-        // Should NOT return AddToQueue/RemoveFromQueue.
-        assert!(
-            !matches!(
-                cmd,
-                Some(TuiCommand::AddToQueue(_)) | Some(TuiCommand::RemoveFromQueue(_))
-            ),
-            "Space on MergeWait must not issue queue commands, got {:?}",
-            cmd
-        );
+        // Space on MergeWait toggles the execution mark only.
+        app.toggle_selection();
+        assert!(app.changes[0].selected);
         // display_status_cache must still be MergeWait.
         assert_eq!(app.changes[0].display_status_cache, "merge wait");
     }
@@ -5448,16 +5190,9 @@ mod tests {
         app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "resolve pending".to_string();
 
-        // Space on ResolveWait toggles selection only (no queue change).
-        let cmd = app.toggle_selection();
-        assert!(
-            !matches!(
-                cmd,
-                Some(TuiCommand::AddToQueue(_)) | Some(TuiCommand::RemoveFromQueue(_))
-            ),
-            "Space on ResolveWait must not issue queue commands, got {:?}",
-            cmd
-        );
+        // Space on ResolveWait toggles the execution mark only.
+        app.toggle_selection();
+        assert!(app.changes[0].selected);
         assert_eq!(app.changes[0].display_status_cache, "resolve pending");
     }
 

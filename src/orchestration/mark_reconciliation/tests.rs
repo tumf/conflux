@@ -533,3 +533,137 @@ fn queue_intent_never_creates_an_execution_mark() {
         "queue intent must not become an execution mark"
     );
 }
+
+// ============================================================================
+// Archive is the terminal revocation edge
+// ============================================================================
+
+/// Unit: the first effective `ChangeArchived` clears only its own target.
+#[test]
+fn run_mark_intent_archive_clears_only_its_target() {
+    let (reconciler, marks) = reconciler(&["alpha", "beta"]);
+    let mut state = state(&["alpha", "beta"]);
+
+    let revoked = apply(
+        &mut state,
+        &reconciler,
+        &ExecutionEvent::ChangeArchived("alpha".to_string()),
+    );
+
+    assert_eq!(revoked, vec!["alpha".to_string()]);
+    assert!(!marks.is_marked("alpha"));
+    assert!(marks.is_marked("beta"), "an unrelated mark is preserved");
+}
+
+/// Unit: a duplicate or stale archive event revokes nothing.
+///
+/// The edge is pre/post evidence, not the event variant, so a second delivery
+/// cannot clear a mark the operator set again afterwards.
+#[test]
+fn run_mark_intent_duplicate_archive_is_a_no_op() {
+    let (reconciler, marks) = reconciler(&["alpha"]);
+    let mut state = state(&["alpha"]);
+    let archived = ExecutionEvent::ChangeArchived("alpha".to_string());
+
+    assert_eq!(
+        apply(&mut state, &reconciler, &archived),
+        vec!["alpha".to_string()]
+    );
+
+    // The operator re-marks the row, then the same event is delivered again.
+    marks.set("alpha", true);
+    assert!(
+        apply(&mut state, &reconciler, &archived).is_empty(),
+        "a duplicate archive creates no new edge"
+    );
+    assert!(
+        marks.is_marked("alpha"),
+        "a duplicate delivery must not destroy a fresh mark"
+    );
+}
+
+/// Unit: the post-archive merged and pushed transitions cannot recreate a mark,
+/// and carry no revoking edge of their own.
+#[test]
+fn run_mark_intent_post_archive_transitions_do_not_recreate_the_mark() {
+    let (reconciler, marks) = reconciler(&["alpha"]);
+    let mut state = state(&["alpha"]);
+
+    apply(
+        &mut state,
+        &reconciler,
+        &ExecutionEvent::ChangeArchived("alpha".to_string()),
+    );
+    assert!(!marks.is_marked("alpha"));
+
+    for event in [
+        ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "rev".to_string(),
+        },
+        ExecutionEvent::PushCompleted {
+            change_id: "alpha".to_string(),
+            remote: "origin".to_string(),
+            branch: "cflx/alpha".to_string(),
+        },
+    ] {
+        assert!(
+            revoking_edge_target(&event).is_none(),
+            "{event:?} carries no revoking edge of its own"
+        );
+        assert!(apply(&mut state, &reconciler, &event).is_empty());
+        assert!(
+            !marks.is_marked("alpha"),
+            "{event:?} must leave the cleared mark cleared"
+        );
+    }
+}
+
+/// Unit: archive is classified from its own pre/post evidence, exactly like the
+/// pre-existing edges, and does not disturb them.
+#[test]
+fn run_mark_intent_archive_edge_composes_with_the_existing_edges() {
+    assert!(RevokingEdge::Archive.revokes(
+        MarkEvidence {
+            archived: false,
+            ..MarkEvidence::default()
+        },
+        MarkEvidence {
+            archived: true,
+            ..MarkEvidence::default()
+        },
+    ));
+    assert!(!RevokingEdge::Archive.revokes(
+        MarkEvidence {
+            archived: true,
+            ..MarkEvidence::default()
+        },
+        MarkEvidence {
+            archived: true,
+            ..MarkEvidence::default()
+        },
+    ));
+    // An archive transition alone must not look like any other edge.
+    for edge in [
+        RevokingEdge::ChangeLevelFailure,
+        RevokingEdge::Rejection,
+        RevokingEdge::Dequeue,
+        RevokingEdge::MergedHookRecovery,
+    ] {
+        assert!(
+            !edge.revokes(
+                MarkEvidence::default(),
+                MarkEvidence {
+                    archived: true,
+                    ..MarkEvidence::default()
+                },
+            ),
+            "{edge:?} must not fire on an archive transition"
+        );
+    }
+
+    assert!(matches!(
+        revoking_edge_target(&ExecutionEvent::ChangeArchived("alpha".to_string())),
+        Some(("alpha", RevokingEdge::Archive))
+    ));
+}

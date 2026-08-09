@@ -928,7 +928,7 @@ async fn persistent_idle_commands_use_live_scheduler() {
     harness
         .run_control
         .operator()
-        .set_execution_mark(AppExecutionMode::Select.operator_mode(), "c1", true)
+        .set_execution_mark("c1", true)
         .await
         .expect("marking in Select is accepted");
     assert_eq!(

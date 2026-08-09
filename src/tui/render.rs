@@ -11,6 +11,8 @@ use ratatui::{
 };
 use std::time::Duration;
 
+use crate::orchestration::operator_command::is_markable_status;
+
 use super::state::{
     guards, log_logic, AppState, ChangeState, CopyFeedback, ErrorDetailsPopup,
     ERROR_DETAILS_UNAVAILABLE,
@@ -18,10 +20,11 @@ use super::state::{
 use super::types::{AppExecutionMode, ModalState};
 use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
 
-/// Key-hint replacement for a row whose active run owns its Apply ceiling.
+/// Key hint for a row whose active run owns its Apply ceiling.
 ///
-/// It deliberately names no key. Offering `Space` or the start key here would
-/// advertise a mutation the shared service refuses before it touches anything.
+/// It deliberately names no key. Marking the row is allowed — a mark is only
+/// next-run intent — but the start key would still refuse the dispatch, so this
+/// explains the condition instead of promising a control.
 const APPLY_LIMIT_KEY_HINT: &str = "Apply limit reached (retry after the run closes)";
 
 /// Footer/status condition for rows blocked by an active-run Apply ceiling.
@@ -133,18 +136,79 @@ fn build_change_rows(changes: &[ChangeState]) -> (Vec<ChangeRow>, Vec<usize>) {
     (rows, change_to_visual)
 }
 
+/// The blank that stands in for a checkbox on a post-archive row.
+///
+/// Exactly [`CHECKBOX_WIDTH`] columns, so substituting it keeps the cursor,
+/// change ID, badges, status, progress, and preview in the same columns as
+/// every non-terminal row.
+const CHECKBOX_PLACEHOLDER: &str = "   ";
+
+/// Display width of the checkbox column, shared by `[x]`, `[ ]`, and the blank.
+#[cfg_attr(not(test), allow(dead_code))]
+const CHECKBOX_WIDTH: usize = CHECKBOX_PLACEHOLDER.len();
+
+/// True when the row has completed archive and is no longer a run candidate.
+///
+/// `archived`, `merged`, and `pushed` are all post-archive presentations of the
+/// same fact, and none of them can carry next-run intent.
+fn is_post_archive_status(display_status: &str) -> bool {
+    matches!(display_status, "archived" | "merged" | "pushed")
+}
+
 /// Determine checkbox display and color for a change item
 ///
 /// Returns (checkbox_text, checkbox_color) based on the change's status.
-/// Archived changes are always shown as gray "[x]" to indicate they are
-/// no longer actionable.
+/// A post-archive row renders neither `[x]` nor `[ ]`: it is not an execution
+/// candidate, so a checkbox there would advertise intent it cannot hold. The
+/// blank keeps the column width so nothing after it shifts left.
 fn get_checkbox_display(display_status: &str, is_selected: bool) -> (&'static str, Color) {
-    if matches!(display_status, "archived" | "merged") {
-        ("[x]", Color::DarkGray) // Archived - grayed out
+    if is_post_archive_status(display_status) {
+        (CHECKBOX_PLACEHOLDER, Color::DarkGray) // Post-archive - no checkbox
     } else if is_selected {
         ("[x]", Color::Green) // Selected/In queue
     } else {
         ("[ ]", Color::Gray) // Not selected
+    }
+}
+
+/// Push the cursor row's kill and execution-mark hints.
+///
+/// Shared by the Select and Running/Stopped layouts so the two can never
+/// describe the same row differently. Two independent controls, so two
+/// independent hints:
+///
+/// * `K: kill` is per-change termination and belongs only to an active row;
+/// * `Space: mark` / `Space: unmark` is next-run intent and belongs to every
+///   visible non-terminal row, whatever its execution mode, activity, wait
+///   state, Apply-limit evidence, or current worktree eligibility.
+///
+/// A terminal row gets no mark hint at all: Space on it is a silent no-op.
+fn push_change_row_hints(keys: &mut Vec<String>, app: &AppState, item: &ChangeState) {
+    let status = item.display_status_cache.as_str();
+    if matches!(
+        status,
+        "preparing" | "applying" | "accepting" | "archiving" | "resolving"
+    ) {
+        if let Some(ModalState::ConfirmForceKill { .. }) = app.modal {
+            keys.push("Y: confirm kill".to_string());
+            keys.push("N: cancel".to_string());
+        } else {
+            keys.push("K: kill".to_string());
+        }
+    }
+
+    if is_markable_status(status) {
+        keys.push(if item.selected {
+            "Space: unmark".to_string()
+        } else {
+            "Space: mark".to_string()
+        });
+        // Explains why the start key will still refuse this row. It sits next to
+        // the mark hint rather than replacing it: marking is genuinely allowed,
+        // and only the dispatch it asks for is gated.
+        if item.apply_iteration_limit_active {
+            keys.push(APPLY_LIMIT_KEY_HINT.to_string());
+        }
     }
 }
 
@@ -657,17 +721,17 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 let i = *i;
                 let change = &app.changes[i];
                 // Checkbox display (Select mode):
-                // [ ] - not selected (ready to select)
-                // [x] - selected (will become Queued when the start key is pressed)
-                // [x] (gray) - archived (processing complete, no longer actionable)
-                // Note: 'selected' field indicates selection for next run
-                let is_archived =
-                    matches!(change.display_status_cache.as_str(), "archived" | "merged");
-                // Every worktree-ineligible reason still blocks the row; only
+                // [ ] - not marked
+                // [x] - marked as a next-run target
+                // (blank) - post-archive: no longer a run candidate
+                // Note: 'selected' field indicates the execution mark
+                let is_post_archive =
+                    is_post_archive_status(change.display_status_cache.as_str());
+                // Every worktree-ineligible reason still refuses a *run*; only
                 // the badge narrows to the one reason that is actually a Git
-                // working-tree condition.
+                // working-tree condition. It never refuses a mark.
                 let is_parallel_blocked = !change.is_parallel_eligible()
-                    && !is_archived
+                    && !is_post_archive
                     && matches!(
                         change.display_status_cache.as_str(),
                         "not queued" | "queued"
@@ -683,10 +747,13 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 } else {
                     Color::DarkGray
                 };
-                let (checkbox, checkbox_color) = if is_parallel_blocked {
-                    ("[ ]", blocked_fg)
-                } else {
-                    get_checkbox_display(&change.display_status_cache, change.selected)
+                // A blocked row is dimmed, never falsified: the checkbox still
+                // reports the mark the operator actually set, because worktree
+                // eligibility no longer gates mark intent.
+                let (checkbox, checkbox_color) = {
+                    let (text, color) =
+                        get_checkbox_display(&change.display_status_cache, change.selected);
+                    (text, if is_parallel_blocked { blocked_fg } else { color })
                 };
 
                 let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -842,31 +909,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
     let mut keys = vec!["↑↓/jk: move".to_string()];
     if let Some(item) = current_item {
-        // Show "K: kill" for active changes, otherwise describe the mark action.
-        // Don't show Space hints for worktree-ineligible changes.
-        let is_parallel_blocked = !item.is_parallel_eligible();
-        if matches!(
-            item.display_status_cache.as_str(),
-            "preparing" | "applying" | "accepting" | "archiving" | "resolving"
-        ) {
-            if let Some(ModalState::ConfirmForceKill { .. }) = app.modal {
-                keys.push("Y: confirm kill".to_string());
-                keys.push("N: cancel".to_string());
-            } else {
-                keys.push("K: kill".to_string());
-            }
-        } else if item.apply_iteration_limit_active {
-            // Never a Space promise for a row the shared service refuses: the
-            // row keeps its diagnostic and gets the stable condition instead.
-            keys.push(APPLY_LIMIT_KEY_HINT.to_string());
-        } else if !is_parallel_blocked {
-            keys.push(match (item.display_status_cache.as_str(), item.selected) {
-                ("error", true) => "Space: clear retry".to_string(),
-                ("error", false) => "Space: retry mark".to_string(),
-                (_, true) => "Space: unqueue".to_string(),
-                (_, false) => "Space: queue".to_string(),
-            });
-        }
+        push_change_row_hints(&mut keys, app, item);
         keys.push("e: edit".to_string());
         // Advertise the Error Details popup only on a row that can open it.
         if item.display_status_cache == "error" {
@@ -951,19 +994,18 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 let i = *i;
                 let change = &app.changes[i];
                 // Checkbox display (Running/Stopped mode):
-                // [ ] - not in queue / not marked
-                // [x] - in queue OR marked for execution (Stopped mode)
-                // [x] (gray) - archived (processing complete, no longer actionable)
-                // Note: Display is driven by 'selected' field, which serves dual purpose:
-                //   - Running: shows queue membership (selected=true means Queued/Processing)
-                //   - Stopped: shows execution mark (selected=true, display_status_cache=NotQueued)
-                let is_archived =
-                    matches!(change.display_status_cache.as_str(), "archived" | "merged");
-                // Every worktree-ineligible reason still blocks the row; only
+                // [ ] - not marked
+                // [x] - marked as a next-run target
+                // (blank) - post-archive: no longer a run candidate
+                // The checkbox is the execution mark in every mode. Queue
+                // membership is a separate axis and has its own status column.
+                let is_post_archive =
+                    is_post_archive_status(change.display_status_cache.as_str());
+                // Every worktree-ineligible reason still refuses a *run*; only
                 // the badge narrows to the one reason that is actually a Git
-                // working-tree condition.
+                // working-tree condition. It never refuses a mark.
                 let is_parallel_blocked = !change.is_parallel_eligible()
-                    && !is_archived
+                    && !is_post_archive
                     && matches!(
                         change.display_status_cache.as_str(),
                         "not queued" | "queued"
@@ -979,10 +1021,13 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 } else {
                     Color::DarkGray
                 };
-                let (checkbox, checkbox_color) = if is_parallel_blocked {
-                    ("[ ]", blocked_fg)
-                } else {
-                    get_checkbox_display(&change.display_status_cache, change.selected)
+                // A blocked row is dimmed, never falsified: the checkbox still
+                // reports the mark the operator actually set, because worktree
+                // eligibility no longer gates mark intent.
+                let (checkbox, checkbox_color) = {
+                    let (text, color) =
+                        get_checkbox_display(&change.display_status_cache, change.selected);
+                    (text, if is_parallel_blocked { blocked_fg } else { color })
                 };
 
                 let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -1193,31 +1238,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
     let mut keys = vec!["↑↓/jk: move".to_string()];
     if let Some(item) = current_item {
-        // Show "K: kill" for active changes, otherwise describe the mark action.
-        // Don't show Space hints for worktree-ineligible changes.
-        let is_parallel_blocked = !item.is_parallel_eligible();
-        if matches!(
-            item.display_status_cache.as_str(),
-            "preparing" | "applying" | "accepting" | "archiving" | "resolving"
-        ) {
-            if let Some(ModalState::ConfirmForceKill { .. }) = app.modal {
-                keys.push("Y: confirm kill".to_string());
-                keys.push("N: cancel".to_string());
-            } else {
-                keys.push("K: kill".to_string());
-            }
-        } else if item.apply_iteration_limit_active {
-            // Never a Space promise for a row the shared service refuses: the
-            // row keeps its diagnostic and gets the stable condition instead.
-            keys.push(APPLY_LIMIT_KEY_HINT.to_string());
-        } else if !is_parallel_blocked {
-            keys.push(match (item.display_status_cache.as_str(), item.selected) {
-                ("error", true) => "Space: clear retry".to_string(),
-                ("error", false) => "Space: retry mark".to_string(),
-                (_, true) => "Space: unqueue".to_string(),
-                (_, false) => "Space: queue".to_string(),
-            });
-        }
+        push_change_row_hints(&mut keys, app, item);
         keys.push("e: edit".to_string());
         // Advertise the Error Details popup only on a row that can open it.
         if item.display_status_cache == "error" {
@@ -3260,7 +3281,7 @@ mod tests {
                 // The badge is the only thing that changed: admission still refuses
                 // the row, and the refusal names the condition that was observed.
                 assert!(!app.changes[0].is_parallel_eligible());
-                assert!(app.toggle_selection().is_none());
+                app.toggle_selection();
                 let warning = app.warning_message.clone().expect("a refusal is reported");
                 assert!(
                     warning.contains("not present in HEAD"),
@@ -3332,7 +3353,7 @@ mod tests {
                     "{mode:?}/{status}: the dirty row is non-actionable too"
                 );
 
-                assert!(app.toggle_selection().is_none());
+                app.toggle_selection();
                 let warning = app.warning_message.clone().expect("a refusal is reported");
                 assert!(
                     warning.contains("Commit it first"),

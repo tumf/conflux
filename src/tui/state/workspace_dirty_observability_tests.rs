@@ -175,7 +175,7 @@ async fn drive(harness: &mut Harness, observe_dirty: bool) -> Vec<String> {
         "{:?}",
         harness
             .operator
-            .set_execution_mark(mode, "alpha", true)
+            .set_execution_mark("alpha", true)
             .await
     ));
     command_outcomes.push(format!(
@@ -217,7 +217,7 @@ async fn drive(harness: &mut Harness, observe_dirty: bool) -> Vec<String> {
         "{:?}",
         harness
             .operator
-            .set_execution_mark(mode, "beta", true)
+            .set_execution_mark("beta", true)
             .await
     ));
 
