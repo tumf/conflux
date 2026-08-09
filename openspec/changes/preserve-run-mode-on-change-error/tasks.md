@@ -1,0 +1,19 @@
+## Implementation Tasks
+
+- [ ] Change the authoritative process-mode transition so `ProcessingError` preserves the current `CoreMode` while `ExecutionEvent::Error` remains the fatal Error transition. Completion requires deterministic coverage from Running, Select, Stopping, Stopped, and Error starting modes plus a fatal control case. (verification: unit - add `processing_error_preserves_shared_mode` coverage beside `CoreMode::apply_event` in `src/orchestration/operator_coordinator.rs`; run `cargo test --lib processing_error_preserves_shared_mode`; verification-id: change-error-mode-tests)
+
+- [ ] Align external lifecycle mode mirroring with the same typed scope: a change-local `ProcessingError` must not replace the mirrored process mode, while a global `ExecutionEvent::Error` must still enter Error. Completion requires tests that assert the exact before/after mode and prevent message-content classification. (verification: unit - extend `LifecycleModeMirror` coverage in `src/events.rs`; run `cargo test --lib processing_error_preserves_lifecycle_mode`; verification-id: change-error-mode-tests)
+
+- [ ] Add a TUI regression through the authoritative dispatcher and per-frame Core-mode adoption: dispatch `ProcessingError` for one marked change during a multi-change Running run, reconcile the failed mark, adopt Core mode, then exercise bulk `x`. Completion requires the TUI to remain Running, avoid the Error-mode warning, mutate unrelated eligible marks under existing bulk rules, and keep the failed change's stale mark revoked. (verification: integration - add `processing_error_keeps_bulk_mark_available` under `src/tui/command_handlers/cross_adapter_tests.rs` or equivalent shared-dispatch TUI tests; run `cargo test --lib processing_error_keeps_bulk_mark_available`; verification-id: change-error-mode-tests)
+
+- [ ] Remove the Web projection's process-wide Error assignment for `ProcessingError` while preserving reducer-derived row Error, sanitized `error_detail`, attention/activity updates, and event publication. Completion requires `/api/v2/state` to retain its pre-event `app_mode`, keep `process_error` null, and expose the failed change separately; a global Error control must still set both fatal mode and process detail. (verification: integration - add `processing_error_preserves_process_snapshot` in `src/web/remote_control_api/tests/operator_snapshot_tests.rs`; run `cargo test --features web-monitoring --lib processing_error_preserves_process_snapshot`; verification-id: change-error-mode-tests)
+
+- [ ] Add one cross-projection regression over a shared authoritative dispatch proving Core, TUI-facing mode, Web/API, and lifecycle observation agree that `ProcessingError` is change-local and `ExecutionEvent::Error` is process-fatal. Completion requires the test to fail if any projection promotes the change-local event or if the fatal control is downgraded. (verification: integration - extend `src/orchestration/operator_coordinator/mode_matrix_tests.rs` with a shared dispatcher test; run `cargo test --features web-monitoring --lib processing_error_converges_across_projections`; verification-id: change-error-mode-tests)
+
+## Final Validation
+
+Archive validation is the authoritative final OpenSpec gate. Expected archive gate: `cflx openspec validate preserve-run-mode-on-change-error --archive-gate`.
+
+## Future Work
+
+- Provider quota observability and provider/model failover policy, if desired, should be proposed separately; they do not change this event-scope correction.
