@@ -218,6 +218,11 @@ Notes for client authors:
   fields: a parked persistent scheduler is alive with nothing admitted. Every
   timestamp there is an absolute UTC RFC 3339 instant, including `observed_at`;
   compute relative time against that rather than your own clock.
+- `cflx run` serves the same resource, and its work is visible in
+  `has_active_work`, `active_activities`, and the per-change phases. It binds no
+  run supervisor and no command executor, so `scheduler_running` stays false for
+  the whole run and `/api/v2` commands are rejected: judge a run by the work
+  fields, not by scheduler liveness.
 - Never conclude that Apply produced no commit from `display_status: applying`
   or from a `stop_and_dequeue` that merely succeeded. Apply can finish while a
   cancellation is in flight. Read the settled record's typed `result`:

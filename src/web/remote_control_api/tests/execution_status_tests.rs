@@ -150,6 +150,132 @@ async fn agent_execution_observability_status_reports_phase_boundaries_absolutel
     }
 }
 
+/// `cflx run` shape: no `EventDispatcher` exists, so the only thing that reaches
+/// the store is the orchestrator's forwarder calling
+/// `WebState::apply_execution_event`.
+///
+/// Everything above drives the store the way the TUI's dispatch owner does, with
+/// the reducer state travelling on the dispatch. Run mode has no such owner: it
+/// moves the shared reducer inside the parallel executor and hands the same
+/// typed event to `WebState` afterwards, which reads the reducer back. This is
+/// integration-scoped over the real `WebState`, the real app router, and the two
+/// bindings `main.rs` makes for a run — a resource that publishes
+/// `has_active_work: false` while acceptance is running is exactly the
+/// affirmative wrong answer this contract exists to prevent.
+#[tokio::test]
+async fn agent_execution_observability_status_follows_run_mode_forwarded_events() {
+    /// One forwarded event: the executor moves the reducer, then the
+    /// orchestrator's web channel delivers the same event. No dispatch owner.
+    async fn forward(
+        shared: &Arc<tokio::sync::RwLock<OrchestratorState>>,
+        web_state: &Arc<crate::web::state::WebState>,
+        event: ExecutionEvent,
+    ) {
+        shared.write().await.apply_execution_event(&event);
+        web_state.apply_execution_event(&event).await;
+    }
+
+    let change = crate::openspec::Change {
+        id: "alpha".to_string(),
+        completed_tasks: 0,
+        total_tasks: 1,
+        last_modified: "now".to_string(),
+        dependencies: Vec::new(),
+        metadata: crate::openspec::ProposalMetadata::default(),
+    };
+    let web_state = Arc::new(crate::web::state::WebState::new(&[change]));
+    // The two bindings a run makes: the process-local facts store (`main.rs`,
+    // `Commands::Run`) and the shared reducer (`Orchestrator::set_web_state`).
+    web_state
+        .set_execution_facts(Arc::new(
+            crate::orchestration::execution_facts::ExecutionFactsStore::new(),
+        ))
+        .await;
+    let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+        vec!["alpha".to_string()],
+        0,
+    )));
+    web_state.set_shared_state(shared.clone()).await;
+
+    let config = crate::web::WebConfig::enabled(0, "127.0.0.1".to_string());
+    let router = crate::web::build_app_for_test(&config, web_state.clone());
+    let read = || async {
+        let response = send(&router, get(STATUS_PATH, None)).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        json_body(response).await
+    };
+
+    forward(
+        &shared,
+        &web_state,
+        ExecutionEvent::ApplyStarted {
+            change_id: "alpha".to_string(),
+            command: "agent apply".to_string(),
+        },
+    )
+    .await;
+    forward(
+        &shared,
+        &web_state,
+        ExecutionEvent::ApplyCompleted {
+            change_id: "alpha".to_string(),
+            revision: "abc123".to_string(),
+        },
+    )
+    .await;
+    forward(
+        &shared,
+        &web_state,
+        ExecutionEvent::AcceptanceStarted {
+            change_id: "alpha".to_string(),
+            command: "agent accept".to_string(),
+        },
+    )
+    .await;
+
+    let body = read().await;
+    assert_eq!(
+        body["process"]["has_active_work"], true,
+        "a run forwarding typed events must not report an idle process"
+    );
+    let change = body["changes"]
+        .as_array()
+        .expect("changes")
+        .iter()
+        .find(|change| change["id"] == "alpha")
+        .expect("alpha")
+        .clone();
+    assert_eq!(change["current_phase"], "acceptance");
+    assert_eq!(change["last_completed_phase"], "apply");
+    assert_eq!(change["execution_state"], "active");
+
+    // The typed terminal for that phase, forwarded the same way, must close it
+    // rather than leave the run looking busy forever.
+    forward(
+        &shared,
+        &web_state,
+        ExecutionEvent::AcceptanceCompleted {
+            change_id: "alpha".to_string(),
+        },
+    )
+    .await;
+
+    let body = read().await;
+    assert_eq!(body["process"]["has_active_work"], false);
+    let change = body["changes"]
+        .as_array()
+        .expect("changes")
+        .iter()
+        .find(|change| change["id"] == "alpha")
+        .expect("alpha")
+        .clone();
+    assert_eq!(change["current_phase"], "none");
+    assert_eq!(
+        change["last_completed_phase"], "acceptance",
+        "the completion the forwarder delivered is the one recorded"
+    );
+}
+
 /// A live scheduler with nothing admitted is not active work. This is the exact
 /// ambiguity the resource exists to remove.
 #[tokio::test]

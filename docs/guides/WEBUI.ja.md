@@ -95,7 +95,9 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 - `process.scheduler_running` — スケジューラタスクが生存している
 - `process.has_active_work` — ライフサイクル作業が実際に走っている。**この 2 つは
   同じではありません。** 実行対象が無く待機中の常駐スケジューラは
-  `scheduler_running: true` かつ `has_active_work: false` です
+  `scheduler_running: true` かつ `has_active_work: false` です。また `cflx run`
+  は run supervisor を束縛しないため、実行中もつねに
+  `scheduler_running: false` を返し、作業の有無は `has_active_work` 側に出ます
 - `process.active_activities` — 個々の変更に属さないプロセスレベルの処理
   （依存解析、base ブランチマージ、コンフリクト解決、ブランチマージ、
   ワークスペースクリーンアップ）

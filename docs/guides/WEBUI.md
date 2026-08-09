@@ -182,7 +182,9 @@ It reports, in closed typed vocabularies rather than display strings:
 - `process.scheduler_running` — the scheduler task is alive;
 - `process.has_active_work` — lifecycle work is actually running. **These are not
   the same thing.** A persistent scheduler parked with nothing to execute is
-  `scheduler_running: true` with `has_active_work: false`;
+  `scheduler_running: true` with `has_active_work: false`, and a `cflx run`
+  binds no run supervisor at all, so it reports `scheduler_running: false`
+  throughout while `has_active_work` still tracks its work;
 - `process.active_activities` — process-level episodes that belong to no single
   change (dependency analysis, base-branch merge, conflict resolution, branch
   merge, workspace cleanup);

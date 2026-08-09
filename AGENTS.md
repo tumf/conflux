@@ -50,6 +50,12 @@ curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" \
 actually running". `scheduler_running` and `has_active_work` are separate: a
 parked persistent scheduler is alive with nothing admitted.
 
+`cflx run` serves this resource too, and its lifecycle work shows up in
+`has_active_work`, `active_activities`, and the per-change phases. It binds no
+run supervisor and no command executor, though, so `scheduler_running` stays
+false for a whole run and `/api/v2` commands are rejected there — read the work
+fields, not scheduler liveness, to decide whether a run is busy.
+
 Never infer that Apply produced no commit from `display_status: applying`, or
 from a `stop_and_dequeue` that merely returned success — Apply can finish while
 a cancellation is still in flight. Read the settled command record's typed
