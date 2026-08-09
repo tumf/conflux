@@ -864,6 +864,28 @@ async fn main() -> Result<()> {
             #[cfg(feature = "web-monitoring")]
             let web_state_arc = started_api.as_ref().map(|(_, state)| state.clone());
 
+            // Run mode owns no `EventDispatcher`: the orchestrator forwards its
+            // typed events straight into `WebState::apply_execution_event`.
+            // Binding the one process-local facts store here is what makes that
+            // forwarder feed `/api/v2/execution-status`, which serves on the
+            // default Unix socket in this mode too. Without it the resource
+            // would answer "nothing is running" with full authority while
+            // lifecycle work is in flight — the exact misreading an agent is
+            // told to trust this resource to prevent.
+            //
+            // One store for the whole process, created before orchestration and
+            // outside the restart loop, so a restarted run keeps reading the
+            // same observability output the socket already advertises. It stays
+            // observability-only: nothing here decides a workflow action.
+            #[cfg(feature = "web-monitoring")]
+            if let Some(web_state) = web_state_arc.as_ref() {
+                web_state
+                    .set_execution_facts(std::sync::Arc::new(
+                        orchestration::execution_facts::ExecutionFactsStore::new(),
+                    ))
+                    .await;
+            }
+
             #[cfg(not(feature = "web-monitoring"))]
             if args.web {
                 eprintln!(

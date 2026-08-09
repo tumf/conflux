@@ -52,6 +52,7 @@ use crate::events::{
     all_completed_may_overwrite_mode, is_admitted_work_start, persistent_idle_may_project_ready,
     EventDispatcher, ExecutionEvent, OperatorCommandEffect, OutcomeRevisions,
 };
+use crate::orchestration::apply_commit_evidence::ApplyCommitEvidencePort;
 use crate::orchestration::operator_command::{OperatorMode, OperatorOutcome, PendingTermination};
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
@@ -484,6 +485,11 @@ pub struct OperatorApplication {
     /// `None` for a process with no `/api/v2` projection, which is also a
     /// process with no command record to bind a revision to.
     revisions: Option<Arc<dyn OutcomeRevisions>>,
+    /// Where explanatory Apply-commit evidence is read from at stop settlement.
+    ///
+    /// `None` for a process with no repository observation port, which reports
+    /// unknown rather than guessing.
+    apply_commit_evidence: Option<Arc<dyn ApplyCommitEvidencePort>>,
 }
 
 impl OperatorApplication {
@@ -500,12 +506,22 @@ impl OperatorApplication {
             run_control,
             dispatch,
             revisions: None,
+            apply_commit_evidence: None,
         }
     }
 
     /// Bind the projection an outcome dispatch's revision is read back from.
     pub fn with_revisions(mut self, revisions: Option<Arc<dyn OutcomeRevisions>>) -> Self {
         self.revisions = revisions;
+        self
+    }
+
+    /// Bind the repository port stop settlement reads Apply-commit evidence from.
+    pub fn with_apply_commit_evidence(
+        mut self,
+        port: Option<Arc<dyn ApplyCommitEvidencePort>>,
+    ) -> Self {
+        self.apply_commit_evidence = port;
         self
     }
 
@@ -571,6 +587,13 @@ impl OperatorApplication {
     /// Reacquires the gate, revalidates the target's current runtime state, and
     /// commits — or settles with the explicit unchanged revision observed under
     /// the reacquired boundary, without publishing a dequeue event.
+    ///
+    /// Between confirmation and reacquisition the terminated worktree is
+    /// quiescent, which is the one window where explanatory Git evidence can be
+    /// read safely *and* cheaply: doing it here rather than under the boundary
+    /// keeps a Git subprocess from monopolizing operator admission, and doing it
+    /// after termination rather than before keeps it from racing a worker that
+    /// is still committing.
     pub async fn settle_stop_and_dequeue(&self, pending: PendingTermination) -> ApplicationResult {
         let change_id = pending.change_id().to_string();
         if let Err(error) = pending.confirm_termination().await {
@@ -589,14 +612,25 @@ impl OperatorApplication {
             };
         }
 
+        // Outside the boundary, over a quiescent worktree.
+        let apply_commit = crate::orchestration::apply_commit_evidence::observe_apply_commit(
+            self.run_control.operator().execution_facts().as_deref(),
+            self.apply_commit_evidence.as_deref(),
+            &change_id,
+        )
+        .await;
+
         let _guard = self.gate.clone().lock_owned().await;
         match self
             .run_control
             .operator()
-            .commit_stop_and_dequeue(&change_id)
+            .commit_stop_and_dequeue(&change_id, apply_commit)
             .await
         {
-            Ok(OperatorOutcome::Dequeued { change_id }) => {
+            Ok(OperatorOutcome::Dequeued {
+                change_id,
+                settlement,
+            }) => {
                 // `ChangeDequeued` already means exactly this; a second spelling
                 // would give the same fact two authorities.
                 let revision = self
@@ -604,7 +638,13 @@ impl OperatorApplication {
                         change_id: change_id.clone(),
                     })
                     .await;
-                ApplicationResult::operator(OperatorOutcome::Dequeued { change_id }, Some(revision))
+                ApplicationResult::operator(
+                    OperatorOutcome::Dequeued {
+                        change_id,
+                        settlement,
+                    },
+                    Some(revision),
+                )
             }
             Ok(outcome) => ApplicationResult::operator(outcome, Some(self.current_revision())),
             Err(error) => ApplicationResult {
@@ -948,6 +988,10 @@ fn operator_outcome_event(outcome: &OperatorOutcome) -> Option<ExecutionEvent> {
 
 #[cfg(test)]
 mod tests;
+
+/// Phase-aware stop settlement, over deterministic termination ordering.
+#[cfg(test)]
+mod stop_settlement_tests;
 
 /// The dispatch boundary with a real `/api/v2` projection attached.
 #[cfg(all(test, feature = "web-monitoring"))]

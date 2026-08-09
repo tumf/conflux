@@ -262,6 +262,10 @@ pub fn remote_control_router(
         // serializes submissions through the same gate a keypress takes as soon
         // as an orchestration runtime binds one.
         .with_gate(runtime.gate())
+        // Execution facts and scheduler liveness are late-bound with the
+        // orchestration runtime that produces them, so the status resource and
+        // the command path observe the same process.
+        .with_execution_facts(runtime.execution_facts())
         // The runtime is both the command target and the worktree read port, so
         // both halves of the API see the same late binding.
         .with_worktrees(runtime),

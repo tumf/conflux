@@ -1243,7 +1243,7 @@ pub async fn dispatch_event_with_marks(
     event: ExecutionEvent,
     reconciler: Option<&crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
 ) -> u64 {
-    dispatch_event_fully(state, sinks, event, reconciler, None).await
+    dispatch_event_fully(state, sinks, event, reconciler, None, None).await
 }
 
 /// The authoritative dispatch owner, with the process lifecycle mode bound.
@@ -1255,12 +1255,19 @@ pub async fn dispatch_event_with_marks(
 /// `mode` is applied *before* the sinks run: every frontend's projection of a
 /// lifecycle event and the admission mode the next command is validated against
 /// are then the same transition, rather than a frontend cache racing the core.
+///
+/// `facts` is the process-local observability store. It is updated inside the
+/// same critical section, from the reducer state this transition produced, so a
+/// typed fact dispatched by a worker before it exits is visible to a settlement
+/// that observes the worker as terminated. It is an output, never an input: no
+/// workflow decision reads it.
 pub async fn dispatch_event_fully(
     state: &tokio::sync::RwLock<OrchestratorState>,
     sinks: &[std::sync::Arc<dyn EventSink>],
     event: ExecutionEvent,
     reconciler: Option<&crate::orchestration::mark_reconciliation::ExecutionMarkReconciler>,
     mode: Option<&crate::orchestration::operator_coordinator::CoreMode>,
+    facts: Option<&crate::orchestration::execution_facts::ExecutionFactsStore>,
 ) -> u64 {
     let ownership = event_ownership(&event);
     let id = next_dispatch_id();
@@ -1292,6 +1299,18 @@ pub async fn dispatch_event_fully(
                     classify_event(&event).0
                 );
             }
+        }
+        // The observability facts are refreshed from the reducer state this
+        // transition produced, while the write guard still excludes any other
+        // transition. A store updated after the guard was released could
+        // publish a phase two events old.
+        if let Some(facts) = facts {
+            facts.observe(
+                id,
+                &event,
+                matches!(ownership, EventOwnership::State).then_some(&*guard),
+                chrono::Utc::now(),
+            );
         }
         // Only a state-owning event can change what a frontend publishes;
         // cloning the reducer for every log line would be pure waste.
@@ -1338,6 +1357,11 @@ pub struct EventDispatcher {
     /// `None` for a dispatcher with no command-capable core — a headless run,
     /// or a test that only observes the reducer.
     mode: Option<std::sync::Arc<crate::orchestration::operator_coordinator::CoreMode>>,
+    /// The process-local execution-facts store this boundary feeds.
+    ///
+    /// `None` for a process with no observability consumer. It is a pure
+    /// output: nothing in the dispatch path reads it back.
+    facts: Option<std::sync::Arc<crate::orchestration::execution_facts::ExecutionFactsStore>>,
 }
 
 impl EventDispatcher {
@@ -1351,6 +1375,7 @@ impl EventDispatcher {
             sinks,
             marks: None,
             mode: None,
+            facts: None,
         }
     }
 
@@ -1376,6 +1401,19 @@ impl EventDispatcher {
         self
     }
 
+    /// Bind the process-local execution-facts store this boundary feeds.
+    ///
+    /// The *same* store the `/api/v2` execution-status resource reads and
+    /// stop-and-dequeue settlement consults, so "what was running" has one
+    /// answer no matter who asks.
+    pub fn with_execution_facts(
+        mut self,
+        facts: Option<std::sync::Arc<crate::orchestration::execution_facts::ExecutionFactsStore>>,
+    ) -> Self {
+        self.facts = facts;
+        self
+    }
+
     /// Apply one event and fan it out, reporting its dispatch identity.
     pub async fn dispatch(&self, event: ExecutionEvent) -> u64 {
         dispatch_event_fully(
@@ -1384,6 +1422,7 @@ impl EventDispatcher {
             event,
             self.marks.as_ref(),
             self.mode.as_deref(),
+            self.facts.as_deref(),
         )
         .await
     }

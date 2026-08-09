@@ -237,27 +237,40 @@ fn settle(
     command_id: &str,
     result: Result<ExecutionSummary, CommandFailure>,
 ) {
-    let (command_state, detail, error_code, revision) = match result {
+    let (command_state, detail, error_code, revision, typed_result) = match result {
         Ok(summary) if summary.changed => (
             CommandState::Succeeded,
             summary.detail,
             None,
             summary.result_revision,
+            summary.result,
         ),
         Ok(summary) => (
             CommandState::NoOp,
             summary.detail,
             None,
             summary.result_revision,
+            summary.result,
         ),
+        // A refusal settled no evidence: it cancelled nothing and dequeued
+        // nothing, so it must not carry a settlement result that would read as
+        // one.
         Err(failure) => (
             CommandState::Failed,
             Some(failure.message),
             Some(failure.error_code),
             failure.result_revision,
+            None,
         ),
     };
-    projection.complete_command(command_id, command_state, detail, error_code, revision);
+    projection.complete_command(
+        command_id,
+        command_state,
+        detail,
+        error_code,
+        revision,
+        typed_result,
+    );
 }
 
 /// Look up a previously submitted command.
