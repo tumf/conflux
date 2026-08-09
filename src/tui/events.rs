@@ -41,6 +41,23 @@ use crate::events::EventSink;
 use crate::orchestration::state::OrchestratorState;
 use crate::tui::types::DeleteIntent;
 
+/// Presentation-only observations the local TUI refresh task hands to the render loop.
+///
+/// Deliberately *not* an [`ExecutionEvent`]: nothing carried here is a workflow
+/// fact. It never reaches the orchestration reducer, the shared state store, the
+/// operator snapshot, or `/api/v2`, so this channel cannot change a published
+/// contract or a next-action decision — only what the header draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiRefreshObservation {
+    /// One **successful** dirty-state read of the repository root captured at
+    /// TUI startup.
+    ///
+    /// A failed read publishes nothing at all. That absence is what preserves
+    /// the last successful observation instead of reporting an unobservable
+    /// workspace as clean.
+    WorkspaceDirty { dirty: bool },
+}
+
 /// Commands sent from TUI to orchestrator
 #[derive(Debug, Clone)]
 pub enum TuiCommand {

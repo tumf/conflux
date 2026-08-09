@@ -20,7 +20,8 @@ use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplication
 use crate::tui::config::TuiConfig;
 use crate::tui::events::{LogEntry, LogLevel, TuiCommand};
 use crate::tui::types::{
-    AppExecutionMode, DeleteIntent, ModalState, StopMode, ViewMode, WorktreeInfo,
+    AppExecutionMode, DeleteIntent, ModalState, StopMode, ViewMode, WorkspaceDirtyState,
+    WorktreeInfo,
 };
 use ratatui::style::Color;
 use ratatui::widgets::ListState;
@@ -37,6 +38,8 @@ pub(crate) mod log_logic;
 pub(crate) mod modal_logic;
 mod processing_logic;
 mod selection_logic;
+#[cfg(test)]
+mod workspace_dirty_observability_tests;
 mod worktree_action_logic;
 mod worktree_logic;
 
@@ -334,6 +337,18 @@ pub struct AppState {
     /// One store, shared by every frontend, so a keypress and a remote command
     /// read the same concurrency, backend, and per-change eligibility.
     parallel_runtime: std::sync::Arc<crate::orchestration::operator_command::ParallelRuntime>,
+    /// Latest successful workspace dirty observation from the local refresh task.
+    ///
+    /// Private on purpose: the only way to move it is
+    /// [`AppState::adopt_workspace_dirty_observation`], which consumes a typed
+    /// event that the refresh task publishes only after a completed `git status`
+    /// read. Nothing else can turn a failed or unfinished check into a
+    /// `Clean` claim.
+    ///
+    /// Presentation-only, process-local state. It is never persisted and never
+    /// used as scheduler dispatch, resume routing, acceptance, archive, or
+    /// next-action input.
+    workspace_dirty: WorkspaceDirtyState,
     /// Target-scoped mark writes an operator interaction requested but that the
     /// shared service has not applied yet.
     ///
@@ -577,8 +592,17 @@ impl AppState {
             parallel_runtime: std::sync::Arc::new(
                 crate::orchestration::operator_command::ParallelRuntime::new(),
             ),
+            workspace_dirty: WorkspaceDirtyState::default(),
             pending_mark_writes: Vec::new(),
         }
+    }
+
+    /// Latest workspace dirty observation, for the header badge.
+    ///
+    /// Read-only by design: rendering is the only consumer, and there is no
+    /// setter beyond the typed observation adoption path.
+    pub fn workspace_dirty(&self) -> WorkspaceDirtyState {
+        self.workspace_dirty
     }
 
     /// Shared handle to the process-wide parallel runtime facts.

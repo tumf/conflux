@@ -521,6 +521,17 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
             .add_modifier(Modifier::BOLD),
     ));
 
+    // Workspace dirty observation from the existing auto-refresh. Only a known
+    // dirty result draws: a clean observation and a not-yet-observed workspace
+    // both stay silent, so the badge's absence is never evidence of anything.
+    if app.workspace_dirty().shows_dirty_badge() {
+        header_spans.push(Span::raw(" "));
+        header_spans.push(Span::styled(
+            "[dirty]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let header_text = Line::from(header_spans);
 
     let version = get_version_string();
@@ -2344,6 +2355,128 @@ mod tests {
             assert!(
                 content.contains("[workspaces:"),
                 "{mode:?} must still report concurrency and backend:\n{content}"
+            );
+        }
+    }
+
+    /// The header row, as rendered text.
+    fn header_line(buffer: &Buffer) -> String {
+        let mut line = String::new();
+        for x in 0..buffer.area.width {
+            line.push_str(buffer[(x, 1)].symbol());
+        }
+        line
+    }
+
+    fn observe_workspace_dirty(app: &mut AppState, dirty: bool) {
+        app.adopt_workspace_dirty_observation(
+            crate::tui::events::TuiRefreshObservation::WorkspaceDirty { dirty },
+        );
+    }
+
+    /// Only a known dirty observation draws the badge. Clean and unknown both
+    /// omit it, and neither omission may cost the header its existing content.
+    #[test]
+    fn workspace_dirty_header_shows_the_badge_only_for_an_observed_dirty_workspace() {
+        // (label, how the observation got there, whether the badge is expected)
+        let cases: [(&str, Option<bool>, bool); 3] = [
+            ("unknown", None, false),
+            ("clean", Some(false), false),
+            ("dirty", Some(true), true),
+        ];
+
+        for (label, observation, expects_badge) in cases {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            let workspaces_badge =
+                format!("[workspaces:{}:{}]", app.max_concurrent, app.vcs_backend);
+            if let Some(dirty) = observation {
+                observe_workspace_dirty(&mut app, dirty);
+            }
+
+            let buffer = render_buffer(&mut app, 120, 30);
+            let header = header_line(&buffer);
+
+            assert_eq!(
+                header.contains("[dirty]"),
+                expects_badge,
+                "{label} observation rendered the wrong badge state:\n{header}"
+            );
+            assert!(
+                header.contains("[Ready]"),
+                "{label}: the status label must survive:\n{header}"
+            );
+            assert!(
+                header.contains(&workspaces_badge),
+                "{label}: the workspaces badge must survive:\n{header}"
+            );
+            assert!(
+                header.contains(&crate::tui::utils::get_version_string()),
+                "{label}: the right-aligned version area must still render:\n{header}"
+            );
+        }
+
+        // The badge sits after the workspaces badge, not in place of it.
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        observe_workspace_dirty(&mut app, true);
+        let buffer = render_buffer(&mut app, 120, 30);
+        let header = header_line(&buffer);
+        let workspaces_at = header.find("[workspaces:").expect("workspaces badge");
+        let dirty_at = header.find("[dirty]").expect("dirty badge");
+        assert!(
+            workspaces_at < dirty_at,
+            "the dirty badge must follow the workspaces badge:\n{header}"
+        );
+
+        // Warning styling: the badge is a caution, so it must read as one.
+        let cell = buffer
+            .cell((dirty_at as u16, 1))
+            .expect("dirty badge cell exists");
+        assert_eq!(cell.style().fg, Some(Color::Red));
+        assert!(
+            cell.style().add_modifier.contains(Modifier::BOLD),
+            "the dirty badge must render bold"
+        );
+    }
+
+    /// The badge coexists with every other header owner: the running count, an
+    /// active modal's relabel, and the right-aligned version area — at both a
+    /// narrow and a wide terminal.
+    #[test]
+    fn workspace_dirty_header_coexists_with_status_modal_and_version_content() {
+        for width in [80, 120, 200] {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            app.execution_mode = AppExecutionMode::Running;
+            app.changes[0].set_display_status_cache("applying");
+            observe_workspace_dirty(&mut app, true);
+            let workspaces_badge =
+                format!("[workspaces:{}:{}]", app.max_concurrent, app.vcs_backend);
+
+            let buffer = render_buffer(&mut app, width, 30);
+            let header = header_line(&buffer);
+            assert!(
+                header.contains("[Running 1]"),
+                "width {width}: the running status must survive:\n{header}"
+            );
+            assert!(
+                header.contains(&workspaces_badge) && header.contains("[dirty]"),
+                "width {width}: both badges must render:\n{header}"
+            );
+            assert!(
+                header.contains(&crate::tui::utils::get_version_string()),
+                "width {width}: the version area must still render:\n{header}"
+            );
+
+            // An overlay relabels the status; it does not take the badge away.
+            app.modal = Some(ModalState::QrPopup);
+            let buffer = render_buffer(&mut app, width, 30);
+            let header = header_line(&buffer);
+            assert!(
+                header.contains("[dirty]"),
+                "width {width}: a modal must not suppress the badge:\n{header}"
+            );
+            assert!(
+                !header.contains("[Running 1]"),
+                "width {width}: the modal still owns the status label:\n{header}"
             );
         }
     }

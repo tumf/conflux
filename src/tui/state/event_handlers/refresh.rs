@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::openspec::Change;
-use crate::tui::events::LogEntry;
-use crate::tui::types::WorktreeInfo;
+use crate::tui::events::{LogEntry, TuiRefreshObservation};
+use crate::tui::types::{WorkspaceDirtyState, WorktreeInfo};
 
 use super::AppState;
 
@@ -188,6 +188,21 @@ impl AppState {
             self.worktree_cursor_index = self.worktrees.len() - 1;
         }
     }
+
+    /// Adopt one presentation-only observation from the local refresh task.
+    ///
+    /// The whole path is deliberately narrow: the only way this frontend's
+    /// workspace dirty value can move is a typed event the refresh task
+    /// publishes after a *completed* `git status` read, so a failed or
+    /// unfinished read has no way to be presented as clean. Nothing here touches
+    /// the reducer, the mark store, the queue, or any workflow decision.
+    pub(crate) fn adopt_workspace_dirty_observation(&mut self, observation: TuiRefreshObservation) {
+        match observation {
+            TuiRefreshObservation::WorkspaceDirty { dirty } => {
+                self.workspace_dirty = WorkspaceDirtyState::observed(dirty);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +245,77 @@ mod tests {
             HashMap::new(),
             HashSet::new(),
         )
+    }
+
+    /// Unknown, clean, and dirty stay three distinguishable facts, and each
+    /// successful observation replaces the previous one.
+    #[test]
+    fn workspace_dirty_header_state_adopts_successful_observations() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+
+        assert_eq!(app.workspace_dirty(), WorkspaceDirtyState::Unknown);
+        assert!(
+            !app.workspace_dirty().shows_dirty_badge(),
+            "an unobserved workspace must not render the badge"
+        );
+
+        app.adopt_workspace_dirty_observation(TuiRefreshObservation::WorkspaceDirty {
+            dirty: true,
+        });
+        assert_eq!(app.workspace_dirty(), WorkspaceDirtyState::Dirty);
+        assert!(app.workspace_dirty().shows_dirty_badge());
+
+        app.adopt_workspace_dirty_observation(TuiRefreshObservation::WorkspaceDirty {
+            dirty: false,
+        });
+        assert_eq!(
+            app.workspace_dirty(),
+            WorkspaceDirtyState::Clean,
+            "a later successful clean observation must replace the dirty one"
+        );
+        assert!(!app.workspace_dirty().shows_dirty_badge());
+        assert_ne!(
+            app.workspace_dirty(),
+            WorkspaceDirtyState::Unknown,
+            "an observed clean workspace is a positive fact, not the absence of one"
+        );
+    }
+
+    /// A failed Git status read publishes no observation at all, and the refresh
+    /// traffic that keeps flowing around it must not reset what was last seen.
+    #[test]
+    fn workspace_dirty_header_state_preserves_last_success_on_failure() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        app.adopt_workspace_dirty_observation(TuiRefreshObservation::WorkspaceDirty {
+            dirty: true,
+        });
+
+        // The same tick whose dirty read failed still delivers its ordinary
+        // catalog refresh, and other events keep arriving behind it.
+        let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+        app.handle_changes_refreshed(
+            vec![create_test_change("change-a")],
+            Vec::new(),
+            committed,
+            uncommitted,
+            worktrees,
+            paths,
+            not_ahead,
+            HashSet::new(),
+        );
+        app.handle_orchestrator_event(crate::tui::events::OrchestratorEvent::Stopped);
+
+        assert_eq!(
+            app.workspace_dirty(),
+            WorkspaceDirtyState::Dirty,
+            "a failed observation must never be reported as clean"
+        );
+
+        // Unknown is preserved by the same absence: nothing but a successful
+        // observation may make a cleanliness claim.
+        let mut unobserved = AppState::new(vec![create_test_change("change-a")]);
+        unobserved.handle_orchestrator_event(crate::tui::events::OrchestratorEvent::Stopped);
+        assert_eq!(unobserved.workspace_dirty(), WorkspaceDirtyState::Unknown);
     }
 
     #[test]
