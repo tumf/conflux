@@ -1,10 +1,55 @@
 ## MODIFIED Requirements
 
+### Requirement: Dynamic Execution Queue
+
+The orchestrator SHALL retain explicit DynamicQueue add/remove services for clients that intentionally invoke queue commands. Space and bulk `x` are execution-mark controls and MUST NOT add, remove, stop, dequeue, or otherwise mutate current-run work, including queued work that has not started and Applying/Accepting/Archiving/Resolving work.
+
+Applying/Accepting/Archiving/Resolving changes MUST continue to reject `@` state mutation. Their independent per-change termination control is `K: kill`.
+
+#### Scenario: Running Space does not remove queued current-run work
+
+- **GIVEN** TUI is in Running mode
+- **AND** a change is queued but has not started Processing
+- **WHEN** the user unmarks it with Space
+- **THEN** its execution mark becomes false
+- **AND** the change remains admitted to the current run
+- **AND** no DynamicQueue remove or dequeue command is emitted
+
+#### Scenario: Running Space does not stop active work
+
+- **GIVEN** TUI is in Running mode
+- **AND** a change is Applying, Accepting, Archiving, or Resolving
+- **WHEN** the user toggles its mark with Space
+- **THEN** only its execution mark changes
+- **AND** no stop or cancellation request is emitted
+- **AND** `K: kill` remains the independent guarded termination control
+
+#### Scenario: Processing 中の change で @ は無効
+
+- **GIVEN** change の queue_status が Applying/Accepting/Archiving/Resolving のいずれかである
+- **WHEN** ユーザーが `@` キーを押す
+- **THEN** queue_status と選択状態は変更されない
+
+#### Scenario: Explicit queue command retains queue semantics
+
+- **GIVEN** a client intentionally invokes an explicit queue add or remove command
+- **WHEN** the shared queue service accepts it
+- **THEN** DynamicQueue changes according to that explicit command
+- **AND** the operation does not derive its effect from Space or bulk execution-mark state
+
 ### Requirement: Archived 状態の checkbox 表示
 
-TUI は execution mark を、その change が次回 run の候補として保持されている間だけ checkbox として表現しなければならない（SHALL）。
+TUI は terminal row の checkbox / execution mark semantics を、その row が execution candidate かどうかに応じて表現しなければならない（SHALL）。
 
-`archived`、`merged`、または `pushed` 状態の change は execution candidate ではないため、checkbox テキストとして `[x]` または `[ ]` を表示してはならない（MUST NOT）。TUI は既存 checkbox と同じ表示幅の空白を描画し、cursor、change ID、badge、status、progress、および preview の開始位置を詰めてはならない（MUST NOT）。
+`archived`、`merged`、または `pushed` 状態の change は execution candidate ではないため、checkbox テキストとして `[x]` または `[ ]` を表示してはならない（MUST NOT）。TUI は既存 checkbox と同じ表示幅の空白を描画し、cursor、change ID、badge、status、progress、および preview の開始位置を詰めてはならない（MUST NOT）。Rejected 状態の change も execution candidate ではなく、以前の execution mark を保持したまま表示してはならない（MUST NOT）。
+
+#### Scenario: rejected 状態では x マークを保持しない
+
+- **GIVEN** TUI が change 一覧を表示している
+- **AND** ある change が rejection flow 完了により `rejected` 状態へ遷移した
+- **WHEN** 画面が次にレンダリングされる
+- **THEN** その change は execution mark なし (`selected = false`) で表示される
+- **AND** ステータス表示は `rejected` のままである
 
 #### Scenario: 実行モードで archived 状態の checkbox を表示しない
 
@@ -30,4 +75,4 @@ TUI は execution mark を、その change が次回 run の候補として保�
 - **THEN** execution mark、queue intent、runtime state、および表示状態は変化しない
 - **AND** mark refusal warning は表示されない
 
-<!-- Expected canonical result after archive: `cli` will replace gray post-archive `[x]` rendering with a fixed-width blank checkbox placeholder and silent Space no-op semantics. -->
+<!-- Expected canonical result after archive: `cli` will reserve DynamicQueue mutation for explicit queue commands, preserve rejected mark clearing, and replace gray post-archive `[x]` rendering with a fixed-width blank checkbox placeholder. -->

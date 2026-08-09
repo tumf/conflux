@@ -10,12 +10,10 @@ The existing `ExecutionMarkStore` remains the authority. TUI rows and `/api/v2` 
 
 A shared classifier distinguishes only:
 
-- visible pre-archive target: mark mutation allowed;
-- archived, merged, or pushed target: mark mutation unavailable because archive ended its run candidacy.
+- visible non-terminal target: mark mutation allowed;
+- archived, merged, pushed, or rejected target: mark mutation unavailable because the row is not a run candidate.
 
-Execution mode, active status, error/retry status, wait state, Apply-limit state, queue intent, and parallel eligibility are deliberately absent from mark admission.
-
-Rejected marker rows remain pre-archive rows. They may carry future-run intent, but the mark itself does not bypass rejection recovery or certify run eligibility. Final run admission still rejects or routes them according to current workflow facts.
+Execution mode, active status, error/retry status, wait state, Apply-limit state, queue intent, and parallel eligibility are deliberately absent from mark admission. Rejected marker rows retain their existing read-only contract and may become markable only after the marker is removed and discovery restores a non-terminal row.
 
 ## Command Separation
 
@@ -24,7 +22,7 @@ Mark commands mutate only `ExecutionMarkStore`. They do not call `QueuePort`, qu
 Existing controls keep their independent meanings:
 
 - Space: mark/unmark future run intent;
-- `x`: apply one mark state to all visible pre-archive rows;
+- `x`: apply one mark state to all visible non-terminal rows;
 - `K`: terminate one active change through the existing guarded flow;
 - configured start key: admit and dispatch current marked targets;
 - explicit queue API: mutate DynamicQueue when a client intentionally invokes a queue command;
@@ -37,19 +35,22 @@ Start/retry reads one coherent mark snapshot, then evaluates current reducer/wor
 Admission is fail-before-effect:
 
 1. capture marked IDs;
-2. classify current target eligibility and route;
-3. reject an empty or invalid requested set with target-specific reasons;
-4. prepare scheduler capability;
-5. commit any required run intent and publish the accepted outcome;
-6. activate the prepared scheduler.
+2. apply the existing all-or-nothing worktree eligibility fence to the complete marked set;
+3. classify remaining IDs by the requested route, excluding non-startable statuses with target-specific diagnostics;
+4. reject when no startable target remains;
+5. prepare scheduler capability;
+6. commit any required run intent and publish the accepted outcome;
+7. activate the prepared scheduler.
 
-This preserves the existing atomic command boundary while removing mark/queue aliasing. Unmarking after step 5 affects only a later run and cannot cancel work already admitted.
+For ordinary Start, startable rows use the existing start route. In Error mode, retry considers marked retry-eligible error rows only and reports marked non-error or non-retryable rows as excluded. A worktree-ineligible marked row rejects the complete request; other currently non-startable statuses do not block runnable marked rows. Any rejection is effect-free.
+
+This preserves the existing atomic command boundary while removing mark/queue aliasing. Unmarking after admission affects only a later run and cannot cancel work already admitted.
 
 ## Archive Boundary
 
-`ChangeArchived` is the edge where mark intent stops having meaning. The authoritative dispatch reconciler clears that target's mark after reducer application and before frontend projection, in the same revision. Duplicate or stale archive events do not create another revision or clear unrelated marks.
+Existing typed reconciliation edges continue to revoke stale marks for failure, rejection, rejected or parallel-ineligible refresh, dequeue, target-scoped stop, and first `on_merged` hook recovery. Those system revocations do not prohibit an operator from marking a later non-terminal steady state again.
 
-Merged and pushed events preserve the already-cleared state. Restart also begins with an empty store as before.
+`ChangeArchived` is added as the terminal edge where mark intent stops having meaning. The authoritative dispatch reconciler clears that target's mark after reducer application and before frontend projection, in the same revision. Duplicate or stale archive events do not create another revision or clear unrelated marks. Merged and pushed events preserve the already-cleared state. Restart also begins with an empty store as before.
 
 ## Rendering
 
@@ -59,4 +60,4 @@ Post-archive rows expose no Space or bulk mark affordance. Space is consumed as 
 
 ## Verification Strategy
 
-Focused in-memory service tests prove all lifecycle classes accept pre-archive mark-only mutation and record no queue/runtime effects. Cross-adapter tests prove TUI and API parity. Run-control tests prove eligibility is final-admission-owned and failed admission is effect-free. Event/revision tests prove archive and mark reconciliation are coherent. Buffer tests assert both absence of checkbox glyphs and exact column offsets.
+Focused in-memory service tests prove all non-terminal lifecycle classes accept mark-only mutation and record no queue/runtime effects while terminal rows remain unchanged no-ops. Cross-adapter tests prove TUI and API parity. Run-control tests prove eligibility is final-admission-owned and failed admission is effect-free. Event/revision tests prove archive and mark reconciliation are coherent. Buffer tests assert both absence of checkbox glyphs and exact column offsets.

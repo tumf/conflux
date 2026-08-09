@@ -18,7 +18,7 @@ references:
   - src/tui/key_handlers.rs
 verifications:
   - id: run-mark-contract-tests
-    requirement: "Execution marks remain pure next-run target intent across pre-archive lifecycle states, do not mutate queue or live execution, are excluded after archive, and render with stable row alignment"
+    requirement: "Execution marks remain pure next-run target intent across non-terminal lifecycle states, do not mutate queue or live execution, preserve existing reconciliation revocations, and are excluded from terminal rows with stable alignment"
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
@@ -53,13 +53,13 @@ After archive, the opposite problem occurs: the row no longer represents a possi
 
 Make execution marks pure process-local next-run target intent until archive completion:
 
-- permit single-row and bulk mark/unmark operations for every visible pre-archive change regardless of Select, Running, Stopping, Stopped, or Error mode, current active/retry/wait state, apply-limit state, or current parallel eligibility;
+- permit single-row and bulk mark/unmark operations for every visible non-terminal change regardless of Select, Running, Stopping, Stopped, or Error mode, current active/retry/wait state, apply-limit state, or current parallel eligibility, while retaining the existing rejected-row exclusion;
 - keep modal input ownership unchanged: an active popup still consumes keys, but execution lifecycle timing does not make marks immutable;
 - make mark mutation update only `ExecutionMarkStore` and its frontend projection; it must not add/remove `DynamicQueue` entries, stop/dequeue active work, create retry/resolve intent, change reducer status, or wake/start a scheduler;
 - retain `K: kill`, start controls, explicit retry/resolve commands, and queue services as separate controls;
-- have start/retry admission read a coherent mark snapshot and decide which marked changes are runnable using current reducer and worktree facts at that boundary rather than at mark time;
-- reject a start without partial scheduler or queue effects when marked targets cannot form a valid run target set, using actionable target-specific diagnostics;
-- revoke a change's mark when `ChangeArchived` is authoritatively applied so archived and later merged/pushed rows cannot re-enter a run target set;
+- have start/retry admission read a coherent mark snapshot and decide which marked changes are runnable using current reducer and worktree facts at that boundary rather than at mark time; preserve the existing all-or-nothing worktree eligibility fence, exclude other non-startable statuses with target-specific diagnostics, and reject when no runnable target remains;
+- reject failed admission without partial scheduler or queue effects, and define Error-mode retry to route only marked retry-eligible error targets while reporting other marked rows as excluded;
+- preserve existing typed mark-revocation edges and add `ChangeArchived` as an authoritative revocation edge so archived and later merged/pushed rows cannot re-enter a run target set;
 - render a fixed-width blank placeholder instead of `[x]` or `[ ]` for archived, merged, and pushed rows, preserving the existing cursor, change ID, badge, status, progress, and preview column positions;
 - make Space on a post-archive row a silent no-op and omit mark hints for that row;
 - preserve the shared TUI and `/api/v2` mark contract, including bulk target-state calculation and coherent state revisions.
@@ -69,16 +69,16 @@ No durable state, new key, new queue, new dependency, or configuration option is
 ## Acceptance Criteria
 
 1. Space can mark or unmark any visible non-archived change in Select, Running, Stopping, Stopped, and Error modes.
-2. Bulk `x` can mark or unmark the same pre-archive population in all five modes; overlays continue to consume input without leaking the action to the Changes view.
-3. Active, retryable-error, waiting, apply-limit, rejected-marker, and temporarily parallel-ineligible rows can retain operator mark intent until archive, without mark-time admission warnings.
+2. Bulk `x` can mark or unmark the same non-terminal population in all five modes; archived, merged, pushed, and rejected rows remain excluded, and overlays continue to consume input without leaking the action to the Changes view.
+3. Active, retryable-error, waiting, apply-limit, and temporarily parallel-ineligible non-terminal rows accept operator mark intent without mark-time admission warnings; existing typed reconciliation may still revoke stale marks, after which a non-terminal row can be marked again.
 4. A single or bulk mark change modifies only the execution-mark store/projection and does not mutate `DynamicQueue`, reducer queue intent, active execution, cancellation, retry, resolve, hooks, scheduler state, or process mode.
 5. Unmarking a currently active or queued change does not stop, dequeue, or unschedule work already admitted by the current run.
 6. `K: kill`, explicit retry/resolve behavior, graceful/force stop, and direct queue command APIs remain separate and retain their existing effects.
-7. Start/retry evaluates current marks and current run eligibility at final admission; invalid marked targets cause no partial queue or scheduler effect and return actionable diagnostics.
-8. A successful `ChangeArchived` transition clears only that change's mark in the same authoritative revision while preserving unrelated marks.
+7. Start/retry evaluates current marks and current run eligibility at final admission: any worktree-ineligible marked target rejects the whole request, other non-startable statuses are excluded with diagnostics, zero runnable targets rejects, and failed admission leaves no partial queue or scheduler effect. Error-mode retry routes only marked retry-eligible error targets.
+8. Existing typed mark-revocation edges remain authoritative, and a successful `ChangeArchived` transition additionally clears only that change's mark in the same authoritative revision while preserving unrelated marks.
 9. Archived, merged, and pushed rows remain in the current TUI session as specified, but display neither `[x]` nor `[ ]`.
 10. The post-archive checkbox area remains the same width, so cursor, ID, badges, status, progress, and preview content do not shift left.
-11. Space on an archived, merged, or pushed row is a silent no-op and no mark hint is advertised for that row.
+11. Space on an archived, merged, pushed, or rejected row is a silent no-op and no mark hint is advertised for that row; rejected rows otherwise retain their existing read-only display contract.
 12. TUI single-row mark, TUI bulk mark, `/api/v2 set_execution_mark`, and `/api/v2 set_all_execution_marks` use the same lifecycle-independent mark semantics and coherent revisions.
 13. Marks remain process-local and restart-empty; repository contents remain the sole durable workflow authority.
 
@@ -87,8 +87,8 @@ No durable state, new key, new queue, new dependency, or configuration option is
 - `src/orchestration/operator_command.rs` classifies mark mutation independently from queue, retry, active-state, execution-mode, apply-limit, and parallel-eligibility admission while retaining a distinct post-archive exclusion.
 - `src/tui/state/selection_logic.rs` no longer emits `AddToQueue` or `RemoveFromQueue` from Space or bulk `x`, and frontend mark projection follows the shared store.
 - `/api/v2` command execution and action projection expose the same markability contract as the TUI without a second frontend-local lifecycle table.
-- `src/orchestration/run_control.rs` performs current-state run eligibility checks after reading marks and proves failed admission leaves queue and scheduler state unchanged.
-- `src/orchestration/mark_reconciliation.rs` revokes the target mark on the authoritative archive edge and publishes it with the archive revision.
+- `src/orchestration/run_control.rs` performs current-state run eligibility checks after reading marks, preserves the complete-set worktree fence, reports status exclusions, routes Error-mode retries precisely, and proves failed admission leaves queue and scheduler state unchanged.
+- `src/orchestration/mark_reconciliation.rs` preserves existing typed mark-revocation edges, additionally revokes the target mark on the authoritative archive edge, and publishes every effective revocation with its reducer revision.
 - `src/tui/render.rs` uses an exactly checkbox-width blank placeholder for archived, merged, and pushed rows in Select and Running/Stopped layouts and suppresses their mark hints.
 - Focused unit and integration tests prove lifecycle-wide markability, side-effect isolation, current-run continuity after unmark, API/TUI parity, archive clearing, silent post-archive Space, and fixed-width rendering.
 - The declared `run-mark-contract-tests` verification passes.
