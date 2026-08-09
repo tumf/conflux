@@ -184,6 +184,7 @@ AUTH="Authorization: Bearer $CFLX_WEB_TOKEN"
 curl "$BASE/health"                          # always unauthenticated
 curl -H "$AUTH" "$BASE/capabilities"         # commands, transports, limits
 curl -H "$AUTH" "$BASE/state"                # coherent snapshot + revision
+curl -H "$AUTH" "$BASE/execution-status"     # what is actually executing now
 
 # Every command needs the revision it was decided against and a replay key.
 curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
@@ -212,6 +213,21 @@ Notes for client authors:
   are never honored.
 - Errors carry a stable `error_code` to branch on — `stale_revision` and
   `idempotency_mismatch` are both HTTP 409 but mean different things.
+- `GET /execution-status` answers "is anything actually running", which
+  `/state` does not. `scheduler_running` and `has_active_work` are separate
+  fields: a parked persistent scheduler is alive with nothing admitted. Every
+  timestamp there is an absolute UTC RFC 3339 instant, including `observed_at`;
+  compute relative time against that rather than your own clock.
+- Never conclude that Apply produced no commit from `display_status: applying`
+  or from a `stop_and_dequeue` that merely succeeded. Apply can finish while a
+  cancellation is in flight. Read the settled record's typed `result`:
+  `cancelled_phase`, `last_completed_phase`, `apply_commit` (whose `present:
+  null` means *unknown*, not absent), and `effects_rolled_back`, which is always
+  `false` because dequeue never undoes completed worktree work.
+- Log content is available through `GET /logs`, `/events`, and `/ws` only. No
+  response, schema, event, or command result discloses a log file path, a
+  repository root, a workspace path used as a log locator, or a `file://` URL,
+  and no endpoint accepts a host path or filename.
 
 The full schema is generated at runtime rather than tracked in the repository.
 Export it with `cflx openapi > openapi.yaml`, or fetch it from a running

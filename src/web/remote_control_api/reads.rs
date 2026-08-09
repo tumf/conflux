@@ -14,11 +14,12 @@ use axum::{Extension, Json};
 use super::auth::CorrelationId;
 
 use super::dto::{
-    ApiError, CapabilitiesResponse, CapabilityLimits, ChangeResponse, ChangesResponse, ErrorCode,
-    HealthResponse, InstanceResponse, LogsResponse, ParallelCapabilities, StateResponse,
-    TransportDescriptor, ALL_ERROR_CODES, ALL_PARALLEL_BLOCKED_REASONS, API_VERSION,
-    COMMAND_RECORD_TTL_SECS, MAX_COMMAND_RECORDS, MAX_CORRELATION_ID_LEN, MAX_EVENTS, MAX_LOGS,
-    SUPPORTED_COMMANDS,
+    ApiError, CapabilitiesResponse, CapabilityLimits, ChangeExecutionState, ChangeExecutionStatus,
+    ChangeResponse, ChangesResponse, ErrorCode, ExecutionPhase, ExecutionStatusResponse,
+    HealthResponse, InstanceResponse, LatestLogProjection, LogsResponse, ParallelCapabilities,
+    ProcessExecutionStatus, StateResponse, TransportDescriptor, ALL_ERROR_CODES,
+    ALL_PARALLEL_BLOCKED_REASONS, API_VERSION, COMMAND_RECORD_TTL_SECS, MAX_COMMAND_RECORDS,
+    MAX_CORRELATION_ID_LEN, MAX_EVENTS, MAX_LOGS, SUPPORTED_COMMANDS,
 };
 use super::worktrees::{WorktreeCapabilities, WorktreeResponse, WorktreesResponse};
 use super::RemoteControlState;
@@ -264,6 +265,80 @@ pub async fn get_worktree(
         .with_revision(state_revision)
         .into_response(),
     }
+}
+
+/// Coherent machine-readable answer to "what is actually happening right now".
+///
+/// This is the resource an agent reads *before* intervening. `/state` says what
+/// may be commanded and `/logs` says what was printed; neither closes the gap
+/// between "the scheduler is alive" and "lifecycle work is running", and neither
+/// says which phase most recently completed. Getting that wrong is how an agent
+/// creates a duplicate manual commit while Conflux is still settling.
+///
+/// The snapshot and the retained log ring are read under one hold of the
+/// projection lock, so the phase, the revision, the cursor, and the log line all
+/// describe the same instant. Every timestamp is an absolute UTC RFC 3339
+/// instant, including `observed_at`, which is what lets a client render relative
+/// time without trusting its own clock — the server returns no elapsed counter
+/// and no relative-time text at all.
+#[utoipa::path(
+    get,
+    path = "/api/v2/execution-status",
+    tag = "remote-control",
+    responses((status = 200, description = "Coherent execution observation with absolute timestamps", body = ExecutionStatusResponse))
+)]
+pub async fn execution_status(State(state): State<RemoteControlState>) -> Response {
+    let observation = state.projection.execution_observation();
+    let facts = state.execution_facts.snapshot();
+
+    let changes = observation
+        .snapshot
+        .changes
+        .iter()
+        .map(|change| {
+            let change_facts = facts.change(&change.id);
+            ChangeExecutionStatus {
+                id: change.id.clone(),
+                execution_state: ChangeExecutionState::from_shared(change_facts.execution_state),
+                current_phase: ExecutionPhase::from_shared(change_facts.current_phase),
+                last_completed_phase: change_facts
+                    .last_completed_phase
+                    .map(ExecutionPhase::from_shared),
+                iteration: change.iteration_number,
+                phase_started_at: change_facts.phase_started_at.map(|at| at.to_rfc3339()),
+                last_completed_at: change_facts.last_completed_at.map(|at| at.to_rfc3339()),
+                run_started_at: change.timing.started_at.clone(),
+                run_completed_at: change.timing.completed_at.clone(),
+                latest_activity: change.latest_activity.clone(),
+                latest_log: observation
+                    .change_logs
+                    .get(&change.id)
+                    .map(LatestLogProjection::from_entry),
+            }
+        })
+        .collect();
+
+    no_store(ExecutionStatusResponse {
+        instance_id: state.projection.instance_id().to_string(),
+        state_revision: observation.state_revision,
+        event_sequence: observation.event_sequence,
+        observed_at: chrono::Utc::now().to_rfc3339(),
+        process: ProcessExecutionStatus {
+            app_mode: observation.snapshot.app_mode.clone(),
+            scheduler_running: state.scheduler_running(),
+            has_active_work: facts.has_active_work(),
+            active_activities: facts
+                .activities
+                .iter()
+                .map(|activity| activity.as_str().to_string())
+                .collect(),
+            latest_log: observation
+                .process_log
+                .as_ref()
+                .map(LatestLogProjection::from_entry),
+        },
+        changes,
+    })
 }
 
 /// Bounded observational log ring.

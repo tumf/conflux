@@ -58,6 +58,25 @@ pub enum Admission {
     Capacity,
 }
 
+/// A snapshot and the retained log lines that belong to the same instant.
+///
+/// Deliberately a value rather than a pair of accessors: the coherence is the
+/// point, and returning the parts separately would invite a caller to recombine
+/// two different instants.
+#[derive(Debug, Clone)]
+pub struct ExecutionObservation {
+    /// The snapshot at `state_revision`.
+    pub snapshot: InstanceSnapshot,
+    /// Revision of that snapshot.
+    pub state_revision: u64,
+    /// Latest allocated event sequence at the same instant.
+    pub event_sequence: u64,
+    /// Newest retained entry regardless of change; `None` when the ring is empty.
+    pub process_log: Option<LogEntry>,
+    /// Newest retained entry per change, by exact structured `change_id`.
+    pub change_logs: std::collections::HashMap<String, LogEntry>,
+}
+
 struct Inner {
     state_revision: u64,
     event_sequence: u64,
@@ -151,6 +170,54 @@ impl Projection {
             inner.state_revision,
             inner.event_sequence,
         )
+    }
+
+    /// One coherent read of the snapshot and the retained log ring.
+    ///
+    /// Taken under a single hold of the projection lock so the snapshot, the
+    /// revision, the cursor, and the selected log lines all describe the same
+    /// instant. Two reads — `snapshot()` then `logs()` — would let an event land
+    /// between them and hand a client a log line from a revision its snapshot
+    /// never saw.
+    ///
+    /// Latest-log selection is by retained-ring *insertion order*, and a change
+    /// line is selected only by exact structured `change_id` equality. Second-
+    /// precision timestamps are never compared, message text is never searched,
+    /// and the persistent log file is never read.
+    pub fn execution_observation(&self) -> ExecutionObservation {
+        let inner = self.lock();
+
+        let wanted: std::collections::HashSet<&str> = inner
+            .snapshot
+            .changes
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect();
+
+        let mut change_logs: std::collections::HashMap<String, LogEntry> =
+            std::collections::HashMap::new();
+        // Reverse insertion order: the first hit for a change ID is its newest
+        // retained entry, so one pass answers every change at once.
+        for entry in inner.logs.iter().rev() {
+            let Some(change_id) = entry.change_id.as_deref() else {
+                continue;
+            };
+            if !wanted.contains(change_id) || change_logs.contains_key(change_id) {
+                continue;
+            }
+            change_logs.insert(change_id.to_string(), entry.clone());
+            if change_logs.len() == wanted.len() {
+                break;
+            }
+        }
+
+        ExecutionObservation {
+            snapshot: inner.snapshot.clone(),
+            state_revision: inner.state_revision,
+            event_sequence: inner.event_sequence,
+            process_log: inner.logs.back().cloned(),
+            change_logs,
+        }
     }
 
     /// Events strictly after `after`, or `Gap` when that cursor is unusable.
@@ -394,6 +461,7 @@ impl Projection {
             completed_at: None,
             detail: None,
             error_code: None,
+            result: None,
         };
 
         match inner.registry.reserve(
@@ -425,6 +493,7 @@ impl Projection {
         detail: Option<String>,
         error_code: Option<super::dto::ErrorCode>,
         result_revision: Option<u64>,
+        result: Option<super::dto::CommandResult>,
     ) -> Option<CommandRecord> {
         let mut inner = self.lock();
         let admitted = inner
@@ -440,6 +509,7 @@ impl Projection {
                 result_revision,
                 detail,
                 error_code,
+                result,
             },
         )
     }

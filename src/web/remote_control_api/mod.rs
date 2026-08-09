@@ -89,6 +89,80 @@ pub struct RemoteControlRuntime {
     worktrees: tokio::sync::RwLock<Option<Arc<dyn WorktreeOperations>>>,
     /// The process-local application gate, bound with the executor.
     gate: Arc<CommandGate>,
+    /// Execution facts and scheduler liveness, bound with the orchestration
+    /// runtime that produces them.
+    execution_facts: Arc<ExecutionFactsHandle>,
+}
+
+/// Late-bound handle to the shared execution-facts store and the scheduler
+/// liveness authority the execution-status resource reads.
+///
+/// Bound together because they answer the two halves of one question: a live
+/// scheduler with no admitted work and a dead scheduler with stale facts are
+/// different situations, and a client must be able to tell them apart. Unbound
+/// is a process that has observed no lifecycle work and has no scheduler, which
+/// reports exactly that rather than inventing either half.
+///
+/// Both bindings sit behind synchronous locks: every operation is a clone or a
+/// boolean read, so an async lock would only add an await point where a request
+/// could be reordered against a binding.
+#[derive(Default)]
+pub struct ExecutionFactsHandle {
+    facts:
+        std::sync::RwLock<Option<Arc<crate::orchestration::execution_facts::ExecutionFactsStore>>>,
+    boundary: std::sync::RwLock<
+        Option<Arc<dyn crate::orchestration::operator_command::RunBoundaryLiveness>>,
+    >,
+}
+
+impl ExecutionFactsHandle {
+    /// Bind the shared store.
+    pub fn bind(&self, facts: Arc<crate::orchestration::execution_facts::ExecutionFactsStore>) {
+        *self
+            .facts
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(facts);
+    }
+
+    /// Bind the scheduler-task liveness authority.
+    pub fn bind_boundary(
+        &self,
+        boundary: Arc<dyn crate::orchestration::operator_command::RunBoundaryLiveness>,
+    ) {
+        *self
+            .boundary
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(boundary);
+    }
+
+    /// A coherent read of the store, empty when nothing is bound.
+    ///
+    /// An unbound process has observed no lifecycle work, and the empty snapshot
+    /// says exactly that: no phases, no episodes, no active work.
+    pub fn snapshot(&self) -> crate::orchestration::execution_facts::ExecutionFactsSnapshot {
+        match self
+            .facts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            Some(facts) => facts.snapshot(),
+            None => Default::default(),
+        }
+    }
+
+    /// Whether the scheduler task owning the current run state is alive.
+    pub fn scheduler_running(&self) -> bool {
+        match self
+            .boundary
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            Some(boundary) => boundary.boundary_running(),
+            None => false,
+        }
+    }
 }
 
 /// Late-bound handle to the process-local operator application gate.
@@ -133,6 +207,7 @@ impl RemoteControlRuntime {
             executor: tokio::sync::RwLock::new(None),
             worktrees: tokio::sync::RwLock::new(None),
             gate: Arc::new(CommandGate::default()),
+            execution_facts: Arc::new(ExecutionFactsHandle::default()),
         }
     }
 
@@ -144,6 +219,27 @@ impl RemoteControlRuntime {
     /// The application gate the command endpoint serializes submissions with.
     pub fn gate(&self) -> Arc<CommandGate> {
         self.gate.clone()
+    }
+
+    /// The execution-facts handle the status resource reads.
+    pub fn execution_facts(&self) -> Arc<ExecutionFactsHandle> {
+        self.execution_facts.clone()
+    }
+
+    /// Bind the shared execution-facts store once an orchestration runtime exists.
+    pub fn bind_execution_facts(
+        &self,
+        facts: Arc<crate::orchestration::execution_facts::ExecutionFactsStore>,
+    ) {
+        self.execution_facts.bind(facts);
+    }
+
+    /// Bind the scheduler-task liveness authority the status resource reports.
+    pub fn bind_run_boundary(
+        &self,
+        boundary: Arc<dyn crate::orchestration::operator_command::RunBoundaryLiveness>,
+    ) {
+        self.execution_facts.bind_boundary(boundary);
     }
 
     /// Bind the delegation target once an orchestration runtime exists.
@@ -263,6 +359,15 @@ pub struct RemoteControlState {
     /// Defaults to unbound, which is a process with no coordinator and therefore
     /// no transaction to serialize.
     pub gate: Arc<CommandGate>,
+    /// Execution facts and scheduler liveness for `/api/v2/execution-status`.
+    pub execution_facts: Arc<ExecutionFactsHandle>,
+}
+
+impl RemoteControlState {
+    /// Whether the scheduler task owning the current run state is alive.
+    pub fn scheduler_running(&self) -> bool {
+        self.execution_facts.scheduler_running()
+    }
 }
 
 impl RemoteControlState {
@@ -278,12 +383,19 @@ impl RemoteControlState {
             executor,
             worktrees: Arc::new(UnboundWorktreeOperations),
             gate: Arc::new(CommandGate::default()),
+            execution_facts: Arc::new(ExecutionFactsHandle::default()),
         }
     }
 
     /// Attach the application gate this router serializes submissions with.
     pub fn with_gate(mut self, gate: Arc<CommandGate>) -> Self {
         self.gate = gate;
+        self
+    }
+
+    /// Attach the execution-facts handle the status resource reads.
+    pub fn with_execution_facts(mut self, facts: Arc<ExecutionFactsHandle>) -> Self {
+        self.execution_facts = facts;
         self
     }
 
@@ -311,6 +423,7 @@ pub fn router(state: RemoteControlState) -> Router {
         .route("/api/v2/capabilities", get(reads::capabilities))
         .route("/api/v2/instance", get(reads::instance))
         .route("/api/v2/state", get(reads::state))
+        .route("/api/v2/execution-status", get(reads::execution_status))
         .route("/api/v2/changes", get(reads::list_changes))
         .route("/api/v2/changes/{change_id}", get(reads::get_change))
         .route("/api/v2/logs", get(reads::logs))

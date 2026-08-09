@@ -568,6 +568,14 @@ async fn run_tui_loop(
     // action from the workspace alone.
     let core_mode = Arc::new(crate::orchestration::operator_coordinator::CoreMode::new());
 
+    // The one process-local execution-facts store. The dispatch owner feeds it,
+    // `/api/v2/execution-status` reads it, and stop settlement consults it, so
+    // "which phase was running" has one answer for every consumer. It is an
+    // observability output only: it starts empty on every restart and no
+    // workflow decision reads it.
+    let execution_facts =
+        Arc::new(crate::orchestration::execution_facts::ExecutionFactsStore::new());
+
     // *The* dispatch owner for this process. Runner-local producers, accepted
     // operator-command outcomes, and every orchestration run publish through it,
     // which is what makes one internal event produce exactly one reducer
@@ -587,7 +595,8 @@ async fn run_tui_loop(
             ),
         )
         .with_mark_reconciler(Some(mark_reconciler.clone()))
-        .with_core_mode(Some(core_mode.clone())),
+        .with_core_mode(Some(core_mode.clone()))
+        .with_execution_facts(Some(execution_facts.clone())),
     );
 
     // TUI-local producers (key handlers, hooks, worktree operations, the
@@ -650,7 +659,11 @@ async fn run_tui_loop(
             // The supervisor's own task handle is the active-limit gate's
             // lifetime. Binding it here — the same handle run control dispatches
             // through — is what makes admission and eligibility one decision.
-            .with_run_boundary(supervisor.clone()),
+            .with_run_boundary(supervisor.clone())
+            // Read-only, and only at stop settlement: the phase a settled
+            // command reports comes from the same store the status resource
+            // publishes.
+            .with_execution_facts(execution_facts.clone()),
         )
     };
     // One store, three readers: the start guard, the operator service that
@@ -672,7 +685,12 @@ async fn run_tui_loop(
         core_mode.clone(),
         run_control.clone(),
         dispatcher.clone(),
-    );
+    )
+    // Explanatory Git evidence for stop settlement, read from the server's own
+    // change-to-worktree mapping while the terminated worktree is quiescent.
+    .with_apply_commit_evidence(Some(Arc::new(
+        crate::orchestration::apply_commit_evidence::GitApplyCommitEvidence::new(repo_root.clone()),
+    )));
     #[cfg(feature = "web-monitoring")]
     if let Some(ref ws) = web_state {
         // Where an outcome dispatch's exact revision is read back from. Without
@@ -749,6 +767,13 @@ async fn run_tui_loop(
         // services would refuse, and cannot keep advertising the block once the
         // owning scheduler task exits.
         ws.set_run_boundary(supervisor.clone()).await;
+        // The same liveness authority the execution-status resource reports as
+        // `scheduler_running`, kept distinct from `has_active_work` so a parked
+        // persistent scheduler is never mistaken for admitted work.
+        runtime.bind_run_boundary(supervisor.clone());
+        // The store the dispatch owner already feeds, so a v2 client reads the
+        // same phases the coordinator settles against.
+        ws.set_execution_facts(execution_facts.clone()).await;
     }
 
     // Cancellation token for graceful shutdown

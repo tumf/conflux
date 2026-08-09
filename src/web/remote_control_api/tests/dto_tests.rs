@@ -233,6 +233,7 @@ fn command_record_status_reflects_its_lifecycle_state() {
         completed_at: None,
         detail: None,
         error_code: None,
+        result: None,
     };
     assert_eq!(record.http_status(), StatusCode::ACCEPTED);
 

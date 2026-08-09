@@ -37,10 +37,13 @@ use conflux::web::openapi::{
     document_yaml, BEARER_SCHEME, GENERATED_BANNER, SUPPORTED_V2_PATHS, UNAUTHENTICATED_V2_PATHS,
 };
 use conflux::web::remote_control_api::dto::{
-    ActionEligibility, ApiError, AttentionState, ChangeActions, ChangeActivity, ChangeBlocker,
-    ChangeResource, ChangeTiming, ChangeWorktree, CommandRecord, CommandState, ErrorCode,
-    EventCategory, EventEnvelope, InstanceSnapshot, ParallelEligibility, ParallelRuntimeState,
-    QueueIntent, SnapshotTotals, StateResponse, ALL_ERROR_CODES, SUPPORTED_COMMANDS,
+    ActionEligibility, ApiError, ApplyCommitEvidence, AttentionState, ChangeActions,
+    ChangeActivity, ChangeBlocker, ChangeExecutionState, ChangeExecutionStatus, ChangeResource,
+    ChangeTiming, ChangeWorktree, CommandRecord, CommandResult, CommandState, ErrorCode,
+    EventCategory, EventEnvelope, ExecutionPhase, ExecutionStatusResponse, InstanceSnapshot,
+    LatestLogProjection, ParallelEligibility, ParallelRuntimeState, ProcessExecutionStatus,
+    QueueIntent, SnapshotTotals, StateResponse, ALL_CHANGE_EXECUTION_STATES, ALL_ERROR_CODES,
+    ALL_EXECUTION_PHASES, SUPPORTED_COMMANDS,
 };
 use conflux::web::remote_control_api::worktrees::{
     WorktreeConflict, WorktreeEligibility, WorktreeResource, WorktreeResponse,
@@ -120,6 +123,42 @@ const REQUIRED_MEMBERS: &[(&str, &[&str])] = &[
         "WorktreeResponse",
         &["instance_id", "state_revision", "worktree"],
     ),
+    // The execution observation. `observed_at` is required because it is what
+    // a client renders relative time against; without it, a consumer falls back
+    // to its own clock and the whole absolute-time contract is pointless.
+    (
+        "ExecutionStatusResponse",
+        &[
+            "instance_id",
+            "state_revision",
+            "event_sequence",
+            "observed_at",
+            "process",
+            "changes",
+        ],
+    ),
+    (
+        "ProcessExecutionStatus",
+        &["app_mode", "scheduler_running", "has_active_work"],
+    ),
+    (
+        "ChangeExecutionStatus",
+        &["id", "execution_state", "current_phase"],
+    ),
+    ("LatestLogProjection", &["message", "level", "created_at"]),
+];
+
+/// The execution-status resource publishes absolute instants and nothing else.
+///
+/// A client that found an elapsed counter here would render a value that is
+/// already stale, and a server that published one would have to advance its own
+/// revision forever to keep it fresh.
+const FORBIDDEN_TIME_MEMBERS: &[&str] = &[
+    "elapsed_seconds",
+    "elapsed_ms",
+    "age_seconds",
+    "seconds_ago",
+    "relative_time",
 ];
 
 /// Snapshot members an operator console decides from.
@@ -299,6 +338,7 @@ fn contract_errors(doc: &Value) -> Vec<String> {
     errors.extend(required_member_errors(doc));
     errors.extend(payload_errors(doc));
     errors.extend(snapshot_field_errors(doc));
+    errors.extend(execution_observability_errors(doc));
     errors
 }
 
@@ -573,9 +613,11 @@ fn payload_errors(doc: &Value) -> Vec<String> {
     let cases: Vec<(&str, Value)> = vec![
         ("StateResponse", to_value(&state_response())),
         ("CommandRecord", to_value(&command_record())),
+        ("CommandRecord", to_value(&settled_stop_record())),
         ("WorktreeResponse", to_value(&worktree_response())),
         ("EventEnvelope", to_value(&event_envelope())),
         ("ApiError", to_value(&api_error())),
+        ("ExecutionStatusResponse", to_value(&execution_status())),
     ];
 
     let mut errors = Vec::new();
@@ -621,9 +663,131 @@ fn snapshot_field_errors(doc: &Value) -> Vec<String> {
     errors
 }
 
+/// The execution-observability surface a remote agent depends on.
+///
+/// Every assertion here exists because an agent would otherwise have to infer
+/// the answer: closed vocabularies instead of display strings, a typed stop
+/// result instead of generic success, absolute instants instead of counters, and
+/// a log projection that carries no filesystem locator.
+fn execution_observability_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let expected_phases: BTreeSet<String> = ALL_EXECUTION_PHASES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    if published_enum(doc, "ExecutionPhase") != expected_phases {
+        errors.push(
+            "ExecutionPhase must publish exactly the closed phase vocabulary the server \
+             projects"
+                .to_string(),
+        );
+    }
+
+    let expected_states: BTreeSet<String> = ALL_CHANGE_EXECUTION_STATES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    if published_enum(doc, "ChangeExecutionState") != expected_states {
+        errors.push(
+            "ChangeExecutionState must publish exactly the closed execution-state vocabulary"
+                .to_string(),
+        );
+    }
+
+    // The typed command result: a machine consumer must be able to branch on it
+    // without parsing the detail sentence.
+    let stop_variant = schemas(doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .and_then(|variants| {
+            variants.iter().find(|variant| {
+                variant["properties"]["kind"]["enum"]
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|value| value == "stop_and_dequeue"))
+            })
+        })
+        .cloned();
+    match stop_variant {
+        None => errors
+            .push("CommandResult must publish the stop_and_dequeue settlement variant".to_string()),
+        Some(variant) => {
+            let properties: BTreeSet<&str> = variant["properties"]
+                .as_object()
+                .map(|p| p.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            for member in [
+                "cancelled_phase",
+                "last_completed_phase",
+                "apply_commit",
+                "effects_rolled_back",
+            ] {
+                if !properties.contains(member) {
+                    errors.push(format!(
+                        "the stop_and_dequeue result must publish `{member}`; a client would \
+                         otherwise have to inspect Git itself"
+                    ));
+                }
+            }
+        }
+    }
+
+    // The latest-log projection is closed and path-free. `workspace_path` and the
+    // display `timestamp` exist on the retained entry and must not travel here.
+    let log_properties: BTreeSet<&str> = schemas(doc)["LatestLogProjection"]["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let expected_log: BTreeSet<&str> = ["message", "level", "operation", "iteration", "created_at"]
+        .into_iter()
+        .collect();
+    if log_properties != expected_log {
+        errors.push(format!(
+            "LatestLogProjection must publish exactly {expected_log:?}, found {log_properties:?}"
+        ));
+    }
+
+    // No published execution schema may carry a relative-time member.
+    for schema in [
+        "ExecutionStatusResponse",
+        "ProcessExecutionStatus",
+        "ChangeExecutionStatus",
+        "LatestLogProjection",
+    ] {
+        let properties: BTreeSet<&str> = schemas(doc)[schema]["properties"]
+            .as_object()
+            .map(|p| p.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        if properties.is_empty() {
+            errors.push(format!(
+                "{schema} is served by this API but is not published"
+            ));
+            continue;
+        }
+        for forbidden in FORBIDDEN_TIME_MEMBERS {
+            if properties.contains(forbidden) {
+                errors.push(format!(
+                    "{schema}.{forbidden} is a relative-time member; this resource publishes \
+                     absolute UTC instants only"
+                ));
+            }
+        }
+    }
+
+    errors
+}
+
 // ============================================================================
 // The generated document is complete
 // ============================================================================
+
+/// The execution-status resource is published with its closed vocabularies.
+#[test]
+fn agent_execution_observability_contract_publishes_the_execution_surface() {
+    assert_eq!(
+        execution_observability_errors(&generated()),
+        Vec::<String>::new()
+    );
+}
 
 #[test]
 fn the_document_publishes_exactly_the_supported_route_surface() {
@@ -868,6 +1032,72 @@ fn incomplete_contracts_are_rejected_and_the_failure_names_what_is_missing() {
                     .unwrap()
                     .pop()
                     .expect("the vocabulary has members");
+            }),
+        ),
+        (
+            "the execution-status route is dropped",
+            "/api/v2/execution-status",
+            Box::new(|doc| {
+                doc["paths"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("/api/v2/execution-status")
+                    .expect("the route was published");
+            }),
+        ),
+        (
+            "the typed stop settlement result is dropped",
+            "stop_and_dequeue",
+            Box::new(|doc| {
+                doc["components"]["schemas"]["CommandResult"]["oneOf"]
+                    .as_array_mut()
+                    .unwrap()
+                    .clear();
+            }),
+        ),
+        (
+            "an Apply-commit evidence member is dropped",
+            "apply_commit",
+            Box::new(|doc| {
+                for variant in doc["components"]["schemas"]["CommandResult"]["oneOf"]
+                    .as_array_mut()
+                    .unwrap()
+                {
+                    variant["properties"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("apply_commit");
+                }
+            }),
+        ),
+        (
+            "a phase vocabulary member is dropped",
+            "ExecutionPhase",
+            Box::new(|doc| {
+                doc["components"]["schemas"]["ExecutionPhase"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|member| member != "acceptance");
+            }),
+        ),
+        (
+            "the latest-log projection grows a workspace path",
+            "LatestLogProjection",
+            Box::new(|doc| {
+                doc["components"]["schemas"]["LatestLogProjection"]["properties"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("workspace_path".to_string(), json!({"type": "string"}));
+            }),
+        ),
+        (
+            "the execution status grows an elapsed counter",
+            "elapsed_seconds",
+            Box::new(|doc| {
+                doc["components"]["schemas"]["ChangeExecutionStatus"]["properties"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("elapsed_seconds".to_string(), json!({"type": "integer"}));
             }),
         ),
         (
@@ -1164,6 +1394,72 @@ fn command_record() -> CommandRecord {
         completed_at: Some("2026-08-04T00:00:01Z".to_string()),
         detail: Some("sanitized detail".to_string()),
         error_code: Some(ErrorCode::TargetIneligible),
+        result: None,
+    }
+}
+
+/// A settled stop-and-dequeue record, with its typed settlement evidence.
+fn settled_stop_record() -> CommandRecord {
+    CommandRecord {
+        command_type: "stop_and_dequeue".to_string(),
+        state: CommandState::Succeeded,
+        error_code: None,
+        detail: Some("'alpha' was cancelled during acceptance and dequeued".to_string()),
+        result: Some(CommandResult::StopAndDequeue {
+            cancelled_phase: ExecutionPhase::Acceptance,
+            last_completed_phase: Some(ExecutionPhase::Apply),
+            apply_commit: ApplyCommitEvidence {
+                present: Some(true),
+                oid: Some("9f1c0de0c0ffee0000000000000000000000abcd".to_string()),
+            },
+            effects_rolled_back: false,
+        }),
+        ..command_record()
+    }
+}
+
+/// A live execution observation, built field by field so a new published member
+/// cannot land without this file changing with it.
+fn execution_status() -> ExecutionStatusResponse {
+    ExecutionStatusResponse {
+        instance_id: "instance-1".to_string(),
+        state_revision: 12,
+        event_sequence: 30,
+        observed_at: "2026-08-04T00:00:02Z".to_string(),
+        process: ProcessExecutionStatus {
+            app_mode: "running".to_string(),
+            scheduler_running: true,
+            has_active_work: true,
+            active_activities: vec!["dependency_analysis".to_string()],
+            latest_log: Some(latest_log()),
+        },
+        changes: vec![ChangeExecutionStatus {
+            id: "a-change".to_string(),
+            execution_state: ChangeExecutionState::Active,
+            current_phase: ExecutionPhase::Acceptance,
+            last_completed_phase: Some(ExecutionPhase::Apply),
+            iteration: Some(2),
+            phase_started_at: Some("2026-08-04T00:00:01Z".to_string()),
+            last_completed_at: Some("2026-08-04T00:00:00Z".to_string()),
+            run_started_at: Some("2026-08-03T23:59:00Z".to_string()),
+            run_completed_at: None,
+            latest_activity: Some(ChangeActivity {
+                event_type: "acceptance_started".to_string(),
+                timestamp: "2026-08-04T00:00:01Z".to_string(),
+                detail: None,
+            }),
+            latest_log: Some(latest_log()),
+        }],
+    }
+}
+
+fn latest_log() -> LatestLogProjection {
+    LatestLogProjection {
+        message: "acceptance iteration 2".to_string(),
+        level: conflux::events::LogLevel::Info,
+        operation: Some("acceptance".to_string()),
+        iteration: Some(2),
+        created_at: "2026-08-04T00:00:01Z".to_string(),
     }
 }
 

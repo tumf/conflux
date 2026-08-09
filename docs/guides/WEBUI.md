@@ -120,8 +120,10 @@ or `/ws` surface.
 |----------|--------|-------------|
 | `/api/v2/health` | GET | Health check |
 | `/api/v2/state` | GET | Full orchestrator state |
+| `/api/v2/execution-status` | GET | What is actually executing right now |
 | `/api/v2/changes` | GET | List all changes with progress |
 | `/api/v2/changes/{id}` | GET | Details for a specific change |
+| `/api/v2/logs` | GET | Retained structured log ring |
 | `/api/v2/commands` | POST | Submit a control command |
 
 See [USAGE.md](USAGE.md#remote-control-api-apiv2) for authentication, revisions,
@@ -168,6 +170,81 @@ Absent values are explicit `null`s rather than omitted keys, so a client that
 replaces its local data from one snapshot can also *clear* a field. Nothing here
 is durable: execution marks, attention, and timing all start empty in a new
 process, and workflow routing is recomputed from the workspace.
+
+### Read execution status before you intervene
+
+`GET /api/v2/state` says what you may command. `GET /api/v2/execution-status`
+says what is actually happening, which is a different question and the one to
+answer before stopping, committing, archiving, or merging anything yourself.
+
+It reports, in closed typed vocabularies rather than display strings:
+
+- `process.scheduler_running` — the scheduler task is alive;
+- `process.has_active_work` — lifecycle work is actually running. **These are not
+  the same thing.** A persistent scheduler parked with nothing to execute is
+  `scheduler_running: true` with `has_active_work: false`;
+- `process.active_activities` — process-level episodes that belong to no single
+  change (dependency analysis, base-branch merge, conflict resolution, branch
+  merge, workspace cleanup);
+- per change: `execution_state`, `current_phase`, `last_completed_phase`,
+  `iteration`, phase and run boundaries, `latest_activity`, and the newest
+  retained log line whose structured `change_id` matches exactly.
+
+Every timestamp is an absolute UTC RFC 3339 instant, including `observed_at`.
+The API returns no elapsed counter and no "N minutes ago" text: compute relative
+time against `observed_at` rather than against your own clock. Unknown evidence
+is `null` or the explicit `unknown` value — never a guess.
+
+A log arriving on its own changes `latest_log` and `event_sequence` while leaving
+`state_revision` alone, so this resource never invalidates an optimistic
+concurrency token.
+
+Full retained logs stay at `GET /api/v2/logs`, and live observation stays on
+`/api/v2/events` and `/api/v2/ws`. No API response, schema, event, capability, or
+command result exposes a persistent log path, a repository root, a workspace path
+used as a log locator, or a `file://` URL, and no endpoint accepts a host path or
+filename for log access. That holds identically over the Unix socket and TCP.
+
+### Do not infer Apply commit absence from a display status
+
+A change whose `display_status` still reads `applying`, or a `stop_and_dequeue`
+that merely returned success, tells you **nothing** about whether Apply already
+created its final commit. Apply can finish and Acceptance can start while a
+cancellation is still in flight. Acting on that guess is how a duplicate manual
+commit gets created.
+
+A settled successful `stop_and_dequeue` publishes typed settlement evidence on
+its command record instead:
+
+```json
+{
+  "state": "succeeded",
+  "result": {
+    "kind": "stop_and_dequeue",
+    "cancelled_phase": "acceptance",
+    "last_completed_phase": "apply",
+    "apply_commit": { "present": true, "oid": "<full commit oid>" },
+    "effects_rolled_back": false
+  }
+}
+```
+
+Read `result`, not `detail`. Three rules matter:
+
+- `cancelled_phase` is the phase active *at settlement*, immediately before the
+  dequeue — not the one that was visible when the command was admitted. `none`
+  means the target had already terminated.
+- `apply_commit.present` is `true` only when the server proved the retained
+  typed Apply-completion OID is in the managed worktree's history. It is `null`
+  whenever that could not be proven — after a restart, with no worktree, on a Git
+  failure, or on a non-ancestor result. **`null` means "unknown", not "absent".**
+  It is never derived from a commit subject, a task count, a display status, or a
+  log line.
+- `effects_rolled_back` is always `false`. Dequeue cancels and removes; it does
+  not undo work the worktree already contains.
+
+Replaying the same idempotency key returns the original record, evidence
+included, even after the repository has moved on.
 
 ## Event stream
 
