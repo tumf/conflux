@@ -22,7 +22,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: "Focused Rust test output covering the authoritative dispatch, CoreMode, TUI frame adoption and bulk mark behavior, Web/API snapshot, lifecycle mirror, and fatal global Error control case"
-    rerun: "cargo test --lib processing_error_preserves_shared_mode && cargo test --lib processing_error_keeps_bulk_mark_available && cargo test --features web-monitoring --lib processing_error_preserves_process_snapshot"
+    rerun: "cargo test --lib processing_error_preserves_shared_mode && cargo test --lib processing_error_preserves_lifecycle_mode && cargo test --features web-monitoring --lib processing_error_keeps_bulk_mark_available && cargo test --features web-monitoring --lib processing_error_preserves_process_snapshot && cargo test --features web-monitoring --lib processing_error_converges_across_projections"
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
