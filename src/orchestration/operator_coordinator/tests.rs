@@ -235,9 +235,10 @@ pub(super) async fn terminal_error(harness: &Harness, change_id: &str) {
             id: change_id.to_string(),
             error: "boom".to_string(),
         });
-    // The event moved Core into Error the same way it would in production; the
-    // arrangement is not allowed to leave Core describing a different process.
-    harness.core.set(OperatorMode::Error);
+    // Core is deliberately *not* touched. `ProcessingError` is change-scoped:
+    // in production it leaves the process mode exactly where it was, so an
+    // arrangement that pushed Core into Error here would be describing a
+    // process state this event cannot produce.
 }
 
 // ============================================================================
@@ -428,10 +429,22 @@ async fn accepted_operator_command_transaction_resolve_projects_only_the_active_
 }
 
 /// Explicit retry routes an errored target, commits its intent, and dispatches.
+///
+/// `Start` in Error mode *is* the retry-every-marked-target route, so the
+/// process mode is arranged from the one event that produces it: a typed global
+/// fatal error. The change's own terminal state comes from `ProcessingError`,
+/// which is change-scoped and deliberately leaves the process mode alone.
 #[tokio::test]
 async fn accepted_operator_command_transaction_retry_commits_and_dispatches() {
     let harness = Harness::new(&["c1"]);
     terminal_error(&harness, "c1").await;
+    harness
+        .dispatcher
+        .dispatch(ExecutionEvent::Error {
+            message: "fatal".to_string(),
+        })
+        .await;
+    assert_eq!(harness.core.get(), OperatorMode::Error);
     harness.marks.set("c1", true);
 
     let result = harness.apply(OperatorIntent::Start).await;
@@ -447,7 +460,11 @@ async fn accepted_operator_command_transaction_retry_commits_and_dispatches() {
     assert_eq!(change_ids, vec!["c1".to_string()]);
     assert!(explicit_retry, "retry must carry explicit-retry semantics");
     assert_eq!(harness.core.get(), OperatorMode::Running);
-    assert_eq!(harness.timeline.events(), vec!["OperatorCommandApplied"]);
+    assert_eq!(
+        harness.timeline.events(),
+        vec!["Error", "OperatorCommandApplied"],
+        "the arranged fatal error, then exactly one accepted outcome"
+    );
 }
 
 /// Retry with no retryable evidence is a no-op with no scheduler effect.

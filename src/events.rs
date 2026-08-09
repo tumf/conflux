@@ -1537,9 +1537,15 @@ impl LifecycleModeMirror {
             ExecutionEvent::Stopped | ExecutionEvent::AllCompleted => {
                 self.mode = "stopped".to_string()
             }
-            ExecutionEvent::Error { .. } | ExecutionEvent::ProcessingError { .. } => {
-                self.mode = "error".to_string()
-            }
+            ExecutionEvent::Error { .. } => self.mode = "error".to_string(),
+            // A change-scoped failure is not a process mode. The failed change
+            // still projects `blocked` through
+            // [`lifecycle_event_for_execution_event`]; what must not happen is
+            // the mirror recording a dead process while the scheduler is still
+            // executing everything else. Kept as its own arm rather than left to
+            // the fallthrough so the scope decision stays visible next to the
+            // fatal one it is deliberately not sharing.
+            ExecutionEvent::ProcessingError { .. } => {}
             // A pending graceful stop outranks work that started after it was
             // requested: the operator's stop is still owed. Every other mode
             // yields to typed evidence that something is really executing.
@@ -2710,6 +2716,61 @@ mod lifecycle_bridge_tests {
             })
         );
         assert_eq!(mirror.app_mode(), "stopping");
+    }
+
+    /// The mirror mirrors a *process* mode, so a change-scoped failure leaves it
+    /// alone from every mode it can be in.
+    ///
+    /// The exact before/after token is asserted rather than "not error", so a
+    /// regression that moved the mode somewhere else — or that started reading
+    /// the failure message to decide — fails here.
+    #[test]
+    fn processing_error_preserves_lifecycle_mode() {
+        for arranged in ["select", "running", "stopping", "stopped", "error"] {
+            let mut mirror = LifecycleModeMirror {
+                mode: arranged.to_string(),
+            };
+
+            for error in [
+                "acceptance command attempts exhausted",
+                // Deliberately fatal-sounding: scope is the typed variant, never
+                // the text, so identical prose must not change the answer.
+                "fatal: the orchestrator could not start",
+            ] {
+                assert!(
+                    !mirror.absorb(&ExecutionEvent::ProcessingError {
+                        id: "alpha".to_string(),
+                        error: error.to_string(),
+                    }),
+                    "a change-scoped failure authorizes no idle publication"
+                );
+                assert_eq!(
+                    mirror.app_mode(),
+                    arranged,
+                    "a change-scoped failure must not move the mirrored process mode"
+                );
+            }
+        }
+    }
+
+    /// The fatal control for the test above: the global event still lands in
+    /// Error, so the change cannot pass by suppressing both.
+    #[test]
+    fn processing_error_preserves_lifecycle_mode_fatal_control_still_transitions() {
+        for arranged in ["select", "running", "stopping", "stopped"] {
+            let mut mirror = LifecycleModeMirror {
+                mode: arranged.to_string(),
+            };
+
+            assert!(!mirror.absorb(&ExecutionEvent::Error {
+                message: "the orchestrator could not start".to_string(),
+            }));
+            assert_eq!(
+                mirror.app_mode(),
+                "error",
+                "a typed global Error is still process-fatal (from {arranged})"
+            );
+        }
     }
 }
 

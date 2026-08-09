@@ -773,6 +773,109 @@ async fn a_change_local_error_is_distinct_from_a_fatal_process_error() {
     );
 }
 
+/// A change-scoped failure moves the row and nothing process-wide.
+///
+/// Driven through a real dispatch owner with the shared mark reconciler bound,
+/// because `execution_marked` is the half a projection-only test cannot see: the
+/// failed row's stale mark must be revoked by the same dispatch that painted it
+/// Error, while the unrelated row keeps the mark it was given.
+#[tokio::test]
+async fn processing_error_preserves_process_snapshot() {
+    use crate::orchestration::mark_reconciliation::ExecutionMarkReconciler;
+    use crate::orchestration::operator_command::ParallelRuntime;
+    use crate::web::state::WebEventSink;
+
+    let (web_state, reducer, marks) = wired_web_state(&["alpha", "beta"]).await;
+    let web_state = Arc::new(web_state);
+    web_state
+        .update_with_mode(&[change("alpha"), change("beta")], "running")
+        .await;
+    marks.set("alpha", true);
+    marks.set("beta", true);
+
+    let dispatcher = crate::events::EventDispatcher::new(
+        reducer.clone(),
+        vec![Arc::new(WebEventSink::new(web_state.clone()))],
+    )
+    .with_mark_reconciler(Some(ExecutionMarkReconciler::new(
+        marks.clone(),
+        Arc::new(ParallelRuntime::new()),
+    )));
+
+    dispatcher
+        .dispatch(ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "acceptance command attempts exhausted".to_string(),
+        })
+        .await;
+
+    let (snapshot, _, _) = web_state.remote_control().projection().snapshot();
+    let by_id: HashMap<&str, _> = snapshot
+        .changes
+        .iter()
+        .map(|change| (change.id.as_str(), change))
+        .collect();
+
+    assert_eq!(by_id["alpha"].display_status, "error");
+    assert_eq!(
+        by_id["alpha"].error_detail.as_deref(),
+        Some("acceptance command attempts exhausted"),
+        "the sanitized change-local detail is still published"
+    );
+    assert!(
+        !by_id["alpha"].execution_marked,
+        "the failed row's stale execution intent is revoked at the same revision"
+    );
+    assert!(
+        by_id["beta"].execution_marked,
+        "an unrelated row's mark is not touched by another change's failure"
+    );
+    assert_eq!(
+        by_id["beta"].display_status, "not queued",
+        "and its presentation is untouched too"
+    );
+
+    assert_eq!(
+        snapshot.app_mode, "running",
+        "the process did not fail, so the pre-event app_mode is retained"
+    );
+    assert_eq!(
+        snapshot.process_error, None,
+        "a change-local failure sets no process-wide error detail"
+    );
+    assert_eq!(
+        web_state.get_state().await.app_mode,
+        "running",
+        "the monitoring snapshot the projection derives from agrees"
+    );
+
+    // The fatal control, over the same process: the one event that really means
+    // the run died must still set both process-wide facts.
+    dispatcher
+        .dispatch(ExecutionEvent::Error {
+            message: "the orchestrator could not start".to_string(),
+        })
+        .await;
+
+    let (snapshot, _, _) = web_state.remote_control().projection().snapshot();
+    assert_eq!(snapshot.app_mode, "error");
+    assert_eq!(
+        snapshot.process_error.as_deref(),
+        Some("the orchestrator could not start")
+    );
+    assert_eq!(
+        snapshot
+            .changes
+            .iter()
+            .find(|change| change.id == "alpha")
+            .expect("the failed change is still projected")
+            .error_detail
+            .as_deref(),
+        Some("acceptance command attempts exhausted"),
+        "the change-local detail stays distinguishable from the process failure"
+    );
+}
+
 /// Bounded post-archive resolve exhaustion is change-local across the remote
 /// surface: one ordered `resolve_failed` carrying the change ID, presentation
 /// telemetry that owns no state, and `process_error` left unset.

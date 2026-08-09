@@ -17,10 +17,43 @@ use crate::events::{EventSink, ExecutionEvent};
 use crate::orchestration::run_control::SchedulerEffect;
 use crate::web::state::{WebEventSink, WebState};
 
-/// The full production wiring: coordinator, dispatch boundary, and Web frontend.
+/// The full production wiring: coordinator, dispatch boundary, Web frontend, and
+/// the external lifecycle projection.
 struct Bound {
     harness: Harness,
     web: Arc<WebState>,
+    /// Everything the external lifecycle adapter was told, in order.
+    lifecycle: Arc<RecordingLifecycle>,
+}
+
+/// In-memory lifecycle publisher.
+///
+/// Keeps the external projection observable without an adapter process: the sink
+/// under test is the real [`crate::events::LifecycleEventSink`], only its
+/// transport is replaced.
+#[derive(Default)]
+struct RecordingLifecycle {
+    published: std::sync::Mutex<Vec<crate::lifecycle_integration::LifecycleState>>,
+}
+
+impl RecordingLifecycle {
+    fn states(&self) -> Vec<crate::lifecycle_integration::LifecycleState> {
+        self.published
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl crate::lifecycle_integration::LifecyclePublisher for RecordingLifecycle {
+    fn publish(&self, event: crate::lifecycle_integration::LifecycleEvent) {
+        if let crate::lifecycle_integration::LifecycleEvent::StateChanged { state, .. } = event {
+            self.published
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(state);
+        }
+    }
 }
 
 impl Bound {
@@ -38,6 +71,13 @@ impl Bound {
         // frontend is attached to. Rebuilding the application rather than the
         // dispatcher would give the two halves different owners, which is the
         // arrangement this whole change removes.
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let lifecycle_sink = crate::events::LifecycleEventSink::new(
+            crate::lifecycle_integration::LifecycleHandle::from_publisher(
+                lifecycle.clone() as Arc<dyn crate::lifecycle_integration::LifecyclePublisher>
+            ),
+            Some("/repo".to_string()),
+        );
         let dispatcher = Arc::new(
             crate::events::EventDispatcher::new(
                 harness.state.clone(),
@@ -46,6 +86,7 @@ impl Bound {
                         timeline: harness.timeline.clone(),
                     }),
                     Arc::new(WebEventSink::new(web.clone())),
+                    Arc::new(lifecycle_sink),
                 ],
             )
             .with_core_mode(Some(harness.core.clone())),
@@ -67,6 +108,7 @@ impl Bound {
                 ..harness
             },
             web,
+            lifecycle,
         }
     }
 
@@ -350,5 +392,152 @@ async fn accepted_operator_command_mode_matrix_outcome_event_reapplies_no_reduce
         harness.status("c1").await,
         after_start,
         "the outcome event must not reapply the reducer command that produced it"
+    );
+}
+
+// ============================================================================
+// Typed failure scope, across every projection at once
+// ============================================================================
+
+/// One authoritative dispatch, four projections, one answer about scope.
+///
+/// Core admission mode, the TUI-facing execution mode derived from it,
+/// `/api/v2`, and the external lifecycle mirror are all projections of the same
+/// event. The incident was that they disagreed: the reducer and the TUI row
+/// handler treated `ProcessingError` as change-local while the shared mode
+/// promoted it to process-wide Error. Asserting them together is what makes a
+/// future fix to one projection unable to leave the others behind.
+///
+/// The lifecycle mirror is observed through the decision it actually gates: a
+/// persistent-scheduler idle event projects `idle` only out of a *running*
+/// mirrored mode, so an accepted idle publication is proof the mirror never
+/// recorded a dead process.
+#[tokio::test]
+async fn processing_error_converges_across_projections() {
+    let bound = Bound::new(&["alpha", "beta"]).await;
+    let harness = &bound.harness;
+
+    harness
+        .dispatcher
+        .dispatch(ExecutionEvent::ProcessingStarted("alpha".to_string()))
+        .await;
+    assert_eq!(harness.core.get(), OperatorMode::Running);
+    assert_eq!(bound.app_mode().await, "running");
+
+    harness
+        .dispatcher
+        .dispatch(ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "acceptance command attempts exhausted".to_string(),
+        })
+        .await;
+
+    assert_eq!(
+        harness.core.get(),
+        OperatorMode::Running,
+        "Core: a change-scoped failure moves no process mode"
+    );
+    assert_eq!(
+        crate::tui::types::AppExecutionMode::from_operator_mode(harness.core.get()),
+        crate::tui::types::AppExecutionMode::Running,
+        "TUI: the mode a frame adopts is that same value"
+    );
+    assert_eq!(
+        bound.app_mode().await,
+        "running",
+        "Web: `app_mode` describes the process, which did not fail"
+    );
+    let (snapshot, _, _) = bound.web.remote_control().projection().snapshot();
+    assert_eq!(
+        snapshot.process_error, None,
+        "Web: and no process-wide error detail is manufactured"
+    );
+    assert_eq!(
+        snapshot
+            .changes
+            .iter()
+            .find(|change| change.id == "alpha")
+            .expect("the failed change is projected")
+            .display_status,
+        "error",
+        "while the failed change really is in change-level Error"
+    );
+    assert_eq!(
+        harness.status("beta").await,
+        "not queued",
+        "and an unrelated change is untouched"
+    );
+
+    // Lifecycle: the mirror still describes a running process, so the guarded
+    // Running-to-Ready idle transition is accepted.
+    let before = bound.lifecycle.states().len();
+    harness
+        .dispatcher
+        .dispatch(ExecutionEvent::PersistentSchedulerIdle)
+        .await;
+    assert_eq!(
+        bound.lifecycle.states()[before..],
+        [crate::lifecycle_integration::LifecycleState::Idle],
+        "lifecycle: a change-scoped failure did not leave the mirror describing a dead run"
+    );
+
+    // The fatal control, over the same wiring. Suppressing both failure events
+    // would satisfy every assertion above; it cannot satisfy these.
+    harness
+        .dispatcher
+        .dispatch(ExecutionEvent::ProcessingStarted("beta".to_string()))
+        .await;
+    let before = bound.lifecycle.states().len();
+    harness
+        .dispatcher
+        .dispatch(ExecutionEvent::Error {
+            message: "the orchestrator could not start".to_string(),
+        })
+        .await;
+
+    assert_eq!(
+        harness.core.get(),
+        OperatorMode::Error,
+        "Core: a typed global Error is still process-fatal"
+    );
+    assert_eq!(
+        crate::tui::types::AppExecutionMode::from_operator_mode(harness.core.get()),
+        crate::tui::types::AppExecutionMode::Error,
+        "TUI: and the frame adopts Error"
+    );
+    assert_eq!(bound.app_mode().await, "error", "Web: as does `app_mode`");
+    let (snapshot, _, _) = bound.web.remote_control().projection().snapshot();
+    assert_eq!(
+        snapshot.process_error.as_deref(),
+        Some("the orchestrator could not start"),
+        "Web: with the sanitized fatal detail"
+    );
+    assert_eq!(
+        snapshot
+            .changes
+            .iter()
+            .find(|change| change.id == "alpha")
+            .expect("the failed change is still projected")
+            .error_detail
+            .as_deref(),
+        Some("acceptance command attempts exhausted"),
+        "and the change-local detail stays distinguishable from it"
+    );
+    assert_eq!(
+        bound.lifecycle.states()[before..],
+        [crate::lifecycle_integration::LifecycleState::Blocked],
+        "lifecycle: the fatal transition is still published"
+    );
+
+    // The mirror is in Error too, so the idle transition it gates is now refused.
+    let before = bound.lifecycle.states().len();
+    harness
+        .dispatcher
+        .dispatch(ExecutionEvent::PersistentSchedulerIdle)
+        .await;
+    assert_eq!(
+        bound.lifecycle.states().len(),
+        before,
+        "lifecycle: a late idle must not report a fatally stopped run as idle"
     );
 }

@@ -977,12 +977,16 @@ impl WebState {
                     }
                     state.app_mode = "running".to_string();
                 }
+                // Change-scoped. The failed row goes to Error and its sanitized
+                // detail reaches the operator through the reducer-derived
+                // projection; `app_mode` and `process_error` describe the
+                // *process*, and one change failing is not the process failing.
+                // Only `ExecutionEvent::Error` below writes those.
                 ExecutionEvent::ProcessingError { id, error: _ } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *id) {
                         change.status = "error".to_string();
                         updated = true;
                     }
-                    state.app_mode = "error".to_string();
                 }
 
                 // Apply output with iteration tracking

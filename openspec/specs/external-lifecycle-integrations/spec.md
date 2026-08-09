@@ -64,7 +64,22 @@ Lifecycle messages MUST NOT include environment values, credentials, provider to
 
 ### Requirement: Typed frontend lifecycle emission
 
-TUI and non-interactive frontends MUST publish lifecycle state from typed runtime state and actions rather than rendered-screen scraping. The TUI lifecycle snapshot MUST represent execution mode independently from modal interaction state and MUST include only two typed row-status facts evaluated after reducer-to-TUI synchronization: whether any row is active or queued, and whether any row is blocked or stalled. A typed persistent-scheduler idle dispatch MUST project `idle` only when its guarded Running-to-Ready transition is accepted, even when blocked or stalled rows remain visible; a late idle event that leaves Select, Stopping, Error, or Stopped unchanged MUST NOT publish a new idle transition. Without an accepted persistent-idle transition, a Running blocked/stalled-only snapshot MUST continue to report `blocked`. This lifecycle publication MUST preserve the existing `EventSink` and `ReducerCommand` ownership boundaries and MUST remain observability-only.
+TUI and non-interactive frontends MUST publish lifecycle state from typed runtime state and actions rather than rendered-screen scraping. A change-scoped `ProcessingError` MUST preserve the mirrored process execution mode and MUST NOT publish a process-fatal lifecycle transition solely because one change entered Error. A typed global `ExecutionEvent::Error` MUST retain its process-fatal lifecycle meaning. The TUI lifecycle snapshot MUST represent execution mode independently from modal interaction state and MUST include only two typed row-status facts evaluated after reducer-to-TUI synchronization: whether any row is active or queued, and whether any row is blocked or stalled. A typed persistent-scheduler idle dispatch MUST project `idle` only when its guarded Running-to-Ready transition is accepted, even when blocked or stalled rows remain visible; a late idle event that leaves Select, Stopping, Error, or Stopped unchanged MUST NOT publish a new idle transition. Without an accepted persistent-idle transition, a Running blocked/stalled-only snapshot MUST continue to report `blocked`. This lifecycle publication MUST preserve the existing `EventSink` and `ReducerCommand` ownership boundaries and MUST remain observability-only.
+
+#### Scenario: Change-local processing error preserves lifecycle mode
+
+- **GIVEN** the lifecycle mode mirror reports a Running process
+- **WHEN** `ProcessingError` is dispatched for change `alpha`
+- **THEN** the mirrored process mode SHALL remain Running
+- **AND** no process-fatal lifecycle transition SHALL be published solely for `alpha`'s failure
+- **AND** subsequent row-state projection MAY report working or blocked according to the existing synchronized row facts
+
+#### Scenario: Global error remains fatal in lifecycle projection
+
+- **GIVEN** the lifecycle mode mirror reports an active process
+- **WHEN** a typed global `ExecutionEvent::Error` is dispatched
+- **THEN** the mirrored process mode SHALL become Error
+- **AND** the lifecycle adapter SHALL receive the existing process-fatal semantic transition
 
 #### Scenario: Confirmation dialog reports blocked
 
@@ -148,3 +163,5 @@ TUI and non-interactive frontends MUST publish lifecycle state from typed runtim
 - **WHEN** it receives events or exits with an error
 - **THEN** Core state changes still occur only through existing Core command paths
 - **AND** adapter behavior cannot select the next workflow action
+
+<!-- Expected canonical result after archive: typed lifecycle projection will preserve process mode for change-local ProcessingError and reserve fatal lifecycle Error for the global Error event. -->
