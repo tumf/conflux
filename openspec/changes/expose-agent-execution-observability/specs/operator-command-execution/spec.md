@@ -4,7 +4,9 @@
 
 For an active change, the service MUST request per-change cancellation and confirm task/process termination before applying dequeue state. It MUST preserve active state when the cancellation handle is absent, cancellation fails, or confirmation times out.
 
-After confirmed termination, the shared application coordinator MUST reacquire its boundary, revalidate the target's current lifecycle state, and capture typed settlement evidence before committing dequeue. A successful outcome MUST identify the phase actually cancelled, the last completed lifecycle phase, and nullable final managed-worktree Apply commit evidence. It MUST state that dequeue does not roll back previously completed worktree effects. Phase and Git evidence are explanatory non-authoritative observations; they MUST NOT become durable workflow-control state or cause unavailable evidence to be guessed.
+After confirmed termination and while the managed worktree is quiescent, the shared application coordinator MAY capture explanatory Git evidence before reacquiring its boundary so Git subprocess latency does not block unrelated operator admission. It MUST then reacquire the boundary, revalidate the target's current lifecycle state, read typed phase facts before `ReducerCommand::DequeueChange` clears them, and only then commit dequeue. Phase facts MUST be updated synchronously under the authoritative dispatch boundary so every typed fact dispatched before termination confirmation is visible at settlement.
+
+A successful outcome MUST identify the typed phase active at settlement as the cancelled phase, the last completed lifecycle phase, and nullable final managed-worktree Apply commit evidence. An already-terminated target or target with no active typed phase MUST report `cancelled_phase: none`. The result MUST state that dequeue does not roll back previously completed worktree effects. Phase and Git evidence are explanatory non-authoritative observations; they MUST NOT become durable workflow-control state or cause unavailable evidence to be guessed.
 
 #### Scenario: Active change terminates before dequeue
 
@@ -12,7 +14,8 @@ After confirmed termination, the shared application coordinator MUST reacquire i
 **When**: The operator requests stop-and-dequeue
 **Then**: Cancellation is issued
 **And**: Termination is confirmed
-**And**: The application boundary is reacquired and current lifecycle evidence is revalidated
+**And**: Explanatory Git evidence may be read from the quiescent worktree without holding the application boundary
+**And**: The boundary is reacquired, current lifecycle evidence is revalidated, and typed phase facts are read before dequeue clears them
 **And**: Only then is `ReducerCommand::DequeueChange` applied
 **And**: The successful outcome carries typed settlement evidence and reports no rollback of prior effects
 
@@ -24,6 +27,14 @@ After confirmed termination, the shared application coordinator MUST reacquire i
 **Then**: Settlement classifies Acceptance as the cancelled phase and Apply as the last completed phase
 **And**: The exact final Apply commit OID is reported when repository evidence proves it
 **And**: The Apply commit remains present after dequeue
+
+#### Scenario: Already-terminated success reports no cancellation phase
+
+**Given**: The registered task has already terminated and no typed phase remains active
+**When**: stop-and-dequeue follows its existing already-terminated success path
+**Then**: Settlement reads phase facts before dequeue
+**And**: The result reports `cancelled_phase: none`
+**And**: It does not infer a cancelled phase from historical display or logs
 
 #### Scenario: Missing cancellation handle fails safely
 

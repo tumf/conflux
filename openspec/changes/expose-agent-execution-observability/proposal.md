@@ -15,7 +15,6 @@ references:
   - src/orchestration/operator_command.rs
   - src/orchestration/operator_coordinator.rs
   - tests/openapi_contract_tests.rs
-  - https://github.com/tumf/conflux/issues/14
 verifications:
   - id: agent-execution-observability-tests
     requirement: "Remote agents can distinguish scheduler availability, active lifecycle work, completed phase boundaries, and phase-aware stop settlement from structured API evidence without parsing display strings, reading Git independently, or accessing log files"
@@ -61,8 +60,8 @@ Display strings and generic command detail cannot safely answer those questions.
 
 Add an authenticated `GET /api/v2/execution-status` read resource that coherently joins the current process snapshot with the bounded in-memory structured log ring. It will expose:
 
-- process incarnation, state revision, event sequence, observation time, application mode, scheduler liveness, and a typed `has_active_work` result;
-- each relevant change's typed execution state, current phase, last completed phase, iteration, start/completion boundaries, latest lifecycle activity, and latest exact-`change_id` structured log entry;
+- process incarnation, state revision, event sequence, observation time, application mode, scheduler liveness from the shared run-boundary authority, and a typed `has_active_work` result covering active per-change phases plus typed process-level dependency analysis, base-branch merge, conflict resolution, branch merge, and workspace cleanup;
+- each relevant change's typed execution state, current phase projected from existing reducer `ActivityState`, last completed phase, iteration, start/completion boundaries, latest lifecycle activity, and latest exact-`change_id` closed log projection;
 - UTC RFC 3339 absolute timestamps only, including `observed_at`; no server-generated elapsed duration or “N minutes ago” text;
 - `null` for unavailable evidence instead of inferred values.
 
@@ -86,12 +85,12 @@ No log path, workspace path, repository path, file URL, arbitrary file-read para
 3. Each observed change reports `current_phase`, `last_completed_phase`, iteration, and available start/completion boundaries from process-local lifecycle facts without making those facts durable workflow authority.
 4. Every returned timestamp is an absolute UTC RFC 3339 instant. The API returns no elapsed seconds, age seconds, or localized relative-time text.
 5. `observed_at` lets clients render relative time against the server observation instant without relying on the client clock.
-6. Each change's `latest_log` is the newest retained sanitized `LogEntry` whose `change_id` exactly matches; a process-level latest log is also returned; absence is `null`.
+6. Each change's `latest_log` is a closed path-free projection of the last retained ring entry by insertion order whose structured `change_id` exactly matches; it contains only sanitized message, level, operation, iteration, and RFC 3339 UTC `created_at`. A process-level latest projection is also returned; absence is `null`.
 7. Log-only activity can change `latest_log` and `event_sequence` without advancing `state_revision`.
 8. Agents can retrieve the complete retained structured log ring through `GET /api/v2/logs` and live observation transports, subject to existing authentication, bounds, sanitization, and replay rules.
 9. No v2 response, schema, command result, event, or capability exposes the persistent log path, workspace path as a log locator, file URL, or arbitrary host-file read facility over either transport.
 10. A settled successful `stop_and_dequeue` command returns a typed result containing `cancelled_phase`, `last_completed_phase`, Apply commit presence, optional commit OID, and `effects_rolled_back=false`.
-11. Apply commit presence and OID are derived from managed-worktree Git evidence at settlement. Indeterminate evidence is represented as unknown and never guessed from task count, display status, logs, or a commit subject alone.
+11. Apply commit presence and OID are derived by retaining non-empty typed `ApplyCompleted.revision` per change for the process incarnation, identifying the server-owned managed worktree, and proving that OID equals or is an ancestor of its quiescent HEAD. Indeterminate evidence is unknown and never guessed from task count, display status, logs, or commit subject.
 12. The human-readable stop detail distinguishes cancellation before final Apply commit, cancellation after Apply completion, and later lifecycle cancellation when evidence permits, and always states that prior effects were not rolled back.
 13. Exact idempotent replay preserves the original structured result even if later lifecycle or Git state changes.
 14. A deterministic regression test proves that when the final Apply commit lands before stop settlement and acceptance is then cancelled, the result reports `cancelled_phase=acceptance`, `last_completed_phase=apply`, the retained Apply commit OID, and no rollback.
