@@ -308,7 +308,25 @@ The single-instance web server MUST serve the embedded static operator console a
 
 ### Requirement: Authoritative operator snapshot
 
-The state resource MUST be a coherent reducer-derived operator snapshot that includes every server-authoritative field needed to determine current change presentation and permitted operator actions without replaying prior events or parsing logs. For each change whose command-capable run owns typed Apply iteration-limit evidence and whose scheduler task reports live, the snapshot MUST block `retry_change` with `apply_iteration_limit_active` at the same state revision. Projection and command admission MUST consult the same scheduler-liveness authority. A live-to-exited scheduler transition MUST publish the changed authoritative action snapshot without waiting for unrelated repository activity. Record presence without live ownership MUST NOT remain an action blocker. A headless `cflx run` process with no bound command executor or scheduler-liveness authority MUST omit this process-local blocked reason; command submission remains unavailable through the existing unbound-runtime lifecycle contract.
+The state resource MUST be a coherent reducer-derived operator snapshot that includes every server-authoritative field needed to determine current change presentation and permitted operator actions without replaying prior events or parsing logs. A change-scoped `ProcessingError` MUST update the failed change's display status, bounded sanitized error detail, activity, attention, action eligibility, and reconciled execution mark without changing `app_mode` or setting `process_error`. Only a typed process-fatal event MAY set process-wide Error state. For each change whose command-capable run owns typed Apply iteration-limit evidence and whose scheduler task reports live, the snapshot MUST block `retry_change` with `apply_iteration_limit_active` at the same state revision. Projection and command admission MUST consult the same scheduler-liveness authority. A live-to-exited scheduler transition MUST publish the changed authoritative action snapshot without waiting for unrelated repository activity. Record presence without live ownership MUST NOT remain an action blocker. A headless `cflx run` process with no bound command executor or scheduler-liveness authority MUST omit this process-local blocked reason; command submission remains unavailable through the existing unbound-runtime lifecycle contract.
+
+#### Scenario: Change-local processing error preserves process snapshot mode
+
+**Given**: `/api/v2/state` reports `app_mode: running` for a multi-change run
+**When**: `ProcessingError` is authoritatively dispatched for change `alpha`
+**Then**: `alpha.display_status` is `error` and its sanitized `error_detail` is present
+**And**: `alpha.execution_marked` reflects the same-revision mark reconciliation
+**And**: `app_mode` remains `running`
+**And**: `process_error` remains null
+**And**: unrelated changes retain their current marks and action eligibility
+
+#### Scenario: Fatal process error remains distinct
+
+**Given**: a snapshot may already contain one or more change-level errors
+**When**: a typed fatal `ExecutionEvent::Error` is authoritatively dispatched
+**Then**: `app_mode` becomes `error`
+**And**: `process_error` contains the sanitized fatal detail
+**And**: change-level error details remain distinguishable from the process failure
 
 #### Scenario: Client discovers and snapshots operator state
 
@@ -355,6 +373,8 @@ The state resource MUST be a coherent reducer-derived operator snapshot that inc
 **When**: A client reads the subsequent snapshot
 **Then**: The snapshot does not expose `apply_iteration_limit_active` as a current action block
 **And**: A submitted command is refused by the existing unbound-runtime lifecycle contract
+
+<!-- Expected canonical result after archive: the authoritative snapshot requirement will explicitly separate change-local ProcessingError fields from process-wide app_mode/process_error. -->
 
 ### Requirement: Shared lifecycle scheduling semantics
 
