@@ -358,6 +358,7 @@ fn describe_start(retry: RetryContext) -> impl FnOnce(ApplicationResult) -> Comm
         Ok(ApplicationOutcome::Run(RunControlOutcome::RunDispatched {
             change_ids,
             scheduler,
+            excluded,
             ..
         })) => {
             // Wording only. Which of the two run projections the frontends apply
@@ -368,10 +369,24 @@ fn describe_start(retry: RetryContext) -> impl FnOnce(ApplicationResult) -> Comm
                 SchedulerEffect::Started => "Starting",
                 _ => "Queued for the running scheduler:",
             };
+            // Marks the admission could not take are named rather than dropped:
+            // the operator marked them, so they have to learn the run left them
+            // out and why.
+            let left_behind = if excluded.is_empty() {
+                String::new()
+            } else {
+                let detail = excluded
+                    .iter()
+                    .map(|target| format!("{} ({})", target.change_id, target.status))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("; excluded: {detail}")
+            };
             CommandFeedback::accepted(LogEntry::info(format!(
-                "{} processing {} change(s)",
+                "{} processing {} change(s){}",
                 verb,
-                change_ids.len()
+                change_ids.len(),
+                left_behind
             )))
         }
         Ok(ApplicationOutcome::Run(RunControlOutcome::NoOp { reason })) => {

@@ -42,15 +42,29 @@ const MERGE_WAIT_STATUS: &str = "merge wait";
 /// Display status a change must carry before it can be started.
 const NOT_QUEUED_STATUS: &str = "not queued";
 
+/// A marked target that final admission did not route, and why.
+///
+/// A mark carries no eligibility of its own, so an operator may mark a row that
+/// the run cannot currently take. The exclusion is therefore an ordinary
+/// reportable outcome rather than an error, and it names the target so the
+/// operator can tell *which* of their marks did not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludedTarget {
+    /// Marked change that was not routed.
+    pub change_id: String,
+    /// Reducer display status that excluded it, read at admission.
+    pub status: String,
+}
+
 /// Name every excluded target with the status that excluded it.
 ///
 /// Target-specific by construction: a marked row an operator can see excluded
 /// has to be identifiable, or the diagnostic only says that *something* was
 /// dropped.
-fn describe_exclusions(excluded: &[(String, String)]) -> String {
+fn describe_exclusions(excluded: &[ExcludedTarget]) -> String {
     excluded
         .iter()
-        .map(|(id, status)| format!("{id} ({status})"))
+        .map(|target| format!("{} ({})", target.change_id, target.status))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -135,6 +149,11 @@ pub enum RunControlOutcome {
         explicit_retry: bool,
         /// What actually happened to the scheduler.
         scheduler: SchedulerEffect,
+        /// Marked targets the admission did not route, with their statuses.
+        ///
+        /// An admitted run is still reported truthfully: a marked row the run
+        /// could not take is named here rather than silently dropped.
+        excluded: Vec<ExcludedTarget>,
     },
     /// A graceful stop was requested.
     StopRequested,
@@ -539,9 +558,20 @@ impl PreparedDispatch {
 #[derive(Debug)]
 enum PreparedIntent {
     /// Start or resume the run over exactly these targets.
-    Start { targets: Vec<String> },
+    Start {
+        /// Admitted targets, in request order.
+        targets: Vec<String>,
+        /// Marked targets the classification left out, carried so the committed
+        /// outcome can report them alongside the admitted subset.
+        excluded: Vec<ExcludedTarget>,
+    },
     /// Consume these already-classified retry routes.
-    Retry { routes: Vec<(String, RetryRoute)> },
+    Retry {
+        /// Routes the retry classification accepted.
+        routes: Vec<(String, RetryRoute)>,
+        /// Marked targets the classification left out.
+        excluded: Vec<ExcludedTarget>,
+    },
     /// Reserve the single resolver for this change.
     Resolve { change_id: String },
 }
@@ -701,7 +731,7 @@ impl RunControlService {
     /// non-terminal row at any time — so the whole run-target decision is made
     /// here, from current reducer facts, and every excluded target is named with
     /// the status that excluded it.
-    async fn classify_start_targets(&self) -> (Vec<String>, Vec<(String, String)>) {
+    async fn classify_start_targets(&self) -> (Vec<String>, Vec<ExcludedTarget>) {
         let marked = self.operator.marks().marked_ids();
         let guard = self.state.read().await;
         let mut startable = Vec::new();
@@ -711,7 +741,10 @@ impl RunControlService {
             if status == NOT_QUEUED_STATUS {
                 startable.push(id);
             } else {
-                excluded.push((id, status.to_string()));
+                excluded.push(ExcludedTarget {
+                    change_id: id,
+                    status: status.to_string(),
+                });
             }
         }
         (startable, excluded)
@@ -772,6 +805,7 @@ impl RunControlService {
             change_ids: targets,
             explicit_retry: false,
             scheduler,
+            excluded,
         })
     }
 
@@ -800,8 +834,9 @@ impl RunControlService {
                 ),
             });
         }
+        let excluded = self.describe_non_retryable(&marked, &routes).await;
         let plan = self.operator.commit_retry_routes(&routes).await;
-        self.dispatch_retry(plan).await
+        self.dispatch_retry(plan, excluded).await
     }
 
     // ------------------------------------------------------------------
@@ -818,7 +853,7 @@ impl RunControlService {
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn retry_change(&self, change_id: &str) -> RunControlResult<RunControlOutcome> {
         let plan = self.operator.retry_change(change_id).await?;
-        self.dispatch_retry(plan).await
+        self.dispatch_retry(plan, Vec::new()).await
     }
 
     /// Retry every change in `change_ids` that carries retryable evidence.
@@ -832,11 +867,15 @@ impl RunControlService {
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn retry_errors(&self, change_ids: &[String]) -> RunControlResult<RunControlOutcome> {
         let plan = self.operator.retry_errors(change_ids).await;
-        self.dispatch_retry(plan).await
+        self.dispatch_retry(plan, Vec::new()).await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn dispatch_retry(&self, plan: RetryPlan) -> RunControlResult<RunControlOutcome> {
+    async fn dispatch_retry(
+        &self,
+        plan: RetryPlan,
+        excluded: Vec<ExcludedTarget>,
+    ) -> RunControlResult<RunControlOutcome> {
         if plan.is_empty() {
             return Ok(RunControlOutcome::NoOp {
                 reason: RunNoOpReason::NoRetryableTarget,
@@ -853,6 +892,7 @@ impl RunControlService {
             change_ids: plan.change_ids,
             explicit_retry: plan.explicit_retry,
             scheduler,
+            excluded,
         })
     }
 
@@ -1053,7 +1093,8 @@ impl RunControlService {
                 ),
             });
         }
-        self.prepare_routes(routes).await
+        let excluded = self.describe_non_retryable(&marked, &routes).await;
+        self.prepare_routes(routes, excluded).await
     }
 
     /// Name every marked target the retry classification did not accept.
@@ -1061,12 +1102,15 @@ impl RunControlService {
         &self,
         marked: &[String],
         routes: &[(String, RetryRoute)],
-    ) -> Vec<(String, String)> {
+    ) -> Vec<ExcludedTarget> {
         let guard = self.state.read().await;
         marked
             .iter()
             .filter(|id| !routes.iter().any(|(routed, _)| routed == *id))
-            .map(|id| (id.clone(), guard.display_status(id).to_string()))
+            .map(|id| ExcludedTarget {
+                change_id: id.clone(),
+                status: guard.display_status(id).to_string(),
+            })
             .collect()
     }
 
@@ -1115,7 +1159,7 @@ impl RunControlService {
             .prepare_dispatch(RunCommandKind::Start, targets.clone(), false)
             .await?;
         Ok(PreparedRunCommand {
-            intent: PreparedIntent::Start { targets },
+            intent: PreparedIntent::Start { targets, excluded },
             dispatch,
         })
     }
@@ -1129,7 +1173,7 @@ impl RunControlService {
             Some(route) => vec![(change_id.to_string(), route)],
             None => Vec::new(),
         };
-        self.prepare_routes(routes).await
+        self.prepare_routes(routes, Vec::new()).await
     }
 
     /// Validate a bulk retry and reserve its dispatch.
@@ -1138,18 +1182,19 @@ impl RunControlService {
         change_ids: &[String],
     ) -> RunControlResult<PreparedRunCommand> {
         let routes = self.operator.plan_retry_errors(change_ids).await;
-        self.prepare_routes(routes).await
+        self.prepare_routes(routes, Vec::new()).await
     }
 
     async fn prepare_routes(
         &self,
         routes: Vec<(String, RetryRoute)>,
+        excluded: Vec<ExcludedTarget>,
     ) -> RunControlResult<PreparedRunCommand> {
         if routes.is_empty() {
             // Nothing retryable: no dispatch is reserved, so nothing has to be
             // rolled back when the caller settles this as a no-op.
             return Ok(PreparedRunCommand {
-                intent: PreparedIntent::Retry { routes },
+                intent: PreparedIntent::Retry { routes, excluded },
                 dispatch: PreparedDispatch::None,
             });
         }
@@ -1158,7 +1203,7 @@ impl RunControlService {
             .prepare_dispatch(RunCommandKind::Retry, targets, true)
             .await?;
         Ok(PreparedRunCommand {
-            intent: PreparedIntent::Retry { routes },
+            intent: PreparedIntent::Retry { routes, excluded },
             dispatch,
         })
     }
@@ -1215,7 +1260,7 @@ impl RunControlService {
         let scheduler = dispatch.effect();
 
         match intent {
-            PreparedIntent::Start { targets } => {
+            PreparedIntent::Start { targets, excluded } => {
                 {
                     let mut guard = self.state.write().await;
                     for id in &targets {
@@ -1227,11 +1272,12 @@ impl RunControlService {
                         change_ids: targets,
                         explicit_retry: false,
                         scheduler,
+                        excluded,
                     },
                     dispatch,
                 })
             }
-            PreparedIntent::Retry { routes } => {
+            PreparedIntent::Retry { routes, excluded } => {
                 let plan = self.operator.commit_retry_routes(&routes).await;
                 if plan.is_empty() {
                     // Every classified route was refused by the reducer. The
@@ -1249,6 +1295,7 @@ impl RunControlService {
                         change_ids: plan.change_ids,
                         explicit_retry: plan.explicit_retry,
                         scheduler,
+                        excluded,
                     },
                     dispatch,
                 })

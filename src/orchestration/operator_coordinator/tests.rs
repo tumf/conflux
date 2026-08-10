@@ -258,6 +258,7 @@ async fn accepted_operator_command_transaction_start_commits_and_projects_once()
         change_ids,
         explicit_retry,
         scheduler,
+        ..
     })) = result.outcome
     else {
         panic!("a marked, startable target must dispatch a run: {result:?}");

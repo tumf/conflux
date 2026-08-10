@@ -860,6 +860,10 @@ fn run_outcome_event(outcome: &RunControlOutcome) -> Option<ExecutionEvent> {
             change_ids,
             explicit_retry,
             scheduler,
+            // Exclusions are operator-facing reporting on the command result,
+            // not run state: the authoritative event carries only what was
+            // actually dispatched.
+            excluded: _,
         } => Some(ExecutionEvent::OperatorCommandApplied {
             effect: OperatorCommandEffect::RunDispatched {
                 change_ids: change_ids.clone(),

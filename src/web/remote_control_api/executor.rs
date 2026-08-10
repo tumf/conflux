@@ -313,6 +313,7 @@ pub fn summarize_run_outcome(outcome: &RunControlOutcome) -> ExecutionSummary {
             change_ids,
             explicit_retry,
             scheduler,
+            excluded,
         } => {
             let how = match scheduler {
                 SchedulerEffect::Started => "started the scheduler",
@@ -320,7 +321,20 @@ pub fn summarize_run_outcome(outcome: &RunControlOutcome) -> ExecutionSummary {
                 SchedulerEffect::None => "dispatched no scheduler work",
             };
             let kind = if *explicit_retry { "retry" } else { "run" };
-            ExecutionSummary::changed(format!("{kind} for {change_ids:?} {how}"))
+            // A mark the admission could not take is still the operator's mark:
+            // naming it here is what keeps an accepted run honest about the
+            // targets it left behind.
+            let left_behind = if excluded.is_empty() {
+                String::new()
+            } else {
+                let detail = excluded
+                    .iter()
+                    .map(|target| format!("{} ({})", target.change_id, target.status))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("; excluded: {detail}")
+            };
+            ExecutionSummary::changed(format!("{kind} for {change_ids:?} {how}{left_behind}"))
         }
         RunControlOutcome::StopRequested => {
             ExecutionSummary::changed("graceful stop requested; the run stops at its next boundary")
