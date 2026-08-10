@@ -611,12 +611,15 @@ fn rows() -> Vec<Row> {
             notice: None,
         },
         Row {
-            name: "retry without retryable evidence changes nothing",
+            // Admission owns the refusal now: a mark is accepted whatever the
+            // row's status, so Error-mode retry with nothing retryable marked
+            // is rejected at start rather than quietly settling as a no-op.
+            name: "retry without retryable evidence is rejected without effects",
             setup: Setup::Marked,
             mode: AppExecutionMode::Error,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
-            expect: Settlement::NoOp,
+            expect: Settlement::Failed(ErrorCode::TargetIneligible),
             notice: None,
         },
         // ── stop family ─────────────────────────────────────────────────────
@@ -928,7 +931,7 @@ async fn persistent_idle_commands_use_live_scheduler() {
     harness
         .run_control
         .operator()
-        .set_execution_mark(AppExecutionMode::Select.operator_mode(), "c1", true)
+        .set_execution_mark("c1", true)
         .await
         .expect("marking in Select is accepted");
     assert_eq!(
@@ -1267,6 +1270,16 @@ async fn arrange_bulk(harness: &AdapterHarness, rows: &[BulkRow], marked: &[&str
                 change_id: (*id).to_string(),
                 reason: "acceptance refused the proposal".to_string(),
             }),
+            // Archive alone is not terminal: it hands the row to the
+            // post-archive resolve lane, which is still a legitimate next-run
+            // target. The merge is what makes the row terminal.
+            "merged" => {
+                guard.apply_execution_event(&ExecutionEvent::ChangeArchived((*id).to_string()));
+                guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
+                    change_id: (*id).to_string(),
+                    revision: "deadbeef".to_string(),
+                });
+            }
             "not queued" => {}
             other => panic!("unsupported bulk-mark arrangement status '{other}'"),
         }
@@ -1368,29 +1381,36 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             expect: Settlement::Changed,
         },
         Case {
-            name: "an uncommitted row is excluded from the target set",
+            name: "an uncommitted row joins the target set: eligibility is a start-time fact",
             rows: vec![("c1", "not queued", true), ("c2", "not queued", false)],
             marked: vec![],
             mode: AppExecutionMode::Select,
             expect: Settlement::Changed,
         },
         Case {
-            name: "running mode turns the mark into queue intent and skips the active row",
+            name: "running mode marks the active row too, and writes no queue intent",
             rows: vec![("c1", "not queued", true), ("c2", "applying", true)],
             marked: vec![],
             mode: AppExecutionMode::Running,
             expect: Settlement::Changed,
         },
         Case {
-            name: "running mode takes queue intent back out when unmarking",
+            name: "an already-queued row is marked without its queue membership moving",
             rows: vec![("c1", "queued", true), ("c2", "applying", true)],
             marked: vec!["c1"],
             mode: AppExecutionMode::Running,
             expect: Settlement::Changed,
         },
         Case {
-            name: "a target set with no eligible row changes nothing on either side",
-            rows: vec![("c1", "rejected", true), ("c2", "applying", true)],
+            name: "a fully marked non-terminal set unmarks without dequeuing anything",
+            rows: vec![("c1", "queued", true), ("c2", "applying", true)],
+            marked: vec!["c1", "c2"],
+            mode: AppExecutionMode::Running,
+            expect: Settlement::Changed,
+        },
+        Case {
+            name: "a terminal-only target set changes nothing on either side",
+            rows: vec![("c1", "rejected", true), ("c2", "merged", true)],
             marked: vec![],
             mode: AppExecutionMode::Running,
             expect: Settlement::NoOp,
@@ -1527,9 +1547,9 @@ async fn processing_error_keeps_bulk_mark_available() {
         "and no Error-mode block of any wording may be reported: {report}"
     );
 
-    // The unrelated eligible row really moved, under the ordinary Running plan:
-    // `gamma` was the one unmarked eligible row, so the plan marks every
-    // eligible row and carries its queue intent with it.
+    // The unrelated eligible row really moved: the plan marks every visible
+    // non-terminal row. The mark is all it moves — Running mode no longer
+    // carries a queue intent along with it.
     assert!(
         wired.harness.marks.is_marked("gamma"),
         "an unrelated eligible row is still bulk-markable"
@@ -1537,8 +1557,8 @@ async fn processing_error_keeps_bulk_mark_available() {
     assert!(wired.row("gamma").selected);
     assert_eq!(
         wired.harness.status("gamma").await,
-        "queued",
-        "and its Running-mode queue intent was committed too"
+        "not queued",
+        "and the mark wrote no Running-mode queue intent"
     );
     assert!(
         wired.harness.marks.is_marked("beta"),

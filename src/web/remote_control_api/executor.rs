@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::orchestration::operator_command::{
-    MarkExclusion, MarkRoute, NoOpReason, OperatorCommandError, OperatorOutcome, StopSettlement,
+    MarkExclusion, NoOpReason, OperatorCommandError, OperatorOutcome, StopSettlement,
 };
 use crate::orchestration::operator_coordinator::{
     ApplicationOutcome, ApplicationResult, OperatorApplication, OperatorIntent,
@@ -191,14 +191,6 @@ pub trait RemoteControlExecutor: Send + Sync {
 /// different target.
 pub fn map_operator_error(error: &OperatorCommandError) -> CommandFailure {
     match error {
-        OperatorCommandError::MarkNotAllowed { route, .. } => {
-            let code = match route {
-                // Recovery is owned by retry commands in this mode.
-                MarkRoute::RetryRequired => ErrorCode::LifecycleConflict,
-                _ => ErrorCode::TargetIneligible,
-            };
-            CommandFailure::new(code, error.to_string())
-        }
         // The active run owns this target's exhausted Apply ceiling. It is a
         // target problem, not a mode problem: unrelated targets in the same run
         // are still retryable, and this one becomes retryable again once its
@@ -207,11 +199,6 @@ pub fn map_operator_error(error: &OperatorCommandError) -> CommandFailure {
         | OperatorCommandError::RetryUnsupported { .. }
         | OperatorCommandError::ApplyIterationLimitActive { .. } => {
             CommandFailure::new(ErrorCode::TargetIneligible, error.to_string())
-        }
-        // A mode that has to move on, not a target that has to change: the same
-        // request succeeds once the run reaches Select or Stopped.
-        OperatorCommandError::BulkMarksNotAllowed { .. } => {
-            CommandFailure::new(ErrorCode::LifecycleConflict, error.to_string())
         }
         // Termination did not confirm: the change is still occupying the root.
         OperatorCommandError::TerminationTimeout { .. } => {
@@ -273,6 +260,11 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
         OperatorOutcome::NoOp { change_id, reason } => {
             let why = match reason {
                 NoOpReason::MarkUnchanged => "execution mark already had the requested value",
+                // Stable terminal-target reason: the row is archived, merged,
+                // pushed, or rejected, so next-run intent has no meaning for it.
+                NoOpReason::TerminalMarkTarget => {
+                    "the target is terminal and carries no next-run intent"
+                }
                 NoOpReason::ReducerRejected => "the reducer produced no state change",
                 NoOpReason::BulkMarksUnchanged => {
                     "every eligible change already carried the derived mark"
@@ -357,6 +349,7 @@ pub fn summarize_run_outcome(outcome: &RunControlOutcome) -> ExecutionSummary {
             change_ids,
             explicit_retry,
             scheduler,
+            excluded,
         } => {
             let how = match scheduler {
                 SchedulerEffect::Started => "started the scheduler",
@@ -364,7 +357,20 @@ pub fn summarize_run_outcome(outcome: &RunControlOutcome) -> ExecutionSummary {
                 SchedulerEffect::None => "dispatched no scheduler work",
             };
             let kind = if *explicit_retry { "retry" } else { "run" };
-            ExecutionSummary::changed(format!("{kind} for {change_ids:?} {how}"))
+            // A mark the admission could not take is still the operator's mark:
+            // naming it here is what keeps an accepted run honest about the
+            // targets it left behind.
+            let left_behind = if excluded.is_empty() {
+                String::new()
+            } else {
+                let detail = excluded
+                    .iter()
+                    .map(|target| format!("{} ({})", target.change_id, target.status))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("; excluded: {detail}")
+            };
+            ExecutionSummary::changed(format!("{kind} for {change_ids:?} {how}{left_behind}"))
         }
         RunControlOutcome::StopRequested => {
             ExecutionSummary::changed("graceful stop requested; the run stops at its next boundary")

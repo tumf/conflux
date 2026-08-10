@@ -290,6 +290,89 @@ async fn on_merged_recovery_and_cleared_mark_are_coherent() {
     );
 }
 
+/// The archive edge publishes the cleared mark in the revision its own envelope
+/// names, and no post-archive transition can bring the mark back.
+///
+/// Archive is the terminal revocation edge, and it is the one edge classified
+/// from a run-level aggregate (`is_archived`) rather than per-change runtime, so
+/// the ordering claim is asserted here at the real dispatch boundary instead of
+/// being inferred from the reducer-level edge tests.
+#[tokio::test]
+async fn run_mark_intent_archive_revision_publishes_the_cleared_mark() {
+    let wired = Wired::new(&["alpha", "beta"]).await;
+    wired.marks.set("alpha", true);
+    wired.marks.set("beta", true);
+
+    // Establish a baseline revision that still reports both marks.
+    wired
+        .dispatch(ExecutionEvent::ApplyStarted {
+            change_id: "alpha".to_string(),
+            command: "apply".to_string(),
+        })
+        .await;
+    let (before, before_revision) = wired.published();
+    assert!(marked(&before, "alpha") && marked(&before, "beta"));
+
+    wired
+        .dispatch(ExecutionEvent::ChangeArchived("alpha".to_string()))
+        .await;
+
+    let (after, after_revision) = wired.published();
+    assert!(
+        after_revision > before_revision,
+        "the archive must advance the published revision"
+    );
+    assert_eq!(
+        wired.envelope_revision("change_archived"),
+        after_revision,
+        "the archive event must name the revision that already reports the cleared mark"
+    );
+    assert!(
+        !marked(&after, "alpha"),
+        "the archive revision still exposes the mark it revoked"
+    );
+    assert!(
+        marked(&after, "beta"),
+        "an unrelated target lost its mark to another row's archive"
+    );
+    assert_eq!(
+        after
+            .changes
+            .iter()
+            .find(|change| change.id == "alpha")
+            .and_then(|change| change.latest_activity.as_ref())
+            .map(|activity| activity.event_type.as_str()),
+        Some("change_archived"),
+        "the same revision must carry the reducer transition"
+    );
+
+    // Post-archive success transitions carry no revoking edge of their own, and
+    // must not resurrect the mark in any later published revision either.
+    for event in [
+        ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "rev".to_string(),
+        },
+        ExecutionEvent::PushCompleted {
+            change_id: "alpha".to_string(),
+            remote: "origin".to_string(),
+            branch: "cflx/alpha".to_string(),
+        },
+    ] {
+        wired.dispatch(event.clone()).await;
+        let (snapshot, _) = wired.published();
+        assert!(
+            !marked(&snapshot, "alpha"),
+            "{event:?} recreated the mark the archive edge revoked"
+        );
+        assert!(
+            marked(&snapshot, "beta"),
+            "{event:?} disturbed an unrelated mark"
+        );
+    }
+    assert_eq!(wired.marks.marked_ids(), vec!["beta".to_string()]);
+}
+
 /// Process-level `Stopped` publishes a revision that still names every resume
 /// target.
 #[tokio::test]

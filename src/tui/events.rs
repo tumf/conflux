@@ -67,9 +67,17 @@ pub enum TuiCommand {
     /// shared run-control service decides start vs. resume vs. retry from the
     /// mode it is given rather than from a separate command variant.
     StartProcessing(Vec<String>),
-    /// Add a change to the queue dynamically
+    /// Add a change to the queue dynamically.
+    ///
+    /// Explicit queue intent only. No key press produces it any more: Space and
+    /// bulk `x` write execution marks, which never alias onto queue membership.
+    /// The adapter is retained so the explicit queue service stays reachable
+    /// from the TUI command channel exactly as `/api/v2 set_queue_intent` is.
+    #[allow(dead_code)]
     AddToQueue(String),
-    /// Remove a change from the queue dynamically
+    /// Remove a change from the queue dynamically. Explicit intent only; see
+    /// [`TuiCommand::AddToQueue`].
+    #[allow(dead_code)]
     RemoveFromQueue(String),
     /// Stop processing (graceful shutdown)
     #[allow(dead_code)]

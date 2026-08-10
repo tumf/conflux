@@ -246,6 +246,10 @@ fn the_snapshot_carries_no_live_clock_even_with_timing_published() {
 fn action_eligibility_is_stated_for_every_canonical_status() {
     // Running mode, no blocker payload: the table below is the contract a client
     // branches on instead of re-implementing the lifecycle matrix.
+    //
+    // `set_execution_mark` is the one column with no lifecycle branching left:
+    // a mark is next-run intent, so every non-final status accepts it and only
+    // a final status — which has no next run — refuses.
     let expected: HashMap<&str, [Option<ActionBlockedReason>; 5]> = HashMap::from([
         // (set_execution_mark, set_queue_intent, retry_change, stop_and_dequeue, resolve_merge)
         (
@@ -271,7 +275,7 @@ fn action_eligibility_is_stated_for_every_canonical_status() {
         (
             "blocked",
             [
-                Some(ActionBlockedReason::StatusImmutable),
+                None,
                 Some(ActionBlockedReason::StatusImmutable),
                 Some(ActionBlockedReason::NoRetryableEvidence),
                 None,
@@ -281,7 +285,7 @@ fn action_eligibility_is_stated_for_every_canonical_status() {
         (
             "stalled",
             [
-                Some(ActionBlockedReason::StatusImmutable),
+                None,
                 Some(ActionBlockedReason::StatusImmutable),
                 None,
                 None,
@@ -291,7 +295,7 @@ fn action_eligibility_is_stated_for_every_canonical_status() {
         (
             "applying",
             [
-                Some(ActionBlockedReason::StatusImmutable),
+                None,
                 Some(ActionBlockedReason::StatusImmutable),
                 Some(ActionBlockedReason::NoRetryableEvidence),
                 None,
@@ -301,7 +305,7 @@ fn action_eligibility_is_stated_for_every_canonical_status() {
         (
             "accepting",
             [
-                Some(ActionBlockedReason::StatusImmutable),
+                None,
                 Some(ActionBlockedReason::StatusImmutable),
                 Some(ActionBlockedReason::NoRetryableEvidence),
                 None,
@@ -311,7 +315,7 @@ fn action_eligibility_is_stated_for_every_canonical_status() {
         (
             "rejecting",
             [
-                Some(ActionBlockedReason::StatusImmutable),
+                None,
                 Some(ActionBlockedReason::StatusImmutable),
                 Some(ActionBlockedReason::NoRetryableEvidence),
                 None,
@@ -321,7 +325,7 @@ fn action_eligibility_is_stated_for_every_canonical_status() {
         (
             "archiving",
             [
-                Some(ActionBlockedReason::StatusImmutable),
+                None,
                 Some(ActionBlockedReason::StatusImmutable),
                 Some(ActionBlockedReason::NoRetryableEvidence),
                 None,
@@ -331,7 +335,7 @@ fn action_eligibility_is_stated_for_every_canonical_status() {
         (
             "resolving",
             [
-                Some(ActionBlockedReason::StatusImmutable),
+                None,
                 Some(ActionBlockedReason::StatusImmutable),
                 Some(ActionBlockedReason::NoRetryableEvidence),
                 None,
@@ -361,7 +365,7 @@ fn action_eligibility_is_stated_for_every_canonical_status() {
         (
             "reject pending",
             [
-                Some(ActionBlockedReason::StatusImmutable),
+                None,
                 Some(ActionBlockedReason::StatusImmutable),
                 Some(ActionBlockedReason::NoRetryableEvidence),
                 None,
@@ -421,7 +425,7 @@ fn action_eligibility_is_stated_for_every_canonical_status() {
         (
             "stopped",
             [
-                Some(ActionBlockedReason::StatusImmutable),
+                None,
                 Some(ActionBlockedReason::StatusImmutable),
                 Some(ActionBlockedReason::NoRetryableEvidence),
                 None,
@@ -459,43 +463,105 @@ fn action_eligibility_is_stated_for_every_canonical_status() {
 
 #[test]
 fn mode_changes_the_offered_actions_without_changing_the_status() {
-    // Error mode routes recovery through retry; a pending graceful stop refuses
-    // intent changes outright. Both are mode facts, not status facts.
+    // Mode still routes the *queue* actions: Error mode owns recovery through
+    // retry, a pending graceful stop refuses intent changes, and Select mode has
+    // no runtime queue to mutate at all.
     let error_mode = change_actions_for_test("error", "not queued", None);
     assert_eq!(
-        error_mode.set_execution_mark.blocked_reason,
+        error_mode.set_queue_intent.blocked_reason,
         Some(ActionBlockedReason::RetryRequired)
     );
 
     let stopping = change_actions_for_test("stopping", "queued", None);
     assert_eq!(
-        stopping.set_execution_mark.blocked_reason,
+        stopping.set_queue_intent.blocked_reason,
         Some(ActionBlockedReason::StopPending)
     );
 
-    // Select mode has no runtime queue, so a mark is pure intent.
     let select = change_actions_for_test("select", "not queued", None);
-    assert!(select.set_execution_mark.allowed);
     assert_eq!(
         select.set_queue_intent.blocked_reason,
         Some(ActionBlockedReason::ModeHasNoQueue)
     );
+
+    // The mark is the one action mode does not reach: the same non-terminal row
+    // is markable in every mode, which is what keeps a client from having to
+    // re-derive a second lifecycle table.
+    for actions in [&error_mode, &stopping, &select] {
+        assert!(
+            actions.set_execution_mark.allowed,
+            "mode must not gate next-run intent: {:?}",
+            actions.set_execution_mark
+        );
+    }
+}
+
+/// `/api/v2` mark eligibility *is* the shared classifier, on every axis.
+///
+/// The projection is asserted against `is_markable_status` rather than against a
+/// second table written here: a hand-maintained expectation would be free to
+/// drift from what the TUI routes a keypress through, which is exactly the
+/// two-lifecycle-tables problem this contract exists to prevent.
+#[test]
+fn run_mark_intent_api_markability_is_the_shared_classifier_on_every_axis() {
+    use crate::orchestration::operator_command::is_markable_status;
+
+    for mode in ["select", "running", "stopping", "stopped", "error"] {
+        for status in CANONICAL_STATUSES {
+            let markable = is_markable_status(status);
+
+            for parallel_eligible in [true, false] {
+                let actions = parallel_change_actions_for_test(mode, status, parallel_eligible);
+                assert_eq!(
+                    actions.set_execution_mark.allowed, markable,
+                    "{mode}/{status}/eligible={parallel_eligible}: mark eligibility must match \
+                     the shared classifier: {:?}",
+                    actions.set_execution_mark
+                );
+                if !markable {
+                    assert_eq!(
+                        actions.set_execution_mark.blocked_reason,
+                        Some(ActionBlockedReason::FinalStatus),
+                        "{mode}/{status}: a terminal row is the only refusal, and it says so"
+                    );
+                }
+            }
+
+            for apply_iteration_limit_active in [true, false] {
+                let actions =
+                    crate::web::remote_control_api::projection::limited_change_actions_for_test(
+                        mode,
+                        status,
+                        apply_iteration_limit_active,
+                    );
+                assert_eq!(
+                    actions.set_execution_mark.allowed, markable,
+                    "{mode}/{status}/limit={apply_iteration_limit_active}: an Apply ceiling must \
+                     not reach mark eligibility: {:?}",
+                    actions.set_execution_mark
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn an_ineligible_change_never_advertises_its_mark_actions() {
+fn an_ineligible_change_still_advertises_its_mark_action() {
     // An eligible change is markable.
     let eligible_baseline = change_actions_for_test("select", "not queued", None);
     assert!(eligible_baseline.set_execution_mark.allowed);
 
-    // Worktree eligibility is an unconditional input, so an uncommitted change
-    // is refused up front with the same token the bulk command reports, or a
-    // client would mark a row that start then rejects.
+    // So is an uncommitted one. Worktree eligibility is evaluated at start
+    // admission against current facts, so refusing the mark now would refuse
+    // intent on the strength of a condition that may not hold by then — and
+    // the operator has no other way to say what the next run should consider.
     let ineligible = parallel_change_actions_for_test("select", "not queued", false);
-    assert_eq!(
-        ineligible.set_execution_mark.blocked_reason,
-        Some(ActionBlockedReason::ParallelIneligible)
+    assert!(
+        ineligible.set_execution_mark.allowed,
+        "worktree eligibility is a start-time fact: {:?}",
+        ineligible.set_execution_mark
     );
+    // The queue action keeps the eligibility gate: it mutates the current run.
     let queued = parallel_change_actions_for_test("running", "queued", false);
     assert_eq!(
         queued.set_queue_intent.blocked_reason,
@@ -1650,9 +1716,13 @@ async fn active_iteration_limit_projection_blocks_retry_while_the_task_is_live()
         alpha.actions.set_queue_intent.blocked_reason,
         Some(ActionBlockedReason::ApplyIterationLimitActive)
     );
-    assert_eq!(
-        alpha.actions.set_execution_mark.blocked_reason,
-        Some(ActionBlockedReason::ApplyIterationLimitActive)
+    // The mark is not: a ceiling on the *active* run says nothing about which
+    // change the operator wants the next run to consider. Retry is where the
+    // limit is reported, and it is reported there.
+    assert!(
+        alpha.actions.set_execution_mark.allowed,
+        "an Apply ceiling never refuses next-run intent: {:?}",
+        alpha.actions.set_execution_mark
     );
 }
 

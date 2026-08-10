@@ -258,6 +258,7 @@ async fn accepted_operator_command_transaction_start_commits_and_projects_once()
         change_ids,
         explicit_retry,
         scheduler,
+        ..
     })) = result.outcome
     else {
         panic!("a marked, startable target must dispatch a run: {result:?}");
@@ -467,9 +468,14 @@ async fn accepted_operator_command_transaction_retry_commits_and_dispatches() {
     );
 }
 
-/// Retry with no retryable evidence is a no-op with no scheduler effect.
+/// Retry with no retryable evidence is rejected with no scheduler effect.
+///
+/// A mark is next-run intent only, so an idle row may carry one in Error mode.
+/// Admission is where that intent meets current evidence: with no retryable
+/// target left, the request is refused and the excluded row is named, rather
+/// than settling as a silent no-op the operator cannot act on.
 #[tokio::test]
-async fn accepted_operator_command_transaction_retry_without_evidence_is_a_no_op() {
+async fn accepted_operator_command_transaction_retry_without_evidence_is_rejected() {
     let harness = Harness::new(&["c1"]);
     harness.marks.set("c1", true);
     harness.core.set(OperatorMode::Error);
@@ -477,14 +483,16 @@ async fn accepted_operator_command_transaction_retry_without_evidence_is_a_no_op
 
     let result = harness.apply(OperatorIntent::Start).await;
 
+    let Err(RunControlError::NoEligibleTarget {
+        command: RunCommandKind::Start,
+        ref detail,
+    }) = result.outcome
+    else {
+        panic!("an idle marked row carries no retryable evidence: {result:?}");
+    };
     assert!(
-        matches!(
-            &result.outcome,
-            Ok(ApplicationOutcome::Run(RunControlOutcome::NoOp {
-                reason: RunNoOpReason::NoRetryableTarget
-            }))
-        ),
-        "an idle marked row carries no retryable evidence: {result:?}"
+        detail.contains("c1"),
+        "the excluded target must be named: {detail}"
     );
     assert_eq!(result.revision, None);
     assert_eq!(harness.axes(&["c1"]).await, before);

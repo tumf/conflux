@@ -18,37 +18,37 @@ When a user triggers merge resolve (`M` key) on a `MergeWait` change, the shared
 
 ### Requirement: error-change-space-toggle-running-mode
 
-Running モードで change の queue-oriented 実行マーク操作に使う `display_status_cache` は、shared reducer display snapshot と `ChangesRefreshed` の往復後も queue 状態と active 状態を正しく反映しなければならない（MUST）。
+Running モードで change の表示に使う `display_status_cache` は、shared reducer display snapshot と `ChangesRefreshed` の往復後も queue 状態と active 状態を正しく反映しなければならない（MUST）。
 
-Running モードで error 状態の change に Space キーを押した場合、retry mark の設定だけでなく、実際に queue への追加/削除コマンドを発行しなければならない。
+Running モードで error 状態または error から遷移した queued 状態の change に Space を押した場合、Space は process-local execution mark のみを変更しなければならない（SHALL）。`AddToQueue`、`RemoveFromQueue`、retry、stop、scheduler、または display-status transition を発行してはならない（MUST NOT）。Retry execution は configured Start/F5 の final admission が current eligibility に基づいて決定しなければならない（SHALL）。
 
-<!-- Expected canonical result after archive: Running-mode queue toggle semantics will explicitly require reducer-synced display_status_cache so Space/x remain actionable after refresh. -->
+#### Scenario: Space on error change marks future retry intent only
 
-#### Scenario: Space on error change marks for retry and adds to queue
+**Given**: Running モードで display_status_cache が `error` の non-terminal change が存在する
+**When**: ユーザーが Space を押す
+**Then**: change の execution mark だけが toggle される
+**And**: `AddToQueue`、`RemoveFromQueue`、retry、scheduler、mode、または display-status effect は発行されない
 
-**Given**: Running モードで display_status_cache が "error" の change が存在する
-**When**: ユーザーが Space キーを押す
-**Then**: change の selected が true になり、TuiCommand::AddToQueue が発行され、display_status_cache が "queued" に遷移する
+#### Scenario: Space on queued recovery row does not remove current work
 
-#### Scenario: Space on retried error change clears mark and removes from queue
+**Given**: Running モードで error recovery 由来の `queued` change が存在する
+**When**: ユーザーが Space を押す
+**Then**: execution mark だけが toggle される
+**And**: current-run queue と display status は変化しない
 
-**Given**: Running モードで display_status_cache が "queued"（error からの遷移後）の change が存在する
-**When**: ユーザーが Space キーを押す
-**Then**: change の selected が false になり、TuiCommand::RemoveFromQueue が発行され、display_status_cache が "not queued" に遷移する
+#### Scenario: Running new change remains mark-toggleable after refresh
 
-#### Scenario: Running new change remains queue-toggleable after refresh
+**Given**: TUI が Running モードで、新しく検出された change の display_status_cache が `not queued` である
+**When**: ユーザーが Space で mark を変更し、その後 reducer display sync と `ChangesRefreshed` が発生する
+**Then**: frontend mark は shared ExecutionMarkStore の projection と一致する
+**And**: refreshed display status does not create or remove queue intent from the mark
 
-**Given**: TUI が Running モードで、新しく検出された change の display_status_cache が "not queued" である
-**When**: ユーザーが Space キーでその change を queue に追加し、その後 reducer display sync と `ChangesRefreshed` が発生する
-**Then**: change は queue-oriented 実行マークを保持する
-**And**: subsequent Running-mode queue controls still treat the row as actionable `queued` or `not queued` state rather than regressing it to an incorrect inactive status
+#### Scenario: Running bulk toggle preserves queue state
 
-#### Scenario: Running bulk toggle preserves actionable non-active rows
-
-**Given**: TUI が Running モードで、eligible な `not queued` / `queued` row と active row が混在している
+**Given**: TUI が Running モードで、not queued、queued、active、error、および wait rows が混在している
 **When**: ユーザーが `x` で bulk toggle を実行する
-**Then**: `not queued` / `queued` row には single-row Space と同じ queue add/remove semantics が適用される
-**And**: active row は bulk toggle 対象として state change されない
+**Then**: non-terminal rows receive the common execution-mark state
+**And**: no row receives AddToQueue, RemoveFromQueue, stop, retry, or display-status mutation
 
 ### Requirement: update-change-status-guard-allows-error-to-queued
 
@@ -80,43 +80,52 @@ When a user triggers merge resolve (`M` key) on a `MergeWait` change, the shared
 
 ### Requirement: Bulk execution mark toggle reports complete target results
 
-Changes viewのbulk execution mark toggleは、操作開始時点のeligibleなproposal全体を1つの対象集合として扱わなければならない（SHALL）。対象集合に未マークが1件でもあれば対象全件をマークし、対象全件がマーク済みなら対象全件をアンマークしなければならない（SHALL）。
+Changes view の bulk execution mark toggle は、操作開始時点の visible non-terminal proposal 全体を1つの対象集合として扱わなければならない（SHALL）。対象集合に未マークが1件でもあれば対象全件をマークし、対象全件がマーク済みなら対象全件をアンマークしなければならない（SHALL）。
 
-既存の安全guardによりactive、rejected、またはparallel-ineligibleなproposalは対象集合へ含めてはならない（MUST NOT）。除外行が存在する場合、TUIは操作された件数、除外された件数、およびユーザーが理解または対処できる除外理由を表示しなければならない（SHALL）。対象集合が空の場合も無反応にしてはならない（MUST NOT）。
+Execution mode、active/retry/wait status、Apply iteration-limit evidence、および現在の parallel eligibility は対象集合から non-terminal proposal を除外する理由にしてはならない（MUST NOT）。Archived、merged、pushed、および rejected proposal は対象集合へ含めてはならない（MUST NOT）。Terminal row の除外だけを理由に warning を表示してはならない（MUST NOT）。
 
-Running modeのeligibleなqueue-mutating rowには、単一行のSpace操作と同じAddToQueue/RemoveFromQueue semanticsを適用しなければならない（SHALL）。active rowをbulk操作から停止要求へ変換してはならない（MUST NOT）。
+Bulk 操作は execution mark のみを変更しなければならない（SHALL）。Running mode を含め、`AddToQueue`、`RemoveFromQueue`、stop/dequeue、retry、resolve、cancellation、scheduler、hook、または process-mode effect を発行してはならない（MUST NOT）。対象が存在する場合、結果は変更件数と共通 target mark state を報告しなければならない（SHALL）。表示中の proposal が terminal rows のみの場合は silent no-op としなければならない（SHALL）。Changes list 自体が空など terminal 除外以外の理由で対象集合が空の場合は、対象がない理由を報告しなければならない（SHALL）。
 
-#### Scenario: 部分的にマーク済みならeligible全件をマークする
+#### Scenario: 部分的にマーク済みなら全 non-terminal proposal をマークする
 
-**Given**: eligibleなproposalの一部だけが実行マーク済みである
-**When**: ユーザーがChanges viewで`x`を押す
-**Then**: eligibleなproposalはすべて実行マーク済みになる
-**And**: 既にマーク済みのproposalもマーク状態を維持する
+**Given**: visible non-terminal proposal の一部だけが実行マーク済みである
+**When**: ユーザーが Changes view で `x` を押す
+**Then**: visible non-terminal proposal はすべて実行マーク済みになる
+**And**: 既にマーク済みの proposal もマーク状態を維持する
 
-#### Scenario: eligible全件がマーク済みなら全件をアンマークする
+#### Scenario: 全 non-terminal proposal がマーク済みなら全件をアンマークする
 
-**Given**: eligibleなproposalがすべて実行マーク済みである
-**When**: ユーザーがChanges viewで`x`を押す
-**Then**: eligibleなproposalはすべて未マークになる
+**Given**: visible non-terminal proposal がすべて実行マーク済みである
+**When**: ユーザーが Changes view で `x` を押す
+**Then**: visible non-terminal proposal はすべて未マークになる
+**And**: current-run queue と active execution は変化しない
 
-#### Scenario: eligibleとineligibleが混在する
+#### Scenario: lifecycle と eligibility が混在しても同じ mark target になる
 
-**Given**: eligibleな未マークproposalと、active、rejected、またはparallel-ineligibleなproposalが混在する
-**When**: ユーザーがChanges viewで`x`を押す
-**Then**: eligibleなproposalはすべてマークされる
-**And**: ineligibleなproposalのマーク状態は変更されない
-**And**: TUIは変更件数、除外件数、および除外理由を表示する
+**Given**: active、error、wait、Apply-limit、parallel-ineligible、および ordinary non-terminal proposal が混在する
+**When**: ユーザーが Changes view で `x` を押す
+**Then**: 全 visible non-terminal proposal に同じ target mark state が適用される
+**And**: queue、runtime、retry、resolve、cancellation、scheduler、hook、および mode state は変化しない
 
-#### Scenario: bulk対象が存在しない
+#### Scenario: terminal rows は bulk 対象外
 
-**Given**: 表示中のproposalがすべてbulk toggleの対象外である
-**When**: ユーザーがChanges viewで`x`を押す
-**Then**: proposalの状態は変更されない
-**And**: TUIは対象がない理由を表示する
+**Given**: non-terminal proposal と archived、merged、pushed、または rejected proposal が混在する
+**When**: ユーザーが Changes view で `x` を押す
+**Then**: non-terminal proposal だけに共通 target mark state が適用される
+**And**: terminal row exclusion warning は表示されない
 
-#### Scenario: Running modeでqueue commandを全対象へ発行する
+#### Scenario: terminal rows だけの場合は silent no-op
 
-**Given**: Running modeで複数のeligibleな`not queued` proposalが未マークであり、active proposalも存在する
-**When**: ユーザーがChanges viewで`x`を押す
-**Then**: 各eligibleな`not queued` proposalがマークされ、それぞれにAddToQueue commandが発行される
-**And**: active proposalには停止commandもstate changeも発生しない
+**Given**: 表示中の proposal がすべて archived、merged、pushed、または rejected である
+**When**: ユーザーが Changes view で `x` を押す
+**Then**: proposal の状態は変更されない
+**And**: mark refusal warning または empty-target message は表示されない
+
+#### Scenario: Changes list が空なら理由を表示する
+
+**Given**: Changes list に proposal が存在しない
+**When**: ユーザーが Changes view で `x` を押す
+**Then**: proposal の状態は変更されない
+**And**: TUI は対象がない理由を表示する
+
+<!-- Expected canonical result after archive: `tui-state-management` will retain refresh correctness while making single and bulk Space/x mark-only, excluding terminal rows, and distinguishing terminal-only silent no-op from other empty-target feedback. -->

@@ -15,18 +15,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::json;
 
 use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
 use crate::orchestration::operator_command::{
-    ExecutionMarkStore, MarkExclusion, NoopQueueHooks, OperatorCommandService, OperatorMode,
-    OperatorOutcome, ParallelEligibility, ParallelRuntime, QueuePort, TerminationWaiter,
+    ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, OperatorOutcome,
+    ParallelEligibility, ParallelRuntime, QueuePort,
 };
 use crate::orchestration::run_control::{
     testing::{RecordingScheduler, SchedulerCall},
@@ -85,12 +84,7 @@ struct Wired {
 
 impl Wired {
     async fn new(change_ids: &[&str]) -> Self {
-        Self::with_queue(change_ids, Arc::new(crate::tui::queue::DynamicQueue::new())).await
-    }
-
-    /// Same wiring, over a caller-supplied queue port so a test can suspend a
-    /// mutation inside the queue effect and drive a real interleaving.
-    async fn with_queue(change_ids: &[&str], queue: Arc<dyn QueuePort>) -> Self {
+        let queue: Arc<dyn QueuePort> = Arc::new(crate::tui::queue::DynamicQueue::new());
         let reducer = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
             change_ids.iter().map(|id| id.to_string()).collect(),
             10,
@@ -418,12 +412,15 @@ async fn a_stale_revision_refuses_a_bulk_mutation_before_it_reaches_the_service(
 // Shared-service behavior through the v2 executor
 // ============================================================================
 
+/// A remote bulk mark covers every visible non-terminal row and writes marks only.
+///
+/// `dirty` has uncommitted proposal files, `absent` is missing from HEAD, and
+/// `active` is mid-apply. None of those is a reason to refuse *next-run* intent:
+/// they are current-run facts that start admission evaluates against the state
+/// that holds when a run is actually requested. What the command must not do is
+/// carry queue intent, dispatch a scheduler, or disturb the live row.
 #[tokio::test]
-async fn remote_bulk_mark_is_atomic_over_one_revision_and_names_its_exclusions() {
-    // `dirty` is committed but has uncommitted proposal files; `absent` is
-    // simply missing from HEAD. Both are refused, and the two must be named
-    // apart: telling an operator to commit `absent` describes work that does
-    // not exist.
+async fn remote_bulk_mark_covers_every_non_terminal_row_without_run_effects() {
     let wired = Wired::new(&["a", "b", "dirty", "absent", "active"]).await;
     wired
         .observe(
@@ -450,28 +447,35 @@ async fn remote_bulk_mark_is_atomic_over_one_revision_and_names_its_exclusions()
     assert!(summary.changed);
     let detail = summary.detail.unwrap_or_default();
     assert!(
-        detail.contains("2 change(s) marked")
-            && detail.contains("3 excluded")
-            && detail.contains("change_active")
-            && detail.contains("parallel_ineligible")
-            && detail.contains("parallel_proposal_absent"),
-        "the outcome must report changed IDs and stable exclusion reasons: {detail}"
+        detail.contains("5 change(s) marked") && !detail.contains("excluded"),
+        "every visible non-terminal row is a target, so nothing is excluded: {detail}"
     );
 
+    let mut marked = wired.marks.marked_ids();
+    marked.sort();
     assert_eq!(
-        wired.marks.marked_ids(),
-        vec!["a".to_string(), "b".to_string()]
+        marked,
+        vec![
+            "a".to_string(),
+            "absent".to_string(),
+            "active".to_string(),
+            "b".to_string(),
+            "dirty".to_string()
+        ]
     );
-    assert_eq!(wired.status("a").await, "queued");
-    assert_eq!(wired.status("b").await, "queued");
-    for excluded in ["dirty", "absent"] {
+    // Not one row moved in the queue: a mark is intent, not membership.
+    for id in ["a", "b", "dirty", "absent"] {
         assert_eq!(
-            wired.status(excluded).await,
+            wired.status(id).await,
             "not queued",
-            "an excluded row keeps coherent intent"
+            "{id}: a mark must not write queue intent"
         );
     }
-    assert_eq!(wired.status("active").await, "applying");
+    assert_eq!(
+        wired.status("active").await,
+        "applying",
+        "and the live row keeps running, unmarked or marked"
+    );
     assert!(
         wired.scheduler.calls().is_empty(),
         "a bulk mark expresses intent; it never dispatches a run by itself"
@@ -521,19 +525,127 @@ async fn remote_bulk_mark_with_no_eligible_row_settles_as_a_no_op() {
     assert!(wired.marks.marked_ids().is_empty());
 }
 
+/// The single-row remote mark obeys the same contract as the bulk one.
+///
+/// Two commands, one rule: every visible non-terminal row accepts the mutation
+/// whatever its status or mode, a terminal row settles as a reasoned no-op, and
+/// neither writes queue intent, dispatches a scheduler, or disturbs an in-flight
+/// run. The single command is checked against a *live* row on purpose — that is
+/// the case the old matrix refused, and the one where a queue alias would show
+/// up.
+///
+/// `gone` is driven all the way through archive *and* merge on purpose: archive
+/// alone leaves the row in the post-archive resolve lane, which is still a
+/// legitimate next-run target. Only the merge makes it terminal.
 #[tokio::test]
-async fn remote_bulk_mark_is_refused_in_error_mode_without_touching_any_row() {
+async fn run_mark_intent_single_remote_mark_is_lifecycle_independent_and_effect_free() {
+    let wired = Wired::new(&["active", "idle", "gone"]).await;
+    wired
+        .observe(
+            &["active", "idle", "gone"],
+            &["active", "idle", "gone"],
+            &[],
+            "running",
+        )
+        .await;
+    {
+        let mut guard = wired.reducer.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "active".to_string(),
+            command: "apply".to_string(),
+        });
+        guard.apply_execution_event(&ExecutionEvent::ChangeArchived("gone".to_string()));
+        guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "gone".to_string(),
+            revision: "deadbeef".to_string(),
+        });
+    }
+    assert_eq!(wired.status("gone").await, "merged");
+
+    for change_id in ["active", "idle"] {
+        let summary = wired
+            .executor
+            .execute(&CommandSpec::SetExecutionMark {
+                change_id: change_id.to_string(),
+                marked: true,
+            })
+            .await
+            .unwrap_or_else(|err| panic!("`{change_id}` must accept a mark: {err:?}"));
+        assert!(summary.changed, "`{change_id}` was unmarked before");
+        assert!(wired.marks.is_marked(change_id));
+    }
+
+    // The live run is untouched: still applying, still not queued by the mark.
+    assert_eq!(wired.status("active").await, "applying");
+    assert_eq!(wired.status("idle").await, "not queued");
+    assert!(
+        wired.scheduler.calls().is_empty(),
+        "a mark never wakes a scheduler"
+    );
+
+    // Unmarking the live row changes intent and nothing else.
+    let summary = wired
+        .executor
+        .execute(&CommandSpec::SetExecutionMark {
+            change_id: "active".to_string(),
+            marked: false,
+        })
+        .await
+        .expect("unmarking a live row is allowed");
+    assert!(summary.changed);
+    assert!(!wired.marks.is_marked("active"));
+    assert_eq!(
+        wired.status("active").await,
+        "applying",
+        "unmarking must not cancel or dequeue admitted work"
+    );
+    assert!(wired.scheduler.calls().is_empty());
+
+    // The terminal row is the one exclusion, and the store keeps its shape.
+    let summary = wired
+        .executor
+        .execute(&CommandSpec::SetExecutionMark {
+            change_id: "gone".to_string(),
+            marked: true,
+        })
+        .await
+        .expect("a terminal target is a reasoned no-op, not a transport error");
+    assert!(
+        !summary.changed,
+        "a terminal row carries no next-run intent: {summary:?}"
+    );
+    assert!(summary
+        .detail
+        .unwrap_or_default()
+        .contains("terminal and carries no next-run intent"));
+    assert!(!wired.marks.is_marked("gone"));
+    assert!(wired.marks.is_marked("idle"), "unrelated marks survive");
+}
+
+/// Error mode marks like any other mode.
+///
+/// Recovery is still owned by the retry commands — this writes no retry intent
+/// and starts nothing. It records which change the operator wants the next run
+/// to consider, which is exactly the decision an operator makes while looking at
+/// a failed run.
+#[tokio::test]
+async fn remote_bulk_mark_is_accepted_in_error_mode_without_starting_anything() {
     let wired = Wired::new(&["c1"]).await;
     wired.observe(&["c1"], &["c1"], &[], "error").await;
 
-    let failure = wired
+    let summary = wired
         .executor
         .execute(&CommandSpec::SetAllExecutionMarks {})
         .await
-        .expect_err("recovery in Error mode is owned by the retry commands");
+        .expect("Error mode does not gate next-run intent");
 
-    assert_eq!(failure.error_code, ErrorCode::LifecycleConflict);
-    assert!(wired.marks.marked_ids().is_empty());
+    assert!(summary.changed);
+    assert_eq!(wired.marks.marked_ids(), vec!["c1".to_string()]);
+    assert_eq!(wired.status("c1").await, "not queued");
+    assert!(
+        wired.scheduler.calls().is_empty(),
+        "recovery stays owned by the retry commands"
+    );
 }
 
 // ============================================================================
@@ -579,88 +691,9 @@ async fn one_ineligible_marked_target_rejects_a_remote_parallel_start_entirely()
 // Concurrency: the toggle and a bulk mark are one mutation each
 // ============================================================================
 
-/// A queue port that parks the first queue mutation until the test releases it.
-///
-/// The pause is a real await *inside* a service mutation, which is what lets a
-/// test place a second command in the middle of the first one deterministically
-/// instead of starting two tasks and hoping for the damaging interleaving.
-struct PausingQueue {
-    inner: crate::tui::queue::DynamicQueue,
-    parked_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    parked_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
-    release_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    release_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
-}
-
-impl PausingQueue {
-    fn new() -> Arc<Self> {
-        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        Arc::new(Self {
-            inner: crate::tui::queue::DynamicQueue::new(),
-            parked_tx: Mutex::new(Some(parked_tx)),
-            parked_rx: Mutex::new(Some(parked_rx)),
-            release_tx: Mutex::new(Some(release_tx)),
-            release_rx: Mutex::new(Some(release_rx)),
-        })
-    }
-
-    /// Resolve once a mutation is parked inside its queue effect.
-    async fn parked(&self) {
-        let rx = self
-            .parked_rx
-            .lock()
-            .unwrap()
-            .take()
-            .expect("parked() is awaited once per queue");
-        rx.await.expect("a queue mutation must be reached");
-    }
-
-    /// Let the parked mutation run to completion.
-    fn release(&self) {
-        if let Some(tx) = self.release_tx.lock().unwrap().take() {
-            let _ = tx.send(());
-        }
-    }
-
-    async fn pause_first_mutation(&self) {
-        let parked = self.parked_tx.lock().unwrap().take();
-        if let Some(tx) = parked {
-            let _ = tx.send(());
-            let release = self.release_rx.lock().unwrap().take();
-            if let Some(release) = release {
-                let _ = release.await;
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl QueuePort for PausingQueue {
-    async fn add(&self, change_id: &str) -> bool {
-        self.pause_first_mutation().await;
-        QueuePort::add(&self.inner, change_id).await
-    }
-
-    async fn remove(&self, change_id: &str) -> bool {
-        self.pause_first_mutation().await;
-        QueuePort::remove(&self.inner, change_id).await
-    }
-
-    async fn request_cancellation(
-        &self,
-        change_id: &str,
-    ) -> std::result::Result<Option<TerminationWaiter>, String> {
-        QueuePort::request_cancellation(&self.inner, change_id).await
-    }
-
-    async fn notify_scheduler(&self) {
-        QueuePort::notify_scheduler(&self.inner).await
-    }
-}
-
-/// The second mutation's outcome if it finished while the first one was parked,
-/// `None` if it was still waiting — which is what serialization looks like.
+/// The second mutation's outcome if it finished while the first one held the
+/// guard, `None` if it was still waiting — which is what serialization looks
+/// like.
 ///
 /// The result is *carried* rather than asserted on immediately so that an
 /// interleaving is judged by the state it leaves behind: the settled-state
@@ -681,15 +714,20 @@ async fn settled_early(
         })
 }
 
-/// Two operator mutations must serialize under the shared mutation guard.
+/// A bulk mark must serialize against the shared mutation guard.
 ///
-/// A bulk mark classifies against one observation and then awaits the queue.
-/// If a second mutation could interleave there, it would classify against a
-/// half-applied target set and the two would settle on different answers.
+/// A bulk mark classifies against one observation and then writes the derived
+/// state to every eligible row. If it could run while another mutation — an
+/// operator command, or the event reconciliation that revokes marks — held the
+/// guard, it would classify against a half-applied target set and the two would
+/// settle on different answers.
+///
+/// The guard is held directly here rather than through a queue effect: a mark
+/// is pure next-run intent and no longer touches `DynamicQueue` at all, so
+/// there is no queue mutation left inside it to park in.
 #[tokio::test(start_paused = true)]
-async fn a_second_bulk_mark_waits_for_the_in_flight_one_instead_of_interleaving() {
-    let queue = PausingQueue::new();
-    let wired = Wired::with_queue(&["a_eligible", "z_blocked"], queue.clone()).await;
+async fn a_bulk_mark_waits_for_the_shared_mutation_guard() {
+    let wired = Wired::new(&["a_eligible", "z_blocked"]).await;
     wired
         .observe(
             &["a_eligible", "z_blocked"],
@@ -699,62 +737,55 @@ async fn a_second_bulk_mark_waits_for_the_in_flight_one_instead_of_interleaving(
         )
         .await;
 
-    // The first mutation parks inside its queue effect, holding the guard.
-    let first = tokio::spawn({
-        let service = wired.service.clone();
-        async move { service.set_all_execution_marks(OperatorMode::Running).await }
-    });
-    queue.parked().await;
+    // Another mutation is in flight: the guard is held and not yet released.
+    let parallel = wired.service.parallel();
+    let in_flight = parallel.lock_mutations().await;
 
-    let mut second = tokio::spawn({
+    let mut bulk = tokio::spawn({
         let service = wired.service.clone();
-        async move { service.set_all_execution_marks(OperatorMode::Running).await }
+        async move { service.set_all_execution_marks().await }
     });
-    let raced = settled_early(&mut second, "Running mode accepts a bulk mark").await;
+    let raced = settled_early(&mut bulk, "Running mode accepts a bulk mark").await;
     assert!(
         raced.is_none(),
-        "the second mutation must wait for the in-flight one"
+        "the bulk mark must wait for the in-flight mutation"
+    );
+    assert!(
+        wired.marks.marked_ids().is_empty(),
+        "a waiting bulk mark must not have written anything yet"
     );
 
-    queue.release();
-    let first = first
-        .await
-        .unwrap()
-        .expect("Running mode accepts a bulk mark");
-    let second = second
+    drop(in_flight);
+
+    let settled = bulk
         .await
         .unwrap()
         .expect("Running mode accepts a bulk mark");
 
-    match first {
+    match settled {
         OperatorOutcome::BulkMarks {
             marked, excluded, ..
         } => {
-            assert!(marked);
-            assert_eq!(
-                excluded,
-                vec![(
-                    "z_blocked".to_string(),
-                    MarkExclusion::ParallelProposalAbsent
-                )],
-                "an ineligible row is excluded with no mode to turn the constraint off"
+            assert!(marked, "the observation had no marks, so the bulk marks");
+            assert!(
+                excluded.is_empty(),
+                "worktree eligibility no longer excludes a mark target: {excluded:?}"
             );
         }
-        other => panic!("the first mutation must complete in full: {other:?}"),
+        other => panic!("the bulk mark must complete in full: {other:?}"),
     }
-    // The second observed the settled state, so it unmarks what the first marked.
-    match second {
-        OperatorOutcome::BulkMarks { marked, .. } => assert!(
-            !marked,
-            "the second mutation classified against the first one's settled result"
-        ),
-        other => panic!("the second mutation must complete in full: {other:?}"),
-    }
-    assert!(
-        wired.marks.marked_ids().is_empty(),
-        "an ineligible row is never left marked"
+    assert_eq!(
+        {
+            let mut ids = wired.marks.marked_ids();
+            ids.sort();
+            ids
+        },
+        vec!["a_eligible".to_string(), "z_blocked".to_string()],
+        "every visible non-terminal row carries the derived mark"
     );
+    // The mark wrote no queue intent: an ineligible row is still not queued.
     assert_eq!(wired.status("z_blocked").await, "not queued");
+    assert_eq!(wired.status("a_eligible").await, "not queued");
 }
 
 #[tokio::test]
@@ -834,8 +865,13 @@ async fn preparing_projection_is_one_reducer_token_across_every_surface() {
         "stop remains expressible; the refusal is the queue's to make"
     );
     assert!(
-        !actions.set_execution_mark.allowed && !actions.set_queue_intent.allowed,
-        "an admitted change mutating its worktree is not mark- or queue-mutable"
+        !actions.set_queue_intent.allowed,
+        "an admitted change mutating its worktree is not queue-mutable"
+    );
+    assert!(
+        actions.set_execution_mark.allowed,
+        "but its next-run intent is still the operator's to state: {:?}",
+        actions.set_execution_mark
     );
     assert_eq!(
         actions.resolve_merge.blocked_reason,

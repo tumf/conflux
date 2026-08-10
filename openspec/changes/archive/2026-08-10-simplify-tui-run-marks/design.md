@@ -42,17 +42,9 @@ Admission is fail-before-effect:
 6. commit any required run intent and publish the accepted outcome;
 7. activate the prepared scheduler.
 
-Configured Start does not select ordinary-start versus retry solely from process mode. After the worktree fence, it classifies the coherent marked snapshot by target route:
+For ordinary Start, startable rows use the existing start route. In Error mode, retry considers marked retry-eligible error rows only and reports marked non-error or non-retryable rows as excluded. A worktree-ineligible marked row rejects the complete request; other currently non-startable statuses do not block runnable marked rows. Any rejection is effect-free.
 
-- retry-eligible recovery rows use the existing typed retry routes in Ready/Select, Stopped, and process-wide Error;
-- when at least one retry route exists, this invocation dispatches only those routes with explicit-retry semantics;
-- marked ordinary-start rows in that mixed request are reported as deferred and retain their marks for a later ordinary Start;
-- when no retry route exists, startable `not queued` rows use the existing ordinary Start route;
-- Running and Stopping continue to refuse configured Start.
-
-This priority prevents a run-wide `explicit_retry` flag from granting retry-only acceptance budget to fresh ordinary work. A worktree-ineligible marked row rejects the complete request; other currently non-startable statuses do not block runnable work but are reported with target-specific detail. Any rejection is effect-free.
-
-This preserves the existing atomic command boundary while removing mark/queue aliasing. It also closes the Ready/Select gap after a change-scoped `ProcessingError`: re-mark plus configured Start/F5 reaches the typed retry path even though Core correctly never entered process-wide Error. Unmarking after admission affects only a later run and cannot cancel work already admitted.
+This preserves the existing atomic command boundary while removing mark/queue aliasing. Unmarking after admission affects only a later run and cannot cancel work already admitted.
 
 ## Archive Boundary
 

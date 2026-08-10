@@ -53,7 +53,7 @@ In parallel mode, once the user explicitly queues a `NotQueued` change through a
 
 Configured start keys SHALL remain app-level orchestration controls and MUST NOT emit cursor-local `ResolveMerge` or move a cursor `MergeWait` row to `resolve pending`.
 
-At final admission, run control SHALL read one coherent mark snapshot. A worktree-ineligible marked target SHALL reject the complete request with target-specific diagnostics. Other currently non-startable statuses SHALL be excluded from that admission with target-specific diagnostics; if no runnable target remains, admission SHALL reject. Configured Start/F5 SHALL classify marked retry-eligible recovery rows from Ready/Select, Stopped, and process-wide Error rather than requiring process-wide Error mode. When retry and ordinary-start routes coexist, the invocation SHALL dispatch only retry routes with explicit-retry semantics, report ordinary rows as deferred, and preserve their marks for a later ordinary Start. When no retry route exists, ordinary startable rows SHALL use the existing Start route. Rejection MUST leave no partial queue, scheduler, retry-edge, or mode effect.
+At final admission, run control SHALL read one coherent mark snapshot. A worktree-ineligible marked target SHALL reject the complete request with target-specific diagnostics. Other currently non-startable statuses SHALL be excluded from that admission with target-specific diagnostics; if no runnable target remains, admission SHALL reject. Error-mode retry SHALL route only marked retry-eligible error targets and report other marked rows as excluded. Rejection MUST leave no partial queue, scheduler, retry-edge, or mode effect.
 
 #### Scenario: Queue and mark projections remain independent
 
@@ -68,23 +68,6 @@ At final admission, run control SHALL read one coherent mark snapshot. A worktre
 - **WHEN** the user toggles its execution mark
 - **THEN** only the process-local mark changes
 - **AND** no retry, resolve, or queue intent is created
-
-#### Scenario: Ready re-mark and F5 retries a change-scoped error
-
-- **GIVEN** `ProcessingError` moved change `alpha` to change-level `error`
-- **AND** Core later projects Ready/Select without entering process-wide Error
-- **AND** the operator re-marks `alpha`
-- **WHEN** the configured Start/F5 control reaches final admission
-- **THEN** `alpha` is routed through the existing typed retry path
-- **AND** retry dispatch does not depend on process-wide Error mode
-
-#### Scenario: Mixed recovery and ordinary marks preserve route semantics
-
-- **GIVEN** marked targets contain retry-eligible `alpha` and ordinary `not queued` `beta`
-- **WHEN** configured Start/F5 reaches final admission
-- **THEN** this invocation dispatches only `alpha` with explicit-retry semantics
-- **AND** `beta` is reported as deferred and remains marked
-- **AND** a later configured Start MAY admit `beta` through the ordinary Start route
 
 #### Scenario: Worktree-ineligible mark rejects atomically
 

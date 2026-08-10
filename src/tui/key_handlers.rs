@@ -800,10 +800,10 @@ pub(crate) async fn handle_modal_key(key: KeyEvent, ctx: &mut KeyEventContext<'_
 
 /// Handle the bulk execution-mark toggle (`x`) in the Changes view.
 ///
-/// Eligibility, mode constraints, and exclusion reporting are enforced in
-/// `AppState::toggle_all_marks`. In Running mode, queue commands
-/// (AddToQueue/RemoveFromQueue) are emitted for eligible NotQueued/Queued rows,
-/// matching single-row Space semantics.
+/// Target classification and exclusion reporting are enforced in
+/// `AppState::toggle_all_marks`, which writes next-run intent and nothing else:
+/// no queue command is emitted in any execution mode, matching single-row Space
+/// semantics.
 pub(crate) fn handle_bulk_toggle_key(app: &mut AppState) -> Vec<TuiCommand> {
     use crate::tui::types::ViewMode;
     if app.view_mode != ViewMode::Changes {
@@ -866,9 +866,9 @@ pub async fn handle_key_event(
             handle_cursor_movement(ctx.app, false);
         }
         (KeyCode::Char(' '), _) => {
-            if let Some(cmd) = ctx.app.toggle_selection() {
-                let _ = ctx.cmd_tx.send(cmd).await;
-            }
+            // Marks are process-local intent, so this emits no command at all:
+            // the pending mark write is drained through the shared store.
+            ctx.app.toggle_selection();
         }
         (KeyCode::Char('x'), _) => {
             for cmd in handle_bulk_toggle_key(ctx.app) {
@@ -948,7 +948,6 @@ mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
     use crate::tui::config::TuiConfig;
-    use crate::tui::events::LogLevel;
     use crate::tui::types::ViewMode;
     use crossterm::event::KeyCode;
     use std::sync::atomic::Ordering;
@@ -1816,8 +1815,14 @@ mod tests {
         app
     }
 
+    /// `x` marks every visible non-terminal row and emits nothing else.
+    ///
+    /// The active row is a target like any other: the mark it receives is
+    /// next-run intent, which the in-flight run neither owns nor answers. The
+    /// terminal row is skipped without a warning, because skipping a change
+    /// that has no next run refuses nothing.
     #[test]
-    fn bulk_toggle_key_surfaces_excluded_rows_with_reasons() {
+    fn bulk_toggle_key_marks_every_non_terminal_row_without_queue_effects() {
         let mut app = bulk_toggle_app(&[
             ("active", "applying", false),
             ("rejected", "rejected", false),
@@ -1826,45 +1831,47 @@ mod tests {
 
         let commands = handle_bulk_toggle_key(&mut app);
 
-        assert!(matches!(&commands[..], [TuiCommand::AddToQueue(id)] if id == "eligible"));
-        assert!(app.changes[2].selected);
-        assert!(!app.changes[0].selected);
-        assert!(!app.changes[1].selected);
-
-        let warning = app
-            .warning_message
-            .as_ref()
-            .expect("x must surface excluded rows in the Changes view");
         assert!(
-            warning.contains("2 excluded")
-                && warning.contains("in progress")
-                && warning.contains("rejected"),
-            "warning must explain the exclusions: {}",
-            warning
+            commands.is_empty(),
+            "a bulk mark emits no command: {commands:?}"
         );
-        assert!(app.logs.iter().any(|entry| entry.message == *warning));
+        assert!(app.changes[0].selected, "an active row is a mark target");
+        assert!(!app.changes[1].selected, "a terminal row is not");
+        assert!(app.changes[2].selected);
+
+        assert!(
+            app.warning_message.is_none(),
+            "a skipped terminal row is not a refusal: {:?}",
+            app.warning_message
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|entry| entry.message == "Toggled all: 2 marked change(s)"));
     }
 
+    /// Terminal rows only: nothing to mark, and nothing to say about it.
     #[test]
-    fn bulk_toggle_key_with_zero_eligible_targets_is_not_silent() {
+    fn bulk_toggle_key_with_only_terminal_rows_is_silent() {
         let mut app = bulk_toggle_app(&[
-            ("active", "applying", false),
+            ("archived", "archived", false),
             ("rejected", "rejected", true),
         ]);
 
         let commands = handle_bulk_toggle_key(&mut app);
 
         assert!(commands.is_empty());
-        assert!(!app.changes[0].selected);
-        assert!(app.changes[1].selected, "ineligible rows must not change");
-        assert!(app
-            .warning_message
-            .as_ref()
-            .is_some_and(|msg| msg.contains("no eligible changes")));
-        assert!(app
+        assert!(!app.changes[0].selected, "terminal rows must not change");
+        assert!(app.changes[1].selected, "terminal rows must not change");
+        assert!(
+            app.warning_message.is_none(),
+            "a terminal-only list refuses nothing: {:?}",
+            app.warning_message
+        );
+        assert!(!app
             .logs
             .iter()
-            .any(|entry| entry.level == LogLevel::Warn && entry.message.contains("no eligible")));
+            .any(|entry| entry.message.contains("Toggled all")));
     }
 
     #[test]
@@ -2732,12 +2739,20 @@ mod tests {
         assert_eq!(UnderlyingState::capture(&app), before);
     }
 
+    /// `x` reaches the shared bulk mark in every execution mode.
+    ///
+    /// Execution mode is absent from mark admission on purpose: a mark says
+    /// what the operator wants the *next* run to consider, and Stopping and
+    /// Error are exactly the states in which planning the next run matters
+    /// most.
     #[tokio::test]
-    async fn bulk_mark_key_applies_across_the_admitted_execution_modes() {
+    async fn bulk_mark_key_applies_in_every_execution_mode() {
         for mode in [
             AppExecutionMode::Select,
             AppExecutionMode::Running,
+            AppExecutionMode::Stopping,
             AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
         ] {
             let mut app = routing_app();
             app.execution_mode = mode;
@@ -2746,19 +2761,7 @@ mod tests {
 
             assert!(
                 app.changes[1].selected,
-                "{mode:?} must admit bulk mark for eligible rows"
-            );
-        }
-
-        for mode in [AppExecutionMode::Stopping, AppExecutionMode::Error] {
-            let mut app = routing_app();
-            app.execution_mode = mode;
-
-            route_key(&mut app, KeyCode::Char('x')).await;
-
-            assert!(
-                !app.changes[1].selected,
-                "{mode:?} must refuse bulk mark through the shared matrix"
+                "{mode:?} must admit bulk mark for a visible non-terminal row"
             );
         }
     }

@@ -700,12 +700,12 @@ impl OperatorApplication {
             OperatorIntent::CancelStop => self.apply_cancel_stop(mode).await,
             OperatorIntent::ForceStop => self.apply_force_stop(mode).await,
             OperatorIntent::SetExecutionMark { change_id, marked } => {
-                self.apply_mark(mode, &change_id, marked).await
+                self.apply_mark(&change_id, marked).await
             }
             OperatorIntent::SetQueueIntent { change_id, queued } => {
                 self.apply_queue_intent(&change_id, queued).await
             }
-            OperatorIntent::SetAllExecutionMarks => self.apply_bulk_marks(mode).await,
+            OperatorIntent::SetAllExecutionMarks => self.apply_bulk_marks().await,
             // Routed before the gate was taken.
             OperatorIntent::StopAndDequeue { .. } => {
                 unreachable!("a two-phase intent is routed through apply_stop_and_dequeue")
@@ -821,16 +821,11 @@ impl OperatorApplication {
         ApplicationResult::run(outcome, Some(revision))
     }
 
-    async fn apply_mark(
-        &self,
-        mode: OperatorMode,
-        change_id: &str,
-        marked: bool,
-    ) -> ApplicationResult {
+    async fn apply_mark(&self, change_id: &str, marked: bool) -> ApplicationResult {
         match self
             .run_control
             .operator()
-            .set_execution_mark(mode, change_id, marked)
+            .set_execution_mark(change_id, marked)
             .await
         {
             Ok(outcome) => self.publish_operator_outcome(outcome).await,
@@ -854,13 +849,8 @@ impl OperatorApplication {
         }
     }
 
-    async fn apply_bulk_marks(&self, mode: OperatorMode) -> ApplicationResult {
-        match self
-            .run_control
-            .operator()
-            .set_all_execution_marks(mode)
-            .await
-        {
+    async fn apply_bulk_marks(&self) -> ApplicationResult {
+        match self.run_control.operator().set_all_execution_marks().await {
             Ok(outcome) => self.publish_operator_outcome(outcome).await,
             Err(error) => ApplicationResult::failed(RunControlError::Operator(error)),
         }
@@ -910,6 +900,10 @@ fn run_outcome_event(outcome: &RunControlOutcome) -> Option<ExecutionEvent> {
             change_ids,
             explicit_retry,
             scheduler,
+            // Exclusions are operator-facing reporting on the command result,
+            // not run state: the authoritative event carries only what was
+            // actually dispatched.
+            excluded: _,
         } => Some(ExecutionEvent::OperatorCommandApplied {
             effect: OperatorCommandEffect::RunDispatched {
                 change_ids: change_ids.clone(),

@@ -512,6 +512,193 @@ mod spec_promotion_tests {
         assert!(result.contains("Existing"));
         assert!(result.contains("New"));
     }
+
+    /// A canonical spec that carries the same requirement header twice keeps
+    /// both copies in step: a single MODIFIED block replaces every occurrence.
+    ///
+    /// Without this, a duplicated legacy requirement would quietly survive its
+    /// own replacement and keep asserting the semantics the change removed.
+    #[test]
+    fn test_merge_spec_delta_modified_replaces_every_duplicate_occurrence() {
+        let canonical = concat!(
+            "# Spec\n\n",
+            "### Requirement: Duplicated\n\nLegacy semantics.\n\n",
+            "### Requirement: Unrelated\n\nUntouched.\n\n",
+            "### Requirement: Duplicated\n\nLegacy semantics.\n",
+        );
+        let delta =
+            "## MODIFIED Requirements\n\n### Requirement: Duplicated\n\nReplacement semantics.\n";
+
+        let (result, errors) = merge_spec_delta(canonical, delta);
+
+        assert!(
+            errors.is_empty(),
+            "duplicate targets must promote: {errors:?}"
+        );
+        assert!(
+            !result.contains("Legacy semantics"),
+            "no duplicate may preserve the replaced semantics:\n{result}"
+        );
+        assert_eq!(
+            result.matches("Replacement semantics").count(),
+            2,
+            "both duplicates must carry the replacement:\n{result}"
+        );
+        assert!(
+            result.contains("Untouched"),
+            "unrelated requirements survive"
+        );
+    }
+}
+
+// ─── Archive promotion: the execution-mark contract ──────────────────────────
+//
+// `simplify-tui-run-marks` replaces the canonical requirements that aliased
+// Space (and bulk `x`) to a stop request or a DynamicQueue mutation. What the
+// operator ends up with is the *promoted* spec, so that is what is asserted
+// here rather than the delta alone.
+
+#[cfg(test)]
+mod archive_promotion_mark_contract_tests {
+    use crate::openspec_cmd::promotion::{merge_spec_delta, split_spec};
+    use std::path::{Path, PathBuf};
+
+    const CHANGE_ID: &str = "simplify-tui-run-marks";
+
+    /// Legacy phrasings that alias Space or bulk `x` to a stop request or a
+    /// DynamicQueue mutation. None of them may survive promotion.
+    const LEGACY_SPACE_SEMANTICS: &[(&str, &str)] = &[
+        ("cli", "`Space` による単体停止要求のみ許可"),
+        (
+            "cli",
+            "ユーザーが queued change を Space キーで NotQueued に切り替える",
+        ),
+        (
+            "tui-architecture",
+            "`Space` 操作は単体停止要求として受け付けなければならない",
+        ),
+        (
+            "tui-architecture",
+            "Space queue operations MUST NOT modify DynamicQueue",
+        ),
+        (
+            "tui-state-management",
+            "実際に queue への追加/削除コマンドを発行しなければならない",
+        ),
+        ("tui-state-management", "TuiCommand::AddToQueue が発行され"),
+        (
+            "tui-state-management",
+            "TuiCommand::RemoveFromQueue が発行され",
+        ),
+    ];
+
+    fn repo_path(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    /// The capability spec as it reads once this change is archived.
+    ///
+    /// Before archive that is the delta promoted onto the canonical spec.
+    /// After archive the delta directory is gone and the canonical spec *is*
+    /// the promotion result, so the same assertions keep applying and the
+    /// guarantee outlives the change directory.
+    fn promoted_spec(capability: &str) -> String {
+        let canonical_path = repo_path(&format!("openspec/specs/{capability}/spec.md"));
+        let canonical = std::fs::read_to_string(&canonical_path).unwrap_or_else(|err| {
+            panic!(
+                "canonical spec `{}` must be readable: {err}",
+                canonical_path.display()
+            )
+        });
+
+        let delta_path = repo_path(&format!(
+            "openspec/changes/{CHANGE_ID}/specs/{capability}/spec.md"
+        ));
+        let Ok(delta) = std::fs::read_to_string(&delta_path) else {
+            return canonical;
+        };
+
+        let (promoted, errors) = merge_spec_delta(&canonical, &delta);
+        assert!(
+            errors.is_empty(),
+            "`{capability}` delta must promote cleanly: {errors:?}"
+        );
+        promoted
+    }
+
+    /// The promoted specs must not keep any requirement that still equates
+    /// Space or bulk `x` with stopping work or editing DynamicQueue.
+    #[test]
+    fn promoted_specs_retain_no_space_to_stop_or_queue_semantics() {
+        for capability in ["cli", "tui-architecture", "tui-state-management"] {
+            let promoted = promoted_spec(capability);
+            for (owner, legacy) in LEGACY_SPACE_SEMANTICS {
+                if *owner != capability {
+                    continue;
+                }
+                assert!(
+                    !promoted.contains(legacy),
+                    "promoted `{capability}` still asserts legacy Space semantics: {legacy}"
+                );
+            }
+        }
+    }
+
+    /// `tui-architecture` carries `Queue State Synchronization` twice. Both
+    /// copies must promote, or the surviving one would restore the very
+    /// Space-to-DynamicQueue rule this change removes.
+    #[test]
+    fn promoted_duplicate_queue_state_synchronization_carries_the_new_contract() {
+        let promoted = promoted_spec("tui-architecture");
+        let (_, blocks) = split_spec(&promoted);
+
+        let duplicates: Vec<&(String, String)> = blocks
+            .iter()
+            .filter(|(key, _)| key == "Queue State Synchronization")
+            .collect();
+
+        assert!(
+            !duplicates.is_empty(),
+            "`Queue State Synchronization` must survive promotion"
+        );
+        for (index, (_, block)) in duplicates.iter().enumerate() {
+            assert!(
+                block.contains("MUST NOT modify DynamicQueue, reducer queue intent"),
+                "duplicate #{index} must carry the pure-mark contract:\n{block}"
+            );
+            assert!(
+                !block.contains("Space queue operations MUST NOT modify DynamicQueue"),
+                "duplicate #{index} must not retain the legacy Space-to-queue rule:\n{block}"
+            );
+        }
+    }
+
+    /// The retained guarantees that live alongside the replaced Space rules
+    /// must not be lost in the rewrite.
+    #[test]
+    fn promoted_specs_preserve_the_unrelated_guarantees() {
+        let cli = promoted_spec("cli");
+        assert!(
+            cli.contains("explicit DynamicQueue add/remove services"),
+            "the explicit queue-service guarantee must survive"
+        );
+        assert!(
+            cli.contains("queue_status と選択状態は変更されない"),
+            "the `@` no-op guarantee must survive"
+        );
+
+        let architecture = promoted_spec("tui-architecture");
+        for retained in [
+            "resolve pending",
+            "MUST NOT regress it to `not queued`",
+            "MUST NOT emit cursor-local `ResolveMerge`",
+        ] {
+            assert!(
+                architecture.contains(retained),
+                "`tui-architecture` must retain: {retained}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

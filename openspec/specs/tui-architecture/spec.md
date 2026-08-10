@@ -126,71 +126,114 @@ Remote TUI mode (`--server`) is excluded from local-work cancellation semantics:
 - **AND** the TUI does not send an implicit stop or force-stop command to the remote server
 
 ### Requirement: Dynamic Queue Management
-The system SHALL provide the ability to dynamically add and remove changes to/from the queue during execution.
+
+The system SHALL provide explicit services for dynamically adding and removing changes to/from the queue during execution.
 
 DynamicQueue SHALL support the following operations:
 - `push(id)`: Add a change ID to the queue (with duplicate check)
 - `pop()`: Retrieve the next change ID from the queue
 - `remove(id)`: Remove a specified change ID from the queue
 
-#### Scenario: Add to queue during execution
-- **WHEN** the user selects a change with the Space key in Running mode
-- **THEN** the change ID is added to DynamicQueue and will be executed in the next processing cycle
+Execution-mark mutation through Space or bulk `x` SHALL NOT implicitly call these operations. A mark expresses future run-target intent; it does not add, remove, stop, dequeue, or reschedule work in the active run.
 
-#### Scenario: Remove from queue during execution
-- **WHEN** the user changes a [x] change to [ ] with the Space key in Running mode
-- **THEN** the corresponding change ID is removed from DynamicQueue and will not be executed
+#### Scenario: Marking during execution does not add to DynamicQueue
+
+- **GIVEN** a run is active
+- **AND** a visible non-terminal change is not marked
+- **WHEN** the user marks the change with Space or bulk `x`
+- **THEN** its execution mark becomes true
+- **AND** no DynamicQueue `push` occurs
+- **AND** no scheduler wake or run dispatch occurs
+
+#### Scenario: Unmarking during execution does not remove admitted work
+
+- **GIVEN** a change is already queued or active in the current run
+- **AND** the change carries an execution mark
+- **WHEN** the user unmarks it with Space or bulk `x`
+- **THEN** its execution mark becomes false
+- **AND** no DynamicQueue `remove`, cancellation, stop, or dequeue request occurs
+- **AND** current-run execution continues unchanged
 
 #### Scenario: Prevent duplicate additions
-- **WHEN** attempting to add a change ID that already exists in the queue
-- **THEN** the addition is rejected and the queue state remains unchanged
+
+- **WHEN** an explicit queue service attempts to add an ID that already exists
+- **THEN** the addition is rejected and queue state remains unchanged
+- **AND** execution-mark state remains unchanged
 
 #### Scenario: Remove non-existent ID
-- **WHEN** attempting to remove a change ID that does not exist in the queue
-- **THEN** no error occurs and the queue state remains unchanged
+
+- **WHEN** an explicit queue service attempts to remove an ID that does not exist
+- **THEN** no error occurs and queue state remains unchanged
+- **AND** execution-mark state remains unchanged
 
 ### Requirement: Queue State Synchronization
 
-The system SHALL always synchronize the queue state displayed in the UI with the DynamicQueue state.
+The system SHALL synchronize displayed queue state with DynamicQueue and reducer queue intent independently from execution marks.
 
-`ResolveWait` is a state waiting for scheduler-owned resolve retry work, and Space queue operations MUST NOT modify DynamicQueue. `MergeWait` similarly MUST NOT be a target for normal queue operations.
+Space and bulk `x` SHALL toggle only process-local execution marks for visible non-terminal rows and MUST NOT modify DynamicQueue, reducer queue intent, retry/resolve intent, active execution, cancellation, or process mode. Queue status MUST NOT synthesize an execution mark, and mark state MUST NOT synthesize queue status.
 
-However, for `ResolveWait`/`MergeWait` rows, the following SHALL be satisfied:
-- Space operation SHALL toggle only the execution mark (`selected`) and MUST NOT modify `queue_status` or DynamicQueue.
-- @ operation SHALL be ignored and MUST NOT modify any state.
+`ResolveWait` is scheduler-owned resolve retry work and `MergeWait` is merge-resolution work. Space on either row SHALL toggle only the execution mark and MUST NOT modify `queue_status` or DynamicQueue. `@` SHALL remain ignored. The TUI MUST continue to display `ResolveWait` as `resolve pending`.
 
-The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is scheduler-owned retry work and not normal queue work.
+In parallel mode, once the user explicitly queues a `NotQueued` change through admitted orchestration, refresh-derived reconciliation MUST preserve the queued display state until execution starts, startup is explicitly rejected, or an explicit dequeue occurs. Auto-refresh, reducer synchronization, and eligibility reconciliation MUST NOT regress it to `not queued` before backend analysis or dispatch.
 
-In parallel mode, once the user explicitly queues a `NotQueued` change for execution (for example via the configured start key after marking it), refresh-derived state reconciliation MUST preserve the queued display state until one of the following occurs:
-- execution for that change actually starts,
-- the backend explicitly rejects startup for that change, or
-- the user explicitly dequeues the change.
+Configured start keys SHALL remain app-level orchestration controls and MUST NOT emit cursor-local `ResolveMerge` or move a cursor `MergeWait` row to `resolve pending`.
 
-Auto-refresh, reducer display synchronization, and eligibility reconciliation MUST NOT regress such a queued row back to `not queued` before backend analysis/dispatch begins.
+At final admission, run control SHALL read one coherent mark snapshot. A worktree-ineligible marked target SHALL reject the complete request with target-specific diagnostics. Other currently non-startable statuses SHALL be excluded from that admission with target-specific diagnostics; if no runnable target remains, admission SHALL reject. Error-mode retry SHALL route only marked retry-eligible error targets and report other marked rows as excluded. Rejection MUST leave no partial queue, scheduler, retry-edge, or mode effect.
 
-The configured start keybindings SHALL be treated as app-level orchestration control and MUST NOT perform cursor-local merge resolve actions. A cursor row in `MergeWait` MUST NOT cause any configured start key to emit `ResolveMerge` or transition that row to `resolve pending`.
+#### Scenario: Queue and mark projections remain independent
 
-<!-- Expected canonical result after archive: `tui-architecture` will generalize the historical F5-specific orchestration control rule to all configured start keybindings. -->
+- **GIVEN** a change is reducer-visible as `queued` but is not execution-marked
+- **WHEN** frontend state is synchronized
+- **THEN** the row remains queued and unmarked
+- **AND** neither projection overwrites the other
+
+#### Scenario: Marking wait and error rows has no workflow side effect
+
+- **GIVEN** a visible non-terminal row is in error, merge wait, resolve pending, or another non-active wait state
+- **WHEN** the user toggles its execution mark
+- **THEN** only the process-local mark changes
+- **AND** no retry, resolve, or queue intent is created
+
+#### Scenario: Worktree-ineligible mark rejects atomically
+
+- **GIVEN** marked targets include a worktree-ineligible change
+- **WHEN** the configured start control reaches final admission
+- **THEN** the complete request is rejected
+- **AND** no scheduler, queue, retry-edge, or mode effect survives
+- **AND** the diagnostic identifies that target and reason
+
+#### Scenario: Non-startable status is excluded without blocking runnable work
+
+- **GIVEN** marked targets include one runnable change and one currently non-startable status
+- **AND** neither target violates the worktree eligibility fence
+- **WHEN** Start reaches final admission
+- **THEN** the runnable change is admitted
+- **AND** the other target is excluded with target-specific diagnostic detail
+
+#### Scenario: No runnable target rejects
+
+- **GIVEN** every marked target is currently non-startable
+- **WHEN** Start reaches final admission
+- **THEN** admission is rejected before queue or scheduler effects
+- **AND** the diagnostics identify the exclusions
 
 #### Scenario: Configured start key on MergeWait does not resolve cursor row
 
-- **GIVEN** the TUI cursor is on change `alpha`
-- **AND** `alpha` is in `MergeWait`
-- **AND** change `beta` is marked runnable work in `NotQueued`
-- **AND** the resolved TUI start keybindings include `r`
-- **WHEN** the user presses `r`
+- **GIVEN** cursor change `alpha` is in `MergeWait`
+- **AND** change `beta` is marked runnable work
+- **WHEN** a configured start key is pressed
 - **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
-- **AND** `alpha` SHALL NOT transition to `resolve pending` because of the configured start key
-- **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work such as `beta`
+- **AND** normal orchestration MAY admit `beta`
 
 #### Scenario: Default start keys remain app-level controls
 
-- **GIVEN** no TUI config override exists
-- **AND** the default resolved TUI start keybindings are `F5` and `!`
-- **AND** the TUI cursor is on change `alpha` in `MergeWait`
+- **GIVEN** default start keys are `F5` and `!`
+- **AND** the cursor is on a `MergeWait` row
 - **WHEN** the user presses `F5` or `!`
-- **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
-- **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work
+- **THEN** the TUI SHALL NOT emit cursor-local `ResolveMerge`
+- **AND** normal orchestration MAY proceed for marked runnable work
+
+<!-- Expected canonical result after archive: both historical duplicate `Queue State Synchronization` requirements will converge to this complete contract; archive validation must leave no duplicate legacy Space-to-queue semantics. -->
 
 ### Requirement: Event-Driven State Updates
 
@@ -360,18 +403,20 @@ In auto-refresh processing, if 0/0 is returned from the active location, the arc
 - **AND** if still 0/0, the existing progress value is retained
 
 ### Requirement: Active Change Input Lockout
-`queue_status.is_active()` が true の change では、`@` 操作を受け付けてはならない（MUST NOT）。
-`Space` 操作は単体停止要求として受け付けなければならない（SHALL）。`Space` 操作は即時に `selected`/`queue_status` を変更してはならず（SHALL NOT）、停止完了イベントを受信した時点で `selected=false` と `not queued` に遷移させなければならない（SHALL）。
 
-#### Scenario: active change を Space で単体停止する
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on a change with `queue_status.is_active() == true`
+`queue_status.is_active()` が true の change では、`@` 操作を受け付けてはならない（MUST NOT）。Space は active change でも process-local execution mark のみを変更し、停止要求、cancellation、queue mutation、または即時 `queue_status` 変更を発行してはならない（MUST NOT）。Per-change termination は独立した `K: kill` control を使用しなければならない（SHALL）。
+
+#### Scenario: active change の Space は mark のみ変更する
+
+- **GIVEN** the TUI is in Running mode
+- **AND** cursor change has `queue_status.is_active() == true`
 - **WHEN** the user presses Space
-- **THEN** a stop request for that change is issued
-- **AND** the change remains in its active queue_status until stop completion
-- **AND** after `ChangeStopped` is processed, the change becomes `not queued` and `selected` is cleared
+- **THEN** only its process-local execution mark toggles
+- **AND** no stop, cancellation, dequeue, or queue-status mutation occurs
+- **AND** current active work continues
 
 #### Scenario: active change で @ 操作は無効
+
 - **GIVEN** the TUI is in running mode
 - **AND** the cursor is on a change with `queue_status.is_active() == true`
 - **WHEN** the user presses `@`
@@ -454,23 +499,35 @@ If no resolve/base-mutating operation is active and retry preconditions are clea
 
 ### Requirement: Bulk Execution Mark Toggle
 
-Changes ビューは、実行マーク可能な change を対象に、全マーク/全アンマークを1操作で切り替えられなければならない（SHALL）。
+Changes ビューは、表示中の non-terminal change を対象に、全マーク/全アンマークを1操作で切り替えられなければならない（SHALL）。
 
-この操作は Select/Stopped モードでのみ有効で、Running/Stopping/Error では無効でなければならない（SHALL）。
+この操作は Select、Running、Stopping、Stopped、および Error の全 execution mode で有効でなければならない（SHALL）。warning popup、confirmation、QR、またはその他の overlay が input を所有する場合は overlay がキーを消費し、Changes view の bulk mark を実行してはならない（MUST NOT）。
 
-トグル対象に未マークが1件でも存在する場合は対象を全てマークし、対象が全てマーク済みの場合は全てアンマークしなければならない（SHALL）。
+トグル対象に未マークが1件でも存在する場合は対象を全てマークし、対象が全てマーク済みの場合は全てアンマークしなければならない（SHALL）。bulk mark は execution mark のみを変更し、DynamicQueue、reducer queue intent、retry、resolve、cancellation、scheduler、hook、または process mode を変更してはならない（MUST NOT）。Archived、merged、pushed、および rejected rows は対象外でなければならない（SHALL）。
 
-#### Scenario: 未マークが残っている場合は全マークする
-- **GIVEN** the TUI is in select mode
-- **AND** at least one eligible change is not marked
+#### Scenario: 全 execution mode で未マークを全マークする
+
+- **GIVEN** the TUI is in Select, Running, Stopping, Stopped, or Error mode
+- **AND** at least one visible non-terminal change is not marked
 - **WHEN** the user triggers the bulk toggle
-- **THEN** all eligible changes SHALL be marked
+- **THEN** all visible non-terminal changes SHALL be marked
+- **AND** no queue or runtime side effect occurs
 
 #### Scenario: すべてマーク済みの場合は全アンマークする
-- **GIVEN** the TUI is in stopped mode
-- **AND** all eligible changes are marked
+
+- **GIVEN** all visible non-terminal changes are marked
+- **WHEN** the user triggers the bulk toggle in any execution mode
+- **THEN** all visible non-terminal changes SHALL be unmarked
+- **AND** work already admitted to the current run remains unchanged
+
+#### Scenario: terminal row は bulk 対象外
+
+- **GIVEN** visible rows include archived, merged, pushed, or rejected changes
 - **WHEN** the user triggers the bulk toggle
-- **THEN** all eligible changes SHALL be unmarked
+- **THEN** terminal rows are excluded without a mark refusal warning
+- **AND** every visible non-terminal row receives the common target mark state
+
+<!-- Expected canonical result after archive: `tui-architecture` will separate execution marks from DynamicQueue, replace active Space stop with K, and converge duplicate synchronization requirements without dropping resolve or queued-display guarantees. -->
 
 ### Requirement: リモートデータソース対応
 TUI は `--server` が指定された場合、ローカルの共有状態ではなくリモート API をデータソースとして使用しなければならない（MUST）。
@@ -648,46 +705,72 @@ Running mode は、auto-refresh により新規 active change が検出され `n
 
 ### Requirement: Queue State Synchronization
 
-The system SHALL always synchronize the queue state displayed in the UI with the DynamicQueue state.
+The system SHALL synchronize displayed queue state with DynamicQueue and reducer queue intent independently from execution marks.
 
-`ResolveWait` is a state waiting for scheduler-owned resolve retry work, and Space queue operations MUST NOT modify DynamicQueue. `MergeWait` similarly MUST NOT be a target for normal queue operations.
+Space and bulk `x` SHALL toggle only process-local execution marks for visible non-terminal rows and MUST NOT modify DynamicQueue, reducer queue intent, retry/resolve intent, active execution, cancellation, or process mode. Queue status MUST NOT synthesize an execution mark, and mark state MUST NOT synthesize queue status.
 
-However, for `ResolveWait`/`MergeWait` rows, the following SHALL be satisfied:
-- Space operation SHALL toggle only the execution mark (`selected`) and MUST NOT modify `queue_status` or DynamicQueue.
-- @ operation SHALL be ignored and MUST NOT modify any state.
+`ResolveWait` is scheduler-owned resolve retry work and `MergeWait` is merge-resolution work. Space on either row SHALL toggle only the execution mark and MUST NOT modify `queue_status` or DynamicQueue. `@` SHALL remain ignored. The TUI MUST continue to display `ResolveWait` as `resolve pending`.
 
-The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is scheduler-owned retry work and not normal queue work.
+In parallel mode, once the user explicitly queues a `NotQueued` change through admitted orchestration, refresh-derived reconciliation MUST preserve the queued display state until execution starts, startup is explicitly rejected, or an explicit dequeue occurs. Auto-refresh, reducer synchronization, and eligibility reconciliation MUST NOT regress it to `not queued` before backend analysis or dispatch.
 
-In parallel mode, once the user explicitly queues a `NotQueued` change for execution (for example via the configured start key after marking it), refresh-derived state reconciliation MUST preserve the queued display state until one of the following occurs:
-- execution for that change actually starts,
-- the backend explicitly rejects startup for that change, or
-- the user explicitly dequeues the change.
+Configured start keys SHALL remain app-level orchestration controls and MUST NOT emit cursor-local `ResolveMerge` or move a cursor `MergeWait` row to `resolve pending`.
 
-Auto-refresh, reducer display synchronization, and eligibility reconciliation MUST NOT regress such a queued row back to `not queued` before backend analysis/dispatch begins.
+At final admission, run control SHALL read one coherent mark snapshot. A worktree-ineligible marked target SHALL reject the complete request with target-specific diagnostics. Other currently non-startable statuses SHALL be excluded from that admission with target-specific diagnostics; if no runnable target remains, admission SHALL reject. Error-mode retry SHALL route only marked retry-eligible error targets and report other marked rows as excluded. Rejection MUST leave no partial queue, scheduler, retry-edge, or mode effect.
 
-The configured start keybindings SHALL be treated as app-level orchestration control and MUST NOT perform cursor-local merge resolve actions. A cursor row in `MergeWait` MUST NOT cause any configured start key to emit `ResolveMerge` or transition that row to `resolve pending`.
+#### Scenario: Queue and mark projections remain independent
 
-<!-- Expected canonical result after archive: `tui-architecture` will generalize the historical F5-specific orchestration control rule to all configured start keybindings. -->
+- **GIVEN** a change is reducer-visible as `queued` but is not execution-marked
+- **WHEN** frontend state is synchronized
+- **THEN** the row remains queued and unmarked
+- **AND** neither projection overwrites the other
+
+#### Scenario: Marking wait and error rows has no workflow side effect
+
+- **GIVEN** a visible non-terminal row is in error, merge wait, resolve pending, or another non-active wait state
+- **WHEN** the user toggles its execution mark
+- **THEN** only the process-local mark changes
+- **AND** no retry, resolve, or queue intent is created
+
+#### Scenario: Worktree-ineligible mark rejects atomically
+
+- **GIVEN** marked targets include a worktree-ineligible change
+- **WHEN** the configured start control reaches final admission
+- **THEN** the complete request is rejected
+- **AND** no scheduler, queue, retry-edge, or mode effect survives
+- **AND** the diagnostic identifies that target and reason
+
+#### Scenario: Non-startable status is excluded without blocking runnable work
+
+- **GIVEN** marked targets include one runnable change and one currently non-startable status
+- **AND** neither target violates the worktree eligibility fence
+- **WHEN** Start reaches final admission
+- **THEN** the runnable change is admitted
+- **AND** the other target is excluded with target-specific diagnostic detail
+
+#### Scenario: No runnable target rejects
+
+- **GIVEN** every marked target is currently non-startable
+- **WHEN** Start reaches final admission
+- **THEN** admission is rejected before queue or scheduler effects
+- **AND** the diagnostics identify the exclusions
 
 #### Scenario: Configured start key on MergeWait does not resolve cursor row
 
-- **GIVEN** the TUI cursor is on change `alpha`
-- **AND** `alpha` is in `MergeWait`
-- **AND** change `beta` is marked runnable work in `NotQueued`
-- **AND** the resolved TUI start keybindings include `r`
-- **WHEN** the user presses `r`
+- **GIVEN** cursor change `alpha` is in `MergeWait`
+- **AND** change `beta` is marked runnable work
+- **WHEN** a configured start key is pressed
 - **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
-- **AND** `alpha` SHALL NOT transition to `resolve pending` because of the configured start key
-- **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work such as `beta`
+- **AND** normal orchestration MAY admit `beta`
 
 #### Scenario: Default start keys remain app-level controls
 
-- **GIVEN** no TUI config override exists
-- **AND** the default resolved TUI start keybindings are `F5` and `!`
-- **AND** the TUI cursor is on change `alpha` in `MergeWait`
+- **GIVEN** default start keys are `F5` and `!`
+- **AND** the cursor is on a `MergeWait` row
 - **WHEN** the user presses `F5` or `!`
-- **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
-- **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work
+- **THEN** the TUI SHALL NOT emit cursor-local `ResolveMerge`
+- **AND** normal orchestration MAY proceed for marked runnable work
+
+<!-- Expected canonical result after archive: both historical duplicate `Queue State Synchronization` requirements will converge to this complete contract; archive validation must leave no duplicate legacy Space-to-queue semantics. -->
 
 ### Requirement: Local TUI header reports workspace dirty state
 

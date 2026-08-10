@@ -18,8 +18,8 @@ use tokio::sync::broadcast;
 
 use crate::events::{ExecutionEvent, LogEntry};
 use crate::orchestration::operator_command::{
-    classify_mark_route, classify_retry_route, is_active_status, is_final_status, MarkExclusion,
-    MarkRoute, OperatorMode, RetryRoute,
+    classify_queue_intent_route, classify_retry_route, is_active_status, is_final_status,
+    is_markable_status, MarkExclusion, OperatorMode, QueueIntentRoute, RetryRoute,
 };
 use crate::orchestration::state::BlockerKind;
 use crate::web::state::OrchestratorStateSnapshot;
@@ -621,17 +621,20 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
 /// change, but advertising "resolve" on a change that is not waiting on a merge
 /// describes an operation nobody asked for.
 ///
-/// `parallel_eligible` gates the mark actions the same way
-/// [`crate::orchestration::operator_command::classify_bulk_mark_row`] gates a
-/// bulk mutation: a row worktree execution would refuse to start must not be
-/// advertised as markable, or a client would mark it and then watch start
-/// refuse the whole set.
+/// `set_execution_mark` is deliberately *not* gated by mode, activity, worktree
+/// eligibility, or the Apply-iteration limit: a mark is pure next-run target
+/// intent, and whether that run may actually start is decided at final start /
+/// retry admission. Only a terminal row — archived, merged, pushed, rejected —
+/// is reported as non-markable, because it is no longer a run candidate.
+///
+/// `parallel_eligible` still gates the explicit queue command, which really does
+/// mutate current-run membership.
 ///
 /// `apply_iteration_limit_active` is the process-local admission gate: the
 /// snapshot builder sets it only when typed iteration-limit evidence exists and
 /// the owning command-capable scheduler task is still live. It blocks retry and
-/// both mark actions, because in Running mode a mark for an `error` row *is* the
-/// terminal-error queue alias the same guard refuses.
+/// the explicit queue command for a terminal-error row, because that request
+/// routes through the same `RetryError` edge.
 fn classify_actions(
     mode: OperatorMode,
     display_status: &str,
@@ -640,7 +643,7 @@ fn classify_actions(
     apply_iteration_limit_active: bool,
 ) -> ChangeActions {
     let final_status = is_final_status(display_status);
-    let route = classify_mark_route(mode, display_status);
+    let route = classify_queue_intent_route(mode, display_status);
 
     // Only a terminal-error row can route through `RetryError`, so only that row
     // carries the gate. Anything else with a retained record is describing a
@@ -656,33 +659,34 @@ fn classify_actions(
         ActionBlockedReason::StatusImmutable
     };
 
-    // Precedence matches `classify_bulk_mark_row`: a final status is reported as
-    // final rather than as an eligibility problem, because committing the change
-    // would not make it markable again.
     let parallel_blocked = !parallel_eligible && !final_status;
     let parallel_reason =
         ActionBlockedReason::from_mark_exclusion(MarkExclusion::ParallelIneligible);
 
-    let set_execution_mark = match route {
-        _ if limit_blocked => ActionEligibility::blocked(limit_reason),
-        _ if parallel_blocked => ActionEligibility::blocked(parallel_reason),
-        MarkRoute::MarkOnly | MarkRoute::QueueIntent => ActionEligibility::allowed(),
-        MarkRoute::RetryRequired => ActionEligibility::blocked(ActionBlockedReason::RetryRequired),
-        MarkRoute::Immutable => ActionEligibility::blocked(immutable_reason),
+    let set_execution_mark = if is_markable_status(display_status) {
+        ActionEligibility::allowed()
+    } else {
+        ActionEligibility::blocked(ActionBlockedReason::FinalStatus)
     };
 
     let set_queue_intent = match route {
         _ if limit_blocked => ActionEligibility::blocked(limit_reason),
         _ if parallel_blocked => ActionEligibility::blocked(parallel_reason),
-        MarkRoute::QueueIntent => ActionEligibility::allowed(),
+        QueueIntentRoute::Mutable => ActionEligibility::allowed(),
         // Select and Stopped have no runtime queue to mutate; a base-lane wait in
         // Running has one but refuses membership changes.
-        MarkRoute::MarkOnly if matches!(mode, OperatorMode::Select | OperatorMode::Stopped) => {
+        QueueIntentRoute::NoQueueEffect
+            if matches!(mode, OperatorMode::Select | OperatorMode::Stopped) =>
+        {
             ActionEligibility::blocked(ActionBlockedReason::ModeHasNoQueue)
         }
-        MarkRoute::MarkOnly => ActionEligibility::blocked(ActionBlockedReason::StatusImmutable),
-        MarkRoute::RetryRequired => ActionEligibility::blocked(ActionBlockedReason::RetryRequired),
-        MarkRoute::Immutable => ActionEligibility::blocked(immutable_reason),
+        QueueIntentRoute::NoQueueEffect => {
+            ActionEligibility::blocked(ActionBlockedReason::StatusImmutable)
+        }
+        QueueIntentRoute::RetryRequired => {
+            ActionEligibility::blocked(ActionBlockedReason::RetryRequired)
+        }
+        QueueIntentRoute::Immutable => ActionEligibility::blocked(immutable_reason),
     };
 
     let retry_change = if limit_blocked {

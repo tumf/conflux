@@ -105,11 +105,19 @@ enum CancellationBehavior {
 }
 
 /// In-memory queue double for unit-scoped service tests.
+///
+/// Every port call is recorded, not just the ones that change `contents`. A
+/// mark-only assertion needs to prove a call never *happened*, and a double
+/// that only tracked resulting state could not tell a refused call from an
+/// absent one.
 struct FakeQueue {
     contents: StdMutex<Vec<String>>,
     cancellation: CancellationBehavior,
     notified: StdMutex<usize>,
     explicit_retries: StdMutex<Vec<String>>,
+    added: StdMutex<Vec<String>>,
+    removed: StdMutex<Vec<String>>,
+    cancellations: StdMutex<Vec<String>>,
 }
 
 impl FakeQueue {
@@ -119,6 +127,9 @@ impl FakeQueue {
             cancellation,
             notified: StdMutex::new(0),
             explicit_retries: StdMutex::new(Vec::new()),
+            added: StdMutex::new(Vec::new()),
+            removed: StdMutex::new(Vec::new()),
+            cancellations: StdMutex::new(Vec::new()),
         }
     }
 
@@ -133,6 +144,10 @@ impl FakeQueue {
 #[async_trait]
 impl QueuePort for FakeQueue {
     async fn add(&self, change_id: &str) -> bool {
+        self.added
+            .lock()
+            .expect("added lock")
+            .push(change_id.to_string());
         let mut contents = self.contents.lock().expect("contents lock");
         if contents.iter().any(|id| id == change_id) {
             return false;
@@ -142,6 +157,10 @@ impl QueuePort for FakeQueue {
     }
 
     async fn remove(&self, change_id: &str) -> bool {
+        self.removed
+            .lock()
+            .expect("removed lock")
+            .push(change_id.to_string());
         let mut contents = self.contents.lock().expect("contents lock");
         let before = contents.len();
         contents.retain(|id| id != change_id);
@@ -152,6 +171,10 @@ impl QueuePort for FakeQueue {
         &self,
         _change_id: &str,
     ) -> std::result::Result<Option<TerminationWaiter>, String> {
+        self.cancellations
+            .lock()
+            .expect("cancellations lock")
+            .push(_change_id.to_string());
         match &self.cancellation {
             CancellationBehavior::ConfirmedImmediately => {
                 Ok(Some(TerminationWaiter::already_terminated()))
@@ -258,84 +281,99 @@ fn dynamic_queue_fixture(
 // Task 1 / Task 5: lifecycle matrix and state-axis separation (unit)
 // ============================================================================
 
+/// Every operator-facing execution mode.
+const ALL_MODES: [OperatorMode; 5] = [
+    OperatorMode::Select,
+    OperatorMode::Running,
+    OperatorMode::Stopping,
+    OperatorMode::Stopped,
+    OperatorMode::Error,
+];
+
+/// Non-terminal display statuses spanning idle, queued, active, error, and wait.
+const NON_TERMINAL_STATUSES: [&str; 12] = [
+    "not queued",
+    "queued",
+    "preparing",
+    "applying",
+    "accepting",
+    "rejecting",
+    "archiving",
+    "resolving",
+    "error",
+    "stalled",
+    "merge wait",
+    "resolve pending",
+];
+
+/// The rows that are no longer run candidates.
+const TERMINAL_STATUSES: [&str; 4] = ["archived", "merged", "pushed", "rejected"];
+
+/// Unit: mark admission is decided by terminality alone.
+///
+/// Asserted over the whole mode axis so no mode can grow a private rule: the
+/// classifier does not take a mode at all, and this proves the vocabulary it
+/// exposes agrees with that for every status class.
 #[test]
-fn operator_command_mark_route_matrix_matches_mode_and_status() {
-    // Select mode: marks are pure operator intent.
-    assert_eq!(
-        classify_mark_route(OperatorMode::Select, "not queued"),
-        MarkRoute::MarkOnly
-    );
-    assert_eq!(
-        classify_mark_route(OperatorMode::Select, "applying"),
-        MarkRoute::MarkOnly
-    );
-
-    // Stopped mode: mark-only for resumable rows.
-    for status in ["not queued", "error", "merge wait", "resolve pending"] {
+fn run_mark_intent_admission_depends_only_on_terminality() {
+    for status in NON_TERMINAL_STATUSES {
         assert_eq!(
-            classify_mark_route(OperatorMode::Stopped, status),
-            MarkRoute::MarkOnly,
-            "stopped mode must mutate marks for '{status}'"
+            classify_mark_admission(status),
+            MarkAdmission::Allowed,
+            "'{status}' is a visible non-terminal mark target"
         );
+        assert!(is_markable_status(status));
     }
-    assert_eq!(
-        classify_mark_route(OperatorMode::Stopped, "applying"),
-        MarkRoute::Immutable
-    );
+    for status in TERMINAL_STATUSES {
+        assert_eq!(
+            classify_mark_admission(status),
+            MarkAdmission::TerminalTarget,
+            "'{status}' is not a run candidate"
+        );
+        assert!(!is_markable_status(status));
+    }
+}
 
-    // Running mode: ordinary rows use queue intent.
+/// Unit: the explicit queue matrix still exists, and it is a *different*
+/// function from mark admission. That separation is the whole change: a mode
+/// that refuses queue mutation must still accept mark intent.
+#[test]
+fn run_mark_intent_queue_route_matrix_is_independent_of_mark_admission() {
     for status in ["not queued", "queued", "error"] {
         assert_eq!(
-            classify_mark_route(OperatorMode::Running, status),
-            MarkRoute::QueueIntent,
-            "running mode must use queue intent for '{status}'"
+            classify_queue_intent_route(OperatorMode::Running, status),
+            QueueIntentRoute::Mutable
         );
+        assert!(is_markable_status(status), "'{status}' stays markable");
     }
-    // Running mode: base-lane waits are mark-only.
-    for status in ["merge wait", "resolve pending"] {
-        assert_eq!(
-            classify_mark_route(OperatorMode::Running, status),
-            MarkRoute::MarkOnly,
-            "running mode must allow mark-only mutation for '{status}'"
-        );
-    }
-    // Running mode: active rows are stopped through stop-and-dequeue.
-    for status in [
-        "applying",
-        "accepting",
-        "rejecting",
-        "archiving",
-        "resolving",
-    ] {
-        assert_eq!(
-            classify_mark_route(OperatorMode::Running, status),
-            MarkRoute::Immutable,
-            "active row '{status}' must not be mutated by marks"
-        );
-    }
-
-    // Error mode always requires an explicit retry command.
     for status in ["not queued", "queued", "error", "stalled", "merge wait"] {
         assert_eq!(
-            classify_mark_route(OperatorMode::Error, status),
-            MarkRoute::RetryRequired,
-            "error mode must require retry for '{status}'"
+            classify_queue_intent_route(OperatorMode::Error, status),
+            QueueIntentRoute::RetryRequired,
+            "error-mode queue mutation is still retry-owned for '{status}'"
+        );
+        assert!(
+            is_markable_status(status),
+            "'{status}' is still markable in Error mode"
         );
     }
-
-    // Final outcomes are immutable in every mode.
-    for mode in [
-        OperatorMode::Select,
-        OperatorMode::Running,
-        OperatorMode::Stopping,
-        OperatorMode::Stopped,
-        OperatorMode::Error,
-    ] {
-        for status in ["archived", "merged", "pushed", "rejected"] {
+    for status in ["applying", "accepting", "archiving", "resolving"] {
+        assert_eq!(
+            classify_queue_intent_route(OperatorMode::Running, status),
+            QueueIntentRoute::Immutable
+        );
+        assert!(is_markable_status(status), "an active row stays markable");
+    }
+    assert_eq!(
+        classify_queue_intent_route(OperatorMode::Stopping, "not queued"),
+        QueueIntentRoute::Immutable
+    );
+    for mode in ALL_MODES {
+        for status in TERMINAL_STATUSES {
             assert_eq!(
-                classify_mark_route(mode, status),
-                MarkRoute::Immutable,
-                "final status '{status}' must be immutable in {mode:?}"
+                classify_queue_intent_route(mode, status),
+                QueueIntentRoute::Immutable,
+                "final status '{status}' is immutable in {mode:?}"
             );
         }
     }
@@ -350,139 +388,229 @@ fn operator_command_service_never_exposes_a_gated_display_status() {
     );
 }
 
+/// Unit: a single mark in any mode writes the mark store and nothing else.
+///
+/// The recorders fail the test if a queue mutation, a hook, or a scheduler
+/// notification happens, so "mark-only" is proved by absence of effects rather
+/// than asserted in prose.
 #[tokio::test]
-async fn operator_command_error_mode_rejects_mark_mutation_without_side_effects() {
-    let fixture = fixture(&["change-a"]);
-    {
-        let mut guard = fixture.state.write().await;
-        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
-            id: "change-a".to_string(),
-            error: "boom".to_string(),
-        });
+async fn run_mark_intent_single_mark_is_lifecycle_independent_and_side_effect_free() {
+    for mode in ALL_MODES {
+        for status in ["not queued", "queued", "applying", "error", "merge wait"] {
+            let fixture = fixture(&["change-a"]);
+            reach_status(&fixture, "change-a", status).await;
+            let before = fixture.state.read().await.display_status("change-a");
+            assert_eq!(before, status, "fixture must really reach '{status}'");
+
+            let outcome = fixture
+                .service
+                .execute(
+                    mode,
+                    OperatorCommand::SetExecutionMark {
+                        change_id: "change-a".to_string(),
+                        marked: true,
+                    },
+                )
+                .await
+                .expect("mark mutation is always admitted for a non-terminal row");
+
+            assert_eq!(
+                outcome,
+                OperatorOutcome::MarkSet {
+                    change_id: "change-a".to_string(),
+                    marked: true,
+                },
+                "{mode:?}/{status} must report a plain mark mutation"
+            );
+            assert!(fixture.marks.is_marked("change-a"));
+            assert_eq!(
+                fixture.state.read().await.display_status("change-a"),
+                before,
+                "{mode:?}/{status}: a mark must not move reducer state"
+            );
+            assert!(
+                fixture.hooks.adds().is_empty() && fixture.hooks.removes().is_empty(),
+                "{mode:?}/{status}: a mark must run no queue hook"
+            );
+            assert!(
+                fixture.queue.added.lock().expect("added").is_empty()
+                    && fixture.queue.removed.lock().expect("removed").is_empty(),
+                "{mode:?}/{status}: a mark must not mutate the dynamic queue"
+            );
+            assert_eq!(
+                *fixture.queue.notified.lock().expect("notified"),
+                0,
+                "{mode:?}/{status}: a mark must not wake the scheduler"
+            );
+            assert!(
+                fixture.queue.explicit_retries().is_empty(),
+                "{mode:?}/{status}: a mark must not publish a retry edge"
+            );
+            assert!(
+                fixture
+                    .queue
+                    .cancellations
+                    .lock()
+                    .expect("cancels")
+                    .is_empty(),
+                "{mode:?}/{status}: a mark must not request cancellation"
+            );
+
+            // Repeating the same mark is a no-op, not a second mutation.
+            let repeated = fixture
+                .service
+                .set_execution_mark("change-a", true)
+                .await
+                .expect("repeat mark must succeed");
+            assert_eq!(
+                repeated,
+                OperatorOutcome::NoOp {
+                    change_id: "change-a".to_string(),
+                    reason: NoOpReason::MarkUnchanged,
+                }
+            );
+        }
     }
-
-    let error = fixture
-        .service
-        .set_execution_mark(OperatorMode::Error, "change-a", true)
-        .await
-        .expect_err("error mode must reject mark mutation");
-
-    assert!(matches!(
-        error,
-        OperatorCommandError::MarkNotAllowed {
-            route: MarkRoute::RetryRequired,
-            ..
-        }
-    ));
-    assert_eq!(
-        fixture.state.read().await.display_status("change-a"),
-        "error",
-        "rejected mark mutation must not change reducer state"
-    );
-    assert!(
-        !fixture.marks.is_marked("change-a"),
-        "rejected mark mutation must not change the mark store"
-    );
-    assert!(
-        fixture.hooks.adds().is_empty() && fixture.hooks.removes().is_empty(),
-        "rejected requests must not run queue hooks"
-    );
 }
 
+/// Unit: unmarking an admitted row leaves the current run exactly as it was.
 #[tokio::test]
-async fn operator_command_active_rows_reject_mark_mutation_in_running_mode() {
-    let fixture = fixture(&["change-a"]);
-    {
-        let mut guard = fixture.state.write().await;
-        guard.apply_execution_event(&ExecutionEvent::ApplyStarted {
-            change_id: "change-a".to_string(),
-            command: "apply".to_string(),
-        });
+async fn run_mark_intent_unmark_does_not_disturb_admitted_work() {
+    for status in ["queued", "applying"] {
+        let fixture = fixture(&["change-a"]);
+        // Admit the change through the explicit queue service, the way a run
+        // really admits work, then reach the status under test.
+        fixture
+            .service
+            .add_to_queue("change-a")
+            .await
+            .expect("explicit queue add");
+        reach_status(&fixture, "change-a", status).await;
+        fixture.marks.set("change-a", true);
+        let admitted_adds = fixture.queue.added.lock().expect("added").clone();
+        let before = fixture.state.read().await.display_status("change-a");
+
+        let outcome = fixture
+            .service
+            .set_execution_mark("change-a", false)
+            .await
+            .expect("unmark is always admitted for a non-terminal row");
+
+        assert_eq!(
+            outcome,
+            OperatorOutcome::MarkSet {
+                change_id: "change-a".to_string(),
+                marked: false,
+            }
+        );
+        assert!(!fixture.marks.is_marked("change-a"));
+        assert_eq!(
+            fixture.state.read().await.display_status("change-a"),
+            before,
+            "'{status}': unmarking must not change the current run's state"
+        );
+        assert_eq!(
+            *fixture.queue.added.lock().expect("added"),
+            admitted_adds,
+            "'{status}': unmarking must not touch the dynamic queue"
+        );
+        assert!(
+            fixture.queue.removed.lock().expect("removed").is_empty(),
+            "'{status}': unmarking must not dequeue"
+        );
+        assert!(
+            fixture
+                .queue
+                .cancellations
+                .lock()
+                .expect("cancels")
+                .is_empty(),
+            "'{status}': unmarking must not cancel"
+        );
+        assert_eq!(
+            fixture.hooks.removes(),
+            Vec::<String>::new(),
+            "'{status}': unmarking must not run the queue-remove hook"
+        );
     }
-
-    let error = fixture
-        .service
-        .set_execution_mark(OperatorMode::Running, "change-a", false)
-        .await
-        .expect_err("active rows must reject mark mutation");
-
-    assert!(matches!(
-        error,
-        OperatorCommandError::MarkNotAllowed {
-            route: MarkRoute::Immutable,
-            ..
-        }
-    ));
-    assert_eq!(
-        fixture.state.read().await.display_status("change-a"),
-        "applying"
-    );
 }
 
+/// Unit: a terminal target settles as a reasoned unchanged no-op, not a failure.
 #[tokio::test]
-async fn operator_command_mark_only_route_leaves_queue_intent_untouched() {
-    let fixture = fixture(&["change-a"]);
-    let before = fixture.state.read().await.display_status("change-a");
-
-    let outcome = fixture
-        .service
-        .set_execution_mark(OperatorMode::Select, "change-a", true)
-        .await
-        .expect("select mode must mutate marks");
-
-    assert_eq!(
-        outcome,
-        OperatorOutcome::MarkSet {
-            change_id: "change-a".to_string(),
-            marked: true,
+async fn run_mark_intent_terminal_target_is_a_reasoned_no_op() {
+    for mode in ALL_MODES {
+        let fixture = fixture(&["change-a"]);
+        {
+            let mut guard = fixture.state.write().await;
+            guard.apply_execution_event(&ExecutionEvent::ChangeRejected {
+                change_id: "change-a".to_string(),
+                reason: "rejected".to_string(),
+            });
         }
-    );
-    assert!(fixture.marks.is_marked("change-a"));
-    assert_eq!(
-        fixture.state.read().await.display_status("change-a"),
-        before,
-        "an execution mark must not change queue intent or display status"
-    );
+        assert_eq!(
+            fixture.state.read().await.display_status("change-a"),
+            "rejected"
+        );
 
-    // Repeating the same mark is a no-op, not a second mutation.
-    let repeated = fixture
-        .service
-        .set_execution_mark(OperatorMode::Select, "change-a", true)
-        .await
-        .expect("repeat mark must succeed");
-    assert_eq!(
-        repeated,
-        OperatorOutcome::NoOp {
-            change_id: "change-a".to_string(),
-            reason: NoOpReason::MarkUnchanged,
-        }
-    );
+        let outcome = fixture
+            .service
+            .execute(
+                mode,
+                OperatorCommand::SetExecutionMark {
+                    change_id: "change-a".to_string(),
+                    marked: true,
+                },
+            )
+            .await
+            .expect("a terminal target settles successfully");
+
+        assert_eq!(
+            outcome,
+            OperatorOutcome::NoOp {
+                change_id: "change-a".to_string(),
+                reason: NoOpReason::TerminalMarkTarget,
+            },
+            "{mode:?} must identify the terminal-target reason"
+        );
+        assert!(!fixture.marks.is_marked("change-a"));
+        assert_eq!(
+            fixture.state.read().await.display_status("change-a"),
+            "rejected"
+        );
+        assert!(fixture.hooks.adds().is_empty() && fixture.hooks.removes().is_empty());
+        assert_eq!(*fixture.queue.notified.lock().expect("notified"), 0);
+    }
 }
 
-#[tokio::test]
-async fn operator_command_running_mark_routes_to_queue_intent() {
-    let fixture = fixture(&["change-a"]);
-
-    let outcome = fixture
-        .service
-        .set_execution_mark(OperatorMode::Running, "change-a", true)
-        .await
-        .expect("running mode add must succeed");
-
-    let OperatorOutcome::Queue(queue_outcome) = outcome else {
-        panic!("running-mode mark must route to queue intent");
-    };
-    assert_eq!(queue_outcome.mutation, QueueMutation::Added);
-    assert!(queue_outcome.reducer_changed);
-    assert!(queue_outcome.dynamic_queue_mutated);
-    assert_eq!(queue_outcome.display_status, "queued");
-    assert!(fixture.marks.is_marked("change-a"));
-    assert_eq!(fixture.hooks.adds(), vec!["change-a".to_string()]);
-    assert_eq!(
-        *fixture.queue.notified.lock().expect("notified"),
-        1,
-        "a real addition must wake the scheduler exactly once"
-    );
+/// Drive `change_id` to `status` through the reducer's own event vocabulary.
+async fn reach_status(fixture: &Fixture, change_id: &str, status: &str) {
+    let mut guard = fixture.state.write().await;
+    match status {
+        "not queued" => {}
+        "queued" => {
+            guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+        }
+        "applying" => {
+            guard.apply_execution_event(&ExecutionEvent::ApplyStarted {
+                change_id: change_id.to_string(),
+                command: "apply".to_string(),
+            });
+        }
+        "error" => {
+            guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+                id: change_id.to_string(),
+                error: "boom".to_string(),
+            });
+        }
+        "merge wait" => {
+            guard.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: change_id.to_string(),
+                workspace_name: format!("ws-{change_id}"),
+                status: crate::vcs::WorkspaceStatus::MergeWait,
+            });
+        }
+        other => panic!("unsupported fixture status '{other}'"),
+    }
 }
 
 #[tokio::test]
@@ -1281,7 +1409,7 @@ async fn operator_command_marks_do_not_change_workspace_derived_routing() {
 
     fixture
         .service
-        .set_execution_mark(OperatorMode::Select, "change-a", true)
+        .set_execution_mark("change-a", true)
         .await
         .expect("mark");
     let after_mark = fixture.state.read().await.all_display_statuses();
@@ -1577,25 +1705,15 @@ async fn externally_blocked_change_does_not_block_unrelated_or_dependent_kinds()
 // ============================================================================
 
 /// Build a bulk-mark row without repeating the struct literal per case.
-///
-/// An ineligible row is spelled as dirty proposal content; the reason-specific
-/// cases build their rows directly.
-fn row<'a>(
-    change_id: &'a str,
-    display_status: &'a str,
-    parallel_eligible: bool,
-    marked: bool,
-) -> MarkTargetRow<'a> {
+fn row<'a>(change_id: &'a str, display_status: &'a str, marked: bool) -> MarkTargetRow<'a> {
     MarkTargetRow {
         change_id,
         display_status,
-        parallel_eligibility: eligibility(parallel_eligible),
-        apply_iteration_limit_active: false,
         marked,
     }
 }
 
-/// Bool-to-reason shorthand for cases where only admission is under test.
+/// Bool-to-reason shorthand for cases where only observation is under test.
 fn eligibility(parallel_eligible: bool) -> ParallelEligibility {
     if parallel_eligible {
         ParallelEligibility::Eligible
@@ -1609,11 +1727,11 @@ fn bulk_mark_target_state_is_derived_from_eligible_rows_only() {
     // One unmarked eligible row means "mark all", even though the excluded row
     // is unmarked too and the other eligible row is already marked.
     let rows = [
-        row("marked", "not queued", true, true),
-        row("unmarked", "not queued", true, false),
-        row("rejected", "rejected", true, false),
+        row("marked", "not queued", true),
+        row("unmarked", "not queued", false),
+        row("rejected", "rejected", false),
     ];
-    let plan = plan_bulk_marks(OperatorMode::Select, &rows);
+    let plan = plan_bulk_marks(&rows);
     assert!(plan.target_state, "a partially marked set marks all");
     assert_eq!(plan.eligible, vec!["marked", "unmarked"]);
     assert_eq!(
@@ -1624,91 +1742,62 @@ fn bulk_mark_target_state_is_derived_from_eligible_rows_only() {
     // Every eligible row marked means "unmark all"; the unmarked excluded row
     // must not drag the target state back to `true`.
     let rows = [
-        row("a", "not queued", true, true),
-        row("b", "not queued", true, true),
-        row("rejected", "rejected", true, false),
+        row("a", "not queued", true),
+        row("b", "not queued", true),
+        row("rejected", "rejected", false),
     ];
-    let plan = plan_bulk_marks(OperatorMode::Select, &rows);
+    let plan = plan_bulk_marks(&rows);
     assert!(!plan.target_state, "a fully marked set unmarks all");
     assert_eq!(plan.eligible, vec!["a", "b"]);
 }
 
+/// Unit: the bulk classifier has exactly one exclusion, and it is terminality.
+///
+/// Mode, activity, wait state, and worktree eligibility all used to appear here.
+/// Their absence is the contract: a mark is next-run intent, and only a row with
+/// no next run is refused.
 #[test]
-fn bulk_mark_classification_reports_one_stable_reason_per_mode_and_status() {
-    let cases: Vec<(OperatorMode, &str, bool, Option<MarkExclusion>)> = vec![
-        // Select: everything non-final and eligible is pure operator intent.
-        (OperatorMode::Select, "not queued", true, None),
-        (
-            OperatorMode::Select,
-            "archived",
-            true,
-            Some(MarkExclusion::FinalStatus),
-        ),
-        (
-            OperatorMode::Select,
-            "rejected",
-            true,
-            Some(MarkExclusion::FinalStatus),
-        ),
-        // An uncommitted row is excluded unconditionally: there is no mode that
-        // turns the worktree-eligibility constraint off.
-        (
-            OperatorMode::Select,
-            "not queued",
-            false,
-            Some(MarkExclusion::ParallelIneligible),
-        ),
-        // A final row stays "final": worktree eligibility is not why it is
-        // refused, and reporting "commit it first" would be a lie.
-        (
-            OperatorMode::Select,
-            "archived",
-            false,
-            Some(MarkExclusion::FinalStatus),
-        ),
-        // Running: active rows are stopped, not marked; waits are mark-only.
-        (
-            OperatorMode::Running,
-            "applying",
-            true,
-            Some(MarkExclusion::ChangeActive),
-        ),
-        (OperatorMode::Running, "merge wait", true, None),
-        (OperatorMode::Running, "queued", true, None),
-        // Stopped: only resumable rows.
-        (OperatorMode::Stopped, "error", true, None),
-        (
-            OperatorMode::Stopped,
-            "queued",
-            true,
-            Some(MarkExclusion::StatusImmutable),
-        ),
-    ];
-
-    for (mode, status, eligible, expected) in cases {
+fn run_mark_intent_bulk_classification_excludes_terminal_rows_only() {
+    for status in NON_TERMINAL_STATUSES {
         assert_eq!(
-            classify_bulk_mark_row(mode, status, eligibility(eligible), false),
-            expected,
-            "mode {mode:?}, status '{status}', eligible {eligible}"
+            classify_bulk_mark_row(status),
+            None,
+            "'{status}' is a bulk mark target"
+        );
+    }
+    for status in TERMINAL_STATUSES {
+        assert_eq!(
+            classify_bulk_mark_row(status),
+            Some(MarkExclusion::FinalStatus),
+            "'{status}' is excluded as terminal"
         );
     }
 }
 
+/// Unit: every mode produces the same plan, because the plan does not see one.
 #[test]
-fn bulk_mark_is_unavailable_in_error_and_stopping_modes() {
-    for mode in [OperatorMode::Error, OperatorMode::Stopping] {
-        assert!(!supports_bulk_marks(mode));
-        let plan = plan_bulk_marks(mode, &[row("a", "not queued", true, false)]);
-        assert!(
-            plan.is_empty() && plan.excluded.is_empty(),
-            "{mode:?} must produce no target set at all"
-        );
-    }
+fn run_mark_intent_bulk_plan_is_identical_in_every_mode() {
+    let rows = [
+        row("idle", "not queued", false),
+        row("active", "applying", false),
+        row("error", "error", false),
+        row("wait", "merge wait", false),
+        row("archived", "archived", false),
+    ];
+
+    let plan = plan_bulk_marks(&rows);
+
+    assert!(plan.target_state);
+    assert_eq!(plan.eligible, vec!["idle", "active", "error", "wait"]);
+    assert_eq!(
+        plan.excluded,
+        vec![("archived".to_string(), MarkExclusion::FinalStatus)]
+    );
 }
 
 #[test]
 fn bulk_mark_plan_over_zero_rows_is_an_empty_unmark() {
-    let plan = plan_bulk_marks(OperatorMode::Select, &[]);
+    let plan = plan_bulk_marks(&[]);
     assert!(plan.is_empty());
     assert!(plan.excluded.is_empty());
     assert!(!plan.target_state);
@@ -1718,21 +1807,16 @@ fn bulk_mark_plan_over_zero_rows_is_an_empty_unmark() {
 #[test]
 fn bulk_mark_exclusion_summary_groups_reasons_with_counts() {
     let rows = [
-        row("active-a", "applying", true, false),
-        row("active-b", "archiving", true, false),
-        row("rejected", "rejected", true, false),
-        row("eligible", "not queued", true, false),
+        row("archived-a", "archived", false),
+        row("merged-b", "merged", false),
+        row("eligible", "not queued", false),
     ];
-    let plan = plan_bulk_marks(OperatorMode::Running, &rows);
+    let plan = plan_bulk_marks(&rows);
 
     assert_eq!(plan.eligible, vec!["eligible"]);
     assert_eq!(
         plan.exclusion_summary(),
-        format!(
-            "2 {}, 1 {}",
-            MarkExclusion::ChangeActive.reason(),
-            MarkExclusion::FinalStatus.reason()
-        )
+        format!("2 {}", MarkExclusion::FinalStatus.reason())
     );
     // Machine-readable tokens are distinct so a client can branch on them.
     let tokens: std::collections::HashSet<&str> =
@@ -1740,47 +1824,22 @@ fn bulk_mark_exclusion_summary_groups_reasons_with_counts() {
     assert_eq!(tokens.len(), MarkExclusion::ALL.len());
 }
 
-/// The two parallel refusals block identically and are reported apart.
+/// The two parallel refusals are still reported apart wherever they apply.
 ///
 /// A row absent from `HEAD` has no uncommitted content, so telling the operator
-/// to commit it names work that does not exist.
+/// to commit it names work that does not exist. They no longer touch marks, but
+/// the vocabulary the queue and start paths report is unchanged.
 #[test]
-fn bulk_mark_names_the_eligibility_reason_it_actually_observed() {
-    let rows = [
-        MarkTargetRow {
-            change_id: "dirty",
-            display_status: "not queued",
-            parallel_eligibility: ParallelEligibility::UncommittedProposalFiles,
-            apply_iteration_limit_active: false,
-            marked: false,
-        },
-        MarkTargetRow {
-            change_id: "absent",
-            display_status: "queued",
-            parallel_eligibility: ParallelEligibility::ProposalAbsentFromHead,
-            apply_iteration_limit_active: false,
-            marked: false,
-        },
-        row("eligible", "not queued", true, false),
-    ];
-
-    let plan = plan_bulk_marks(OperatorMode::Running, &rows);
-
-    assert_eq!(plan.eligible, vec!["eligible"]);
+fn parallel_refusals_keep_naming_the_reason_they_actually_observed() {
     assert_eq!(
-        plan.excluded,
-        vec![
-            ("dirty".to_string(), MarkExclusion::ParallelIneligible),
-            ("absent".to_string(), MarkExclusion::ParallelProposalAbsent),
-        ]
+        ParallelEligibility::UncommittedProposalFiles.queue_exclusion(),
+        Some(MarkExclusion::ParallelIneligible)
     );
-
-    let summary = plan.exclusion_summary();
-    assert!(summary.contains("uncommitted (commit first)"), "{summary}");
-    assert!(
-        summary.contains("not present in HEAD (cannot queue)"),
-        "{summary}"
+    assert_eq!(
+        ParallelEligibility::ProposalAbsentFromHead.queue_exclusion(),
+        Some(MarkExclusion::ParallelProposalAbsent)
     );
+    assert_eq!(ParallelEligibility::Eligible.queue_exclusion(), None);
     assert!(
         !MarkExclusion::ParallelProposalAbsent
             .reason()
@@ -1896,9 +1955,9 @@ async fn bulk_mark_marks_every_eligible_change_and_reports_exclusions() {
 
     let outcome = fixture
         .service
-        .set_all_execution_marks(OperatorMode::Select)
+        .set_all_execution_marks()
         .await
-        .expect("Select mode accepts a bulk mutation");
+        .expect("a bulk mutation is always admitted");
 
     match outcome {
         OperatorOutcome::BulkMarks {
@@ -1907,18 +1966,18 @@ async fn bulk_mark_marks_every_eligible_change_and_reports_exclusions() {
             excluded,
         } => {
             assert!(marked, "one unmarked eligible row marks the whole set");
-            assert_eq!(changed, vec!["b".to_string()], "'a' was already marked");
             assert_eq!(
-                excluded,
-                vec![("uncommitted".to_string(), MarkExclusion::ParallelIneligible)]
+                changed,
+                vec!["b".to_string(), "uncommitted".to_string()],
+                "'a' was already marked; worktree eligibility excludes nothing"
             );
+            assert!(excluded.is_empty(), "no row is terminal");
         }
         other => panic!("unexpected outcome: {other:?}"),
     }
     assert_eq!(
         fixture.marks.marked_ids(),
-        vec!["a".to_string(), "b".to_string()],
-        "an excluded row keeps whatever intent it had"
+        vec!["a".to_string(), "b".to_string(), "uncommitted".to_string()]
     );
 }
 
@@ -1929,9 +1988,9 @@ async fn bulk_mark_unmarks_every_eligible_change_when_all_are_marked() {
 
     let outcome = fixture
         .service
-        .set_all_execution_marks(OperatorMode::Select)
+        .set_all_execution_marks()
         .await
-        .expect("Select mode accepts a bulk mutation");
+        .expect("a bulk mutation is always admitted");
 
     match outcome {
         OperatorOutcome::BulkMarks {
@@ -1945,60 +2004,71 @@ async fn bulk_mark_unmarks_every_eligible_change_when_all_are_marked() {
     assert!(fixture.marks.marked_ids().is_empty());
 }
 
+/// Unit: a bulk mark writes marks only, in every mode, including for an
+/// in-flight row. The queue recorders prove no membership moved with it.
 #[tokio::test]
-async fn bulk_mark_in_running_mode_moves_queue_intent_with_the_mark() {
-    let fixture = parallel_fixture(&["idle", "active"], &[]);
-    {
-        let mut guard = fixture.state.write().await;
-        guard.apply_execution_event(&ExecutionEvent::ApplyStarted {
-            change_id: "active".to_string(),
-            command: "apply".to_string(),
-        });
-    }
-
-    let outcome = fixture
-        .service
-        .set_all_execution_marks(OperatorMode::Running)
-        .await
-        .expect("Running mode accepts a bulk mutation");
-
-    match outcome {
-        OperatorOutcome::BulkMarks {
-            marked,
-            changed,
-            excluded,
-        } => {
-            assert!(marked);
-            assert_eq!(changed, vec!["idle".to_string()]);
-            assert_eq!(
-                excluded,
-                vec![("active".to_string(), MarkExclusion::ChangeActive)],
-                "an in-flight change is stopped, never marked"
-            );
+async fn run_mark_intent_bulk_mark_never_moves_queue_intent() {
+    for mode in ALL_MODES {
+        let fixture = parallel_fixture(&["idle", "active"], &[]);
+        {
+            let mut guard = fixture.state.write().await;
+            guard.apply_execution_event(&ExecutionEvent::ApplyStarted {
+                change_id: "active".to_string(),
+                command: "apply".to_string(),
+            });
         }
-        other => panic!("unexpected outcome: {other:?}"),
+
+        let outcome = fixture
+            .service
+            .execute(mode, OperatorCommand::SetAllExecutionMarks)
+            .await
+            .expect("a bulk mutation is always admitted");
+
+        match outcome {
+            OperatorOutcome::BulkMarks {
+                marked,
+                changed,
+                excluded,
+            } => {
+                assert!(marked, "{mode:?} must mark the whole non-terminal set");
+                assert_eq!(
+                    changed,
+                    vec!["active".to_string(), "idle".to_string()],
+                    "{mode:?}: an in-flight row still accepts next-run intent"
+                );
+                assert!(excluded.is_empty());
+            }
+            other => panic!("{mode:?} unexpected outcome: {other:?}"),
+        }
+
+        assert_eq!(
+            fixture.state.read().await.display_status("idle"),
+            "not queued",
+            "{mode:?}: a bulk mark must not create queue intent"
+        );
+        assert_eq!(
+            fixture.state.read().await.display_status("active"),
+            "applying",
+            "{mode:?}: a bulk mark must not disturb active execution"
+        );
+        assert!(fixture.queue.contents.lock().unwrap().is_empty());
+        assert!(fixture.queue.added.lock().unwrap().is_empty());
+        assert!(fixture.queue.removed.lock().unwrap().is_empty());
+        assert!(fixture.queue.cancellations.lock().unwrap().is_empty());
+        assert_eq!(*fixture.queue.notified.lock().unwrap(), 0);
+        assert!(fixture.queue.explicit_retries().is_empty());
+        assert!(fixture.hooks.adds().is_empty() && fixture.hooks.removes().is_empty());
+
+        // The reverse mutation is equally inert.
+        fixture
+            .service
+            .set_all_execution_marks()
+            .await
+            .expect("the reverse mutation is admitted too");
+        assert!(fixture.marks.marked_ids().is_empty());
+        assert!(fixture.hooks.removes().is_empty());
+        assert!(fixture.queue.removed.lock().unwrap().is_empty());
     }
-
-    assert_eq!(
-        fixture.state.read().await.display_status("idle"),
-        "queued",
-        "Running mode turns the mark into queue intent"
-    );
-    assert_eq!(fixture.queue.contents.lock().unwrap().clone(), vec!["idle"]);
-    assert_eq!(fixture.hooks.adds(), vec!["idle".to_string()]);
-
-    // Unmarking must take the queue intent back out with it.
-    fixture
-        .service
-        .set_all_execution_marks(OperatorMode::Running)
-        .await
-        .expect("Running mode accepts the reverse mutation");
-    assert_eq!(
-        fixture.state.read().await.display_status("idle"),
-        "not queued"
-    );
-    assert!(fixture.marks.marked_ids().is_empty());
-    assert_eq!(fixture.hooks.removes(), vec!["idle".to_string()]);
 }
 
 #[tokio::test]
@@ -2014,7 +2084,7 @@ async fn bulk_mark_with_zero_eligible_rows_changes_nothing() {
 
     let outcome = fixture
         .service
-        .set_all_execution_marks(OperatorMode::Select)
+        .set_all_execution_marks()
         .await
         .expect("a zero-eligible bulk mutation is valid, not an error");
 
@@ -2027,24 +2097,6 @@ async fn bulk_mark_with_zero_eligible_rows_changes_nothing() {
     ));
     assert!(fixture.marks.marked_ids().is_empty());
     assert!(fixture.queue.contents.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn bulk_mark_is_refused_in_error_and_stopping_modes_without_side_effects() {
-    for mode in [OperatorMode::Error, OperatorMode::Stopping] {
-        let fixture = parallel_fixture(&["a"], &[]);
-        let error = fixture
-            .service
-            .set_all_execution_marks(mode)
-            .await
-            .expect_err("recovery and a pending stop own these modes");
-        assert!(matches!(
-            error,
-            OperatorCommandError::BulkMarksNotAllowed { .. }
-        ));
-        assert!(fixture.marks.marked_ids().is_empty());
-        assert!(fixture.queue.contents.lock().unwrap().is_empty());
-    }
 }
 
 // ============================================================================
@@ -2062,26 +2114,20 @@ async fn enter_preparation(state: &Arc<RwLock<OrchestratorState>>, change_id: &s
 }
 
 /// Unit: the shared lifecycle matrix classifies `preparing` as active, so no
-/// frontend can offer a mark or queue-intent mutation on a change whose worktree
-/// Conflux is currently building.
+/// frontend can offer a queue-intent mutation on a change whose worktree Conflux
+/// is currently building. Marking it is a different question and stays allowed:
+/// preparation is not a terminal outcome.
 #[test]
 fn preparing_is_active_in_the_shared_lifecycle_matrix() {
     assert!(is_active_status("preparing"));
     assert!(!is_final_status("preparing"));
 
     assert_eq!(
-        classify_mark_route(OperatorMode::Running, "preparing"),
-        MarkRoute::Immutable
+        classify_queue_intent_route(OperatorMode::Running, "preparing"),
+        QueueIntentRoute::Immutable
     );
-    assert_eq!(
-        classify_bulk_mark_row(
-            OperatorMode::Running,
-            "preparing",
-            ParallelEligibility::Eligible,
-            false
-        ),
-        Some(MarkExclusion::ChangeActive)
-    );
+    assert_eq!(classify_bulk_mark_row("preparing"), None);
+    assert!(is_markable_status("preparing"));
 }
 
 /// Unit: inline preparation registers no termination handle, so an immediate
@@ -2272,22 +2318,33 @@ async fn active_iteration_limit_retry_guard_blocks_the_terminal_error_queue_alia
         OperatorCommandError::ApplyIterationLimitActive { .. }
     ));
 
-    // `set_queue_intent=true` reaches the service through the mark route in
-    // Running mode; it must be refused by the same guard.
-    let mark_error = fixture
-        .service
-        .set_execution_mark(OperatorMode::Running, "limited", true)
-        .await
-        .expect_err("the mark route must not become a bypass");
-    assert!(matches!(
-        mark_error,
-        OperatorCommandError::ApplyIterationLimitActive { .. }
-    ));
-
     assert_eq!(
         fixture.snapshot("limited").await,
         before,
-        "neither alias may release the failed classification or touch the queue"
+        "the refused queue addition may not release the failed classification"
+    );
+
+    // A mark is *not* an alias for that addition any more, so it is admitted —
+    // and it still leaves every run-affecting axis alone.
+    let outcome = fixture
+        .service
+        .set_execution_mark("limited", true)
+        .await
+        .expect("a limited row still accepts next-run intent");
+    assert_eq!(
+        outcome,
+        OperatorOutcome::MarkSet {
+            change_id: "limited".to_string(),
+            marked: true,
+        }
+    );
+    let after = fixture.snapshot("limited").await;
+    assert_eq!(after.display_status, before.display_status);
+    assert_eq!(after.error_detail, before.error_detail);
+    assert_eq!(after.queue_intent_queued, before.queue_intent_queued);
+    assert_eq!(
+        after.explicit_retries, before.explicit_retries,
+        "a mark must not publish an explicit-retry edge"
     );
 }
 
@@ -2311,16 +2368,20 @@ async fn active_iteration_limit_retry_guard_leaves_ordinary_retry_unchanged() {
     );
 }
 
+/// Unit: a bulk mark covers an Apply-limited row like any other non-terminal
+/// row, and still publishes no retry edge and no queue mutation for it. The
+/// ceiling gates dispatch, which is `retry`'s and `Start`'s problem, not the
+/// mark's.
 #[tokio::test]
-async fn active_iteration_limit_retry_guard_excludes_limited_rows_from_bulk_marks() {
+async fn active_iteration_limit_bulk_mark_marks_the_limited_row_without_retry_effects() {
     let (fixture, _boundary) = limited_fixture(&["limited", "ordinary"], &["limited"]).await;
     let before = fixture.snapshot("limited").await;
 
     let outcome = fixture
         .service
-        .set_all_execution_marks(OperatorMode::Running)
+        .set_all_execution_marks()
         .await
-        .expect("Running mode admits bulk marks");
+        .expect("a bulk mutation is always admitted");
 
     match outcome {
         OperatorOutcome::BulkMarks {
@@ -2329,22 +2390,12 @@ async fn active_iteration_limit_retry_guard_excludes_limited_rows_from_bulk_mark
             excluded,
         } => {
             assert!(marked, "an unmarked eligible row means mark-all");
+            assert!(changed.contains(&"ordinary".to_string()), "{changed:?}");
             assert!(
-                changed.contains(&"ordinary".to_string()),
-                "eligible rows still apply atomically: {changed:?}"
+                changed.contains(&"limited".to_string()),
+                "the limited row is a mark target too: {changed:?}"
             );
-            assert!(
-                !changed.contains(&"limited".to_string()),
-                "the limited row is never mutated: {changed:?}"
-            );
-            assert_eq!(
-                excluded,
-                vec![(
-                    "limited".to_string(),
-                    MarkExclusion::ApplyIterationLimitActive
-                )],
-                "the exclusion carries the stable token"
-            );
+            assert!(excluded.is_empty(), "no row is terminal");
         }
         other => panic!("unexpected outcome: {other:?}"),
     }
@@ -2357,13 +2408,10 @@ async fn active_iteration_limit_retry_guard_excludes_limited_rows_from_bulk_mark
         after.explicit_retries, before.explicit_retries,
         "a bulk mark must not publish an explicit-retry edge for a limited row"
     );
-    assert!(
-        !after.marks.contains(&"limited".to_string()),
-        "the limited row keeps its mark exactly as the run left it"
-    );
     assert_eq!(
         MarkExclusion::ApplyIterationLimitActive.as_str(),
-        APPLY_ITERATION_LIMIT_ACTIVE
+        APPLY_ITERATION_LIMIT_ACTIVE,
+        "the token stays stable for the retry and queue paths that still use it"
     );
 }
 

@@ -372,37 +372,40 @@ The TUI MUST derive its base status, controls, elapsed-time presentation, and vi
 
 ### Requirement: Bulk mark follows execution lifecycle and modal input ownership
 
-The TUI MUST admit bulk execution-mark input only while the Changes view owns ordinary input, no warning or interaction modal owns input, and the shared operator lifecycle matrix admits the operation. Select, Running, and Stopped execution modes MAY admit bulk marking according to row eligibility and queue-intent rules. Stopping MUST remain immutable, and Error recovery MUST remain owned by explicit retry commands rather than mark mutation.
+The TUI MUST admit single-row and bulk execution-mark input for visible non-terminal rows in Select, Running, Stopping, Stopped, and Error execution modes. Execution lifecycle timing, active/retry/wait status, apply-iteration-limit evidence, and current parallel eligibility MUST NOT make a pre-archive execution mark immutable.
 
-The TUI MUST consume all key input while a warning or interaction modal is active and MUST NOT route `x` or any other ordinary command to the underlying view. A rejected bulk-mark attempt MUST identify the actual execution condition and MUST NOT describe a modal presentation variant as an execution mode.
+An execution mark is process-local next-run target intent only. Mark mutation MUST NOT mutate queue intent, stop or dequeue current work, issue cancellation, create retry or resolve intent, run hooks, wake a scheduler, or change process mode. Current-state run eligibility SHALL be evaluated at final start/retry admission instead.
 
-#### Scenario: eligible execution modes admit bulk mark
+The TUI MUST consume all key input while a warning or interaction modal is active and MUST NOT route `x`, Space, or any other ordinary command to the underlying view. Terminal rows (`archived`, `merged`, `pushed`, and `rejected`) MUST remain outside mark controls and Space on them MUST be a silent no-op.
 
-- **GIVEN** the Changes view is active with no warning or interaction modal
-- **AND** execution mode is Select, Running, or Stopped
-- **WHEN** the operator presses `x`
-- **THEN** the TUI applies the shared lifecycle and per-row eligibility rules
-- **AND** Running-mode queue intent remains consistent with execution marks
-
-#### Scenario: stopping rejects bulk mark
+#### Scenario: every execution mode admits pre-archive marks
 
 - **GIVEN** the Changes view is active with no warning or interaction modal
-- **AND** execution mode is Stopping
-- **WHEN** the operator presses `x`
-- **THEN** no execution mark or queue intent changes
-- **AND** the TUI reports that bulk mark is unavailable while stopping
+- **AND** execution mode is Select, Running, Stopping, Stopped, or Error
+- **AND** the target is a visible non-terminal row
+- **WHEN** the operator presses Space or `x`
+- **THEN** the TUI updates only process-local execution marks
+- **AND** current queue, runtime, retry, resolve, cancellation, scheduler, hook, and mode state remain unchanged
 
-#### Scenario: fatal error keeps recovery retry-owned
+#### Scenario: active and limited rows retain future intent
 
-- **GIVEN** the Changes view is active with no warning or interaction modal
-- **AND** execution mode is Error
-- **WHEN** the operator presses `x`
-- **THEN** no execution mark or queue intent changes
-- **AND** the TUI reports that error recovery requires retry
+- **GIVEN** a visible non-terminal change is active or carries active Apply iteration-limit evidence
+- **WHEN** the operator toggles its mark
+- **THEN** the mark changes without stopping or retrying the current run
+- **AND** final run admission remains responsible for deciding future executability
 
-#### Scenario: overlay consumes bulk-mark input
+#### Scenario: overlay consumes mark input
 
 - **GIVEN** a warning popup, QR, worktree-delete confirmation, or force-kill confirmation owns input
-- **WHEN** the operator presses `x`
+- **WHEN** the operator presses Space or `x`
 - **THEN** the overlay handles or consumes the key according to its interaction contract
-- **AND** the underlying bulk-mark action does not run
+- **AND** the underlying mark action does not run
+
+#### Scenario: terminal row ignores mark input
+
+- **GIVEN** the cursor is on an archived, merged, pushed, or rejected row
+- **WHEN** the operator presses Space
+- **THEN** no execution mark or other state changes
+- **AND** no warning is presented
+
+<!-- Expected canonical result after archive: `tui-state` will keep modal input ownership but remove lifecycle-based mark immutability and treat post-archive Space as silent no-op. -->

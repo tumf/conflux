@@ -59,6 +59,8 @@ struct Harness {
     state: Arc<RwLock<OrchestratorState>>,
     scheduler: Arc<RecordingScheduler>,
     marks: Arc<ExecutionMarkStore>,
+    queue: Arc<FakeQueue>,
+    operator: Arc<OperatorCommandService>,
     resolves: Arc<ResolveReservations>,
     eligibility: Arc<StartEligibility>,
 }
@@ -71,13 +73,14 @@ impl Harness {
         )));
         let marks = Arc::new(ExecutionMarkStore::new());
         let scheduler = Arc::new(RecordingScheduler::new());
+        let queue = Arc::new(FakeQueue::default());
         // The scheduler is the liveness authority for the active Apply-limit
         // gate, so the service the run-control path composes with observes the
         // *same* handle the dispatch decision reads.
         let operator = Arc::new(
             OperatorCommandService::new(
                 state.clone(),
-                Arc::new(FakeQueue::default()),
+                queue.clone(),
                 Arc::new(NoopQueueHooks),
                 marks.clone(),
             )
@@ -88,7 +91,7 @@ impl Harness {
         Self {
             service: RunControlService::new(
                 state.clone(),
-                operator,
+                operator.clone(),
                 scheduler.clone(),
                 resolves.clone(),
                 eligibility.clone(),
@@ -96,6 +99,8 @@ impl Harness {
             state,
             scheduler,
             marks,
+            queue,
+            operator,
             resolves,
             eligibility,
         }
@@ -104,6 +109,37 @@ impl Harness {
     fn mark(&self, change_ids: &[&str]) {
         self.marks
             .replace(change_ids.iter().map(|id| id.to_string()));
+    }
+
+    /// Everything the run-control path could have mutated outside the mark store.
+    ///
+    /// A single snapshot keeps "failed admission left no partial effect" a
+    /// comparison rather than a list of assertions that can silently miss one.
+    async fn effects(&self) -> RunEffects {
+        // Read the blocking queue locks out first: a `MutexGuard` that is still
+        // a live temporary when the reducer read awaits would hold a sync lock
+        // across a yield point.
+        let queue = self.queue.entries.lock().unwrap().clone();
+        let notifications = *self.queue.notifications.lock().unwrap();
+        let statuses = {
+            let guard = self.state.read().await;
+            let mut statuses: Vec<(String, String)> = guard
+                .tracked_change_ids()
+                .into_iter()
+                .map(|id| {
+                    let status = guard.display_status(&id).to_string();
+                    (id, status)
+                })
+                .collect();
+            statuses.sort();
+            statuses
+        };
+        RunEffects {
+            scheduler: self.scheduler.calls(),
+            queue,
+            notifications,
+            statuses,
+        }
     }
 
     async fn apply(&self, event: ExecutionEvent) {
@@ -158,6 +194,15 @@ impl Harness {
     }
 }
 
+/// Every observable effect a run command could leave behind, outside marks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunEffects {
+    scheduler: Vec<SchedulerCall>,
+    queue: Vec<String>,
+    notifications: usize,
+    statuses: Vec<(String, String)>,
+}
+
 fn external_blocker() -> StalledBlocker {
     StalledBlocker {
         category: "external_service".to_string(),
@@ -194,6 +239,7 @@ async fn start_consumes_the_authoritative_marked_target_set() {
             change_ids: vec!["a".to_string(), "c".to_string()],
             explicit_retry: false,
             scheduler: SchedulerEffect::Started,
+            excluded: Vec::new(),
         }
     );
     assert_eq!(
@@ -394,6 +440,7 @@ async fn retry_routes_a_terminal_error_and_dispatches_the_scheduler() {
             change_ids: vec!["a".to_string()],
             explicit_retry: true,
             scheduler: SchedulerEffect::Started,
+            excluded: Vec::new(),
         }
     );
     assert_eq!(
@@ -475,6 +522,13 @@ async fn start_in_error_mode_retries_the_marked_error_rows() {
             change_ids: vec!["a".to_string()],
             explicit_retry: true,
             scheduler: SchedulerEffect::Started,
+            // `b` is marked but carries no retryable evidence. A mark is
+            // next-run intent, so it is reported as excluded rather than
+            // refused when it was set.
+            excluded: vec![ExcludedTarget {
+                change_id: "b".to_string(),
+                status: "not queued".to_string(),
+            }],
         },
         "only the row that carries retryable evidence is retried"
     );
@@ -1135,6 +1189,7 @@ async fn active_iteration_limit_run_boundary_admits_a_later_run_after_task_exit(
             change_ids: vec!["limited".to_string()],
             explicit_retry: true,
             scheduler: SchedulerEffect::Started,
+            excluded: Vec::new(),
         },
         "a later boundary is started, never a wake-up of the exited scheduler"
     );
@@ -1201,6 +1256,7 @@ async fn active_iteration_limit_bulk_retry_dispatches_only_the_admitted_targets(
             change_ids: vec!["ordinary".to_string()],
             explicit_retry: true,
             scheduler: SchedulerEffect::Notified,
+            excluded: Vec::new(),
         },
         "the limited target is neither dispatched nor reported as accepted"
     );
@@ -1246,18 +1302,261 @@ async fn active_iteration_limit_bulk_retry_error_mode_start_is_mutation_free() {
     harness.mark(&["limited"]);
     let calls_before = harness.scheduler.calls();
 
+    let error = harness
+        .service
+        .start(OperatorMode::Error)
+        .await
+        .expect_err("no marked target carries retryable evidence");
+
+    let RunControlError::NoEligibleTarget {
+        command: RunCommandKind::Start,
+        ref detail,
+    } = error
+    else {
+        panic!("an all-limited request is rejected at admission: {error:?}");
+    };
+    assert!(
+        detail.contains("limited"),
+        "the excluded target must be named: {detail}"
+    );
+    assert_eq!(harness.scheduler.calls(), calls_before);
+    assert_eq!(harness.status("limited").await, "error");
+}
+
+// ============================================================================
+// Final-admission ownership of run-target validity
+// ============================================================================
+//
+// A mark is next-run target intent and nothing else: it carries no eligibility
+// of its own and is accepted for any non-terminal row at any time. These tests
+// pin the consequence — the *whole* run-target decision belongs to the final
+// start/retry admission, is taken from current reducer and worktree facts, and
+// leaves nothing behind when it refuses.
+
+/// Marks recorded while a row was unrunnable are re-read at admission.
+///
+/// Nothing about the mark changes between the two starts; only the reducer
+/// status does. That is what makes the eligibility decision admission-owned
+/// rather than a mark-time verdict that outlived the state it was taken from.
+#[tokio::test]
+async fn run_mark_intent_start_admission_reads_current_status_not_mark_time_status() {
+    let harness = Harness::new(&["a"]);
+    harness
+        .state
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("a".to_string()));
+    harness.mark(&["a"]);
+
+    let refused = harness
+        .service
+        .start(OperatorMode::Select)
+        .await
+        .expect_err("an already-queued row is not a start target");
+    assert!(matches!(refused, RunControlError::NoEligibleTarget { .. }));
+
+    // The same mark, a later reducer state: now it runs.
+    harness
+        .state
+        .write()
+        .await
+        .apply_command(ReducerCommand::RemoveFromQueue("a".to_string()));
+    assert_eq!(harness.status("a").await, "not queued");
+
+    let outcome = harness
+        .service
+        .start(OperatorMode::Select)
+        .await
+        .expect("the unchanged mark is admitted once the status allows it");
+
+    assert!(matches!(outcome, RunControlOutcome::RunDispatched { .. }));
+    assert_eq!(
+        harness.scheduler.started_targets(),
+        vec![vec!["a".to_string()]]
+    );
+}
+
+/// A non-startable mark is excluded by name; it does not block runnable work.
+#[tokio::test]
+async fn run_mark_intent_start_admission_excludes_status_without_blocking_runnable_targets() {
+    let harness = Harness::new(&["runnable", "waiting"]);
+    harness.to_merge_wait("waiting").await;
+    harness.mark(&["runnable", "waiting"]);
+
+    let outcome = harness
+        .service
+        .start(OperatorMode::Select)
+        .await
+        .expect("one non-startable mark does not refuse the runnable subset");
+
+    assert_eq!(
+        outcome,
+        RunControlOutcome::RunDispatched {
+            change_ids: vec!["runnable".to_string()],
+            explicit_retry: false,
+            scheduler: SchedulerEffect::Started,
+            excluded: vec![ExcludedTarget {
+                change_id: "waiting".to_string(),
+                status: "merge wait".to_string(),
+            }],
+        },
+        "the admitted run must name the marked target it left out, and why"
+    );
+    assert_eq!(
+        harness.scheduler.started_targets(),
+        vec![vec!["runnable".to_string()]]
+    );
+    assert_eq!(
+        harness.marks.marked_ids(),
+        vec!["runnable".to_string(), "waiting".to_string()],
+        "admission consumes marks; it does not revoke them"
+    );
+}
+
+/// Zero runnable targets rejects, and the refusal names every exclusion.
+#[tokio::test]
+async fn run_mark_intent_start_admission_rejects_when_no_runnable_target_remains() {
+    let harness = Harness::new(&["waiting", "failed"]);
+    harness.to_merge_wait("waiting").await;
+    harness.to_error("failed").await;
+    harness.mark(&["waiting", "failed"]);
+    let before = harness.effects().await;
+
+    let error = harness
+        .service
+        .start(OperatorMode::Select)
+        .await
+        .expect_err("no marked target is startable");
+
+    match &error {
+        RunControlError::NoEligibleTarget { detail, .. } => {
+            assert!(
+                detail.contains("waiting (merge wait)") && detail.contains("failed (error)"),
+                "every exclusion must be named with its status: {detail}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(
+        harness.effects().await,
+        before,
+        "a rejected admission leaves no queue, scheduler, or reducer effect"
+    );
+}
+
+/// The worktree fence refuses the complete request, effect-free.
+#[tokio::test]
+async fn run_mark_intent_start_admission_worktree_fence_rejects_the_whole_request() {
+    let harness = Harness::new(&["runnable", "ineligible"]);
+    harness.mark(&["runnable", "ineligible"]);
+    harness.eligibility.set_parallel_ineligible([(
+        "ineligible".to_string(),
+        ParallelEligibility::UncommittedProposalFiles,
+    )]);
+    let before = harness.effects().await;
+
+    let error = harness
+        .service
+        .start(OperatorMode::Select)
+        .await
+        .expect_err("one worktree-ineligible mark refuses the whole request");
+
+    match &error {
+        RunControlError::NoEligibleTarget { detail, .. } => assert!(
+            detail.contains("ineligible"),
+            "the refusal must name the fenced target: {detail}"
+        ),
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(
+        harness.effects().await,
+        before,
+        "the fence refuses before any partial effect exists"
+    );
+}
+
+/// Error-mode Start routes only marked retry-eligible rows.
+#[tokio::test]
+async fn run_mark_intent_start_admission_error_mode_routes_only_retryable_marks() {
+    let harness = Harness::new(&["failed", "idle"]);
+    harness.to_error("failed").await;
+    harness.mark(&["failed", "idle"]);
+
     let outcome = harness
         .service
         .start(OperatorMode::Error)
         .await
-        .expect("Error-mode start settles as a no-op rather than failing");
+        .expect("the retryable mark is routed");
 
     assert_eq!(
         outcome,
-        RunControlOutcome::NoOp {
-            reason: RunNoOpReason::NoRetryableTarget
-        }
+        RunControlOutcome::RunDispatched {
+            change_ids: vec!["failed".to_string()],
+            explicit_retry: true,
+            scheduler: SchedulerEffect::Started,
+            excluded: vec![ExcludedTarget {
+                change_id: "idle".to_string(),
+                status: "not queued".to_string(),
+            }],
+        },
+        "a marked row without retryable evidence is reported, not retried"
     );
-    assert_eq!(harness.scheduler.calls(), calls_before);
-    assert_eq!(harness.status("limited").await, "error");
+    assert_eq!(
+        harness.scheduler.started_targets(),
+        vec![vec!["failed".to_string()]]
+    );
+}
+
+/// Error-mode Start with nothing retryable rejects and names the exclusions.
+#[tokio::test]
+async fn run_mark_intent_start_admission_error_mode_rejects_without_retryable_marks() {
+    let harness = Harness::new(&["idle"]);
+    harness.mark(&["idle"]);
+    let before = harness.effects().await;
+
+    let error = harness
+        .service
+        .start(OperatorMode::Error)
+        .await
+        .expect_err("no marked row carries retryable evidence");
+
+    match &error {
+        RunControlError::NoEligibleTarget { detail, .. } => assert!(
+            detail.contains("idle (not queued)"),
+            "the refusal must name the exclusion: {detail}"
+        ),
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(harness.effects().await, before);
+}
+
+/// Unmarking after admission changes only the next run, never this one.
+#[tokio::test]
+async fn run_mark_intent_start_admission_unmark_does_not_cancel_or_dequeue_admitted_work() {
+    let harness = Harness::new(&["a", "b"]);
+    harness.mark(&["a", "b"]);
+    harness
+        .service
+        .start(OperatorMode::Select)
+        .await
+        .expect("both marked targets are startable");
+    let admitted = harness.effects().await;
+
+    // The operator changes their mind *after* the run took the target.
+    let changed = harness
+        .operator
+        .set_execution_mark("a", false)
+        .await
+        .expect("a non-terminal row accepts an unmark at any time");
+    assert!(matches!(
+        changed,
+        crate::orchestration::operator_command::OperatorOutcome::MarkSet { marked: false, .. }
+    ));
+
+    assert_eq!(harness.marks.marked_ids(), vec!["b".to_string()]);
+    assert_eq!(
+        harness.effects().await,
+        admitted,
+        "unmarking must not dequeue, cancel, unschedule, or restatus admitted work"
+    );
 }

@@ -165,7 +165,6 @@ struct WorkflowFacts {
 /// The same lifecycle traffic and the same operator commands both TUIs see.
 async fn drive(harness: &mut Harness, observe_dirty: bool) -> Vec<String> {
     let mut command_outcomes = Vec::new();
-    let mode = harness.app.execution_mode.operator_mode();
 
     if observe_dirty {
         harness.observe_workspace_dirty(true);
@@ -173,10 +172,7 @@ async fn drive(harness: &mut Harness, observe_dirty: bool) -> Vec<String> {
 
     command_outcomes.push(format!(
         "{:?}",
-        harness
-            .operator
-            .set_execution_mark(mode, "alpha", true)
-            .await
+        harness.operator.set_execution_mark("alpha", true).await
     ));
     command_outcomes.push(format!(
         "{:?}",
@@ -215,10 +211,7 @@ async fn drive(harness: &mut Harness, observe_dirty: bool) -> Vec<String> {
     ));
     command_outcomes.push(format!(
         "{:?}",
-        harness
-            .operator
-            .set_execution_mark(mode, "beta", true)
-            .await
+        harness.operator.set_execution_mark("beta", true).await
     ));
 
     command_outcomes
