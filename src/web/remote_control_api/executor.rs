@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::orchestration::operator_command::{
-    MarkExclusion, NoOpReason, OperatorCommandError, OperatorOutcome,
+    MarkExclusion, NoOpReason, OperatorCommandError, OperatorOutcome, StopSettlement,
 };
 use crate::orchestration::operator_coordinator::{
     ApplicationOutcome, ApplicationResult, OperatorApplication, OperatorIntent,
@@ -21,7 +21,9 @@ use crate::orchestration::run_control::{
 };
 use crate::web::state::WebState;
 
-use super::dto::{CommandSpec, ErrorCode};
+use super::dto::{
+    ApplyCommitEvidence, CommandResult, CommandSpec, ErrorCode, ExecutionPhase as DtoPhase,
+};
 
 /// What a delegated command did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,12 @@ pub struct ExecutionSummary {
     /// sampling is exactly how unrelated later scheduler progress used to become
     /// a command's recorded `result_revision`.
     pub result_revision: Option<u64>,
+    /// Typed settlement evidence, for the commands that produce it.
+    ///
+    /// Travels with the outcome rather than being read at settlement time, for
+    /// the same reason `result_revision` does: by the time the record settles,
+    /// the system may already describe a different instant.
+    pub result: Option<CommandResult>,
 }
 
 impl ExecutionSummary {
@@ -46,6 +54,7 @@ impl ExecutionSummary {
             changed: true,
             detail: Some(detail.into()),
             result_revision: None,
+            result: None,
         }
     }
 
@@ -55,12 +64,19 @@ impl ExecutionSummary {
             changed: false,
             detail: Some(detail.into()),
             result_revision: None,
+            result: None,
         }
     }
 
     /// Bind the revision this command's outcome dispatch produced.
     pub fn at_revision(mut self, revision: Option<u64>) -> Self {
         self.result_revision = revision;
+        self
+    }
+
+    /// Bind the typed settlement evidence this command fixed.
+    pub fn with_result(mut self, result: CommandResult) -> Self {
+        self.result = Some(result);
         self
     }
 }
@@ -213,9 +229,11 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
                 ))
             }
         }
-        OperatorOutcome::Dequeued { change_id } => {
-            ExecutionSummary::changed(format!("'{change_id}' was cancelled and dequeued"))
-        }
+        OperatorOutcome::Dequeued {
+            change_id,
+            settlement,
+        } => ExecutionSummary::changed(settlement.describe(change_id))
+            .with_result(stop_result(settlement)),
         OperatorOutcome::Retry(plan) => {
             if plan.is_empty() {
                 ExecutionSummary::no_op("no change carried retryable evidence")
@@ -261,6 +279,24 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
                 ExecutionSummary::no_op(format!("'{change_id}': {why}"))
             }
         }
+    }
+}
+
+/// The typed result a settled successful stop-and-dequeue carries.
+///
+/// `effects_rolled_back` is a literal `false` rather than a computed value: a
+/// dequeue cancels and removes, and there is no code path in which it could undo
+/// a completed worktree effect. Publishing it explicitly is what stops a client
+/// from assuming the opposite.
+pub fn stop_result(settlement: &StopSettlement) -> CommandResult {
+    CommandResult::StopAndDequeue {
+        cancelled_phase: DtoPhase::from_shared(settlement.cancelled_phase),
+        last_completed_phase: settlement.last_completed_phase.map(DtoPhase::from_shared),
+        apply_commit: ApplyCommitEvidence {
+            present: settlement.apply_commit_present,
+            oid: settlement.apply_commit_oid.clone(),
+        },
+        effects_rolled_back: false,
     }
 }
 

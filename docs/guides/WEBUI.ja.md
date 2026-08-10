@@ -51,8 +51,10 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 |----------|--------|-------------|
 | `/api/v2/health` | GET | ヘルスチェック |
 | `/api/v2/state` | GET | オーケストレーター全状態 |
+| `/api/v2/execution-status` | GET | 実際に今何が実行中かの観測 |
 | `/api/v2/changes` | GET | 進捗付きの変更一覧 |
 | `/api/v2/changes/{id}` | GET | 特定変更の詳細 |
+| `/api/v2/logs` | GET | 保持されている構造化ログリング |
 | `/api/v2/commands` | POST | 制御コマンドの送信 |
 
 認証・リビジョン・冪等性の詳細は
@@ -81,6 +83,82 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 スナップショットでフィールドのクリアも表現できます。これらはいずれも永続化
 されません。実行マーク・attention・timing は新しいプロセスで空から始まり、
 ワークフローのルーティングはワークスペースから再計算されます。
+
+### 介入する前に execution-status を読む
+
+`GET /api/v2/state` は「何を命令できるか」を答えます。`GET /api/v2/execution-status`
+は「実際に何が起きているか」を答えます。これは別の問いであり、自分で停止・
+コミット・アーカイブ・マージを行う前に確認すべきなのは後者です。
+
+表示文字列ではなく閉じた型付き語彙で、次を返します。
+
+- `process.scheduler_running` — スケジューラタスクが生存している
+- `process.has_active_work` — ライフサイクル作業が実際に走っている。**この 2 つは
+  同じではありません。** 実行対象が無く待機中の常駐スケジューラは
+  `scheduler_running: true` かつ `has_active_work: false` です。また `cflx run`
+  は run supervisor を束縛しないため、実行中もつねに
+  `scheduler_running: false` を返し、作業の有無は `has_active_work` 側に出ます
+- `process.active_activities` — 個々の変更に属さないプロセスレベルの処理
+  （依存解析、base ブランチマージ、コンフリクト解決、ブランチマージ、
+  ワークスペースクリーンアップ）
+- 変更ごとに `execution_state`、`current_phase`、`last_completed_phase`、
+  `iteration`、フェーズおよび実行の境界時刻、`latest_activity`、および構造化
+  `change_id` が完全一致する最新の保持ログ
+
+すべての時刻は `observed_at` を含め UTC RFC 3339 の絶対時刻です。経過秒や
+「N 分前」のような相対表現は返しません。相対時間はクライアント自身の時計では
+なく `observed_at` を基準に計算してください。不明な情報は `null` または明示的な
+`unknown` であり、推測されることはありません。
+
+ログのみが到着した場合、`latest_log` と `event_sequence` は変化しますが
+`state_revision` は変わりません。したがってこのリソースが楽観的並行制御の
+トークンを無効化することはありません。
+
+保持ログ全体は `GET /api/v2/logs`、ライブ観測は `/api/v2/events` と
+`/api/v2/ws` のままです。API のレスポンス・スキーマ・イベント・ケイパビリティ・
+コマンド結果のいずれも、永続ログのパス、リポジトリルート、ログの位置指定として
+のワークスペースパス、`file://` URL を公開しません。ログ取得のためにホストパスや
+ファイル名を受け取るエンドポイントもありません。これは Unix ソケットでも TCP でも
+同一です。
+
+### display_status から Apply コミットの不在を推測しない
+
+`display_status` がまだ `applying` であることや、`stop_and_dequeue` が成功した
+ことは、Apply が最終コミットを既に作成したかどうかについて**何も**語りません。
+キャンセルの伝播中に Apply が完了して Acceptance が始まることがあります。ここで
+推測すると、手動で重複コミットを作ってしまいます。
+
+成功して確定した `stop_and_dequeue` は、コマンドレコードに型付きの確定証跡を
+公開します。
+
+```json
+{
+  "state": "succeeded",
+  "result": {
+    "kind": "stop_and_dequeue",
+    "cancelled_phase": "acceptance",
+    "last_completed_phase": "apply",
+    "apply_commit": { "present": true, "oid": "<完全なコミット OID>" },
+    "effects_rolled_back": false
+  }
+}
+```
+
+`detail` ではなく `result` を読んでください。重要な規則は 3 つです。
+
+- `cancelled_phase` は dequeue の直前、**確定時点**でアクティブだったフェーズ
+  です。コマンド受理時点で見えていたフェーズではありません。`none` は対象が
+  既に終了していたことを意味します。
+- `apply_commit.present` が `true` になるのは、保持している型付き Apply 完了 OID が
+  管理ワークツリーの履歴に含まれるとサーバーが証明できた場合だけです。証明でき
+  なかった場合（再起動後、ワークツリー不在、Git 失敗、非祖先）は `null` です。
+  **`null` は「不明」であり「存在しない」ではありません。** コミットメッセージ、
+  タスク数、表示ステータス、ログから導出されることはありません。
+- `effects_rolled_back` は常に `false` です。dequeue はキャンセルして取り除く
+  だけで、ワークツリーに既に存在する成果を取り消しません。
+
+同一の冪等キーで再送すると、リポジトリの状態が変わった後でも、証跡を含む元の
+レコードがそのまま返ります。
 
 ## イベントストリーム
 

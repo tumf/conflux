@@ -38,6 +38,7 @@ fn record(command_id: &str, key: &str, state: CommandState) -> CommandRecord {
             _ => Some(now().to_rfc3339()),
         },
         detail: None,
+        result: None,
         error_code: None,
     }
 }
@@ -85,6 +86,7 @@ fn structurally_equal_replay_returns_the_original_record() {
             result_revision: 6,
             detail: Some("done".to_string()),
             error_code: None,
+            result: None,
         },
     );
 
@@ -137,6 +139,7 @@ fn completed_records_expire_after_the_configured_ttl() {
             result_revision: 1,
             detail: None,
             error_code: None,
+            result: None,
         },
     );
 
@@ -239,6 +242,7 @@ fn a_key_whose_command_record_vanished_fails_closed_as_a_mismatch() {
             result_revision: 1,
             detail: Some("nope".to_string()),
             error_code: Some(ErrorCode::TargetIneligible),
+            result: None,
         },
     );
     let stored = registry.get("cmd1").unwrap();

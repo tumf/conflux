@@ -31,6 +31,8 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use crate::orchestration::apply_commit_evidence::ApplyCommitEvidence;
+use crate::orchestration::execution_facts::{project_phase, ExecutionFactsStore, ExecutionPhase};
 use crate::orchestration::state::{OrchestratorState, ReduceOutcome, ReducerCommand};
 
 /// Default bound for waiting on confirmed task termination during stop-and-dequeue.
@@ -787,6 +789,73 @@ pub struct QueueOutcome {
     pub display_status: String,
 }
 
+/// Explanatory evidence fixed at a successful stop-and-dequeue settlement.
+///
+/// Every field is a *non-authoritative observation*. It explains what the
+/// operator interrupted; it never gates a next action, never becomes durable
+/// workflow state, and never causes a missing fact to be guessed. Unknown stays
+/// unknown, which is why the Apply-commit fields are nullable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StopSettlement {
+    /// The typed phase active immediately before dequeue was applied.
+    ///
+    /// `None` for an already-terminated target or one with no active phase. It
+    /// is deliberately read at settlement rather than at admission: a worker can
+    /// finish Apply and enter Acceptance while cancellation is in flight, and
+    /// reporting the admitted-time phase would name the wrong one.
+    pub cancelled_phase: ExecutionPhase,
+    /// The last phase that published a typed completion fact.
+    pub last_completed_phase: Option<ExecutionPhase>,
+    /// Whether the final managed-worktree Apply commit was proven present;
+    /// `None` when the evidence could not be read.
+    pub apply_commit_present: Option<bool>,
+    /// The proven Apply commit OID; `Some` only when presence is `Some(true)`.
+    pub apply_commit_oid: Option<String>,
+}
+
+impl StopSettlement {
+    /// The settlement of a target with nothing left running and no evidence.
+    pub fn none() -> Self {
+        Self {
+            cancelled_phase: ExecutionPhase::None,
+            last_completed_phase: None,
+            apply_commit_present: None,
+            apply_commit_oid: None,
+        }
+    }
+
+    /// The one operator-facing sentence every frontend records for this settlement.
+    ///
+    /// Presentation only — a machine consumer reads the typed fields — but it
+    /// must not mislead, so it names the phase that was actually cancelled,
+    /// states what is known about the final Apply commit, and always denies
+    /// rollback. The incident this exists for is a reader treating generic
+    /// command success as proof that no Apply commit had been created.
+    pub fn describe(&self, change_id: &str) -> String {
+        let what = match self.cancelled_phase {
+            ExecutionPhase::None => {
+                format!("'{change_id}' was already terminated and was dequeued")
+            }
+            ExecutionPhase::Unknown => format!(
+                "'{change_id}' was dequeued; the phase it was cancelled during could not be \
+                 determined"
+            ),
+            phase => format!(
+                "'{change_id}' was cancelled during {} and dequeued",
+                phase.as_str()
+            ),
+        };
+        let apply = match (self.apply_commit_present, self.apply_commit_oid.as_deref()) {
+            (Some(true), Some(oid)) => {
+                format!("; the final Apply commit {oid} was already created")
+            }
+            (Some(true), None) => "; the final Apply commit was already created".to_string(),
+            _ => "; whether the final Apply commit exists could not be proven".to_string(),
+        };
+        format!("{what}{apply}; previously completed worktree effects were not rolled back")
+    }
+}
+
 /// Why a command produced no state change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoOpReason {
@@ -819,6 +888,8 @@ pub enum OperatorOutcome {
     Dequeued {
         /// Target change.
         change_id: String,
+        /// Explanatory evidence fixed at the settlement boundary.
+        settlement: StopSettlement,
     },
     /// A retry was accepted and routed.
     Retry(RetryPlan),
@@ -1188,6 +1259,12 @@ pub struct OperatorCommandService {
     /// Unbound for a process with no command-capable scheduler, which is exactly
     /// the process that has no retry to admit.
     run_boundary: Option<Arc<dyn RunBoundaryLiveness>>,
+    /// Shared process-local execution facts.
+    ///
+    /// Read-only here, and only for explanatory settlement evidence: no
+    /// admission, routing, or reducer decision consults it. `None` for a process
+    /// with no observability consumer, which then reports unknown.
+    execution_facts: Option<Arc<ExecutionFactsStore>>,
 }
 
 impl OperatorCommandService {
@@ -1210,6 +1287,7 @@ impl OperatorCommandService {
             parallel: Arc::new(ParallelRuntime::new()),
             cancellation_timeout: DEFAULT_CANCELLATION_TIMEOUT,
             run_boundary: None,
+            execution_facts: None,
         }
     }
 
@@ -1227,6 +1305,21 @@ impl OperatorCommandService {
     pub fn with_run_boundary(mut self, boundary: Arc<dyn RunBoundaryLiveness>) -> Self {
         self.run_boundary = Some(boundary);
         self
+    }
+
+    /// Bind the shared process-local execution-facts store.
+    ///
+    /// The same store the authoritative dispatch owner feeds, so the phase a
+    /// settled command reports and the phase the execution-status resource
+    /// publishes come from one observation rather than two.
+    pub fn with_execution_facts(mut self, facts: Arc<ExecutionFactsStore>) -> Self {
+        self.execution_facts = Some(facts);
+        self
+    }
+
+    /// The bound execution-facts store, if this process has one.
+    pub fn execution_facts(&self) -> Option<Arc<ExecutionFactsStore>> {
+        self.execution_facts.clone()
     }
 
     /// Override the bound used when waiting for confirmed task termination.
@@ -1540,7 +1633,11 @@ impl OperatorCommandService {
     pub async fn stop_and_dequeue(&self, change_id: &str) -> OperatorResult<OperatorOutcome> {
         let pending = self.begin_stop_and_dequeue(change_id).await?;
         pending.confirm_termination().await?;
-        self.commit_stop_and_dequeue(change_id).await
+        // No evidence port on this convenience path: it is the single-caller
+        // shape used where nothing consumes explanatory Git evidence, and an
+        // unproven commit is reported as unknown rather than guessed.
+        self.commit_stop_and_dequeue(change_id, ApplyCommitEvidence::unknown())
+            .await
     }
 
     /// The bound this service waits for confirmed task termination within.
@@ -1600,14 +1697,27 @@ impl OperatorCommandService {
     pub async fn commit_stop_and_dequeue(
         &self,
         change_id: &str,
+        apply_commit: ApplyCommitEvidence,
     ) -> OperatorResult<OperatorOutcome> {
         // Commit the dequeue and its mark revocation as one indivisible mutation:
         // the same guard event reconciliation takes, so the `ChangeDequeued` edge
         // this produces cannot land between the two halves.
         let _mutation = self.parallel.lock_mutations().await;
-        let reduce_outcome = {
+        // The phase is read from the *same* write guard that applies the
+        // dequeue, immediately before it. `DequeueChange` clears the activity it
+        // describes, so a read taken after the commit — or under a second lock
+        // acquisition — could only ever report `none`.
+        let (cancelled_phase, reduce_outcome) = {
             let mut guard = self.state.write().await;
-            guard.apply_command(ReducerCommand::DequeueChange(change_id.to_string()))
+            let phase = guard
+                .change_runtime(change_id)
+                .map(|runtime| project_phase(runtime, self.push_open(change_id)))
+                // The reducer does not track this change at all, so there is no
+                // typed evidence to classify. That is unknown, not "nothing was
+                // running".
+                .unwrap_or(ExecutionPhase::Unknown);
+            let outcome = guard.apply_command(ReducerCommand::DequeueChange(change_id.to_string()));
+            (phase, outcome)
         };
         if matches!(reduce_outcome, ReduceOutcome::NoOp) {
             return Ok(OperatorOutcome::NoOp {
@@ -1619,7 +1729,27 @@ impl OperatorCommandService {
 
         Ok(OperatorOutcome::Dequeued {
             change_id: change_id.to_string(),
+            settlement: StopSettlement {
+                cancelled_phase,
+                last_completed_phase: self
+                    .execution_facts
+                    .as_ref()
+                    .and_then(|facts| facts.change(change_id).last_completed_phase),
+                apply_commit_present: apply_commit.present,
+                apply_commit_oid: apply_commit.oid,
+            },
         })
+    }
+
+    /// Whether a typed push episode is open for a change.
+    ///
+    /// Publication reuses the reducer's `Resolving` activity, so without this
+    /// the settlement would report a cancelled resolve where a cancelled push
+    /// actually happened.
+    fn push_open(&self, change_id: &str) -> bool {
+        self.execution_facts
+            .as_ref()
+            .is_some_and(|facts| facts.change(change_id).current_phase == ExecutionPhase::Push)
     }
 
     /// Record operator intent to resolve a merge for a change.

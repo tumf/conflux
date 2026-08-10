@@ -8,6 +8,7 @@ use serde_json::json;
 
 use crate::orchestration::operator_command::{
     OperatorCommandError, OperatorMode, OperatorOutcome, QueueMutation, QueueOutcome, RetryPlan,
+    StopSettlement,
 };
 use crate::web::remote_control_api::dto::{
     CommandIdentity, CommandRecord, CommandSpec, CommandState, ErrorCode,
@@ -500,7 +501,8 @@ fn shared_service_outcomes_distinguish_real_effects_from_no_ops() {
 
     assert!(
         summarize_outcome(&OperatorOutcome::Dequeued {
-            change_id: "c1".to_string()
+            change_id: "c1".to_string(),
+            settlement: StopSettlement::none(),
         })
         .changed
     );

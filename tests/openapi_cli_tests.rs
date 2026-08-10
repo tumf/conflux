@@ -85,6 +85,23 @@ mod available {
             document["paths"]["/api/v2/state"].is_object(),
             "the export must carry the served route surface, not a stub"
         );
+        // An agent reads the exported contract to learn that execution
+        // observability exists at all, so the export and the live endpoint must
+        // agree about it rather than only the live one carrying it.
+        assert!(
+            document["paths"]["/api/v2/execution-status"].is_object(),
+            "the export must carry the execution-status resource"
+        );
+        assert!(
+            document["components"]["schemas"]["ExecutionPhase"]["enum"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "acceptance")),
+            "the export must carry the closed phase vocabulary"
+        );
+        assert!(
+            document["components"]["schemas"]["CommandResult"].is_object(),
+            "the export must carry the typed command-result contract"
+        );
 
         std::fs::remove_dir_all(&dir).expect("scratch dir is removable");
     }

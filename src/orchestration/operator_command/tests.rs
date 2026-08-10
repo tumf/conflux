@@ -902,7 +902,18 @@ async fn operator_command_stop_and_dequeue_waits_for_confirmed_termination() {
     assert_eq!(
         outcome,
         OperatorOutcome::Dequeued {
-            change_id: "change-a".to_string()
+            change_id: "change-a".to_string(),
+            // The reducer still carries the Apply activity when the dequeue is
+            // committed, so the settlement names the phase that was actually
+            // cancelled. There is no facts store and no evidence port on this
+            // path, so the remaining fields are honestly unknown rather than
+            // guessed.
+            settlement: StopSettlement {
+                cancelled_phase: ExecutionPhase::Apply,
+                last_completed_phase: None,
+                apply_commit_present: None,
+                apply_commit_oid: None,
+            },
         }
     );
     assert!(
@@ -1026,7 +1037,8 @@ async fn operator_command_stop_and_dequeue_of_idle_row_needs_no_handle() {
     assert_eq!(
         outcome,
         OperatorOutcome::Dequeued {
-            change_id: "change-a".to_string()
+            change_id: "change-a".to_string(),
+            settlement: StopSettlement::none(),
         }
     );
     assert_eq!(

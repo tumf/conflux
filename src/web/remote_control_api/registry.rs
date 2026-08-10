@@ -14,8 +14,8 @@ use std::collections::{HashMap, VecDeque};
 use chrono::{DateTime, Utc};
 
 use super::dto::{
-    CommandIdentity, CommandRecord, CommandState, ErrorCode, COMMAND_RECORD_TTL_SECS,
-    MAX_COMMAND_RECORDS,
+    CommandIdentity, CommandRecord, CommandResult, CommandState, ErrorCode,
+    COMMAND_RECORD_TTL_SECS, MAX_COMMAND_RECORDS,
 };
 
 /// Result of looking up an idempotency key.
@@ -47,6 +47,8 @@ pub struct CommandOutcome {
     pub detail: Option<String>,
     /// Typed failure code when `state` is `Failed`.
     pub error_code: Option<ErrorCode>,
+    /// Typed settlement evidence, for the commands that produce it.
+    pub result: Option<CommandResult>,
 }
 
 /// Paired command and idempotency registries with a shared reservation step.
@@ -151,12 +153,17 @@ impl CommandRegistry {
     }
 
     /// Settle a reserved command record.
+    ///
+    /// The typed result is written here and only here. Nothing recomputes it
+    /// later, which is what makes an exact idempotent replay return the original
+    /// evidence rather than a fresh reading of a system that has moved on.
     pub fn complete(&mut self, command_id: &str, outcome: CommandOutcome) -> Option<CommandRecord> {
         let record = self.records.get_mut(command_id)?;
         record.state = outcome.state;
         record.result_revision = Some(outcome.result_revision);
         record.detail = outcome.detail;
         record.error_code = outcome.error_code;
+        record.result = outcome.result;
         record.completed_at = Some(Utc::now().to_rfc3339());
         Some(record.clone())
     }

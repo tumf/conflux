@@ -10,11 +10,13 @@ mod compatibility_tests;
 mod dto_tests;
 mod event_ownership_tests;
 mod execution_mark_event_tests;
+mod execution_status_tests;
 mod operator_snapshot_tests;
 mod parallel_control_tests;
 mod projection_tests;
 mod read_tests;
 mod registry_tests;
+mod stop_result_tests;
 mod stream_tests;
 mod worktree_tests;
 
@@ -125,6 +127,36 @@ pub(crate) struct Harness {
     pub(crate) projection: Arc<Projection>,
     pub(crate) executor: Arc<RecordingExecutor>,
     pub(crate) worktrees: Arc<worktree_tests::FakeWorktreePort>,
+    /// The shared execution-facts store the router's status resource reads.
+    ///
+    /// Bound in every harness — production binds it as soon as an orchestration
+    /// runtime exists — so a test drives it exactly the way the dispatch owner
+    /// does rather than through a second, easier path.
+    pub(crate) execution_facts: Arc<crate::orchestration::execution_facts::ExecutionFactsStore>,
+    /// The scheduler-liveness authority the status resource reports.
+    pub(crate) boundary: Arc<FakeRunBoundary>,
+}
+
+/// Scheduler-liveness double.
+///
+/// A separate authority from the facts store on purpose: "the scheduler is
+/// alive" and "lifecycle work is running" are the two answers this resource has
+/// to keep apart, and a double that fused them could not prove it.
+#[derive(Default)]
+pub(crate) struct FakeRunBoundary {
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl FakeRunBoundary {
+    pub(crate) fn set_running(&self, running: bool) {
+        self.running.store(running, Ordering::SeqCst);
+    }
+}
+
+impl crate::orchestration::operator_command::RunBoundaryLiveness for FakeRunBoundary {
+    fn boundary_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
 }
 
 /// Build a harness with the given bearer token and exact allowed origins.
@@ -144,15 +176,24 @@ pub(crate) fn harness_with_projection(
     let executor = RecordingExecutor::new();
     let worktrees = Arc::new(worktree_tests::FakeWorktreePort::default());
     executor.bind_worktrees(worktrees.clone());
+    let execution_facts =
+        Arc::new(crate::orchestration::execution_facts::ExecutionFactsStore::new());
+    let boundary = Arc::new(FakeRunBoundary::default());
+    let facts_handle = Arc::new(crate::web::remote_control_api::ExecutionFactsHandle::default());
+    facts_handle.bind(execution_facts.clone());
+    facts_handle.bind_boundary(boundary.clone());
     let router = router(
         RemoteControlState::new(projection.clone(), Arc::new(auth), executor.clone())
-            .with_worktrees(worktrees.clone()),
+            .with_worktrees(worktrees.clone())
+            .with_execution_facts(facts_handle),
     );
     Harness {
         router,
         projection,
         executor,
         worktrees,
+        execution_facts,
+        boundary,
     }
 }
 

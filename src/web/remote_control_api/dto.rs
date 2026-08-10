@@ -479,6 +479,14 @@ pub struct CommandRecord {
     /// Typed failure code when `state` is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<ErrorCode>,
+    /// Typed settlement evidence, for the commands that produce it.
+    ///
+    /// Written once when the command settles and never recomputed: an exact
+    /// idempotent replay returns the original value even after later lifecycle
+    /// or Git state has moved on. Absent for every command that has no typed
+    /// result, which keeps existing clients unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<CommandResult>,
 }
 
 impl CommandRecord {
@@ -1028,6 +1036,290 @@ pub struct LogsResponse {
     pub event_sequence: u64,
     /// Retained log entries, oldest first.
     pub logs: Vec<crate::events::LogEntry>,
+}
+
+// ============================================================================
+// Execution status
+// ============================================================================
+//
+// `/state` answers "what may I command"; `/execution-status` answers "what is
+// actually happening". The two are separate resources because they have
+// different truth conditions: the snapshot is the authoritative operator
+// decision state at `state_revision`, while everything below is explanatory
+// process-local observation that must never become workflow-control authority.
+//
+// Every instant here is an absolute UTC RFC 3339 string. No elapsed counter, age
+// counter, or relative-time phrase appears anywhere in this resource: a server
+// that published one would advance its own revision forever, and a client that
+// consumed one could not tell a stale response from a live one.
+
+/// Closed per-change lifecycle phase vocabulary.
+///
+/// `merge` is reachable only as a *last completed* phase, because the reducer
+/// has no merging activity to observe; `unknown` is the explicit value for
+/// typed evidence that cannot be classified, never a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    /// Admitted to a slot and preparing its managed workspace.
+    Preparing,
+    /// Running Apply.
+    Apply,
+    /// Running acceptance.
+    Acceptance,
+    /// Running dedicated rejection review.
+    RejectionReview,
+    /// Running archive.
+    Archive,
+    /// Running merge resolution.
+    Resolve,
+    /// A typed push episode is open.
+    Push,
+    /// A typed per-change merge completed. Never a current phase.
+    Merge,
+    /// No phase is active.
+    None,
+    /// Typed evidence exists but cannot be classified.
+    Unknown,
+}
+
+impl ExecutionPhase {
+    /// Project the shared orchestration phase onto the wire vocabulary.
+    pub fn from_shared(phase: crate::orchestration::execution_facts::ExecutionPhase) -> Self {
+        use crate::orchestration::execution_facts::ExecutionPhase as P;
+        match phase {
+            P::Preparing => Self::Preparing,
+            P::Apply => Self::Apply,
+            P::Acceptance => Self::Acceptance,
+            P::RejectionReview => Self::RejectionReview,
+            P::Archive => Self::Archive,
+            P::Resolve => Self::Resolve,
+            P::Push => Self::Push,
+            P::Merge => Self::Merge,
+            P::None => Self::None,
+            P::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Every phase value, in the order the contract advertises them.
+#[allow(dead_code)] // Read by the OpenAPI contract assertions, not by the binary.
+pub const ALL_EXECUTION_PHASES: [&str; 10] = [
+    "preparing",
+    "apply",
+    "acceptance",
+    "rejection_review",
+    "archive",
+    "resolve",
+    "push",
+    "merge",
+    "none",
+    "unknown",
+];
+
+/// Closed per-change execution-state vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeExecutionState {
+    /// Requested to run and waiting for a slot.
+    Queued,
+    /// The reducer holds an active execution stage.
+    Active,
+    /// Held on a wait or blocker condition.
+    Waiting,
+    /// Active while a graceful process stop is in flight.
+    Stopping,
+    /// Stopped by operator request.
+    Stopped,
+    /// Reached a terminal failure or rejection.
+    Failed,
+    /// Reached a terminal success.
+    Completed,
+    /// Tracked, but no typed evidence classifies it.
+    Unknown,
+}
+
+impl ChangeExecutionState {
+    /// Project the shared orchestration state onto the wire vocabulary.
+    pub fn from_shared(state: crate::orchestration::execution_facts::ChangeExecutionState) -> Self {
+        use crate::orchestration::execution_facts::ChangeExecutionState as S;
+        match state {
+            S::Queued => Self::Queued,
+            S::Active => Self::Active,
+            S::Waiting => Self::Waiting,
+            S::Stopping => Self::Stopping,
+            S::Stopped => Self::Stopped,
+            S::Failed => Self::Failed,
+            S::Completed => Self::Completed,
+            S::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Every execution-state value, in the order the contract advertises them.
+#[allow(dead_code)] // Read by the OpenAPI contract assertions, not by the binary.
+pub const ALL_CHANGE_EXECUTION_STATES: [&str; 8] = [
+    "queued",
+    "active",
+    "waiting",
+    "stopping",
+    "stopped",
+    "failed",
+    "completed",
+    "unknown",
+];
+
+/// A closed, path-free projection of one retained structured log entry.
+///
+/// Deliberately *not* [`crate::events::LogEntry`]: that shape carries a
+/// display-formatted `timestamp`, an epoch-seconds `created_at`, and a
+/// `workspace_path`. This resource publishes an absolute RFC 3339 instant and no
+/// filesystem locator at all, so a client can render a log line without ever
+/// learning where the process keeps its files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LatestLogProjection {
+    /// Sanitized, length-bounded message.
+    pub message: String,
+    /// Log level.
+    pub level: crate::events::LogLevel,
+    /// Operation the line came from, when the producer supplied one.
+    pub operation: Option<String>,
+    /// Iteration the line came from, when the producer supplied one.
+    pub iteration: Option<u32>,
+    /// Creation instant (absolute UTC RFC 3339).
+    pub created_at: String,
+}
+
+impl LatestLogProjection {
+    /// Project one retained entry, dropping every field that is not observable
+    /// content.
+    pub fn from_entry(entry: &crate::events::LogEntry) -> Self {
+        Self {
+            message: entry.message.clone(),
+            level: entry.level,
+            operation: entry.operation.clone(),
+            iteration: entry.iteration,
+            created_at: entry.created_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Process-level execution facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ProcessExecutionStatus {
+    /// Operator-facing application mode.
+    pub app_mode: String,
+    /// Whether the scheduler task owning the current run state is alive.
+    ///
+    /// Read from the same process-local liveness authority operator snapshot
+    /// eligibility and command admission use. A live scheduler parked with
+    /// nothing to execute reports `true` here and `false` in `has_active_work`.
+    pub scheduler_running: bool,
+    /// Whether any per-change phase or process-level episode is running.
+    pub has_active_work: bool,
+    /// Closed process-level episodes that have started and not terminated.
+    pub active_activities: Vec<String>,
+    /// Latest retained structured log line, regardless of change; `null` when
+    /// the ring is empty.
+    pub latest_log: Option<LatestLogProjection>,
+}
+
+/// One change's execution facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeExecutionStatus {
+    /// Change ID.
+    pub id: String,
+    /// Closed execution state.
+    pub execution_state: ChangeExecutionState,
+    /// Phase the reducer currently holds.
+    pub current_phase: ExecutionPhase,
+    /// Last phase that published its own typed completion fact; `null` when
+    /// none did in this incarnation.
+    pub last_completed_phase: Option<ExecutionPhase>,
+    /// Apply/archive iteration number, when a loop is running.
+    pub iteration: Option<u32>,
+    /// When the current phase became active (absolute UTC RFC 3339).
+    pub phase_started_at: Option<String>,
+    /// When the last completed phase completed (absolute UTC RFC 3339).
+    pub last_completed_at: Option<String>,
+    /// When the current or most recent run started (absolute UTC RFC 3339).
+    pub run_started_at: Option<String>,
+    /// When that run finished (absolute UTC RFC 3339); `null` while running.
+    pub run_completed_at: Option<String>,
+    /// Latest lifecycle-significant activity; `null` when nothing was observed.
+    pub latest_activity: Option<ChangeActivity>,
+    /// Latest retained log whose structured `change_id` exactly equals `id`.
+    pub latest_log: Option<LatestLogProjection>,
+}
+
+/// `GET /api/v2/execution-status` body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ExecutionStatusResponse {
+    /// Process incarnation ID.
+    pub instance_id: String,
+    /// Revision of the snapshot this observation was joined against.
+    ///
+    /// A log-only observation changes `latest_log` and `event_sequence` while
+    /// leaving this value alone: logs are observational and must never
+    /// invalidate a client's optimistic concurrency token.
+    pub state_revision: u64,
+    /// Latest allocated event sequence; the observation cursor.
+    pub event_sequence: u64,
+    /// Server observation instant (absolute UTC RFC 3339).
+    ///
+    /// Present so a client can render relative time against the *server's*
+    /// clock rather than its own. The API returns no relative time itself.
+    pub observed_at: String,
+    /// Process-level facts.
+    pub process: ProcessExecutionStatus,
+    /// Per-change facts, in snapshot order.
+    pub changes: Vec<ChangeExecutionStatus>,
+}
+
+// ============================================================================
+// Typed command results
+// ============================================================================
+
+/// Proof that the final managed-worktree Apply commit exists.
+///
+/// `present` is nullable so unreadable or ambiguous evidence stays unknown
+/// rather than collapsing into `false`, which a client would read as "Apply
+/// definitely produced nothing".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ApplyCommitEvidence {
+    /// True when the retained completion OID was proven to be in the managed
+    /// worktree's history; `null` when the evidence could not be read.
+    pub present: Option<bool>,
+    /// The proven commit OID. Present only when `present` is `true`.
+    ///
+    /// A commit OID is repository identity, not a filesystem locator: no branch,
+    /// worktree path, repository root, or log path accompanies it.
+    pub oid: Option<String>,
+}
+
+/// The closed set of typed command results.
+///
+/// Optional on [`CommandRecord`] because most commands settle with their detail
+/// alone. A variant is added only when a machine consumer would otherwise have
+/// to parse prose or re-observe the system to learn what a command did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandResult {
+    /// Settlement evidence for a successful `stop_and_dequeue`.
+    StopAndDequeue {
+        /// The typed phase active at settlement, immediately before dequeue.
+        ///
+        /// `none` for an already-terminated target or one with no active phase.
+        /// It is never the phase seen at the originally admitted revision.
+        cancelled_phase: ExecutionPhase,
+        /// The last phase that published a typed completion fact.
+        last_completed_phase: Option<ExecutionPhase>,
+        /// Final Apply commit evidence for the managed worktree.
+        apply_commit: ApplyCommitEvidence,
+        /// Always false. Dequeue cancels and removes; it never undoes a
+        /// completed worktree effect, and a client must not infer that it does.
+        effects_rolled_back: bool,
+    },
 }
 
 // ============================================================================

@@ -4,11 +4,13 @@
 
 The authenticated `GET /api/v2/execution-status` resource MUST provide a coherent machine-readable observation of scheduler liveness, actual active lifecycle work, typed current and last-completed phases, iteration and timing boundaries, latest lifecycle activity, and the latest retained structured log for the process and each exactly associated change. It MUST include the process incarnation, `state_revision`, `event_sequence`, and an `observed_at` instant.
 
-Scheduler liveness MUST remain distinct from `has_active_work`. Command acceptance, `app_mode: running`, an execution mark, queue intent, task completion percentage, or a display status alone MUST NOT certify active work or a lifecycle phase. Phase and execution-state fields MUST use closed typed vocabularies derived from typed lifecycle facts rather than display strings or log parsing. Unknown evidence MUST remain explicitly unknown.
+Scheduler liveness MUST read the same process-local `RunBoundaryLiveness` authority used by operator snapshot eligibility and command admission, and MUST remain distinct from `has_active_work`. `has_active_work` MUST be true while at least one change has an active reducer `ActivityState`, or while a closed process-level dependency-analysis, base-branch-merge, conflict-resolution, branch-merge, or workspace-cleanup activity has received its typed start event without its typed terminal event. Persistent-idle scheduler liveness alone MUST NOT be active work. Command acceptance, `app_mode: running`, an execution mark, queue intent, task completion percentage, or a display status alone MUST NOT certify active work or a lifecycle phase.
+
+Per-change phase MUST project the existing reducer activity authority as `preparing`, `apply`, `acceptance`, `rejection_review`, `archive`, `resolve`, typed `push`, `none`, or `unknown`. Analysis MUST remain process-level. `merge` MAY appear as a last-completed phase only from a typed per-change merge-completion fact. `hook` MUST NOT be advertised until production emits typed hook start/completion facts. Phase facts MUST update synchronously from the same source event under the authoritative dispatch boundary and MUST NOT form a second lifecycle state machine. Unknown evidence MUST remain explicitly unknown.
 
 Every execution-status time MUST be an absolute UTC RFC 3339 instant. The resource MUST NOT return elapsed seconds, age seconds, localized relative-time text, or advance `state_revision` merely because time passed. A log-only observation MAY change latest-log output and `event_sequence` while retaining the current `state_revision`.
 
-Latest-log selection MUST use the bounded sanitized in-memory `LogEntry` ring. A change latest log MUST be selected only by exact structured `change_id` equality. The API MUST NOT read persistent log files to fill this resource, expose a persistent log path or file URL, accept a host path or filename for log access, or expose such a locator differently over UDS and TCP. Complete retained API logs MUST remain readable through authenticated `GET /api/v2/logs` and live observation through the existing event transports.
+Latest-log selection MUST use bounded sanitized in-memory ring insertion order. A change latest log MUST be selected only by exact structured `change_id` equality. The resource MUST return a new closed projection containing only sanitized message, level, operation, iteration, and RFC 3339 UTC `created_at`; it MUST NOT embed the existing `LogEntry` wire shape, display timestamp, or `workspace_path`. The API MUST NOT read persistent log files to fill this resource, expose a persistent log path or file URL, accept a host path or filename for log access, or expose such a locator differently over UDS and TCP. Complete retained API logs MUST remain readable through authenticated `GET /api/v2/logs` and live observation through the existing event transports.
 
 #### Scenario: Active change exposes absolute observation boundaries
 
@@ -54,7 +56,7 @@ Latest-log selection MUST use the bounded sanitized in-memory `LogEntry` ring. A
 
 A settled successful `stop_and_dequeue` command record MUST contain a closed typed result captured after confirmed termination and final lifecycle revalidation. The result MUST identify the cancelled phase, the last completed phase, nullable proof of the final managed-worktree Apply commit and its commit OID, and `effects_rolled_back: false`. The presentation detail MUST state that dequeue does not roll back previously completed worktree effects.
 
-Apply commit evidence MUST be derived from managed-worktree Git and lifecycle identity evidence. Task count, display status, log text, or commit subject alone MUST NOT prove the final Apply commit. Unreadable or ambiguous phase or Git evidence MUST be represented as unknown rather than guessed and MUST NOT expose branch, worktree, repository, or log paths.
+Apply commit evidence MUST retain each non-empty typed `ApplyCompleted.revision` OID as a per-change, per-process-incarnation fact. At settlement the server MUST identify the managed worktree through its own change mapping and prove the retained OID equals or is an ancestor of the quiescent worktree HEAD before reporting presence true and returning that retained OID. Missing or empty completion facts, restart-empty facts, absent worktree, Git failure, or non-ancestor evidence MUST be unknown; the server MUST NOT reconstruct evidence from task count, display status, log text, or commit subject. No result may expose branch, worktree, repository, or log paths.
 
 The command registry MUST store the typed result with the settled command record. Exact idempotent replay MUST return the original result unchanged and MUST NOT re-read Git, reclassify phase, or repeat cancellation or dequeue effects after later state changes.
 
@@ -67,6 +69,13 @@ The command registry MUST store the typed result with the settled command record
 **And**: Apply commit presence is true and its OID equals the retained final Apply commit
 **And**: `effects_rolled_back` is false
 **And**: The final Apply commit remains in the managed worktree
+
+#### Scenario: Already-terminated target has no cancelled phase
+
+**Given**: The target task already terminated and no typed phase is active at settlement
+**When**: stop-and-dequeue settles successfully through its existing already-terminated path
+**Then**: The typed result reports `cancelled_phase: none`
+**And**: It does not invent a phase from prior display or log evidence
 
 #### Scenario: Stop settles before final Apply commit
 

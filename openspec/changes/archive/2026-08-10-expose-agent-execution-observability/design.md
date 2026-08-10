@@ -27,7 +27,7 @@ The API does not return elapsed seconds, age seconds, or “N minutes ago”. A 
 
 ## Closed Execution Vocabulary
 
-Process facts distinguish scheduler liveness from active work. `scheduler_running` means the run boundary is alive. `has_active_work` is true only when typed lifecycle facts identify at least one currently active change phase or active process-level resolve/merge work.
+Process facts distinguish scheduler liveness from active work. `scheduler_running` reads the same `RunBoundaryLiveness` authority used by snapshot eligibility and command admission. `has_active_work` is true while either a per-change phase is active or a closed process-level activity has started and has not reached its typed terminal event. The process-level set is dependency analysis, base-branch merge, conflict resolution, branch merge, and workspace cleanup. Persistent-idle scheduler liveness alone is not active work.
 
 Change `execution_state` uses a closed enum:
 
@@ -40,26 +40,25 @@ Change `execution_state` uses a closed enum:
 - `completed`;
 - `unknown`.
 
-Lifecycle phase uses a closed enum:
+Per-change `current_phase` uses the existing reducer `ActivityState` as its sole authority and projects a closed enum:
 
-- `analysis`;
-- `apply`;
-- `acceptance`;
-- `archive`;
-- `resolve`;
-- `merge`;
-- `push`;
-- `hook`;
-- `none`;
-- `unknown`.
+- `preparing` from `ActivityState::Preparing`;
+- `apply` from `ActivityState::Applying`;
+- `acceptance` from `ActivityState::Accepting`;
+- `rejection_review` from `ActivityState::Rejecting`;
+- `archive` from `ActivityState::Archiving`;
+- `resolve` from `ActivityState::Resolving`;
+- `push` when typed push activity is open;
+- `none` when no phase is active;
+- `unknown` only when typed evidence cannot be classified.
 
-These values come from typed lifecycle transitions and process-local phase facts. `display_status`, task completion percentage, log text, and commit subject text are not phase classifiers.
+Analysis is process-level only. `merge` may appear in `last_completed_phase` only from a typed per-change merge-completion fact. `hook` is not advertised until production emits typed hook start/completion facts. Phase facts are updated synchronously from the same typed event under the authoritative dispatch boundary and never form a second lifecycle authority. `display_status`, task completion percentage, log text, and commit subject text are not phase classifiers.
 
 ## Latest Log Selection
 
-The process latest log is the newest entry in the retained ring. A change latest log is the newest entry whose structured `change_id` exactly equals the target ID. Selection does not fall back to substring matching, operation guessing, workspace paths, or reading the persistent file.
+The process latest log is the last entry by retained-ring insertion order. A change latest log is the last inserted entry whose structured `change_id` exactly equals the target ID. Selection does not compare second-precision timestamps and does not fall back to substring matching, operation guessing, workspace paths, or reading the persistent file.
 
-The existing `LogEntry` sanitization and 8,192-byte message bound remain authoritative. The resource returns the retained structured message, level, operation, iteration, and absolute creation time. No filesystem locator is added.
+The resource does not embed the existing `LogEntry` wire shape, whose `created_at` is epoch seconds and whose schema includes `workspace_path`. It returns a closed projection containing only the already-sanitized and 8,192-byte-bounded message, level, operation, iteration, and an RFC 3339 UTC `created_at`. Display timestamp and workspace path are omitted. No filesystem locator is added.
 
 ## Phase-aware Stop Settlement
 
@@ -67,11 +66,11 @@ The existing `LogEntry` sanitization and 8,192-byte message bound remain authori
 
 1. validate target and issue cancellation under the application boundary;
 2. await confirmed termination outside the boundary;
-3. reacquire the boundary and revalidate current lifecycle state;
-4. inspect settlement evidence;
+3. while the terminated worktree is quiescent and before reacquiring the boundary, read explanatory managed-worktree Git evidence so Git subprocess latency cannot monopolize operator admission;
+4. reacquire the boundary, revalidate current lifecycle state, and read typed phase facts before applying `ReducerCommand::DequeueChange` clears them;
 5. commit dequeue, dispatch its exact revision, and store one immutable command result.
 
-Evidence is captured after termination confirmation because the worker may cross a phase boundary between admission and cancellation settlement. The result reports the work that was actually stopped, not merely the phase seen at the original expected revision.
+Phase facts are updated under the authoritative dispatch boundary before termination confirmation can settle, so every typed fact dispatched by the worker before exit is visible in step 4. `cancelled_phase` means the active typed per-change phase observed at settlement immediately before dequeue; an already-terminated target or target with no active phase reports `none`. The result does not report merely the phase seen at the original expected revision.
 
 The result shape is a tagged closed variant, conceptually:
 
@@ -90,7 +89,7 @@ The result shape is a tagged closed variant, conceptually:
 
 `present` is nullable so unreadable or ambiguous evidence is not collapsed into `false`. `oid` is present only when the final Apply commit is proven. OID disclosure is allowed repository identity evidence; no branch, worktree path, repository root, or log path accompanies it.
 
-Apply commit detection must use the repository's managed-worktree and lifecycle evidence. It must not accept a commit solely because its subject starts with `Apply:`; identity and expected lifecycle relation must be verified using existing repository-local mechanisms or a narrowly added evidence port.
+Apply commit detection retains the non-empty OID from typed `ApplyCompleted.revision` as a per-change, per-process-incarnation fact. The evidence port identifies the managed worktree through the server-owned change-to-worktree mapping, reads its HEAD while quiescent, and proves the retained OID is equal to or an ancestor of HEAD. Only then is `present: true`, and `oid` is the retained completion OID. Missing/empty completion OID, restart-empty facts, missing worktree, Git failure, or a non-ancestor result is unknown rather than a subject-based guess. Commit subject is never an evidence input.
 
 ## Result Stability and Replay
 

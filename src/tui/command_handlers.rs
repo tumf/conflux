@@ -758,10 +758,17 @@ pub async fn handle_tui_command(
                     change_id: id.clone(),
                 };
                 let settled = match application.apply(intent).await.outcome {
-                    Ok(ApplicationOutcome::Operator(OperatorOutcome::Dequeued { change_id })) => {
+                    Ok(ApplicationOutcome::Operator(OperatorOutcome::Dequeued {
+                        change_id,
+                        settlement,
+                    })) => {
+                        // The same sentence `/api/v2` records. An operator who
+                        // reads "stopped and dequeued" and concludes that Apply
+                        // produced nothing is making the mistake this wording
+                        // exists to prevent.
                         CommandFeedback::accepted(LogEntry::success(format!(
                             "Stopped and dequeued after confirmed termination: {}",
-                            change_id
+                            settlement.describe(&change_id)
                         )))
                     }
                     Ok(_) => {

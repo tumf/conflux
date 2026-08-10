@@ -44,6 +44,26 @@ curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" \
 - Browsers cannot open a `unix://` endpoint. It is for local clients and reverse
   proxies; the QR popup still encodes the TCP URL only.
 
+### Before intervening in a live run
+
+`GET /api/v2/execution-status` is the resource that answers "is anything
+actually running". `scheduler_running` and `has_active_work` are separate: a
+parked persistent scheduler is alive with nothing admitted.
+
+`cflx run` serves this resource too, and its lifecycle work shows up in
+`has_active_work`, `active_activities`, and the per-change phases. It binds no
+run supervisor and no command executor, though, so `scheduler_running` stays
+false for a whole run and `/api/v2` commands are rejected there — read the work
+fields, not scheduler liveness, to decide whether a run is busy.
+
+Never infer that Apply produced no commit from `display_status: applying`, or
+from a `stop_and_dequeue` that merely returned success — Apply can finish while
+a cancellation is still in flight. Read the settled command record's typed
+`result` instead: `cancelled_phase`, `last_completed_phase`, `apply_commit`
+(where `present: null` means *unknown*, not absent), and `effects_rolled_back`,
+which is always `false`. Creating a manual commit, archive, or merge on that
+guess is exactly the failure this contract exists to prevent.
+
 ## Web UI
 
 The WebUI is an optional local monitoring dashboard enabled with `--web` on

@@ -440,6 +440,15 @@ pub struct WebState {
     /// Timing, latest activity, attention, parallel eligibility, and worktree
     /// relation for this process incarnation.
     operator_facts: tokio::sync::RwLock<OperatorFactsStore>,
+    /// Typed phases, phase boundaries, and process-level activity.
+    ///
+    /// The *same* store the authoritative dispatch owner feeds and stop-and-
+    /// dequeue settlement reads, so "what was running" has one answer no matter
+    /// who asks. Unbound until an orchestration runtime exists, which is a
+    /// process that has observed no lifecycle work yet.
+    execution_facts: tokio::sync::RwLock<
+        Option<Arc<crate::orchestration::execution_facts::ExecutionFactsStore>>,
+    >,
     /// Dispatch identities this frontend has already projected.
     ///
     /// The dispatch owner delivers each event once, but a frontend boundary is
@@ -542,6 +551,7 @@ impl WebState {
             parallel_runtime: tokio::sync::RwLock::new(None),
             run_boundary: tokio::sync::RwLock::new(None),
             operator_facts: tokio::sync::RwLock::new(OperatorFactsStore::new()),
+            execution_facts: tokio::sync::RwLock::new(None),
             projected_dispatches: Mutex::new(RecentDispatchIds::default()),
             dispatch_revisions: std::sync::Mutex::new(DispatchRevisions::default()),
         }
@@ -589,6 +599,19 @@ impl WebState {
     ) {
         *self.run_boundary.write().await = Some(boundary);
         self.sync_remote_control_projection().await;
+    }
+
+    /// Bind the shared process-local execution-facts store.
+    ///
+    /// The same `Arc` the dispatch owner feeds and the coordinator reads at stop
+    /// settlement, so the execution-status resource and a settled command record
+    /// cannot describe two different runs.
+    pub async fn set_execution_facts(
+        &self,
+        facts: Arc<crate::orchestration::execution_facts::ExecutionFactsStore>,
+    ) {
+        *self.execution_facts.write().await = Some(facts.clone());
+        self.remote_control.bind_execution_facts(facts);
     }
 
     /// Bind the repository root used to redact published worktree paths.
@@ -925,6 +948,41 @@ impl WebState {
         self.apply_dispatch(&dispatch).await;
     }
 
+    /// Feed the shared execution-facts store from one dispatch.
+    ///
+    /// A process that owns an [`crate::events::EventDispatcher`] has already
+    /// absorbed this dispatch under the reducer write guard; the store admits a
+    /// dispatch identity once, so this call is then a no-op. It exists for the
+    /// headless forwarder, which has no dispatch owner and would otherwise
+    /// publish an execution status with no phases at all.
+    async fn observe_execution_facts(&self, dispatch: &EventDispatch<'_>) {
+        let Some(facts) = self.execution_facts.read().await.clone() else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        if let Some(state) = dispatch.state {
+            facts.observe(dispatch.id, dispatch.event, Some(state), now);
+            return;
+        }
+        // No authoritative state travelled with the dispatch. The shared reducer
+        // is read back instead, and `try_read` matches the rest of this file: a
+        // contended reducer must not stall event projection.
+        let shared = self.shared_orchestrator_state.read().await.clone();
+        match shared {
+            Some(shared) => match shared.try_read() {
+                Ok(guard) => {
+                    facts.observe(dispatch.id, dispatch.event, Some(&guard), now);
+                }
+                Err(_) => {
+                    facts.observe(dispatch.id, dispatch.event, None, now);
+                }
+            },
+            None => {
+                facts.observe(dispatch.id, dispatch.event, None, now);
+            }
+        }
+    }
+
     /// Absorb one authoritative dispatch.
     ///
     /// A repeated delivery of the same dispatch identity returns without
@@ -935,6 +993,7 @@ impl WebState {
         if !self.projected_dispatches.lock().await.admit(dispatch.id) {
             return;
         }
+        self.observe_execution_facts(dispatch).await;
         let event = dispatch.event;
         {
             let mut state = self.state.write().await;
