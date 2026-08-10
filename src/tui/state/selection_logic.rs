@@ -99,10 +99,7 @@ pub(super) fn toggle_all_marks(state: &mut AppState) -> Vec<TuiCommand> {
         // refused, there is simply no run candidate left to express intent
         // about. Any other empty target set is a condition worth naming.
         if state.changes.is_empty() {
-            report_bulk_toggle_block(
-                state,
-                "Bulk mark (x) has no changes to toggle".to_string(),
-            );
+            report_bulk_toggle_block(state, "Bulk mark (x) has no changes to toggle".to_string());
         }
         return Vec::new();
     }
@@ -409,7 +406,9 @@ mod tests {
 
             let written = state.take_pending_mark_writes();
             assert_eq!(written.len(), 3, "{mode:?} writes only the target rows");
-            assert!(written.iter().all(|(id, marked)| *marked && id != "archived"));
+            assert!(written
+                .iter()
+                .all(|(id, marked)| *marked && id != "archived"));
 
             // Fully marked target set now unmarks in one operation.
             assert!(toggle_all_marks(&mut state).is_empty());
@@ -458,7 +457,10 @@ mod tests {
         state.show_warning_popup("blocked", "diagnostic");
 
         assert!(toggle_all_marks(&mut state).is_empty());
-        assert!(!state.changes[0].selected, "the underlying action never ran");
+        assert!(
+            !state.changes[0].selected,
+            "the underlying action never ran"
+        );
     }
 
     /// Unit: the shared classifier is the only markability authority the TUI has.

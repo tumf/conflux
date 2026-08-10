@@ -3201,9 +3201,12 @@ mod tests {
         assert!(!app.changes[1].selected);
     }
 
+    /// Worktree eligibility no longer gates a mark.
+    ///
+    /// A mark is next-run intent; whether the run may actually start is decided
+    /// at final admission, where the all-or-nothing worktree fence still lives.
     #[test]
-    fn test_toggle_all_marks_excludes_uncommitted() {
-        // Test that toggle all respects worktree eligibility restrictions
+    fn test_toggle_all_marks_includes_worktree_ineligible_rows() {
         let changes = vec![
             create_test_change("committed", 0, 1),
             create_test_change("uncommitted", 0, 1),
@@ -3212,16 +3215,21 @@ mod tests {
         let mut app = AppState::new(changes);
         app.execution_mode = AppExecutionMode::Select;
 
-        // Mark first as committed, second as uncommitted
         app.changes[0].parallel_eligibility = ParallelEligibility::Eligible;
         app.changes[1].parallel_eligibility = ParallelEligibility::UncommittedProposalFiles;
 
-        // Toggle all should only mark the committed change
         app.toggle_all_marks();
         assert!(app.changes[0].selected);
-        assert!(!app.changes[1].selected); // Excluded: uncommitted
+        assert!(
+            app.changes[1].selected,
+            "an ineligible row still carries next-run intent"
+        );
+        assert!(
+            app.warning_message.is_none(),
+            "eligibility is not a mark-time refusal: {:?}",
+            app.warning_message
+        );
 
-        // Toggle all again should unmark
         app.toggle_all_marks();
         assert!(!app.changes[0].selected);
         assert!(!app.changes[1].selected);
@@ -3391,11 +3399,18 @@ mod tests {
         assert!(!app.changes[2].selected);
     }
 
+    /// Running-mode bulk mark writes marks and nothing else.
+    ///
+    /// Active, queued, and wait rows are all mark targets now — the row that
+    /// used to be skipped so Space could mean "stop" instead. What must not
+    /// move is anything the current run owns: no queue command is emitted and
+    /// no display status is rewritten.
     #[test]
-    fn test_toggle_all_marks_running_mode_toggles_non_active_rows_only() {
+    fn test_toggle_all_marks_running_mode_writes_marks_without_queue_or_status_effects() {
         let changes = vec![
-            create_test_change("resolving", 0, 1),
+            create_test_change("active", 0, 1),
             create_test_change("not-queued", 0, 1),
+            create_test_change("queued", 0, 1),
             create_test_change("merge-wait", 0, 1),
             create_test_change("resolve-wait", 0, 1),
         ];
@@ -3405,167 +3420,41 @@ mod tests {
         app.set_resolving("__active__");
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "not queued".to_string();
-        app.changes[2].display_status_cache = "merge wait".to_string();
-        app.changes[3].display_status_cache = "resolve pending".to_string();
-
-        app.toggle_all_marks();
-        assert!(!app.changes[0].selected, "active row must stay unchanged");
-        assert!(app.changes[1].selected);
-        assert!(app.changes[2].selected);
-        assert!(app.changes[3].selected);
-
-        // Wait states must keep display_status_cache unchanged.
-        assert_eq!(app.changes[2].display_status_cache, "merge wait");
-        assert_eq!(app.changes[3].display_status_cache, "resolve pending");
-
-        // Second toggle unmarks only non-active rows.
-        app.toggle_all_marks();
-        assert!(!app.changes[0].selected, "active row must stay unchanged");
-        assert!(!app.changes[1].selected);
-        assert!(!app.changes[2].selected);
-        assert!(!app.changes[3].selected);
-    }
-
-    #[test]
-    fn test_bulk_toggle_running_mode_emits_add_to_queue_commands() {
-        // When bulk toggle marks NotQueued rows in Running mode,
-        // it must emit AddToQueue commands (same as single-row Space).
-        let changes = vec![
-            create_test_change("a", 0, 1),
-            create_test_change("b", 0, 1),
-            create_test_change("c", 0, 1),
-        ];
-
-        let mut app = AppState::new(changes);
-        app.execution_mode = AppExecutionMode::Running;
-        app.changes[0].display_status_cache = "not queued".to_string();
-        app.changes[1].display_status_cache = "not queued".to_string();
-        app.changes[2].display_status_cache = "not queued".to_string();
-
-        let commands = app.toggle_all_marks();
-
-        // All three should be marked
-        assert!(app.changes[0].selected);
-        assert!(app.changes[1].selected);
-        assert!(app.changes[2].selected);
-
-        // Must emit AddToQueue for each NotQueued row
-        assert_eq!(commands.len(), 3);
-        assert!(matches!(&commands[0], TuiCommand::AddToQueue(id) if id == "a"));
-        assert!(matches!(&commands[1], TuiCommand::AddToQueue(id) if id == "b"));
-        assert!(matches!(&commands[2], TuiCommand::AddToQueue(id) if id == "c"));
-    }
-
-    #[test]
-    fn test_bulk_toggle_running_mode_emits_remove_from_queue_commands() {
-        // When all eligible rows are Queued and marked, bulk toggle must
-        // unmark them and emit RemoveFromQueue commands.
-        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
-
-        let mut app = AppState::new(changes);
-        app.execution_mode = AppExecutionMode::Running;
-        app.changes[0].display_status_cache = "queued".to_string();
-        app.changes[0].selected = true;
-        app.changes[1].display_status_cache = "queued".to_string();
-        app.changes[1].selected = true;
-
-        let commands = app.toggle_all_marks();
-
-        // Both should be unmarked
-        assert!(!app.changes[0].selected);
-        assert!(!app.changes[1].selected);
-
-        // Must emit RemoveFromQueue for each Queued row
-        assert_eq!(commands.len(), 2);
-        assert!(matches!(&commands[0], TuiCommand::RemoveFromQueue(id) if id == "a"));
-        assert!(matches!(&commands[1], TuiCommand::RemoveFromQueue(id) if id == "b"));
-    }
-
-    #[test]
-    fn test_bulk_toggle_running_mode_no_commands_for_wait_states() {
-        // MergeWait/ResolveWait rows should only toggle execution mark,
-        // NOT emit queue commands.
-        let changes = vec![
-            create_test_change("not-queued", 0, 1),
-            create_test_change("merge-wait", 0, 1),
-            create_test_change("resolve-wait", 0, 1),
-        ];
-
-        let mut app = AppState::new(changes);
-        app.execution_mode = AppExecutionMode::Running;
-        app.changes[0].display_status_cache = "not queued".to_string();
-        app.changes[1].display_status_cache = "merge wait".to_string();
-        app.changes[2].display_status_cache = "resolve pending".to_string();
-
-        let commands = app.toggle_all_marks();
-
-        // All eligible rows should be marked
-        assert!(app.changes[0].selected);
-        assert!(app.changes[1].selected);
-        assert!(app.changes[2].selected);
-
-        // Wait state display_status_cache must remain unchanged
-        assert_eq!(app.changes[1].display_status_cache, "merge wait");
-        assert_eq!(app.changes[2].display_status_cache, "resolve pending");
-
-        // Only the NotQueued row should emit AddToQueue
-        assert_eq!(commands.len(), 1);
-        assert!(matches!(&commands[0], TuiCommand::AddToQueue(id) if id == "not-queued"));
-    }
-
-    #[test]
-    fn test_bulk_toggle_running_mode_excludes_active_rows_from_commands() {
-        // Active rows (Applying, Accepting, etc.) must NOT be toggled
-        // and must NOT receive stop requests via bulk toggle.
-        let changes = vec![
-            create_test_change("applying", 0, 1),
-            create_test_change("not-queued", 0, 1),
-        ];
-
-        let mut app = AppState::new(changes);
-        app.execution_mode = AppExecutionMode::Running;
-        app.changes[0].display_status_cache = "applying".to_string();
-        app.changes[1].display_status_cache = "not queued".to_string();
-
-        let commands = app.toggle_all_marks();
-
-        // Active row must NOT be selected
-        assert!(!app.changes[0].selected);
-        // NotQueued row should be selected
-        assert!(app.changes[1].selected);
-
-        // Only one command: AddToQueue for the non-active row
-        assert_eq!(commands.len(), 1);
-        assert!(matches!(&commands[0], TuiCommand::AddToQueue(id) if id == "not-queued"));
-        // No StopChange command should appear
-        assert!(!commands
+        app.changes[2].display_status_cache = "queued".to_string();
+        app.changes[3].display_status_cache = "merge wait".to_string();
+        app.changes[4].display_status_cache = "resolve pending".to_string();
+        let statuses_before: Vec<String> = app
+            .changes
             .iter()
-            .any(|c| matches!(c, TuiCommand::DequeueChange(_))));
-    }
-
-    #[test]
-    fn test_bulk_toggle_running_mode_mixed_queued_and_not_queued() {
-        // When there's a mix of Queued and NotQueued, and at least one
-        // unmarked row exists, all should be marked and NotQueued rows
-        // get AddToQueue. (Queued rows already selected stay as-is.)
-        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
-
-        let mut app = AppState::new(changes);
-        app.execution_mode = AppExecutionMode::Running;
-        app.changes[0].display_status_cache = "queued".to_string();
-        app.changes[0].selected = true; // already marked
-        app.changes[1].display_status_cache = "not queued".to_string();
-        app.changes[1].selected = false; // not yet marked
+            .map(|change| change.display_status_cache.clone())
+            .collect();
 
         let commands = app.toggle_all_marks();
 
-        // Both should be marked (a stays marked, b becomes marked)
-        assert!(app.changes[0].selected);
-        assert!(app.changes[1].selected);
+        assert!(
+            commands.is_empty(),
+            "a bulk mark emits no queue command: {commands:?}"
+        );
+        assert!(
+            app.changes.iter().all(|change| change.selected),
+            "every non-terminal row receives the derived mark"
+        );
+        let statuses_after: Vec<String> = app
+            .changes
+            .iter()
+            .map(|change| change.display_status_cache.clone())
+            .collect();
+        assert_eq!(
+            statuses_after, statuses_before,
+            "a mark never rewrites a display status"
+        );
 
-        // Only the newly toggled NotQueued row should emit AddToQueue
-        assert_eq!(commands.len(), 1);
-        assert!(matches!(&commands[0], TuiCommand::AddToQueue(id) if id == "b"));
+        let commands = app.toggle_all_marks();
+        assert!(commands.is_empty());
+        assert!(
+            app.changes.iter().all(|change| !change.selected),
+            "a fully marked target set unmarks in one operation"
+        );
     }
 
     #[test]
@@ -3675,7 +3564,7 @@ mod tests {
                 expected: vec![true, true, false],
             },
             BulkToggleCase {
-                name: "running mode marks every eligible row and skips active rows",
+                name: "running mode marks the active row too: a mark is next-run intent",
                 mode: AppExecutionMode::Running,
                 rows: vec![
                     ("active", "applying", true, false),
@@ -3683,17 +3572,17 @@ mod tests {
                     ("eligible-unmarked", "not queued", true, false),
                     ("rejected", "rejected", true, false),
                 ],
-                expected: vec![false, true, true, false],
+                expected: vec![true, true, true, false],
             },
             BulkToggleCase {
-                name: "worktree execution marks committed rows and skips uncommitted rows",
+                name: "an uncommitted row is marked: worktree eligibility is a start-time fact",
                 mode: AppExecutionMode::Select,
                 rows: vec![
                     ("committed-marked", "not queued", true, true),
                     ("committed-unmarked", "not queued", true, false),
                     ("uncommitted", "not queued", false, false),
                 ],
-                expected: vec![true, true, false],
+                expected: vec![true, true, true],
             },
         ];
 
@@ -3712,8 +3601,14 @@ mod tests {
         }
     }
 
+    /// The bulk toggle reports what it marked, and nothing else.
+    ///
+    /// A terminal row is skipped silently: excluding a change that has no next
+    /// run refuses nothing the operator asked for, so naming it as an exclusion
+    /// would describe a constraint that does not exist. And because a mark is
+    /// pure intent, no queue command leaves with it.
     #[test]
-    fn test_toggle_all_marks_reports_changed_and_excluded_counts_with_reasons() {
+    fn test_toggle_all_marks_reports_the_marked_count_without_queue_effects() {
         let (app, commands) = run_bulk_toggle_case(
             AppExecutionMode::Running,
             &[
@@ -3723,26 +3618,25 @@ mod tests {
             ],
         );
 
-        assert_eq!(commands.len(), 1);
-        assert!(matches!(&commands[0], TuiCommand::AddToQueue(id) if id == "eligible"));
+        assert!(
+            commands.is_empty(),
+            "a bulk mark emits no queue command: {commands:?}"
+        );
+        assert!(app.changes[0].selected, "an active row accepts mark intent");
+        assert!(!app.changes[1].selected, "a terminal row is not a target");
+        assert!(app.changes[2].selected);
 
-        let warning = app
-            .warning_message
-            .as_ref()
-            .expect("exclusions must be surfaced to the user");
         assert!(
-            warning.contains("1 marked change(s)") && warning.contains("2 excluded"),
-            "warning must report changed and excluded counts: {}",
-            warning
+            app.warning_message.is_none(),
+            "a skipped terminal row is not a refusal: {:?}",
+            app.warning_message
         );
         assert!(
-            warning.contains("in progress") && warning.contains("rejected"),
-            "warning must report actionable exclusion reasons: {}",
-            warning
-        );
-        assert!(
-            app.logs.iter().any(|entry| entry.message == *warning),
-            "bulk toggle result must also be logged"
+            app.logs
+                .iter()
+                .any(|entry| entry.message == "Toggled all: 2 marked change(s)"),
+            "the bulk toggle result must be logged: {:?}",
+            app.logs.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
 
@@ -3763,38 +3657,36 @@ mod tests {
             .any(|entry| entry.message == "Toggled all: 2 marked change(s)"));
     }
 
+    /// A list holding only terminal rows is a silent no-op.
+    ///
+    /// There is no run candidate left to express intent about, so there is
+    /// nothing to warn about either. The retained marks stay exactly as the
+    /// reconciler left them.
     #[test]
-    fn test_toggle_all_marks_with_zero_eligible_targets_reports_reason() {
+    fn test_toggle_all_marks_with_only_terminal_rows_is_silent() {
         let (app, commands) = run_bulk_toggle_case(
             AppExecutionMode::Running,
             &[
-                ("active", "applying", true, false),
+                ("archived", "archived", true, false),
                 ("rejected", "rejected", true, true),
             ],
         );
 
         assert!(commands.is_empty());
-        assert!(!app.changes[0].selected, "ineligible rows must not change");
-        assert!(app.changes[1].selected, "ineligible rows must not change");
+        assert!(!app.changes[0].selected, "terminal rows must not change");
+        assert!(app.changes[1].selected, "terminal rows must not change");
 
-        let warning = app
-            .warning_message
-            .as_ref()
-            .expect("zero eligible targets must not be silent");
         assert!(
-            warning.contains("no eligible changes") && warning.contains("2 excluded"),
-            "warning must explain why nothing happened: {}",
-            warning
+            app.warning_message.is_none(),
+            "a terminal-only list refuses nothing: {:?}",
+            app.warning_message
         );
         assert!(
-            warning.contains("in progress") && warning.contains("rejected"),
-            "warning must report actionable exclusion reasons: {}",
-            warning
+            !app.logs
+                .iter()
+                .any(|entry| entry.message.contains("Toggled all")),
+            "nothing was toggled, so nothing is reported"
         );
-        assert!(app
-            .logs
-            .iter()
-            .any(|entry| entry.level == LogLevel::Warn && entry.message == *warning));
     }
 
     #[test]
@@ -3882,53 +3774,6 @@ mod tests {
         assert!(!app.has_bulk_toggle_targets());
         assert!(app.toggle_all_marks().is_empty());
         assert!(!app.changes[0].selected);
-    }
-
-    #[test]
-    fn test_toggle_all_marks_running_partial_selection_emits_command_for_every_eligible_row() {
-        let (app, commands) = run_bulk_toggle_case(
-            AppExecutionMode::Running,
-            &[
-                ("already-queued", "queued", true, true),
-                ("not-queued-a", "not queued", true, false),
-                ("not-queued-b", "not queued", true, false),
-                ("active", "resolving", true, false),
-            ],
-        );
-
-        // Every eligible row ends marked; the active row is untouched.
-        assert!(app.changes[0].selected);
-        assert!(app.changes[1].selected);
-        assert!(app.changes[2].selected);
-        assert!(!app.changes[3].selected);
-
-        let queued_ids: Vec<String> = commands
-            .iter()
-            .filter_map(|cmd| match cmd {
-                TuiCommand::AddToQueue(id) => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(queued_ids, vec!["not-queued-a", "not-queued-b"]);
-        assert_eq!(
-            commands.len(),
-            queued_ids.len(),
-            "active rows must not produce stop or dequeue commands"
-        );
-    }
-
-    #[test]
-    fn test_has_bulk_toggle_targets_running_mode_requires_non_active_rows() {
-        let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
-
-        let mut app = AppState::new(changes);
-        app.execution_mode = AppExecutionMode::Running;
-        app.changes[0].display_status_cache = "applying".to_string();
-        app.changes[1].display_status_cache = "resolving".to_string();
-        assert!(!app.has_bulk_toggle_targets());
-
-        app.changes[1].display_status_cache = "resolve pending".to_string();
-        assert!(app.has_bulk_toggle_targets());
     }
 
     #[test]

@@ -7,8 +7,7 @@ use chrono::Utc;
 use serde_json::json;
 
 use crate::orchestration::operator_command::{
-    OperatorCommandError, OperatorMode, OperatorOutcome, QueueMutation, QueueOutcome,
-    RetryPlan,
+    OperatorCommandError, OperatorMode, OperatorOutcome, QueueMutation, QueueOutcome, RetryPlan,
 };
 use crate::web::remote_control_api::dto::{
     CommandIdentity, CommandRecord, CommandSpec, CommandState, ErrorCode,

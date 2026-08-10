@@ -439,10 +439,9 @@ fn event_mark_reconciliation_preserves_unrelated_and_stopped_marks() {
                 error: "conflict".to_string(),
             },
         ),
-        (
-            "archive success",
-            ExecutionEvent::ChangeArchived("alpha".to_string()),
-        ),
+        // `archive success` is deliberately absent: `ChangeArchived` is now an
+        // authoritative revocation edge, covered by
+        // `run_mark_intent_archive_clears_only_its_target`.
         (
             "merge success",
             ExecutionEvent::MergeCompleted {

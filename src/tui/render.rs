@@ -725,8 +725,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 // [x] - marked as a next-run target
                 // (blank) - post-archive: no longer a run candidate
                 // Note: 'selected' field indicates the execution mark
-                let is_post_archive =
-                    is_post_archive_status(change.display_status_cache.as_str());
+                let is_post_archive = is_post_archive_status(change.display_status_cache.as_str());
                 // Every worktree-ineligible reason still refuses a *run*; only
                 // the badge narrows to the one reason that is actually a Git
                 // working-tree condition. It never refuses a mark.
@@ -753,7 +752,14 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 let (checkbox, checkbox_color) = {
                     let (text, color) =
                         get_checkbox_display(&change.display_status_cache, change.selected);
-                    (text, if is_parallel_blocked { blocked_fg } else { color })
+                    (
+                        text,
+                        if is_parallel_blocked {
+                            blocked_fg
+                        } else {
+                            color
+                        },
+                    )
                 };
 
                 let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -999,8 +1005,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 // (blank) - post-archive: no longer a run candidate
                 // The checkbox is the execution mark in every mode. Queue
                 // membership is a separate axis and has its own status column.
-                let is_post_archive =
-                    is_post_archive_status(change.display_status_cache.as_str());
+                let is_post_archive = is_post_archive_status(change.display_status_cache.as_str());
                 // Every worktree-ineligible reason still refuses a *run*; only
                 // the badge narrows to the one reason that is actually a Git
                 // working-tree condition. It never refuses a mark.
@@ -1027,7 +1032,14 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 let (checkbox, checkbox_color) = {
                     let (text, color) =
                         get_checkbox_display(&change.display_status_cache, change.selected);
-                    (text, if is_parallel_blocked { blocked_fg } else { color })
+                    (
+                        text,
+                        if is_parallel_blocked {
+                            blocked_fg
+                        } else {
+                            color
+                        },
+                    )
                 };
 
                 let cursor = if i == app.cursor_index { "►" } else { " " };
@@ -1643,7 +1655,15 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
         let retryable_error_rows = app.changes.iter().any(|change| {
             change.display_status_cache == "error" && !change.apply_iteration_limit_active
         });
-        let message = if app.has_active_apply_iteration_limit() && !app.has_bulk_toggle_targets() {
+        // Whether a *start* has anything to admit — not whether a mark has
+        // anything to write. The two diverged when marks stopped consulting
+        // lifecycle state: a limited row is markable, so the bulk-mark predicate
+        // would report a target here and hide the condition the footer exists to
+        // state.
+        let startable_rows = app.changes.iter().any(|change| {
+            is_markable_status(&change.display_status_cache) && !change.apply_iteration_limit_active
+        });
+        let message = if app.has_active_apply_iteration_limit() && !startable_rows {
             APPLY_LIMIT_CONDITION
         } else if retryable_error_rows {
             "Select changes with Space to process (error rows need retry mark)"
@@ -2841,17 +2861,304 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_checkbox_display_archived_always_gray() {
-        // Archived status should always result in gray checkbox,
-        // regardless of is_selected value
-        let (text, color) = get_checkbox_display("archived", true);
-        assert_eq!(text, "[x]");
-        assert_eq!(color, Color::DarkGray);
+    // ========================================================================
+    // Post-archive checkbox placeholder
+    //
+    // A post-archive row cannot be a next-run target, so it shows neither
+    // `[x]` nor `[ ]`. What it does keep is the column: the blank is exactly
+    // checkbox-wide, so the cursor, ID, badges, status, progress, and preview
+    // all stay where every other row puts them.
+    // ========================================================================
 
-        let (text, color) = get_checkbox_display("archived", false);
-        assert_eq!(text, "[x]");
-        assert_eq!(color, Color::DarkGray);
+    /// Columns between the start of the checkbox and the start of the change
+    /// ID: the checkbox itself plus the `" {cursor} "` that follows it.
+    const CHECKBOX_TO_ID_COLUMNS: usize = CHECKBOX_WIDTH + 3;
+
+    /// The rendered list row that displays `change_id`, as characters.
+    ///
+    /// Character cells, not bytes: the cursor glyph is multi-byte, so byte
+    /// offsets would not describe columns.
+    fn change_row_cells(buffer: &Buffer, change_id: &str) -> Vec<char> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .flat_map(|x| buffer[(x, y)].symbol().chars())
+                    .collect::<Vec<char>>()
+            })
+            .find(|cells| find_columns(cells, change_id).is_some())
+            .unwrap_or_else(|| panic!("no rendered row contains `{change_id}`"))
+    }
+
+    /// Column at which `needle` starts within a rendered row.
+    fn find_columns(cells: &[char], needle: &str) -> Option<usize> {
+        let needle: Vec<char> = needle.chars().collect();
+        cells.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// The checkbox columns of a rendered row, plus the column its ID starts at.
+    fn checkbox_and_id_column(cells: &[char], change_id: &str) -> (String, usize) {
+        let id_column = find_columns(cells, change_id)
+            .unwrap_or_else(|| panic!("row does not contain `{change_id}`"));
+        let checkbox_start = id_column
+            .checked_sub(CHECKBOX_TO_ID_COLUMNS)
+            .expect("the checkbox column precedes the ID column");
+        (
+            cells[checkbox_start..checkbox_start + CHECKBOX_WIDTH]
+                .iter()
+                .collect(),
+            id_column,
+        )
+    }
+
+    /// Two rows so both the cursor row and a non-cursor row are covered.
+    ///
+    /// `with_logs` picks the layout: the Changes view renders the Select list
+    /// while no log is buffered and the Running/Stopped list once one is.
+    fn checkbox_placeholder_app(
+        mode: AppExecutionMode,
+        with_logs: bool,
+        cursor_index: usize,
+        status: &str,
+        marked: bool,
+    ) -> AppState {
+        let mut app = create_test_app(vec![
+            create_test_change("change-a"),
+            create_test_change("change-b"),
+        ]);
+        app.execution_mode = mode;
+        app.cursor_index = cursor_index;
+        app.changes[0].display_status_cache = status.to_string();
+        app.changes[0].selected = marked;
+        if with_logs {
+            app.add_log(LogEntry::info("log"));
+        }
+        app
+    }
+
+    /// The placeholder must measure exactly what it replaces: the row's preview
+    /// width is computed from the checkbox text's own width, so a placeholder
+    /// of any other size would silently resize the preview column too.
+    #[test]
+    fn archived_checkbox_placeholder_is_exactly_checkbox_wide() {
+        assert_eq!(CHECKBOX_PLACEHOLDER.len(), CHECKBOX_WIDTH);
+        assert_eq!(CHECKBOX_WIDTH, "[x]".len());
+        assert_eq!(CHECKBOX_WIDTH, "[ ]".len());
+        assert!(
+            CHECKBOX_PLACEHOLDER.chars().all(|c| c == ' '),
+            "the placeholder must be blank, not a third checkbox state"
+        );
+    }
+
+    /// Every post-archive presentation drops the checkbox, and it drops it
+    /// whether or not a mark survived into that state.
+    #[test]
+    fn archived_checkbox_placeholder_replaces_both_checkbox_states() {
+        for status in ["archived", "merged", "pushed"] {
+            for marked in [true, false] {
+                let (text, color) = get_checkbox_display(status, marked);
+                assert_eq!(
+                    text, CHECKBOX_PLACEHOLDER,
+                    "`{status}` (marked={marked}) must render no checkbox"
+                );
+                assert_eq!(color, Color::DarkGray);
+            }
+        }
+
+        // A non-terminal row still reports the mark it actually holds.
+        assert_eq!(get_checkbox_display("not queued", true).0, "[x]");
+        assert_eq!(get_checkbox_display("not queued", false).0, "[ ]");
+    }
+
+    /// The column regression: in both list layouts, on the cursor row and off
+    /// it, a post-archive row renders blank checkbox cells and leaves the ID
+    /// column — and therefore everything after it — exactly where a
+    /// non-terminal row puts it.
+    #[test]
+    fn archived_checkbox_placeholder_holds_the_column_in_both_layouts() {
+        for (layout, with_logs) in [("select", false), ("running", true)] {
+            for mode in [
+                AppExecutionMode::Select,
+                AppExecutionMode::Running,
+                AppExecutionMode::Stopped,
+            ] {
+                for cursor_index in [0, 1] {
+                    let mut baseline = checkbox_placeholder_app(
+                        mode,
+                        with_logs,
+                        cursor_index,
+                        "not queued",
+                        false,
+                    );
+                    let baseline_buffer = render_buffer(&mut baseline, 120, 30);
+                    let (baseline_checkbox, baseline_id_column) = checkbox_and_id_column(
+                        &change_row_cells(&baseline_buffer, "change-a"),
+                        "change-a",
+                    );
+                    assert_eq!(
+                        baseline_checkbox, "[ ]",
+                        "{layout}/{mode:?}/cursor={cursor_index}: the baseline row must own a checkbox"
+                    );
+
+                    for status in ["archived", "merged", "pushed"] {
+                        for marked in [true, false] {
+                            let mut app = checkbox_placeholder_app(
+                                mode,
+                                with_logs,
+                                cursor_index,
+                                status,
+                                marked,
+                            );
+                            let buffer = render_buffer(&mut app, 120, 30);
+                            let cells = change_row_cells(&buffer, "change-a");
+                            let (checkbox, id_column) = checkbox_and_id_column(&cells, "change-a");
+
+                            assert_eq!(
+                                checkbox, CHECKBOX_PLACEHOLDER,
+                                "{layout}/{mode:?}/cursor={cursor_index}: `{status}` \
+                                 (marked={marked}) must render blank checkbox cells"
+                            );
+                            assert_eq!(
+                                id_column, baseline_id_column,
+                                "{layout}/{mode:?}/cursor={cursor_index}: `{status}` \
+                                 (marked={marked}) must not shift the columns after the checkbox"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Key hints under the pure-mark contract
+    // ========================================================================
+
+    /// The cursor row's mark hint follows the mark, in every lifecycle mode.
+    ///
+    /// Rendered through the real widget tree rather than by calling the hint
+    /// builder, so the assertion covers the routing that picks a layout as well
+    /// as the hint text itself.
+    #[test]
+    fn run_mark_intent_hint_follows_mark_state_in_every_mode() {
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            for status in [
+                "not queued",
+                "queued",
+                "applying",
+                "error",
+                "merge wait",
+                "stalled",
+            ] {
+                for marked in [false, true] {
+                    let mut app = create_test_app(vec![create_test_change("change-a")]);
+                    app.execution_mode = mode;
+                    app.changes[0].display_status_cache = status.to_string();
+                    app.changes[0].selected = marked;
+                    app.cursor_index = 0;
+
+                    let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
+                    let expected = if marked {
+                        "Space: unmark"
+                    } else {
+                        "Space: mark"
+                    };
+                    assert!(
+                        content.contains(expected),
+                        "{mode:?}/{status}/marked={marked}: expected `{expected}`:\n{content}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An active row advertises kill *and* mark: two independent controls.
+    #[test]
+    fn run_mark_intent_active_row_keeps_kill_alongside_the_mark_hint() {
+        for status in [
+            "preparing",
+            "applying",
+            "accepting",
+            "archiving",
+            "resolving",
+        ] {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            app.execution_mode = AppExecutionMode::Running;
+            app.changes[0].display_status_cache = status.to_string();
+            app.cursor_index = 0;
+
+            let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
+            assert!(
+                content.contains("K: kill"),
+                "{status}: per-change termination stays its own control:\n{content}"
+            );
+            assert!(
+                content.contains("Space: mark"),
+                "{status}: and mark intent stays available beside it:\n{content}"
+            );
+            assert!(
+                !content.contains("Space: stop"),
+                "{status}: Space must never be described as a stop:\n{content}"
+            );
+        }
+    }
+
+    /// A terminal row advertises no mark hint at all.
+    #[test]
+    fn run_mark_intent_terminal_row_omits_the_mark_hint() {
+        for status in ["archived", "merged", "pushed", "rejected"] {
+            for marked in [false, true] {
+                let mut app = create_test_app(vec![create_test_change("change-a")]);
+                app.changes[0].display_status_cache = status.to_string();
+                app.changes[0].selected = marked;
+                app.cursor_index = 0;
+
+                let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
+                assert!(
+                    !content.contains("Space: mark") && !content.contains("Space: unmark"),
+                    "{status}/marked={marked}: a terminal row has no mark to advertise:\n{content}"
+                );
+            }
+        }
+    }
+
+    /// The bulk hint depends on the visible target set, never on the mode.
+    #[test]
+    fn run_mark_intent_bulk_hint_depends_on_targets_not_mode() {
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            let mut app = create_test_app(vec![
+                create_test_change("terminal"),
+                create_test_change("live"),
+            ]);
+            app.execution_mode = mode;
+            app.changes[0].display_status_cache = "archived".to_string();
+            app.changes[1].display_status_cache = "applying".to_string();
+
+            let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
+            assert!(
+                content.contains("x: toggle all"),
+                "{mode:?}: one non-terminal row is enough to offer the bulk toggle:\n{content}"
+            );
+
+            // Take the only non-terminal row away and the hint goes with it.
+            app.changes[1].display_status_cache = "merged".to_string();
+            let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
+            assert!(
+                !content.contains("x: toggle all"),
+                "{mode:?}: a terminal-only list offers no bulk toggle:\n{content}"
+            );
+        }
     }
 
     #[test]
@@ -3194,7 +3501,10 @@ mod tests {
         let content = buffer_to_string(&buffer);
 
         assert!(!content.contains("UNCOMMITTED"));
-        assert!(content.contains("[x]"));
+        // The row is still rendered — it just carries no checkbox any more.
+        let (checkbox, _) =
+            checkbox_and_id_column(&change_row_cells(&buffer, "change-a"), "change-a");
+        assert_eq!(checkbox, CHECKBOX_PLACEHOLDER);
     }
 
     #[test]
@@ -3262,11 +3572,11 @@ mod tests {
                 );
                 assert!(
                     !content.contains("Space: queue") && !content.contains("Space: unqueue"),
-                    "{mode:?}/{status}: a blocked row must keep its queue affordances hidden"
+                    "{mode:?}/{status}: Space is never described as a queue control"
                 );
                 assert!(
                     content.contains("[ ]"),
-                    "{mode:?}/{status}: a blocked row must render as non-markable"
+                    "{mode:?}/{status}: an unmarked non-terminal row still renders its checkbox"
                 );
                 assert_eq!(
                     buffer
@@ -3278,20 +3588,20 @@ mod tests {
                     "{mode:?}/{status}: the focused blocked row stays grayed out"
                 );
 
-                // The badge is the only thing that changed: admission still refuses
-                // the row, and the refusal names the condition that was observed.
+                // Eligibility is still observed and still refuses a *run*; it no
+                // longer refuses the intent. Space marks the row silently and
+                // the start key is where the condition is reported.
                 assert!(!app.changes[0].is_parallel_eligible());
                 app.toggle_selection();
-                let warning = app.warning_message.clone().expect("a refusal is reported");
                 assert!(
-                    warning.contains("not present in HEAD"),
-                    "{mode:?}/{status}: the refusal must name proposal absence: {warning}"
+                    app.changes[0].selected,
+                    "{mode:?}/{status}: a worktree-ineligible row still accepts mark intent"
                 );
                 assert!(
-                    !warning.to_lowercase().contains("uncommitted"),
-                    "{mode:?}/{status}: the refusal must not ask for a commit: {warning}"
+                    app.warning_message.is_none(),
+                    "{mode:?}/{status}: marking refuses nothing: {:?}",
+                    app.warning_message
                 );
-                assert!(!app.changes[0].selected);
             }
         }
     }
@@ -3350,14 +3660,21 @@ mod tests {
                 );
                 assert!(
                     content.contains("[ ]") && !content.contains("Space: queue"),
-                    "{mode:?}/{status}: the dirty row is non-actionable too"
+                    "{mode:?}/{status}: the dirty row renders a checkbox, not a queue affordance"
                 );
 
+                // Same rule as the absent-proposal row: the badge reports the
+                // observation, the mark is accepted, and start admission owns
+                // the refusal.
                 app.toggle_selection();
-                let warning = app.warning_message.clone().expect("a refusal is reported");
                 assert!(
-                    warning.contains("Commit it first"),
-                    "{mode:?}/{status}: dirty content keeps its actionable instruction: {warning}"
+                    app.changes[0].selected,
+                    "{mode:?}/{status}: a dirty row still accepts mark intent"
+                );
+                assert!(
+                    app.warning_message.is_none(),
+                    "{mode:?}/{status}: marking refuses nothing: {:?}",
+                    app.warning_message
                 );
             }
         }
@@ -3511,8 +3828,12 @@ mod tests {
 
         let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
         assert!(
-            content.contains("Space: retry mark"),
-            "ordinary retry guidance returns once the owning boundary closes:\n{content}"
+            content.contains("Space: mark"),
+            "the mark hint stands alone once the owning boundary closes:\n{content}"
+        );
+        assert!(
+            !content.contains("Apply limit reached"),
+            "and the condition it sat beside is no longer stated:\n{content}"
         );
     }
 
@@ -5015,8 +5336,13 @@ mod tests {
         }
     }
 
+    /// An uncommitted row keeps its badge *and* its mark hint.
+    ///
+    /// Worktree eligibility is a start-admission fact, so it no longer removes
+    /// the affordance: the operator may express intent now and the start key
+    /// refuses later, naming the condition.
     #[test]
-    fn test_uncommitted_change_no_space_hint() {
+    fn test_uncommitted_change_still_advertises_its_mark_hint() {
         use crate::openspec::Change;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -5057,14 +5383,15 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        // Verify that Space hints are NOT shown for uncommitted changes
+        // The mark hint is offered: the row is a visible non-terminal target.
         assert!(
-            !content.contains("Space: queue"),
-            "Space: queue should not be shown for uncommitted changes"
+            content.contains("Space: mark"),
+            "an uncommitted row is still a mark target:\n{content}"
         );
+        // And Space never described a queue mutation again.
         assert!(
-            !content.contains("Space: unqueue"),
-            "Space: unqueue should not be shown for uncommitted changes"
+            !content.contains("Space: queue") && !content.contains("Space: unqueue"),
+            "Space must not be described as a queue control:\n{content}"
         );
 
         // Verify that UNCOMMITTED badge is shown
@@ -5116,10 +5443,18 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        // Verify that Space hints ARE shown for committed changes
+        // Verify that the mark hint IS shown for committed changes
         assert!(
-            content.contains("Space: queue"),
-            "Space: queue should be shown for committed changes"
+            content.contains("Space: mark"),
+            "an unmarked row advertises `Space: mark`:\n{content}"
+        );
+
+        // And that it follows the mark state rather than the queue.
+        app.changes[0].selected = true;
+        let content = buffer_to_string(&render_buffer(&mut app, 120, 30));
+        assert!(
+            content.contains("Space: unmark"),
+            "a marked row advertises `Space: unmark`:\n{content}"
         );
     }
 
@@ -5163,8 +5498,10 @@ mod tests {
         );
     }
 
+    /// An active row is still a bulk-mark target: the mark it would receive is
+    /// next-run intent, which an in-flight run neither owns nor answers.
     #[test]
-    fn test_toggle_all_hint_not_shown_in_running_mode_without_non_active_targets() {
+    fn test_toggle_all_hint_shown_in_running_mode_for_an_active_row() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "resolving".to_string();
@@ -5172,35 +5509,48 @@ mod tests {
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
         assert!(
-            !content.contains("x: toggle all"),
-            "Should NOT show 'x: toggle all' hint in Running mode when all changes are active"
+            content.contains("x: toggle all"),
+            "an active row is a bulk-mark target like any other non-terminal row"
         );
     }
 
+    /// The hint depends on the visible target set, not on the execution mode.
     #[test]
-    fn test_toggle_all_hint_not_shown_in_stopping_mode() {
-        let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.execution_mode = AppExecutionMode::Stopping;
+    fn test_toggle_all_hint_shown_in_stopping_and_error_modes() {
+        for mode in [AppExecutionMode::Stopping, AppExecutionMode::Error] {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            app.execution_mode = mode;
 
-        let buffer = render_buffer(&mut app, 100, 24);
-        let content = buffer_to_string(&buffer);
-        assert!(
-            !content.contains("x: toggle all"),
-            "Should NOT show 'x: toggle all' hint in Stopping mode"
-        );
+            let buffer = render_buffer(&mut app, 100, 24);
+            let content = buffer_to_string(&buffer);
+            assert!(
+                content.contains("x: toggle all"),
+                "{mode:?} must offer the bulk toggle for a visible non-terminal row"
+            );
+        }
     }
 
+    /// Terminal rows only: there is no run candidate left to mark.
     #[test]
-    fn test_toggle_all_hint_not_shown_in_error_mode() {
-        let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.execution_mode = AppExecutionMode::Error;
+    fn test_toggle_all_hint_not_shown_for_terminal_rows_only() {
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            app.execution_mode = mode;
+            app.changes[0].display_status_cache = "archived".to_string();
 
-        let buffer = render_buffer(&mut app, 100, 24);
-        let content = buffer_to_string(&buffer);
-        assert!(
-            !content.contains("x: toggle all"),
-            "Should NOT show 'x: toggle all' hint in Error mode"
-        );
+            let buffer = render_buffer(&mut app, 100, 24);
+            let content = buffer_to_string(&buffer);
+            assert!(
+                !content.contains("x: toggle all"),
+                "{mode:?} must not offer the bulk toggle when every row is terminal"
+            );
+        }
     }
 
     #[test]

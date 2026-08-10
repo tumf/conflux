@@ -116,23 +116,29 @@ impl Harness {
     /// A single snapshot keeps "failed admission left no partial effect" a
     /// comparison rather than a list of assertions that can silently miss one.
     async fn effects(&self) -> RunEffects {
+        // Read the blocking queue locks out first: a `MutexGuard` that is still
+        // a live temporary when the reducer read awaits would hold a sync lock
+        // across a yield point.
+        let queue = self.queue.entries.lock().unwrap().clone();
+        let notifications = *self.queue.notifications.lock().unwrap();
+        let statuses = {
+            let guard = self.state.read().await;
+            let mut statuses: Vec<(String, String)> = guard
+                .tracked_change_ids()
+                .into_iter()
+                .map(|id| {
+                    let status = guard.display_status(&id).to_string();
+                    (id, status)
+                })
+                .collect();
+            statuses.sort();
+            statuses
+        };
         RunEffects {
             scheduler: self.scheduler.calls(),
-            queue: self.queue.entries.lock().unwrap().clone(),
-            notifications: *self.queue.notifications.lock().unwrap(),
-            statuses: {
-                let guard = self.state.read().await;
-                let mut statuses: Vec<(String, String)> = guard
-                    .tracked_change_ids()
-                    .into_iter()
-                    .map(|id| {
-                        let status = guard.display_status(&id).to_string();
-                        (id, status)
-                    })
-                    .collect();
-                statuses.sort();
-                statuses
-            },
+            queue,
+            notifications,
+            statuses,
         }
     }
 
@@ -516,7 +522,13 @@ async fn start_in_error_mode_retries_the_marked_error_rows() {
             change_ids: vec!["a".to_string()],
             explicit_retry: true,
             scheduler: SchedulerEffect::Started,
-            excluded: Vec::new(),
+            // `b` is marked but carries no retryable evidence. A mark is
+            // next-run intent, so it is reported as excluded rather than
+            // refused when it was set.
+            excluded: vec![ExcludedTarget {
+                change_id: "b".to_string(),
+                status: "not queued".to_string(),
+            }],
         },
         "only the row that carries retryable evidence is retried"
     );
@@ -1290,17 +1302,22 @@ async fn active_iteration_limit_bulk_retry_error_mode_start_is_mutation_free() {
     harness.mark(&["limited"]);
     let calls_before = harness.scheduler.calls();
 
-    let outcome = harness
+    let error = harness
         .service
         .start(OperatorMode::Error)
         .await
-        .expect("Error-mode start settles as a no-op rather than failing");
+        .expect_err("no marked target carries retryable evidence");
 
-    assert_eq!(
-        outcome,
-        RunControlOutcome::NoOp {
-            reason: RunNoOpReason::NoRetryableTarget
-        }
+    let RunControlError::NoEligibleTarget {
+        command: RunCommandKind::Start,
+        ref detail,
+    } = error
+    else {
+        panic!("an all-limited request is rejected at admission: {error:?}");
+    };
+    assert!(
+        detail.contains("limited"),
+        "the excluded target must be named: {detail}"
     );
     assert_eq!(harness.scheduler.calls(), calls_before);
     assert_eq!(harness.status("limited").await, "error");
@@ -1352,10 +1369,7 @@ async fn run_mark_intent_start_admission_reads_current_status_not_mark_time_stat
         .await
         .expect("the unchanged mark is admitted once the status allows it");
 
-    assert!(matches!(
-        outcome,
-        RunControlOutcome::RunDispatched { .. }
-    ));
+    assert!(matches!(outcome, RunControlOutcome::RunDispatched { .. }));
     assert_eq!(
         harness.scheduler.started_targets(),
         vec![vec!["a".to_string()]]
@@ -1536,10 +1550,7 @@ async fn run_mark_intent_start_admission_unmark_does_not_cancel_or_dequeue_admit
         .expect("a non-terminal row accepts an unmark at any time");
     assert!(matches!(
         changed,
-        crate::orchestration::operator_command::OperatorOutcome::MarkSet {
-            marked: false,
-            ..
-        }
+        crate::orchestration::operator_command::OperatorOutcome::MarkSet { marked: false, .. }
     ));
 
     assert_eq!(harness.marks.marked_ids(), vec!["b".to_string()]);

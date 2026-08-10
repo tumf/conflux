@@ -332,7 +332,6 @@ async fn duplicate_failure_after_remark_preserves_fresh_intent() {
 
         // The operator re-marks the steady recovery row through the shared
         // lifecycle matrix — the same route `/api/v2` takes.
-        let operator_mode = harness.app.operator_mode();
         harness
             .operator
             .set_execution_mark("alpha", true)

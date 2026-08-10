@@ -447,7 +447,12 @@ async fn run_mark_intent_single_mark_is_lifecycle_independent_and_side_effect_fr
                 "{mode:?}/{status}: a mark must not publish a retry edge"
             );
             assert!(
-                fixture.queue.cancellations.lock().expect("cancels").is_empty(),
+                fixture
+                    .queue
+                    .cancellations
+                    .lock()
+                    .expect("cancels")
+                    .is_empty(),
                 "{mode:?}/{status}: a mark must not request cancellation"
             );
 
@@ -514,7 +519,12 @@ async fn run_mark_intent_unmark_does_not_disturb_admitted_work() {
             "'{status}': unmarking must not dequeue"
         );
         assert!(
-            fixture.queue.cancellations.lock().expect("cancels").is_empty(),
+            fixture
+                .queue
+                .cancellations
+                .lock()
+                .expect("cancels")
+                .is_empty(),
             "'{status}': unmarking must not cancel"
         );
         assert_eq!(
