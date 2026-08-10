@@ -22,8 +22,3 @@ Archive validation is the authoritative final OpenSpec gate. Expected archive ga
 
 - A distinct UI for direct current-run DynamicQueue editing may be proposed later if operators still need that control; this change intentionally keeps queue APIs but removes their alias from execution marks.
 - A compact row layout may be proposed separately. This change deliberately preserves the existing checkbox column width after archive.
-
-## Current Acceptance Follow-up
-- attempt: 1
-- [x] Investigate acceptance failure and apply the required fix
-  evidence: acceptance-archive-revision-api-coverage remediated - `src/web/remote_control_api/tests/execution_mark_event_tests.rs` gains `run_mark_intent_archive_revision_publishes_the_cleared_mark`, driving `ExecutionEvent::ChangeArchived("alpha")` through `dispatch_event_with_marks` with the reconciler bound and asserting the `change_archived` envelope revision equals the published revision reporting `alpha.execution_marked == false` while `beta` stays marked, then `MergeCompleted`/`PushCompleted` for alpha recreate no mark; `cargo test --lib run_mark_intent_archive` 3 passed and `cargo test --lib run_mark_intent` 34 passed (was 33), with a reconciler-unbound mutation run failing the new assertion to prove it is load-bearing.
