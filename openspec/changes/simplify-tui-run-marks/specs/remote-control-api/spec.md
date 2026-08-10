@@ -6,7 +6,7 @@
 
 `set_execution_mark` and `set_all_execution_marks` MUST represent process-local next-run target intent only. They MUST accept visible non-terminal targets independent of app mode, active/retry/wait status, Apply iteration-limit evidence, and current parallel eligibility, and MUST NOT mutate queue intent, active execution, cancellation, retry/resolve state, hooks, scheduler state, or process mode. Archived, merged, pushed, and rejected targets MUST settle as unchanged no-op outcomes with a stable terminal-target reason and no effects.
 
-Start/retry MUST perform current reducer and worktree eligibility checks at final admission. A worktree-ineligible marked target MUST reject the complete request. Other non-startable statuses MUST be excluded with target-specific detail, and zero runnable targets MUST reject. Error-mode retry MUST route only marked retry-eligible error targets. Failed admission MUST NOT produce partial queue, scheduler, retry-edge, or projection effects.
+Start/retry MUST perform current reducer and worktree eligibility checks at final admission. A worktree-ineligible marked target MUST reject the complete request. Other non-startable statuses MUST be excluded with target-specific detail, and zero runnable targets MUST reject. Start MUST route marked retry-eligible recovery rows from Ready/Select, Stopped, or process-wide Error without relying on app mode alone. When retry and ordinary-start routes coexist, the command MUST dispatch only retry routes, report ordinary rows as deferred, and preserve their marks for a later ordinary Start. Failed admission MUST NOT produce partial queue, scheduler, retry-edge, or projection effects.
 
 #### Scenario: Single mark is lifecycle-independent and side-effect free
 
@@ -30,6 +30,22 @@ Start/retry MUST perform current reducer and worktree eligibility checks at fina
 **Then**: The service selects one target state from non-terminal rows only
 **And**: It updates only execution marks atomically
 **And**: It returns changed IDs without Running queue-intent effects
+
+#### Scenario: Ready Start retries a marked change-level error
+
+**Given**: `ProcessingError` moved `alpha` to change-level `error` while app mode later became Ready/Select
+**And**: `alpha.execution_marked` is true
+**When**: Start is submitted
+**Then**: `alpha` is admitted through its typed retry route with explicit-retry semantics
+**And**: the decision does not require process-wide Error mode
+
+#### Scenario: Mixed retry and ordinary marks defer fresh work
+
+**Given**: marked `alpha` is retry-eligible and marked `beta` is ordinary `not queued` work
+**When**: Start is submitted
+**Then**: this command dispatches only `alpha` as an explicit retry
+**And**: the outcome reports `beta` as deferred
+**And**: `beta.execution_marked` remains true for a later ordinary Start
 
 #### Scenario: Worktree-invalid Start is rejected atomically
 

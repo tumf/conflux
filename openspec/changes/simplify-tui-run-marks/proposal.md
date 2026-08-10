@@ -10,6 +10,8 @@ references:
   - openspec/specs/tui-state-management/spec.md
   - openspec/specs/tui-key-hints/spec.md
   - openspec/specs/remote-control-api/spec.md
+  - openspec/specs/operator-command-execution/spec.md
+  - openspec/specs/tui-error-handling/spec.md
   - src/orchestration/operator_command.rs
   - src/orchestration/mark_reconciliation.rs
   - src/orchestration/run_control.rs
@@ -42,10 +44,13 @@ verifications:
 - Per-change live termination already has a separate `K: kill` control, so Space does not need to retain stop or dequeue semantics.
 - The Constitution permits process-local marks but forbids treating them as durable workflow evidence.
 - The requested behavior is one shared contract across TUI, `/api/v2`, run admission, and archive reconciliation; splitting it would permit frontend and execution semantics to drift.
+- A change-scoped `ProcessingError` deliberately leaves the process in Running or Ready/Select, so process mode alone cannot decide whether configured Start/F5 means ordinary start or retry for the marked target set.
 
 ## Problem / Context
 
 A mark is intended to answer one question: whether the operator wants a change considered for a run. The current implementation also uses mark admission and mutation to enforce lifecycle timing, queue eligibility, retry ownership, and active-execution safety. As a result, the operator cannot freely express future run intent while a change is active, a stop is settling, the process is in Error, or worktree eligibility is temporarily unavailable. In Running mode the same Space action can mutate both the mark and `DynamicQueue`, so unmarking can alter already-admitted work instead of only changing future intent.
+
+A second failure appears after a change-scoped error settles. `ProcessingError` correctly does not promote the whole process to Error; a persistent scheduler can return the TUI to Ready/Select. The operator can then re-mark the failed row, but configured Start/F5 chooses its route from process mode alone. Select admits only `not queued` rows, so the marked `error` row is excluded instead of retried. The UI accepts retry intent that run control cannot consume.
 
 After archive, the opposite problem occurs: the row no longer represents a possible run target, but the TUI synthesizes a gray `[x]`. This looks like a retained mark even though the checkbox has no actionable meaning.
 
@@ -58,7 +63,7 @@ Make execution marks pure process-local next-run target intent until archive com
 - make mark mutation update only `ExecutionMarkStore` and its frontend projection; it must not add/remove `DynamicQueue` entries, stop/dequeue active work, create retry/resolve intent, change reducer status, or wake/start a scheduler;
 - retain `K: kill`, start controls, explicit retry/resolve commands, and queue services as separate controls;
 - have start/retry admission read a coherent mark snapshot and decide which marked changes are runnable using current reducer and worktree facts at that boundary rather than at mark time; preserve the existing all-or-nothing worktree eligibility fence, exclude other non-startable statuses with target-specific diagnostics, and reject when no runnable target remains;
-- reject failed admission without partial scheduler or queue effects, and define Error-mode retry to route only marked retry-eligible error targets while reporting other marked rows as excluded;
+- reject failed admission without partial scheduler or queue effects, and classify configured Start/F5 from the marked targets' current routes rather than process mode alone: marked retry-eligible recovery rows SHALL be retried from Ready/Select, Stopped, or process-wide Error, while ordinary marked rows excluded from that retry remain marked for a later ordinary run and are reported;
 - preserve existing typed mark-revocation edges and add `ChangeArchived` as an authoritative revocation edge so archived and later merged/pushed rows cannot re-enter a run target set;
 - render a fixed-width blank placeholder instead of `[x]` or `[ ]` for archived, merged, and pushed rows, preserving the existing cursor, change ID, badge, status, progress, and preview column positions;
 - make Space on a post-archive row a silent no-op and omit mark hints for that row;
@@ -74,7 +79,7 @@ No durable state, new key, new queue, new dependency, or configuration option is
 4. A single or bulk mark change modifies only the execution-mark store/projection and does not mutate `DynamicQueue`, reducer queue intent, active execution, cancellation, retry, resolve, hooks, scheduler state, or process mode.
 5. Unmarking a currently active or queued change does not stop, dequeue, or unschedule work already admitted by the current run.
 6. `K: kill`, explicit retry/resolve behavior, graceful/force stop, and direct queue command APIs remain separate and retain their existing effects.
-7. Start/retry evaluates current marks and current run eligibility at final admission: any worktree-ineligible marked target rejects the whole request, other non-startable statuses are excluded with diagnostics, zero runnable targets rejects, and failed admission leaves no partial queue or scheduler effect. Error-mode retry routes only marked retry-eligible error targets.
+7. Configured Start/F5 evaluates current marks and current run eligibility at final admission: any worktree-ineligible marked target rejects the whole request, other non-startable statuses are excluded with diagnostics, zero runnable targets rejects, and failed admission leaves no partial queue or scheduler effect. Marked retry-eligible recovery rows are retried from Ready/Select, Stopped, or process-wide Error without requiring a process-mode promotion. When retry and ordinary-start marks coexist, this invocation dispatches only the retry routes, reports the ordinary rows as deferred, and preserves their marks for a later ordinary Start.
 8. Existing typed mark-revocation edges remain authoritative, and a successful `ChangeArchived` transition additionally clears only that change's mark in the same authoritative revision while preserving unrelated marks.
 9. Archived, merged, and pushed rows remain in the current TUI session as specified, but display neither `[x]` nor `[ ]`.
 10. The post-archive checkbox area remains the same width, so cursor, ID, badges, status, progress, and preview content do not shift left.
@@ -87,10 +92,10 @@ No durable state, new key, new queue, new dependency, or configuration option is
 - `src/orchestration/operator_command.rs` classifies mark mutation independently from queue, retry, active-state, execution-mode, apply-limit, and parallel-eligibility admission while retaining a distinct post-archive exclusion.
 - `src/tui/state/selection_logic.rs` no longer emits `AddToQueue` or `RemoveFromQueue` from Space or bulk `x`, and frontend mark projection follows the shared store.
 - `/api/v2` command execution and action projection expose the same markability contract as the TUI without a second frontend-local lifecycle table.
-- `src/orchestration/run_control.rs` performs current-state run eligibility checks after reading marks, preserves the complete-set worktree fence, reports status exclusions, routes Error-mode retries precisely, and proves failed admission leaves queue and scheduler state unchanged.
+- `src/orchestration/run_control.rs` performs current-state run eligibility checks after reading marks, preserves the complete-set worktree fence, routes marked recovery rows from Ready/Select, Stopped, and process-wide Error, defers and preserves ordinary marks during a retry invocation, reports every status exclusion/deferment, and proves failed admission leaves queue and scheduler state unchanged.
 - `src/orchestration/mark_reconciliation.rs` preserves existing typed mark-revocation edges, additionally revokes the target mark on the authoritative archive edge, and publishes every effective revocation with its reducer revision.
 - `src/tui/render.rs` uses an exactly checkbox-width blank placeholder for archived, merged, and pushed rows in Select and Running/Stopped layouts and suppresses their mark hints.
-- Focused unit and integration tests prove lifecycle-wide markability, side-effect isolation, current-run continuity after unmark, API/TUI parity, archive clearing, silent post-archive Space, and fixed-width rendering.
+- Focused unit and integration tests prove lifecycle-wide markability, side-effect isolation, current-run continuity after unmark, Ready/Select re-mark plus F5 retry after `ProcessingError` and persistent idle, mixed retry/ordinary mark deferral, API/TUI parity, archive clearing, silent post-archive Space, and fixed-width rendering.
 - The declared `run-mark-contract-tests` verification passes.
 
 ## Scope Rationale
@@ -100,8 +105,9 @@ Mark admission, mark side effects, run target consumption, archive cleanup, and 
 ## Out of Scope
 
 - Persisting marks across process restarts.
-- Automatically rerunning a change immediately when it is marked.
-- Changing the `K: kill`, explicit retry, resolve, graceful-stop, or force-stop workflows.
+- Automatically rerunning a change immediately when it is marked; configured Start/F5 remains the explicit dispatch boundary.
+- Combining retry-routed and ordinary-start targets in one scheduler launch; a retry invocation defers ordinary marks to avoid applying run-wide explicit-retry semantics to fresh work.
+- Changing the `K: kill`, direct explicit retry API, resolve, graceful-stop, or force-stop workflows.
 - Removing archived rows before TUI process exit or changing archived-list discovery after restart.
 - Redesigning row spacing, compacting columns, or changing status/progress labels.
 - Introducing a second mark type for current-run queue membership.
