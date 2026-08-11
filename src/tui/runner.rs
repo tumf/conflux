@@ -213,7 +213,7 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
 /// keeps an interaction from ever replacing the shared store from this
 /// frontend's cached row set, so a mark a concurrent event revoked stays
 /// revoked and a mark another frontend set stays set.
-async fn apply_pending_mark_writes(
+pub(crate) async fn apply_pending_mark_writes(
     app: &mut AppState,
     service: &Arc<crate::orchestration::operator_command::OperatorCommandService>,
 ) {
@@ -707,6 +707,10 @@ async fn run_tui_loop(
         application = application.with_revisions(Some(revisions));
     }
     let application = Arc::new(application);
+    // Mark settlement becomes possible only now: the transaction that admits its
+    // additions has to exist before a deadline may be armed against it. Before
+    // this line every mark write in this process is mark-only.
+    crate::orchestration::operator_coordinator::bind_mark_settlement(&application);
 
     // The TUI's ordered submission path. One worker drains it, so keypresses
     // reach the coordinator in the order the operator made them, while the event

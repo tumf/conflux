@@ -1,4 +1,4 @@
-.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy check pre-commit audit publish build-linux build-linux-x86 build-linux-arm
+.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy test-running-mark-reanalysis check-scenario-set check pre-commit audit publish build-linux build-linux-x86 build-linux-arm
 
 # Ensure rustup-managed toolchain is used (not Homebrew rustc)
 RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-$(shell rustup show active-toolchain 2>/dev/null | awk '{print $$1}' | sed 's/^stable-//')/bin
@@ -90,6 +90,37 @@ web-test:
 	@echo "Running operator-console browser tests..."
 	@if [ ! -d tests/web/node_modules ]; then npm --prefix tests/web ci --no-audit --no-fund; fi
 	@npm --prefix tests/web test
+
+# Filter selecting the mark-stability settlement contract's focused tests.
+# Overridable so the discovery gate below can be proven fail-safe:
+#   make test-running-mark-reanalysis MARK_REANALYSIS_FILTER=no_such_test
+MARK_REANALYSIS_FILTER ?= running_mark_reanalysis
+
+# Focused verification for the mark-stability settlement contract.
+#
+# Discovery runs before execution on purpose. `cargo test <filter>` exits 0 when
+# the filter matches nothing at all, so a renamed, deleted, or never-written test
+# would otherwise read as a pass. Listing first and failing on an empty match is
+# what makes the evidence this target produces mean something.
+test-running-mark-reanalysis:
+	@echo "Discovering '$(MARK_REANALYSIS_FILTER)' lib-target tests..."
+	@count=$$(cargo test --lib $(MARK_REANALYSIS_FILTER) -- --list 2>/dev/null | grep -c ': test$$'); \
+	  if [ "$$count" -eq 0 ]; then \
+	    echo "FAIL: no '$(MARK_REANALYSIS_FILTER)' lib-target test was discovered"; \
+	    exit 1; \
+	  fi; \
+	  echo "Discovered $$count focused lib-target test(s)"
+	@echo "Running focused lib-target tests..."
+	cargo test --lib $(MARK_REANALYSIS_FILTER)
+	@$(MAKE) --no-print-directory check-scenario-set
+
+# Archive-preparation guard: promotion must not drop a canonical scenario.
+#
+# Runs over every active change with spec deltas rather than one hard-coded
+# change id, so it keeps working once the change that introduced it is archived.
+check-scenario-set:
+	@echo "Comparing canonical and promoted scenario sets..."
+	@python3 scripts/check-scenario-set.py
 
 # Run heavy real-boundary E2E/integration tests explicitly
 test-heavy:
