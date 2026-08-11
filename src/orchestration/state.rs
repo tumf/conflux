@@ -229,6 +229,33 @@ pub enum TerminalState {
     Stopped,
 }
 
+/// Repository evidence that decides how a stale deferred resolve retry settles.
+///
+/// Base-branch tree comparison is the authoritative completion evidence, so an
+/// unreadable comparison is kept apart from a comparison that ran and found
+/// nothing: only the first is a proof of anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleResolveEvidence {
+    /// Base-branch tree comparison proved the change is already integrated.
+    Proven,
+    /// Base-branch tree comparison ran and the change is not integrated.
+    Absent,
+    /// Integration evidence could not be read safely.
+    Unknown,
+}
+
+/// Reducer state a stale deferred resolve retry settled into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleResolveSettlement {
+    /// Terminal `merged` recorded from repository-proven base integration.
+    Merged,
+    /// Retryable manual `merge wait` retained for an explicit operator retry.
+    MergeWaitRetained,
+    /// The change already carried an immutable outcome or an explicit dequeue,
+    /// so only the consumed retry reservation was released.
+    AlreadySettled,
+}
+
 /// Observation derived from a workspace refresh scan.
 /// Used by `apply_observation()` to reconcile MergeWait without overwriting
 /// active activity.
@@ -1219,13 +1246,74 @@ impl OrchestratorState {
 
     /// Clear reducer-owned resolve retry intent for a change after repository-visible
     /// merge success or stale already-merged detection.
+    ///
+    /// Releasing a consumed reservation is bookkeeping, never an outcome.
+    /// `ReducerCommand::ResolveMerge` leaves `QueueIntent::NotQueued` behind the
+    /// `ResolveWait`, so dropping the wait on its own would expose an idle
+    /// `not queued` row for a change that is still archived and unmerged. An
+    /// entry with no terminal state, no activity, and no queue intent therefore
+    /// falls back to the retryable manual `merge wait` it was promoted from;
+    /// a later success event supersedes that safely.
     pub fn clear_resolve_wait_intent(&mut self, change_id: &str) {
         let rt = self.runtime_entry(change_id);
         if matches!(rt.wait_state, WaitState::ResolveWait) {
-            rt.wait_state = WaitState::None;
+            rt.wait_state = if rt.is_terminal()
+                || rt.dequeued
+                || rt.is_active()
+                || matches!(rt.queue_intent, QueueIntent::Queued)
+            {
+                WaitState::None
+            } else {
+                WaitState::MergeWait
+            };
             rt.clear_blocked_metadata();
         }
         self.remove_from_resolve_wait_queue(change_id);
+    }
+
+    /// Settle a stale deferred resolve retry from base-branch tree evidence.
+    ///
+    /// This is the typed transition the scheduler applies at the stale-retry
+    /// boundary. Terminal `merged` is recorded *before* the retry reservation is
+    /// dropped, so no reader observes an idle `not queued` gap between accepted
+    /// retry intent and the settled outcome. Evidence that is absent or
+    /// unreadable fails closed to retryable manual `merge wait`; only proven
+    /// base integration may report success.
+    ///
+    /// Purely a state transition: it reads no repository content and mutates no
+    /// index, worktree, or file.
+    pub fn settle_stale_resolve_retry(
+        &mut self,
+        change_id: &str,
+        evidence: StaleResolveEvidence,
+    ) -> StaleResolveSettlement {
+        match evidence {
+            StaleResolveEvidence::Proven => {
+                if !self
+                    .runtime_entry(change_id)
+                    .can_success_supersede_terminal()
+                {
+                    self.clear_base_mutating_wait_queues(change_id);
+                    return StaleResolveSettlement::AlreadySettled;
+                }
+                // Terminal first, membership second.
+                self.transition_change_to_merged(change_id);
+                StaleResolveSettlement::Merged
+            }
+            StaleResolveEvidence::Absent | StaleResolveEvidence::Unknown => {
+                let rt = self.runtime_entry(change_id);
+                if rt.is_terminal() || rt.dequeued {
+                    self.clear_base_mutating_wait_queues(change_id);
+                    return StaleResolveSettlement::AlreadySettled;
+                }
+                rt.activity = ActivityState::Idle;
+                rt.wait_state = WaitState::MergeWait;
+                rt.queue_intent = QueueIntent::NotQueued;
+                rt.clear_blocked_metadata();
+                self.clear_base_mutating_wait_queues(change_id);
+                StaleResolveSettlement::MergeWaitRetained
+            }
+        }
     }
 
     /// Return change IDs that are currently waiting for scheduler-owned rejection review.
@@ -5499,8 +5587,135 @@ mod tests {
         state.clear_resolve_wait_intent("alpha");
 
         assert!(state.resolve_wait_change_ids().is_empty());
-        assert_eq!(state.display_status("alpha"), "not queued");
+        // Releasing the reservation records no outcome, so the change falls back
+        // to the retryable manual wait instead of an idle `not queued` row.
+        assert_eq!(state.display_status("alpha"), "merge wait");
         assert!(!state.is_terminal_change("alpha"));
+    }
+
+    /// Reducer settlement table for a stale deferred resolve retry.
+    ///
+    /// The failure this guards is concrete: `ReducerCommand::ResolveMerge` leaves
+    /// `QueueIntent::NotQueued` behind the `ResolveWait`, so clearing the wait on
+    /// its own used to display `not queued` for a change the base tree already
+    /// contains.
+    fn manual_resolve_retry_state(change_id: &str) -> OrchestratorState {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec![change_id.to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: change_id.to_string(),
+            reason: "manual conflict".to_string(),
+            auto_resumable: false,
+        });
+        assert_eq!(state.display_status(change_id), "merge wait");
+        state.apply_command(ReducerCommand::ResolveMerge(change_id.to_string()));
+        assert_eq!(state.display_status(change_id), "resolve pending");
+        assert_eq!(state.resolve_wait_change_ids(), vec![change_id.to_string()]);
+        state
+    }
+
+    #[test]
+    fn stale_deferred_merge_retry_with_proven_base_integration_settles_merged() {
+        let mut state = manual_resolve_retry_state("alpha");
+
+        let settlement = state.settle_stale_resolve_retry("alpha", StaleResolveEvidence::Proven);
+
+        assert_eq!(settlement, StaleResolveSettlement::Merged);
+        assert_eq!(state.display_status("alpha"), "merged");
+        assert_ne!(state.display_status("alpha"), "not queued");
+        assert!(state.is_terminal_change("alpha"));
+        assert!(state.resolve_wait_change_ids().is_empty());
+        assert!(state.resolve_wait_queue.is_empty());
+        assert!(!state.is_base_mutating_lane_occupied());
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn stale_deferred_merge_retry_without_proven_integration_retains_merge_wait() {
+        for evidence in [StaleResolveEvidence::Absent, StaleResolveEvidence::Unknown] {
+            let mut state = manual_resolve_retry_state("alpha");
+
+            let settlement = state.settle_stale_resolve_retry("alpha", evidence);
+
+            assert_eq!(
+                settlement,
+                StaleResolveSettlement::MergeWaitRetained,
+                "{evidence:?} proves nothing and must stay retryable"
+            );
+            assert_eq!(
+                state.display_status("alpha"),
+                "merge wait",
+                "{evidence:?} must not expose not queued or merged"
+            );
+            assert!(!state.is_terminal_change("alpha"));
+            assert!(state.resolve_wait_change_ids().is_empty());
+            assert!(state.resolve_wait_queue.is_empty());
+            assert!(state.global_invariants_hold());
+
+            // The operator can still retry explicitly from the retained state.
+            state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+            assert_eq!(state.display_status("alpha"), "resolve pending");
+        }
+    }
+
+    #[test]
+    fn stale_deferred_merge_retry_settles_promoted_lane_occupant() {
+        let mut state = manual_resolve_retry_state("alpha");
+        assert_eq!(
+            state.promote_next_base_mutating_lane_waiter(),
+            Some(("alpha".to_string(), WaitState::ResolveWait))
+        );
+        assert!(state.is_base_mutating_lane_occupied());
+
+        let settlement = state.settle_stale_resolve_retry("alpha", StaleResolveEvidence::Absent);
+
+        assert_eq!(settlement, StaleResolveSettlement::MergeWaitRetained);
+        assert_eq!(state.display_status("alpha"), "merge wait");
+        assert!(
+            !state.is_base_mutating_lane_occupied(),
+            "settlement releases base-lane ownership once the reducer state agrees"
+        );
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn stale_deferred_merge_retry_preserves_immutable_terminal_outcomes() {
+        let mut state = manual_resolve_retry_state("alpha");
+        state.apply_command(ReducerCommand::StopChange("alpha".to_string()));
+        assert_eq!(state.display_status("alpha"), "stopped");
+
+        let settlement = state.settle_stale_resolve_retry("alpha", StaleResolveEvidence::Proven);
+
+        assert_eq!(settlement, StaleResolveSettlement::AlreadySettled);
+        assert_eq!(state.display_status("alpha"), "stopped");
+        assert!(state.resolve_wait_change_ids().is_empty());
+        assert!(state.resolve_wait_queue.is_empty());
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn stale_deferred_merge_retry_keeps_bounded_resolve_failure_in_merge_wait() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = manual_resolve_retry_state("alpha");
+        assert_eq!(
+            state.promote_next_base_mutating_lane_waiter(),
+            Some(("alpha".to_string(), WaitState::ResolveWait))
+        );
+
+        // Ordinary bounded exhaustion is unchanged by stale settlement: one
+        // change-scoped ResolveFailed returns the change to manual merge wait.
+        state.apply_execution_event(&ExecutionEvent::ResolveFailed {
+            change_id: "alpha".to_string(),
+            error: "bounded resolve exhausted".to_string(),
+        });
+
+        assert_eq!(state.display_status("alpha"), "merge wait");
+        assert!(!state.is_terminal_change("alpha"));
+        assert!(state.resolve_wait_change_ids().is_empty());
+        assert!(!state.is_base_mutating_lane_occupied());
+        assert!(state.global_invariants_hold());
     }
 
     #[test]

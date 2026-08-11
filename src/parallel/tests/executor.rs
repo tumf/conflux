@@ -6351,6 +6351,9 @@ async fn resolve_retry_workspace_lookup_failure_is_operator_visible() {
         assert!(!guard
             .reject_wait_change_ids()
             .contains(&"missing-ws".to_string()));
+        // Base integration was never proven, so releasing the consumed
+        // reservation must leave a retryable row, not an idle one.
+        assert_eq!(guard.display_status("missing-ws"), "merge wait");
         assert!(guard.global_invariants_hold());
     }
     assert_eq!(
@@ -6359,6 +6362,344 @@ async fn resolve_retry_workspace_lookup_failure_is_operator_visible() {
             .await
             .promote_next_base_mutating_lane_waiter(),
         Some(("next-ws".to_string(), WaitState::ResolveWait))
+    );
+}
+
+/// Reducer state for a change that entered `ResolveWait` through an explicit
+/// manual `M` retry and was then promoted onto the base-mutating lane.
+///
+/// `ReducerCommand::ResolveMerge` is what leaves `QueueIntent::NotQueued` behind
+/// the wait, so this is the exact shape whose stale settlement used to surface
+/// `not queued`.
+async fn promoted_manual_resolve_retry_state(change_id: &str) -> Arc<RwLock<OrchestratorState>> {
+    let shared = Arc::new(RwLock::new(OrchestratorState::new(
+        vec![change_id.to_string()],
+        0,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: change_id.to_string(),
+            reason: "manual conflict".to_string(),
+            auto_resumable: false,
+        });
+        guard.apply_command(ReducerCommand::ResolveMerge(change_id.to_string()));
+        assert_eq!(guard.display_status(change_id), "resolve pending");
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some((change_id.to_string(), WaitState::ResolveWait))
+        );
+    }
+    shared
+}
+
+async fn git_porcelain_status(repo_root: &Path) -> String {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("read git status");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+async fn git_stash_list(repo_root: &Path) -> String {
+    let output = Command::new("git")
+        .args(["stash", "list"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("read git stash list");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+#[tokio::test]
+async fn stale_deferred_merge_retry_with_proven_base_integration_settles_merged() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    write_change_proposal(repo_dir.path(), "alpha", &[]);
+    commit_archive_to_base(repo_dir.path(), "2026-05-13-alpha", "alpha").await;
+    assert!(
+        crate::execution::state::is_merged_to_base("alpha", repo_dir.path(), "main")
+            .await
+            .or_fail("read base integration evidence"),
+        "fixture must prove base-branch tree integration before the retry runs"
+    );
+
+    let (event_tx, _event_rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        repo_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(event_tx),
+    );
+    let merge_calls = Arc::new(AtomicUsize::new(0));
+    executor.workspace_manager = Box::new(TestWorkspaceManager::new(merge_calls.clone()));
+    let shared = promoted_manual_resolve_retry_state("alpha").await;
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.resolve_wait_changes.insert("alpha".to_string());
+
+    let outcome = executor
+        .retry_deferred_merges_for(vec!["alpha".to_string()])
+        .await;
+
+    assert_eq!(outcome, MergeTaskOutcome::Merged);
+    {
+        let guard = shared.read().await;
+        assert_eq!(
+            guard.display_status("alpha"),
+            "merged",
+            "repository-proven base integration is a terminal result, not idle bookkeeping"
+        );
+        assert!(guard.resolve_wait_change_ids().is_empty());
+        assert!(
+            !guard.is_base_mutating_lane_occupied(),
+            "base-lane ownership is released once the reducer state agrees"
+        );
+        assert!(guard.global_invariants_hold());
+    }
+    assert!(executor.resolve_wait_changes.is_empty());
+    assert!(!executor.merge_wait_changes.contains("alpha"));
+    assert_eq!(
+        merge_calls.load(Ordering::SeqCst),
+        0,
+        "a stale retry must not attempt another merge"
+    );
+}
+
+#[tokio::test]
+async fn stale_deferred_merge_retry_preserves_dirty_repository_content() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    write_change_proposal(repo_dir.path(), "alpha", &[]);
+    commit_archive_to_base(repo_dir.path(), "2026-05-13-alpha", "alpha").await;
+
+    // Unrelated operator work: a tracked modification, a staged addition, and a
+    // non-ignored untracked file.
+    let tracked = repo_dir.path().join("README.md");
+    let staged = repo_dir.path().join("staged.txt");
+    let untracked = repo_dir.path().join("untracked.txt");
+    std::fs::write(
+        &tracked,
+        "operator edit
+",
+    )
+    .or_fail("write tracked modification");
+    std::fs::write(
+        &staged,
+        "staged work
+",
+    )
+    .or_fail("write staged file");
+    Command::new("git")
+        .args(["add", "staged.txt"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("stage operator file");
+    std::fs::write(
+        &untracked,
+        "untracked work
+",
+    )
+    .or_fail("write untracked file");
+
+    let status_before = git_porcelain_status(repo_dir.path()).await;
+    let head_before = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("read HEAD before settlement");
+    assert!(
+        !status_before.trim().is_empty(),
+        "fixture must be dirty before settlement"
+    );
+
+    let (event_tx, _event_rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        repo_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(event_tx),
+    );
+    executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
+    let shared = promoted_manual_resolve_retry_state("alpha").await;
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.resolve_wait_changes.insert("alpha".to_string());
+
+    let outcome = executor
+        .retry_deferred_merges_for(vec!["alpha".to_string()])
+        .await;
+
+    assert_eq!(outcome, MergeTaskOutcome::Merged);
+    assert_eq!(
+        shared.read().await.display_status("alpha"),
+        "merged",
+        "dirty content is a guard, not a reason to withhold the proven terminal result"
+    );
+
+    assert_eq!(
+        git_porcelain_status(repo_dir.path()).await,
+        status_before,
+        "settlement must not stage, commit, stash, reset, or discard operator content"
+    );
+    assert_eq!(
+        get_current_commit(repo_dir.path())
+            .await
+            .or_fail("read HEAD after settlement"),
+        head_before,
+        "settlement must not create a commit"
+    );
+    assert!(
+        git_stash_list(repo_dir.path()).await.trim().is_empty(),
+        "settlement must not stash operator content"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).or_fail("read tracked file"),
+        "operator edit\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&staged).or_fail("read staged file"),
+        "staged work\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&untracked).or_fail("read untracked file"),
+        "untracked work\n"
+    );
+}
+
+#[tokio::test]
+async fn stale_deferred_merge_retry_with_unreadable_evidence_remains_merge_wait() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    write_change_proposal(repo_dir.path(), "alpha", &[]);
+    commit_archive_to_base(repo_dir.path(), "2026-05-13-alpha", "alpha").await;
+
+    let (event_tx, mut event_rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        repo_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(event_tx),
+    );
+    let merge_calls = Arc::new(AtomicUsize::new(0));
+    // Base identity cannot be resolved, so the archive evidence above can never
+    // be compared against a base tree. The retry still runs and finds no
+    // workspace, which is where settlement happens on unproven evidence.
+    executor.workspace_manager =
+        Box::new(TestWorkspaceManager::new(merge_calls.clone()).with_failing_original_branch());
+    let shared = promoted_manual_resolve_retry_state("alpha").await;
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.resolve_wait_changes.insert("alpha".to_string());
+
+    let outcome = executor
+        .retry_deferred_merges_for(vec!["alpha".to_string()])
+        .await;
+
+    assert_eq!(outcome, MergeTaskOutcome::Merged);
+    {
+        let guard = shared.read().await;
+        let status = guard.display_status("alpha");
+        assert_eq!(
+            status, "merge wait",
+            "unreadable evidence must fail closed to an explicitly retryable state"
+        );
+        assert_ne!(status, "merged");
+        assert_ne!(status, "not queued");
+        assert!(guard.resolve_wait_change_ids().is_empty());
+        assert!(!guard.is_base_mutating_lane_occupied());
+        assert!(guard.global_invariants_hold());
+    }
+    assert!(executor.resolve_wait_changes.is_empty());
+    assert!(executor.merge_wait_changes.contains("alpha"));
+    assert_eq!(
+        merge_calls.load(Ordering::SeqCst),
+        0,
+        "evidence that could not be read must not authorize a merge attempt"
+    );
+
+    let mut saw_retry_dispatch = false;
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            ExecutionEvent::Log(entry) => {
+                if entry
+                    .message
+                    .contains("ResolveWait retry dispatch started for 'alpha'")
+                {
+                    saw_retry_dispatch = true;
+                }
+            }
+            ExecutionEvent::Error { message } => {
+                panic!("unreadable evidence is recoverable, got global Error: {message}")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_retry_dispatch,
+        "unreadable evidence must not silently swallow the operator's retry"
+    );
+
+    // The operator can still retry explicitly once the repository is corrected.
+    assert!(matches!(
+        shared
+            .write()
+            .await
+            .apply_command(ReducerCommand::ResolveMerge("alpha".to_string())),
+        crate::orchestration::state::ReduceOutcome::Changed(_)
+    ));
+    assert_eq!(
+        shared.read().await.display_status("alpha"),
+        "resolve pending"
+    );
+}
+
+#[tokio::test]
+async fn stale_deferred_merge_retry_with_stale_workspace_path_remains_merge_wait() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    write_change_proposal(repo_dir.path(), "alpha", &[]);
+    assert!(
+        !crate::execution::state::is_merged_to_base("alpha", repo_dir.path(), "main")
+            .await
+            .or_fail("read base integration evidence"),
+        "fixture must prove base integration is absent before the retry runs"
+    );
+
+    let (event_tx, _event_rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        repo_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(event_tx),
+    );
+    let merge_calls = Arc::new(AtomicUsize::new(0));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(merge_calls.clone())
+            .with_existing_workspace("alpha", repo_dir.path().join("deleted-worktree")),
+    );
+    let shared = promoted_manual_resolve_retry_state("alpha").await;
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.resolve_wait_changes.insert("alpha".to_string());
+
+    let outcome = executor
+        .retry_deferred_merges_for(vec!["alpha".to_string()])
+        .await;
+
+    assert_eq!(outcome, MergeTaskOutcome::Merged);
+    {
+        let guard = shared.read().await;
+        let status = guard.display_status("alpha");
+        assert_eq!(
+            status, "merge wait",
+            "a stale workspace path proves nothing about base integration"
+        );
+        assert_ne!(status, "merged");
+        assert_ne!(status, "not queued");
+        assert!(guard.resolve_wait_change_ids().is_empty());
+        assert!(!guard.is_base_mutating_lane_occupied());
+        assert!(guard.global_invariants_hold());
+    }
+    assert!(executor.resolve_wait_changes.is_empty());
+    assert!(executor.merge_wait_changes.contains("alpha"));
+    assert_eq!(
+        merge_calls.load(Ordering::SeqCst),
+        0,
+        "a stale workspace path must not authorize a merge attempt"
     );
 }
 
