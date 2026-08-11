@@ -12,6 +12,42 @@ Dependency analysis MUST continue to treat an errored dependency as a dispatch b
 
 When configured for persistent lifetime and fully drained, the scheduler MUST remain alive without timer-driven repository/worktree polling. A fully drained persistent scheduler means there is no local queued work, no in-flight workspace task, no reducer-owned resolve/reject waiter, no active manual resolve, and no pending merge or push task. In that state, the scheduler SHALL wait for explicit wake events such as dynamic queue notifications or scheduler retry notifications before running queue reconciliation, worktree scans, or base-branch merge-state checks again.
 
+When configured for push post-archive mode, the parallel service SHALL preserve the existing apply, acceptance, and archive flow, then push the completed local change branch to the selected remote instead of merging it into the original base branch. Push mode MUST push the local branch to the same-named remote branch and MUST NOT support destination branch override syntax.
+
+#### Scenario: push mode skips base merge
+
+- **GIVEN** parallel execution is running with push post-archive mode using remote `origin`
+- **AND** change `alpha` has completed apply, acceptance, and archive in worktree branch `alpha`
+- **WHEN** the post-archive terminal action runs
+- **THEN** Conflux pushes `alpha` to remote `origin` as `alpha:alpha`
+- **AND** Conflux does not checkout the original base branch to merge `alpha`
+- **AND** the original base branch HEAD is not advanced by the terminal action
+
+#### Scenario: push mode cleans up after successful push
+
+- **GIVEN** change `alpha` is archive-complete in worktree branch `alpha`
+- **AND** push mode successfully pushes `alpha:alpha` to the selected remote
+- **WHEN** terminal action cleanup runs
+- **THEN** the worktree for `alpha` is cleaned up through the normal safe cleanup path
+- **AND** the change is reported as pushed rather than merged
+
+#### Scenario: push failure preserves workspace
+
+- **GIVEN** change `alpha` is archive-complete in worktree branch `alpha`
+- **AND** push mode cannot push to the selected remote
+- **WHEN** the push command fails
+- **THEN** Conflux reports a push failure with the remote, branch, and command error context
+- **AND** the worktree and local branch for `alpha` remain available for inspection or retry
+- **AND** the change is not reported as merged or pushed
+
+#### Scenario: push mode does not run on_merged hook
+
+- **GIVEN** `hooks.on_merged` is configured
+- **AND** parallel execution is running with push post-archive mode
+- **WHEN** change `alpha` is successfully pushed to the remote
+- **THEN** `hooks.on_merged` is not executed for `alpha`
+- **AND** no `MergeCompleted` event is emitted for push success
+
 #### Scenario: Runtime-limit failure is not automatically redispatched
 
 - **GIVEN** Apply for `alpha` is terminated by its absolute runtime limit
@@ -45,4 +81,4 @@ When configured for persistent lifetime and fully drained, the scheduler MUST re
 - **THEN** one fresh scheduler boundary SHALL start for `alpha` with explicit-retry semantics
 - **AND** retry-specific repair budget release SHALL apply only through the accepted retry path
 
-<!-- Expected canonical result after archive: terminal errors remain fail-closed after runtime-limit and other failures until a target-specific accepted retry creates immediate reanalysis, whether waking a persistent scheduler or starting a fresh boundary. -->
+<!-- Expected canonical result after archive: terminal errors remain fail-closed after runtime-limit and other failures until a target-specific accepted retry creates immediate reanalysis, whether waking a persistent scheduler or starting a fresh boundary; push post-archive behavior remains intact. -->

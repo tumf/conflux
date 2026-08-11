@@ -32,7 +32,7 @@ This is a fallback rather than a mixed command. `explicit_retry` is currently a 
 1. Acquire the shared operator application gate.
 2. Read process mode and one coherent marked/reducer eligibility view.
 3. Classify ordinary targets and retry routes without mutation.
-4. Apply the appropriate worktree and active-run guards to the selected class only.
+4. Apply the existing complete-request worktree fence to the full marked set before selecting ordinary or retry-class admission, then apply retry-specific active-run guards to the selected retry class.
 5. Prepare scheduler start or wake before mutation.
 6. Commit either ordinary queue intent or existing retry routes.
 7. Dispatch the authoritative accepted outcome and capture its revision.
@@ -52,7 +52,7 @@ An ordinary `AddToQueue`, generic scheduler notification, execution mark, or mar
 
 ## Interaction with Running Mark Settlement
 
-Running-mode ordinary marks continue to settle into the current run after the configured stability interval. Retry statuses remain excluded from settlement. F5 on a retry-eligible mark bypasses settlement because it is explicit operator retry intent; F5 does not arm, reset, or consume the ordinary mark deadline.
+This change depends on `restore-running-mark-reanalysis`. After that dependency is implemented, Running-mode ordinary marks continue to settle into the current run after the configured stability interval. Retry statuses remain excluded from settlement. F5 on a retry-eligible mark bypasses settlement because it is explicit operator retry intent; F5 does not arm, reset, or consume the ordinary mark deadline.
 
 ## Verification Strategy
 

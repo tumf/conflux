@@ -2,9 +2,43 @@
 
 ### Requirement: Error Retry with F5 Key
 
-Pressing a configured Start key such as F5 SHALL retry marked retry-eligible change-local failures according to shared authoritative eligibility without requiring the process-wide execution mode to be Error. Running mode SHALL permit retry-only Start against a live scheduler. Select and Stopped SHALL preserve ordinary marked `not queued` Start priority and SHALL fall back to marked retry routes only when no ordinary target is startable. Process-wide Error SHALL retain its existing retry behavior, and Stopping SHALL refuse Start without mutation.
+Pressing a configured Start key such as F5 SHALL retry marked retry-eligible targets according to shared authoritative eligibility without requiring the process-wide execution mode to be Error. Running mode SHALL permit retry-only Start against a live scheduler. Select and Stopped SHALL preserve ordinary marked `not queued` Start priority and SHALL fall back to marked retry routes only when no ordinary target is startable. Process-wide Error SHALL retain its existing retry behavior, and Stopping SHALL refuse Start without mutation.
 
 If typed Apply iteration-limit evidence is still owned by the active run, F5 SHALL be a mutation-free refusal and SHALL NOT transition the TUI to Running. Once the owning run closes and eligibility is refreshed, F5 MAY start a later boundary through the ordinary retry path. A typed runtime-limit failure SHALL NOT be retried automatically by the failed invocation's scheduler cycle, but it MAY be retried by a later explicit F5 request when shared eligibility permits it.
+
+#### Scenario: Retry with F5 key
+
+- **WHEN** a retry-eligible Change is execution-marked
+- **AND** user presses F5 key in a mode that permits retry-class Start
+- **THEN** the Change is admitted through explicit retry
+- **AND** processing resumes through a live or newly started scheduler boundary as applicable
+
+#### Scenario: Log display on retry
+
+- **WHEN** user initiates an eligible retry with F5 key
+- **THEN** log panel displays "Retrying: <change_id>"
+
+#### Scenario: State after successful retry
+
+- **WHEN** the retried processing succeeds
+- **THEN** the Change status updates to "completed" or "archived"
+- **AND** remaining queued Changes continue processing
+
+#### Scenario: F5 cannot target an active limited run
+
+- **WHEN** TUI displays a marked retry target carrying active-run Apply iteration-limit evidence
+- **AND** user presses F5 key
+- **THEN** no retry, queue, mark, explicit-retry, or scheduler command is emitted
+- **AND** TUI does not transition to Running because of the refused target
+- **AND** the active-limit explanation remains visible
+
+#### Scenario: F5 becomes available after boundary closure
+
+- **GIVEN** the prior run's finish-hook ownership completed and its active limit gate was retired
+- **WHEN** TUI refreshes authoritative eligibility for the still-retryable change
+- **AND** user presses F5
+- **THEN** ordinary retry admission may start a later scheduler boundary
+- **AND** the later boundary uses workspace-derived state and a fresh Apply budget
 
 #### Scenario: Persistent-idle Select retries a marked change-local error
 
@@ -31,7 +65,7 @@ If typed Apply iteration-limit evidence is still owned by the active run, F5 SHA
 - **AND** marked retry-only change `alpha` is also present
 - **WHEN** the user presses F5
 - **THEN** ordinary Start SHALL admit `beta`
-- **AND** `alpha` SHALL be excluded with target-specific status detail
+- **AND** `alpha` SHALL be excluded with target-specific status detail that explains ordinary marks must be removed before retry-class Start can select `alpha`
 - **AND** the request SHALL NOT implicitly retry `alpha`
 
 #### Scenario: Later explicit retry follows runtime-limit termination

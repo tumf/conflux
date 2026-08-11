@@ -1,13 +1,16 @@
 ---
 change_type: implementation
 priority: high
-dependencies: []
+dependencies:
+  - restore-running-mark-reanalysis
 references:
   - openspec/CONSTITUTION.md
   - openspec/specs/cli/spec.md
   - openspec/specs/operator-command-execution/spec.md
   - openspec/specs/parallel-execution/spec.md
+  - openspec/specs/remote-control-api/spec.md
   - openspec/specs/tui-error-handling/spec.md
+  - openspec/changes/restore-running-mark-reanalysis/proposal.md
   - openspec/changes/archive/2026-08-10-preserve-run-mode-on-change-error/proposal.md
   - src/orchestration/run_control.rs
   - src/orchestration/operator_command.rs
@@ -65,9 +68,9 @@ Make Start/F5 retry classification evidence-aware in every non-stopping process 
 2. A marked retry-eligible change-level `error` can be retried with F5 while process mode remains Running; unrelated active or queued work and process mode are not converted to global Error.
 3. A retry accepted from Stopped starts a fresh explicit-retry scheduler boundary; an accepted retry from a live scheduler notifies that scheduler instead of spawning a second boundary.
 4. A runtime-limit failure is not automatically retried, but a later explicit F5 request is eligible once ordinary shared retry guards permit it.
-5. Active-run Apply iteration-limit evidence, non-resumable or identity-mismatched holds, unsupported terminal states, and Stopping mode produce mutation-free refusal or target-specific exclusion with no reducer, mark, queue, retry-edge, scheduler, or projection effect.
-6. In Select or Stopped, ordinary marked `not queued` work keeps existing Start semantics. If ordinary and retry-only marks are mixed, ordinary work is admitted and retry-only rows are excluded rather than implicitly retried.
-7. TUI F5 and remote `start` resolve the same targets, reducer transitions, explicit-retry semantics, scheduler effect, outcome revision, and diagnostics from the same authoritative snapshot.
+5. Active-run Apply iteration-limit evidence, non-resumable or identity-mismatched holds, unsupported terminal states, Stopping mode, and worktree-ineligible marked targets produce mutation-free refusal or target-specific exclusion with no reducer, mark, queue, retry-edge, scheduler, or projection effect; the existing complete-request worktree fence applies before either ordinary or retry-class Start admission.
+6. In Select or Stopped, ordinary marked `not queued` work keeps existing Start semantics. If ordinary and retry-only marks are mixed, ordinary work is admitted and retry-only rows are excluded rather than implicitly retried; diagnostics explain that ordinary marks must be removed before the retry-only rows can be retried through Start.
+7. TUI F5 and remote `start` resolve the same targets, reducer transitions, explicit-retry semantics, scheduler effect, outcome revision, worktree-fence refusal, and diagnostics from the same authoritative snapshot.
 8. Explicit F5 retry remains separate from the 10-second ordinary mark-settlement path: error/wait marks do not gain delayed implicit retry, and an accepted F5 retry does not arm or wait for that deadline.
 
 ## Explicit Completion Conditions
