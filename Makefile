@@ -1,4 +1,4 @@
-.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy test-running-mark-reanalysis check-scenario-set check pre-commit audit publish build-linux build-linux-x86 build-linux-arm
+.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy test-running-mark-reanalysis test-change-error-f5-retry check-scenario-set check pre-commit audit publish build-linux build-linux-x86 build-linux-arm
 
 # Ensure rustup-managed toolchain is used (not Homebrew rustc)
 RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-$(shell rustup show active-toolchain 2>/dev/null | awk '{print $$1}' | sed 's/^stable-//')/bin
@@ -113,6 +113,27 @@ test-running-mark-reanalysis:
 	@echo "Running focused lib-target tests..."
 	cargo test --lib $(MARK_REANALYSIS_FILTER)
 	@$(MAKE) --no-print-directory check-scenario-set
+
+# Filter selecting the change-local F5 retry contract's focused tests.
+# Overridable so the discovery gate below can be proven fail-safe:
+#   make test-change-error-f5-retry F5_RETRY_FILTER=no_such_test
+F5_RETRY_FILTER ?= change_error_f5_retry
+
+# Focused verification for mode-independent Start/F5 retry routing.
+#
+# Discovery runs before execution for the same reason as above: `cargo test`
+# exits 0 on a filter that matches nothing, so a renamed or never-written test
+# would read as a pass.
+test-change-error-f5-retry:
+	@echo "Discovering '$(F5_RETRY_FILTER)' lib-target tests..."
+	@count=$$(cargo test --lib $(F5_RETRY_FILTER) -- --list 2>/dev/null | grep -c ': test$$'); \
+	  if [ "$$count" -eq 0 ]; then \
+	    echo "FAIL: no '$(F5_RETRY_FILTER)' lib-target test was discovered"; \
+	    exit 1; \
+	  fi; \
+	  echo "Discovered $$count focused lib-target test(s)"
+	@echo "Running focused lib-target tests..."
+	cargo test --lib $(F5_RETRY_FILTER)
 
 # Archive-preparation guard: promotion must not drop a canonical scenario.
 #

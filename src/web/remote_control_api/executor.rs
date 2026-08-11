@@ -17,7 +17,8 @@ use crate::orchestration::operator_coordinator::{
     ApplicationOutcome, ApplicationResult, OperatorApplication, OperatorIntent,
 };
 use crate::orchestration::run_control::{
-    ResolveReservation, RunControlError, RunControlOutcome, RunNoOpReason, SchedulerEffect,
+    ExcludedTarget, ResolveReservation, RunControlError, RunControlOutcome, RunNoOpReason,
+    SchedulerEffect,
 };
 use crate::web::state::WebState;
 
@@ -371,7 +372,7 @@ pub fn summarize_run_outcome(outcome: &RunControlOutcome) -> ExecutionSummary {
             } else {
                 let detail = excluded
                     .iter()
-                    .map(|target| format!("{} ({})", target.change_id, target.status))
+                    .map(ExcludedTarget::describe)
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("; excluded: {detail}")

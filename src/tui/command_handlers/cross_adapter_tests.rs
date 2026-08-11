@@ -572,12 +572,15 @@ fn rows() -> Vec<Row> {
             notice: None,
         },
         Row {
-            name: "start is refused while a run owns the lifecycle",
+            // A live run admits only marked retry routes, and these marks carry
+            // no retryable evidence: the refusal is target-shaped rather than
+            // mode-shaped, and both adapters must reach the same one.
+            name: "start under a live run is refused when no mark is retryable",
             setup: Setup::MarkedWithLiveScheduler,
             mode: AppExecutionMode::Running,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
-            expect: Settlement::Failed(ErrorCode::LifecycleConflict),
+            expect: Settlement::Failed(ErrorCode::TargetIneligible),
             notice: None,
         },
         Row {
