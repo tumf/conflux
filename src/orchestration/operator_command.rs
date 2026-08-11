@@ -48,7 +48,12 @@ pub const DEFAULT_CANCELLATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// admitted change is already creating, recreating, or setting up its managed
 /// worktree, so destructive mutation and mark-based intent changes must be
 /// refused exactly as they are for an operation in flight.
-const ACTIVE_STATUSES: [&str; 6] = [
+///
+/// This is the single backing vocabulary for [`is_active_status`], and it is
+/// public so callers that must be exhaustive over active execution — notably
+/// the TUI refresh precedence rule — can iterate it instead of maintaining a
+/// second hand-written list that silently falls behind this one.
+pub const ACTIVE_STATUSES: [&str; 6] = [
     "preparing",
     "applying",
     "accepting",
