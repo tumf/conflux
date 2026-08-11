@@ -33,6 +33,10 @@ mod cross_adapter_tests;
 #[cfg(all(test, feature = "web-monitoring"))]
 mod convergence_tests;
 
+/// Mark-stability settlement, driven through the real TUI adapter.
+#[cfg(test)]
+mod mark_settlement_tests;
+
 #[cfg(test)]
 #[derive(Clone, Debug)]
 enum DeleteWorktreeTestOutcome {
@@ -453,11 +457,16 @@ fn no_op_message(reason: &RunNoOpReason, retry: RetryContext) -> String {
 /// first, one change at a time, so even an explicit selection is started through
 /// it. The write is target-scoped on purpose: replacing the whole store from a
 /// caller-supplied list would also clear marks this frontend never observed.
+///
+/// These writes go through the *admission* entry point, so they never arm mark
+/// settlement. They belong to this Start request: an accepted Start already
+/// queues its targets, and a rejected one must leave no delayed queue effect
+/// behind for a deadline to discover ten seconds later.
 pub async fn handle_start_processing_command(ids: Vec<String>, ctx: &mut TuiCommandContext<'_>) {
     if !ids.is_empty() {
         let service = ctx.application.run_control().operator();
         for id in &ids {
-            service.apply_execution_mark(id, true).await;
+            service.apply_admission_execution_mark(id, true).await;
         }
         ctx.app.sync_execution_marks_from_store();
     }
@@ -1210,6 +1219,10 @@ mod tests {
                     revisions.clone() as Arc<dyn crate::events::OutcomeRevisions>
                 )),
             );
+            // Production binds the mark-settlement runtime immediately after
+            // the coordinator exists; a harness that skipped it would leave the
+            // whole stability policy unreachable from the adapter under test.
+            crate::orchestration::operator_coordinator::bind_mark_settlement(&application);
             let (submissions_tx, submissions_rx) = mpsc::channel(256);
             let (feedback_tx, feedback_rx) = mpsc::channel(256);
             let worktree_service = build_worktree_service(Path::new("."), &config, &tx);

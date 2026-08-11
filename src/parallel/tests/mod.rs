@@ -27,6 +27,8 @@ mod reducer_snapshot_contention;
 
 mod run_command_scope;
 #[cfg(test)]
+mod running_mark_reanalysis;
+#[cfg(test)]
 mod unchanged_analysis_input;
 #[cfg(test)]
 mod upstream_integration;

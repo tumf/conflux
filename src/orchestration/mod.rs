@@ -10,6 +10,7 @@ pub mod blocker_classification;
 pub mod execution_facts;
 pub mod hooks;
 pub mod mark_reconciliation;
+pub mod mark_settlement;
 pub mod operator_command;
 pub mod operator_coordinator;
 pub mod output;

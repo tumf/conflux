@@ -498,7 +498,7 @@ TUIモードでは、既存workspace検出・再利用時に通知を表示し�
 
 実行中のchangeが存在せず、queuedのchangeも空の場合、システムはオーケストレーションを終了しなければならない（MUST）。
 
-analysis対象をqueuedに限定するため、queuedに含まれないchange（例: merged済みchange、実行済みchange、削除済みchange）はanalysis対象から除外されなければならない（MUST）。
+analysis対象をqueuedに限定するため、queuedに含まれないchange（例: marked but unsettled、merged済みchange、実行済みchange、削除済みchange）はanalysis対象から除外されなければならない（MUST）。
 
 queuedのchangeが空の場合、analysisを実行してはならない（MUST）。ただし reducer-visible queued intent が存在する場合、scheduler は queued が空であると結論する前に reconciliation を試みなければならない（MUST）。
 
@@ -510,13 +510,15 @@ re-analysis はメインの実行ループ進行に依存せず開始できな�
 
 明示的な queue notification により dynamic queue ingestion または reducer reconciliation から新しい loadable queued candidate が scheduler-local queued work に追加された場合、scheduler はその追加を debounce 対象の timer/poll 再確認として扱ってはならない（MUST NOT）。この場合、現在の scheduler iteration が初回でなく、queue debounce timestamp が新しい場合でも、dependency analysis を開始しなければならない（MUST）。
 
-ただし、同一状態で候補追加を伴わない queue wake、timer wake、blocked-only drain、または candidate-unavailable 状態は、既存の debounce / diagnostic dedupe / notification-driven idle policy に従ってよい（MAY）。
+Stable mark settlement が explicit queue service へ新しい loadable queued candidate を追加した場合、その DynamicQueue notification は前段落の明示的 queue-addition edge として扱われなければならない（MUST）。scheduler は mark stability の10秒に通常 queue debounce を重ねてはならない（MUST NOT）。
+
+ただし、mark snapshot の変更または stability deadline だけでは queued candidate が作成される前に dependency analysis を起動してはならない（MUST NOT）。同一状態で候補追加を伴わない queue wake、timer wake、blocked-only drain、または candidate-unavailable 状態は、既存の debounce / diagnostic dedupe / notification-driven idle policy に従ってよい（MAY）。
 
 Scheduler reconciliation は reducer-visible queued work が analysis 対象へ取り込まれない理由を観測可能にしなければならない（SHALL）。ただし、同じ change と同じ理由が scheduler loop ごとに連続する場合、user-visible logs と WARN-level debug log entries への出力は dedupe、rate-limit、または summary 化されなければならない（SHALL）。
 
 Reducer-visible queued reconciliation MUST NOT refresh an existing queue debounce timestamp merely because the same reducer-visible queued intent is reconstructed again from repository-visible OpenSpec state. Reconciliation MAY initialize the debounce timestamp when reducer-visible queued work is first reconstructed and no timestamp exists, but repeated rediscovery of the same reducer-owned queued state MUST allow the original debounce window to elapse or must be handled by the existing explicit queue-notification bypass rules.
 
-<!-- Expected canonical result after archive: `Parallel Analysis Targeting` prevents reducer-visible queued reconciliation from starving analysis by repeatedly resetting queue debounce, while preserving explicit queue-addition bypass and blocked-only idle behavior. -->
+<!-- Expected canonical result after archive: stable marks specialize the existing explicit queue-addition edge without dropping diagnostic, debounce, or queued-only analysis guarantees. -->
 
 #### Scenario: missing queued candidate diagnostic is bounded
 
@@ -540,7 +542,7 @@ Reducer-visible queued reconciliation MUST NOT refresh an existing queue debounc
 
 - **GIVEN** parallel execution is already running beyond the first scheduler analysis iteration
 - **AND** the queue debounce timestamp is fresh enough that timer-driven reanalysis would normally be deferred
-- **WHEN** the operator presses `x` in the TUI Changes view and a `not queued` loadable change is added to scheduler-local queued work through dynamic queue ingestion
+- **WHEN** an admitted TUI operation adds a `not queued` loadable change to scheduler-local queued work through dynamic queue ingestion
 - **THEN** dependency analysis starts for the queued candidate without waiting for the debounce period to expire
 - **AND** the analysis target set includes queued candidates only
 
@@ -577,6 +579,41 @@ Reducer-visible queued reconciliation MUST NOT refresh an existing queue debounc
 - **AND** dynamic queue ingestion and reducer reconciliation do not add any new loadable queued candidate
 - **WHEN** the scheduler evaluates reanalysis eligibility
 - **THEN** the scheduler may defer analysis according to existing debounce, blocked-only, or notification-driven idle policy
+
+#### Scenario: Unsettled mark is not an analysis target
+
+- **GIVEN** a live scheduler exists
+- **AND** a loadable ordinary change is marked but its 10-second stability deadline has not elapsed
+- **WHEN** scheduler reanalysis eligibility is evaluated
+- **THEN** the marked change is not analyzed unless it is independently reducer-visible as queued
+- **AND** the scheduler does not poll because of the mark
+
+#### Scenario: Stable mark queue addition bypasses further queue debounce
+
+- **GIVEN** parallel execution is already beyond the first scheduler analysis iteration
+- **AND** an operator mark set has remained unchanged for 10 seconds
+- **AND** settlement adds a new loadable change through the explicit queue service
+- **AND** the queue debounce timestamp is fresh enough that timer-driven reanalysis would normally be deferred
+- **WHEN** DynamicQueue notification is ingested
+- **THEN** dependency analysis starts without another debounce period
+- **AND** the analysis target set includes queued candidates only
+
+#### Scenario: Stable mark addition analyzes at zero capacity
+
+- **GIVEN** all ordinary dispatch slots are occupied or held by resolve/manual work
+- **AND** stable mark settlement adds a loadable change to scheduler-local queued work
+- **WHEN** the scheduler evaluates the queue notification
+- **THEN** dependency analysis starts for the queued change
+- **AND** ordinary apply dispatch is suppressed until execution capacity becomes available
+- **AND** the suppression is observable through a capacity-gated diagnostic or equivalent event
+
+#### Scenario: No-op settlement does not manufacture an analysis edge
+
+- **GIVEN** a stable mark snapshot reaches its deadline
+- **AND** every marked row is already queued, active, waiting, terminal, unavailable, or otherwise ineligible for ordinary admission
+- **WHEN** settlement completes without adding a loadable queued candidate
+- **THEN** no queue-addition reanalysis edge is created
+- **AND** existing debounce, blocked-only, and persistent-idle behavior remains unchanged
 
 ### Requirement: Workspace State Detection
 既存workspaceの再開時に、archive 状態をコミットメッセージではなく **コミットされたファイルの状態** で判定しなければならない（MUST）。
@@ -1571,7 +1608,7 @@ The scheduler loop SHALL terminate when all of the following conditions are met:
 - Manual resolve counter is zero (no resolve commands actively executing)
 - `join_set` is empty (no spawned tasks running)
 
-Changes in MergeWait state (requiring user intervention) SHALL NOT prevent scheduler loop termination.
+Changes in MergeWait state (requiring user intervention) SHALL NOT prevent scheduler loop termination. An unsettled mark snapshot SHALL NOT add a finite-run termination condition. A persistent scheduler that remains live after its typed idle transition MAY retain and settle the process-local deadline independently of scheduler drain detection.
 
 #### Scenario: ResolveWait prevents scheduler exit
 
@@ -1597,6 +1634,23 @@ Changes in MergeWait state (requiring user intervention) SHALL NOT prevent sched
 **And**: Run slots are available (in_flight + resolve count < max_parallelism)
 **When**: A new change is added to the dynamic queue
 **Then**: The scheduler SHALL analyze and dispatch the new change
+
+#### Scenario: Pending mark deadline is abandoned when a finite run terminates
+
+- **GIVEN** a finite scheduler satisfies every existing termination condition
+- **AND** a process-local mark stability deadline has not expired
+- **WHEN** the scheduler terminates
+- **THEN** the unsettled snapshot is discarded
+- **AND** no queue addition or delayed process-lifetime barrier is created
+- **AND** one operator-visible informational outcome identifies that mark settlement was abandoned because the scheduler ended
+
+#### Scenario: Persistent idle retains a live deadline
+
+- **GIVEN** a persistent scheduler has no queued, in-flight, resolve-wait, manual-resolve, or spawned work
+- **AND** an operator mark deadline is pending
+- **WHEN** the scheduler publishes its typed idle transition and remains live
+- **THEN** presentation may move to Select without cancelling the deadline
+- **AND** stable settlement may notify and resume the same scheduler
 
 ### Requirement: Merge Deferred State Separation
 
@@ -1676,6 +1730,8 @@ When configured for push post-archive mode, the parallel service SHALL preserve 
 
 この非ブロッキング要件は post-archive merge に限らず、すべての base-mutating lane 作業に適用されなければならない（MUST）。具体的には、ResolveWait の deferred merge retry（コンフリクト解決エージェント実行を含む）、RejectWait の rejection-review retry、および手動 resolve（TUI `M` キー由来の reducer ResolveWait promotion）の実行を、スケジューラループタスク内で直接 await してはならない（MUST NOT）。スケジューラループが行ってよいのは promotion（reducer の base-mutating lane への昇格）とバックグラウンドタスクの spawn、および結果の受信処理のみである（MUST）。
 
+Mark stability settlement は base-mutating lane または global merge lock の取得を待ってはならない（MUST NOT）。settlement が ordinary queue candidate を追加した場合、scheduler loop は active resolve の完了を待たず queue ingestion と re-analysis を継続しなければならない（MUST）。
+
 スケジューラループタスクは global merge lock の取得を待ってブロックしてはならない（MUST NOT）。merge 試行は resolve アクティブ判定をロック取得より前に評価し、ロックが取得できない場合は自動再開可能な Deferred として返却しなければならない（MUST）。Deferred は既存の merge/resolve 完了トリガで自動的に再評価されなければならない（MUST）。
 
 merge/resolve の結果（成功・Deferred・失敗）はスケジューラループに非同期に通知され、適切に処理されなければならない（MUST）。base-mutating lane の単一占有（同時に最大1つの resolve または rejection review）は reducer の lane 占有状態によって維持されなければならない（MUST）。spawn された retry の実行中は、スケジューラはドレイン完了・persistent idle・終了判定においてその作業を未完了として扱わなければならない（MUST）。
@@ -1683,6 +1739,8 @@ merge/resolve の結果（成功・Deferred・失敗）はスケジューラル�
 spawn された base-mutating lane retry の結果が Merged 以外（自動再開可能な Deferred、または失敗）である場合、スケジューラは結果受信処理において reducer の base-mutating lane 占有を解放しなければならない（MUST）。自動再開可能な Deferred で終わった change は、promotion 元の wait 種別（ResolveWait / RejectWait）に復元され、以降の merge/resolve 完了トリガまたは queue notification で再 promote 可能でなければならない（MUST）。retry の失敗が `ResolveFailed` / `RejectionReviewFailed` などの失敗イベントを伴わずに終了した場合（例: workspace 喪失）も、lane 占有を解放し、運用者可視のイベントを発行しなければならない（MUST）。lane 占有の解放漏れにより promotion が恒久的に不能となる状態（生存するタスクを伴わない Resolving / Rejecting の残留）を生じさせてはならない（MUST NOT）。retry の失敗は運用者に対して 1 回だけ報告されなければならず（MUST）、retry 本体が発行した失敗イベントに加えて汎用エラーを重複報告してはならない（MUST NOT）。
 
 spawn された retry が実マージを行わずに retry 意図を放棄して終了する場合（give-up: workspace 喪失、stale workspace path、base への既マージ検出による stale intent cleanup を含む）、retry 本体は intent 解除と同時に reducer の lane 占有を同期的に解放しなければならない（MUST）。give-up による解放では、対象 change を ResolveWait / RejectWait のいずれの wait queue にも再登録してはならない（MUST NOT）。give-up の結果が Merged 相当のトリガとしてスケジューラに届いた後、後続の ResolveWait / RejectWait waiter の promotion が可能でなければならない（MUST）。give-up 解放は terminal 遷移済みエントリおよび lane 非占有エントリに対しては no-op でなければならない（MUST）。
+
+<!-- replaces-scenario: Change queued via dynamic queue during active resolve is analyzed promptly -->
 
 #### Scenario: Queued change dispatched during resolve
 
@@ -1713,13 +1771,13 @@ spawn された retry が実マージを行わずに retry 意図を放棄して
 - **AND** スケジューラループは次の iteration に進み、dynamic queue 取り込み・queue reconciliation・re-analysis を継続する
 - **AND** resolve エージェントの実行完了をスケジューラループタスク内で直接 await しない
 
-#### Scenario: Change queued via dynamic queue during active resolve is analyzed promptly
+#### Scenario: Stable mark queued during active resolve is analyzed promptly
 
 - **GIVEN** Change A の resolve（手動 resolve または deferred merge retry の resolve）が進行中である
-- **AND** ユーザーが TUI の `x` キーで Change B を queue に追加する
-- **WHEN** スケジューラループが次の iteration を実行する
+- **AND** ユーザーが TUI の Space または bulk `x` で Change B を mark する
+- **WHEN** mark set が10秒安定し、explicit queue service が Change B を追加する
 - **THEN** Change B は Change A の resolve 完了を待たずに scheduler queue へ取り込まれる
-- **AND** 通常の debounce 範囲内で Change B の dependency analysis が開始される
+- **AND** Change B の dependency analysis が既存 queue-addition edge から開始される
 - **AND** 再計算した利用可能スロットが 1 以上であれば Change B の apply dispatch が開始される
 
 #### Scenario: Scheduler loop does not park on global merge lock
@@ -1786,6 +1844,14 @@ spawn された retry が実マージを行わずに retry 意図を放棄して
 - **WHEN** give-up の Merged 相当結果がスケジューラの結果受信処理に届く
 - **THEN** Change C が promote され、その retry がバックグラウンドタスクとして spawn される
 - **AND** Change B は wait queue に存在せず、再 promote されない
+
+#### Scenario: Mark settlement does not wait on active resolve locks
+
+- **GIVEN** a base-mutating task holds the global merge lock
+- **AND** a stable mark deadline expires for an eligible ordinary change
+- **WHEN** settlement applies its additive queue plan
+- **THEN** settlement does not acquire or wait for the global merge lock
+- **AND** the scheduler may ingest and analyze the resulting queue addition while resolve continues
 
 ### Requirement: Parallel Execution Event Reporting
 

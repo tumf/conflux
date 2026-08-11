@@ -53,6 +53,7 @@ use crate::events::{
     EventDispatcher, ExecutionEvent, OperatorCommandEffect, OutcomeRevisions,
 };
 use crate::orchestration::apply_commit_evidence::ApplyCommitEvidencePort;
+use crate::orchestration::mark_settlement::{MarkSettlementPlan, MarkSettlementRuntime};
 use crate::orchestration::operator_command::{OperatorMode, OperatorOutcome, PendingTermination};
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
@@ -888,6 +889,84 @@ impl OperatorApplication {
         self.revisions
             .as_ref()
             .map_or(0, |revisions| revisions.current_revision())
+    }
+}
+
+/// Bind this coordinator as the process's mark-settlement runtime.
+///
+/// Weakly, and deliberately: the mark store is reachable from the coordinator
+/// through run control, so a strong handle would close a cycle that never drops.
+///
+/// Call it once, after the coordinator is in its `Arc`. Until it is called every
+/// mark write is mark-only, which is the correct behaviour for a process that
+/// has no application transaction to admit work through.
+pub fn bind_mark_settlement(application: &Arc<OperatorApplication>) {
+    let owned: std::sync::Weak<OperatorApplication> = Arc::downgrade(application);
+    let runtime: std::sync::Weak<dyn MarkSettlementRuntime> = owned;
+    application
+        .run_control
+        .operator()
+        .marks()
+        .settlement()
+        .bind_runtime(runtime);
+}
+
+/// The mark-stability policy's view of this process.
+///
+/// The coordinator is the right implementation because settlement must produce
+/// exactly what a frontend queue command produces: the same reducer transition,
+/// the same `DynamicQueue` mutation, the same queue hook, the same authoritative
+/// outcome, and the same scheduler wake. Routing it through
+/// [`OperatorIntent::SetQueueIntent`] is what makes that identity structural
+/// rather than a second implementation that has to be kept in step.
+#[async_trait::async_trait]
+impl MarkSettlementRuntime for OperatorApplication {
+    fn admits_dynamic_queue(&self) -> bool {
+        // Scheduler-task liveness, never presentation mode. A persistent
+        // scheduler parked in Select is still perfectly able to admit work, and
+        // a finite run that already exited is not.
+        self.run_control.scheduler().is_running()
+    }
+
+    async fn settle_marks(&self) -> MarkSettlementPlan {
+        // Classification happens outside the application gate; only the derived
+        // plan is applied under it. Settlement therefore never holds the gate
+        // across a reducer read, and never waits on a base-mutating lane.
+        let plan = self.run_control.operator().plan_mark_settlement().await;
+        for change_id in &plan.additions {
+            self.apply(OperatorIntent::SetQueueIntent {
+                change_id: change_id.clone(),
+                queued: true,
+            })
+            .await;
+        }
+        // Observability only, and deliberately not operator-facing: a marked row
+        // that settlement skipped is otherwise indistinguishable from a deadline
+        // that never expired, which is the one question this policy is hard to
+        // answer from the outside.
+        if !plan.excluded.is_empty() {
+            let skipped = plan
+                .excluded
+                .iter()
+                .map(|(change_id, reason)| format!("{change_id}={}", reason.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::debug!("Mark settlement added no queue intent for: {skipped}");
+        }
+        plan
+    }
+
+    async fn report_abandoned_settlement(&self, pending: Vec<String>) {
+        let targets = if pending.is_empty() {
+            "no marked change".to_string()
+        } else {
+            pending.join(", ")
+        };
+        self.dispatch
+            .dispatch(ExecutionEvent::Log(crate::events::LogEntry::info(format!(
+                "Mark settlement abandoned because the scheduler ended: {targets}"
+            ))))
+            .await;
     }
 }
 

@@ -33,6 +33,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::apply_commit_evidence::ApplyCommitEvidence;
 use crate::orchestration::execution_facts::{project_phase, ExecutionFactsStore, ExecutionPhase};
+use crate::orchestration::mark_settlement::{
+    plan_mark_settlement, MarkSettlementCoordinator, MarkSettlementPlan, MarkSettlementRow,
+};
 use crate::orchestration::state::{OrchestratorState, ReduceOutcome, ReducerCommand};
 
 /// Default bound for waiting on confirmed task termination during stop-and-dequeue.
@@ -1075,15 +1078,40 @@ pub type OperatorResult<T> = std::result::Result<T, OperatorCommandError>;
 /// applicable boundary". They are never persisted, so a new process starts with
 /// every mark `false` by construction and marks can never become durable
 /// workflow-control evidence.
+///
+/// The store also owns the process's single mark-settlement notifier. It is the
+/// one place both frontend service paths already write, so binding the stability
+/// policy here is what keeps a keypress and an `/api/v2` command from arming two
+/// different deadlines.
 #[derive(Debug, Default)]
 pub struct ExecutionMarkStore {
     marks: Mutex<HashSet<String>>,
+    settlement: Arc<MarkSettlementCoordinator>,
 }
 
 impl ExecutionMarkStore {
     /// Create an empty store. A restarted process always begins here.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The process-local mark-settlement notifier this store owns.
+    pub fn settlement(&self) -> Arc<MarkSettlementCoordinator> {
+        self.settlement.clone()
+    }
+
+    /// Arm mark settlement for the current mark set.
+    ///
+    /// Called only after an *accepted standalone operator* write actually
+    /// changed the store. A system revocation, a refused or unchanged command,
+    /// and the mark writes Start admission performs deliberately do not reach
+    /// here, so none of them can restart the stability deadline or create a
+    /// delayed queue effect.
+    ///
+    /// Returns true when a deadline is now pending.
+    pub fn arm_settlement(&self) -> bool {
+        let snapshot = self.marked_ids();
+        self.settlement.clone().notify(snapshot)
     }
 
     /// True when the change currently carries an execution mark.
@@ -1468,7 +1496,28 @@ impl OperatorCommandService {
     /// the store.
     ///
     /// Returns true when the stored value actually changed.
+    ///
+    /// An accepted write also arms mark settlement, which is what gives Space
+    /// and bulk `x` the same delayed admission an `/api/v2` mark command gets
+    /// without either frontend owning a timer.
     pub async fn apply_execution_mark(&self, change_id: &str, marked: bool) -> bool {
+        let _mutation = self.parallel.lock_mutations().await;
+        let changed = self.marks.set(change_id, marked);
+        if changed {
+            self.marks.arm_settlement();
+        }
+        changed
+    }
+
+    /// Apply one execution-mark write that belongs to a Start request.
+    ///
+    /// Identical to [`Self::apply_execution_mark`] except that it never arms
+    /// mark settlement. These writes are part of admission, not standalone
+    /// operator intent: a Start that is later rejected must leave no delayed
+    /// queue effect behind, and an accepted one has already queued its targets
+    /// through run control, so a second delayed admission would be a duplicate
+    /// with no request behind it.
+    pub async fn apply_admission_execution_mark(&self, change_id: &str, marked: bool) -> bool {
         let _mutation = self.parallel.lock_mutations().await;
         self.marks.set(change_id, marked)
     }
@@ -1515,6 +1564,7 @@ impl OperatorCommandService {
             }
         }
         if self.marks.set(change_id, marked) {
+            self.marks.arm_settlement();
             Ok(OperatorOutcome::MarkSet {
                 change_id: change_id.to_string(),
                 marked,
@@ -1596,11 +1646,59 @@ impl OperatorCommandService {
             });
         }
 
+        // One notification for the whole bulk mutation, not one per row: the
+        // deadline describes a mark *set*, and restarting it per row would make
+        // a wide `x` take longer to settle than a narrow one.
+        self.marks.arm_settlement();
+
         Ok(OperatorOutcome::BulkMarks {
             marked: plan.target_state,
             changed,
             excluded: plan.excluded,
         })
+    }
+
+    /// Classify the current mark set into one additive settlement plan.
+    ///
+    /// Read-only by construction. It derives *what* a settled mark set would
+    /// add and nothing more, so the caller can apply the plan through the
+    /// ordinary queue command path instead of this service growing a second one.
+    ///
+    /// The whole observation is taken under the shared mutation guard and one
+    /// reducer read, which is what makes the marks, the statuses, and the
+    /// worktree eligibility one coherent view rather than three instants.
+    /// Deliberately re-reads the marks that exist *now*: an event that revoked a
+    /// mark while the deadline was pending must land in this plan, not be
+    /// overridden by the snapshot the deadline was armed with.
+    pub async fn plan_mark_settlement(&self) -> MarkSettlementPlan {
+        let observed: Vec<(String, String, bool, bool)> = {
+            let _mutation = self.parallel.lock_mutations().await;
+            let marked = self.marks.marked_ids();
+            let guard = self.state.read().await;
+            let tracked: HashSet<String> = guard.tracked_change_ids().into_iter().collect();
+            marked
+                .into_iter()
+                .map(|change_id| {
+                    let display_status = guard.display_status(&change_id).to_string();
+                    let tracked = tracked.contains(&change_id);
+                    let eligible = self.parallel.is_eligible(&change_id);
+                    (change_id, display_status, tracked, eligible)
+                })
+                .collect()
+        };
+
+        let rows: Vec<MarkSettlementRow<'_>> = observed
+            .iter()
+            .map(
+                |(change_id, display_status, tracked, parallel_eligible)| MarkSettlementRow {
+                    change_id,
+                    display_status,
+                    tracked: *tracked,
+                    parallel_eligible: *parallel_eligible,
+                },
+            )
+            .collect();
+        plan_mark_settlement(&rows)
     }
 
     /// Add a change to the dynamic queue.

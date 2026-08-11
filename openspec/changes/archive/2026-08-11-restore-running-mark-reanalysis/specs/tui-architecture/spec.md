@@ -17,6 +17,9 @@ When a live scheduler capable of dynamic queue admission exists, each such opera
 
 Settlement SHALL be additive-only. Unmarking MUST NOT implicitly remove, stop, dequeue, or reschedule work in the active run. Settlement MUST NOT add active, admitted, already queued, error, retry-scoped, resolve-scoped, waiting, terminal, unavailable, or otherwise ineligible work and MUST NOT emit retry, resolve, cancellation, or stop intent.
 
+<!-- replaces-scenario: Marking during execution does not add to DynamicQueue -->
+<!-- replaces-scenario: Unmarking during execution does not remove admitted work -->
+
 #### Scenario: TUI and API mark entry points share settlement notification
 
 - **GIVEN** TUI Space or bulk `x` writes through `apply_execution_mark`
