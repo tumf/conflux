@@ -1,0 +1,17 @@
+## Implementation Tasks
+
+- [ ] Add one shared Start admission classifier that reads a coherent mark/reducer snapshot, applies the existing complete-request worktree eligibility fence to the full marked set before class selection, preserves ordinary `not queued` Start priority in Select/Stopped, falls back to existing retry-route planning only when no ordinary target is startable, permits retry-only Start in Running and Error, and refuses Stopping. Complete when `change_error_f5_retry_*` unit cases cover every mode, mixed ordinary/retry marks, worktree-ineligible retry marks, unsupported statuses, and target-specific exclusions without mutating state during planning. (verification: unit - `make test-change-error-f5-retry`; verification-id: change-error-f5-retry-tests)
+
+- [ ] Commit Start-selected retry routes through the existing `plan_retry_errors` / `commit_retry_routes` boundary so terminal errors use `ReducerCommand::RetryError`, resumable holds retain their existing route, target-specific explicit-retry edges are published exactly once, and accepted marks are restored. Complete when focused tests prove no retry path substitutes ordinary `AddToQueue`, generic notification, or the 10-second mark-settlement path for retry intent. (verification: integration - `make test-change-error-f5-retry`; verification-id: change-error-f5-retry-tests)
+
+- [ ] Preserve prepared-command atomicity and scheduler semantics for the new admissions. A live scheduler must be notified once after the accepted outcome revision is published, while Stopped with no live scheduler must activate one fresh explicit-retry run; preparation failure, active Apply iteration-limit evidence, unsupported evidence, and no-op retry must leave reducer, marks, queue, edge publications, mode, projection, and scheduler untouched. Complete when recorder-based tests assert ordering and exact side-effect cardinality. (verification: integration - `make test-change-error-f5-retry`; verification-id: change-error-f5-retry-tests)
+
+- [ ] Keep TUI configured Start keys and `/api/v2` `start` as thin adapters over the same `OperatorIntent::Start` transaction. Complete when cross-adapter tests compare accepted targets, exclusions, `explicit_retry`, scheduler effect, revision, and refusal diagnostics for persistent-idle Select, Running, Stopped, global Error, Stopping, and mixed-mark requests. (verification: integration - `make test-change-error-f5-retry`; verification-id: change-error-f5-retry-tests)
+
+- [ ] Add a scheduler regression reproducing a change-local Apply runtime-limit failure followed by mark and F5: no automatic retry occurs at failure, the explicit request clears the terminal error through retry intent, the live scheduler consumes the target-specific edge, and a distinct `AnalysisStarted` occurs without waiting for mark settlement. Use deterministic event ordering/channels or paused time, with timeout only as a generous hang safeguard. (verification: integration - `make test-change-error-f5-retry`; verification-id: change-error-f5-retry-tests)
+
+- [ ] Add `test-change-error-f5-retry` to `Makefile`; it must list lib-target tests, fail if zero `change_error_f5_retry_*` cases are discovered, and run only those focused non-heavy tests. Complete when a deliberately unmatched filter returns non-zero and the real target passes. (verification: integration - `make test-change-error-f5-retry`; verification-id: change-error-f5-retry-tests)
+
+## Final Validation
+
+Expected archive gate: `cflx openspec validate fix-change-error-f5-retry --archive-gate`
