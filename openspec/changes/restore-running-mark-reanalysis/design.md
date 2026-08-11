@@ -1,75 +1,87 @@
 ## Context
 
-Execution marks and queue intent are intentionally separate projections, but Running mode previously connected settled operator selection to current-run admission. The current mark-only behavior leaves no command available to add newly marked work to an active run and contradicts scheduler scenarios that expect TUI dynamic queue admission during resolve.
+Execution marks and queue intent are intentionally separate projections. Before `e3167311`, Running-mode mark controls immediately mutated the current queue; the current mark-only behavior leaves no operator path for adding newly selected work to a live run and contradicts scheduler scenarios for queue admission during resolve.
 
-The scheduler already has the required post-admission behavior: `DynamicQueue` notifications wake reconciliation, genuine candidate additions bypass the ordinary queue debounce, analysis can run at zero capacity, and dispatch remains capacity-gated. The missing boundary is therefore before queue admission, not inside dependency analysis.
+The scheduler already has the required post-admission behavior: `DynamicQueue` notifications wake reconciliation, genuine candidate additions bypass the ordinary queue debounce, analysis can run at zero capacity, and dispatch remains capacity-gated. The missing policy belongs before queue admission.
 
 ## Goals / Non-Goals
 
 ### Goals
 
-- Restore Running-mode mark-driven current-run admission after a 10-second stable mark interval.
+- Admit operator-marked work to a live current run after one 10-second stable interval.
 - Reuse the shared operator queue service and scheduler notification path.
-- Make unmark removal safe by limiting it to still-pending memberships created by mark reconciliation.
-- Keep timing and provenance process-local and deterministic under test.
+- Keep settlement additive-only and incapable of dequeue, retry, resolve, stop, or cancellation effects.
+- Keep timing process-local, lock-safe, and deterministic under test.
 
 ### Non-Goals
 
 - Merge execution marks and queue intent into one state axis.
-- Cancel active work from mark controls.
-- Add polling or a second scheduler debounce.
-- Persist unsettled operator intent outside the process.
+- Restore the old immediate mark-to-queue mutation.
+- Cancel or dequeue work from mark controls.
+- Add polling, a second scheduler debounce, or durable mark workflow state.
 
 ## Decisions
 
-### Decision: debounce mark intent before queue mutation
+### Decision: debounce standalone operator mark intent before queue mutation
 
-The 10-second interval applies to the latest Running-mode mark set, not to the scheduler after admission. Each real mark mutation replaces the pending snapshot and restarts one deadline. This matches the requested settle behavior while avoiding repeated queue/hook churn during rapid selection edits.
+A real standalone operator mark mutation replaces the pending snapshot and restarts one 10-second deadline only while a live scheduler capable of dynamic queue admission exists. System reconciliation, automatic mark revocation, no-op/refused commands, and mark writes performed inside Start admission do not arm or restart the deadline.
 
-Once settlement creates a genuine queue candidate, the existing queue-addition edge remains immediate. Adding a second scheduler delay would duplicate policy and conflict with `Parallel Analysis Targeting`.
+Settlement reads current marks rather than trusting a stale captured set. This lets lifecycle-driven mark revocation affect the final plan without extending the deadline or starving settlement.
 
-### Decision: place coordination above frontend adapters
+### Decision: gate on scheduler liveness, not presentation mode
 
-The stability coordinator belongs at the shared operator/orchestration boundary because local TUI and remote operator commands can express the same mark intent. Frontend-local timers would create divergent behavior and could race authoritative outcomes.
+Persistent schedulers report Select while parked. A deadline armed before that transition must still settle, and a standalone mark while parked may wake the same live run. Presentation mode is therefore not the authority; scheduler liveness and dynamic-queue capability are.
 
-The coordinator reacts only to accepted state-changing mark outcomes. Refusals and no-ops do not restart the deadline.
+A finite scheduler gets no new termination barrier. If it exits before settlement, its pending snapshot is discarded and one operator-visible informational outcome reports that mark settlement was abandoned because the scheduler ended.
+
+### Decision: notify from `ExecutionMarkStore` service entry points and settle on a separate task
+
+`ExecutionMarkStore` is the common storage already written by both paths, but accepted-command context remains at its service entry points. TUI `apply_execution_mark` and API/coordinator `set_execution_mark` and `set_all_execution_marks` notify settlement after accepted standalone operator writes. Space and bulk `x` remain on the TUI service path rather than detouring through the API coordinator.
+
+Mark outcomes can occur while the operator mutation guard and reducer lock are held, including system revocations inside event dispatch. Notification records/replaces timer state without re-entering the application transaction. The timer task later acquires the normal operator guard and reducer view in the established order, reclassifies current state, and applies additions. Frontends own no timers.
 
 ### Decision: retain mark and queue as distinct authorities
 
-Marks remain process-local target intent. Queue membership remains reducer-owned workflow intent and is changed only through the existing queue command service. The coordinator is a policy bridge, not a projection merger.
+Marks remain process-local target intent. Queue membership remains reducer-owned workflow intent and changes only through the existing queue command service. The coordinator is a policy bridge, not a projection merger.
 
-### Decision: provenance fences unmark removal
+### Decision: settlement is additive-only
 
-The coordinator keeps process-local provenance for queue memberships it successfully created and that remain pending. Stable unmark may request removal only for those IDs. Provenance is discarded when the membership becomes active, terminal, explicitly dequeued, or otherwise leaves the pending ordinary queue state.
+Stable settlement may add marked eligible ordinary `not queued` work. It never removes queue membership. Unmarking changes only mark intent; explicit dequeue remains the withdrawal operation.
 
-This prevents mark controls from withdrawing explicit queue actions or cancelling admitted work. A restart loses provenance, so post-restart unmark is conservative and removes nothing automatically.
+This removes provenance state, restart asymmetry, and accidental withdrawal of active or explicitly queued work.
 
 ### Decision: final eligibility is checked at settlement
 
-The pending snapshot is intent, not admission authority. At settlement, classification uses one coherent current reducer/operator view. Any row that became active, terminal, waiting, errored, retry-scoped, resolve-scoped, or ineligible is skipped without side effects.
+At deadline expiry, classification uses one coherent current reducer/operator view. Active, admitted, queued, terminal, waiting, errored, retry-scoped, resolve-scoped, unavailable, or otherwise ineligible rows are skipped. The queue service must not be called on terminal-error rows because its explicit behavior may create a retry edge.
+
+Start-admission mark writes are excluded from arming. A rejected Start therefore cannot produce delayed partial queue effects.
 
 ### Decision: timer state is disposable
 
-The latest pending mark snapshot, deadline, and provenance are in-memory only. They are discarded on restart and do not influence resume routing, acceptance, archive, or merge decisions. This follows the workspace-local workflow-state constitution.
+The pending snapshot and deadline are in-memory only. Restart, finite scheduler exit, or scheduler replacement discards them. They do not influence resume routing, acceptance, archive, merge, or next-action decisions.
 
 ## Event Flow
 
 ```text
-accepted Running mark outcome
+accepted standalone operator mark outcome
+        |
+        +-- no live dynamic-queue scheduler --> mark only
         |
         v
-replace pending mark snapshot
-restart 10-second stability deadline
+replace pending snapshot metadata
+restart 10-second deadline
         |
         v
-settlement reads coherent current state
+separate settlement task
+        |
+        v
+acquire operator guard, then coherent reducer view
+read current marks and classify current lifecycle state
         |
         +-- eligible marked not-queued --> shared AddToQueue
         |                                  reducer + DynamicQueue + notify
         |
-        +-- provenance-owned pending unmark --> shared RemoveFromQueue
-        |
-        +-- active/wait/error/terminal/ineligible --> no queue side effect
+        +-- unmarked/active/wait/error/terminal/ineligible --> no queue side effect
 
 DynamicQueue notification
         |
@@ -85,17 +97,17 @@ genuine candidate-addition reanalysis edge
 
 ## Risks / Trade-offs
 
-- A fixed 10-second settle interval delays intentional single-mark admission. It is retained because stability was explicitly requested and avoids queue churn; configurability is future work.
-- Bulk and single mark outcomes can arrive near deadline expiry. Serializing accepted outcomes and settlement through the existing application boundary ensures one ordering; tests must exercise both orderings deterministically.
-- Provenance is process-local, so restart favors safety over automatic unmark removal. Queue intent remains reconstructible from workspace/reducer evidence and is not silently revoked.
+- A fixed 10-second interval delays intentional single-mark admission. It is retained because the requested stability policy avoids queue churn; configurability is future work. It currently equals the scheduler queue debounce duration by coincidence, but is an independent pre-admission interval; the existing queue-notification bypass prevents the two intervals from stacking.
+- Bulk and single outcomes can race deadline expiry. The operator transaction gives settlement and later commands one total order; tests exercise both orders deterministically.
+- A finite run may end before settlement. Preserving its existing termination contract is safer than introducing a hidden liveness barrier for a frontend capability it does not normally expose.
 
 ## Migration Plan
 
-- Replace canonical mark-only Running scenarios with stable mark-reconciliation scenarios.
+- Promote complete canonical requirements without dropping unrelated paragraphs or scenarios.
 - Add the coordinator and focused tests without changing existing queue/scheduler contracts.
 - Reuse current `DynamicQueue`, reducer, queue hook, and reanalysis paths.
-- Remove obsolete tests that assert every Running mark has no queue effect, replacing them with mode- and status-specific safety assertions.
+- Replace only assertions that every live-scheduler mark is permanently queue-inert; retain non-live, status, Start, and cancellation safety coverage.
 
 ## Open Questions
 
-None. The proposal deliberately fixes the interval at 10 seconds and keeps active cancellation on `K`.
+None. The interval is fixed at 10 seconds, settlement is additive-only, and active cancellation remains on `K`.
