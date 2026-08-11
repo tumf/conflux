@@ -284,7 +284,11 @@ impl Harness {
     }
 
     async fn status(&self, change_id: &str) -> String {
-        self.state.read().await.display_status(change_id).to_string()
+        self.state
+            .read()
+            .await
+            .display_status(change_id)
+            .to_string()
     }
 
     async fn reduce(&self, command: ReducerCommand) -> ReduceOutcome {
@@ -450,7 +454,10 @@ async fn running_mark_reanalysis_settles_once_after_the_window() {
 
     settle(&harness.coordinator).await;
 
-    assert_eq!(harness.runtime.settlements(), vec![vec!["alpha".to_string()]]);
+    assert_eq!(
+        harness.runtime.settlements(),
+        vec![vec!["alpha".to_string()]]
+    );
     assert_eq!(harness.coordinator.settled_count(), 1);
     assert!(!harness.coordinator.is_armed());
 }
@@ -568,7 +575,10 @@ async fn running_mark_reanalysis_persistent_idle_scheduler_still_settles() {
     advance_within_window().await;
 
     settle(&harness.coordinator).await;
-    assert_eq!(harness.runtime.settlements(), vec![vec!["alpha".to_string()]]);
+    assert_eq!(
+        harness.runtime.settlements(),
+        vec![vec!["alpha".to_string()]]
+    );
 }
 
 #[test]
@@ -686,10 +696,7 @@ async fn running_mark_reanalysis_addition_produces_one_reducer_and_queue_mutatio
 
     assert_eq!(
         harness.queue.calls(),
-        vec![
-            QueueCall::Add("alpha".to_string()),
-            QueueCall::Notify,
-        ],
+        vec![QueueCall::Add("alpha".to_string()), QueueCall::Notify,],
         "one dynamic mutation and one scheduler wake, and nothing else"
     );
     assert_eq!(harness.status("alpha").await, "queued");
@@ -759,7 +766,11 @@ async fn running_mark_reanalysis_empty_plan_produces_no_mutation() {
     );
     assert_eq!(harness.status("alpha").await, "not queued");
     assert_eq!(
-        harness.coordinator().last_plan().expect("a pass ran").excluded,
+        harness
+            .coordinator()
+            .last_plan()
+            .expect("a pass ran")
+            .excluded,
         vec![("alpha".to_string(), MarkSettlementExclusion::Unavailable)]
     );
 }
@@ -767,7 +778,9 @@ async fn running_mark_reanalysis_empty_plan_produces_no_mutation() {
 #[tokio::test(start_paused = true)]
 async fn running_mark_reanalysis_unmark_never_dequeues_admitted_work() {
     let harness = Harness::running(&["alpha"]);
-    harness.reduce(ReducerCommand::AddToQueue("alpha".to_string())).await;
+    harness
+        .reduce(ReducerCommand::AddToQueue("alpha".to_string()))
+        .await;
     harness.operator.apply_execution_mark("alpha", true).await;
     settle(&harness.coordinator()).await;
     let after_mark = harness.queue.calls();
@@ -844,7 +857,11 @@ async fn running_mark_reanalysis_lifecycle_transition_racing_settlement_is_respe
         harness.queue.calls()
     );
     assert_eq!(
-        harness.coordinator().last_plan().expect("a pass ran").excluded,
+        harness
+            .coordinator()
+            .last_plan()
+            .expect("a pass ran")
+            .excluded,
         vec![("alpha".to_string(), MarkSettlementExclusion::Active)]
     );
 }
@@ -894,7 +911,10 @@ async fn running_mark_reanalysis_settlement_matches_an_explicit_queue_command() 
         .await;
 
     assert_eq!(settled.queue.calls(), explicit.queue.calls());
-    assert_eq!(settled.status("alpha").await, explicit.status("alpha").await);
+    assert_eq!(
+        settled.status("alpha").await,
+        explicit.status("alpha").await
+    );
     assert_eq!(
         settled
             .events()

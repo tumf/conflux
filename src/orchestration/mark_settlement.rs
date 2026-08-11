@@ -111,6 +111,7 @@ pub struct MarkSettlementPlan {
 
 impl MarkSettlementPlan {
     /// True when the plan would mutate nothing.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.additions.is_empty()
     }
@@ -121,13 +122,13 @@ impl MarkSettlementPlan {
 /// The order is precedence, not convenience: a terminal row that also happens to
 /// be ineligible must report `Terminal`, because that is the reason its mark can
 /// never become queue intent again.
-pub fn classify_mark_settlement_row(row: &MarkSettlementRow<'_>) -> Option<MarkSettlementExclusion> {
+pub fn classify_mark_settlement_row(
+    row: &MarkSettlementRow<'_>,
+) -> Option<MarkSettlementExclusion> {
     if !row.tracked {
         return Some(MarkSettlementExclusion::NotLoadable);
     }
-    if is_final_status(row.display_status)
-        || matches!(row.display_status, "error" | "stopped")
-    {
+    if is_final_status(row.display_status) || matches!(row.display_status, "error" | "stopped") {
         return Some(MarkSettlementExclusion::Terminal);
     }
     if is_active_status(row.display_status) {
@@ -294,6 +295,7 @@ impl MarkSettlementCoordinator {
     }
 
     /// The stability window this coordinator arms.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn window(&self) -> Duration {
         self.window
     }
@@ -337,26 +339,31 @@ impl MarkSettlementCoordinator {
     }
 
     /// The marks observed when the current deadline was armed, if one is pending.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pending_snapshot(&self) -> Option<Vec<String>> {
         self.lock().pending.clone()
     }
 
     /// Whether a stability deadline is currently pending.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_armed(&self) -> bool {
         self.lock().pending.is_some()
     }
 
     /// Completed settlement passes in this process lifetime.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn settled_count(&self) -> u64 {
         self.lock().settled
     }
 
     /// Passes abandoned because the scheduler ended before the deadline.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn abandoned_count(&self) -> u64 {
         self.lock().abandoned
     }
 
     /// The plan the most recent completed pass derived.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn last_plan(&self) -> Option<MarkSettlementPlan> {
         self.lock().last_plan.clone()
     }
@@ -365,6 +372,7 @@ impl MarkSettlementCoordinator {
     ///
     /// The current value is already visible to a new receiver, so an observer
     /// that subscribes after a pass finished still sees it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn passes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.passes.subscribe()
     }

@@ -940,6 +940,19 @@ impl MarkSettlementRuntime for OperatorApplication {
             })
             .await;
         }
+        // Observability only, and deliberately not operator-facing: a marked row
+        // that settlement skipped is otherwise indistinguishable from a deadline
+        // that never expired, which is the one question this policy is hard to
+        // answer from the outside.
+        if !plan.excluded.is_empty() {
+            let skipped = plan
+                .excluded
+                .iter()
+                .map(|(change_id, reason)| format!("{change_id}={}", reason.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::debug!("Mark settlement added no queue intent for: {skipped}");
+        }
         plan
     }
 

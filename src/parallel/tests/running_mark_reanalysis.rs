@@ -164,7 +164,10 @@ impl Harness {
             queued: Vec::new(),
             in_flight: HashSet::new(),
             join_set: JoinSet::new(),
-            cleanup_guard: WorkspaceCleanupGuard::new(VcsBackend::Git, repo_dir.path().to_path_buf()),
+            cleanup_guard: WorkspaceCleanupGuard::new(
+                VcsBackend::Git,
+                repo_dir.path().to_path_buf(),
+            ),
             semaphore: Arc::new(Semaphore::new(max_parallelism)),
             reanalysis_reason: ReanalysisReason::Initial,
             // Iteration 1 unconditionally skips debounce; start where a live
@@ -329,7 +332,10 @@ async fn running_mark_reanalysis_settled_addition_analyzes_at_zero_capacity() {
     harness.run_loop_iteration(&analyzer).await;
 
     let (analysis_started, apply_started) = harness.drain_events();
-    assert_eq!(analysis_started, 1, "zero capacity must not suppress analysis");
+    assert_eq!(
+        analysis_started, 1,
+        "zero capacity must not suppress analysis"
+    );
     assert_eq!(
         apply_started, 0,
         "zero capacity must suppress ordinary apply dispatch"
@@ -362,7 +368,10 @@ async fn running_mark_reanalysis_capacity_recovery_dispatches_without_another_op
         harness.run_loop_iteration(&analyzer).await;
     }
     let (_, apply_started) = harness.drain_events();
-    assert_eq!(apply_started, 0, "dispatch stays suppressed while capacity is zero");
+    assert_eq!(
+        apply_started, 0,
+        "dispatch stays suppressed while capacity is zero"
+    );
     assert!(harness.in_flight.is_empty());
 
     // The resolve completes and the scheduler wakes itself with its own edge. No

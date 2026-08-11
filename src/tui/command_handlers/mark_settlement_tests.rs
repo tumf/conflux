@@ -23,15 +23,36 @@ use crate::orchestration::mark_settlement::{MarkSettlementCoordinator, MARK_STAB
 use crate::tui::state::AppState;
 use crate::tui::types::AppExecutionMode;
 
+/// A subscription to the settlement pass an armed deadline will produce.
+///
+/// Captured *before* time advances on purpose. Two harnesses armed in the same
+/// paused instant both settle on the first advance, so a target computed after
+/// that advance would already be in the past and could never be reached.
+struct PendingPass {
+    passes: tokio::sync::watch::Receiver<u64>,
+    target: u64,
+}
+
+fn pending_pass(coordinator: &Arc<MarkSettlementCoordinator>) -> PendingPass {
+    let passes = coordinator.passes();
+    let target = *passes.borrow() + 1;
+    PendingPass { passes, target }
+}
+
+impl PendingPass {
+    async fn wait(mut self) {
+        self.passes
+            .wait_for(|observed| *observed >= self.target)
+            .await
+            .expect("the coordinator outlives its watchers");
+    }
+}
+
 /// Advance past the stability deadline and wait for the settlement pass.
 async fn settle(coordinator: &Arc<MarkSettlementCoordinator>) {
-    let mut passes = coordinator.passes();
-    let target = *passes.borrow() + 1;
+    let pending = pending_pass(coordinator);
     tokio::time::advance(MARK_STABILITY_WINDOW + Duration::from_millis(1)).await;
-    passes
-        .wait_for(|observed| *observed >= target)
-        .await
-        .expect("the coordinator outlives its watchers");
+    pending.wait().await;
 }
 
 /// Advance past the deadline and assert no settlement pass ran at all.
@@ -91,8 +112,14 @@ async fn running_mark_reanalysis_space_and_bulk_x_reach_the_same_settlement() {
         "bulk `x` must reach the shared coordinator"
     );
 
-    settle(&coordinator(&space)).await;
-    settle(&coordinator(&bulk)).await;
+    // One advance settles both: paused time is shared, so the two deadlines
+    // armed in the same instant expire together. Both subscriptions are taken
+    // before it for exactly that reason.
+    let space_pass = pending_pass(&coordinator(&space));
+    let bulk_pass = pending_pass(&coordinator(&bulk));
+    tokio::time::advance(MARK_STABILITY_WINDOW + Duration::from_millis(1)).await;
+    space_pass.wait().await;
+    bulk_pass.wait().await;
 
     assert_eq!(space.status("alpha").await, "queued");
     assert_eq!(
@@ -193,7 +220,10 @@ async fn running_mark_reanalysis_process_without_live_scheduler_stays_mark_only(
 
     expect_no_settlement(&coordinator(&harness)).await;
     assert_eq!(harness.status("alpha").await, "not queued");
-    assert!(harness.queue.pop().await.is_none(), "DynamicQueue is untouched");
+    assert!(
+        harness.queue.pop().await.is_none(),
+        "DynamicQueue is untouched"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -201,12 +231,16 @@ async fn running_mark_reanalysis_rejected_start_leaves_no_delayed_queue_effect()
     // A parked persistent scheduler: live, so a deadline *could* be armed, which
     // is what makes "none was armed" a real assertion rather than a vacuous one.
     let harness = running_harness(&["alpha"]);
-    harness.parallel.set_parallel_ineligible([(
-        "alpha".to_string(),
-        crate::orchestration::operator_command::ParallelEligibility::UncommittedProposalFiles,
-    )]);
     let mut app = harness.app(&["alpha"]);
     app.execution_mode = AppExecutionMode::Select;
+    // Arranged on the row and published from it, the way production does: an
+    // `AppState` republishes the whole eligibility set from its own rows, so a
+    // set written straight into the shared store would be erased the moment the
+    // app joined it — and the Start fence would then admit the target.
+    app.changes[0].parallel_eligibility =
+        crate::orchestration::operator_command::ParallelEligibility::UncommittedProposalFiles;
+    app.publish_parallel_runtime();
+    assert_eq!(harness.parallel.ineligible_ids(), vec!["alpha".to_string()]);
 
     harness
         .run(
