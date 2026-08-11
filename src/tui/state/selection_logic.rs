@@ -8,7 +8,8 @@ use super::{guards, AppState, ChangeState};
 /// Re-exported from the shared operator vocabulary rather than defined here: a
 /// TUI-local exclusion enum would be free to disagree with the reason
 /// `/api/v2` reports for the identical row. Only [`MarkExclusion::FinalStatus`]
-/// is reachable — a terminal row is the one thing that is not a mark target.
+/// and [`MarkExclusion::ArchiveComplete`] are reachable — a terminal row and a
+/// reducer-archived row are the two things that are not mark targets.
 pub(super) type BulkToggleExclusion = MarkExclusion;
 
 /// Snapshot of the bulk toggle target set, taken once per operation.
@@ -43,7 +44,10 @@ pub(crate) const ACTIVE_APPLY_LIMIT_EXPLANATION: &str =
 
 /// Classifies a single change for bulk toggle; `None` means eligible.
 pub(super) fn classify_bulk_toggle_change(change: &ChangeState) -> Option<BulkToggleExclusion> {
-    crate::orchestration::operator_command::classify_bulk_mark_row(&change.display_status_cache)
+    crate::orchestration::operator_command::classify_bulk_mark_row(
+        &change.display_status_cache,
+        change.archive_complete_cache,
+    )
 }
 
 /// Classifies every change once and derives the shared target mark state.
@@ -53,6 +57,10 @@ pub(super) fn build_bulk_toggle_snapshot(changes: &[ChangeState]) -> BulkToggleS
         .map(|change| MarkTargetRow {
             change_id: &change.id,
             display_status: &change.display_status_cache,
+            // The synchronized presentation cache *is* the TUI's copy of the
+            // reducer record; the shared classifier takes it as evidence so
+            // orchestration never has to read TUI state.
+            archive_complete: change.archive_complete_cache,
             marked: change.selected,
         })
         .collect();
@@ -243,6 +251,7 @@ mod tests {
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
             apply_iteration_limit_active: false,
+            archive_complete_cache: false,
         }
     }
 
@@ -480,6 +489,182 @@ mod tests {
                 "{status} is excluded as terminal"
             );
         }
+    }
+
+    // ========================================================================
+    // Reducer-recorded archive completion retires mark controls
+    //
+    // The paired control matters more than any individual case: `resolving` is a
+    // post-archive status *and* a fresh-process resolve-retry status, so the only
+    // thing that may separate them is the reducer's archive record.
+    // ========================================================================
+
+    /// Live post-archive display statuses a reducer-archived row can hold, plus
+    /// the two terminal ones a completed post-archive lane reaches.
+    const ARCHIVE_COMPLETE_STATUSES: [&str; 5] = [
+        "resolving",
+        "resolve pending",
+        "merge wait",
+        "merged",
+        "pushed",
+    ];
+
+    /// A row the reducer has recorded as archive-complete.
+    fn archived_change_state(id: &str, display_status_cache: &str) -> ChangeState {
+        let mut change = make_change_state(id, display_status_cache, true);
+        change.archive_complete_cache = true;
+        change
+    }
+
+    /// Space on a reducer-archived row is a silent no-op in every mode, whatever
+    /// post-archive status the row currently displays.
+    #[test]
+    fn tui_change_row_layout_mark_contract_space_on_an_archive_complete_row_is_a_silent_no_op() {
+        for mode in ALL_MODES {
+            for status in ARCHIVE_COMPLETE_STATUSES {
+                for already_marked in [false, true] {
+                    let mut row = archived_change_state("a", status);
+                    row.selected = already_marked;
+                    let mut state = state_with(mode, vec![row]);
+
+                    state.toggle_selection();
+
+                    assert_eq!(
+                        state.changes[0].selected, already_marked,
+                        "{mode:?}/{status}: an archive-complete row must not move its mark"
+                    );
+                    assert!(
+                        state.take_pending_mark_writes().is_empty(),
+                        "{mode:?}/{status}: no mark write may be queued"
+                    );
+                    assert!(
+                        state.warning_message.is_none(),
+                        "{mode:?}/{status}: refusal is silent: {:?}",
+                        state.warning_message
+                    );
+                }
+            }
+        }
+    }
+
+    /// The control: the same `resolving` status with no reducer archive record —
+    /// a fresh-process resolve retry — keeps its mark and its checkbox.
+    #[test]
+    fn tui_change_row_layout_mark_contract_resolving_without_an_archive_record_stays_markable() {
+        for mode in ALL_MODES {
+            let mut state = state_with(mode, vec![make_change_state("a", "resolving", true)]);
+            assert!(
+                !state.changes[0].archive_complete_cache,
+                "the control row carries no archive evidence"
+            );
+
+            state.toggle_selection();
+
+            assert!(
+                state.changes[0].selected,
+                "{mode:?}: a resolve retry with no archive on record is still a run candidate"
+            );
+            assert_eq!(
+                state.take_pending_mark_writes(),
+                vec![("a".to_string(), true)]
+            );
+        }
+    }
+
+    /// Bulk `x` excludes archive-complete rows with the shared stable reason and
+    /// derives its target state from the remaining rows only.
+    #[test]
+    fn tui_change_row_layout_mark_contract_bulk_toggle_excludes_archive_complete_rows() {
+        for mode in ALL_MODES {
+            let mut rows = vec![
+                make_change_state("idle", "not queued", true),
+                // Same status as `archived-resolving` below, opposite evidence.
+                make_change_state("fresh-resolving", "resolving", true),
+            ];
+            rows.extend(
+                ARCHIVE_COMPLETE_STATUSES
+                    .iter()
+                    .map(|status| archived_change_state(&format!("archived-{status}"), status)),
+            );
+            let mut state = state_with(mode, rows);
+
+            let commands = toggle_all_marks(&mut state);
+
+            assert!(commands.is_empty(), "{mode:?} bulk toggle emits no command");
+            assert!(state.changes[0].selected, "{mode:?} marks the idle row");
+            assert!(
+                state.changes[1].selected,
+                "{mode:?} marks the archive-recordless resolving row"
+            );
+            for change in &state.changes[2..] {
+                assert!(
+                    !change.selected,
+                    "{mode:?} must leave archive-complete row `{}` unmarked",
+                    change.id
+                );
+            }
+            assert!(
+                state.warning_message.is_none(),
+                "{mode:?} archive-complete exclusion must not warn: {:?}",
+                state.warning_message
+            );
+
+            let written = state.take_pending_mark_writes();
+            assert_eq!(written.len(), 2, "{mode:?} writes only the eligible rows");
+            assert!(written
+                .iter()
+                .all(|(id, marked)| *marked && !id.starts_with("archived-")));
+        }
+    }
+
+    /// The exclusion reason is the shared archive-complete token, distinct from
+    /// the terminal-status one, and `x` is not offered for a list of only those.
+    #[test]
+    fn tui_change_row_layout_mark_contract_archive_complete_exclusion_has_its_own_reason() {
+        // A live post-archive status reports archive completion; a terminal one
+        // keeps reporting terminality, because that is what an operator sees.
+        for status in ["resolving", "resolve pending", "merge wait"] {
+            assert_eq!(
+                classify_bulk_toggle_change(&archived_change_state("a", status)),
+                Some(BulkToggleExclusion::ArchiveComplete),
+                "`{status}` with an archive record is excluded as archive-complete"
+            );
+        }
+        for status in ["merged", "pushed"] {
+            assert_eq!(
+                classify_bulk_toggle_change(&archived_change_state("a", status)),
+                Some(BulkToggleExclusion::FinalStatus),
+                "`{status}` is terminal, and terminality is the reason an operator reads"
+            );
+        }
+        assert_eq!(
+            classify_bulk_toggle_change(&make_change_state("a", "resolving", true)),
+            None,
+            "`resolving` with no archive record remains a bulk target"
+        );
+        assert_eq!(
+            classify_bulk_toggle_change(&make_change_state("a", "archived", true)),
+            Some(BulkToggleExclusion::FinalStatus),
+            "a terminal status keeps reporting terminality, not archive completion"
+        );
+
+        let mut archive_complete_only = state_with(
+            AppExecutionMode::Running,
+            ARCHIVE_COMPLETE_STATUSES
+                .iter()
+                .map(|status| archived_change_state(status, status))
+                .collect(),
+        );
+        assert!(
+            !archive_complete_only.has_bulk_toggle_targets(),
+            "a list of only archive-complete rows offers no bulk toggle"
+        );
+        assert!(toggle_all_marks(&mut archive_complete_only).is_empty());
+        assert!(
+            archive_complete_only.warning_message.is_none(),
+            "and says nothing about it: {:?}",
+            archive_complete_only.warning_message
+        );
     }
 
     #[test]

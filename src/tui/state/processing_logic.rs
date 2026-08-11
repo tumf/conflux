@@ -190,6 +190,12 @@ pub(super) fn update_changes_with_rejected(
             )
     });
 
+    // Rows this pass created or re-created start with no archive-completion cache,
+    // so the retained reducer snapshot is reapplied before anything renders. Doing
+    // it here rather than waiting for the next reducer sync is what keeps a
+    // post-archive row from flashing an empty checkbox for one frame.
+    state.reapply_reducer_archive_completion();
+
     if state.cursor_index >= state.changes.len() && !state.changes.is_empty() {
         state.cursor_index = state.changes.len() - 1;
         state.list_state.select(Some(state.cursor_index));

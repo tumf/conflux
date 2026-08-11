@@ -663,7 +663,12 @@ fn classify_actions(
     let parallel_reason =
         ActionBlockedReason::from_mark_exclusion(MarkExclusion::ParallelIneligible);
 
-    let set_execution_mark = if is_markable_status(display_status) {
+    // The read model carries no archive-completion field, and adding one would
+    // change the state payload schema. `false` is the honest input here: a
+    // reducer-recorded archive-complete row is still *accepted* by
+    // `set_execution_mark`, which settles it as a reasoned unchanged no-op rather
+    // than refusing it, so advertising the command stays one-directionally true.
+    let set_execution_mark = if is_markable_status(display_status, false) {
         ActionEligibility::allowed()
     } else {
         ActionEligibility::blocked(ActionBlockedReason::FinalStatus)

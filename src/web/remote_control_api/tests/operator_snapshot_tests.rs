@@ -508,7 +508,7 @@ fn run_mark_intent_api_markability_is_the_shared_classifier_on_every_axis() {
 
     for mode in ["select", "running", "stopping", "stopped", "error"] {
         for status in CANONICAL_STATUSES {
-            let markable = is_markable_status(status);
+            let markable = is_markable_status(status, false);
 
             for parallel_eligible in [true, false] {
                 let actions = parallel_change_actions_for_test(mode, status, parallel_eligible);

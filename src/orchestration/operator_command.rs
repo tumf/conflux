@@ -220,6 +220,9 @@ pub enum MarkAdmission {
     Allowed,
     /// Archived, merged, pushed, or rejected: the row is not a run candidate.
     TerminalTarget,
+    /// The reducer recorded archive completion, so post-archive display statuses
+    /// such as `resolving` or `merge wait` carry no next-run intent either.
+    ArchiveComplete,
 }
 
 impl MarkAdmission {
@@ -234,17 +237,30 @@ impl MarkAdmission {
 /// The single classifier shared by TUI single-row marks, TUI bulk marks, and
 /// the `/api/v2` `set_execution_mark` / `set_all_execution_marks` commands, so
 /// no frontend can hold a second markability table.
-pub fn classify_mark_admission(display_status: &str) -> MarkAdmission {
+///
+/// `archive_complete` is *caller-supplied evidence*, not something derived here:
+/// the reducer owns the archive milestone in
+/// [`crate::orchestration::state::OrchestratorState::archived_changes`], and
+/// orchestration must never reach into a frontend cache to read it. Operator and
+/// API callers pass it from the same reducer read that produced
+/// `display_status`; the TUI passes its synchronized presentation cache.
+///
+/// Deriving it from `display_status == "resolving"` instead would be the same
+/// string-based inference this replaces: a fresh-process resolve retry is
+/// `resolving` with no archive on record, and it stays markable.
+pub fn classify_mark_admission(display_status: &str, archive_complete: bool) -> MarkAdmission {
     if is_final_status(display_status) {
         MarkAdmission::TerminalTarget
+    } else if archive_complete {
+        MarkAdmission::ArchiveComplete
     } else {
         MarkAdmission::Allowed
     }
 }
 
 /// True when the row is a visible non-terminal execution-mark target.
-pub fn is_markable_status(display_status: &str) -> bool {
-    classify_mark_admission(display_status).is_allowed()
+pub fn is_markable_status(display_status: &str, archive_complete: bool) -> bool {
+    classify_mark_admission(display_status, archive_complete).is_allowed()
 }
 
 /// How an *explicit* queue command must be routed for a mode/status pair.
@@ -403,15 +419,23 @@ pub enum MarkExclusion {
     ParallelProposalAbsent,
     /// The active run owns the change's exhausted Apply-dispatch ceiling.
     ApplyIterationLimitActive,
+    /// The reducer recorded archive completion, so the row has no next run left.
+    ///
+    /// Distinct from [`MarkExclusion::FinalStatus`] on purpose: the row's display
+    /// status is still a live post-archive one (`resolving`, `resolve pending`,
+    /// `merge wait`), so "final or rejected" would not describe what an operator
+    /// is looking at.
+    ArchiveComplete,
 }
 
 impl MarkExclusion {
     /// Every exclusion, in the order used when grouping reasons for display.
-    pub const ALL: [MarkExclusion; 8] = [
+    pub const ALL: [MarkExclusion; 9] = [
         MarkExclusion::ChangeActive,
         MarkExclusion::ApplyIterationLimitActive,
         MarkExclusion::ParallelIneligible,
         MarkExclusion::ParallelProposalAbsent,
+        MarkExclusion::ArchiveComplete,
         MarkExclusion::FinalStatus,
         MarkExclusion::RetryRequired,
         MarkExclusion::StopPending,
@@ -421,6 +445,7 @@ impl MarkExclusion {
     /// Stable machine-readable token.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::ArchiveComplete => "archive_complete",
             Self::FinalStatus => "final_status",
             Self::RetryRequired => "retry_required",
             Self::StopPending => "stop_pending",
@@ -435,6 +460,7 @@ impl MarkExclusion {
     /// Short operator-facing reason describing what can be done about it.
     pub fn reason(self) -> &'static str {
         match self {
+            Self::ArchiveComplete => "archive complete (no next run)",
             Self::FinalStatus => "final or rejected and read-only",
             Self::RetryRequired => "in error mode (use retry)",
             Self::StopPending => "waiting for the pending stop",
@@ -451,16 +477,23 @@ impl MarkExclusion {
 
 /// One candidate row for a bulk execution-mark mutation.
 ///
-/// The caller supplies exactly the two facts the decision needs — the reducer's
-/// display status and the current mark. Worktree eligibility and Apply-limit
-/// evidence are deliberately *not* carried here: a classifier that cannot see
-/// them cannot let them exclude a non-terminal row from mark intent.
+/// The caller supplies exactly the facts the decision needs — the reducer's
+/// display status, the reducer's archive-completion evidence, and the current
+/// mark. Worktree eligibility and Apply-limit evidence are deliberately *not*
+/// carried here: a classifier that cannot see them cannot let them exclude a
+/// non-terminal row from mark intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarkTargetRow<'a> {
     /// Target change.
     pub change_id: &'a str,
     /// Reducer-derived display status.
     pub display_status: &'a str,
+    /// Whether the reducer recorded archive completion for this change.
+    ///
+    /// Read from the same reducer snapshot as `display_status` — never inferred
+    /// from the status string, and never read out of a frontend's row cache by
+    /// orchestration itself.
+    pub archive_complete: bool,
     /// Current execution mark.
     pub marked: bool,
 }
@@ -507,10 +540,14 @@ impl BulkMarkPlan {
 ///
 /// Exactly the same rule a single-row mark request goes through, so a bulk
 /// mutation and an individual command can never disagree about one row.
-pub fn classify_bulk_mark_row(display_status: &str) -> Option<MarkExclusion> {
-    match classify_mark_admission(display_status) {
+pub fn classify_bulk_mark_row(
+    display_status: &str,
+    archive_complete: bool,
+) -> Option<MarkExclusion> {
+    match classify_mark_admission(display_status, archive_complete) {
         MarkAdmission::Allowed => None,
         MarkAdmission::TerminalTarget => Some(MarkExclusion::FinalStatus),
+        MarkAdmission::ArchiveComplete => Some(MarkExclusion::ArchiveComplete),
     }
 }
 
@@ -525,7 +562,7 @@ pub fn plan_bulk_marks(rows: &[MarkTargetRow<'_>]) -> BulkMarkPlan {
     let mut any_unmarked = false;
 
     for row in rows {
-        match classify_bulk_mark_row(row.display_status) {
+        match classify_bulk_mark_row(row.display_status, row.archive_complete) {
             Some(reason) => excluded.push((row.change_id.to_string(), reason)),
             None => {
                 any_unmarked |= !row.marked;
@@ -869,6 +906,9 @@ pub enum NoOpReason {
     /// The target is archived, merged, pushed, or rejected and carries no
     /// next-run intent, so the request settles unchanged rather than failing.
     TerminalMarkTarget,
+    /// The reducer recorded archive completion for the target, so its remaining
+    /// post-archive work carries no next-run intent either.
+    ArchiveCompleteMarkTarget,
     /// The reducer rejected the intent in the current lifecycle state.
     ReducerRejected,
     /// Every eligible row already carried the derived target mark.
@@ -1441,19 +1481,38 @@ impl OperatorCommandService {
     /// current run" structural rather than a rule to be re-checked.
     ///
     /// A terminal target settles as a reasoned unchanged no-op rather than a
-    /// refusal: the row is simply not a run candidate any more.
+    /// refusal: the row is simply not a run candidate any more. So does a target
+    /// the reducer has already archived, whose post-archive display status is
+    /// still a live one.
     pub async fn set_execution_mark(
         &self,
         change_id: &str,
         marked: bool,
     ) -> OperatorResult<OperatorOutcome> {
         let _mutation = self.parallel.lock_mutations().await;
-        let display_status = self.display_status(change_id).await;
-        if !is_markable_status(&display_status) {
-            return Ok(OperatorOutcome::NoOp {
-                change_id: change_id.to_string(),
-                reason: NoOpReason::TerminalMarkTarget,
-            });
+        // One read for both facts: a status read and an archive-record read taken
+        // at two instants could describe two different lifecycle states.
+        let (display_status, archive_complete) = {
+            let guard = self.state.read().await;
+            (
+                guard.display_status(change_id).to_string(),
+                guard.is_archived(change_id),
+            )
+        };
+        match classify_mark_admission(&display_status, archive_complete) {
+            MarkAdmission::Allowed => {}
+            MarkAdmission::TerminalTarget => {
+                return Ok(OperatorOutcome::NoOp {
+                    change_id: change_id.to_string(),
+                    reason: NoOpReason::TerminalMarkTarget,
+                })
+            }
+            MarkAdmission::ArchiveComplete => {
+                return Ok(OperatorOutcome::NoOp {
+                    change_id: change_id.to_string(),
+                    reason: NoOpReason::ArchiveCompleteMarkTarget,
+                })
+            }
         }
         if self.marks.set(change_id, marked) {
             Ok(OperatorOutcome::MarkSet {
@@ -1487,26 +1546,32 @@ impl OperatorCommandService {
 
         // One read, one classification: re-reading per row could observe two
         // different instants and derive a target state from neither.
-        let observed: Vec<(String, String, bool)> = {
+        let observed: Vec<(String, String, bool, bool)> = {
             let guard = self.state.read().await;
             guard
                 .tracked_change_ids()
                 .into_iter()
                 .map(|change_id| {
                     let display_status = guard.display_status(&change_id).to_string();
+                    // Same snapshot as the status, so an archive that completed
+                    // mid-classification cannot make one row's two facts disagree.
+                    let archive_complete = guard.is_archived(&change_id);
                     let marked = self.marks.is_marked(&change_id);
-                    (change_id, display_status, marked)
+                    (change_id, display_status, archive_complete, marked)
                 })
                 .collect()
         };
 
         let rows: Vec<MarkTargetRow<'_>> = observed
             .iter()
-            .map(|(change_id, display_status, marked)| MarkTargetRow {
-                change_id,
-                display_status,
-                marked: *marked,
-            })
+            .map(
+                |(change_id, display_status, archive_complete, marked)| MarkTargetRow {
+                    change_id,
+                    display_status,
+                    archive_complete: *archive_complete,
+                    marked: *marked,
+                },
+            )
             .collect();
         let plan = plan_bulk_marks(&rows);
 

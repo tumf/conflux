@@ -138,21 +138,73 @@ fn build_change_rows(changes: &[ChangeState]) -> (Vec<ChangeRow>, Vec<usize>) {
 
 /// The blank that stands in for a checkbox on a post-archive row.
 ///
-/// Exactly [`CHECKBOX_WIDTH`] columns, so substituting it keeps the cursor,
+/// Exactly [`CHECKBOX_WIDTH`] columns, so substituting it keeps the
 /// change ID, badges, status, progress, and preview in the same columns as
 /// every non-terminal row.
 const CHECKBOX_PLACEHOLDER: &str = "   ";
 
 /// Display width of the checkbox column, shared by `[x]`, `[ ]`, and the blank.
-#[cfg_attr(not(test), allow(dead_code))]
 const CHECKBOX_WIDTH: usize = CHECKBOX_PLACEHOLDER.len();
 
-/// True when the row has completed archive and is no longer a run candidate.
+/// The one column between the checkbox area and the change ID.
+///
+/// It is the whole focus-independent separator: the cursor glyph that used to
+/// live here is gone, and Ratatui's row highlight is the only focus indicator.
+const CHECKBOX_TO_ID_SEPARATOR_WIDTH: usize = 1;
+
+/// Terminal display columns of change-ID *content* in a Changes row.
+///
+/// The full ID field is [`CHANGE_ID_FIELD_WIDTH`]; this is the part the ID itself
+/// may occupy, hard-truncated or space-padded to exactly this width so every
+/// following field starts in the same column on every row.
+const CHANGE_ID_CONTENT_WIDTH: usize = 35;
+
+/// Terminal display columns from the change-ID start to the next field's start.
+///
+/// [`CHANGE_ID_CONTENT_WIDTH`] columns of ID content plus one separator column,
+/// which is supplied by the *next* field's own leading space (`" WT"`,
+/// `" [status]"`, …) rather than by the ID span. Nothing but this constant may
+/// describe that boundary, so the two row layouts cannot drift apart.
+#[cfg_attr(not(test), allow(dead_code))]
+const CHANGE_ID_FIELD_WIDTH: usize = CHANGE_ID_CONTENT_WIDTH + CHECKBOX_TO_ID_SEPARATOR_WIDTH;
+
+/// Fixed display columns a Changes row spends before its first badge.
+///
+/// Checkbox, the single separator column, and the ID content field. Fixed by
+/// construction, which is why the preview-width calculation can use it instead of
+/// measuring formatted strings with `str::len` — the byte length of a row prefix
+/// is not its column count.
+const CHANGE_ROW_PREFIX_WIDTH: usize =
+    CHECKBOX_WIDTH + CHECKBOX_TO_ID_SEPARATOR_WIDTH + CHANGE_ID_CONTENT_WIDTH;
+
+/// Terminal display columns a rendered fragment occupies.
+///
+/// Row layout is column accounting, and `str::len` is byte accounting: the two
+/// agree only for ASCII, and the spinner glyph and CJK change IDs are exactly
+/// where they stop agreeing.
+fn display_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// True when the row's *display status* is a post-archive presentation.
 ///
 /// `archived`, `merged`, and `pushed` are all post-archive presentations of the
-/// same fact, and none of them can carry next-run intent.
+/// same fact, and none of them can carry next-run intent. This is the status-only
+/// fallback: it holds on a startup or refresh frame where no reducer
+/// archive-completion snapshot has been observed yet.
 fn is_post_archive_status(display_status: &str) -> bool {
     matches!(display_status, "archived" | "merged" | "pushed")
+}
+
+/// True when the row must render no checkbox text at all.
+///
+/// Either the reducer recorded archive completion — which is what keeps the
+/// checkbox hidden while the row's display status is a live `resolving`,
+/// `resolve pending`, or `merge wait` — or the display status is itself a final
+/// post-archive one. One predicate for both, so the rendered checkbox and the
+/// mark admission in [`guards::is_mark_target`] cannot disagree about a row.
+fn hides_checkbox(change: &ChangeState) -> bool {
+    change.archive_complete_cache || is_post_archive_status(&change.display_status_cache)
 }
 
 /// Determine checkbox display and color for a change item
@@ -161,14 +213,47 @@ fn is_post_archive_status(display_status: &str) -> bool {
 /// A post-archive row renders neither `[x]` nor `[ ]`: it is not an execution
 /// candidate, so a checkbox there would advertise intent it cannot hold. The
 /// blank keeps the column width so nothing after it shifts left.
-fn get_checkbox_display(display_status: &str, is_selected: bool) -> (&'static str, Color) {
-    if is_post_archive_status(display_status) {
+fn get_checkbox_display(
+    display_status: &str,
+    is_selected: bool,
+    archive_complete: bool,
+) -> (&'static str, Color) {
+    if archive_complete || is_post_archive_status(display_status) {
         (CHECKBOX_PLACEHOLDER, Color::DarkGray) // Post-archive - no checkbox
     } else if is_selected {
         ("[x]", Color::Green) // Selected/In queue
     } else {
         ("[ ]", Color::Gray) // Not selected
     }
+}
+
+/// The change-ID field content: exactly [`CHANGE_ID_CONTENT_WIDTH`] columns.
+///
+/// Hard truncation with no ellipsis, measured in terminal display columns rather
+/// than bytes or scalars: a CJK ID is half as many characters as it is columns, so
+/// a byte- or char-padded field would push `WT`, the spinner, elapsed time,
+/// status, and task progress out of alignment on exactly the rows that already
+/// look widest.
+///
+/// A wide character that would straddle the boundary is dropped whole and its
+/// column is filled with a space, because half a character cannot be rendered.
+fn render_change_id_field(display_id: &str) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut field = String::new();
+    let mut width = 0;
+    for ch in display_id.chars() {
+        let char_width = ch.width().unwrap_or(0);
+        if width + char_width > CHANGE_ID_CONTENT_WIDTH {
+            break;
+        }
+        field.push(ch);
+        width += char_width;
+    }
+    // No suffix: an ellipsis would consume a content column and make the visible
+    // prefix depend on whether truncation happened.
+    field.push_str(&" ".repeat(CHANGE_ID_CONTENT_WIDTH - width));
+    field
 }
 
 /// Push the cursor row's kill and execution-mark hints.
@@ -182,7 +267,10 @@ fn get_checkbox_display(display_status: &str, is_selected: bool) -> (&'static st
 ///   visible non-terminal row, whatever its execution mode, activity, wait
 ///   state, Apply-limit evidence, or current worktree eligibility.
 ///
-/// A terminal row gets no mark hint at all: Space on it is a silent no-op.
+/// A terminal row, and a row the reducer has recorded as archive-complete, gets
+/// no mark hint at all: Space on it is a silent no-op. `K: kill` is unaffected —
+/// an archive-complete row that is still executing post-archive work remains
+/// killable.
 fn push_change_row_hints(keys: &mut Vec<String>, app: &AppState, item: &ChangeState) {
     let status = item.display_status_cache.as_str();
     if matches!(
@@ -197,7 +285,7 @@ fn push_change_row_hints(keys: &mut Vec<String>, app: &AppState, item: &ChangeSt
         }
     }
 
-    if is_markable_status(status) {
+    if is_markable_status(status, item.archive_complete_cache) {
         keys.push(if item.selected {
             "Space: unmark".to_string()
         } else {
@@ -725,7 +813,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 // [x] - marked as a next-run target
                 // (blank) - post-archive: no longer a run candidate
                 // Note: 'selected' field indicates the execution mark
-                let is_post_archive = is_post_archive_status(change.display_status_cache.as_str());
+                let is_post_archive = hides_checkbox(change);
                 // Every worktree-ineligible reason still refuses a *run*; only
                 // the badge narrows to the one reason that is actually a Git
                 // working-tree condition. It never refuses a mark.
@@ -750,8 +838,11 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 // reports the mark the operator actually set, because worktree
                 // eligibility no longer gates mark intent.
                 let (checkbox, checkbox_color) = {
-                    let (text, color) =
-                        get_checkbox_display(&change.display_status_cache, change.selected);
+                    let (text, color) = get_checkbox_display(
+                        &change.display_status_cache,
+                        change.selected,
+                        change.archive_complete_cache,
+                    );
                     (
                         text,
                         if is_parallel_blocked {
@@ -762,7 +853,6 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                     )
                 };
 
-                let cursor = if i == app.cursor_index { "►" } else { " " };
                 let worktree_badge = if change.has_worktree { " WT" } else { "" };
                 let worktree_color = if is_parallel_blocked {
                     blocked_fg
@@ -802,12 +892,11 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 let status_text = format!("[{}]", change.status_badge());
 
                 let mut spans = vec![
+                    // Checkbox plus the single separator column. Focus is the row
+                    // highlight alone, so no cursor glyph and no cursor column.
+                    Span::styled(format!("{checkbox} "), Style::default().fg(checkbox_color)),
                     Span::styled(
-                        format!("{} {} ", checkbox, cursor),
-                        Style::default().fg(checkbox_color),
-                    ),
-                    Span::styled(
-                        format!("{:<25}", display_id),
+                        render_change_id_field(display_id),
                         Style::default().fg(name_color),
                     ),
                     Span::styled(
@@ -846,29 +935,27 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 // retained final diagnostic for an error row, otherwise the
                 // latest buffered log.
                 if let Some(preview_text) = change_row_preview_text(app, change) {
-                    // Calculate actual occupied width dynamically
-                    let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
-                    let checkbox_cursor_width = checkbox_cursor_text.len();
-                    let id_text = format!("{:<25}", display_id);
-                    let id_width = id_text.len();
+                    // The row prefix is fixed by construction, so it is taken from
+                    // the shared constant rather than measured: `str::len` on the
+                    // formatted prefix reported bytes, which is not its column
+                    // count once a non-ASCII glyph or ID is involved.
                     let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
                     let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
                     let uncommitted_badge_width = if show_uncommitted_badge {
-                        UNCOMMITTED_BADGE.len()
+                        display_width(UNCOMMITTED_BADGE)
                     } else {
                         0
                     };
                     let status_text = format!("[{}]", change.display_status_cache.as_str());
-                    let status_width = format!(" {:>18}", status_text).len();
+                    let status_width = display_width(&format!(" {:>18}", status_text));
                     let tasks_text =
                         format!(" {}/{} tasks", change.completed_tasks, change.total_tasks);
-                    let tasks_width = tasks_text.len();
+                    let tasks_width = display_width(&tasks_text);
                     let percent_text = format!("  {:>5.1}%", change.progress_percent());
-                    let percent_width = percent_text.len();
+                    let percent_width = display_width(&percent_text);
                     let list_border_width = 2; // List widget border
 
-                    let base_width = checkbox_cursor_width
-                        + id_width
+                    let base_width = CHANGE_ROW_PREFIX_WIDTH
                         + worktree_badge_width
                         + new_badge_width
                         + uncommitted_badge_width
@@ -1005,7 +1092,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 // (blank) - post-archive: no longer a run candidate
                 // The checkbox is the execution mark in every mode. Queue
                 // membership is a separate axis and has its own status column.
-                let is_post_archive = is_post_archive_status(change.display_status_cache.as_str());
+                let is_post_archive = hides_checkbox(change);
                 // Every worktree-ineligible reason still refuses a *run*; only
                 // the badge narrows to the one reason that is actually a Git
                 // working-tree condition. It never refuses a mark.
@@ -1030,8 +1117,11 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 // reports the mark the operator actually set, because worktree
                 // eligibility no longer gates mark intent.
                 let (checkbox, checkbox_color) = {
-                    let (text, color) =
-                        get_checkbox_display(&change.display_status_cache, change.selected);
+                    let (text, color) = get_checkbox_display(
+                        &change.display_status_cache,
+                        change.selected,
+                        change.archive_complete_cache,
+                    );
                     (
                         text,
                         if is_parallel_blocked {
@@ -1042,7 +1132,6 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     )
                 };
 
-                let cursor = if i == app.cursor_index { "►" } else { " " };
                 let worktree_badge = if change.has_worktree { " WT" } else { "" };
                 let worktree_color = if is_parallel_blocked {
                     blocked_fg
@@ -1109,10 +1198,14 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 let (spinner_elapsed_width, status_only_width) = if !spinner_prefix.is_empty() {
                     let spinner_elapsed_text =
                         format!(" {}{:>7} ", spinner_prefix.trim(), elapsed_text);
-                    (spinner_elapsed_text.len(), status_text.len())
+                    // Display columns, not bytes: the spinner glyph is multi-byte.
+                    (
+                        display_width(&spinner_elapsed_text),
+                        display_width(&status_text),
+                    )
                 } else {
                     let status_formatted = format!(" {:>18}", status_text);
-                    (0, status_formatted.len())
+                    (0, display_width(&status_formatted))
                 };
 
                 // In grouped mode show only the bare change id (no project prefix).
@@ -1120,12 +1213,11 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 let display_id = parsed.change;
 
                 let mut spans = vec![
+                    // Checkbox plus the single separator column. Focus is the row
+                    // highlight alone, so no cursor glyph and no cursor column.
+                    Span::styled(format!("{checkbox} "), Style::default().fg(checkbox_color)),
                     Span::styled(
-                        format!("{} {} ", checkbox, cursor),
-                        Style::default().fg(checkbox_color),
-                    ),
-                    Span::styled(
-                        format!("{:<25}", display_id),
+                        render_change_id_field(display_id),
                         Style::default().fg(name_color),
                     ),
                     Span::styled(
@@ -1187,25 +1279,23 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 // retained final diagnostic for an error row, otherwise the
                 // latest buffered log.
                 if let Some(preview_text) = change_row_preview_text(app, change) {
-                    // Calculate actual occupied width dynamically
-                    let checkbox_cursor_text = format!("{} {} ", checkbox, cursor);
-                    let checkbox_cursor_width = checkbox_cursor_text.len();
-                    let id_text = format!("{:<25}", display_id);
-                    let id_width = id_text.len();
+                    // The row prefix is fixed by construction, so it is taken from
+                    // the shared constant rather than measured: `str::len` on the
+                    // formatted prefix reported bytes, which is not its column
+                    // count once a non-ASCII glyph or ID is involved.
                     let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
                     let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
                     let uncommitted_badge_width = if show_uncommitted_badge {
-                        UNCOMMITTED_BADGE.len()
+                        display_width(UNCOMMITTED_BADGE)
                     } else {
                         0
                     };
 
                     // Use the actual tasks_text that was already formatted above
-                    let tasks_width = tasks_text.len();
+                    let tasks_width = display_width(&tasks_text);
                     let list_border_width = 2; // List widget border
 
-                    let base_width = checkbox_cursor_width
-                        + id_width
+                    let base_width = CHANGE_ROW_PREFIX_WIDTH
                         + worktree_badge_width
                         + new_badge_width
                         + uncommitted_badge_width
@@ -1661,7 +1751,8 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
         // would report a target here and hide the condition the footer exists to
         // state.
         let startable_rows = app.changes.iter().any(|change| {
-            is_markable_status(&change.display_status_cache) && !change.apply_iteration_limit_active
+            is_markable_status(&change.display_status_cache, change.archive_complete_cache)
+                && !change.apply_iteration_limit_active
         });
         let message = if app.has_active_apply_iteration_limit() && !startable_rows {
             APPLY_LIMIT_CONDITION
@@ -2871,12 +2962,12 @@ mod tests {
     // ========================================================================
 
     /// Columns between the start of the checkbox and the start of the change
-    /// ID: the checkbox itself plus the `" {cursor} "` that follows it.
-    const CHECKBOX_TO_ID_COLUMNS: usize = CHECKBOX_WIDTH + 3;
+    /// ID: the checkbox itself plus the single separator column after it.
+    const CHECKBOX_TO_ID_COLUMNS: usize = CHECKBOX_WIDTH + CHECKBOX_TO_ID_SEPARATOR_WIDTH;
 
     /// The rendered list row that displays `change_id`, as characters.
     ///
-    /// Character cells, not bytes: the cursor glyph is multi-byte, so byte
+    /// Character cells, not bytes: a wide-character ID is multi-byte, so byte
     /// offsets would not describe columns.
     fn change_row_cells(buffer: &Buffer, change_id: &str) -> Vec<char> {
         (0..buffer.area.height)
@@ -2955,7 +3046,7 @@ mod tests {
     fn archived_checkbox_placeholder_replaces_both_checkbox_states() {
         for status in ["archived", "merged", "pushed"] {
             for marked in [true, false] {
-                let (text, color) = get_checkbox_display(status, marked);
+                let (text, color) = get_checkbox_display(status, marked, false);
                 assert_eq!(
                     text, CHECKBOX_PLACEHOLDER,
                     "`{status}` (marked={marked}) must render no checkbox"
@@ -2965,8 +3056,8 @@ mod tests {
         }
 
         // A non-terminal row still reports the mark it actually holds.
-        assert_eq!(get_checkbox_display("not queued", true).0, "[x]");
-        assert_eq!(get_checkbox_display("not queued", false).0, "[ ]");
+        assert_eq!(get_checkbox_display("not queued", true, false).0, "[x]");
+        assert_eq!(get_checkbox_display("not queued", false, false).0, "[ ]");
     }
 
     /// The column regression: in both list layouts, on the cursor row and off
@@ -3026,6 +3117,552 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // ========================================================================
+    // Changes row layout: reducer-recorded archive completion hides the checkbox
+    //
+    // The checkbox and the mark hint answer the same question, so they are
+    // asserted together against one predicate. `resolving` appears on both sides
+    // of every case here: with an archive record it is post-archive, without one
+    // it is an ordinary active row.
+    // ========================================================================
+
+    /// Live post-archive statuses plus the terminal ones a finished post-archive
+    /// lane reaches.
+    const ARCHIVE_COMPLETE_ROW_STATUSES: [&str; 5] = [
+        "resolving",
+        "resolve pending",
+        "merge wait",
+        "merged",
+        "pushed",
+    ];
+
+    /// One archive-complete row and one ordinary row, for either list layout.
+    fn archive_complete_app(
+        mode: AppExecutionMode,
+        with_logs: bool,
+        status: &str,
+        marked: bool,
+        archive_complete: bool,
+    ) -> AppState {
+        let mut app = create_test_app(vec![
+            create_test_change("change-a"),
+            create_test_change("change-b"),
+        ]);
+        app.execution_mode = mode;
+        app.cursor_index = 0;
+        app.changes[0].set_display_status_cache(status);
+        app.changes[0].selected = marked;
+        app.changes[0].archive_complete_cache = archive_complete;
+        if with_logs {
+            app.add_log(LogEntry::info("log"));
+        }
+        app
+    }
+
+    /// A reducer-archived row renders the blank three-column placeholder even
+    /// while its display status is a live post-archive one, and it holds the
+    /// columns after it.
+    #[test]
+    fn tui_change_row_layout_mark_contract_archive_complete_row_hides_the_checkbox() {
+        for (layout, with_logs) in [("select", false), ("running", true)] {
+            for mode in [
+                AppExecutionMode::Select,
+                AppExecutionMode::Running,
+                AppExecutionMode::Stopped,
+            ] {
+                let mut baseline =
+                    archive_complete_app(mode, with_logs, "not queued", false, false);
+                let baseline_buffer = render_buffer(&mut baseline, 120, 30);
+                let (baseline_checkbox, baseline_id_column) = checkbox_and_id_column(
+                    &change_row_cells(&baseline_buffer, "change-a"),
+                    "change-a",
+                );
+                assert_eq!(baseline_checkbox, "[ ]");
+
+                for status in ARCHIVE_COMPLETE_ROW_STATUSES {
+                    for marked in [true, false] {
+                        let mut app = archive_complete_app(mode, with_logs, status, marked, true);
+                        let buffer = render_buffer(&mut app, 120, 30);
+                        let (checkbox, id_column) = checkbox_and_id_column(
+                            &change_row_cells(&buffer, "change-a"),
+                            "change-a",
+                        );
+
+                        assert_eq!(
+                            checkbox, CHECKBOX_PLACEHOLDER,
+                            "{layout}/{mode:?}: archive-complete `{status}` \
+                             (marked={marked}) must render neither [x] nor [ ]"
+                        );
+                        assert_eq!(
+                            checkbox.chars().count(),
+                            CHECKBOX_WIDTH,
+                            "{layout}/{mode:?}: the placeholder stays three columns"
+                        );
+                        assert_eq!(
+                            id_column, baseline_id_column,
+                            "{layout}/{mode:?}: archive-complete `{status}` must not \
+                             shift the ID or the fields after it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The control: the same statuses with no reducer archive record still show
+    /// the mark the operator actually holds.
+    #[test]
+    fn tui_change_row_layout_mark_contract_row_without_an_archive_record_keeps_its_checkbox() {
+        for (layout, with_logs) in [("select", false), ("running", true)] {
+            // Only the non-terminal statuses: `merged` and `pushed` are terminal
+            // and hide the checkbox on their status alone.
+            for status in ["resolving", "resolve pending", "merge wait"] {
+                for (marked, expected) in [(true, "[x]"), (false, "[ ]")] {
+                    let mut app = archive_complete_app(
+                        AppExecutionMode::Running,
+                        with_logs,
+                        status,
+                        marked,
+                        false,
+                    );
+                    let buffer = render_buffer(&mut app, 120, 30);
+                    let (checkbox, _) =
+                        checkbox_and_id_column(&change_row_cells(&buffer, "change-a"), "change-a");
+
+                    assert_eq!(
+                        checkbox, expected,
+                        "{layout}/{status} (marked={marked}) has no archive record and \
+                         must still report its own mark"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The status-only fallback: on a frame with no reducer archive snapshot, a
+    /// terminal post-archive display status still suppresses the checkbox.
+    #[test]
+    fn tui_change_row_layout_mark_contract_terminal_status_alone_hides_the_checkbox() {
+        for status in ["archived", "merged", "pushed"] {
+            for marked in [true, false] {
+                let (text, color) = get_checkbox_display(status, marked, false);
+                assert_eq!(
+                    text, CHECKBOX_PLACEHOLDER,
+                    "`{status}` must suppress the checkbox without an archive snapshot"
+                );
+                assert_eq!(color, Color::DarkGray);
+            }
+        }
+    }
+
+    /// An archive-complete cursor row offers no Space mark hint, while `K: kill`
+    /// stays available for the post-archive work that is still running.
+    #[test]
+    fn tui_change_row_layout_mark_contract_archive_complete_row_omits_the_mark_hint() {
+        for (layout, with_logs) in [("select", false), ("running", true)] {
+            for status in ARCHIVE_COMPLETE_ROW_STATUSES {
+                for marked in [true, false] {
+                    let mut app = archive_complete_app(
+                        AppExecutionMode::Running,
+                        with_logs,
+                        status,
+                        marked,
+                        true,
+                    );
+                    let content = buffer_to_string(&render_buffer(&mut app, 200, 24));
+
+                    assert!(
+                        !content.contains("Space: mark") && !content.contains("Space: unmark"),
+                        "{layout}/{status} (marked={marked}): an archive-complete row must \
+                         advertise no mark control:\n{content}"
+                    );
+                    if status == "resolving" {
+                        assert!(
+                            content.contains("K: kill"),
+                            "{layout}/{status}: per-change termination is independent of \
+                             markability:\n{content}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The paired control for the hint: no archive record, so the mark hint is
+    /// offered exactly as before.
+    #[test]
+    fn tui_change_row_layout_mark_contract_row_without_an_archive_record_keeps_the_mark_hint() {
+        for with_logs in [false, true] {
+            for status in ["resolving", "resolve pending", "merge wait"] {
+                for (marked, expected) in [(false, "Space: mark"), (true, "Space: unmark")] {
+                    let mut app = archive_complete_app(
+                        AppExecutionMode::Running,
+                        with_logs,
+                        status,
+                        marked,
+                        false,
+                    );
+                    let content = buffer_to_string(&render_buffer(&mut app, 200, 24));
+
+                    assert!(
+                        content.contains(expected),
+                        "{status} (marked={marked}) must still advertise `{expected}`:\n{content}"
+                    );
+                    assert!(
+                        content.contains("x: toggle all"),
+                        "{status}: a markable row keeps the bulk hint:\n{content}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // Changes row layout: highlight-only focus, fixed 36-column ID field
+    //
+    // The row prefix is a column contract, so these assert columns rather than
+    // substrings. `render_change_id_field` is the only thing allowed to decide
+    // where the ID field ends, and both list layouts have to agree with it.
+    // ========================================================================
+
+    /// The two representative IDs from the change: one shorter than the content
+    /// field and one longer than it.
+    const SHORT_REPRESENTATIVE_ID: &str = "fix-stale-resolve-terminal-status";
+    const LONG_REPRESENTATIVE_ID: &str = "preserve-archiving-during-tui-refresh";
+    /// The long ID after hard truncation, with no ellipsis.
+    const LONG_REPRESENTATIVE_ID_TRUNCATED: &str = "preserve-archiving-during-tui-refre";
+
+    /// Unit: the field constants describe one 36-column boundary.
+    #[test]
+    fn tui_change_row_layout_render_field_constants_are_coherent() {
+        assert_eq!(CHANGE_ID_CONTENT_WIDTH, 35);
+        assert_eq!(CHECKBOX_TO_ID_SEPARATOR_WIDTH, 1);
+        assert_eq!(CHANGE_ID_FIELD_WIDTH, 36);
+        assert_eq!(
+            CHANGE_ROW_PREFIX_WIDTH,
+            CHECKBOX_WIDTH + CHECKBOX_TO_ID_SEPARATOR_WIDTH + CHANGE_ID_CONTENT_WIDTH,
+            "the preview base width must be built from the same constants the row is"
+        );
+    }
+
+    /// Unit: short IDs pad, long IDs hard-truncate, and both end up exactly
+    /// [`CHANGE_ID_CONTENT_WIDTH`] display columns wide.
+    #[test]
+    fn tui_change_row_layout_render_id_field_pads_and_truncates_ascii() {
+        let short = render_change_id_field(SHORT_REPRESENTATIVE_ID);
+        assert_eq!(display_width(SHORT_REPRESENTATIVE_ID), 33);
+        assert_eq!(short, format!("{SHORT_REPRESENTATIVE_ID}  "));
+        assert_eq!(display_width(&short), CHANGE_ID_CONTENT_WIDTH);
+
+        let long = render_change_id_field(LONG_REPRESENTATIVE_ID);
+        assert_eq!(long, LONG_REPRESENTATIVE_ID_TRUNCATED);
+        assert_eq!(display_width(&long), CHANGE_ID_CONTENT_WIDTH);
+        assert!(
+            !long.contains('…') && !long.contains("..."),
+            "hard truncation adds no suffix: {long}"
+        );
+
+        // An ID that lands exactly on the boundary is neither padded nor cut.
+        let exact = "a".repeat(CHANGE_ID_CONTENT_WIDTH);
+        assert_eq!(render_change_id_field(&exact), exact);
+
+        assert_eq!(
+            display_width(&render_change_id_field("")),
+            CHANGE_ID_CONTENT_WIDTH,
+            "even an empty ID owns the whole field"
+        );
+    }
+
+    /// Unit: the field is measured in terminal columns, so a wide character is
+    /// never split and the remainder is padded instead.
+    #[test]
+    fn tui_change_row_layout_render_id_field_uses_unicode_display_width() {
+        // 18 wide characters = 36 columns, so the 18th straddles the boundary:
+        // 17 of them fill 34 columns and the last column becomes a space.
+        let wide = "変".repeat(18);
+        let field = render_change_id_field(&wide);
+        assert_eq!(field.chars().filter(|c| *c == '変').count(), 17);
+        assert_eq!(
+            display_width(&field),
+            CHANGE_ID_CONTENT_WIDTH,
+            "the straddling character is dropped whole and its column padded"
+        );
+        assert!(field.ends_with(' '));
+
+        // A mixed ID is cut at the same column, not at the same character count.
+        let mixed = format!("{}変変変変変", "ascii-".repeat(4)); // 24 + 10 columns
+        let mixed_field = render_change_id_field(&mixed);
+        assert_eq!(display_width(&mixed_field), CHANGE_ID_CONTENT_WIDTH);
+        assert!(mixed_field.starts_with("ascii-ascii-ascii-ascii-"));
+    }
+
+    /// One row per representative ID, arranged for either list layout.
+    fn representative_row_app(with_logs: bool, cursor_index: usize) -> AppState {
+        let mut app = create_test_app(vec![
+            create_test_change(SHORT_REPRESENTATIVE_ID),
+            create_test_change(LONG_REPRESENTATIVE_ID),
+        ]);
+        app.execution_mode = if with_logs {
+            AppExecutionMode::Running
+        } else {
+            AppExecutionMode::Select
+        };
+        app.cursor_index = cursor_index;
+        if with_logs {
+            app.add_log(LogEntry::info("log"));
+        }
+        app
+    }
+
+    /// The rendered row containing `needle`, as one string.
+    fn rendered_row(buffer: &Buffer, needle: &str) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no rendered row contains `{needle}`"))
+    }
+
+    /// The regression the cursor column used to cause: no row may render `►`,
+    /// and the focused row is still identifiable from its highlight alone.
+    #[test]
+    fn tui_change_row_layout_render_drops_the_cursor_glyph_and_keeps_the_highlight() {
+        for with_logs in [false, true] {
+            for mode in [
+                AppExecutionMode::Select,
+                AppExecutionMode::Running,
+                AppExecutionMode::Stopping,
+                AppExecutionMode::Stopped,
+                AppExecutionMode::Error,
+            ] {
+                for cursor_index in [0, 1] {
+                    let mut app = representative_row_app(with_logs, cursor_index);
+                    app.execution_mode = mode;
+
+                    let buffer = render_buffer(&mut app, 160, 30);
+                    let content = buffer_to_string(&buffer);
+                    assert!(
+                        !content.contains('►'),
+                        "{mode:?}/logs={with_logs}/cursor={cursor_index}: \
+                         no row may render a cursor glyph:\n{content}"
+                    );
+
+                    // Focus is the row highlight: the focused row's ID column
+                    // carries the highlight background, the other row does not.
+                    let focused_id = if cursor_index == 0 {
+                        SHORT_REPRESENTATIVE_ID
+                    } else {
+                        LONG_REPRESENTATIVE_ID_TRUNCATED
+                    };
+                    let other_id = if cursor_index == 0 {
+                        LONG_REPRESENTATIVE_ID_TRUNCATED
+                    } else {
+                        SHORT_REPRESENTATIVE_ID
+                    };
+                    assert_eq!(
+                        bg_at(&buffer, focused_id),
+                        Color::DarkGray,
+                        "{mode:?}/logs={with_logs}/cursor={cursor_index}: \
+                         the focused row keeps its highlight"
+                    );
+                    assert_ne!(
+                        bg_at(&buffer, other_id),
+                        Color::DarkGray,
+                        "{mode:?}/logs={with_logs}/cursor={cursor_index}: \
+                         only the focused row is highlighted"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Background color of the first cell of `needle` in the rendered buffer.
+    fn bg_at(buffer: &Buffer, needle: &str) -> Color {
+        for y in 0..buffer.area.height {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if let Some(byte_index) = line.find(needle) {
+                let column = line[..byte_index].chars().count() as u16;
+                return buffer[(column, y)].bg;
+            }
+        }
+        panic!("{needle:?} not found in rendered buffer");
+    }
+
+    /// The user's two representative rows, asserted as exact rendered text.
+    ///
+    /// This is the alignment claim itself: the short ID pads, the long one is cut
+    /// at 35 columns with no ellipsis, and `WT`, the spinner, elapsed time,
+    /// status, and task progress therefore start in the same column on both rows.
+    #[test]
+    fn tui_change_row_layout_render_representative_rows_align_every_field() {
+        // Running layout, because that is the one that also carries the spinner
+        // and elapsed-time fields.
+        let mut app = representative_row_app(true, 0);
+        for change in &mut app.changes {
+            change.set_display_status_cache("applying");
+            change.has_worktree = true;
+            change.iteration_number = Some(2);
+            change.elapsed_time = Some(Duration::from_secs(75));
+            change.completed_tasks = 1;
+            change.total_tasks = 4;
+        }
+        app.spinner_frame = 0;
+        let spinner = SPINNER_CHARS[0];
+
+        let buffer = render_buffer(&mut app, 120, 30);
+
+        let short_row = rendered_row(&buffer, SHORT_REPRESENTATIVE_ID);
+        let long_row = rendered_row(&buffer, LONG_REPRESENTATIVE_ID_TRUNCATED);
+
+        // ` WT`, then ` {spinner}{elapsed:>7} `, then the status badge, then task
+        // progress — every one of them supplying its own leading separator.
+        let expected_tail = format!(" WT {spinner} 1m 15s [applying:2]  1/4(25%)");
+        assert!(
+            // 33 columns of ID plus two columns of padding.
+            short_row.contains(&format!("[ ] {SHORT_REPRESENTATIVE_ID}  {expected_tail}")),
+            "short row must pad the ID to the field width before `WT`:\n\
+             {short_row}\nexpected tail: {expected_tail}"
+        );
+        assert!(
+            // 35 columns of hard-truncated ID and no padding at all.
+            long_row.contains(&format!(
+                "[ ] {LONG_REPRESENTATIVE_ID_TRUNCATED}{expected_tail}"
+            )),
+            "long row must hard-truncate at the field width:\n\
+             {long_row}\nexpected tail: {expected_tail}"
+        );
+        assert!(
+            !long_row.contains('…'),
+            "no truncation suffix is rendered:\n{long_row}"
+        );
+
+        // Every field after the ID starts in the same column on both rows.
+        for field in [" WT", "[applying:2]", "1/4(25%)"] {
+            assert_eq!(
+                short_row
+                    .find(field)
+                    .map(|i| short_row[..i].chars().count()),
+                long_row.find(field).map(|i| long_row[..i].chars().count()),
+                "`{field}` must start in the same column on both rows:\n\
+                 {short_row}\n{long_row}"
+            );
+        }
+    }
+
+    /// Both layouts start the ID exactly one column after the checkbox area, for
+    /// short IDs, truncated IDs, and wide-character IDs alike.
+    #[test]
+    fn tui_change_row_layout_render_id_starts_one_column_after_the_checkbox() {
+        for with_logs in [false, true] {
+            for cursor_index in [0, 1] {
+                let mut app = representative_row_app(with_logs, cursor_index);
+                let buffer = render_buffer(&mut app, 160, 30);
+
+                let (_, short_column) = checkbox_and_id_column(
+                    &change_row_cells(&buffer, SHORT_REPRESENTATIVE_ID),
+                    SHORT_REPRESENTATIVE_ID,
+                );
+                let (_, long_column) = checkbox_and_id_column(
+                    &change_row_cells(&buffer, LONG_REPRESENTATIVE_ID_TRUNCATED),
+                    LONG_REPRESENTATIVE_ID_TRUNCATED,
+                );
+                assert_eq!(short_column, CHANGE_ID_X as usize);
+                assert_eq!(long_column, CHANGE_ID_X as usize);
+            }
+        }
+    }
+
+    /// A CJK ID leaves the following field in the same column an ASCII ID does.
+    #[test]
+    fn tui_change_row_layout_render_wide_character_id_preserves_following_columns() {
+        for with_logs in [false, true] {
+            let mut app = create_test_app(vec![
+                create_test_change(SHORT_REPRESENTATIVE_ID),
+                // 18 wide characters: the last one straddles the 35-column
+                // boundary and must be dropped rather than split.
+                create_test_change(&"変".repeat(18)),
+            ]);
+            app.execution_mode = if with_logs {
+                AppExecutionMode::Running
+            } else {
+                AppExecutionMode::Select
+            };
+            for change in &mut app.changes {
+                change.has_worktree = true;
+            }
+            if with_logs {
+                app.add_log(LogEntry::info("log"));
+            }
+
+            let buffer = render_buffer(&mut app, 160, 30);
+            let ascii_row = rendered_row(&buffer, SHORT_REPRESENTATIVE_ID);
+            // A wide cell is followed by a blank spacer cell in the buffer, so
+            // consecutive wide characters are not adjacent in the joined row.
+            let wide_row = rendered_row(&buffer, "変");
+
+            let wide_cells: Vec<char> = wide_row.chars().collect();
+            assert_eq!(
+                wide_cells.iter().filter(|c| **c == '変').count(),
+                17,
+                "logs={with_logs}: the straddling wide character is dropped whole:\n{wide_row}"
+            );
+
+            // `WT` is the first field after the ID, and a display-width-padded
+            // field puts it in the same column on both rows.
+            //
+            // Column, not byte offset: a wide character is one cell pair in the
+            // buffer but three bytes in the string.
+            let column_of = |row: &str, needle: &str| {
+                row.find(needle)
+                    .map(|byte_index| row[..byte_index].chars().count())
+                    .unwrap_or_else(|| panic!("`{needle}` missing from `{row}`"))
+            };
+            assert_eq!(
+                column_of(&wide_row, " WT"),
+                column_of(&ascii_row, " WT"),
+                "logs={with_logs}: a wide-character ID must not shift the next field:\n\
+                 {ascii_row}\n{wide_row}"
+            );
+        }
+    }
+
+    /// The widened fixed prefix must degrade by dropping the preview, never by
+    /// letting it overlap a truncated field.
+    #[test]
+    fn tui_change_row_layout_render_narrow_terminal_omits_preview_safely() {
+        for with_logs in [false, true] {
+            let mut app = create_test_app(vec![create_test_change(LONG_REPRESENTATIVE_ID)]);
+            app.execution_mode = if with_logs {
+                AppExecutionMode::Running
+            } else {
+                AppExecutionMode::Select
+            };
+            app.changes[0].set_error_message_cache("a diagnostic nobody has room for".to_string());
+            if with_logs {
+                app.add_log(LogEntry::info("log"));
+            }
+
+            // Wide enough for the fixed fields, too narrow to leave
+            // `MIN_PREVIEW_WIDTH` beside them.
+            let buffer = render_buffer(&mut app, 76, 20);
+            let content = buffer_to_string(&buffer);
+
+            assert!(
+                content.contains(LONG_REPRESENTATIVE_ID_TRUNCATED),
+                "logs={with_logs}: the fixed ID field is still rendered in full:\n{content}"
+            );
+            assert!(
+                !content.contains("Error: a diagnostic"),
+                "logs={with_logs}: the preview is omitted rather than overlapped:\n{content}"
+            );
         }
     }
 
@@ -3163,18 +3800,18 @@ mod tests {
 
     #[test]
     fn test_get_checkbox_display_not_selected() {
-        let (text, color) = get_checkbox_display("not queued", false);
+        let (text, color) = get_checkbox_display("not queued", false, false);
         assert_eq!(text, "[ ]");
         assert_eq!(color, Color::Gray);
     }
 
     #[test]
     fn test_get_checkbox_display_selected() {
-        let (text, color) = get_checkbox_display("not queued", true);
+        let (text, color) = get_checkbox_display("not queued", true, false);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
 
-        let (text, color) = get_checkbox_display("queued", true);
+        let (text, color) = get_checkbox_display("queued", true, false);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
     }
@@ -3182,7 +3819,7 @@ mod tests {
     #[test]
     fn test_get_checkbox_display_marked_not_queued() {
         // When selected but not queued, show [@] marker
-        let (text, color) = get_checkbox_display("not queued", true);
+        let (text, color) = get_checkbox_display("not queued", true, false);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
     }
@@ -3190,12 +3827,12 @@ mod tests {
     #[test]
     fn test_get_checkbox_display_processing_states() {
         // Applying state should show green when selected
-        let (text, color) = get_checkbox_display("applying", true);
+        let (text, color) = get_checkbox_display("applying", true, false);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
 
         // Archiving state should show green when selected
-        let (text, color) = get_checkbox_display("archiving", true);
+        let (text, color) = get_checkbox_display("archiving", true, false);
         assert_eq!(text, "[x]");
         assert_eq!(color, Color::Green);
     }
@@ -3682,9 +4319,10 @@ mod tests {
 
     // Select-mode layout: header=3 rows, list starts at y=3 (border), first item at y=4.
     // List left border is at x=0, spans start at x=1.
-    // Checkbox "[ ] " = 4 chars, cursor "► " = 2 chars → display_id starts at x=7.
+    // Checkbox "[ ]" = 3 columns plus one separator column → display_id starts at x=5.
+    // There is no cursor column: focus is the row highlight alone.
     const SELECT_FIRST_ROW_Y: u16 = 4;
-    const CHANGE_ID_X: u16 = 7; // x of the first character of display_id in the list
+    const CHANGE_ID_X: u16 = 1 + CHECKBOX_WIDTH as u16 + CHECKBOX_TO_ID_SEPARATOR_WIDTH as u16;
 
     #[test]
     fn test_focused_blocked_row_has_readable_fg_select_mode() {
@@ -5716,6 +6354,7 @@ mod tests {
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
             apply_iteration_limit_active: false,
+            archive_complete_cache: false,
         }
     }
 
@@ -6128,7 +6767,10 @@ mod tests {
         // the characters that survived rather than at a raw substring match.
         let diagnostic = "適用に失敗しました🚀 スタックしています 追記済みです。";
 
-        for width in [85u16, 90, 100, 110, 120, 140, 160] {
+        // The narrowest width here is the first one that leaves the fixed
+        // 36-column ID field enough room for the minimum preview *and* one wide
+        // character beside the `" Error: "` prefix and the ellipsis.
+        for width in [90u16, 100, 110, 120, 140, 160] {
             let mut app = error_row_app(Some(diagnostic));
 
             // Rendering must complete at every width without panicking on a

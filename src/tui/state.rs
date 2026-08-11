@@ -188,6 +188,23 @@ pub struct ChangeState {
     /// the service is about to refuse. It is presentation state only — the
     /// service guard stands on its own with no TUI attached.
     pub apply_iteration_limit_active: bool,
+    /// Whether the reducer has recorded archive completion for this change.
+    ///
+    /// Synchronized from
+    /// [`crate::orchestration::state::OrchestratorState::archived_changes`] in the
+    /// same snapshot read as `display_status_cache`, so a row's status and its
+    /// archive milestone can never come from two different instants.
+    ///
+    /// It exists because the two facts genuinely diverge: after archive the
+    /// reducer truthfully advances the row to `resolving`, `resolve pending`, or
+    /// `merge wait`, none of which is a terminal status. Inferring "post-archive"
+    /// from `resolving` would misclassify a fresh-process resolve retry, which is
+    /// `resolving` with no archive on record and stays markable.
+    ///
+    /// Presentation state only, and process-local: it is discarded on restart, is
+    /// never persisted, and never becomes scheduler, resume, acceptance, archive,
+    /// or merge input.
+    pub archive_complete_cache: bool,
 }
 
 /// Main application state for the TUI
@@ -322,6 +339,18 @@ pub struct AppState {
     /// reducer-owned lifecycle intent is stronger than refresh-derived display hints.
     /// It must not be used as scheduler dispatch, resume routing, or workflow-control input.
     reducer_display_status_snapshot: HashMap<String, &'static str>,
+    /// Latest reducer-derived archive-completion snapshot observed by the TUI.
+    ///
+    /// Retained at app level, not only per row, because catalog refresh rebuilds
+    /// `ChangeState` values: a row that refresh re-creates from `Change` would
+    /// otherwise come back with `archive_complete_cache = false` and flash a
+    /// checkbox the reducer already retired. Refresh reapplies this snapshot in
+    /// the same pass.
+    ///
+    /// Presentation-only, process-local state. It is discarded on restart and is
+    /// never used as scheduler dispatch, resume routing, acceptance, or archive
+    /// input.
+    reducer_archived_changes: HashSet<String>,
     /// Runtime-only observability dedupe for TUI diagnostics.
     ///
     /// This state is not workflow-control state.
@@ -393,6 +422,7 @@ impl ChangeState {
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
             apply_iteration_limit_active: false,
+            archive_complete_cache: false,
         }
     }
 
@@ -585,6 +615,7 @@ impl AppState {
             selected_proposal_log_filter: false, // Default: show logs for every proposal
             tui_config: TuiConfig::default(),
             reducer_display_status_snapshot: HashMap::new(),
+            reducer_archived_changes: HashSet::new(),
             diagnostic_dedup: DiagnosticDeduplicationStore::new(),
             execution_marks: std::sync::Arc::new(
                 crate::orchestration::operator_command::ExecutionMarkStore::new(),
@@ -1670,6 +1701,40 @@ impl AppState {
         }
     }
 
+    /// Sync the reducer's archive-completion snapshot into the row cache.
+    ///
+    /// Taken from the same reducer read as the display statuses so a row's status
+    /// and its archive milestone always describe one instant. The snapshot is
+    /// retained so refresh reconstruction can reapply it — see
+    /// [`AppState::reapply_reducer_archive_completion`].
+    ///
+    /// Nothing is inferred from the status string here: this is only the reducer's
+    /// own record, projected onto the rows that carry it.
+    pub fn apply_archived_changes_from_reducer(&mut self, archived: &HashSet<String>) {
+        self.reducer_archived_changes = archived.clone();
+        self.reapply_reducer_archive_completion();
+    }
+
+    /// Reapply the retained archive-completion snapshot to the current rows.
+    ///
+    /// Catalog refresh rebuilds and re-adds rows; without this the reconstructed
+    /// row would render an empty `[ ]` for a change the reducer already archived,
+    /// which is exactly the one-frame checkbox flash post-archive rows must never
+    /// show.
+    pub(crate) fn reapply_reducer_archive_completion(&mut self) {
+        for change in &mut self.changes {
+            change.archive_complete_cache = self.reducer_archived_changes.contains(&change.id);
+        }
+    }
+
+    /// Changes the reducer has recorded as archive-complete, as this TUI sees them.
+    ///
+    /// Assertion helper only: production reads the per-row cache.
+    #[cfg(test)]
+    pub(crate) fn reducer_archived_changes(&self) -> &HashSet<String> {
+        &self.reducer_archived_changes
+    }
+
     /// Sync displayed status caches from the reducer's display status snapshot.
     ///
     /// This is Phase 6.1: TUI derives displayed change status from the shared
@@ -2270,8 +2335,12 @@ pub(crate) mod guards {
     /// markability table. Worktree eligibility and Apply-limit evidence are not
     /// consulted: they decide whether a *run* may start, not whether an operator
     /// may express intent.
+    ///
+    /// The archive-completion evidence is supplied, not inferred: a row whose
+    /// hidden checkbox says "no next run" must not still be toggleable, and a
+    /// `resolving` row with no reducer archive record stays markable.
     pub fn is_mark_target(change: &ChangeState) -> bool {
-        is_markable_status(&change.display_status_cache)
+        is_markable_status(&change.display_status_cache, change.archive_complete_cache)
     }
 }
 
@@ -3068,6 +3137,7 @@ mod tests {
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
             apply_iteration_limit_active: false,
+            archive_complete_cache: false,
         };
 
         assert_eq!(change.progress_percent(), 50.0);
@@ -4255,6 +4325,7 @@ mod tests {
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
             apply_iteration_limit_active: false,
+            archive_complete_cache: false,
         };
 
         // First iteration should be accepted
@@ -4286,6 +4357,7 @@ mod tests {
             iteration_number: Some(3),
             apply_operation_cache: "apply".to_string(),
             apply_iteration_limit_active: false,
+            archive_complete_cache: false,
         };
 
         // Lower iteration should be ignored
@@ -4321,6 +4393,7 @@ mod tests {
             iteration_number: Some(2),
             apply_operation_cache: "apply".to_string(),
             apply_iteration_limit_active: false,
+            archive_complete_cache: false,
         };
 
         // None should be ignored

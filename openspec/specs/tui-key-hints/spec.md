@@ -8,7 +8,7 @@ Defines TUI key binding hints display based on application mode.
 
 `MergeWait` の change が選択中の場合、TUI は resolve 実行中なら `M: queue resolve`、未実行なら `M: resolve` を表示しなければならない（SHALL）。`MergeWait` 以外の change では `M` hint を表示してはならない（SHALL NOT）。Configured start key hints SHALL describe app-level orchestration start/resume/retry only, MUST NOT imply cursor-local resolve behavior, and SHALL use the resolved key label such as default `F5/!`.
 
-Visible non-terminal row では execution mark の現在値に応じて `Space: mark` または `Space: unmark` を表示しなければならない（SHALL）。Active row では独立した `K: kill` hint と mark hint を同時に表示しなければならない（SHALL）。Archived、merged、pushed、または rejected row では Space mark hint を表示してはならない（MUST NOT）。
+Visible non-terminal row のうち reducer が archive 完了を記録していない markable row では execution mark の現在値に応じて `Space: mark` または `Space: unmark` を表示しなければならない（SHALL）。Active markable row では独立した `K: kill` hint と mark hint を同時に表示しなければならない（SHALL）。Terminal display status、または reducer-recorded archive-complete row では Space mark hint を表示してはならない（MUST NOT）。
 
 #### Scenario: MergeWait shows the appropriate M hint
 
@@ -25,23 +25,23 @@ Visible non-terminal row では execution mark の現在値に応じて `Space: 
 - **THEN** no M resolve hint is shown
 - **AND** configured start availability for marked runnable work is unaffected
 
-#### Scenario: non-terminal row shows mark hint
+#### Scenario: markable non-terminal row shows mark hint
 
-- **GIVEN** the cursor is on a visible non-terminal row
+- **GIVEN** the cursor is on a visible non-terminal row without reducer-recorded archive completion
 - **WHEN** key hints are rendered
 - **THEN** an unmarked row shows `Space: mark`
 - **AND** a marked row shows `Space: unmark`
 
-#### Scenario: active row shows independent kill and mark hints
+#### Scenario: active markable row shows independent kill and mark hints
 
-- **GIVEN** the cursor is on an active non-terminal change
+- **GIVEN** the cursor is on an active non-terminal change without reducer-recorded archive completion
 - **WHEN** key hints are rendered
 - **THEN** the Changes panel shows `K: kill`
 - **AND** it also shows `Space: mark` or `Space: unmark`
 
-#### Scenario: terminal row omits mark hint
+#### Scenario: non-markable row omits mark hint
 
-- **GIVEN** the cursor is on an archived, merged, pushed, or rejected row
+- **GIVEN** the cursor is on a row with terminal display status or reducer-recorded archive completion
 - **WHEN** key hints are rendered
 - **THEN** the Changes panel does not show `Space: mark` or `Space: unmark`
 
@@ -55,24 +55,24 @@ Visible non-terminal row では execution mark の現在値に応じて `Space: 
 
 ### Requirement: Context-Aware Key Hints in Running Mode
 
-The TUI SHALL display execution-mark hints in Running mode consistent with Select mode. Every visible non-terminal row SHALL show `Space: mark` or `Space: unmark` from current mark state regardless of active/retry/wait status or current eligibility. Active rows SHALL additionally show `K: kill`. Archived, merged, pushed, and rejected rows SHALL show no Space mark hint.
+The TUI SHALL display execution-mark hints in Running mode consistent with Select mode. Every visible non-terminal row without reducer-recorded archive completion SHALL show `Space: mark` or `Space: unmark` from current mark state regardless of active/retry/wait status or current eligibility. Active rows SHALL additionally show `K: kill` independently of markability. Rows with terminal display status or reducer-recorded archive completion SHALL show no Space mark hint.
 
 Changes panel title SHALL show only change-related keys. App-level controls such as Esc and Ctrl+C SHALL remain in the Status panel title.
 
 #### Scenario: Running mode shows mark and independent kill keys
 
 - **GIVEN** the TUI is in Running mode
-- **AND** cursor row is an active non-terminal change
+- **AND** cursor row is an active non-terminal change without reducer-recorded archive completion
 - **WHEN** Changes panel hints are rendered
 - **THEN** hints include `K: kill`
 - **AND** include `Space: mark` or `Space: unmark`
 - **AND** do not describe Space as queue, unqueue, retry, or stop
 - **AND** do not show `Esc: stop` or `q: quit` in the Changes panel title
 
-#### Scenario: Running terminal row omits mark hint
+#### Scenario: Running non-markable row omits mark hint
 
 - **GIVEN** the TUI is in Running mode
-- **AND** cursor row is archived, merged, pushed, or rejected
+- **AND** cursor row has terminal display status or reducer-recorded archive completion
 - **WHEN** Changes panel hints are rendered
 - **THEN** no Space mark hint is shown
 
@@ -222,9 +222,7 @@ Scheduler が deferred retry を stale と分類する場合、base-branch tree 
 
 並列実行への不適格理由は区別されなければならない（SHALL）。proposal directory が `HEAD` に存在しないことだけを、未コミットまたは未追跡ファイルの存在として表示してはならない（SHALL NOT）。
 
-実際に未コミットまたは未追跡の proposal ファイルが存在する場合のみ、TUI は正しい綴りの `UNCOMMITTED` バッジを表示しなければならない（SHALL）。Archived 状態、failed merge 状態、または retained managed worktree の存在だけを理由に `UNCOMMITTED` を表示してはならない（SHALL NOT）。managed worktree が存在する場合の `WT` 表示は独立して維持されなければならない（SHALL）。
-
-<!-- Expected canonical result after archive: `tui-key-hints` will reserve `UNCOMMITTED` for observed dirty proposal files, retain independent `WT` display, and stop equating all parallel-ineligible reasons with dirty Git state. -->
+実際に未コミットまたは未追跡の proposal ファイルが存在する場合のみ、TUI は正しい綴りの `UNCOMMITTED` バッジを表示しなければならない（SHALL）。Archived 状態、failed merge 状態、または retained managed worktree の存在だけを理由に `UNCOMMITTED` を表示してはならない（SHALL NOT）。managed worktree が存在する場合の `WT` 表示は独立して維持されなければならない（SHALL）。Archived row の checkbox area は CLI の post-archive placeholder contract に従わなければならず（SHALL）、archived `[x]` styling を要求してはならない（MUST NOT）。
 
 #### Scenario: dirty active proposal は `UNCOMMITTED` を表示する
 
@@ -263,12 +261,13 @@ Scheduler が deferred retry を stale と分類する場合、base-branch tree 
 - **AND** the row SHALL NOT display `UNCOMMITTED`
 - **AND** the row SHALL remain grayed out and non-actionable
 
-#### Scenario: Archived 行はアーカイブ済み表示を優先する
+#### Scenario: Archived 行はblank checkbox placeholderを優先する
 
 - **GIVEN** the TUI is in parallel mode
 - **AND** a change row is in `Archived` status
 - **WHEN** the Changes list is rendered
-- **THEN** the row SHALL display the archived checkbox styling (e.g., gray `[x]`)
+- **THEN** the row SHALL display the blank three-column checkbox placeholder required by the CLI specification
+- **AND** the row SHALL NOT display archived `[x]` styling
 - **AND** the row SHALL NOT display `UNCOMMITTED`
 
 #### Scenario: active TUI contract uses the correct spelling
@@ -317,36 +316,44 @@ Logs パネルが表示されている場合、TUI はログ閲覧操作とし�
 
 ### Requirement: Active Change Stop Hint
 
-Changes パネルは、cursor が active change にある場合、per-change termination control として `K: kill` を表示しなければならない（SHALL）。Space は active change でも execution mark の変更に使用し、stop/dequeue control として表示してはならない（MUST NOT）。
+Changes パネルは、cursor が active change にある場合、per-change termination control として `K: kill` を表示しなければならない（SHALL）。Space は markable active change でのみ execution mark の変更に使用し、stop/dequeue control として表示してはならない（MUST NOT）。Archive-complete active change でも `K: kill` は markability と独立して表示しなければならない（SHALL）。
 
-#### Scenario: Running mode shows independent kill and mark hints for active change
+#### Scenario: Running mode shows independent kill and mark hints for markable active change
 
 - **GIVEN** the TUI is in Running mode
-- **AND** cursor row is an active non-terminal change
+- **AND** cursor row is an active non-terminal change without reducer-recorded archive completion
 - **WHEN** the Changes panel is rendered
 - **THEN** key hints include `K: kill`
 - **AND** key hints include `Space: mark` or `Space: unmark`
 - **AND** key hints do not include `Space: stop`
 
+#### Scenario: archive-complete active change retains kill without mark hint
+
+- **GIVEN** the TUI is in Running mode
+- **AND** cursor row is active with reducer-recorded archive completion
+- **WHEN** the Changes panel is rendered
+- **THEN** key hints include `K: kill`
+- **AND** key hints do not include `Space: mark`, `Space: unmark`, or `Space: stop`
+
 ### Requirement: Bulk Toggle Key Hint
 
-Changes パネルは、visible non-terminal change が1件以上存在し、overlay が input を所有していない場合に `x: toggle all` を表示しなければならない（SHALL）。この hint は Select、Running、Stopping、Stopped、および Error の全 execution mode で表示可能でなければならない（SHALL）。Archived、merged、pushed、または rejected rows だけが表示されている場合は hint を表示してはならない（MUST NOT）。
+Changes パネルは、reducer が archive 完了を記録していない visible non-terminal change が1件以上存在し、overlay が input を所有していない場合に `x: toggle all` を表示しなければならない（SHALL）。この hint は Select、Running、Stopping、Stopped、および Error の全 execution mode で表示可能でなければならない（SHALL）。Terminal display status または reducer-recorded archive-complete rows だけが表示されている場合は hint を表示してはならない（MUST NOT）。
 
-#### Scenario: 全 execution mode で hint を表示する
+#### Scenario: 全 execution mode で markable row があれば hint を表示する
 
 - **GIVEN** the TUI is in Select, Running, Stopping, Stopped, or Error mode
-- **AND** at least one visible non-terminal change exists
+- **AND** at least one visible non-terminal change without reducer-recorded archive completion exists
 - **AND** no overlay owns input
 - **WHEN** the Changes panel is rendered
 - **THEN** key hints include `x: toggle all`
 
-#### Scenario: terminal rows だけなら hint を表示しない
+#### Scenario: non-markable rows だけなら hint を表示しない
 
-- **GIVEN** every visible row is archived, merged, pushed, or rejected
+- **GIVEN** every visible row has terminal display status or reducer-recorded archive completion
 - **WHEN** the Changes panel is rendered
 - **THEN** key hints do not include `x: toggle all`
 
-<!-- Expected canonical result after archive: `tui-key-hints` will preserve M and configured-start guarantees while describing Space as pure mark intent, K as independent termination, and terminal rows as non-markable. -->
+<!-- Expected canonical result after archive: `tui-key-hints` will preserve resolve, start, kill, and dirty-worktree guidance while deriving mark hints from the shared markable-row class and replacing stale archived `[x]` styling with the CLI blank placeholder. -->
 
 ### Requirement: Error Details Key Hint
 
