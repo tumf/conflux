@@ -1284,13 +1284,13 @@ mod tests {
     // === Absolute command runtime limit ===
 
     #[test]
-    fn command_max_runtime_defaults_to_one_hour() {
+    fn command_max_runtime_defaults_to_three_hours() {
         let config = OrchestratorConfig::default();
         assert!(config.command_max_runtime_secs.is_none());
         assert_eq!(
             config.get_command_max_runtime_secs(),
-            3600,
-            "the absolute command runtime limit defaults to 3600 seconds"
+            10800,
+            "the absolute command runtime limit defaults to 10800 seconds"
         );
     }
 
@@ -1336,6 +1336,42 @@ mod tests {
         );
     }
 
+    /// The previous default (3,600) is now an ordinary explicit value, so it must
+    /// still win over the 10,800-second default at every layer of the merge.
+    #[test]
+    fn command_max_runtime_explicit_value_overrides_the_default() {
+        let explicit = OrchestratorConfig::parse_jsonc(
+            r#"{
+            "command_max_runtime_secs": 3600
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.get_command_max_runtime_secs(),
+            3600,
+            "an explicitly configured limit is never replaced by the default"
+        );
+
+        // global -> project -> custom, each layer merged over the previous one.
+        let mut merged = OrchestratorConfig {
+            command_max_runtime_secs: Some(3600),
+            ..OrchestratorConfig::default()
+        };
+        merged.merge(OrchestratorConfig {
+            command_max_runtime_secs: Some(1800),
+            ..OrchestratorConfig::default()
+        });
+        merged.merge(OrchestratorConfig {
+            command_max_runtime_secs: Some(900),
+            ..OrchestratorConfig::default()
+        });
+        assert_eq!(
+            merged.get_command_max_runtime_secs(),
+            900,
+            "custom overrides project, which overrides global"
+        );
+    }
+
     /// The absolute deadline and the inactivity timeout are independent knobs:
     /// configuring one must never move the other.
     #[test]
@@ -1359,9 +1395,40 @@ mod tests {
         assert_eq!(inactivity_only.get_command_inactivity_timeout_secs(), 0);
         assert_eq!(
             inactivity_only.get_command_max_runtime_secs(),
-            3600,
+            10800,
             "disabling the inactivity timeout must not disable the absolute deadline"
         );
+    }
+
+    /// Every generated configuration example is a distributed contract: an operator
+    /// who copies one must read the same default and the same `0`-disable meaning
+    /// the code enforces.
+    #[test]
+    fn generated_config_examples_document_the_absolute_runtime_limit() {
+        for template in [
+            crate::cli::Template::Claude,
+            crate::cli::Template::Opencode,
+            crate::cli::Template::Codex,
+        ] {
+            let example = crate::templates::get_template_content(template);
+            assert!(
+                example.contains("\"command_max_runtime_secs\": 10800"),
+                "{template:?} example must show the {}-second default",
+                defaults::DEFAULT_COMMAND_MAX_RUNTIME_SECS
+            );
+            assert!(
+                example.contains("Default: 10800 (3 hours)"),
+                "{template:?} example must name the default explicitly"
+            );
+            assert!(
+                example.contains("0 disables it"),
+                "{template:?} example must keep the `0`-disable semantics"
+            );
+            assert!(
+                !example.contains("command_max_runtime_secs\": 3600"),
+                "{template:?} example must not advertise the retired 3600-second default"
+            );
+        }
     }
 
     // === Tests for XDG config path precedence ===
@@ -2217,7 +2284,7 @@ mod tests {
         assert_eq!(config.get_command_inactivity_timeout_secs(), 900);
         assert_eq!(config.get_command_inactivity_kill_grace_secs(), 5);
         assert_eq!(config.get_command_inactivity_timeout_max_retries(), 3);
-        assert_eq!(config.get_command_max_runtime_secs(), 3600);
+        assert_eq!(config.get_command_max_runtime_secs(), 10800);
         assert!(config.use_llm_analysis());
         assert!(config.get_stream_json_textify());
         assert!(config.get_command_strict_process_cleanup());

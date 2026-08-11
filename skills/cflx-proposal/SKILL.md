@@ -529,7 +529,7 @@ so a reviewer can check the same evidence.
 
 An active checkbox task is work Apply must finish inside one bounded invocation.
 Conflux enforces an absolute runtime limit on that invocation
-(`command_max_runtime_secs`, default 3600s), so a checkbox that requires a gate
+(`command_max_runtime_secs`, default 10800s / 3 hours), so a checkbox that requires a gate
 Apply cannot finish does not produce late evidence — it produces a terminated
 command and no evidence at all.
 
