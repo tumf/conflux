@@ -318,7 +318,13 @@ Streaming リトライの動作は以下の通りとする：
 
 ### Requirement: AI command invocations have an absolute runtime limit
 
-The common AI command runner MUST enforce `command_max_runtime_secs` as an absolute deadline measured from successful child spawn. The default MUST be 3,600 seconds, `0` MUST disable the deadline, and stdout or stderr activity MUST NOT extend it. Runtime-limit expiry MUST close retry admission for the invocation, terminate the owned process group through the existing graceful-then-forceful cleanup path, and return a typed non-retryable runtime-limit outcome.
+The common AI command runner MUST enforce `command_max_runtime_secs` as an absolute deadline measured from successful child spawn. The default MUST be 10,800 seconds, `0` MUST disable the deadline, and stdout or stderr activity MUST NOT extend it. Runtime-limit expiry MUST close retry admission for the invocation, terminate the owned process group through the existing graceful-then-forceful cleanup path, and return a typed non-retryable runtime-limit outcome.
+
+#### Scenario: Default runtime limit is three hours
+
+**Given**: no configuration layer sets `command_max_runtime_secs`
+**When**: the common AI command runner starts an owned command
+**Then**: its absolute runtime deadline is 10,800 seconds after successful child spawn
 
 #### Scenario: Continuous output does not extend the absolute deadline
 

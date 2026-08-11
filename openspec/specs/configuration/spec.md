@@ -845,26 +845,21 @@ The orchestrator SHALL support configuring the maximum number of acceptance CONT
 
 ### Requirement: 絶対実行時間タイムアウト設定
 
-オーケストレーターはJSONC設定ファイルでAI command invocation全体の絶対実行時間上限を設定できなければならない（MUST）。`command_max_runtime_secs`のdefaultは3,600秒とし、`0`はabsolute runtime limitを無効化しなければならない（MUST）。このkeyは他のtop-level optional config fieldsと同じmerge precedenceに従い、custom configがproject configをoverrideし、project configがglobal configをoverrideし、higher-precedence configがkeyを省略した場合はlower-precedence valueを保持しなければならない（MUST）。生成されるconfiguration exampleはkey、default、`0` disable semanticsを含まなければならない（MUST）。
+オーケストレーターはJSONC設定ファイルでAI command invocation全体の絶対実行時間上限を設定できなければならない（MUST）。`command_max_runtime_secs`のdefaultは10,800秒とし、`0`はabsolute runtime limitを無効化しなければならない（MUST）。このkeyは他のtop-level optional config fieldsと同じmerge precedenceに従い、custom configがproject configをoverrideし、project configがglobal configをoverrideし、higher-precedence configがkeyを省略した場合はlower-precedence valueを保持しなければならない（MUST）。生成されるconfiguration exampleはkey、default、`0` disable semanticsを含まなければならない（MUST）。
 
 #### Scenario: デフォルト設定でabsolute runtime limitが有効になる
 
 - **WHEN** merged configurationに`command_max_runtime_secs`が存在しない
-- **THEN** `command_max_runtime_secs`は3,600秒として扱われる
+- **THEN** `command_max_runtime_secs`は10,800秒として扱われる
 
 #### Scenario: absolute runtime limitを無効化する
 
-- **GIVEN** `.cflx.jsonc`に以下の設定が存在する:
-  ```jsonc
-  {
-    "command_max_runtime_secs": 0
-  }
-  ```
+- **GIVEN** `.cflx.jsonc`の`command_max_runtime_secs`が`0`である
 - **WHEN** AI command invocationが実行される
 - **THEN** total elapsed runtimeだけを理由とするabsolute timeoutは適用されない
 - **AND** inactivity timeoutとexplicit cancellationは独立して適用される
 
-#### Scenario: custom configがprojectとglobalをoverrideする
+#### Scenario: 明示設定が新しいdefaultをoverrideする
 
 - **GIVEN** global configの`command_max_runtime_secs`が3,600である
 - **AND** project configの`command_max_runtime_secs`が1,800である
@@ -883,7 +878,7 @@ The orchestrator SHALL support configuring the maximum number of acceptance CONT
 
 - **WHEN** Confluxがdefault JSONC configuration exampleを生成する
 - **THEN** exampleは`command_max_runtime_secs`を含む
-- **AND** default 3,600秒と`0`による無効化を説明する
+- **AND** default 10,800秒と`0`による無効化を説明する
 
 ### Requirement: Configurable operation skills
 
