@@ -29,7 +29,7 @@ Use the existing `orchestration::operator_command::is_active_status` predicate i
 
 This removes the duplicate active-status subset without introducing a new abstraction. The shared predicate already contains the canonical display vocabulary used by command and lifecycle code.
 
-The refresh detector remains unchanged because it is still needed for fresh-process recovery and stale display correction. Reducer observation logic remains unchanged because it already refuses to overwrite active execution.
+The refresh detector remains unchanged because it is still needed for fresh-process recovery and stale display correction. `OrchestratorState::apply_observation` remains unchanged because it already refuses to overwrite active execution.
 
 ## Verification Design
 
@@ -59,4 +59,6 @@ Keep or extend existing tests proving:
 
 - Over-protecting every reducer status would disable startup restoration. The change protects only shared active statuses plus the already protected pending/terminal/stop states.
 - Changing archive detection would hide useful repository evidence and break resume behavior. Detection is intentionally unchanged.
-- Creating another active-status table would repeat the root cause. The implementation must reuse the existing classifier.
+- `on_workspace_status_merge_wait` has a narrower active-state guard, but production emits `WorkspaceStatus::MergeWait` only for concrete post-archive manual deferral. Changing that reducer path is outside this TUI refresh fix.
+- The refresh helper's existing terminal list intentionally remains unchanged because its omitted statuses cannot coincide with archived-but-not-integrated refresh evidence; broad terminal-vocabulary cleanup is outside this fix.
+- Creating another active-status table would repeat the root cause. The implementation must expose and reuse the existing classifier's backing vocabulary for exhaustive coverage.

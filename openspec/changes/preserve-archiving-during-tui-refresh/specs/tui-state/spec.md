@@ -25,7 +25,7 @@ Stale archive lifecycle events MUST NOT regress a row that is already displayed 
 **Given**: the reducer snapshot reports `alpha` with a status classified by the shared active-status vocabulary
 **When**: the TUI handles `ChangesRefreshed` with `alpha` in `merge_wait_ids`
 **Then**: `alpha` remains displayed with that active status
-**And**: TUI refresh protection does not maintain a narrower independent active-status vocabulary
+**And**: every status classified as active by the shared active-status vocabulary is protected by the same rule
 
 #### Scenario: refresh-derived merge wait does not overwrite resolving
 

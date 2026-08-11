@@ -21,7 +21,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: "Focused Rust test output covering ArchiveStarted followed by ChangesRefreshed, the complete active-status vocabulary, existing pending and terminal precedence, stale display correction, startup restoration, and concrete manual deferral"
-    rerun: "cargo test --lib merge_wait_refresh && cargo test --lib archive_refresh"
+    rerun: "cargo test --lib merge_wait_refresh && cargo test --lib archive_refresh_preserves_reducer_owned_archiving_row"
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
