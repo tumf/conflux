@@ -719,7 +719,11 @@ impl ActionBlockedReason {
     ) -> Self {
         use crate::orchestration::operator_command::MarkExclusion as E;
         match exclusion {
-            E::FinalStatus => Self::FinalStatus,
+            // A reducer-recorded archive completion blocks exactly what a final
+            // status blocks, and it is reported on the wire as the same reason:
+            // publishing a new variant would change the state payload's schema
+            // for a fact the archive milestone already implies.
+            E::ArchiveComplete | E::FinalStatus => Self::FinalStatus,
             E::RetryRequired => Self::RetryRequired,
             E::StopPending => Self::StopPending,
             E::ChangeActive => Self::ChangeActive,

@@ -318,19 +318,19 @@ const TERMINAL_STATUSES: [&str; 4] = ["archived", "merged", "pushed", "rejected"
 fn run_mark_intent_admission_depends_only_on_terminality() {
     for status in NON_TERMINAL_STATUSES {
         assert_eq!(
-            classify_mark_admission(status),
+            classify_mark_admission(status, false),
             MarkAdmission::Allowed,
             "'{status}' is a visible non-terminal mark target"
         );
-        assert!(is_markable_status(status));
+        assert!(is_markable_status(status, false));
     }
     for status in TERMINAL_STATUSES {
         assert_eq!(
-            classify_mark_admission(status),
+            classify_mark_admission(status, false),
             MarkAdmission::TerminalTarget,
             "'{status}' is not a run candidate"
         );
-        assert!(!is_markable_status(status));
+        assert!(!is_markable_status(status, false));
     }
 }
 
@@ -344,7 +344,10 @@ fn run_mark_intent_queue_route_matrix_is_independent_of_mark_admission() {
             classify_queue_intent_route(OperatorMode::Running, status),
             QueueIntentRoute::Mutable
         );
-        assert!(is_markable_status(status), "'{status}' stays markable");
+        assert!(
+            is_markable_status(status, false),
+            "'{status}' stays markable"
+        );
     }
     for status in ["not queued", "queued", "error", "stalled", "merge wait"] {
         assert_eq!(
@@ -353,7 +356,7 @@ fn run_mark_intent_queue_route_matrix_is_independent_of_mark_admission() {
             "error-mode queue mutation is still retry-owned for '{status}'"
         );
         assert!(
-            is_markable_status(status),
+            is_markable_status(status, false),
             "'{status}' is still markable in Error mode"
         );
     }
@@ -362,7 +365,10 @@ fn run_mark_intent_queue_route_matrix_is_independent_of_mark_admission() {
             classify_queue_intent_route(OperatorMode::Running, status),
             QueueIntentRoute::Immutable
         );
-        assert!(is_markable_status(status), "an active row stays markable");
+        assert!(
+            is_markable_status(status, false),
+            "an active row stays markable"
+        );
     }
     assert_eq!(
         classify_queue_intent_route(OperatorMode::Stopping, "not queued"),
@@ -1705,10 +1711,27 @@ async fn externally_blocked_change_does_not_block_unrelated_or_dependent_kinds()
 // ============================================================================
 
 /// Build a bulk-mark row without repeating the struct literal per case.
+///
+/// No reducer archive record: `archived_row` is the counterpart for that case.
 fn row<'a>(change_id: &'a str, display_status: &'a str, marked: bool) -> MarkTargetRow<'a> {
     MarkTargetRow {
         change_id,
         display_status,
+        archive_complete: false,
+        marked,
+    }
+}
+
+/// Build a bulk-mark row the reducer has already recorded as archived.
+fn archived_row<'a>(
+    change_id: &'a str,
+    display_status: &'a str,
+    marked: bool,
+) -> MarkTargetRow<'a> {
+    MarkTargetRow {
+        change_id,
+        display_status,
+        archive_complete: true,
         marked,
     }
 }
@@ -1751,23 +1774,24 @@ fn bulk_mark_target_state_is_derived_from_eligible_rows_only() {
     assert_eq!(plan.eligible, vec!["a", "b"]);
 }
 
-/// Unit: the bulk classifier has exactly one exclusion, and it is terminality.
+/// Unit: without archive evidence the bulk classifier excludes terminality only.
 ///
 /// Mode, activity, wait state, and worktree eligibility all used to appear here.
 /// Their absence is the contract: a mark is next-run intent, and only a row with
-/// no next run is refused.
+/// no next run is refused. Reducer-recorded archive completion is the *other* way
+/// a row can have no next run, and it is asserted separately below.
 #[test]
 fn run_mark_intent_bulk_classification_excludes_terminal_rows_only() {
     for status in NON_TERMINAL_STATUSES {
         assert_eq!(
-            classify_bulk_mark_row(status),
+            classify_bulk_mark_row(status, false),
             None,
             "'{status}' is a bulk mark target"
         );
     }
     for status in TERMINAL_STATUSES {
         assert_eq!(
-            classify_bulk_mark_row(status),
+            classify_bulk_mark_row(status, false),
             Some(MarkExclusion::FinalStatus),
             "'{status}' is excluded as terminal"
         );
@@ -2126,8 +2150,8 @@ fn preparing_is_active_in_the_shared_lifecycle_matrix() {
         classify_queue_intent_route(OperatorMode::Running, "preparing"),
         QueueIntentRoute::Immutable
     );
-    assert_eq!(classify_bulk_mark_row("preparing"), None);
-    assert!(is_markable_status("preparing"));
+    assert_eq!(classify_bulk_mark_row("preparing", false), None);
+    assert!(is_markable_status("preparing", false));
 }
 
 /// Unit: inline preparation registers no termination handle, so an immediate
@@ -2557,4 +2581,222 @@ async fn active_iteration_limit_bulk_retry_is_a_no_op_when_every_candidate_is_li
     assert!(!plan.explicit_retry);
     assert_eq!(fixture.snapshot("a").await, before_a);
     assert_eq!(fixture.snapshot("b").await, before_b);
+}
+
+// ============================================================================
+// Changes row layout: reducer-recorded archive completion retires mark intent
+// ============================================================================
+//
+// The classifier cases are unit evidence over pure functions. The service cases
+// drive a real `OrchestratorState` through real `ChangeArchived` /
+// `ResolveStarted` events and then submit real commands, so they are integration
+// evidence for the caller-supplied-evidence contract: orchestration reads
+// `OrchestratorState::archived_changes` from the same snapshot as the display
+// status, never a frontend cache.
+
+/// Live post-archive display statuses an archive-complete row can hold.
+const POST_ARCHIVE_LIVE_STATUSES: [&str; 3] = ["resolving", "resolve pending", "merge wait"];
+
+/// Unit: archive evidence excludes a row whose display status is still live, and
+/// it reports its own stable reason rather than borrowing terminality's.
+#[test]
+fn tui_change_row_layout_mark_contract_archive_evidence_excludes_live_post_archive_rows() {
+    for status in POST_ARCHIVE_LIVE_STATUSES {
+        assert_eq!(
+            classify_mark_admission(status, true),
+            MarkAdmission::ArchiveComplete,
+            "'{status}' with an archive record is not a run candidate"
+        );
+        assert!(!is_markable_status(status, true));
+        assert_eq!(
+            classify_bulk_mark_row(status, true),
+            Some(MarkExclusion::ArchiveComplete),
+            "'{status}' reports the archive-complete reason"
+        );
+
+        // The control: the identical status without the record stays markable.
+        assert_eq!(
+            classify_mark_admission(status, false),
+            MarkAdmission::Allowed,
+            "'{status}' with no archive record is still a run candidate"
+        );
+        assert!(is_markable_status(status, false));
+        assert_eq!(classify_bulk_mark_row(status, false), None);
+    }
+
+    // Terminality wins where both hold: that is the reason an operator reads.
+    for status in TERMINAL_STATUSES {
+        assert_eq!(
+            classify_mark_admission(status, true),
+            MarkAdmission::TerminalTarget
+        );
+        assert_eq!(
+            classify_bulk_mark_row(status, true),
+            Some(MarkExclusion::FinalStatus)
+        );
+    }
+
+    assert_eq!(
+        MarkExclusion::ArchiveComplete.as_str(),
+        "archive_complete",
+        "the token is stable: clients branch on it rather than on prose"
+    );
+    assert!(MarkExclusion::ALL.contains(&MarkExclusion::ArchiveComplete));
+}
+
+/// Unit: a bulk plan derives its target state from the remaining rows only.
+#[test]
+fn tui_change_row_layout_mark_contract_bulk_plan_excludes_archive_complete_rows() {
+    let rows = [
+        row("idle", "not queued", true),
+        // Same status, opposite evidence: only the record separates them.
+        row("fresh-resolving", "resolving", true),
+        archived_row("archived-resolving", "resolving", false),
+        archived_row("archived-wait", "merge wait", true),
+    ];
+
+    let plan = plan_bulk_marks(&rows);
+
+    assert_eq!(plan.eligible, vec!["idle", "fresh-resolving"]);
+    assert_eq!(
+        plan.excluded,
+        vec![
+            (
+                "archived-resolving".to_string(),
+                MarkExclusion::ArchiveComplete
+            ),
+            ("archived-wait".to_string(), MarkExclusion::ArchiveComplete),
+        ]
+    );
+    assert!(
+        !plan.target_state,
+        "every *eligible* row was marked, so the unmarked archive-complete row \
+         must not flip the derived state"
+    );
+    assert!(plan.exclusion_summary().contains("archive complete"));
+}
+
+/// Integration: the service reads the reducer's archive record in the same
+/// snapshot as the display status and settles a single mark as an unchanged
+/// reasoned no-op.
+#[tokio::test]
+async fn tui_change_row_layout_mark_contract_single_mark_on_an_archive_complete_row_is_unchanged() {
+    let fixture = fixture(&["archived-change", "fresh-change"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ChangeArchived(
+            "archived-change".to_string(),
+        ));
+        // The control: a resolve retry that archived nothing in this process.
+        guard.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "fresh-change".to_string(),
+            command: "resolve".to_string(),
+        });
+    }
+    {
+        let guard = fixture.state.read().await;
+        assert!(guard.is_archived("archived-change"));
+        assert!(!guard.is_archived("fresh-change"));
+        // Both rows display the same live status; only the record differs.
+        assert_eq!(guard.display_status("archived-change"), "resolving");
+        assert_eq!(guard.display_status("fresh-change"), "resolving");
+    }
+
+    let before = fixture.snapshot("archived-change").await;
+
+    let outcome = fixture
+        .service
+        .set_execution_mark("archived-change", true)
+        .await
+        .expect("an archive-complete target settles rather than failing");
+
+    assert_eq!(
+        outcome,
+        OperatorOutcome::NoOp {
+            change_id: "archived-change".to_string(),
+            reason: NoOpReason::ArchiveCompleteMarkTarget,
+        }
+    );
+    assert_eq!(
+        fixture.snapshot("archived-change").await,
+        before,
+        "no mark, queue, runtime, retry, hook, or scheduler effect may occur"
+    );
+
+    // The control row accepts the identical request.
+    assert_eq!(
+        fixture
+            .service
+            .set_execution_mark("fresh-change", true)
+            .await
+            .expect("a resolve retry with no archive record is markable"),
+        OperatorOutcome::MarkSet {
+            change_id: "fresh-change".to_string(),
+            marked: true,
+        }
+    );
+    assert_eq!(fixture.marks.marked_ids(), vec!["fresh-change".to_string()]);
+}
+
+/// Integration: bulk marks exclude the archive-complete row before mutating, and
+/// apply one coherent state to the rest.
+#[tokio::test]
+async fn tui_change_row_layout_mark_contract_bulk_mark_excludes_archive_complete_rows() {
+    let fixture = fixture(&["archived-change", "fresh-change", "idle-change"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ChangeArchived(
+            "archived-change".to_string(),
+        ));
+        guard.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "fresh-change".to_string(),
+            command: "resolve".to_string(),
+        });
+    }
+
+    let before_archived = fixture.snapshot("archived-change").await;
+
+    let outcome = fixture
+        .service
+        .set_all_execution_marks()
+        .await
+        .expect("a bulk mark with eligible rows is accepted");
+
+    let OperatorOutcome::BulkMarks {
+        marked,
+        changed,
+        excluded,
+    } = outcome
+    else {
+        panic!("expected a bulk-mark outcome, got {outcome:?}");
+    };
+    assert!(marked);
+    let mut changed = changed;
+    changed.sort();
+    assert_eq!(
+        changed,
+        vec!["fresh-change".to_string(), "idle-change".to_string()]
+    );
+    assert_eq!(
+        excluded,
+        vec![(
+            "archived-change".to_string(),
+            MarkExclusion::ArchiveComplete
+        )]
+    );
+    assert!(
+        !fixture
+            .marks
+            .marked_ids()
+            .contains(&"archived-change".to_string()),
+        "the excluded row must not receive the derived mark"
+    );
+    assert_eq!(
+        fixture
+            .snapshot("archived-change")
+            .await
+            .queue_intent_queued,
+        before_archived.queue_intent_queued,
+        "and nothing else about it moves either"
+    );
 }

@@ -265,6 +265,12 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
                 NoOpReason::TerminalMarkTarget => {
                     "the target is terminal and carries no next-run intent"
                 }
+                // Stable archive-complete reason: the reducer recorded the
+                // archive, so the row's remaining post-archive work is not a
+                // next-run target even though its display status is still live.
+                NoOpReason::ArchiveCompleteMarkTarget => {
+                    "the target has completed archive and carries no next-run intent"
+                }
                 NoOpReason::ReducerRejected => "the reducer produced no state change",
                 NoOpReason::BulkMarksUnchanged => {
                     "every eligible change already carried the derived mark"

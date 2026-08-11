@@ -245,16 +245,23 @@ pub(crate) async fn sync_reducer_display_caches(
     if !should_apply_event_to_tui_reducer(event) {
         return;
     }
-    let (display_map, blocker_views, error_details, apply_operations) = {
+    let (display_map, archived, blocker_views, error_details, apply_operations) = {
         let state = shared_state.read().await;
         (
             state.all_display_statuses(),
+            // Same read as the statuses: after `ChangeArchived` the reducer keeps
+            // the archive milestone here while truthfully advancing the row to
+            // `resolving` or `resolve pending`, so presentation needs both facts
+            // from one instant to hide the checkbox without inferring it from the
+            // status string.
+            state.archived_changes().clone(),
             state.all_blocker_views(),
             state.all_error_details(),
             state.all_apply_operation_labels(),
         )
     };
     app.apply_display_statuses_from_reducer(&display_map);
+    app.apply_archived_changes_from_reducer(&archived);
     app.apply_blocker_views_from_reducer(&blocker_views);
     // Rendering-only refresh: the reducer's ephemeral commit subphase decides
     // whether the Apply lane prints `[apply]` or `[commit]`.
@@ -1541,6 +1548,216 @@ mod tests {
         assert!(
             app.changes[0].selected,
             "a presentation-only refresh must not clear the execution mark"
+        );
+    }
+
+    // ========================================================================
+    // Changes row layout: reducer archive-completion synchronization
+    //
+    // Integration evidence: a real `OrchestratorState`, real event dispatch, and
+    // the real TUI cache-synchronization and refresh paths. The reducer is what
+    // owns the archive milestone; these prove the TUI reads it rather than
+    // inferring "post-archive" from the `resolving` display string.
+    // ========================================================================
+
+    /// The reducer records archive completion while truthfully advancing the row
+    /// to a live post-archive status, and the TUI adopts both facts at once.
+    #[tokio::test]
+    async fn tui_change_row_layout_archive_sync_adopts_the_reducer_archive_record() {
+        use crate::events::EventSink;
+        use crate::orchestration::state::OrchestratorState;
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let sinks: Vec<Arc<dyn EventSink>> = Vec::new();
+        let mut app = AppState::new(vec![sample_change()]);
+        app.set_shared_state(shared_state.clone());
+
+        assert!(
+            !app.changes[0].archive_complete_cache,
+            "no archive is on record before the event"
+        );
+
+        let archived = ExecutionEvent::ChangeArchived("change-a".to_string());
+        crate::events::dispatch_event(&shared_state, &sinks, archived.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &archived).await;
+
+        // The reducer's own view: archived, and already moved on to post-archive
+        // resolve handling. Neither fact is derivable from the other.
+        assert!(shared_state.read().await.is_archived("change-a"));
+        assert_eq!(
+            app.changes[0].display_status_cache, "resolving",
+            "the row must show the reducer's truthful post-archive status"
+        );
+        assert!(
+            app.changes[0].archive_complete_cache,
+            "the archive milestone must reach the row as presentation evidence"
+        );
+        assert_eq!(
+            app.reducer_archived_changes(),
+            &HashSet::from(["change-a".to_string()])
+        );
+    }
+
+    /// One `ChangesRefreshed` event carrying `change-a` as an active change.
+    fn archive_refresh_event() -> ExecutionEvent {
+        ExecutionEvent::ChangesRefreshed {
+            changes: vec![sample_change()],
+            rejected_changes: Vec::new(),
+            committed_change_ids: HashSet::from(["change-a".to_string()]),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::from(["change-a".to_string()]),
+            worktree_paths: HashMap::<String, PathBuf>::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::from(["change-a".to_string()]),
+        }
+    }
+
+    /// A row the refresh pass *constructs* adopts the retained archive evidence.
+    ///
+    /// The regression this pins: `ChangeState::from_change` knows nothing about
+    /// the reducer, so a row built during refresh came back with no archive
+    /// evidence and would render an empty `[ ]` for a change the reducer had
+    /// already archived. The app-level snapshot is what closes that, and it has to
+    /// be reapplied inside the refresh pass rather than one reducer sync later —
+    /// refresh handling runs *after* cache synchronization in the run loop, so
+    /// anything it leaves wrong is what the next frame draws.
+    #[tokio::test]
+    async fn tui_change_row_layout_archive_sync_survives_refresh_reconstruction() {
+        use crate::events::EventSink;
+        use crate::orchestration::state::OrchestratorState;
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let sinks: Vec<Arc<dyn EventSink>> = Vec::new();
+        // No rows yet: the refresh pass below is what materializes this one.
+        let mut app = AppState::new(Vec::new());
+        app.set_shared_state(shared_state.clone());
+
+        let archived = ExecutionEvent::ChangeArchived("change-a".to_string());
+        crate::events::dispatch_event(&shared_state, &sinks, archived.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &archived).await;
+        assert!(app.changes.is_empty());
+        assert_eq!(
+            app.reducer_archived_changes(),
+            &HashSet::from(["change-a".to_string()]),
+            "the snapshot is retained even with no row to apply it to"
+        );
+
+        let refresh = archive_refresh_event();
+        crate::events::dispatch_event(&shared_state, &sinks, refresh.clone()).await;
+        app.handle_orchestrator_event(refresh.clone());
+
+        assert_eq!(app.changes.len(), 1, "refresh constructed the row");
+        assert!(
+            app.changes[0].archive_complete_cache,
+            "refresh reconstruction must reapply the retained archive evidence \
+             in the same pass, not one reducer sync later"
+        );
+
+        // And the following reducer sync agrees rather than correcting it.
+        super::sync_reducer_display_caches(&mut app, &shared_state, &refresh).await;
+        assert!(app.changes[0].archive_complete_cache);
+    }
+
+    /// Refresh must not use a reactivated proposal directory to retire the
+    /// archive evidence either.
+    ///
+    /// Refresh resets a row it observes as `archived` back to `not queued` when the
+    /// proposal is present again. That reset is display-status work; the reducer's
+    /// archive record is not refresh's to revoke, so the checkbox stays hidden.
+    #[tokio::test]
+    async fn tui_change_row_layout_archive_sync_refresh_does_not_revoke_the_archive_record() {
+        use crate::events::EventSink;
+        use crate::orchestration::state::OrchestratorState;
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let sinks: Vec<Arc<dyn EventSink>> = Vec::new();
+        let mut app = AppState::new(vec![sample_change()]);
+        app.set_shared_state(shared_state.clone());
+
+        let archived = ExecutionEvent::ChangeArchived("change-a".to_string());
+        crate::events::dispatch_event(&shared_state, &sinks, archived.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &archived).await;
+
+        // Post-archive merge readiness parks the row on a base-lane wait, which
+        // is a live non-terminal status and not a terminal one.
+        let deferred = ExecutionEvent::MergeDeferred {
+            change_id: "change-a".to_string(),
+            reason: "waiting for base".to_string(),
+            auto_resumable: false,
+        };
+        crate::events::dispatch_event(&shared_state, &sinks, deferred.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &deferred).await;
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+        assert!(app.changes[0].archive_complete_cache);
+
+        // The row's own refresh reset path, reached by presenting it as archived
+        // with the proposal directory present again and no merge-wait evidence to
+        // restore the terminal status.
+        app.changes[0].set_display_status_cache("archived");
+        let refresh = ExecutionEvent::ChangesRefreshed {
+            changes: vec![sample_change()],
+            rejected_changes: Vec::new(),
+            committed_change_ids: HashSet::from(["change-a".to_string()]),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::from(["change-a".to_string()]),
+            worktree_paths: HashMap::<String, PathBuf>::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::new(),
+        };
+        app.handle_orchestrator_event(refresh);
+
+        assert_eq!(
+            app.changes[0].display_status_cache, "not queued",
+            "refresh still owns the display-status reset"
+        );
+        assert!(
+            app.changes[0].archive_complete_cache,
+            "but it must not clear the reducer's archive record"
+        );
+    }
+
+    /// A `resolving` row with no reducer archive record stays a plain active row.
+    ///
+    /// This is the control for the whole design: a fresh process that resolves a
+    /// retry shows `resolving` without having archived anything, and inferring
+    /// post-archive state from that string would retire a live run candidate.
+    #[tokio::test]
+    async fn tui_change_row_layout_archive_sync_leaves_a_fresh_resolving_row_alone() {
+        use crate::events::EventSink;
+        use crate::orchestration::state::OrchestratorState;
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let sinks: Vec<Arc<dyn EventSink>> = Vec::new();
+        let mut app = AppState::new(vec![sample_change()]);
+        app.set_shared_state(shared_state.clone());
+
+        let resolving = ExecutionEvent::ResolveStarted {
+            change_id: "change-a".to_string(),
+            command: "resolve".to_string(),
+        };
+        crate::events::dispatch_event(&shared_state, &sinks, resolving.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &resolving).await;
+
+        assert_eq!(app.changes[0].display_status_cache, "resolving");
+        assert!(
+            !shared_state.read().await.is_archived("change-a"),
+            "no archive happened in this process"
+        );
+        assert!(
+            !app.changes[0].archive_complete_cache,
+            "an identical display status must not manufacture archive evidence"
         );
     }
 

@@ -261,6 +261,7 @@ mod tests {
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
             apply_iteration_limit_active: false,
+            archive_complete_cache: false,
         }
     }
 
