@@ -11,12 +11,22 @@ fn is_refresh_merge_wait_terminal_status(status: &str) -> bool {
     matches!(status, "archived" | "merged" | "rejected")
 }
 
+/// Whether the reducer already owns a status that refresh-derived merge-wait
+/// evidence must not overwrite.
+///
+/// Active execution is delegated to the shared classifier rather than restated
+/// here. A second hand-written active list is what let `archiving` fall through
+/// and repaint a healthy Archive as `merge wait`: `merge_wait_ids` proves the
+/// archive commit exists without base integration, which says nothing about
+/// whether Archive has returned.
 fn is_reducer_owned_refresh_merge_wait_protected_status(status: &str) -> bool {
+    if crate::orchestration::operator_command::is_active_status(status) {
+        return true;
+    }
+
     matches!(
         status,
-        "resolving"
-            | "resolve pending"
-            | "rejecting"
+        "resolve pending"
             | "reject pending"
             | "merged"
             | "rejected"
@@ -467,6 +477,146 @@ mod tests {
 
         assert_eq!(app.changes[0].display_status_cache, "reject pending");
         assert_eq!(app.changes[1].display_status_cache, "error");
+    }
+
+    /// The precedence rule is bound to the shared vocabulary, not to a list
+    /// copied into this module: adding a status to `ACTIVE_STATUSES` must extend
+    /// this protection automatically, which is exactly what `archiving` did not
+    /// get from the previous hand-written subset.
+    #[test]
+    fn merge_wait_refresh_protects_every_shared_active_status() {
+        for active_status in crate::orchestration::operator_command::ACTIVE_STATUSES {
+            let mut app = AppState::new(vec![create_test_change("change-a")]);
+            app.apply_display_statuses_from_reducer(&HashMap::from([(
+                "change-a".to_string(),
+                active_status,
+            )]));
+            assert_eq!(
+                app.changes[0].display_status_cache, active_status,
+                "reducer sync did not place '{}' on the row",
+                active_status
+            );
+
+            let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+            app.handle_changes_refreshed(
+                vec![create_test_change("change-a")],
+                Vec::new(),
+                committed,
+                uncommitted,
+                worktrees,
+                paths,
+                not_ahead,
+                HashSet::from(["change-a".to_string()]),
+            );
+
+            assert_eq!(
+                app.changes[0].display_status_cache, active_status,
+                "refresh merge-wait evidence overwrote active status '{}'",
+                active_status
+            );
+        }
+    }
+
+    /// Startup restoration is the reason the refresh detector still exists: a
+    /// fresh process owns no reducer lifecycle history, so archived-but-not-
+    /// integrated evidence is the only thing that can surface the manual row.
+    #[test]
+    fn merge_wait_refresh_restores_fresh_process_archived_workspace() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        assert!(
+            app.reducer_display_status_snapshot.is_empty(),
+            "a fresh process must start with no reducer lifecycle history"
+        );
+
+        let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+        app.handle_changes_refreshed(
+            vec![create_test_change("change-a")],
+            Vec::new(),
+            committed,
+            uncommitted,
+            worktrees,
+            paths,
+            not_ahead,
+            HashSet::from(["change-a".to_string()]),
+        );
+
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+    }
+
+    /// `merge wait` still means what it always meant — concrete manual deferral
+    /// — and the reducer, not the refresh scan, is what establishes it. The
+    /// auto-resumable and active rows in the same pass prove refresh evidence
+    /// alone never invents it.
+    #[test]
+    fn merge_wait_refresh_preserves_concrete_manual_merge_deferral() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::OrchestratorState;
+
+        let mut state = OrchestratorState::new(
+            vec![
+                "manual".to_string(),
+                "auto".to_string(),
+                "active".to_string(),
+            ],
+            10,
+        );
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "manual".to_string(),
+            reason: "base has local commits".to_string(),
+            auto_resumable: false,
+        });
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "auto".to_string(),
+            reason: "merge in progress".to_string(),
+            auto_resumable: true,
+        });
+        state.apply_execution_event(&ExecutionEvent::ArchiveStarted {
+            change_id: "active".to_string(),
+            command: "archive".to_string(),
+        });
+
+        assert_eq!(state.display_status("manual"), "merge wait");
+        assert_ne!(
+            state.display_status("auto"),
+            "merge wait",
+            "auto-resumable deferral is scheduler-owned retry intent, not manual wait"
+        );
+        assert_ne!(
+            state.display_status("active"),
+            "merge wait",
+            "active execution is not a manual wait"
+        );
+
+        let mut app = AppState::new(vec![
+            create_test_change("manual"),
+            create_test_change("auto"),
+            create_test_change("active"),
+        ]);
+        app.apply_display_statuses_from_reducer(&state.all_display_statuses());
+
+        let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+        app.handle_changes_refreshed(
+            vec![
+                create_test_change("manual"),
+                create_test_change("auto"),
+                create_test_change("active"),
+            ],
+            Vec::new(),
+            committed,
+            uncommitted,
+            worktrees,
+            paths,
+            not_ahead,
+            HashSet::from([
+                "manual".to_string(),
+                "auto".to_string(),
+                "active".to_string(),
+            ]),
+        );
+
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+        assert_eq!(app.changes[2].display_status_cache, "archiving");
     }
 
     #[test]

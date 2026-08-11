@@ -1474,6 +1474,76 @@ mod tests {
         );
     }
 
+    /// The production ordering that used to repaint a healthy Archive.
+    ///
+    /// `ArchiveStarted` → reducer-cache synchronization → a `ChangesRefreshed`
+    /// whose `merge_wait_ids` carries the same change. The archive commit is
+    /// real by then, so repository inspection legitimately reports an
+    /// archived-but-not-integrated workspace — but Archive has not returned, and
+    /// the row must not tell the operator that manual intervention is due. The
+    /// reducer refuses the downgrade; the TUI's own refresh handling must too.
+    #[tokio::test]
+    async fn archive_refresh_preserves_reducer_owned_archiving_row() {
+        use crate::events::EventSink;
+        use crate::orchestration::state::OrchestratorState;
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let sinks: Vec<Arc<dyn EventSink>> = Vec::new();
+        let mut app = AppState::new(vec![sample_change()]);
+        app.set_shared_state(shared_state.clone());
+        app.changes[0].selected = true;
+        app.publish_execution_marks();
+
+        let archiving = ExecutionEvent::ArchiveStarted {
+            change_id: "change-a".to_string(),
+            command: "archive".to_string(),
+        };
+        crate::events::dispatch_event(&shared_state, &sinks, archiving.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &archiving).await;
+        app.handle_orchestrator_event(archiving);
+        assert_eq!(app.changes[0].display_status_cache, "archiving");
+
+        let queued_before = shared_state.read().await.queued_change_ids();
+
+        // The five-second scan sees the archive commit that Archive itself just
+        // created, with the change not yet integrated into base.
+        let refresh = ExecutionEvent::ChangesRefreshed {
+            changes: vec![sample_change()],
+            rejected_changes: Vec::new(),
+            committed_change_ids: HashSet::from(["change-a".to_string()]),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::from(["change-a".to_string()]),
+            worktree_paths: HashMap::<String, PathBuf>::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::from(["change-a".to_string()]),
+        };
+        crate::events::dispatch_event(&shared_state, &sinks, refresh.clone()).await;
+        super::sync_reducer_display_caches(&mut app, &shared_state, &refresh).await;
+        app.handle_orchestrator_event(refresh);
+
+        assert_eq!(
+            app.changes[0].display_status_cache, "archiving",
+            "refresh merge-wait evidence repainted an in-flight Archive row"
+        );
+        assert_eq!(
+            shared_state.read().await.display_status("change-a"),
+            "archiving",
+            "the reducer must still own the active archive lifecycle"
+        );
+        assert_eq!(
+            shared_state.read().await.queued_change_ids(),
+            queued_before,
+            "a presentation-only refresh must not change queue intent"
+        );
+        assert!(
+            app.changes[0].selected,
+            "a presentation-only refresh must not clear the execution mark"
+        );
+    }
+
     /// The exact observed force-stop order must leave `accepting` behind.
     ///
     /// `AcceptanceStarted` → authoritative `Stopped` dispatch → reducer-cache
