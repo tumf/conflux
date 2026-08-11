@@ -21,6 +21,13 @@ use crate::orchestration::operator_command::{
 struct FakeQueue {
     entries: Mutex<Vec<String>>,
     notifications: Mutex<usize>,
+    /// Target-ID-bearing explicit-retry edges, in publication order.
+    ///
+    /// Recorded rather than dropped because the edge is the only signal that
+    /// releases a scheduler's ephemeral failed classification: a retry that
+    /// committed the reducer transition without it would start nothing, and one
+    /// that published it twice would release a classification once too often.
+    explicit_retries: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -50,6 +57,13 @@ impl QueuePort for FakeQueue {
 
     async fn notify_scheduler(&self) {
         *self.notifications.lock().unwrap() += 1;
+    }
+
+    async fn publish_explicit_retry(&self, change_id: &str) {
+        self.explicit_retries
+            .lock()
+            .unwrap()
+            .push(change_id.to_string());
     }
 }
 
@@ -121,6 +135,7 @@ impl Harness {
         // across a yield point.
         let queue = self.queue.entries.lock().unwrap().clone();
         let notifications = *self.queue.notifications.lock().unwrap();
+        let explicit_retries = self.queue.explicit_retries.lock().unwrap().clone();
         let statuses = {
             let guard = self.state.read().await;
             let mut statuses: Vec<(String, String)> = guard
@@ -138,6 +153,7 @@ impl Harness {
             scheduler: self.scheduler.calls(),
             queue,
             notifications,
+            explicit_retries,
             statuses,
         }
     }
@@ -200,6 +216,8 @@ struct RunEffects {
     scheduler: Vec<SchedulerCall>,
     queue: Vec<String>,
     notifications: usize,
+    /// Explicit-retry edges published so far, in order.
+    explicit_retries: Vec<String>,
     statuses: Vec<(String, String)>,
 }
 
@@ -381,6 +399,13 @@ async fn start_wakes_a_live_scheduler_instead_of_spawning_a_second_run() {
     assert_eq!(harness.scheduler.calls(), vec![SchedulerCall::Notified]);
 }
 
+/// Neither mode that owns a live lifecycle admits this ordinary mark — but they
+/// refuse it for different reasons, and the difference is the contract.
+///
+/// `Stopping` is walking to a boundary, so nothing may be admitted into it at
+/// all: the mode itself refuses. `Running` refuses only because `a` carries no
+/// retryable evidence; a marked change-local error would have been admitted, so
+/// its refusal has to be target-shaped.
 #[tokio::test]
 async fn start_is_refused_while_a_run_owns_the_lifecycle() {
     for mode in [OperatorMode::Running, OperatorMode::Stopping] {
@@ -389,13 +414,22 @@ async fn start_is_refused_while_a_run_owns_the_lifecycle() {
 
         let error = harness.service.start(mode).await.expect_err("mode refuses");
 
-        assert!(matches!(
-            error,
-            RunControlError::InvalidMode {
-                command: RunCommandKind::Start,
-                ..
+        match (mode, &error) {
+            (
+                OperatorMode::Stopping,
+                RunControlError::InvalidMode {
+                    command: RunCommandKind::Start,
+                    ..
+                },
+            ) => {}
+            (OperatorMode::Running, RunControlError::NoEligibleTarget { detail, .. }) => {
+                assert!(
+                    detail.contains("a (not queued)"),
+                    "the refusal must name the mark it could not route: {detail}"
+                );
             }
-        ));
+            _ => panic!("{mode:?}: unexpected refusal: {error:?}"),
+        }
         assert!(harness.scheduler.calls().is_empty());
     }
 }
@@ -525,10 +559,7 @@ async fn start_in_error_mode_retries_the_marked_error_rows() {
             // `b` is marked but carries no retryable evidence. A mark is
             // next-run intent, so it is reported as excluded rather than
             // refused when it was set.
-            excluded: vec![ExcludedTarget {
-                change_id: "b".to_string(),
-                status: "not queued".to_string(),
-            }],
+            excluded: vec![ExcludedTarget::new("b", "not queued")],
         },
         "only the row that carries retryable evidence is retried"
     );
@@ -1395,10 +1426,7 @@ async fn run_mark_intent_start_admission_excludes_status_without_blocking_runnab
             change_ids: vec!["runnable".to_string()],
             explicit_retry: false,
             scheduler: SchedulerEffect::Started,
-            excluded: vec![ExcludedTarget {
-                change_id: "waiting".to_string(),
-                status: "merge wait".to_string(),
-            }],
+            excluded: vec![ExcludedTarget::new("waiting", "merge wait")],
         },
         "the admitted run must name the marked target it left out, and why"
     );
@@ -1418,7 +1446,12 @@ async fn run_mark_intent_start_admission_excludes_status_without_blocking_runnab
 async fn run_mark_intent_start_admission_rejects_when_no_runnable_target_remains() {
     let harness = Harness::new(&["waiting", "failed"]);
     harness.to_merge_wait("waiting").await;
-    harness.to_error("failed").await;
+    // A bare terminal error is retryable now, so Start would fall back to it
+    // and this would stop being a zero-runnable-target case. The Apply ceiling
+    // plus the live task that owns it is what still makes an `error` row
+    // unroutable, which is the state this case needs.
+    harness.to_iteration_limit("failed", 50, 50).await;
+    harness.scheduler.set_running(true);
     harness.mark(&["waiting", "failed"]);
     let before = harness.effects().await;
 
@@ -1494,10 +1527,7 @@ async fn run_mark_intent_start_admission_error_mode_routes_only_retryable_marks(
             change_ids: vec!["failed".to_string()],
             explicit_retry: true,
             scheduler: SchedulerEffect::Started,
-            excluded: vec![ExcludedTarget {
-                change_id: "idle".to_string(),
-                status: "not queued".to_string(),
-            }],
+            excluded: vec![ExcludedTarget::new("idle", "not queued")],
         },
         "a marked row without retryable evidence is reported, not retried"
     );
@@ -1560,3 +1590,6 @@ async fn run_mark_intent_start_admission_unmark_does_not_cancel_or_dequeue_admit
         "unmarking must not dequeue, cancel, unschedule, or restatus admitted work"
     );
 }
+
+/// Mode-independent Start/F5 retry routing.
+mod change_error_f5_retry;

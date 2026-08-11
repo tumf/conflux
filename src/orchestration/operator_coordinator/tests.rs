@@ -297,7 +297,9 @@ async fn accepted_operator_command_transaction_start_commits_and_projects_once()
 #[tokio::test]
 async fn accepted_operator_command_transaction_invalid_mode_has_no_effect() {
     for (mode, intent) in [
-        (OperatorMode::Running, OperatorIntent::Start),
+        // `Running` is deliberately absent: a live run refuses Start for the
+        // *target* rather than for the mode, because a marked change-local error
+        // stays retryable while unrelated work continues.
         (OperatorMode::Stopping, OperatorIntent::Start),
         (OperatorMode::Select, OperatorIntent::Stop),
         (OperatorMode::Running, OperatorIntent::CancelStop),
@@ -325,6 +327,36 @@ async fn accepted_operator_command_transaction_invalid_mode_has_no_effect() {
             "{intent:?} in {mode:?} must leave every axis untouched"
         );
     }
+}
+
+/// A live run refuses Start for the target, and still changes nothing.
+///
+/// The mode guard used to answer this case. It cannot any more — a marked
+/// change-local error is retryable in `Running` — so what has to hold is that
+/// the *target* refusal is just as complete.
+#[tokio::test]
+async fn accepted_operator_command_transaction_running_start_without_retry_evidence_has_no_effect()
+{
+    let harness = Harness::new(&["c1"]);
+    harness.marks.set("c1", true);
+    harness.core.set(OperatorMode::Running);
+    let before = harness.axes(&["c1"]).await;
+
+    let result = harness.apply(OperatorIntent::Start).await;
+
+    assert!(
+        matches!(
+            result.outcome,
+            Err(RunControlError::NoEligibleTarget { .. })
+        ),
+        "an ordinary mark under a live run is a target refusal: {result:?}"
+    );
+    assert_eq!(result.revision, None);
+    assert_eq!(
+        harness.axes(&["c1"]).await,
+        before,
+        "a refused Start must leave every axis untouched"
+    );
 }
 
 /// Start with no eligible target is a refusal, not a false success.

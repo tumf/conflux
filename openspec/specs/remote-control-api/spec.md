@@ -20,7 +20,7 @@ Single-instance web monitoring MUST expose `/api/v2` health, capabilities, insta
 
 `set_execution_mark` and `set_all_execution_marks` MUST represent process-local next-run target intent only. They MUST accept visible non-terminal targets for which the reducer has not recorded archive completion, independent of app mode, active/retry/wait status, Apply iteration-limit evidence, and current parallel eligibility, and MUST NOT mutate queue intent, active execution, cancellation, retry/resolve state, hooks, scheduler state, or process mode. Targets with terminal display status (`archived`, `merged`, `pushed`, or `rejected`) or reducer-recorded archive completion MUST settle as unchanged no-op outcomes with a stable non-markable-target reason and no effects.
 
-Start/retry MUST perform current reducer and worktree eligibility checks at final admission. A worktree-ineligible marked target MUST reject the complete request. Other non-startable statuses MUST be excluded with target-specific detail, and zero runnable targets MUST reject. Error-mode retry MUST route only marked retry-eligible error targets. Failed admission MUST NOT produce partial queue, scheduler, retry-edge, or projection effects.
+Start/retry MUST perform current reducer and worktree eligibility checks at final admission. A worktree-ineligible marked target MUST reject the complete request before ordinary or retry-class Start selection. Other non-startable statuses MUST be excluded with target-specific detail, and zero runnable targets MUST reject. In Select and Stopped, Start MUST admit ordinary startable marks when any exist and otherwise MAY select marked retry routes. In Running and Error, Start MUST select marked retry routes only; Stopping MUST reject Start. Failed admission MUST NOT produce partial queue, scheduler, retry-edge, or projection effects.
 
 #### Scenario: Single mark is lifecycle-independent and side-effect free
 
@@ -48,29 +48,47 @@ Start/retry MUST perform current reducer and worktree eligibility checks at fina
 
 #### Scenario: Worktree-invalid Start is rejected atomically
 
-**Given**: Marks include a worktree-ineligible target
+**Given**: Marks include a worktree-ineligible target, including a retry-eligible target
 **When**: Start is submitted
-**Then**: the complete request is rejected
+**Then**: the complete request is rejected before ordinary or retry-class selection
 **And**: No scheduler is prepared, activated, or notified
 **And**: no queue, mark, retry-edge, reservation, mode, hook, or projection effect survives
 **And**: the command identifies the target and reason
 
-#### Scenario: Mixed status Start admits runnable subset
+<!-- replaces-scenario: Mixed status Start admits runnable subset -->
 
-**Given**: Marks include at least one runnable target and another currently non-startable status
+#### Scenario: Mixed status Start admits the route permitted by mode and evidence
+
+**Given**: Marks include at least one target permitted by the current Start route and another currently non-startable status
 **And**: no marked target violates the worktree eligibility fence
 **When**: Start is submitted
-**Then**: runnable targets are admitted
+**Then**: permitted targets are admitted
 **And**: non-startable statuses are reported as excluded with target-specific detail
 
 #### Scenario: Zero runnable targets is rejected
 
-**Given**: Marks exist but no runnable target remains after status classification
+**Given**: Marks exist but no runnable target remains after status and retry classification
 **When**: Start or Retry is submitted
 **Then**: no scheduler or queue effect occurs
 **And**: the command rejects with actionable exclusion detail
 
-<!-- Expected canonical result after archive: `remote-control-api` will keep mark commands lifecycle-independent for markable rows while making reducer-recorded archive completion a reasoned unchanged no-op without adding an archive field to state payloads. -->
+#### Scenario: Remote Start uses ordinary priority before retry fallback
+
+**Given**: Select or Stopped has ordinary startable marks and retry-only marks
+**When**: remote `start` is submitted
+**Then**: ordinary targets are admitted and retry-only targets are excluded
+**And**: exclusion detail explains that ordinary marks must be removed before retry-class Start can select the retry-only targets
+**And**: remote behavior matches TUI F5 for the same authoritative state
+
+#### Scenario: Remote Running Start can retry a change-local error
+
+**Given**: a scheduler is live in Running mode
+**And**: a marked target carries retry-eligible change-local terminal Error evidence
+**When**: remote `start` is submitted
+**Then**: the target is admitted through the same explicit retry transaction as TUI F5
+**And**: the accepted result records the same targets, exclusions, retry semantics, scheduler wake, and revision
+
+<!-- Expected canonical result after archive: `/api/v2` preserves lifecycle-independent mark commands and routes remote Start through the same mode-aware ordinary-or-retry transaction and complete-request worktree fence as TUI F5. -->
 
 ### Requirement: Serialized optimistic revision control
 

@@ -42,6 +42,19 @@ const MERGE_WAIT_STATUS: &str = "merge wait";
 /// Display status a change must carry before it can be started.
 const NOT_QUEUED_STATUS: &str = "not queued";
 
+/// Why a retry-eligible mark was not routed while ordinary Start work existed.
+///
+/// Start admits one class per request, so a retry-eligible row an operator can
+/// see left behind has to be told what would make it selectable — otherwise the
+/// exclusion reads as "your retryable change is not retryable".
+const RETRY_DEFERRED_TO_ORDINARY_START: &str =
+    "retry-class Start selects it only when no ordinary marked change is startable; \
+     remove the ordinary marks first";
+
+/// Why an ordinary mark was not routed while a run owned the lifecycle.
+const ORDINARY_DEFERRED_TO_MARK_SETTLEMENT: &str =
+    "a live run admits ordinary marks through mark settlement rather than Start";
+
 /// A marked target that final admission did not route, and why.
 ///
 /// A mark carries no eligibility of its own, so an operator may mark a row that
@@ -54,6 +67,41 @@ pub struct ExcludedTarget {
     pub change_id: String,
     /// Reducer display status that excluded it, read at admission.
     pub status: String,
+    /// Why that status excluded it, when the status alone does not say so.
+    ///
+    /// A status like `merge wait` explains itself. A retry-eligible `error`
+    /// excluded because ordinary Start work took priority does not: the same
+    /// row would be routed by the very next request, so the reason has to
+    /// travel with the exclusion.
+    pub detail: Option<String>,
+}
+
+impl ExcludedTarget {
+    /// Name a target whose status is the whole reason it was not routed.
+    pub fn new(change_id: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            change_id: change_id.into(),
+            status: status.into(),
+            detail: None,
+        }
+    }
+
+    /// Add the reason a status that admission *could* have routed was not.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// The one operator-facing spelling of this exclusion.
+    ///
+    /// Both frontends render exclusions through it, so a keypress and an
+    /// `/api/v2` response cannot describe the same excluded target differently.
+    pub fn describe(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{} ({}): {detail}", self.change_id, self.status),
+            None => format!("{} ({})", self.change_id, self.status),
+        }
+    }
 }
 
 /// Name every excluded target with the status that excluded it.
@@ -64,7 +112,7 @@ pub struct ExcludedTarget {
 fn describe_exclusions(excluded: &[ExcludedTarget]) -> String {
     excluded
         .iter()
-        .map(|target| format!("{} ({})", target.change_id, target.status))
+        .map(ExcludedTarget::describe)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -554,6 +602,54 @@ impl PreparedDispatch {
     }
 }
 
+/// The class of work one Start request admits, chosen from marked evidence.
+///
+/// Deliberately not a mixed variant. `explicit_retry` is a run-level launch
+/// property, so a launch carrying both classes would apply retry-specific
+/// startup behaviour to ordinary work and hide which targets the operator
+/// actually asked to retry.
+#[derive(Debug)]
+enum StartAdmission {
+    /// Ordinary `not queued` marks enter the run.
+    Ordinary {
+        /// Admitted targets, in request order.
+        targets: Vec<String>,
+        /// Marked targets the classification left out.
+        excluded: Vec<ExcludedTarget>,
+    },
+    /// Marked retry-eligible routes are consumed through explicit retry.
+    Retry {
+        /// Routes the retry classification accepted.
+        routes: Vec<(String, RetryRoute)>,
+        /// Marked targets the classification left out.
+        excluded: Vec<ExcludedTarget>,
+    },
+}
+
+/// The refusal detail for a Start whose marks contained nothing it could route.
+///
+/// Worded per mode because the operator's next action differs: in `Select` and
+/// `Stopped` either class could have run, while a live run and process-wide
+/// `Error` only ever admit retry routes.
+fn exhausted_start_detail(
+    mode: OperatorMode,
+    marked: usize,
+    excluded: &[ExcludedTarget],
+) -> String {
+    let cause = match mode {
+        OperatorMode::Select | OperatorMode::Stopped => format!(
+            "no marked change is startable ({marked} marked, none with status \
+             '{NOT_QUEUED_STATUS}' and none carrying retryable evidence)"
+        ),
+        OperatorMode::Running => format!(
+            "a live run admits only marked retry-eligible changes \
+             ({marked} marked, none carries retryable evidence)"
+        ),
+        _ => format!("no marked change carries retryable evidence ({marked} marked)"),
+    };
+    format!("{cause}; excluded: {}", describe_exclusions(excluded))
+}
+
 /// What a prepared run-lifecycle command will commit once its gate allows it.
 #[derive(Debug)]
 enum PreparedIntent {
@@ -700,20 +796,18 @@ impl RunControlService {
 
     /// Start, resume, or retry the run for the authoritative marked target set.
     ///
-    /// `Select` and `Stopped` start marked rows that are not queued yet.
-    /// `Error` routes the marked rows through retry classification instead, so a
-    /// reconciled acceptance hold resumes rather than rerunning apply. A mode
-    /// with a live run owns its own queue mutation and refuses start outright.
+    /// The unordered shorthand over [`Self::prepare_start`], [`Self::commit`],
+    /// and activation. It routes through exactly those halves rather than
+    /// repeating their admission rules, so the composed form and the
+    /// coordinator-driven form cannot disagree about which class a mark set
+    /// selects.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn start(&self, mode: OperatorMode) -> RunControlResult<RunControlOutcome> {
-        match mode {
-            OperatorMode::Running | OperatorMode::Stopping => Err(RunControlError::InvalidMode {
-                command: RunCommandKind::Start,
-                mode,
-            }),
-            OperatorMode::Error => self.start_retry().await,
-            OperatorMode::Select | OperatorMode::Stopped => self.start_marked().await,
-        }
+        let prepared = self.prepare_start(mode).await?;
+        let committed = self.commit(prepared).await?;
+        let outcome = committed.outcome.clone();
+        committed.activate(self.scheduler.as_ref()).await;
+        Ok(outcome)
     }
 
     /// Marked change IDs that are eligible to enter a new run.
@@ -741,102 +835,11 @@ impl RunControlService {
             if status == NOT_QUEUED_STATUS {
                 startable.push(id);
             } else {
-                excluded.push(ExcludedTarget {
-                    change_id: id,
-                    status: status.to_string(),
-                });
+                let status = status.to_string();
+                excluded.push(ExcludedTarget::new(id, status));
             }
         }
         (startable, excluded)
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn start_marked(&self) -> RunControlResult<RunControlOutcome> {
-        let marked = self.operator.marks().marked_ids();
-        if marked.is_empty() {
-            return Err(RunControlError::NoEligibleTarget {
-                command: RunCommandKind::Start,
-                detail: "no change carries an execution mark".to_string(),
-            });
-        }
-
-        // The fence is applied to the *complete* marked set before anything is
-        // narrowed down, so start is all-or-nothing: one ineligible target
-        // refuses the whole operation instead of quietly starting the eligible
-        // remainder, which is a target set the operator never asked for.
-        let rejected = self.eligibility.rejected(&marked);
-        if !rejected.is_empty() {
-            return Err(RunControlError::NoEligibleTarget {
-                command: RunCommandKind::Start,
-                detail: format!(
-                    "worktree execution requires committed changes with no uncommitted \
-                     files; ineligible marked targets: {}",
-                    rejected.join(", ")
-                ),
-            });
-        }
-
-        let (targets, excluded) = self.classify_start_targets().await;
-        if targets.is_empty() {
-            return Err(RunControlError::NoEligibleTarget {
-                command: RunCommandKind::Start,
-                detail: format!(
-                    "no marked change is startable ({} marked, none with status \
-                     '{NOT_QUEUED_STATUS}'); excluded: {}",
-                    marked.len(),
-                    describe_exclusions(&excluded)
-                ),
-            });
-        }
-
-        // Queue intent before dispatch: a scheduler woken by the dispatch below
-        // must already see the work it is being woken for.
-        {
-            let mut guard = self.state.write().await;
-            for id in &targets {
-                guard.apply_command(ReducerCommand::AddToQueue(id.clone()));
-            }
-        }
-
-        let scheduler = self
-            .dispatch(RunCommandKind::Start, targets.clone(), false)
-            .await?;
-        Ok(RunControlOutcome::RunDispatched {
-            change_ids: targets,
-            explicit_retry: false,
-            scheduler,
-            excluded,
-        })
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    async fn start_retry(&self) -> RunControlResult<RunControlOutcome> {
-        let marked = self.operator.marks().marked_ids();
-        if marked.is_empty() {
-            return Err(RunControlError::NoEligibleTarget {
-                command: RunCommandKind::Start,
-                detail: "no change carries an execution mark".to_string(),
-            });
-        }
-
-        // Only marked retry-eligible rows are routed; every other marked row is
-        // named as excluded rather than silently dropped, and a request with no
-        // runnable target is rejected before any effect.
-        let routes = self.operator.plan_retry_errors(&marked).await;
-        if routes.is_empty() {
-            let excluded = self.describe_non_retryable(&marked, &routes).await;
-            return Err(RunControlError::NoEligibleTarget {
-                command: RunCommandKind::Start,
-                detail: format!(
-                    "no marked change carries retryable evidence ({} marked); excluded: {}",
-                    marked.len(),
-                    describe_exclusions(&excluded)
-                ),
-            });
-        }
-        let excluded = self.describe_non_retryable(&marked, &routes).await;
-        let plan = self.operator.commit_retry_routes(&routes).await;
-        self.dispatch_retry(plan, excluded).await
     }
 
     // ------------------------------------------------------------------
@@ -1053,68 +1056,56 @@ impl RunControlService {
     // decision state and its outcome event are published before any scheduler
     // activity the command enabled can exist.
 
-    /// Validate a Start (or, in `Error` mode, a retry) and reserve its dispatch.
+    /// Validate a Start and reserve its dispatch.
     ///
     /// Read-only: a refusal here has changed nothing.
+    ///
+    /// Which class the request selects comes from
+    /// [`Self::classify_start_admission`], so ordinary and retry Start share one
+    /// mark read, one worktree fence, and one set of refusals.
     pub async fn prepare_start(&self, mode: OperatorMode) -> RunControlResult<PreparedRunCommand> {
-        match mode {
-            OperatorMode::Running | OperatorMode::Stopping => Err(RunControlError::InvalidMode {
+        match self.classify_start_admission(mode).await? {
+            StartAdmission::Ordinary { targets, excluded } => {
+                let dispatch = self
+                    .prepare_dispatch(RunCommandKind::Start, targets.clone(), false)
+                    .await?;
+                Ok(PreparedRunCommand {
+                    intent: PreparedIntent::Start { targets, excluded },
+                    dispatch,
+                })
+            }
+            StartAdmission::Retry { routes, excluded } => {
+                self.prepare_routes(RunCommandKind::Start, routes, excluded)
+                    .await
+            }
+        }
+    }
+
+    /// Choose the class of work one Start request admits, without mutating.
+    ///
+    /// Process mode is a lifecycle guard here, not a proxy for retry
+    /// eligibility. `ProcessingError` is change-scoped, so a retryable failure
+    /// leaves the process in `Running` or persistent-idle `Select`; deriving the
+    /// class from marked target evidence instead is what keeps the configured
+    /// Start control reachable for it.
+    ///
+    /// The order below is the contract: mode guard, then the complete-request
+    /// worktree fence over the *whole* marked set, then class selection. A fence
+    /// applied after class selection would let a worktree-ineligible mark decide
+    /// which class ran before refusing the request.
+    async fn classify_start_admission(
+        &self,
+        mode: OperatorMode,
+    ) -> RunControlResult<StartAdmission> {
+        // A run that is already stopping owns its own termination; admitting
+        // work into it would race the boundary it is walking to.
+        if mode == OperatorMode::Stopping {
+            return Err(RunControlError::InvalidMode {
                 command: RunCommandKind::Start,
                 mode,
-            }),
-            OperatorMode::Error => self.prepare_start_retry().await,
-            OperatorMode::Select | OperatorMode::Stopped => self.prepare_start_marked().await,
-        }
-    }
-
-    /// Validate an `Error`-mode Start: route only marked retry-eligible targets.
-    ///
-    /// A marked row that carries no retryable evidence is reported as excluded
-    /// rather than silently dropped, and a request where nothing is retryable is
-    /// rejected before any reducer, retry-edge, queue, or scheduler effect.
-    async fn prepare_start_retry(&self) -> RunControlResult<PreparedRunCommand> {
-        let marked = self.operator.marks().marked_ids();
-        if marked.is_empty() {
-            return Err(RunControlError::NoEligibleTarget {
-                command: RunCommandKind::Start,
-                detail: "no change carries an execution mark".to_string(),
             });
         }
 
-        let routes = self.operator.plan_retry_errors(&marked).await;
-        if routes.is_empty() {
-            let excluded = self.describe_non_retryable(&marked, &routes).await;
-            return Err(RunControlError::NoEligibleTarget {
-                command: RunCommandKind::Start,
-                detail: format!(
-                    "no marked change carries retryable evidence ({} marked); excluded: {}",
-                    marked.len(),
-                    describe_exclusions(&excluded)
-                ),
-            });
-        }
-        let excluded = self.describe_non_retryable(&marked, &routes).await;
-        self.prepare_routes(routes, excluded).await
-    }
-
-    /// Name every marked target the retry classification did not accept.
-    async fn describe_non_retryable(
-        &self,
-        marked: &[String],
-        routes: &[(String, RetryRoute)],
-    ) -> Vec<ExcludedTarget> {
-        let guard = self.state.read().await;
-        marked
-            .iter()
-            .filter(|id| !routes.iter().any(|(routed, _)| routed == *id))
-            .map(|id| ExcludedTarget {
-                change_id: id.clone(),
-                status: guard.display_status(id).to_string(),
-            })
-            .collect()
-    }
-
-    async fn prepare_start_marked(&self) -> RunControlResult<PreparedRunCommand> {
         let marked = self.operator.marks().marked_ids();
         if marked.is_empty() {
             return Err(RunControlError::NoEligibleTarget {
@@ -1142,26 +1133,91 @@ impl RunControlService {
         // Status classification happens here, at final admission, from current
         // reducer facts — never from an eligibility result recorded at mark
         // time. Excluded rows are named but do not block the runnable subset.
-        let (targets, excluded) = self.classify_start_targets().await;
-        if targets.is_empty() {
-            return Err(RunControlError::NoEligibleTarget {
-                command: RunCommandKind::Start,
-                detail: format!(
-                    "no marked change is startable ({} marked, none with status \
-                     '{NOT_QUEUED_STATUS}'); excluded: {}",
-                    marked.len(),
-                    describe_exclusions(&excluded)
-                ),
+        let admits_ordinary = matches!(mode, OperatorMode::Select | OperatorMode::Stopped);
+        let (ordinary, ordinary_excluded) = if admits_ordinary {
+            self.classify_start_targets().await
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        if !ordinary.is_empty() {
+            // Ordinary Start keeps its priority, and the retry-eligible rows it
+            // left behind are reported as deferred rather than implicitly
+            // retried: `explicit_retry` is a run-level launch property, so
+            // mixing the two classes would apply retry startup semantics to work
+            // that never asked for them.
+            let excluded = self.defer_retry_only(ordinary_excluded).await;
+            return Ok(StartAdmission::Ordinary {
+                targets: ordinary,
+                excluded,
             });
         }
 
-        let dispatch = self
-            .prepare_dispatch(RunCommandKind::Start, targets.clone(), false)
-            .await?;
-        Ok(PreparedRunCommand {
-            intent: PreparedIntent::Start { targets, excluded },
-            dispatch,
-        })
+        // Only marked retry-eligible rows are routed; every other marked row is
+        // named as excluded rather than silently dropped, and a request with no
+        // runnable target is rejected before any effect.
+        let routes = self.operator.plan_retry_errors(&marked).await;
+        let excluded = self.describe_non_retryable(&marked, &routes, mode).await;
+        if routes.is_empty() {
+            return Err(RunControlError::NoEligibleTarget {
+                command: RunCommandKind::Start,
+                detail: exhausted_start_detail(mode, marked.len(), &excluded),
+            });
+        }
+        Ok(StartAdmission::Retry { routes, excluded })
+    }
+
+    /// Explain the retry-eligible rows ordinary Start admission left behind.
+    ///
+    /// Read-only classification over the excluded rows only: a row that the very
+    /// next request would retry must not be reported as though its status made
+    /// it permanently unrunnable.
+    async fn defer_retry_only(&self, excluded: Vec<ExcludedTarget>) -> Vec<ExcludedTarget> {
+        let ids: Vec<String> = excluded
+            .iter()
+            .map(|target| target.change_id.clone())
+            .collect();
+        if ids.is_empty() {
+            return excluded;
+        }
+        let routes = self.operator.plan_retry_errors(&ids).await;
+        excluded
+            .into_iter()
+            .map(|target| {
+                if routes.iter().any(|(id, _)| *id == target.change_id) {
+                    target.with_detail(RETRY_DEFERRED_TO_ORDINARY_START)
+                } else {
+                    target
+                }
+            })
+            .collect()
+    }
+
+    /// Name every marked target the retry classification did not accept.
+    async fn describe_non_retryable(
+        &self,
+        marked: &[String],
+        routes: &[(String, RetryRoute)],
+        mode: OperatorMode,
+    ) -> Vec<ExcludedTarget> {
+        let guard = self.state.read().await;
+        marked
+            .iter()
+            .filter(|id| !routes.iter().any(|(routed, _)| routed == *id))
+            .map(|id| {
+                let status = guard.display_status(id).to_string();
+                // An ordinary mark under a live run is not unrunnable; it is
+                // owned by the mark-settlement path instead, and saying so is
+                // what keeps a Running-mode exclusion actionable.
+                let deferred = mode == OperatorMode::Running && status == NOT_QUEUED_STATUS;
+                let target = ExcludedTarget::new(id.clone(), status);
+                if deferred {
+                    target.with_detail(ORDINARY_DEFERRED_TO_MARK_SETTLEMENT)
+                } else {
+                    target
+                }
+            })
+            .collect()
     }
 
     /// Validate a single-change retry and reserve its dispatch.
@@ -1173,7 +1229,8 @@ impl RunControlService {
             Some(route) => vec![(change_id.to_string(), route)],
             None => Vec::new(),
         };
-        self.prepare_routes(routes, Vec::new()).await
+        self.prepare_routes(RunCommandKind::Retry, routes, Vec::new())
+            .await
     }
 
     /// Validate a bulk retry and reserve its dispatch.
@@ -1182,11 +1239,18 @@ impl RunControlService {
         change_ids: &[String],
     ) -> RunControlResult<PreparedRunCommand> {
         let routes = self.operator.plan_retry_errors(change_ids).await;
-        self.prepare_routes(routes, Vec::new()).await
+        self.prepare_routes(RunCommandKind::Retry, routes, Vec::new())
+            .await
     }
 
+    /// Reserve the dispatch for already-classified retry routes.
+    ///
+    /// `command` is the operator-facing command the routes came from, so a
+    /// runtime launch refusal for a Start-selected retry reads as a refused
+    /// start rather than as a retry the operator never typed.
     async fn prepare_routes(
         &self,
+        command: RunCommandKind,
         routes: Vec<(String, RetryRoute)>,
         excluded: Vec<ExcludedTarget>,
     ) -> RunControlResult<PreparedRunCommand> {
@@ -1199,9 +1263,7 @@ impl RunControlService {
             });
         }
         let targets: Vec<String> = routes.iter().map(|(id, _)| id.clone()).collect();
-        let dispatch = self
-            .prepare_dispatch(RunCommandKind::Retry, targets, true)
-            .await?;
+        let dispatch = self.prepare_dispatch(command, targets, true).await?;
         Ok(PreparedRunCommand {
             intent: PreparedIntent::Retry { routes, excluded },
             dispatch,

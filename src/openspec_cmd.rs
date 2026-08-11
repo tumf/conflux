@@ -662,8 +662,13 @@ mod archive_promotion_mark_contract_tests {
             "`Queue State Synchronization` must survive promotion"
         );
         for (index, (_, block)) in duplicates.iter().enumerate() {
+            // `restore-running-mark-reanalysis` narrowed this to "directly":
+            // the stability coordinator *may* queue settled marked work, while
+            // Space itself still may not. The guard here is that Space carries
+            // no queue authority, so it tracks the narrowed wording rather than
+            // asserting the sentence it replaced.
             assert!(
-                block.contains("MUST NOT modify DynamicQueue, reducer queue intent"),
+                block.contains("MUST NOT directly modify DynamicQueue, reducer queue intent"),
                 "duplicate #{index} must carry the pure-mark contract:\n{block}"
             );
             assert!(

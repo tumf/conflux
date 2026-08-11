@@ -41,6 +41,8 @@ Start/retry MUST perform current reducer and worktree eligibility checks at fina
 **And**: no queue, mark, retry-edge, reservation, mode, hook, or projection effect survives
 **And**: the command identifies the target and reason
 
+<!-- replaces-scenario: Mixed status Start admits runnable subset -->
+
 #### Scenario: Mixed status Start admits the route permitted by mode and evidence
 
 **Given**: Marks include at least one target permitted by the current Start route and another currently non-startable status

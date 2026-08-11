@@ -1915,13 +1915,21 @@ impl AppState {
     }
 
     /// Row cache and run-scoped presentation shared by both Start projections.
+    ///
+    /// The run-scoped reset belongs to a dispatch that *opens* a run. A Start
+    /// accepted while the process is already Running — the change-local error
+    /// retry — adds a target to the run in progress, so clearing the current
+    /// change and restarting the elapsed timer there would erase unrelated live
+    /// work's presentation on behalf of a command that never touched it.
     fn admit_run_targets(&mut self, change_ids: &[String]) {
         for change in &mut self.changes {
             if change_ids.iter().any(|id| id == &change.id) {
                 change.set_display_status_cache("queued");
             }
         }
-        self.reset_for_run();
+        if self.execution_mode != AppExecutionMode::Running {
+            self.reset_for_run();
+        }
         // The service resolved these targets *from* the shared marks, so the row
         // projection is read back from the store rather than written into it.
         self.sync_execution_marks_from_store();

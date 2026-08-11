@@ -9,7 +9,8 @@ use crate::orchestration::operator_coordinator::{
     ApplicationOutcome, ApplicationResult, OperatorApplication, OperatorIntent,
 };
 use crate::orchestration::run_control::{
-    ResolveReservation, RunControlError, RunControlOutcome, RunNoOpReason, SchedulerEffect,
+    ExcludedTarget, ResolveReservation, RunControlError, RunControlOutcome, RunNoOpReason,
+    SchedulerEffect,
 };
 #[cfg(test)]
 use crate::parallel::PostArchiveAction;
@@ -36,6 +37,10 @@ mod convergence_tests;
 /// Mark-stability settlement, driven through the real TUI adapter.
 #[cfg(test)]
 mod mark_settlement_tests;
+
+/// TUI ↔ `/api/v2` parity for mode-independent Start/F5 retry routing.
+#[cfg(all(test, feature = "web-monitoring"))]
+mod change_error_f5_retry_tests;
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -381,7 +386,7 @@ fn describe_start(retry: RetryContext) -> impl FnOnce(ApplicationResult) -> Comm
             } else {
                 let detail = excluded
                     .iter()
-                    .map(|target| format!("{} ({})", target.change_id, target.status))
+                    .map(ExcludedTarget::describe)
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("; excluded: {detail}")
