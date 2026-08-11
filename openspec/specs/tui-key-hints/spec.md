@@ -139,7 +139,11 @@ Status panel app-control hints SHALL use the resolved TUI start key label instea
 
 resolve 実行中に `M` が押された場合、対象 change は `ResolveWait` として待ち行列へ追加されなければならない（SHALL）。
 
-<!-- Expected canonical result after archive: `tui-key-hints` will no longer imply that M immediately displays `resolving`; M registers intent, then scheduler events drive `resolving`. -->
+Scheduler が deferred retry を stale と分類する場合、base-branch tree comparison が対象 change の統合を証明したときは shared reducer を terminal `merged` に遷移させてから scheduler-owned retry intent を解放しなければならない（SHALL）。統合が証明されない、または証拠を安全に読み取れない場合、対象 change は manual `merge wait` を維持しなければならず（SHALL）、`ResolveWait` の消去によって `not queued` を露出してはならない（MUST NOT）。
+
+いずれの stale retry settlement も、dirty index、tracked changes、または non-ignored untracked content を stage、commit、stash、reset、discard してはならない（MUST NOT）。
+
+<!-- Expected canonical result after archive: `tui-key-hints` will require stale manual resolve retries to settle as repository-proven `merged` or retryable `merge wait`, never idle `not queued`, while preserving dirty content. -->
 
 #### Scenario: Stopped mode M registers resolve intent
 
@@ -159,6 +163,32 @@ resolve 実行中に `M` が押された場合、対象 change は `ResolveWait`
 - **WHEN** the user presses `M`
 - **THEN** the change status SHALL transition to `ResolveWait`
 - **AND** the resolve command SHALL NOT be triggered immediately as a second concurrent resolve
+
+#### Scenario: Stale retry with proven base integration becomes merged
+
+- **GIVEN** a change moved from `MergeWait` to `ResolveWait` after explicit `M`
+- **AND** base-branch tree comparison proves the archived change is already integrated
+- **WHEN** the scheduler classifies the deferred retry as stale
+- **THEN** the shared reducer SHALL transition the change to terminal `merged`
+- **AND** TUI and Web projections SHALL display `merged`
+- **AND** the row SHALL NOT display `not queued`
+- **AND** scheduler retry and base-lane ownership SHALL be released after reducer settlement
+
+#### Scenario: Stale retry without safe completion evidence remains retryable
+
+- **GIVEN** a change moved from `MergeWait` to `ResolveWait` after explicit `M`
+- **WHEN** base integration is absent or its evidence cannot be read safely
+- **THEN** the shared reducer SHALL retain or restore manual `MergeWait`
+- **AND** the row SHALL NOT display `merged` or `not queued`
+- **AND** the operator MAY explicitly retry after repository state is corrected
+
+#### Scenario: Dirty content is preserved during stale settlement
+
+- **GIVEN** the repository index or worktree contains unrelated dirty content
+- **AND** a deferred resolve retry reaches stale settlement
+- **WHEN** the scheduler evaluates base integration and settles reducer state
+- **THEN** the dirty content and index state SHALL remain unchanged
+- **AND** Conflux SHALL NOT stage, commit, stash, reset, or discard that content
 
 ### Requirement: 未コミット change の操作ヒントを非表示にする
 
