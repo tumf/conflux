@@ -319,6 +319,42 @@ fn installed_apply_skill_retains_bounded_verification_guidance() {
     );
 }
 
+/// The invocation budget an agent is told about must be the one Conflux enforces.
+///
+/// An agent that believes it has one hour when it actually has three plans
+/// smaller work than it can finish; one that believes the reverse plans work
+/// that gets terminated mid-task. Both failures are silent, so the distributed
+/// guidance is pinned to `DEFAULT_COMMAND_MAX_RUNTIME_SECS` itself.
+#[test]
+fn installed_skills_state_the_enforced_default_runtime_limit() {
+    let workdir = TempDir::new().unwrap();
+    let skills_base = install_embedded_skills(&workdir);
+
+    let default_secs = conflux::config::defaults::DEFAULT_COMMAND_MAX_RUNTIME_SECS;
+    assert_eq!(
+        default_secs, 10800,
+        "the distributed guidance below is written for the three-hour default"
+    );
+    let expected = format!("`command_max_runtime_secs`, default {default_secs}s");
+
+    for relative in [
+        "cflx-apply/SKILL.md",
+        "cflx-apply/references/cflx-apply.md",
+        "cflx-proposal/SKILL.md",
+    ] {
+        let text = fs::read_to_string(skills_base.join(relative))
+            .unwrap_or_else(|e| panic!("{relative} must ship with the skills: {e}"));
+        assert!(
+            text.contains(&expected),
+            "{relative} must state the enforced default: {expected}"
+        );
+        assert!(
+            !text.contains("`command_max_runtime_secs`, default 3600s"),
+            "{relative} must not advertise the retired one-hour default"
+        );
+    }
+}
+
 /// Bounded blocker handoff must stay complete.
 ///
 /// A blocker Conflux cannot classify is a blocker that stops the loop with no

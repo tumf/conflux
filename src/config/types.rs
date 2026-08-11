@@ -382,7 +382,7 @@ pub struct OrchestratorConfig {
     /// Measured from successful child spawn and evaluated independently of the
     /// inactivity timeout: stdout/stderr activity extends the inactivity
     /// deadline only, never this one. `0` disables it.
-    /// Default: 3600 (1 hour)
+    /// Default: 10800 (3 hours)
     #[serde(default)]
     pub command_max_runtime_secs: Option<u64>,
 
@@ -990,7 +990,7 @@ impl OrchestratorConfig {
 
     /// Get the absolute runtime limit for one AI command invocation (seconds).
     ///
-    /// Returns 0 when disabled. Default: 3600 (1 hour). The value is independent
+    /// Returns 0 when disabled. Default: 10800 (3 hours). The value is independent
     /// of [`Self::get_command_inactivity_timeout_secs`]: output activity resets
     /// the inactivity deadline only.
     pub fn get_command_max_runtime_secs(&self) -> u64 {

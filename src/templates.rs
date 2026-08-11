@@ -64,8 +64,9 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // "max_iterations": 50,
 
   // Absolute runtime limit for one AI command invocation (seconds).
-  // Measured from child spawn and never extended by output; 0 disables it.
-  // "command_max_runtime_secs": 3600,
+  // Default: 10800 (3 hours). Measured from child spawn and never extended by
+  // output; 0 disables it.
+  // "command_max_runtime_secs": 10800,
 
   // Logging configuration for TUI debug output
   // "logging": {
@@ -164,8 +165,9 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // "max_iterations": 50,
 
   // Absolute runtime limit for one AI command invocation (seconds).
-  // Measured from child spawn and never extended by output; 0 disables it.
-  // "command_max_runtime_secs": 3600,
+  // Default: 10800 (3 hours). Measured from child spawn and never extended by
+  // output; 0 disables it.
+  // "command_max_runtime_secs": 10800,
 
   // Logging configuration for TUI debug output
   // "logging": {
@@ -264,8 +266,9 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // "max_iterations": 50,
 
   // Absolute runtime limit for one AI command invocation (seconds).
-  // Measured from child spawn and never extended by output; 0 disables it.
-  // "command_max_runtime_secs": 3600,
+  // Default: 10800 (3 hours). Measured from child spawn and never extended by
+  // output; 0 disables it.
+  // "command_max_runtime_secs": 10800,
 
   // Logging configuration for TUI debug output
   // "logging": {

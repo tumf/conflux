@@ -129,9 +129,11 @@ pub const DEFAULT_COMMAND_INACTIVITY_TIMEOUT_MAX_RETRIES: u32 = 3;
 
 /// Default absolute runtime limit for one AI command invocation (seconds).
 ///
-/// Measured from successful child spawn and never extended by stdout or stderr
-/// activity, so an agent that keeps printing is still bounded. `0` disables it.
-pub const DEFAULT_COMMAND_MAX_RUNTIME_SECS: u64 = 3600;
+/// Three hours: long enough for one Apply invocation to build, fix, and run its
+/// repository-local verification without being cut off mid-task. Measured from
+/// successful child spawn and never extended by stdout or stderr activity, so an
+/// agent that keeps printing is still bounded. `0` disables it.
+pub const DEFAULT_COMMAND_MAX_RUNTIME_SECS: u64 = 10800;
 
 /// Default enablement for stream-json output textification
 pub const DEFAULT_STREAM_JSON_TEXTIFY: bool = true;

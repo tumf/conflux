@@ -133,7 +133,7 @@ Never mark a task complete based only on any of the following:
 
 Autonomy is not permission for unbounded verification. Apply runs inside a
 bounded invocation whose absolute runtime limit Conflux enforces
-(`command_max_runtime_secs`, default 3600s, `0` disables it). A verification
+(`command_max_runtime_secs`, default 10800s / 3 hours, `0` disables it). A verification
 loop that outlives that budget produces no evidence at all: the process group is
 terminated, and the next iteration sees unchanged tasks with nothing to consume.
 
