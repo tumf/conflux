@@ -8,7 +8,7 @@ Reducer が archive 完了を記録済みの change、または display status �
 
 Changes row は cursor glyph とその専用列を表示してはならず（MUST NOT）、focus は row highlight で示さなければならない（SHALL）。Checkbox 領域の直後には1表示列の区切りを置き、change ID の開始から次の field の開始までを36表示列に固定しなければならない（SHALL）。その内訳は最大35表示列の change ID content と1表示列の field separator とする。Change ID content が35表示列を超える場合はellipsisなしで表示幅境界においてhard truncateし、不足する場合は空白でpadしてcontent領域を35表示列にしなければならない（SHALL）。Unicode wide characterが境界を跨ぐ場合はその文字を含めず、残る列を空白でpadしなければならない（SHALL）。
 
-Reducer が archive 完了を記録済みの行では、Spaceとbulk mark操作はsilent no-opでなければならず（SHALL）、mark hintを表示してはならない（MUST NOT）。Display statusが同じ`resolving`でもarchive未完了の行は、従来どおりexecution markを表示・変更できなければならない（SHALL）。
+Reducer が archive 完了を記録済みの行、またはdisplay statusがterminalである行では、Spaceとbulk mark操作はsilent no-opでなければならず（SHALL）、mark hintを表示してはならない（MUST NOT）。Display statusが同じ`resolving`でもreducerにarchive完了記録がない行は、従来どおりexecution markを表示・変更できなければならない（SHALL）。
 
 #### Scenario: rejected 状態では x マークを保持しない
 
@@ -35,17 +35,25 @@ Reducer が archive 完了を記録済みの行では、Spaceとbulk mark操作�
 - **THEN** reducer由来のarchive完了factが再適用される
 - **AND** checkbox textは1 frameも再表示されない
 
-#### Scenario: post-archive 行の Space は silent no-op
+#### Scenario: terminal display statusだけでもcheckboxを表示しない
 
-- **GIVEN** reducer がcursor rowのarchive完了を記録済みである
-- **AND** rowのdisplay statusが`resolving`、`resolve pending`、`merge wait`、`merged`、または`pushed`である
+- **GIVEN** reducer由来のarchive完了snapshotが利用できないstartupまたはrefresh frameである
+- **AND** rowのdisplay statusが`archived`、`merged`、または`pushed`である
+- **WHEN** Changes listがSelectまたはRunning layoutでレンダリングされる
+- **THEN** checkbox領域に`[x]`も`[ ]`も表示されない
+- **AND** checkboxと同じ3表示列の空白が表示される
+
+#### Scenario: non-markable 行の Space は silent no-op
+
+- **GIVEN** reducer がcursor rowのarchive完了を記録済みである、またはrowのdisplay statusが`archived`、`merged`、`pushed`、`rejected`である
 - **WHEN** ユーザーがSpaceまたはbulk mark操作を実行する
 - **THEN** execution mark、queue intent、runtime state、および表示状態は変化しない
 - **AND** mark hintとmark refusal warningは表示されない
 
-#### Scenario: pre-archive resolving row remains markable
+#### Scenario: reducer archive recordなしのresolving row remains markable
 
-- **GIVEN** changeがarchive完了前のactive `resolving`状態である
+- **GIVEN** changeがfresh processのresolve retry等によりactive `resolving`状態である
+- **AND** reducerはそのchangeのarchive完了を記録していない
 - **WHEN** Changes listがレンダリングされ、ユーザーがSpaceを押す
 - **THEN** rowは現在のexecution markに応じて`[x]`または`[ ]`を表示する
 - **AND** execution markは従来どおり切り替わる

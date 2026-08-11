@@ -5,7 +5,10 @@ dependencies: []
 references:
   - openspec/CONSTITUTION.md
   - openspec/specs/cli/spec.md
+  - openspec/specs/operator-command-execution/spec.md
+  - openspec/specs/remote-control-api/spec.md
   - openspec/specs/tui-key-hints/spec.md
+  - openspec/specs/tui-state/spec.md
   - src/orchestration/operator_command.rs
   - src/orchestration/state.rs
   - src/tui/render.rs
@@ -72,14 +75,15 @@ No new dependency, durable state, configuration option, workflow status, Web/API
 7. The post-archive checkbox placeholder remains exactly three columns, preserving the ID and following field positions.
 8. Refresh reconstruction does not briefly restore a checkbox or lose archive-complete presentation state.
 9. Space and bulk mark operations treat a reducer-recorded archive-complete row as non-markable, omit mark hints, and do not create invisible execution intent.
-10. A pre-archive active row such as `applying` or `resolving` remains markable and still displays its actual `[x]` or `[ ]` state.
-11. WebUI/API display contracts and reducer lifecycle transitions remain unchanged.
+10. An active row without reducer-recorded archive completion, such as `applying` or a fresh-process `resolving` resolve retry, remains markable and still displays its actual `[x]` or `[ ]` state.
+11. WebUI/API state and display payload contracts and reducer lifecycle transitions remain unchanged; mark-command unchanged outcomes reflect reducer-recorded archive completion without adding a payload field.
 12. Preview text remains safely omitted when the widened fixed row fields leave less than the existing minimum preview width.
 
 ## Explicit Completion Conditions
 
 - `ChangeState` and `AppState` carry a process-local reducer-derived archive-complete presentation cache, synchronized in the same snapshot read as display status and reapplied after row refresh.
 - Rendering, key hints, local optimistic selection, and shared mark admission use one archive-complete predicate rather than inferring completion from `resolving`.
+- The shared mark classifier accepts caller-supplied archive-complete evidence: TUI callers use the synchronized presentation cache, while operator-command and API callers use `OrchestratorState::archived_changes()` from the same reducer read as display status. Orchestration code does not depend on TUI state.
 - Both Changes render paths use shared constants/helpers for checkbox width, the one-column checkbox-to-ID separator, 35-column ID content, and preview base width.
 - The rendered ID helper performs Unicode display-width hard truncation and right padding without adding a suffix.
 - Buffer tests assert the user's two representative rows, absence of `►`, retained highlight, stable following-field columns, and safe narrow-terminal degradation.
@@ -93,12 +97,12 @@ Cursor removal, fixed ID width, checkbox placeholder behavior, and preview width
 
 ## Fable Review Disposition
 
-The independent Fable review was adopted for the reducer-owned archive snapshot, refresh preservation, 35-plus-1 column definition, Unicode display-width handling, hard truncation without ellipsis, stale-spec cleanup, and single-proposal scope. Its suggestion to leave post-archive mark admission as a separate known limitation was not adopted: the existing checkbox contract denotes execution intent, so an invisible but mutable mark would violate truthful presentation and the canonical silent-no-op behavior.
+The initial Fable review was adopted for the reducer-owned archive snapshot, refresh preservation, 35-plus-1 column definition, Unicode display-width handling, hard truncation without ellipsis, stale-spec cleanup, and single-proposal scope. Its initial suggestion to split post-archive mark admission was not adopted because an invisible mutable mark would violate truthful presentation. Fable's artifact re-review conditionally supported that integration and required the accompanying `remote-control-api`, `operator-command-execution`, `tui-state`, and `tui-key-hints` deltas; those cross-capability contracts, the fresh-process `resolving` control, status-only fallback coverage, and caller-supplied archive evidence flow are included here.
 
 ## Out of Scope
 
 - Changing reducer lifecycle transitions or display-status vocabulary.
-- Changing WebUI/API row layout or exposing the archive-complete cache externally.
+- Changing WebUI/API state or display payload schemas, or exposing the archive-complete cache as a new field. Existing mark-command outcomes may report a stable archive-complete no-op reason.
 - Adding ellipses, horizontal scrolling, configurable column widths, or responsive column priorities.
 - Aligning status fields across rows that do not carry the same optional badges.
 - Redesigning colors, spinner glyphs, elapsed-time formatting, task progress, or preview contents.
