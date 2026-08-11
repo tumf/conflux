@@ -13,6 +13,12 @@ Base-branch tree comparison is the authoritative completion evidence. Scheduler-
 | Evidence read unknown/error | manual `merge wait` | fail closed, clear only consumed ephemeral ownership |
 | Bounded resolve exhaustion | `ResolveFailed` to `merge wait` | existing change-scoped cleanup |
 
+Unreadable evidence never *classifies* the retry as stale. It is not proof of
+completion, so it can never settle as `merged`; but it is not proof of anything
+else either, so it does not cancel the operator's retry. The retry proceeds, and
+whichever stale branch it reaches settles it with the same unproven evidence into
+manual `merge wait`.
+
 ## Decision
 
 Use a typed reducer transition at the stale-retry boundary instead of teaching `clear_resolve_wait_intent` to infer success. That helper is also used by non-success outcomes, so broadening it would risk marking failures as merged.

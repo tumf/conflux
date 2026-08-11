@@ -6,6 +6,7 @@
 //! - Merge verification
 
 use crate::error::{OrchestratorError, Result};
+use crate::orchestration::state::StaleResolveEvidence;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{VcsBackend, VcsError};
 use std::path::Path;
@@ -402,6 +403,26 @@ impl Drop for ActivePostArchiveMergeGuard {
 
 impl ParallelExecutor {
     pub(super) async fn is_change_already_merged_to_base(&self, change_id: &str) -> bool {
+        matches!(
+            self.classify_base_integration_evidence(change_id).await,
+            StaleResolveEvidence::Proven
+        )
+    }
+
+    /// Classify base-branch integration evidence for one change.
+    ///
+    /// Reads repository evidence only: base identity plus base-tree comparison.
+    /// Nothing here stages, commits, stashes, resets, or discards anything, so a
+    /// dirty index or worktree is observed and left exactly as it was.
+    ///
+    /// Unlike the boolean projection, an unreadable base identity or a failed
+    /// tree comparison stays `Unknown` instead of collapsing into
+    /// "not integrated", so a caller that must fail closed can tell the two
+    /// apart.
+    pub(super) async fn classify_base_integration_evidence(
+        &self,
+        change_id: &str,
+    ) -> StaleResolveEvidence {
         let original_branch = match self
             .workspace_manager
             .ensure_original_branch_initialized()
@@ -414,7 +435,7 @@ impl ParallelExecutor {
                     "Failed to determine base branch before post-archive merge idempotency check: {}",
                     error
                 );
-                return false;
+                return StaleResolveEvidence::Unknown;
             }
         };
 
@@ -425,8 +446,8 @@ impl ParallelExecutor {
         )
         .await
         {
-            Ok(true) => true,
-            Ok(false) => false,
+            Ok(true) => StaleResolveEvidence::Proven,
+            Ok(false) => StaleResolveEvidence::Absent,
             Err(error) => {
                 tracing::warn!(
                     change_id = %change_id,
@@ -434,7 +455,7 @@ impl ParallelExecutor {
                     "Failed to check whether change is already merged to base: {}",
                     error
                 );
-                false
+                StaleResolveEvidence::Unknown
             }
         }
     }

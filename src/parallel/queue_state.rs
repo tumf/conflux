@@ -11,7 +11,7 @@ use crate::analyzer::{AnalysisOutcome, AnalysisResult};
 use crate::dependency_targets::DependencyTargetClass;
 use crate::error::{OrchestratorError, Result};
 use crate::events::{ExecutionEvent, LogEntry};
-use crate::orchestration::state::WaitState;
+use crate::orchestration::state::{StaleResolveEvidence, StaleResolveSettlement, WaitState};
 use crate::orchestration::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
     run_rejection_review, RejectionReviewVerdict,
@@ -414,6 +414,51 @@ impl ParallelExecutor {
             let mut guard = shared.write().await;
             guard.clear_resolve_wait_intent(change_id);
         }
+    }
+
+    /// Settle a stale deferred resolve retry, then release scheduler-local ownership.
+    ///
+    /// Ordering is the point: the shared reducer records the typed outcome first,
+    /// and scheduler-local retry membership plus base-lane occupancy are released
+    /// only afterwards. A refresh that lands mid-settlement therefore sees either
+    /// the accepted retry intent or the settled outcome, never an idle
+    /// `not queued` row in between.
+    ///
+    /// Repository content is never touched here: this is bookkeeping over
+    /// evidence that was already read.
+    pub(super) async fn settle_stale_resolve_retry_for(
+        &mut self,
+        change_id: &str,
+        evidence: StaleResolveEvidence,
+    ) -> StaleResolveSettlement {
+        let settlement = match &self.shared_orchestrator_state {
+            Some(shared) => {
+                let mut guard = shared.write().await;
+                guard.settle_stale_resolve_retry(change_id, evidence)
+            }
+            // No reducer is wired: the scheduler still classifies the retry the
+            // same way so its own bookkeeping stays truthful.
+            None => match evidence {
+                StaleResolveEvidence::Proven => StaleResolveSettlement::Merged,
+                StaleResolveEvidence::Absent | StaleResolveEvidence::Unknown => {
+                    StaleResolveSettlement::MergeWaitRetained
+                }
+            },
+        };
+
+        self.resolve_wait_changes.remove(change_id);
+        self.last_dispatched_resolve_wait_changes.remove(change_id);
+        match settlement {
+            StaleResolveSettlement::MergeWaitRetained => {
+                self.merge_wait_changes.insert(change_id.to_string());
+            }
+            StaleResolveSettlement::Merged | StaleResolveSettlement::AlreadySettled => {
+                self.merge_wait_changes.remove(change_id);
+            }
+        }
+        self.abandon_base_mutating_lane_occupant_for_give_up(change_id)
+            .await;
+        settlement
     }
 
     pub(super) async fn clear_reject_wait_intent_for_success(&mut self, change_id: &str) {
@@ -1559,13 +1604,26 @@ impl ParallelExecutor {
             // cumulative base but is *not* done: retry must resume publication
             // rather than be discarded as a stale already-merged retry.
             let owes_publication = self.has_pending_publication_for(&change_id).await;
-            if !owes_publication && self.is_change_already_merged_to_base(&change_id).await {
+            // Read base-tree evidence once per retry: every stale branch below
+            // settles from this same observation.
+            let integration_evidence = if owes_publication {
+                // Durable publication is still owed, so this change is in
+                // cumulative base but not done. Base integration is not the
+                // question here, and it must never settle as merged.
+                StaleResolveEvidence::Absent
+            } else {
+                self.classify_base_integration_evidence(&change_id).await
+            };
+            // Only proof settles the retry as already done. Absent and unreadable
+            // evidence both stay retryable: the retry proceeds, and if it cannot
+            // proceed the stale branches below settle it to manual `merge wait`
+            // carrying this same unproven evidence.
+            if matches!(integration_evidence, StaleResolveEvidence::Proven) {
                 info!(
                     "Skipping stale deferred merge retry for '{}' because it is already merged to base",
                     change_id
                 );
-                self.clear_resolve_wait_intent_for_outcome(&change_id).await;
-                self.abandon_base_mutating_lane_occupant_for_give_up(&change_id)
+                self.settle_stale_resolve_retry_for(&change_id, integration_evidence)
                     .await;
                 continue;
             }
@@ -1601,9 +1659,11 @@ impl ParallelExecutor {
                         ParallelEvent::Log(LogEntry::warn(&message).with_change_id(&change_id)),
                     )
                     .await;
-                    // Remove from deferred set; the workspace is gone, nothing to retry.
-                    self.clear_resolve_wait_intent_for_outcome(&change_id).await;
-                    self.abandon_base_mutating_lane_occupant_for_give_up(&change_id)
+                    // The consumed reservation goes away because there is no
+                    // workspace left to retry, but base integration was not
+                    // proven: the row stays retryable `merge wait` rather than
+                    // dropping to idle `not queued`.
+                    self.settle_stale_resolve_retry_for(&change_id, integration_evidence)
                         .await;
                     outcome = MergeTaskOutcome::Merged;
                     continue;
@@ -1628,10 +1688,9 @@ impl ParallelExecutor {
                     workspace = %workspace_info.workspace_name,
                     workspace_path = %workspace_info.path.display(),
                     stale_reason = %stale_reason,
-                    "Deferred merge retry workspace path is stale; clearing retry intent"
+                    "Deferred merge retry workspace path is stale; keeping manual merge wait"
                 );
-                self.clear_resolve_wait_intent_for_outcome(&change_id).await;
-                self.abandon_base_mutating_lane_occupant_for_give_up(&change_id)
+                self.settle_stale_resolve_retry_for(&change_id, integration_evidence)
                     .await;
                 outcome = MergeTaskOutcome::Merged;
                 continue;
