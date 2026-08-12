@@ -18,7 +18,7 @@ Connection options belong to the `client` namespace. `--auth-token-env` names an
 
 ## Transport and discovery
 
-The default socket is derived with the same canonical Git common-directory helper as the owner. An override supports tests and explicitly configured owners. The client performs health, capabilities, instance, state, execution-status, and owner execution-contract reads before deciding an action. Because these are separate resources, one coherent observation requires the same `instance_id` and matching `state_revision`; event cursors must not move backwards. A mismatch triggers a bounded full reread, then `observation_conflict` rather than a mixed snapshot.
+The default socket is derived with the same canonical Git common-directory helper as the owner. An override supports tests and explicitly configured owners. The client performs health, capabilities, instance, state, execution-status, and owner execution-contract reads before deciding an action. Because these are separate resources, every read must retain the same `instance_id`. Revision-bearing resources are read state-last and accepted when their revisions match, or when an earlier resource is reread at the final revision; `event_sequence` must not move backwards. `status` ends bounded rereads with `observation_conflict`. `wait` keeps reconciling until its own deadline and never combines a mixed snapshot.
 
 The client should reuse the source v2 DTOs. Transport code should add only the minimum HTTP-over-UDS machinery needed by this repository; do not introduce a general HTTP client dependency if the existing Tokio/Axum/HTTP stack or a small local codec suffices.
 
@@ -54,6 +54,8 @@ Initial stable unsuccessful outcomes include:
 - `revision_conflict`
 - `observation_conflict`
 - `command_failed`
+- `partial_intent`
+- `unsupported_terminal_mode`
 - `change_rejected`
 - `process_failed`
 - `timeout`
@@ -74,7 +76,7 @@ Exit zero means the requested operation reached its successful outcome. Status s
 6. On `stale_revision`, re-read the snapshot and recompute the complete intent. Retry only a small fixed number of times. Never reuse an idempotency key with a changed typed identity.
 7. Abort if `instance_id` changes. A new process cannot prove whether an old in-flight command settled.
 
-When idle Start requires a mark followed by Start, this is intentionally a two-command sequence using server-owned transactions. Before marking and again before Start, the client refuses `operator_intent_conflict` if unrelated ordinary marks would be consumed. It never clears another operator's marks to manufacture an isolated target set. After the mark settles, the client rereads state before Start. If Start fails or another mark appears in that race window, the requested mark may remain as truthful next-run intent; JSON must report that observable partial intent rather than claim rollback.
+When idle Start requires a mark followed by Start, this is intentionally a two-command sequence using server-owned transactions. Before marking and again before Start, the client refuses `operator_intent_conflict` if unrelated ordinary marks would be consumed. It never clears another operator's marks to manufacture an isolated target set. After the mark settles, the client rereads state before Start. If Start fails or another mark appears in that race window, the requested mark may remain as truthful next-run intent. The client returns non-zero `partial_intent`, names the remaining mark, warns that a later operator Start can consume it, and never claims rollback.
 
 ## Wait algorithm
 
@@ -83,11 +85,12 @@ When idle Start requires a mark followed by Start, this is intentionally a two-c
 1. Capture `instance_id`, the typed owner execution contract, initial change snapshot, and execution status at a reconciled revision.
 2. Observe events when available, with polling as recovery for gaps; always rehydrate all observation resources after a gap.
 3. Treat command/API presentation as progress evidence, not durable completion authority.
-4. For terminal mode `merged`, require terminal `merged` presentation plus an archived proposal and Git ancestry proving the owner-published terminal commit is reachable from the owner-published base branch.
-5. For terminal mode `pushed`, require terminal `pushed` presentation plus an archived proposal and typed owner evidence naming the selected remote and remotely confirmed terminal commit; do not substitute local branch ancestry.
-6. Return unsuccessful outcomes for rejection, process-fatal failure, incompatible owner replacement, missing/ambiguous completion evidence, or timeout.
+4. For terminal mode `merged`, require the existing `classify_base_completion` repository oracle to return `Completed` for the captured base branch. Preserve its `NotCompleted`, `Contradictory`, and `EvidenceError` distinctions as typed non-success outcomes.
+5. For `base_published`, additionally require `git ls-remote` evidence that the selected remote base ref equals the locally verified base tip.
+6. For `branch_pushed`, require an archived proposal on the named local change branch and `git ls-remote` evidence that the selected remote branch ref equals that local branch tip; report publication, not base integration.
+7. Return unsuccessful outcomes for rejection, process-fatal failure, unsupported terminal mode, missing/ambiguous repository evidence, or timeout. If `instance_id` changes, reevaluate repository completion once and succeed only when repository evidence alone proves it; otherwise return `owner_restarted`.
 
-The owner execution contract is a minimal source-owned v2 DTO projected with `instance_id` and `state_revision`. It publishes base branch identity, terminal success mode, selected remote when applicable, and the exact terminal commit evidence already owned by the orchestration boundary. It is observability only and cannot drive workflow routing.
+The owner execution contract is a minimal source-owned v2 DTO projected with `instance_id` and `state_revision`. It publishes base branch identity, terminal mode, selected remote, and pushed branch when applicable. It does not retain per-change terminal commits or become durable workflow authority; current Git/OpenSpec evidence certifies completion.
 
 ## Security and failure handling
 
@@ -102,4 +105,4 @@ The owner execution contract is a minimal source-owned v2 DTO projected with `in
 
 Use a real local router on a temporary Unix socket with fixture projections and bound/unbound executors. Run the compiled CLI against it. Deterministic synchronization should advance state and command settlement without short correctness timeouts. Timeout flags remain generous safety valves and explicit timeout behavior tests may use paused time or immediate fixture deadlines.
 
-Tests must prove real command calls occurred where expected and zero calls occurred for status, wait, and refused enqueue paths. Stub JSON responses without router/client execution are insufficient for the main integration proof.
+Tests must prove real command calls occurred where expected and zero calls occurred for status, wait, and refused enqueue paths. Stub JSON responses without router/client execution are insufficient for the main integration proof. A production-wired smoke test proves one admission round trip only; terminal proof uses deterministic temporary Git repositories and refs so the default suite stays under its one-second target.

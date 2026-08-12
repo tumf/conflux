@@ -20,7 +20,7 @@ verifications:
     trigger: pull-request-validation
     automation: Cargo.toml
     evidence: CLI parser, Unix-socket integration, concurrency-retry, owner-unavailable, read-only status, enqueue, and wait outcome tests
-    rerun: cargo test --features web-monitoring --test client_cli_tests
+    rerun: cargo test --features web-monitoring --test client_cli_tests && cargo test --no-default-features --test client_cli_tests feature_disabled
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -52,13 +52,13 @@ The client also needs truthful waiting semantics. A successful enqueue command o
 
 Add a `cflx client` namespace for a thin local client of the existing repository owner:
 
-- `cflx client status --json` discovers the repository-scoped Unix socket, reads capabilities, instance, authoritative state, execution status, and the typed owner execution contract, then emits one stable summary envelope without mutation. Multi-resource reads are coherent only when `instance_id`, `state_revision`, and compatible `event_sequence` boundaries agree; otherwise the client performs bounded rereads or returns a typed observation conflict.
+- `cflx client status --json` discovers the repository-scoped Unix socket, reads capabilities, instance, authoritative state, execution status, and the typed owner execution contract, then emits one stable summary envelope without mutation. Multi-resource reads are coherent only when `instance_id` agrees and revision-bearing resources reconcile at one `state_revision`; `event_sequence` must not move backwards. Otherwise `status` performs bounded rereads and returns a typed observation conflict, while `wait` keeps reconciling until its deadline.
 - `cflx client enqueue <change-id> --json` expresses the high-level intent “admit this change to the existing owner.” The client reads authoritative action/lifecycle fields and uses the smallest supported sequence of existing typed commands. It owns revision refresh, idempotency keys, command-record settlement, bounded stale-revision retries, and mode-aware choice of execution mark, queue intent, retry, and start. It never starts a second owner.
 - `cflx client wait <change-id> --json [--timeout <duration>]` observes the same owner until repository-verifiable success or a typed unsuccessful terminal result. It does not mutate, retry, archive, merge, or repair work.
 
 The public CLI contract is intent-based. It must not expose flags for `expected_revision`, raw command type, queue marks, or caller-provided idempotency keys. JSON output uses a versioned envelope and stable outcome/error codes; human output remains concise and diagnostics go to stderr.
 
-`control` uses the default `${GIT_COMMON_DIR}/cflx-api.sock` and permits an explicit `--unix-socket PATH` override. A bearer token may be read only from an explicitly named environment variable; the CLI must not accept a token value in argv or print it. Missing Git identity, missing/unreachable owner, incompatible capabilities, an unbound command executor such as `cflx run`, authentication failure, owner restart during a mutation, and timeout all fail closed with distinct machine-readable outcomes.
+`client` uses the default `${GIT_COMMON_DIR}/cflx-api.sock` and permits an explicit `--unix-socket PATH` override. A bearer token may be read only from an explicitly named environment variable; the CLI must not accept a token value in argv or print it. Missing Git identity, missing/unreachable owner, incompatible capabilities, an unbound command executor such as `cflx run`, authentication failure, owner restart during a mutation, and timeout all fail closed with distinct machine-readable outcomes.
 
 ## Acceptance Criteria
 
@@ -78,9 +78,9 @@ The public CLI contract is intent-based. It must not expose flags for `expected_
 
 - CLI parsing and help expose only `status`, `enqueue`, and `wait` under `client`, plus shared connection/output options.
 - A reusable internal client connects over Unix domain sockets and reuses the source-owned v2 DTOs rather than duplicating ad-hoc JSON field parsing; generated OpenAPI remains the external schema contract.
-- The owner publishes a minimal typed execution contract containing base branch identity and terminal success mode (`merged` or `pushed`, including selected remote when applicable), at the same owner incarnation and revision boundary used by client observations.
+- The owner publishes a minimal typed execution contract containing base branch identity and terminal mode (`merged`, `base_published`, or `branch_pushed`), plus selected remote and pushed branch when applicable, at the same owner incarnation and revision boundary used by client observations. The client derives completion from current Git/OpenSpec evidence rather than ephemeral owner-held commit facts.
 - Integration fixtures run a real local v2 router with bound and unbound executors and prove the success, no-op, refusal, stale-revision, restart, timeout, and no-side-effect paths.
-- One bounded smoke test runs the compiled client CLI against a production shared operator coordinator/real local owner and proves actual admission and terminal completion, rather than only fixture executor calls.
+- One bounded smoke test runs the compiled client CLI against a production shared operator coordinator/real local owner and proves actual admission rather than only fixture executor calls. Deterministic temporary Git fixtures separately prove terminal completion without invoking an AI phase.
 - Tests prove `status` and `wait` submit zero commands and that failed `enqueue` paths do not start a second process, acquire the repository lock, or mutate Git/workspace state.
 - JSON schema/version and exit-code mappings are asserted as executable CLI behavior, including clean stdout/stderr separation.
 - `cargo test --features web-monitoring --test client_cli_tests`, `cargo fmt --check`, and `cargo clippy --features web-monitoring -- -D warnings` pass.

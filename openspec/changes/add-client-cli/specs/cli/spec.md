@@ -51,7 +51,7 @@ Client commands MUST support concise human output and a machine-readable JSON mo
 
 `cflx client enqueue <change-id>` MUST express the high-level intent to admit one change to the existing command-capable owner. The CLI MUST determine the route from authoritative capabilities, instance, state, execution status, and action eligibility. It MUST shield callers from raw command types, `expected_revision`, execution marks, queue intent, and idempotency keys.
 
-The CLI MUST submit the smallest supported sequence through the existing shared operator-command service, wait for each command record to settle, and return success only when the target is already admitted or the intended admission is accepted. It MUST recompute intent after bounded stale-revision conflicts, use a fresh idempotency identity when the typed command identity changes, and fail if the owner instance changes. It MUST fail closed for unknown, final, blocked, worktree-ineligible, active-run-limited, unsupported, or command-incapable targets without starting another owner or claiming admission. An idle-owner Start MUST NOT consume unrelated execution marks: the client MUST preserve them and return a typed operator-intent conflict if it cannot isolate the requested target through existing semantics.
+The CLI MUST submit the smallest supported sequence through the existing shared operator-command service, wait for each command record to settle, and return success only when the target is already admitted or the intended admission is accepted. It MUST recompute intent after bounded stale-revision conflicts, use a fresh idempotency identity when the typed command identity changes, and fail if the owner instance changes. It MUST fail closed for unknown, final, blocked, worktree-ineligible, active-run-limited, unsupported, or command-incapable targets without starting another owner or claiming admission. An idle-owner Start MUST NOT consume unrelated execution marks: the client MUST preserve them and return a typed operator-intent conflict if it cannot isolate the requested target through existing semantics. If the requested mark settles but Start does not, the client MUST return non-zero `partial_intent`, identify the remaining mark, warn that a later operator Start can consume it, and MUST NOT claim rollback.
 
 #### Scenario: Idle owner admits one change
 
@@ -74,6 +74,14 @@ The CLI MUST submit the smallest supported sequence through the existing shared 
 **Then**: the client does not submit Start for the combined marked set
 **And**: it does not clear or otherwise mutate `beta`'s mark
 **And**: it returns `operator_intent_conflict` with a non-zero exit status
+
+#### Scenario: Settled mark without Start is partial intent
+
+**Given**: idle admission settles the requested execution mark
+**When**: Start is rejected or a conflicting mark appears before Start
+**Then**: enqueue exits non-zero with outcome `partial_intent`
+**And**: it identifies the remaining requested mark and warns that a later operator Start can consume it
+**And**: it does not claim rollback
 
 #### Scenario: Stale revision is recomputed safely
 
@@ -99,9 +107,9 @@ The CLI MUST submit the smallest supported sequence through the existing shared 
 
 ### Requirement: Observation-only completion wait
 
-`cflx client wait <change-id>` MUST observe one owner and repository until the requested change reaches a repository-verifiable terminal success, a typed unsuccessful terminal outcome, owner replacement, or timeout. It MUST use event streaming when available and authoritative multi-resource polling to recover from gaps. Reads MUST agree on `instance_id` and `state_revision`; incompatible reads require bounded reread or typed observation conflict. API presentation and command records MAY provide progress but MUST NOT alone certify implementation or integration completion.
+`cflx client wait <change-id>` MUST observe one owner and repository until the requested change reaches a repository-verifiable terminal success, a typed unsuccessful terminal outcome, owner replacement, or timeout. It MUST use event streaming when available and authoritative multi-resource polling to recover from gaps. Reads MUST agree on `instance_id`; revision-bearing resources must reconcile at one `state_revision`, and `event_sequence` must not move backwards. `status` may end bounded rereads with typed observation conflict, while `wait` must keep reconciling until its deadline. API presentation and command records MAY provide progress but MUST NOT alone certify implementation or integration completion.
 
-Wait MUST submit no mutation command. Change disappearance alone MUST NOT count as success. For owner terminal mode `merged`, success requires archived proposal evidence and Git ancestry from the owner-published terminal commit to the owner-published base branch. For terminal mode `pushed`, success requires archived proposal evidence plus owner-published selected-remote and remotely confirmed terminal commit evidence. Missing or ambiguous typed owner evidence MUST fail closed rather than weaken truthful completion.
+Wait MUST submit no mutation command. Change disappearance alone MUST NOT count as success. For terminal mode `merged`, success requires the existing repository completion oracle to return `Completed` for the captured base branch. For `base_published`, the selected remote base ref must additionally equal the locally verified base tip. For `branch_pushed`, archived proposal evidence must exist on the named local change branch and the selected remote branch ref must equal that local branch tip; this proves publication, not base integration. `NotCompleted`, `Contradictory`, `EvidenceError`, unsupported mode, and missing or ambiguous repository evidence MUST remain typed non-success outcomes.
 
 #### Scenario: Wait proves successful local integration
 
@@ -112,10 +120,10 @@ Wait MUST submit no mutation command. Change disappearance alone MUST NOT count 
 
 #### Scenario: Wait proves pushed publication
 
-**Given**: `alpha` is processed by one owner in pushed terminal mode
-**When**: the owner reports terminal `pushed`, an archived proposal exists, and typed owner evidence identifies the selected remote and remotely confirmed terminal commit
+**Given**: `alpha` is processed in `branch_pushed` terminal mode
+**When**: an archived proposal exists on the named local change branch and the selected remote branch ref equals that local branch tip
 **Then**: `cflx client wait alpha --json` exits zero with outcome `completed`
-**And**: it does not substitute local branch ancestry for remote confirmation
+**And**: it reports branch publication without claiming base integration
 
 #### Scenario: Mixed observation is not completion
 
@@ -142,8 +150,9 @@ Wait MUST submit no mutation command. Change disappearance alone MUST NOT count 
 
 **Given**: wait captured one process `instance_id`
 **When**: the socket begins serving a different owner incarnation
-**Then**: wait exits non-zero with outcome `owner_restarted`
-**And**: it does not infer settlement of commands or work owned by the prior process
+**Then**: wait reevaluates current repository completion evidence once for `alpha`
+**And**: it returns successful completion only if repository evidence alone proves it
+**And**: otherwise it exits non-zero with outcome `owner_restarted` without inferring settlement of commands owned by the prior process
 
 #### Scenario: Timeout is not completion
 
