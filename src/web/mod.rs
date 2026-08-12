@@ -266,6 +266,10 @@ pub fn remote_control_router(
         // orchestration runtime that produces them, so the status resource and
         // the command path observe the same process.
         .with_execution_facts(runtime.execution_facts())
+        // Same late binding for the execution contract: startup resolves the
+        // base branch and terminal mode after the listener is already bound, so
+        // the resource reports "not published yet" until it does.
+        .with_execution_contract(runtime.execution_contract())
         // The runtime is both the command target and the worktree read port, so
         // both halves of the API see the same late binding.
         .with_worktrees(runtime),

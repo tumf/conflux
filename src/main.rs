@@ -9,6 +9,7 @@ mod embedded_skills;
 mod install_skills;
 
 mod cli;
+mod client;
 mod command_queue;
 mod completion;
 mod config;
@@ -229,6 +230,20 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
         None => (None, None),
     };
 
+    // Startup has now resolved both publication options, so the contract a
+    // client verifies completion against is a fact rather than a guess.
+    #[cfg(feature = "web-monitoring")]
+    if let Some(state) = &web_state_opt {
+        publish_execution_contract(
+            state,
+            args.push.as_deref(),
+            upstream_runtime
+                .as_ref()
+                .map(|runtime| runtime.config.remote.as_str()),
+        )
+        .await;
+    }
+
     #[cfg(not(feature = "web-monitoring"))]
     let web_url: Option<String> = {
         if args.web {
@@ -271,6 +286,41 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
     }
 
     result
+}
+
+/// Publish the minimal execution contract a client needs to verify completion.
+///
+/// This is what turns `cflx client wait` from a guess into a proof: it names the
+/// base branch this owner integrates into and *how* a change reaches its
+/// terminal success, so a waiter knows which repository evidence would count.
+/// It is observational only — nothing in this process reads it back to decide a
+/// workflow action, and it holds no per-change or durable state.
+///
+/// Published after option validation and before orchestration, so a client that
+/// connects during startup sees either no contract or the real one, never a
+/// guessed base branch.
+#[cfg(feature = "web-monitoring")]
+async fn publish_execution_contract(
+    state: &web::WebState,
+    push_remote: Option<&str>,
+    upstream_remote: Option<&str>,
+) {
+    let Ok(repo_root) = std::env::current_dir() else {
+        return;
+    };
+    // A detached HEAD has no base-branch identity to publish, and inventing one
+    // would let a client verify completion against a branch this owner never
+    // integrates into. Publishing nothing makes `wait` say so.
+    let Ok(Some(base_branch)) = vcs::git::commands::get_current_branch(&repo_root).await else {
+        return;
+    };
+    state.set_execution_contract(
+        web::remote_control_api::dto::OwnerExecutionContract::resolve(
+            base_branch,
+            push_remote,
+            upstream_remote,
+        ),
+    );
 }
 
 /// Resolve which listeners this local orchestration invocation must start.
@@ -823,6 +873,15 @@ async fn main() -> Result<()> {
             run_openapi_subcommand();
         }
 
+        // A client of an existing owner, so it runs before logging, config
+        // loading, lifecycle adapters, and orchestration — none of which a
+        // client is allowed to start. The repository lock was already bypassed
+        // for this invocation kind, so nothing here can contend with the owner
+        // it is about to talk to.
+        Some(Commands::Client(args)) => {
+            std::process::exit(client::run(args).await);
+        }
+
         // No subcommand: launch TUI (default behavior)
         None => {
             launch_tui(TuiArgs {
@@ -884,6 +943,19 @@ async fn main() -> Result<()> {
                         orchestration::execution_facts::ExecutionFactsStore::new(),
                     ))
                     .await;
+                // A run binds no command executor, so a client can only observe
+                // it — but observing truthfully still needs to know which
+                // repository evidence would prove a change finished.
+                publish_execution_contract(
+                    web_state,
+                    args.push.as_deref(),
+                    args.upstream_integration()
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        .map(|config| config.remote.as_str()),
+                )
+                .await;
             }
 
             #[cfg(not(feature = "web-monitoring"))]

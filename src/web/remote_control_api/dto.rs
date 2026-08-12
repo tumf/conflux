@@ -53,6 +53,14 @@ pub enum ErrorCode {
     StaleRevision,
     /// The current lifecycle state does not accept this command.
     LifecycleConflict,
+    /// This process serves reads but has no command executor bound, so no
+    /// mutation can be executed and none is queued for a future one.
+    ///
+    /// Distinct from [`Self::LifecycleConflict`] on purpose: a lifecycle
+    /// conflict says "not now, in this state", while this says "not by this
+    /// process, ever". A client that confused the two would keep retrying a
+    /// headless `cflx run` forever.
+    CommandExecutorUnbound,
     /// The named target cannot accept this command right now.
     TargetIneligible,
     /// The workspace root is busy with another operation.
@@ -86,6 +94,7 @@ impl ErrorCode {
             Self::NotFound | Self::WorktreeNotFound => StatusCode::NOT_FOUND,
             Self::StaleRevision
             | Self::LifecycleConflict
+            | Self::CommandExecutorUnbound
             | Self::TargetIneligible
             | Self::RootBusy
             | Self::IdempotencyMismatch
@@ -107,6 +116,7 @@ impl ErrorCode {
             Self::NotFound => "not_found",
             Self::StaleRevision => "stale_revision",
             Self::LifecycleConflict => "lifecycle_conflict",
+            Self::CommandExecutorUnbound => "command_executor_unbound",
             Self::TargetIneligible => "target_ineligible",
             Self::RootBusy => "root_busy",
             Self::IdempotencyMismatch => "idempotency_mismatch",
@@ -123,12 +133,13 @@ impl ErrorCode {
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 16] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 17] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
     ErrorCode::StaleRevision,
     ErrorCode::LifecycleConflict,
+    ErrorCode::CommandExecutorUnbound,
     ErrorCode::TargetIneligible,
     ErrorCode::RootBusy,
     ErrorCode::IdempotencyMismatch,
@@ -555,10 +566,26 @@ pub struct CapabilitiesResponse {
     pub limits: CapabilityLimits,
     /// True when bearer authentication is enforced.
     pub authentication_required: bool,
+    /// Whether this process can execute a command at all.
+    pub command_execution: CommandExecutionCapability,
     /// The complete worktree surface, including its conflict-recovery boundary.
     pub worktrees: super::worktrees::WorktreeCapabilities,
     /// The parallel execution surface, including its blocked-reason vocabulary.
     pub parallel: ParallelCapabilities,
+}
+
+/// Whether a mutation can be executed by this process at all.
+///
+/// A separate typed fact from lifecycle eligibility: a headless `cflx run`
+/// serves every read resource and publishes ordinary action eligibility, but has
+/// no command executor bound, so *every* mutation is refused with
+/// [`ErrorCode::CommandExecutorUnbound`] and none is queued for a future
+/// executor. A client reads this before it prepares a mutation, rather than
+/// discovering it from a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CommandExecutionCapability {
+    /// True once a command executor is bound to this process incarnation.
+    pub available: bool,
 }
 
 /// One supported event transport.
@@ -1278,6 +1305,111 @@ pub struct ExecutionStatusResponse {
     pub process: ProcessExecutionStatus,
     /// Per-change facts, in snapshot order.
     pub changes: Vec<ChangeExecutionStatus>,
+}
+
+// ============================================================================
+// Owner execution contract
+// ============================================================================
+//
+// The minimum a client needs to know *what would prove* that a change finished.
+// It is deliberately not a completion record: it names the base branch, the
+// terminal mode, and the remote/branch identity that mode publishes to, and
+// stops there. Current Git and OpenSpec evidence certifies completion; nothing
+// here is durable, per-change, or authoritative for routing.
+
+/// How this owner finishes a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMode {
+    /// The change branch is merged into the local base branch.
+    Merged,
+    /// The verified cumulative base is additionally published to a remote.
+    BasePublished,
+    /// The change branch is pushed to a remote instead of merged to base.
+    ///
+    /// Publication, never base integration: a pushed branch proves the work
+    /// left the machine, not that base contains it.
+    BranchPushed,
+}
+
+impl TerminalMode {
+    /// Wire representation, used by contract assertions.
+    #[allow(dead_code)] // Read by the OpenAPI contract assertions, not by the binary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merged => "merged",
+            Self::BasePublished => "base_published",
+            Self::BranchPushed => "branch_pushed",
+        }
+    }
+}
+
+/// Every terminal mode, in the order the contract advertises them.
+#[allow(dead_code)] // Read by the OpenAPI contract assertions, not by the binary.
+pub const ALL_TERMINAL_MODES: [&str; 3] = ["merged", "base_published", "branch_pushed"];
+
+/// The minimal typed execution contract of one owner incarnation.
+///
+/// Inapplicable fields are *omitted*, not nulled: a `merged` owner has no
+/// selected remote, and publishing an empty one would invite a client to build a
+/// remote-ref check that can never pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct OwnerExecutionContract {
+    /// Base branch this owner integrates into and verifies completion against.
+    pub base_branch: String,
+    /// How a change reaches its terminal success.
+    pub terminal_mode: TerminalMode,
+    /// Remote selected for publication. Present for `base_published` and
+    /// `branch_pushed` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// Server-derived local change branch that `branch_pushed` publishes.
+    ///
+    /// Present only when the request named a change *and* the mode is
+    /// `branch_pushed`. The derivation stays server-side for the same reason
+    /// worktree branches do: a client must never be able to point terminal proof
+    /// at a ref it chose itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pushed_branch: Option<String>,
+}
+
+impl OwnerExecutionContract {
+    /// Classify the terminal mode from the two mutually exclusive publication
+    /// options an entrypoint resolved.
+    ///
+    /// The frontends already reject `--push` together with upstream
+    /// integration, so the two are disjoint by construction; upstream wins the
+    /// impossible case because the upstream lane is what would actually own the
+    /// terminal boundary if it ever existed.
+    pub fn resolve(
+        base_branch: impl Into<String>,
+        push_remote: Option<&str>,
+        upstream_remote: Option<&str>,
+    ) -> Self {
+        let (terminal_mode, remote) = match (upstream_remote, push_remote) {
+            (Some(remote), _) => (TerminalMode::BasePublished, Some(remote.to_string())),
+            (None, Some(remote)) => (TerminalMode::BranchPushed, Some(remote.to_string())),
+            (None, None) => (TerminalMode::Merged, None),
+        };
+        Self {
+            base_branch: base_branch.into(),
+            terminal_mode,
+            remote,
+            // Change-scoped and therefore resolved per request, never stored.
+            pushed_branch: None,
+        }
+    }
+}
+
+/// `GET /api/v2/execution-contract` body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ExecutionContractResponse {
+    /// Process incarnation this contract belongs to.
+    pub instance_id: String,
+    /// Revision the contract was read at, for joining with `/api/v2/state`.
+    pub state_revision: u64,
+    /// The contract; `null` while no orchestration runtime has published one.
+    pub contract: Option<OwnerExecutionContract>,
 }
 
 // ============================================================================

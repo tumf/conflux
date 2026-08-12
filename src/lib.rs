@@ -27,7 +27,8 @@ mod agent;
 pub mod ai_command_runner;
 mod analyzer;
 mod archive_layout;
-mod cli;
+pub mod cli;
+pub mod client;
 mod command_queue;
 pub mod completion;
 pub mod config;
@@ -37,7 +38,9 @@ mod error_history;
 mod execution;
 mod history;
 mod hooks;
-mod openspec;
+// Public so `tests/client_cli_tests.rs` can build the same monitoring snapshot a
+// real owner publishes when it wires a production coordinator.
+pub mod openspec;
 pub mod openspec_cmd;
 pub mod orchestration;
 mod orchestrator;

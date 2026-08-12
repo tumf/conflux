@@ -92,6 +92,53 @@ pub struct RemoteControlRuntime {
     /// Execution facts and scheduler liveness, bound with the orchestration
     /// runtime that produces them.
     execution_facts: Arc<ExecutionFactsHandle>,
+    /// The owner execution contract, bound once startup has resolved the base
+    /// branch and the terminal mode this process will finish changes with.
+    execution_contract: Arc<ExecutionContractHandle>,
+}
+
+/// Late-bound holder of this owner's minimal execution contract.
+///
+/// Unbound until startup has resolved a base branch and a terminal mode, which
+/// is deliberately *before* orchestration runs but *after* option validation:
+/// publishing a guessed contract would let a client verify completion against a
+/// branch this owner never integrates into.
+///
+/// Behind a synchronous lock because every operation is a clone of a small
+/// value, so an async lock would only add an await point a request could be
+/// reordered against.
+#[derive(Default)]
+pub struct ExecutionContractHandle {
+    contract: std::sync::RwLock<Option<dto::OwnerExecutionContract>>,
+}
+
+impl ExecutionContractHandle {
+    /// Publish the contract this process will finish changes with.
+    pub fn bind(&self, contract: dto::OwnerExecutionContract) {
+        *self
+            .contract
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(contract);
+    }
+
+    /// The published contract, resolved for one change when a change was named.
+    ///
+    /// The branch derivation is applied here rather than by the caller so a
+    /// client can never point terminal proof at a ref of its own choosing.
+    pub fn resolve(&self, change_id: Option<&str>) -> Option<dto::OwnerExecutionContract> {
+        let mut contract = self
+            .contract
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        contract.pushed_branch = match (contract.terminal_mode, change_id) {
+            (dto::TerminalMode::BranchPushed, Some(change_id)) => Some(
+                crate::worktree_ops::service::branch_name_for_change(change_id),
+            ),
+            _ => None,
+        };
+        Some(contract)
+    }
 }
 
 /// Late-bound handle to the shared execution-facts store and the scheduler
@@ -208,6 +255,7 @@ impl RemoteControlRuntime {
             worktrees: tokio::sync::RwLock::new(None),
             gate: Arc::new(CommandGate::default()),
             execution_facts: Arc::new(ExecutionFactsHandle::default()),
+            execution_contract: Arc::new(ExecutionContractHandle::default()),
         }
     }
 
@@ -224,6 +272,16 @@ impl RemoteControlRuntime {
     /// The execution-facts handle the status resource reads.
     pub fn execution_facts(&self) -> Arc<ExecutionFactsHandle> {
         self.execution_facts.clone()
+    }
+
+    /// The execution-contract handle the contract resource reads.
+    pub fn execution_contract(&self) -> Arc<ExecutionContractHandle> {
+        self.execution_contract.clone()
+    }
+
+    /// Publish this owner's execution contract.
+    pub fn bind_execution_contract(&self, contract: dto::OwnerExecutionContract) {
+        self.execution_contract.bind(contract);
     }
 
     /// Bind the shared execution-facts store once an orchestration runtime exists.
@@ -298,15 +356,22 @@ impl RemoteControlExecutor for RemoteControlRuntime {
             None => Err(unbound_runtime()),
         }
     }
+
+    async fn is_command_capable(&self) -> bool {
+        self.executor.read().await.is_some()
+    }
 }
 
 /// The refusal a process with no orchestration runtime returns.
 ///
 /// A refusal rather than a queue: a controller must not be told a command was
-/// accepted by a process that cannot act on it.
+/// accepted by a process that cannot act on it. Its own error code rather than
+/// a lifecycle conflict, because the two ask different things of a client — a
+/// lifecycle conflict may clear on its own, while an unbound executor never
+/// does within this incarnation.
 fn unbound_runtime() -> CommandFailure {
     CommandFailure::new(
-        ErrorCode::LifecycleConflict,
+        ErrorCode::CommandExecutorUnbound,
         "this instance has no orchestration runtime bound yet",
     )
 }
@@ -361,6 +426,11 @@ pub struct RemoteControlState {
     pub gate: Arc<CommandGate>,
     /// Execution facts and scheduler liveness for `/api/v2/execution-status`.
     pub execution_facts: Arc<ExecutionFactsHandle>,
+    /// Owner execution contract for `/api/v2/execution-contract`.
+    ///
+    /// Defaults to unbound, which is a process that has not resolved a base
+    /// branch or terminal mode yet and says exactly that.
+    pub execution_contract: Arc<ExecutionContractHandle>,
 }
 
 impl RemoteControlState {
@@ -384,7 +454,14 @@ impl RemoteControlState {
             worktrees: Arc::new(UnboundWorktreeOperations),
             gate: Arc::new(CommandGate::default()),
             execution_facts: Arc::new(ExecutionFactsHandle::default()),
+            execution_contract: Arc::new(ExecutionContractHandle::default()),
         }
+    }
+
+    /// Attach the owner execution contract this router publishes.
+    pub fn with_execution_contract(mut self, contract: Arc<ExecutionContractHandle>) -> Self {
+        self.execution_contract = contract;
+        self
     }
 
     /// Attach the application gate this router serializes submissions with.
@@ -424,6 +501,7 @@ pub fn router(state: RemoteControlState) -> Router {
         .route("/api/v2/instance", get(reads::instance))
         .route("/api/v2/state", get(reads::state))
         .route("/api/v2/execution-status", get(reads::execution_status))
+        .route("/api/v2/execution-contract", get(reads::execution_contract))
         .route("/api/v2/changes", get(reads::list_changes))
         .route("/api/v2/changes/{change_id}", get(reads::get_change))
         .route("/api/v2/logs", get(reads::logs))

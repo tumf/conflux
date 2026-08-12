@@ -729,7 +729,13 @@ fn classify_actions(
 }
 
 /// Action eligibility for an `app_mode`/status pair, for tests and fixtures.
-#[cfg(test)]
+///
+/// Reachable outside `cfg(test)` so `tests/client_cli_tests.rs` builds its
+/// fixtures through the real classifier; a hand-written `ChangeActions` there
+/// could advertise a route production refuses, and the client's routing reads
+/// exactly these fields.
+#[doc(hidden)]
+#[allow(dead_code)] // Used by unit tests and by `tests/client_cli_tests.rs`.
 pub fn change_actions_for_test(
     app_mode: &str,
     display_status: &str,
@@ -745,7 +751,14 @@ pub fn change_actions_for_test(
 }
 
 /// Action eligibility with an explicit active Apply-iteration-limit gate.
-#[cfg(test)]
+///
+/// Reachable outside `cfg(test)` for the same reason as
+/// [`change_actions_for_test`]: the active-ceiling refusal is produced by a live
+/// scheduler boundary plus typed limit evidence, which a client fixture cannot
+/// assemble, and a hand-written `ChangeActions` there could publish a reason the
+/// server never would.
+#[doc(hidden)]
+#[allow(dead_code)] // Used by unit tests and by `tests/client_cli_tests.rs`.
 pub fn limited_change_actions_for_test(
     app_mode: &str,
     display_status: &str,

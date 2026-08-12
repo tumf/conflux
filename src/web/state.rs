@@ -614,6 +614,19 @@ impl WebState {
         self.remote_control.bind_execution_facts(facts);
     }
 
+    /// Publish this owner's minimal execution contract.
+    ///
+    /// Called once startup has resolved the base branch and the terminal mode,
+    /// which is what a client needs to know *which* repository evidence would
+    /// prove a change finished. It is observation only: nothing reads it back to
+    /// decide a workflow action.
+    pub fn set_execution_contract(
+        &self,
+        contract: crate::web::remote_control_api::dto::OwnerExecutionContract,
+    ) {
+        self.remote_control.bind_execution_contract(contract);
+    }
+
     /// Bind the repository root used to redact published worktree paths.
     pub async fn set_repo_root(&self, repo_root: std::path::PathBuf) {
         self.operator_facts.write().await.set_repo_root(repo_root);

@@ -40,6 +40,7 @@ Automates the OpenSpec change workflow:
 SUBCOMMANDS:
   run      Execute orchestration loop (non-interactive)
   tui      Launch interactive TUI dashboard (default)
+  client   Operate an existing owner (status/enqueue/wait) without becoming one
   init     Generate configuration template
   openapi  Print the generated /api/v2 OpenAPI 3.1 schema to stdout
 
@@ -187,6 +188,7 @@ impl Cli {
             Commands::InstallSkills(_) => Some("install-skills"),
             Commands::Logs(_) => Some("logs"),
             Commands::Openspec(_) => Some("openspec"),
+            Commands::Client(_) => Some("client"),
             Commands::Openapi => Some("openapi"),
             Commands::Completion(_) => Some("completion"),
             Commands::Complete(_) => Some("__complete"),
@@ -266,6 +268,25 @@ pub enum Commands {
     ///   cflx openspec validate --strict             # Validate all changes
     ///   cflx openspec archive my-change --yes       # Archive a change
     Openspec(OpenspecArgs),
+
+    /// Operate an existing Conflux owner as a client, without becoming one
+    ///
+    /// `cflx client` talks to the process that already holds this repository —
+    /// a TUI, or a `cflx run` for read-only observation — over its local
+    /// `/api/v2` Unix socket. It never takes the repository lock, binds a
+    /// listener, starts orchestration, or launches an AI subprocess, which is
+    /// exactly what separates it from `cflx run`: `run` *is* an owner of a
+    /// finite explicit-target run, while `client` only speaks to one.
+    ///
+    /// Intent, not protocol: the CLI reads authoritative eligibility itself and
+    /// chooses the commands, so no caller constructs a revision, an idempotency
+    /// key, an execution mark, or a queue intent.
+    ///
+    /// EXAMPLES:
+    ///   cflx client status --json               # Read the owner without mutating it
+    ///   cflx client enqueue alpha --json        # Ask the owner to admit one change
+    ///   cflx client wait alpha --timeout 30m    # Observe until verified completion
+    Client(ClientArgs),
 
     /// Print the generated /api/v2 OpenAPI 3.1 schema to standard output
     ///
@@ -823,6 +844,206 @@ pub fn install_skills_legacy_error(src: &str) -> String {
          cflx install-skills           # project scope\n  \
          cflx install-skills --global  # global scope"
     )
+}
+
+// ============================================================================
+// Existing-owner client namespace
+// ============================================================================
+
+/// Smallest accepted `--timeout`, so a "0s" typo cannot turn a wait into a probe.
+///
+/// Sub-second values are accepted because the deadline is a safety valve, not a
+/// latency budget: a scripted caller that wants "check once and give up" should
+/// be able to say so without inventing a second flag.
+const MIN_CLIENT_TIMEOUT_MILLIS: u64 = 100;
+
+/// Largest accepted `--timeout`: 7 days.
+///
+/// Not a policy about how long work may take — it is a parse bound, so an
+/// accidental `--timeout 99999999999h` fails as usage rather than as an overflow
+/// deep inside a deadline computation.
+const MAX_CLIENT_TIMEOUT_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Longest accepted change ID.
+const MAX_CHANGE_ID_LEN: usize = 128;
+
+/// Parse a `--timeout` value as a strict duration.
+///
+/// Accepted spellings are `<n>`, `<n>ms`, `<n>s`, `<n>m`, and `<n>h`; a bare
+/// number is seconds. Deliberately strict: a silently-ignored suffix would turn
+/// `30m` into thirty seconds and make a wait report `timeout` on work that was
+/// fine. `ms` is matched before `m` for the same reason.
+pub fn parse_client_timeout(value: &str) -> std::result::Result<std::time::Duration, String> {
+    let trimmed = value.trim();
+    let (digits, multiplier) = if let Some(digits) = trimmed.strip_suffix("ms") {
+        (digits, 1)
+    } else if let Some(digits) = trimmed.strip_suffix('s') {
+        (digits, 1_000)
+    } else if let Some(digits) = trimmed.strip_suffix('m') {
+        (digits, 60_000)
+    } else if let Some(digits) = trimmed.strip_suffix('h') {
+        (digits, 3_600_000)
+    } else {
+        (trimmed, 1_000)
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "'{value}' is not a duration: use a whole number optionally suffixed with ms, s, m, or h (for example 500ms, 30s, 45m, 2h)"
+        ));
+    }
+    let magnitude: u64 = digits
+        .parse()
+        .map_err(|_| format!("'{value}' is out of range: the maximum timeout is 7d"))?;
+    let millis = magnitude
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("'{value}' is out of range: the maximum timeout is 7d"))?;
+    if !(MIN_CLIENT_TIMEOUT_MILLIS..=MAX_CLIENT_TIMEOUT_MILLIS).contains(&millis) {
+        return Err(format!(
+            "'{value}' is out of range: the timeout must be between {MIN_CLIENT_TIMEOUT_MILLIS}ms and 7d"
+        ));
+    }
+    Ok(std::time::Duration::from_millis(millis))
+}
+
+/// Parse a change ID as an ordinary managed identifier.
+///
+/// Change IDs reach a socket path join, a Git ref derivation, and a URL query,
+/// so the accepted shape is narrow on purpose: a leading dot, a separator, or a
+/// percent sign is rejected as usage rather than escaped somewhere downstream.
+pub fn parse_change_id(value: &str) -> std::result::Result<String, String> {
+    let invalid = |reason: &str| {
+        Err(format!(
+            "'{value}' is not a change ID: {reason}. Change IDs are 1-{MAX_CHANGE_ID_LEN} characters of [A-Za-z0-9._-] and may not start with '.' or '-'"
+        ))
+    };
+    if value.is_empty() {
+        return invalid("it is empty");
+    }
+    if value.len() > MAX_CHANGE_ID_LEN {
+        return invalid("it is too long");
+    }
+    if value.starts_with('.') || value.starts_with('-') {
+        return invalid("it starts with a reserved character");
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return invalid("it contains characters outside [A-Za-z0-9._-]");
+    }
+    Ok(value.to_string())
+}
+
+/// Arguments for the `client` subcommand group.
+#[derive(Parser, Debug)]
+#[command(
+    about = "Operate an existing Conflux owner without becoming one",
+    long_about = "Client-only namespace for one existing repository owner.
+
+Connects to the owner's local /api/v2 Unix socket, which defaults to
+${GIT_COMMON_DIR}/cflx-api.sock — the same repository identity the orchestration
+lock uses, so every linked worktree of one repository reaches one owner.
+
+No client command acquires the repository lock, binds a listener, starts an
+orchestration run, launches a lifecycle adapter or an AI subprocess, or writes
+to the workspace. `status` and `wait` submit no command at all.
+
+Machine output: --json prints exactly one versioned envelope on stdout and sends
+every diagnostic to stderr. Outcomes and exit statuses are stable.
+
+Secrets are never accepted in argv: --auth-token-env names an environment
+variable that holds the bearer token, and the token is never printed.
+
+EXAMPLES:
+  cflx client status --json
+  cflx client enqueue alpha --json
+  cflx client wait alpha --timeout 45m --json
+  cflx client --unix-socket /tmp/cflx-api.sock status"
+)]
+pub struct ClientArgs {
+    /// Path to the owner's `/api/v2` Unix socket
+    ///
+    /// Overrides the default `${GIT_COMMON_DIR}/cflx-api.sock`. Required when
+    /// the working directory is not inside a Git repository, because there is
+    /// no repository identity to derive a default from.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub unix_socket: Option<PathBuf>,
+
+    /// Name of the environment variable holding the bearer token
+    ///
+    /// The token value itself is never accepted as an argument: anything that
+    /// can read this process's arguments would see it.
+    #[arg(long, value_name = "NAME", global = true)]
+    pub auth_token_env: Option<String>,
+
+    #[command(subcommand)]
+    pub command: ClientCommands,
+}
+
+/// Subcommands for `cflx client`.
+#[derive(Subcommand, Debug)]
+pub enum ClientCommands {
+    /// Read the existing owner without mutating it
+    ///
+    /// Reports the owner incarnation, application mode, scheduler and activity
+    /// state, execution contract, and per-change authoritative status — but only
+    /// once the separate reads reconcile at one incarnation and revision. A
+    /// snapshot that cannot be reconciled is reported as `observation_conflict`
+    /// rather than stitched together.
+    Status(ClientStatusArgs),
+
+    /// Ask the existing owner to admit one change
+    ///
+    /// Expresses the intent "admit this change", then reads authoritative
+    /// eligibility and submits the smallest supported sequence of ordinary v2
+    /// commands. Refuses unknown, final, blocked, worktree-ineligible, and
+    /// active-run-limited targets without any hidden fallback, and never starts
+    /// a second owner.
+    Enqueue(ClientEnqueueArgs),
+
+    /// Observe one change until verified completion, a typed failure, or timeout
+    ///
+    /// Observation only: it submits no start, retry, queue, resolve, archive,
+    /// merge, or cleanup command. Success requires current repository evidence
+    /// for the owner's terminal mode; a change merely disappearing from the
+    /// snapshot is never completion.
+    Wait(ClientWaitArgs),
+}
+
+/// Arguments for `cflx client status`.
+#[derive(Parser, Debug)]
+pub struct ClientStatusArgs {
+    /// Emit one versioned JSON envelope on stdout
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `cflx client enqueue`.
+#[derive(Parser, Debug)]
+pub struct ClientEnqueueArgs {
+    /// Change ID to admit
+    #[arg(value_parser = parse_change_id)]
+    pub change_id: String,
+
+    /// Emit one versioned JSON envelope on stdout
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `cflx client wait`.
+#[derive(Parser, Debug)]
+pub struct ClientWaitArgs {
+    /// Change ID to observe
+    #[arg(value_parser = parse_change_id)]
+    pub change_id: String,
+
+    /// How long to observe before giving up (for example 500ms, 30s, 45m, 2h)
+    #[arg(long, value_name = "DURATION", default_value = "60m", value_parser = parse_client_timeout)]
+    pub timeout: std::time::Duration,
+
+    /// Emit one versioned JSON envelope on stdout
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the `openspec` subcommand group
