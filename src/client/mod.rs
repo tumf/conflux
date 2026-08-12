@@ -32,6 +32,10 @@
 
 pub mod envelope;
 
+use std::ffi::OsString;
+
+use clap::CommandFactory;
+
 #[cfg(feature = "web-monitoring")]
 mod enqueue;
 #[cfg(feature = "web-monitoring")]
@@ -96,6 +100,110 @@ pub fn emit(envelope: &ResultEnvelope, mode: OutputMode) -> i32 {
         }
     }
     envelope.exit_code()
+}
+
+/// The exact spelling that selects machine output.
+///
+/// Matched as a whole argument and never as a substring: a change ID or a socket
+/// path that merely *contains* `--json` is data, and rewriting an unrelated
+/// error into a JSON envelope because of it would corrupt the human contract of
+/// every other command.
+const JSON_FLAG: &str = "--json";
+
+/// Map a client subcommand name onto the operation an envelope reports.
+fn operation_of(subcommand: &str) -> Option<Operation> {
+    match subcommand {
+        "status" => Some(Operation::Status),
+        "enqueue" => Some(Operation::Enqueue),
+        "wait" => Some(Operation::Wait),
+        _ => None,
+    }
+}
+
+/// Whether this argv selected `cflx client` in JSON mode, and which operation.
+///
+/// Clap's own parse decides the namespace, so an option *value* that happens to
+/// read `client` cannot fake one. The `--json` flag is looked for in argv rather
+/// than in the parsed matches on purpose: parsing stops at the first rejected
+/// argument, so `cflx client enqueue ../escape --json` never records the flag
+/// even though the caller plainly asked for machine output.
+///
+/// When the namespace is selected but no operation is named — `cflx client
+/// --json` — the envelope still has to exist, and it reports [`Operation::Status`]:
+/// of the three, it is the only one that neither mutates nor waits, so a caller
+/// branching on `operation` cannot read a refused invocation as an attempted
+/// admission. `outcome` is `usage_error` either way, and `message` carries
+/// Clap's own statement of what was wrong.
+pub fn json_usage_operation(argv: &[OsString]) -> Option<Operation> {
+    if !argv.iter().skip(1).any(|arg| arg == JSON_FLAG) {
+        return None;
+    }
+    let matches = crate::cli::Cli::command()
+        .ignore_errors(true)
+        .try_get_matches_from(argv)
+        .ok()?;
+    let client = matches.subcommand_matches("client")?;
+    Some(
+        client
+            .subcommand_name()
+            .and_then(operation_of)
+            .unwrap_or(Operation::Status),
+    )
+}
+
+/// The one-line problem statement from a Clap error.
+///
+/// Clap renders a problem line, a usage block, and a help hint. Only the problem
+/// belongs in an envelope: the rest is human help, and a caller reading
+/// `message` wants the reason, not a rendering of the CLI.
+fn summarize_parse_error(error: &clap::Error) -> String {
+    error
+        .render()
+        .to_string()
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.strip_prefix("error: ").unwrap_or(line).to_string())
+        .unwrap_or_else(|| "the invocation could not be parsed".to_string())
+}
+
+/// Build the usage-failure envelope for a rejected client invocation.
+pub fn usage_error_envelope(error: &clap::Error, operation: Operation) -> ResultEnvelope {
+    ResultEnvelope::new(operation, Outcome::UsageError).with_message(summarize_parse_error(error))
+}
+
+/// Whether a Clap outcome is a usage *failure* rather than requested output.
+///
+/// `--help` and `--version` arrive as errors too, and both are successful
+/// invocations that print what was asked for. Rewriting either into a
+/// `usage_error` envelope would break the one thing a caller uses them for.
+fn is_usage_failure(kind: clap::error::ErrorKind) -> bool {
+    use clap::error::ErrorKind;
+    !matches!(
+        kind,
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    )
+}
+
+/// Answer a Clap parse failure and terminate the process.
+///
+/// This is the entrypoint's replacement for `Cli::parse()`'s implicit exit, and
+/// it runs before *anything* observable: no logging, no configuration, no
+/// repository lock, no listener, no lifecycle work. A `cflx client ... --json`
+/// invocation gets its promised single envelope on stdout and the outcome's own
+/// exit status; every other invocation keeps Clap's existing human behavior
+/// byte for byte.
+pub fn exit_on_parse_error(error: clap::Error) -> ! {
+    if is_usage_failure(error.kind()) {
+        let argv: Vec<OsString> = std::env::args_os().collect();
+        if let Some(operation) = json_usage_operation(&argv) {
+            let envelope = usage_error_envelope(&error, operation);
+            std::process::exit(emit(&envelope, OutputMode::Json));
+        }
+    }
+    error.exit()
 }
 
 /// Run one `cflx client` invocation and return its exit status.
@@ -163,6 +271,117 @@ async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(args: &[&str]) -> Vec<OsString> {
+        std::iter::once("cflx")
+            .chain(args.iter().copied())
+            .map(OsString::from)
+            .collect()
+    }
+
+    #[test]
+    fn a_client_json_invocation_is_recognized_with_the_operation_it_named() {
+        assert_eq!(
+            json_usage_operation(&argv(&["client", "status", "--json"])),
+            Some(Operation::Status)
+        );
+        // The rejected value stops Clap's parse before `--json`, which is
+        // exactly the case the argv scan exists for.
+        assert_eq!(
+            json_usage_operation(&argv(&["client", "enqueue", "../escape", "--json"])),
+            Some(Operation::Enqueue)
+        );
+        assert_eq!(
+            json_usage_operation(&argv(&[
+                "client",
+                "wait",
+                "alpha",
+                "--timeout",
+                "abc",
+                "--json"
+            ])),
+            Some(Operation::Wait)
+        );
+        // A missing required argument still names its operation.
+        assert_eq!(
+            json_usage_operation(&argv(&["client", "enqueue", "--json"])),
+            Some(Operation::Enqueue)
+        );
+        // The namespace with no operation still owes the caller an envelope.
+        assert_eq!(
+            json_usage_operation(&argv(&["client", "--json"])),
+            Some(Operation::Status)
+        );
+    }
+
+    #[test]
+    fn human_and_non_client_invocations_keep_clap_to_themselves() {
+        // No `--json` at all.
+        assert_eq!(json_usage_operation(&argv(&["client", "status"])), None);
+        assert_eq!(
+            json_usage_operation(&argv(&["client", "enqueue", "../escape"])),
+            None
+        );
+        // JSON, but not this namespace.
+        assert_eq!(
+            json_usage_operation(&argv(&["openspec", "show", "alpha", "--json"])),
+            None
+        );
+        assert_eq!(json_usage_operation(&argv(&["--json"])), None);
+    }
+
+    #[test]
+    fn json_intent_is_a_whole_argument_never_a_substring_of_a_value() {
+        // Values that merely contain the spelling are data. Rewriting these into
+        // JSON would be exactly the "infer intent from a substring" failure the
+        // contract forbids.
+        for value in ["--jsonish", "not--json", "x--json", "--json=true"] {
+            assert_eq!(
+                json_usage_operation(&argv(&["client", "enqueue", value])),
+                None,
+                "{value} must not select JSON mode"
+            );
+        }
+    }
+
+    #[test]
+    fn help_and_version_are_answers_rather_than_usage_failures() {
+        use clap::error::ErrorKind;
+        assert!(!is_usage_failure(ErrorKind::DisplayHelp));
+        assert!(!is_usage_failure(ErrorKind::DisplayVersion));
+        assert!(!is_usage_failure(
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        ));
+        for kind in [
+            ErrorKind::InvalidValue,
+            ErrorKind::UnknownArgument,
+            ErrorKind::MissingRequiredArgument,
+            ErrorKind::ValueValidation,
+            ErrorKind::InvalidSubcommand,
+        ] {
+            assert!(is_usage_failure(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_usage_envelope_is_one_line_and_carries_only_the_problem() {
+        let error = <crate::cli::Cli as clap::Parser>::try_parse_from(argv(&[
+            "client",
+            "enqueue",
+            "../escape",
+            "--json",
+        ]))
+        .expect_err("an escaping change ID must be rejected");
+        let envelope = usage_error_envelope(&error, Operation::Enqueue);
+        assert_eq!(envelope.outcome, Outcome::UsageError);
+        assert!(!envelope.ok);
+        assert_eq!(envelope.exit_code(), 2);
+        let message = envelope.message.clone().unwrap();
+        assert!(!message.contains('\n'), "{message}");
+        assert!(!message.starts_with("error: "), "{message}");
+        assert!(!message.contains("Usage:"), "{message}");
+        assert!(!envelope.to_json_line().contains('\n'));
+    }
 
     #[test]
     fn the_json_flag_selects_the_machine_contract() {

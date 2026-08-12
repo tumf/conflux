@@ -13,9 +13,10 @@
 
 use std::path::Path;
 
-use tokio::process::Command;
+use tokio::time::Instant;
 
-use crate::execution::state::{classify_base_completion, BaseCompletionEvidence};
+use crate::bounded_git::{run_git, GitOutcome};
+use crate::execution::state::{classify_base_completion_within, BaseCompletionEvidence};
 use crate::web::remote_control_api::dto::{OwnerExecutionContract, TerminalMode};
 
 /// What current repository state says about one change.
@@ -32,25 +33,40 @@ pub enum Verdict {
     Broken { detail: String },
     /// The contract names a mode or a field this build cannot verify.
     Unsupported { detail: String },
+    /// The caller's operation deadline passed before evidence was established.
+    ///
+    /// Separate from every other verdict on purpose: a verification that ran out
+    /// of time proves nothing about the repository, so it must not be reported
+    /// as missing evidence, broken evidence, or "keep waiting".
+    DeadlineExpired,
 }
 
 /// Verify one change against the owner's declared terminal mode.
+///
+/// `deadline` is the caller's whole-operation deadline, not a per-command
+/// budget: it is handed to every Git child so an expiry terminates the child
+/// that is still running rather than leaving it behind.
 pub async fn verify(
     change_id: &str,
     repo_root: &Path,
     contract: &OwnerExecutionContract,
+    deadline: Instant,
 ) -> Verdict {
     match contract.terminal_mode {
-        TerminalMode::Merged => verify_base(change_id, repo_root, &contract.base_branch).await,
+        TerminalMode::Merged => {
+            verify_base(change_id, repo_root, &contract.base_branch, deadline).await
+        }
         TerminalMode::BasePublished => {
             let Some(remote) = contract.remote.as_deref() else {
                 return Verdict::Unsupported {
                     detail: "the owner declared base publication but named no remote".to_string(),
                 };
             };
-            match verify_base(change_id, repo_root, &contract.base_branch).await {
+            match verify_base(change_id, repo_root, &contract.base_branch, deadline).await {
                 Verdict::Completed { evidence } => {
-                    match remote_matches_local(repo_root, remote, &contract.base_branch).await {
+                    match remote_matches_local(repo_root, remote, &contract.base_branch, deadline)
+                        .await
+                    {
                         Ok(Some(oid)) => Verdict::Completed {
                             evidence: format!(
                                 "{evidence}; {remote}/{} published at {oid}",
@@ -64,7 +80,8 @@ pub async fn verify(
                                 change_id, contract.base_branch
                             ),
                         },
-                        Err(detail) => Verdict::Broken { detail },
+                        Err(RemoteError::Broken(detail)) => Verdict::Broken { detail },
+                        Err(RemoteError::DeadlineExpired) => Verdict::DeadlineExpired,
                     }
                 }
                 other => other,
@@ -83,9 +100,9 @@ pub async fn verify(
             // The change branch, not base: `branch_pushed` proves publication,
             // and claiming base integration from it would be exactly the false
             // success this mode exists to avoid.
-            match verify_base(change_id, repo_root, branch).await {
+            match verify_base(change_id, repo_root, branch, deadline).await {
                 Verdict::Completed { evidence } => {
-                    match remote_matches_local(repo_root, remote, branch).await {
+                    match remote_matches_local(repo_root, remote, branch, deadline).await {
                         Ok(Some(oid)) => Verdict::Completed {
                             evidence: format!(
                                 "{evidence}; {remote}/{branch} published at {oid} (branch \
@@ -98,7 +115,8 @@ pub async fn verify(
                                  does not yet match its local tip"
                             ),
                         },
-                        Err(detail) => Verdict::Broken { detail },
+                        Err(RemoteError::Broken(detail)) => Verdict::Broken { detail },
+                        Err(RemoteError::DeadlineExpired) => Verdict::DeadlineExpired,
                     }
                 }
                 other => other,
@@ -112,8 +130,18 @@ pub async fn verify(
 /// The four-way distinction is preserved rather than collapsed: a missing
 /// branch and a contradictory tree are different problems, and only one of them
 /// is worth waiting through.
-async fn verify_base(change_id: &str, repo_root: &Path, branch: &str) -> Verdict {
-    match classify_base_completion(change_id, repo_root, branch).await {
+async fn verify_base(
+    change_id: &str,
+    repo_root: &Path,
+    branch: &str,
+    deadline: Instant,
+) -> Verdict {
+    let Some(evidence) =
+        classify_base_completion_within(change_id, repo_root, branch, Some(deadline)).await
+    else {
+        return Verdict::DeadlineExpired;
+    };
+    match evidence {
         BaseCompletionEvidence::Completed => Verdict::Completed {
             evidence: format!(
                 "'{branch}' holds the archived '{change_id}' entry and no active change directory"
@@ -127,27 +155,51 @@ async fn verify_base(change_id: &str, repo_root: &Path, branch: &str) -> Verdict
     }
 }
 
+/// Why a remote comparison produced no answer.
+enum RemoteError {
+    /// The comparison could not be made at all.
+    Broken(String),
+    /// The caller's deadline passed; the `ls-remote` child was killed and reaped.
+    DeadlineExpired,
+}
+
 /// Whether the remote ref already equals the locally verified branch tip.
 ///
 /// `ls-remote` rather than a cached remote-tracking ref: a stale
 /// `refs/remotes/<remote>/<branch>` would let a never-pushed branch read as
 /// published. Returns the shared OID when they match, `None` when they do not,
 /// and an error only when the comparison could not be made at all.
+///
+/// This is the one Git command here that talks to the network, so it is also the
+/// one that can hang indefinitely: the caller's deadline reaches the child
+/// itself, not a wrapper around a future that would abandon it.
 async fn remote_matches_local(
     repo_root: &Path,
     remote: &str,
     branch: &str,
-) -> Result<Option<String>, String> {
-    let local = rev_parse(repo_root, branch)
+    deadline: Instant,
+) -> Result<Option<String>, RemoteError> {
+    let local = rev_parse(repo_root, branch, deadline)
         .await?
-        .ok_or_else(|| format!("local branch '{branch}' could not be resolved"))?;
+        .ok_or_else(|| {
+            RemoteError::Broken(format!("local branch '{branch}' could not be resolved"))
+        })?;
 
-    let output = Command::new("git")
-        .args(["ls-remote", "--exit-code", "--heads", remote, branch])
-        .current_dir(repo_root)
-        .output()
-        .await
-        .map_err(|error| format!("failed to run git ls-remote for '{remote}': {error}"))?;
+    let output = match run_git(
+        repo_root,
+        &["ls-remote", "--exit-code", "--heads", remote, branch],
+        Some(deadline),
+    )
+    .await
+    {
+        Ok(GitOutcome::Finished(output)) => output,
+        Ok(GitOutcome::DeadlineExpired) => return Err(RemoteError::DeadlineExpired),
+        Err(error) => {
+            return Err(RemoteError::Broken(format!(
+                "failed to run git ls-remote for '{remote}': {error}"
+            )))
+        }
+    };
 
     // Exit code 2 is `--exit-code`'s "no matching refs", which is an ordinary
     // "not published yet" rather than a broken comparison.
@@ -155,10 +207,10 @@ async fn remote_matches_local(
         if output.status.code() == Some(2) {
             return Ok(None);
         }
-        return Err(format!(
+        return Err(RemoteError::Broken(format!(
             "git ls-remote {remote} {branch} failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -188,13 +240,26 @@ pub fn parse_ls_remote_line(line: &str, branch: &str) -> Option<String> {
 }
 
 /// Resolve a revision to an OID, or `None` when it does not exist.
-async fn rev_parse(repo_root: &Path, revision: &str) -> Result<Option<String>, String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--verify", &format!("{revision}^{{commit}}")])
-        .current_dir(repo_root)
-        .output()
-        .await
-        .map_err(|error| format!("failed to run git rev-parse for '{revision}': {error}"))?;
+async fn rev_parse(
+    repo_root: &Path,
+    revision: &str,
+    deadline: Instant,
+) -> Result<Option<String>, RemoteError> {
+    let output = match run_git(
+        repo_root,
+        &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+        Some(deadline),
+    )
+    .await
+    {
+        Ok(GitOutcome::Finished(output)) => output,
+        Ok(GitOutcome::DeadlineExpired) => return Err(RemoteError::DeadlineExpired),
+        Err(error) => {
+            return Err(RemoteError::Broken(format!(
+                "failed to run git rev-parse for '{revision}': {error}"
+            )))
+        }
+    };
     if !output.status.success() {
         return Ok(None);
     }
@@ -205,6 +270,7 @@ async fn rev_parse(repo_root: &Path, revision: &str) -> Result<Option<String>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn an_ls_remote_line_matches_only_the_exact_branch_ref() {
@@ -241,9 +307,18 @@ mod tests {
             pushed_branch: None,
         };
         let verdict = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap()
-            .block_on(verify("alpha", Path::new("/nonexistent"), &contract));
+            .block_on(async {
+                verify(
+                    "alpha",
+                    Path::new("/nonexistent"),
+                    &contract,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .await
+            });
         assert!(
             matches!(verdict, Verdict::Unsupported { .. }),
             "{verdict:?}"
@@ -259,9 +334,18 @@ mod tests {
             pushed_branch: None,
         };
         let verdict = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap()
-            .block_on(verify("alpha", Path::new("/nonexistent"), &contract));
+            .block_on(async {
+                verify(
+                    "alpha",
+                    Path::new("/nonexistent"),
+                    &contract,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .await
+            });
         assert!(
             matches!(verdict, Verdict::Unsupported { .. }),
             "{verdict:?}"

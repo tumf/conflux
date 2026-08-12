@@ -120,10 +120,26 @@ impl Connection {
             None => None,
         };
 
-        Ok(Self {
-            client: UnixApiClient::new(socket, token),
-            repo_root,
-        })
+        // The token is framed into an HTTP header, so a value carrying CR, LF,
+        // another control byte, or DEL is refused here — before a connection is
+        // opened and before any request bytes exist. The diagnostic names the
+        // variable and the byte class only: echoing the value would leak the
+        // credential, and echoing an injection attempt would leak it into a log.
+        let client = UnixApiClient::new(socket, token).map_err(|rejection| ConnectionRefusal {
+            outcome: Outcome::AuthenticationFailed,
+            message: match auth_token_env {
+                Some(name) => format!(
+                    "the bearer token in environment variable '{name}' contains {rejection}, \
+                     which cannot be sent as an HTTP header value. The value is not shown"
+                ),
+                None => format!(
+                    "the configured bearer token contains {rejection}, which cannot be sent as \
+                     an HTTP header value. The value is not shown"
+                ),
+            },
+        })?;
+
+        Ok(Self { client, repo_root })
     }
 
     /// The underlying transport.

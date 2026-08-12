@@ -431,7 +431,9 @@ async fn mark_and_start(
     // goes wrong below is partial intent rather than a clean refusal.
     let after_mark = match observe(connection, Some(change_id)).await {
         Ok(after_mark) => after_mark,
-        Err(error) => return Attempt::settled(partial_after_mark(change_id, instance, &error)),
+        Err(error) => {
+            return Attempt::settled(partial_after_mark(change_id, instance, &submitted, &error))
+        }
     };
     if after_mark.instance_id != observation.instance_id {
         return Attempt::settled(restarted_envelope(
@@ -450,6 +452,7 @@ async fn mark_and_start(
         return Attempt::settled(partial_start(
             change_id,
             instance,
+            &submitted,
             format!(
                 "an unrelated execution mark appeared before Start ({}), so starting would have \
                  consumed it",
@@ -486,11 +489,12 @@ async fn mark_and_start(
         Err(SubmitFailure::Stale { .. }) => Attempt::settled(partial_start(
             change_id,
             instance,
+            &submitted,
             "the owner's state advanced between the settled mark and Start",
         )),
         Err(failure) => {
             let message = failure.message();
-            Attempt::settled(partial_start(change_id, instance, message))
+            Attempt::settled(partial_start(change_id, instance, &submitted, message))
         }
     }
 }
@@ -514,35 +518,51 @@ fn intent_conflict(change_id: &str, instance: Option<String>, marks: &[String]) 
 fn partial_after_mark(
     change_id: &str,
     instance: Option<String>,
+    submitted: &[&str],
     error: &ObserveError,
 ) -> ResultEnvelope {
     partial_start(
         change_id,
         instance,
+        submitted,
         format!(
-            "the owner could not be reread after the mark settled: {}",
+            "the owner could not be reread before Start: {}",
             error.message()
         ),
     )
 }
 
+/// The partial-intent result, reporting the commands *this invocation* sent.
+///
+/// `submitted` is the live audit list, not a description of the situation: a
+/// change that was already execution-marked before the client looked reaches
+/// this same path with nothing submitted, and naming `set_execution_mark` there
+/// would tell an operator that the client wrote a mark it merely found. The
+/// remaining mark and the warning that a later Start can consume it are reported
+/// either way, because that part is true of the repository, not of the audit.
 fn partial_start(
     change_id: &str,
     instance: Option<String>,
+    submitted: &[&str],
     reason: impl Into<String>,
 ) -> ResultEnvelope {
+    let mark_was_submitted = submitted.contains(&"set_execution_mark");
+    let origin = if mark_was_submitted {
+        format!("the execution mark for '{change_id}' settled but Start did not")
+    } else {
+        format!("'{change_id}' was already execution-marked and Start did not succeed")
+    };
     ResultEnvelope::new(Operation::Enqueue, Outcome::PartialIntent)
         .with_change(change_id)
         .with_instance(instance)
         .with_message(format!(
-            "the execution mark for '{change_id}' settled but Start did not: {}. The mark was \
-             left in place as truthful next-run intent and a later operator Start can consume \
-             it; nothing was rolled back",
+            "{origin}: {}. The mark was left in place as truthful next-run intent and a later \
+             operator Start can consume it; nothing was rolled back",
             reason.into()
         ))
         .with_detail(serde_json::json!({
             "remaining_mark": change_id,
-            "commands_submitted": ["set_execution_mark"],
+            "commands_submitted": submitted,
             "rolled_back": false,
         }))
 }
@@ -987,12 +1007,43 @@ mod tests {
 
     #[test]
     fn partial_intent_names_the_mark_and_refuses_to_claim_rollback() {
-        let envelope = partial_start("alpha", Some("i-1".to_string()), "Start was refused");
+        let envelope = partial_start(
+            "alpha",
+            Some("i-1".to_string()),
+            &["set_execution_mark"],
+            "Start was refused",
+        );
         assert_eq!(envelope.outcome, Outcome::PartialIntent);
         assert!(!envelope.ok);
         let message = envelope.message.clone().unwrap();
         assert!(message.contains("left in place"), "{message}");
         assert!(message.contains("nothing was rolled back"), "{message}");
+        assert_eq!(envelope.detail["remaining_mark"], "alpha");
+        assert_eq!(envelope.detail["rolled_back"], false);
+        assert_eq!(
+            envelope.detail["commands_submitted"],
+            serde_json::json!(["set_execution_mark"])
+        );
+    }
+
+    #[test]
+    fn a_pre_existing_mark_is_never_audited_as_a_submitted_command() {
+        // The mark was already there, so this invocation sent nothing at all
+        // before Start failed. The remaining-mark warning still has to be
+        // reported: it describes the repository, not what the client did.
+        let envelope = partial_start("alpha", Some("i-1".to_string()), &[], "Start was refused");
+        assert_eq!(envelope.outcome, Outcome::PartialIntent);
+        assert_eq!(
+            envelope.detail["commands_submitted"],
+            serde_json::json!([]),
+            "a mark this client did not submit must not appear in its audit list"
+        );
+        let message = envelope.message.clone().unwrap();
+        assert!(
+            message.contains("already execution-marked"),
+            "the message must not claim a mark settled: {message}"
+        );
+        assert!(message.contains("left in place"), "{message}");
         assert_eq!(envelope.detail["remaining_mark"], "alpha");
         assert_eq!(envelope.detail["rolled_back"], false);
     }

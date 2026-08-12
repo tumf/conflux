@@ -33,7 +33,10 @@
 
 use std::path::Path;
 use tokio::process::Command;
+use tokio::time::Instant;
 use tracing::debug;
+
+use crate::bounded_git::{run_git, GitOutcome};
 
 use crate::error::{OrchestratorError, Result};
 use crate::execution::archive::is_archive_commit_complete;
@@ -132,50 +135,60 @@ pub async fn classify_base_completion(
     repo_root: &Path,
     base_branch: &str,
 ) -> BaseCompletionEvidence {
-    // Check if base branch exists
-    let rev_parse_output = Command::new("git")
-        .args(["rev-parse", "--verify", base_branch])
-        .current_dir(repo_root)
-        .output()
-        .await;
+    // No deadline, so expiry is unreachable and the fallback is unobservable.
+    classify_base_completion_within(change_id, repo_root, base_branch, None)
+        .await
+        .unwrap_or(BaseCompletionEvidence::NotCompleted)
+}
 
-    let rev_parse_output = match rev_parse_output {
-        Ok(output) => output,
-        Err(e) => {
-            return BaseCompletionEvidence::EvidenceError {
-                kind: BaseEvidenceErrorKind::CommandFailure,
-                detail: format!("Failed to verify base branch: {}", e),
-            }
-        }
+/// [`classify_base_completion`], bounded by a caller's operation deadline.
+///
+/// `None` means the deadline passed before the evidence was established. It is
+/// deliberately not an [`BaseCompletionEvidence::EvidenceError`]: a classification
+/// that ran out of time says nothing about the repository, and reporting broken
+/// evidence would send an operator to look at a repository that is fine.
+///
+/// Every Git child is spawned through [`run_git`], so an expiry terminates and
+/// reaps the classification's own subprocess instead of orphaning it.
+pub async fn classify_base_completion_within(
+    change_id: &str,
+    repo_root: &Path,
+    base_branch: &str,
+    deadline: Option<Instant>,
+) -> Option<BaseCompletionEvidence> {
+    let failed = |detail: String| {
+        Some(BaseCompletionEvidence::EvidenceError {
+            kind: BaseEvidenceErrorKind::CommandFailure,
+            detail,
+        })
     };
+
+    // Check if base branch exists
+    let rev_parse_output =
+        match run_git(repo_root, &["rev-parse", "--verify", base_branch], deadline).await {
+            Ok(GitOutcome::Finished(output)) => output,
+            Ok(GitOutcome::DeadlineExpired) => return None,
+            Err(e) => return failed(format!("Failed to verify base branch: {}", e)),
+        };
 
     if !rev_parse_output.status.success() {
         debug!(
             base_branch = %base_branch,
             "classify_base_completion: base branch does not exist"
         );
-        return BaseCompletionEvidence::EvidenceError {
+        return Some(BaseCompletionEvidence::EvidenceError {
             kind: BaseEvidenceErrorKind::MissingBranch,
             detail: format!("base branch '{}' does not exist", base_branch),
-        };
+        });
     }
 
     // Check if archive entry exists in base branch HEAD tree
     let archive_path = format!("{}:openspec/changes/archive/", base_branch);
-    let ls_tree_output = Command::new("git")
-        .args(["ls-tree", "-d", &archive_path])
-        .current_dir(repo_root)
-        .output()
-        .await;
-
-    let ls_tree_output = match ls_tree_output {
-        Ok(output) => output,
-        Err(e) => {
-            return BaseCompletionEvidence::EvidenceError {
-                kind: BaseEvidenceErrorKind::CommandFailure,
-                detail: format!("Failed to list archive tree: {}", e),
-            }
-        }
+    let ls_tree_output = match run_git(repo_root, &["ls-tree", "-d", &archive_path], deadline).await
+    {
+        Ok(GitOutcome::Finished(output)) => output,
+        Ok(GitOutcome::DeadlineExpired) => return None,
+        Err(e) => return failed(format!("Failed to list archive tree: {}", e)),
     };
 
     if !ls_tree_output.status.success() {
@@ -184,7 +197,7 @@ pub async fn classify_base_completion(
             base_branch = %base_branch,
             "classify_base_completion: archive directory does not exist in base branch"
         );
-        return BaseCompletionEvidence::NotCompleted;
+        return Some(BaseCompletionEvidence::NotCompleted);
     }
 
     // Parse ls-tree output to find matching archive entries
@@ -204,7 +217,7 @@ pub async fn classify_base_completion(
             base_branch = %base_branch,
             "classify_base_completion: no archive entry in base branch tree"
         );
-        return BaseCompletionEvidence::NotCompleted;
+        return Some(BaseCompletionEvidence::NotCompleted);
     }
 
     // Check if the active change directory still exists in base branch HEAD tree.
@@ -214,21 +227,12 @@ pub async fn classify_base_completion(
     // *subdirectories*, so a change directory holding only files would look
     // absent and an archive-plus-active contradiction would read as completed.
     let changes_path = format!("{}:openspec/changes/", base_branch);
-    let changes_ls_tree = Command::new("git")
-        .args(["ls-tree", "-d", &changes_path])
-        .current_dir(repo_root)
-        .output()
-        .await;
-
-    let changes_ls_tree = match changes_ls_tree {
-        Ok(output) => output,
-        Err(e) => {
-            return BaseCompletionEvidence::EvidenceError {
-                kind: BaseEvidenceErrorKind::CommandFailure,
-                detail: format!("Failed to check change tree: {}", e),
-            }
-        }
-    };
+    let changes_ls_tree =
+        match run_git(repo_root, &["ls-tree", "-d", &changes_path], deadline).await {
+            Ok(GitOutcome::Finished(output)) => output,
+            Ok(GitOutcome::DeadlineExpired) => return None,
+            Err(e) => return failed(format!("Failed to check change tree: {}", e)),
+        };
 
     let change_dir_exists = changes_ls_tree.status.success()
         && String::from_utf8_lossy(&changes_ls_tree.stdout)
@@ -244,15 +248,15 @@ pub async fn classify_base_completion(
     );
 
     if change_dir_exists {
-        return BaseCompletionEvidence::Contradictory {
+        return Some(BaseCompletionEvidence::Contradictory {
             detail: format!(
                 "archive entry and active change directory both exist for '{}' in base branch '{}'",
                 change_id, base_branch
             ),
-        };
+        });
     }
 
-    BaseCompletionEvidence::Completed
+    Some(BaseCompletionEvidence::Completed)
 }
 
 /// Check if a change has been merged to the base branch.

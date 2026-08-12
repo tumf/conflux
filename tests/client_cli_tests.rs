@@ -113,6 +113,7 @@ mod enabled {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
 
@@ -434,10 +435,12 @@ mod enabled {
                 "'{bad}' must be a usage error, stderr={}",
                 stderr_of(&output)
             );
-            assert!(
-                stdout_of(&output).trim().is_empty(),
-                "a usage error must not print a result envelope"
-            );
+            // A rejected `--json` invocation still owes the caller its one
+            // envelope: `usage_error` is an outcome, not an escape from the
+            // machine contract.
+            let parsed = envelope(&output);
+            assert_eq!(parsed["outcome"], "usage_error");
+            assert_eq!(parsed["operation"], "enqueue");
         }
     }
 
@@ -465,6 +468,9 @@ mod enabled {
                 "'{bad}' must be a usage error, stderr={}",
                 stderr_of(&output)
             );
+            let parsed = envelope(&output);
+            assert_eq!(parsed["outcome"], "usage_error");
+            assert_eq!(parsed["operation"], "wait");
         }
     }
 
@@ -510,6 +516,156 @@ mod enabled {
             assert_eq!(output.status.code(), Some(3));
             assert!(stderr_of(&output).contains("--unix-socket"));
         }
+    }
+
+    // ========================================================================
+    // json_usage_errors
+    // ========================================================================
+    //
+    // The machine contract has to hold on the path a caller hits most often
+    // while wiring an agent up: a typo. Before this, `cflx client ... --json`
+    // exited through Clap with an empty stdout, so the one thing the contract
+    // promised — exactly one parseable envelope — was false precisely when the
+    // caller had nothing else to branch on.
+
+    #[test]
+    fn json_usage_errors_emit_one_envelope_for_every_rejected_client_invocation() {
+        let tmp = neutral_cwd();
+        for (args, operation, what) in [
+            (
+                vec!["client", "enqueue", "../escape", "--json"],
+                "enqueue",
+                "an invalid change ID",
+            ),
+            (
+                vec!["client", "enqueue", "", "--json"],
+                "enqueue",
+                "an empty change ID",
+            ),
+            (
+                vec!["client", "wait", "alpha", "--timeout", "abc", "--json"],
+                "wait",
+                "an unparseable timeout",
+            ),
+            (
+                vec!["client", "wait", "alpha", "--timeout", "0s", "--json"],
+                "wait",
+                "a zero timeout",
+            ),
+            (
+                vec!["client", "enqueue", "--json"],
+                "enqueue",
+                "a missing required argument",
+            ),
+            (
+                vec!["client", "status", "--json", "--not-an-option"],
+                "status",
+                "an unknown client option",
+            ),
+            (
+                vec!["client", "--json"],
+                "status",
+                "the namespace with no operation",
+            ),
+        ] {
+            let output = run_cli(tmp.path(), &args, &[]);
+            // `envelope` itself asserts stdout is exactly one JSON object.
+            let parsed = envelope(&output);
+            assert_eq!(parsed["schema_version"], 1, "{what}");
+            assert_eq!(parsed["ok"], false, "{what}");
+            assert_eq!(parsed["outcome"], "usage_error", "{what}");
+            assert_eq!(parsed["operation"], operation, "{what}");
+            assert!(parsed["detail"].is_object(), "{what}");
+            assert_eq!(output.status.code(), Some(2), "{what}");
+            // The reason is a diagnostic, so it belongs on stderr as well.
+            assert!(
+                stderr_of(&output).contains("usage_error"),
+                "{what}: stderr={}",
+                stderr_of(&output)
+            );
+            // Nothing was initialized: no lock file, no socket, no log directory.
+            assert!(
+                std::fs::read_dir(tmp.path())
+                    .expect("temp dir readable")
+                    .next()
+                    .is_none(),
+                "{what}: a rejected invocation must write nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn json_usage_errors_leave_human_and_non_client_parse_failures_alone() {
+        let tmp = neutral_cwd();
+        // Human mode: Clap's own diagnostics, and no envelope on stdout.
+        for args in [
+            vec!["client", "enqueue", "../escape"],
+            vec!["client", "wait", "alpha", "--timeout", "abc"],
+            vec!["client", "status", "--not-an-option"],
+        ] {
+            let output = run_cli(tmp.path(), &args, &[]);
+            assert!(
+                stdout_of(&output).trim().is_empty(),
+                "a human parse failure must not print an envelope: {}",
+                stdout_of(&output)
+            );
+            assert!(!output.status.success());
+            assert!(
+                stderr_of(&output).contains("error:"),
+                "Clap's human diagnostic must survive: {}",
+                stderr_of(&output)
+            );
+        }
+
+        // Another namespace's parse failure is not a client result, even though
+        // `--json` appears in argv.
+        let unrelated = run_cli(
+            tmp.path(),
+            &["openspec", "show", "alpha", "--not-an-option", "--json"],
+            &[],
+        );
+        assert!(
+            stdout_of(&unrelated).trim().is_empty(),
+            "an unrelated top-level failure must not be rewritten as a client envelope: {}",
+            stdout_of(&unrelated)
+        );
+        assert!(!unrelated.status.success());
+
+        // A *value* that merely contains the spelling is data, not intent.
+        let substring = run_cli(
+            tmp.path(),
+            &[
+                "client",
+                "--unix-socket",
+                "/tmp/holds--json-in-its-name.sock",
+                "enqueue",
+                "../escape",
+            ],
+            &[],
+        );
+        assert!(
+            stdout_of(&substring).trim().is_empty(),
+            "'--json' inside a value must not select JSON mode: {}",
+            stdout_of(&substring)
+        );
+        assert_eq!(substring.status.code(), Some(2));
+    }
+
+    #[test]
+    fn json_usage_errors_never_rewrite_help_or_version() {
+        let tmp = neutral_cwd();
+        // Help is an answer, not a usage failure, even alongside `--json`.
+        let help = run_cli(tmp.path(), &["client", "status", "--help", "--json"], &[]);
+        assert!(help.status.success(), "{}", stderr_of(&help));
+        assert!(
+            stdout_of(&help).contains("Usage:"),
+            "help must still be help: {}",
+            stdout_of(&help)
+        );
+
+        let version = run_cli(tmp.path(), &["--version"], &[]);
+        assert!(version.status.success());
+        assert!(!stdout_of(&version).contains("usage_error"));
     }
 
     // ========================================================================
@@ -708,6 +864,148 @@ mod enabled {
         assert_eq!(output.status.code(), Some(6));
         shutdown.cancel();
         let _ = task.await;
+    }
+
+    // ------------------------------------------------------------------------
+    // auth_header_validation
+    // ------------------------------------------------------------------------
+    //
+    // The token is opaque to this client but not to HTTP. A CR or LF inside it
+    // ends the `Authorization` header early and lets the rest be read as another
+    // header, so the check has to happen before a connection exists — "no bytes
+    // were written" is the property, and a counting listener is how it is
+    // proven rather than asserted.
+
+    #[tokio::test]
+    async fn auth_header_validation_refuses_a_malformed_token_before_connecting() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("counting.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("binds the counting socket");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let accepted = accepted.clone();
+            let stop = shutdown.clone();
+            async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        incoming = listener.accept() => {
+                            if incoming.is_ok() {
+                                accepted.fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let path = socket.display().to_string();
+        for (token, what) in [
+            ("s3cret\r\nX-Injected: yes", "a CRLF header injection"),
+            ("s3cret\n", "a trailing line feed"),
+            ("s3cret\rmore", "a bare carriage return"),
+            ("s3cret\u{7f}", "DEL"),
+            ("s3\u{1}cret", "another C0 control"),
+            ("s3\tcret", "a horizontal tab"),
+        ] {
+            let output = tokio::task::spawn_blocking({
+                let path = path.clone();
+                let dir = dir.path().to_path_buf();
+                let token = token.to_string();
+                move || {
+                    run_cli(
+                        &dir,
+                        &[
+                            "client",
+                            "--unix-socket",
+                            &path,
+                            "--auth-token-env",
+                            "CFLX_CLIENT_TEST_TOKEN",
+                            "status",
+                            "--json",
+                        ],
+                        &[("CFLX_CLIENT_TEST_TOKEN", &token)],
+                    )
+                }
+            })
+            .await
+            .unwrap();
+
+            let parsed = envelope(&output);
+            assert_eq!(parsed["outcome"], "authentication_failed", "{what}");
+            assert_eq!(output.status.code(), Some(5), "{what}");
+            let stdout = stdout_of(&output);
+            let stderr = stderr_of(&output);
+            for stream in [&stdout, &stderr] {
+                assert!(
+                    !stream.contains("s3"),
+                    "{what}: no fragment of the token value may be shown: {stream}"
+                );
+                assert!(
+                    !stream.contains("X-Injected"),
+                    "{what}: an injection attempt must not be echoed: {stream}"
+                );
+            }
+            // The variable is named so an operator can fix it; the value is not.
+            assert!(
+                stderr.contains("CFLX_CLIENT_TEST_TOKEN"),
+                "{what}: {stderr}"
+            );
+        }
+
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "a malformed token must be refused before any connection is opened"
+        );
+        shutdown.cancel();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn auth_header_validation_keeps_a_valid_token_authenticating() {
+        // Punctuation-heavy but entirely legal as a header value, so the check
+        // cannot have been implemented as an alphanumeric allow-list.
+        const TOKEN: &str = "tok.en-plus~/+=:_9";
+        let owner = Owner::start(Some(SpyExecutor::new()), Some(TOKEN)).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+
+        let output = tokio::task::spawn_blocking({
+            let cwd = tmp.path().to_path_buf();
+            move || {
+                run_cli(
+                    &cwd,
+                    &[
+                        "client",
+                        "--unix-socket",
+                        &socket,
+                        "--auth-token-env",
+                        "CFLX_CLIENT_TEST_TOKEN",
+                        "status",
+                        "--json",
+                    ],
+                    &[("CFLX_CLIENT_TEST_TOKEN", TOKEN)],
+                )
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(envelope(&output)["outcome"], "observed");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            !stdout_of(&output).contains(TOKEN) && !stderr_of(&output).contains(TOKEN),
+            "a valid token still must never be printed"
+        );
+        owner.stop().await;
     }
 
     // ========================================================================
@@ -1609,6 +1907,101 @@ mod enabled {
         owner.stop().await;
     }
 
+    // ------------------------------------------------------------------------
+    // partial_intent_command_audit
+    // ------------------------------------------------------------------------
+    //
+    // `commands_submitted` is an audit list, not a description of the situation.
+    // A mark the client *found* and a mark the client *set* leave the repository
+    // in the same shape but say different things about who to ask next, and only
+    // one of them is this invocation's doing.
+
+    #[tokio::test]
+    async fn partial_intent_command_audit_lists_the_mark_this_invocation_submitted() {
+        let spy = SpyExecutor::new();
+        spy.script(vec![
+            Ok(ExecutionSummary::changed("marked")),
+            Err(CommandFailure::new(
+                ErrorCode::LifecycleConflict,
+                "the run cannot start right now",
+            )),
+        ]);
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+
+        let output = enqueue(&owner, "alpha").await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "partial_intent");
+        assert_eq!(output.status.code(), Some(15));
+        assert_eq!(
+            parsed["detail"]["commands_submitted"],
+            serde_json::json!(["set_execution_mark"])
+        );
+        assert_eq!(parsed["detail"]["remaining_mark"], "alpha");
+        assert_eq!(parsed["detail"]["rolled_back"], false);
+
+        // The audit list and the executor agree on exactly which commands ran.
+        let submitted: Vec<&str> = spy
+            .calls()
+            .iter()
+            .map(|command| match command {
+                CommandSpec::SetExecutionMark { .. } => "set_execution_mark",
+                CommandSpec::Start => "start",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(submitted, vec!["set_execution_mark", "start"]);
+        owner.stop().await;
+    }
+
+    #[tokio::test]
+    async fn partial_intent_command_audit_omits_a_mark_it_only_found() {
+        let spy = SpyExecutor::new();
+        // Only Start is ever submitted: the target carries an operator's mark
+        // already, so the client has no mark command to send.
+        spy.script(vec![Err(CommandFailure::new(
+            ErrorCode::LifecycleConflict,
+            "the run cannot start right now",
+        ))]);
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        let mut premarked = change("alpha", "select", "not queued");
+        premarked.execution_marked = true;
+        owner.publish(snapshot("select", vec![premarked]));
+
+        let output = enqueue(&owner, "alpha").await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "partial_intent");
+        assert_eq!(output.status.code(), Some(15));
+        assert_eq!(
+            parsed["detail"]["commands_submitted"],
+            serde_json::json!([]),
+            "a pre-existing mark is state, not a command this invocation sent"
+        );
+
+        // The truthful parts of the report survive: the mark is still there and
+        // a later operator Start can still consume it.
+        assert_eq!(parsed["detail"]["remaining_mark"], "alpha");
+        assert_eq!(parsed["detail"]["rolled_back"], false);
+        let message = parsed["message"].as_str().unwrap();
+        assert!(message.contains("later operator Start"), "{message}");
+        assert!(
+            message.contains("already execution-marked"),
+            "the message must not claim a mark settled: {message}"
+        );
+
+        // Exactly one command reached the executor, and it was not a mark.
+        assert_eq!(spy.call_count(), 1, "{:?}", spy.calls());
+        assert!(
+            matches!(spy.calls().as_slice(), [CommandSpec::Start]),
+            "{:?}",
+            spy.calls()
+        );
+        owner.stop().await;
+    }
+
     #[tokio::test]
     async fn enqueue_recomputes_after_a_stale_revision_without_repeating_a_settled_effect() {
         let spy = SpyExecutor::new();
@@ -2114,6 +2507,219 @@ mod enabled {
             repo.git(&["status", "--porcelain"]),
             "",
             "wait must leave the worktree clean"
+        );
+        owner.stop().await;
+    }
+
+    // ------------------------------------------------------------------------
+    // wait_deadline
+    // ------------------------------------------------------------------------
+    //
+    // `--timeout D` is a promise about the operation, so the oracle here is the
+    // *outcome*, never elapsed time: an unbounded read reports `transport_error`
+    // after the transport's own 30s valve, and an unbounded `git ls-remote`
+    // never reports anything at all. Both fixtures synchronize on the client
+    // actually being inside the blocking step — a connection accepted — so a
+    // client that failed to connect could not pass by accident. The wall-clock
+    // guards below exist only so a regression fails instead of hanging.
+
+    /// Longest a bounded `wait` invocation may take before the test gives up.
+    ///
+    /// Far above the sub-second deadlines under test and above the transport's
+    /// own 30s valve, so it can only trip on a genuine loss of bounding.
+    const DEADLINE_TEST_GUARD: Duration = Duration::from_secs(60);
+
+    #[tokio::test]
+    async fn wait_deadline_bounds_a_stalled_owner_read_rather_than_the_transport_valve() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+        let head_before = repo.git(&["rev-parse", "HEAD"]);
+
+        // Accepts, then never answers: the client gets past `connect` and blocks
+        // inside the exchange, which is the only place the deadline can be
+        // observed doing its job.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("stalled.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("binds the stalled socket");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let accepted = accepted.clone();
+            let stop = shutdown.clone();
+            async move {
+                // The accepted streams are held, not dropped: closing them would
+                // hand the client an EOF and let it fail for the wrong reason.
+                let mut held = Vec::new();
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        incoming = listener.accept() => {
+                            let Ok((stream, _)) = incoming else { break };
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                            held.push(stream);
+                        }
+                    }
+                }
+            }
+        });
+
+        let path = socket.display().to_string();
+        let output = tokio::time::timeout(
+            DEADLINE_TEST_GUARD,
+            tokio::task::spawn_blocking({
+                let cwd = repo.path().to_path_buf();
+                move || {
+                    run_cli(
+                        &cwd,
+                        &[
+                            "client",
+                            "--unix-socket",
+                            &path,
+                            "wait",
+                            "alpha",
+                            "--timeout",
+                            "500ms",
+                            "--json",
+                        ],
+                        &[],
+                    )
+                }
+            }),
+        )
+        .await
+        .expect("a bounded wait must not hang")
+        .unwrap();
+
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"], "timeout",
+            "a stalled owner must expire the operation, not the transport"
+        );
+        assert_eq!(output.status.code(), Some(19));
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 1,
+            "the client must have been inside a request, not failing to connect"
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+        assert_eq!(
+            repo.git(&["status", "--porcelain"]),
+            "",
+            "a timed-out wait must leave the worktree clean"
+        );
+        shutdown.cancel();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn wait_deadline_terminates_a_stalled_remote_lookup_and_reaps_it() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+        repo.archive("alpha");
+        let head_before = repo.git(&["rev-parse", "HEAD"]);
+
+        // A `git://` endpoint that accepts and then says nothing. Real Git, real
+        // TCP, and no network beyond loopback: `git ls-remote` connects, sends
+        // its request, and waits forever for a ref advertisement.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds a loopback port");
+        let port = listener.local_addr().unwrap().port();
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let stop = shutdown.clone();
+            async move {
+                let mut connected_tx = Some(connected_tx);
+                let mut held = Vec::new();
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        incoming = listener.accept() => {
+                            let Ok((stream, _)) = incoming else { break };
+                            if let Some(tx) = connected_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            held.push(stream);
+                        }
+                    }
+                }
+                held
+            }
+        });
+
+        repo.git(&[
+            "remote",
+            "add",
+            "upstream",
+            &format!("git://127.0.0.1:{port}/stalled.git"),
+        ]);
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "merged")],
+        ));
+        // Base publication, so local integration alone is not enough and the
+        // remote lookup is genuinely required to decide the outcome.
+        owner.contract(OwnerExecutionContract::resolve(
+            "main",
+            None,
+            Some("upstream"),
+        ));
+
+        let output = tokio::time::timeout(
+            DEADLINE_TEST_GUARD,
+            wait_for(&owner, repo.path(), "alpha", "2s"),
+        )
+        .await
+        .expect("an unbounded git ls-remote would hang here");
+
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"], "timeout",
+            "the deadline owns the outcome; no later evidence error may replace it"
+        );
+        assert_eq!(output.status.code(), Some(19));
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(spy.call_count(), 0, "wait must submit no command");
+
+        // The lookup really happened, so the deadline cancelled work in flight
+        // rather than skipping it.
+        tokio::time::timeout(DEADLINE_TEST_GUARD, connected_rx)
+            .await
+            .expect("git must have reached the stalled remote")
+            .expect("the fixture must report the connection");
+
+        // The child is gone: its socket reached EOF. A `git` left running would
+        // hold the connection open and this read would never return.
+        let held = tokio::time::timeout(DEADLINE_TEST_GUARD, async {
+            shutdown.cancel();
+            task.await.unwrap()
+        })
+        .await
+        .expect("the fixture must stop");
+        let mut stream = held.into_iter().next().expect("one accepted connection");
+        let mut sink = [0u8; 64];
+        loop {
+            let read = tokio::time::timeout(
+                DEADLINE_TEST_GUARD,
+                tokio::io::AsyncReadExt::read(&mut stream, &mut sink),
+            )
+            .await
+            .expect("the git child must have been terminated and reaped")
+            .expect("reading the fixture connection");
+            if read == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+        assert_eq!(
+            repo.git(&["status", "--porcelain"]),
+            "",
+            "a timed-out wait must leave the worktree clean"
         );
         owner.stop().await;
     }
