@@ -33,6 +33,7 @@ verifications:
 - The requested denominator is the union of completed changes, currently executing changes, and not-yet-executed changes carrying an execution mark.
 - `src/tui/render.rs::render_status` currently filters only on `ChangeState::selected`, so the Status progress bar is a view of current execution marks rather than overall run progress.
 - Archive completion revokes the process-local execution mark by design, while later `archived`, `merged`, and `pushed` rows remain visible with their last known task counts.
+- Change-level failure, terminal rejection, and successful dequeue also revoke the execution mark automatically through `RevokingEdge` in `src/orchestration/mark_reconciliation.rs`, so an unmarked `error` row is the expected state after a failure and its exclusion may shrink the aggregate denominator without operator action.
 - The canonical `Running Footer Progress Bar Display` requirement already requires progress retention through Completed, Archived, and Merged transitions, but does not fully define the denominator when completed, active, and marked rows coexist.
 - The shared active-status vocabulary already exists in `src/orchestration/operator_command.rs`; the TUI must reuse it rather than maintain another phase list.
 - The constitution permits process-local presentation state but forbids it from becoming workflow-control authority. This change only reads existing presentation facts for rendering.
@@ -65,10 +66,10 @@ Rows that satisfy none of the three conditions remain outside the aggregate. A r
 2. A reducer-observed archive-complete change remains included while its display status advances through post-archive `resolving`, `resolve pending`, or `merge wait`.
 3. Every active status recognized by shared `is_active_status` is included even when its execution mark is absent.
 4. A non-completed, non-active change is included when its execution mark is set, including a marked retryable `error` row.
-5. An unmarked, inactive, unfinished row and a rejected row are excluded.
+5. An unmarked, inactive, unfinished row, including an `error` row whose mark was revoked by its own failure, and a rejected row are excluded.
 6. A change satisfying two or all three inclusion conditions contributes its task counts exactly once.
 7. Given `merged` unmarked `3/3`, `applying` unmarked `1/4`, marked `not queued` `0/2`, and unmarked `not queued` `0/5`, the Status panel displays `4/9` and `44.4%`.
-8. A completion transition alone does not reduce progress by dropping the completed row. Explicit operator changes to the marked target set may legitimately change the aggregate denominator and percentage.
+8. A completion transition alone does not reduce progress by dropping the completed row. Automatic mark revocation on failure, rejection, or dequeue, and explicit operator changes to the marked target set, may legitimately change the aggregate denominator and percentage.
 9. Rows with zero total tasks do not cause division by zero or duplicate output; existing no-task rendering behavior remains unchanged.
 
 ## Explicit Completion Conditions

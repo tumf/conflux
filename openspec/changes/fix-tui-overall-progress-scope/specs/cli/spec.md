@@ -6,7 +6,7 @@ The TUI Status panel SHALL display a progress bar for overall processing progres
 
 Successful completed work SHALL include a change with reducer-observed archive completion or final success display `archived`, `merged`, or `pushed`. Current execution SHALL use the shared active-status vocabulary rather than a TUI-local phase list. Marked unfinished work SHALL include marked idle, queued, waiting, or retryable error rows. Rejected rows and rows that are unfinished, inactive, and unmarked SHALL NOT contribute.
 
-The TUI SHALL sum the included rows' last known task counts and SHALL NOT synthesize full task completion solely from lifecycle status. A completion transition MUST NOT reduce the displayed progress by removing the completed row when its execution mark is revoked. An explicit change to the operator's marked target set MAY change the aggregate denominator and percentage.
+The TUI SHALL sum the included rows' last known task counts and SHALL NOT synthesize full task completion solely from lifecycle status. A completion transition MUST NOT reduce the displayed progress by removing the completed row when its execution mark is revoked. Mark revocation caused by a change-level failure, rejection, or dequeue, and an explicit change to the operator's marked target set, MAY change the aggregate denominator and percentage.
 
 #### Scenario: Completed task progress survives mark revocation
 
@@ -55,7 +55,7 @@ The TUI SHALL sum the included rows' last known task counts and SHALL NOT synthe
 
 #### Scenario: Unmarked idle and rejected rows are excluded
 
-**Given**: A row is unfinished, inactive, and unmarked, or its final outcome is rejected
+**Given**: A row is unfinished, inactive, and unmarked, including an `error` row whose execution mark was revoked by its failure, or its final outcome is rejected
 **When**: Overall progress is calculated
 **Then**: The row contributes neither completed nor total tasks
 
