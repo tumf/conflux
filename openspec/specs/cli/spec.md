@@ -2464,6 +2464,58 @@ Client commands MUST support concise human output and a machine-readable JSON mo
 
 The CLI MUST submit the smallest supported sequence through the existing shared operator-command service, wait for each command record to settle, and return success only when the target is already admitted or the intended admission is accepted. It MUST recompute intent after bounded stale-revision conflicts, use a fresh idempotency identity when the typed command identity changes, and fail if the owner instance changes. It MUST fail closed for unknown, final, blocked, worktree-ineligible, active-run-limited, unsupported, or command-incapable targets without starting another owner or claiming admission. An idle-owner Start MUST NOT consume unrelated execution marks: the client MUST preserve them and return a typed operator-intent conflict if it cannot isolate the requested target through existing semantics. If the requested mark settles but Start does not, the client MUST return non-zero `partial_intent`, identify the remaining mark, warn that a later operator Start can consume it, and MUST NOT claim rollback. Every `partial_intent` result MUST list only commands actually submitted by that invocation.
 
+#### Scenario: Idle owner admits one change
+
+**Given**: a command-capable idle owner exposes eligible unmarked change `alpha`
+**When**: an agent runs `cflx client enqueue alpha --json`
+**Then**: the client marks only `alpha`, rereads authoritative state, and submits Start through the existing command service
+**And**: it reports success only after the command records settle successfully
+
+#### Scenario: Live owner admits additional eligible work
+
+**Given**: a command-capable owner has a live scheduler and `alpha` is eligible for dynamic admission
+**When**: an agent runs `cflx client enqueue alpha --json`
+**Then**: the client uses the existing live-owner admission semantics
+**And**: it does not start a second scheduler or owner
+
+#### Scenario: Idle enqueue preserves unrelated marks
+
+**Given**: an idle owner has unrelated ordinary change `beta` execution-marked
+**When**: an agent runs `cflx client enqueue alpha --json`
+**Then**: the client does not submit Start for the combined marked set
+**And**: it does not clear or otherwise mutate `beta`'s mark
+**And**: it returns `operator_intent_conflict` with a non-zero exit status
+
+#### Scenario: Settled mark without Start is partial intent
+
+**Given**: idle admission settles the requested execution mark
+**When**: Start is rejected or a conflicting mark appears before Start
+**Then**: enqueue exits non-zero with outcome `partial_intent`
+**And**: it identifies the remaining requested mark and warns that a later operator Start can consume it
+**And**: it does not claim rollback
+
+#### Scenario: Stale revision is recomputed safely
+
+**Given**: owner state advances between the client's read and mutation
+**When**: the v2 command rejects the observed revision as stale
+**Then**: the client rereads instance and authoritative state and recomputes the complete intent
+**And**: retries are bounded
+**And**: no settled side effect is submitted twice
+
+#### Scenario: Headless run is not command capable
+
+**Given**: the socket belongs to `cflx run`, whose remote command executor is unbound
+**When**: an agent runs `cflx client enqueue alpha --json`
+**Then**: the client returns `owner_not_command_capable` non-zero
+**And**: it does not start or replace an owner
+
+#### Scenario: Unsafe target is mutation free
+
+**Given**: `alpha` is unknown, final, blocked, worktree-ineligible, or blocked by active-run iteration-limit evidence
+**When**: an agent runs `cflx client enqueue alpha --json`
+**Then**: the client returns a typed unsuccessful outcome
+**And**: it submits no hidden fallback, manual archive, merge, repair, or second-owner action
+
 #### Scenario: Pre-existing mark is not reported as submitted
 
 **Given**: `alpha` was already execution-marked before the client invocation
@@ -2476,6 +2528,56 @@ The CLI MUST submit the smallest supported sequence through the existing shared 
 `cflx client wait <change-id>` MUST observe one owner and repository until the requested change reaches a repository-verifiable terminal success, a typed unsuccessful terminal outcome, owner replacement, or timeout. One monotonic operation deadline MUST bound initial observation, repeated observation, event/poll recovery, repository classification, and every local or remote Git subprocess. Deadline expiry MUST terminate and reap owned subprocesses, return typed `timeout`, and MUST NOT be replaced by a later inner transport or evidence error. It MUST use event streaming when available and authoritative multi-resource polling to recover from gaps. Reads MUST agree on `instance_id`; revision-bearing resources must reconcile at one `state_revision`, and `event_sequence` must not move backwards. `status` may end bounded rereads with typed observation conflict, while `wait` must keep reconciling until its deadline. API presentation and command records MAY provide progress but MUST NOT alone certify implementation or integration completion.
 
 Wait MUST submit no mutation command. Change disappearance alone MUST NOT count as success. For terminal mode `merged`, success requires the existing repository completion oracle to return `Completed` for the captured base branch. For `base_published`, the selected remote base ref must additionally equal the locally verified base tip. For `branch_pushed`, archived proposal evidence must exist on the named local change branch and the selected remote branch ref must equal that local branch tip; this proves publication, not base integration. `NotCompleted`, `Contradictory`, `EvidenceError`, unsupported mode, and missing or ambiguous repository evidence MUST remain typed non-success outcomes.
+
+#### Scenario: Wait proves successful local integration
+
+**Given**: `alpha` is processed by one owner in local integration mode
+**When**: archive completes and repository evidence proves the resulting change is integrated into the intended base
+**Then**: `cflx client wait alpha --json` exits zero with outcome `completed`
+**And**: it identifies the observed owner instance and repository completion evidence
+
+#### Scenario: Wait proves pushed publication
+
+**Given**: `alpha` is processed in `branch_pushed` terminal mode
+**When**: an archived proposal exists on the named local change branch and the selected remote branch ref equals that local branch tip
+**Then**: `cflx client wait alpha --json` exits zero with outcome `completed`
+**And**: it reports branch publication without claiming base integration
+
+#### Scenario: Mixed observation is not completion
+
+**Given**: state and execution-contract reads carry different revisions or owner incarnations
+**When**: wait evaluates terminal completion
+**Then**: it performs a bounded coherent reread or returns `observation_conflict`
+**And**: it does not combine the mixed values into a success claim
+
+#### Scenario: Disappearance does not prove success
+
+**Given**: `alpha` disappears from the active snapshot without repository evidence proving archive and integration
+**When**: wait evaluates completion
+**Then**: it does not return successful completion
+**And**: it continues observing or returns a typed unsuccessful outcome
+
+#### Scenario: Wait never repairs execution
+
+**Given**: `alpha` enters an error, blocked, stalled, merge-wait, or retryable state
+**When**: wait observes that state
+**Then**: it submits no start, retry, queue, resolve, archive, merge, cleanup, or worktree command
+**And**: it reports or continues according to the typed terminal/progress contract
+
+#### Scenario: Owner replacement invalidates the wait
+
+**Given**: wait captured one process `instance_id`
+**When**: the socket begins serving a different owner incarnation
+**Then**: wait reevaluates current repository completion evidence once for `alpha`
+**And**: it returns successful completion only if repository evidence alone proves it
+**And**: otherwise it exits non-zero with outcome `owner_restarted` without inferring settlement of commands owned by the prior process
+
+#### Scenario: Timeout is not completion
+
+**Given**: the configured wait duration expires before verified success or another terminal outcome
+**When**: wait reaches the deadline
+**Then**: it exits non-zero with outcome `timeout`
+**And**: it performs no mutation while exiting
 
 #### Scenario: Stalled owner read respects the operation deadline
 
