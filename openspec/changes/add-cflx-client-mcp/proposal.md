@@ -63,9 +63,9 @@ The MCP process remains a client. It does not acquire the repository lock, becom
 
 ### 2. Identify an admitted execution explicitly
 
-A successful `cflx_enqueue` returns a process-local `execution_id` in addition to `instance_id` and `change_id`. The ID identifies one admitted execution episode, including retries of the same proposal as distinct episodes.
+A successful `cflx_enqueue` returns a process-local `execution_id` in addition to `instance_id` and `change_id`. The ID identifies one admitted execution episode, including retries of the same proposal as distinct episodes. The owner creates episodes for every admission source, including TUI, scheduler, direct `/api/v2`, CLI client, and MCP; `already_admitted` returns the current episode ID.
 
-The owner creates the ID only after admission succeeds. Notification operations require the tuple `(instance_id, execution_id, change_id)` and reject stale owner incarnations or mismatched bindings.
+The owner creates the ID when a change enters queued or active work from a non-admitted state. Notification operations require the tuple `(instance_id, execution_id, change_id)` and reject stale owner incarnations or mismatched bindings.
 
 Execution IDs and notification registrations are process-local observability state. They are discarded on restart and are never consulted for workflow routing, acceptance, archive, merge, retry, or scheduler eligibility.
 
@@ -77,9 +77,11 @@ Execution IDs and notification registrations are process-local observability sta
 - `failed`
 - `blocked`
 - `stopped`
-- `owner_replaced`
+- `owner_stopping` on graceful owner shutdown only
 
-`completed` uses the same completion oracle and owner execution contract as `cflx client wait`; disappearance or a presentation-only lifecycle transition is not success. `blocked` is an attention event and may be followed by a later terminal event. Terminal delivery is idempotent per `(execution_id, event_type)`.
+`completed` uses the same completion oracle and owner execution contract as `cflx client wait`; disappearance or a presentation-only lifecycle transition is not success. `blocked` is an opt-in attention event and may be followed by a later terminal event. All terminal event types are always enabled. Terminal delivery is attempted at most once per execution; `blocked` is delivered once per leave-and-reenter edge. Registering after an execution is already terminal causes an immediate single terminal delivery attempt.
+
+Sink set/get/clear use dedicated authenticated `/api/v2` execution-sink resources, not the closed workflow command registry. Sink mutation is accepted only over the owner-only Unix socket. Capability discovery reports support explicitly, and unsupported owners fail with a typed refusal.
 
 The callback receives only fixed environment variables:
 
@@ -109,11 +111,12 @@ The generated message is documented as an ordinary OpenCode `role=user` message,
 
 - MCP uses stdio and the existing owner-only Unix socket by default.
 - Authentication tokens remain environment-variable references; token values never enter argv, tool results, logs, or event files.
-- Notification commands are argv, not shell source. No `sh -c` interpretation is added.
+- Notification commands are argv, not shell source. No `sh -c` interpretation is added, and sink set/clear is rejected over TCP even with a bearer token.
 - Notification registration validates exact instance/execution/change binding.
 - OpenCode callbacks allow only loopback destinations by default.
 - Callback delivery has a bounded timeout and output size. It never blocks or rolls back orchestration.
-- Owner restart invalidates process-local execution IDs and registrations. Callers receive `owner_replaced`; registrations are not silently rebound.
+- Owner restart invalidates process-local execution IDs and registrations. Later get/set/wait operations return the existing typed `owner_restarted` outcome; registrations are not silently rebound. A graceful old owner may attempt `owner_stopping`, but a crash cannot deliver a final callback.
+- The OpenCode reference plugin therefore keeps a low-frequency bounded owner-continuity observer after registration. It resumes the original session with typed `owner_restarted` if the owner disappears or changes, without treating that outcome as workflow success.
 - The MCP adapter does not expose raw `/api/v2` commands or free-form workflow mutations.
 
 ## Non-Goals
