@@ -1,20 +1,20 @@
-# Design: stable existing-owner control CLI
+# Design: stable existing-owner client CLI
 
 ## Boundaries
 
-`cflx control` is a client. It must never acquire the repository orchestration lock, bind an API listener, initialize logging, load orchestration configuration, launch lifecycle adapters, or start AI subprocesses. It may inspect Git only to derive the canonical common directory and later confirm repository-visible completion.
+`cflx client` is a client. It must never acquire the repository orchestration lock, bind an API listener, initialize logging, load orchestration configuration, launch lifecycle adapters, or start AI subprocesses. It may inspect Git only to derive the canonical common directory and later confirm repository-visible completion.
 
 The existing owner remains authoritative for process-local marks, queue intent, action eligibility, command admission, retries, scheduling, and transitions. Workspace and Git evidence remain authoritative for workflow routing and completion under the constitution.
 
 ## Command surface
 
 ```text
-cflx control [--unix-socket PATH] [--auth-token-env NAME] status [--json]
-cflx control [--unix-socket PATH] [--auth-token-env NAME] enqueue <change-id> [--json]
-cflx control [--unix-socket PATH] [--auth-token-env NAME] wait <change-id> [--timeout DURATION] [--json]
+cflx client [--unix-socket PATH] [--auth-token-env NAME] status [--json]
+cflx client [--unix-socket PATH] [--auth-token-env NAME] enqueue <change-id> [--json]
+cflx client [--unix-socket PATH] [--auth-token-env NAME] wait <change-id> [--timeout DURATION] [--json]
 ```
 
-Connection options belong to the `control` namespace. `--auth-token-env` names an environment variable; no literal token flag is supported. `--json` may be shared or per-action according to the existing Clap conventions, but the resulting help must be unambiguous.
+Connection options belong to the `client` namespace. `--auth-token-env` names an environment variable; no literal token flag is supported. `--json` may be shared or per-action according to the existing Clap conventions, but the resulting help must be unambiguous.
 
 ## Transport and discovery
 

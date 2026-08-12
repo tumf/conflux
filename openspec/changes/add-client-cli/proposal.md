@@ -13,14 +13,14 @@ references:
   - src/web/remote_control_api
   - tests/openapi_cli_tests.rs
 verifications:
-  - id: control-cli-tests
+  - id: client-cli-tests
     requirement: External agents can inspect, enqueue, and wait for work through a stable CLI without owning orchestration or constructing internal v2 command envelopes
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: Cargo.toml
     evidence: CLI parser, Unix-socket integration, concurrency-retry, owner-unavailable, read-only status, enqueue, and wait outcome tests
-    rerun: cargo test --features web-monitoring --test control_cli_tests
+    rerun: cargo test --features web-monitoring --test client_cli_tests
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -36,11 +36,11 @@ verifications:
 - Local `cflx`, `cflx tui`, and `cflx run` expose `/api/v2` on `${GIT_COMMON_DIR}/cflx-api.sock`, but a headless `cflx run` intentionally has no command executor and rejects mutations.
 - The v2 mutation contract requires callers to understand `state_revision`, typed command envelopes, idempotency keys, command settlement, and mode-aware mark/queue/start behavior.
 - Agents currently have to reproduce those internal protocol details, making integrations brittle when the API or orchestration state model changes.
-- No related active proposal, open PR, or unmerged implementation branch was found; archived work provides the existing socket and v2 control foundation.
+- No related active proposal, open PR, or unmerged implementation branch was found; archived work provides the existing socket and v2 remote-control foundation.
 
 ## Requested Artifact
 
-Implementation of a stable, machine-readable `cflx control` CLI namespace.
+Implementation of a stable, machine-readable `cflx client` CLI namespace.
 
 ## Problem / Context
 
@@ -50,11 +50,11 @@ The client also needs truthful waiting semantics. A successful enqueue command o
 
 ## Proposed Solution
 
-Add a `cflx control` namespace for a thin local client of the existing repository owner:
+Add a `cflx client` namespace for a thin local client of the existing repository owner:
 
-- `cflx control status --json` discovers the repository-scoped Unix socket, reads capabilities, instance, authoritative state, execution status, and the typed owner execution contract, then emits one stable summary envelope without mutation. Multi-resource reads are coherent only when `instance_id`, `state_revision`, and compatible `event_sequence` boundaries agree; otherwise the client performs bounded rereads or returns a typed observation conflict.
-- `cflx control enqueue <change-id> --json` expresses the high-level intent “admit this change to the existing owner.” The client reads authoritative action/lifecycle fields and uses the smallest supported sequence of existing typed commands. It owns revision refresh, idempotency keys, command-record settlement, bounded stale-revision retries, and mode-aware choice of execution mark, queue intent, retry, and start. It never starts a second owner.
-- `cflx control wait <change-id> --json [--timeout <duration>]` observes the same owner until repository-verifiable success or a typed unsuccessful terminal result. It does not mutate, retry, archive, merge, or repair work.
+- `cflx client status --json` discovers the repository-scoped Unix socket, reads capabilities, instance, authoritative state, execution status, and the typed owner execution contract, then emits one stable summary envelope without mutation. Multi-resource reads are coherent only when `instance_id`, `state_revision`, and compatible `event_sequence` boundaries agree; otherwise the client performs bounded rereads or returns a typed observation conflict.
+- `cflx client enqueue <change-id> --json` expresses the high-level intent “admit this change to the existing owner.” The client reads authoritative action/lifecycle fields and uses the smallest supported sequence of existing typed commands. It owns revision refresh, idempotency keys, command-record settlement, bounded stale-revision retries, and mode-aware choice of execution mark, queue intent, retry, and start. It never starts a second owner.
+- `cflx client wait <change-id> --json [--timeout <duration>]` observes the same owner until repository-verifiable success or a typed unsuccessful terminal result. It does not mutate, retry, archive, merge, or repair work.
 
 The public CLI contract is intent-based. It must not expose flags for `expected_revision`, raw command type, queue marks, or caller-provided idempotency keys. JSON output uses a versioned envelope and stable outcome/error codes; human output remains concise and diagnostics go to stderr.
 
@@ -62,7 +62,7 @@ The public CLI contract is intent-based. It must not expose flags for `expected_
 
 ## Acceptance Criteria
 
-1. `cflx control` is a separate namespace and does not change `cflx run` ownership, lock, or target semantics.
+1. `cflx client` is a separate namespace and does not change `cflx run` ownership, lock, or target semantics.
 2. `status --json` is read-only and reports owner instance, app mode, scheduler/activity state, execution contract, and per-change authoritative status only after incarnation/revision reconciliation produces one coherent observation.
 3. `enqueue <change-id> --json` can admit an eligible idle change to a command-capable TUI owner and can add eligible work to a live owner using existing shared operator-command semantics.
 4. Enqueue handles retry-eligible changes through authoritative action eligibility and refuses blocked, terminal, unknown, worktree-ineligible, or active-run-limited targets without hidden mutation.
@@ -72,18 +72,18 @@ The public CLI contract is intent-based. It must not expose flags for `expected_
 8. `wait` returns success only after current repository and owner evidence establishes the requested change's successful archive/integration outcome; rejection, unrecoverable error, process-fatal error, owner replacement, and timeout return distinct non-zero outcomes.
 9. `wait` is observation-only. It never issues start, retry, queue, archive, resolve, merge, or cleanup commands.
 10. JSON stdout contains exactly one versioned result envelope. Human diagnostics and errors do not contaminate JSON stdout, and secrets are never accepted in argv or emitted.
-11. Feature-disabled builds reject `control` clearly and without network, lock, socket, or repository mutation.
+11. Feature-disabled builds reject `client` clearly and without network, lock, socket, or repository mutation.
 
 ## Explicit Completion Conditions
 
-- CLI parsing and help expose only `status`, `enqueue`, and `wait` under `control`, plus shared connection/output options.
+- CLI parsing and help expose only `status`, `enqueue`, and `wait` under `client`, plus shared connection/output options.
 - A reusable internal client connects over Unix domain sockets and reuses the source-owned v2 DTOs rather than duplicating ad-hoc JSON field parsing; generated OpenAPI remains the external schema contract.
-- The owner publishes a minimal typed execution contract containing base branch identity and terminal success mode (`merged` or `pushed`, including selected remote when applicable), at the same owner incarnation and revision boundary used by control observations.
+- The owner publishes a minimal typed execution contract containing base branch identity and terminal success mode (`merged` or `pushed`, including selected remote when applicable), at the same owner incarnation and revision boundary used by client observations.
 - Integration fixtures run a real local v2 router with bound and unbound executors and prove the success, no-op, refusal, stale-revision, restart, timeout, and no-side-effect paths.
-- One bounded smoke test runs the compiled control CLI against a production shared operator coordinator/real local owner and proves actual admission and terminal completion, rather than only fixture executor calls.
+- One bounded smoke test runs the compiled client CLI against a production shared operator coordinator/real local owner and proves actual admission and terminal completion, rather than only fixture executor calls.
 - Tests prove `status` and `wait` submit zero commands and that failed `enqueue` paths do not start a second process, acquire the repository lock, or mutate Git/workspace state.
 - JSON schema/version and exit-code mappings are asserted as executable CLI behavior, including clean stdout/stderr separation.
-- `cargo test --features web-monitoring --test control_cli_tests`, `cargo fmt --check`, and `cargo clippy --features web-monitoring -- -D warnings` pass.
+- `cargo test --features web-monitoring --test client_cli_tests`, `cargo fmt --check`, and `cargo clippy --features web-monitoring -- -D warnings` pass.
 
 ## Scope Rationale
 
@@ -92,7 +92,7 @@ Socket transport, protocol shielding, intent-based enqueue, machine output, and 
 ## Out of Scope
 
 - Starting, supervising, or replacing a Conflux owner.
-- Adding a daemon, TCP discovery, multi-project server, or remote-host control.
+- Adding a daemon, TCP discovery, multi-project server, or remote-host operation.
 - Exposing arbitrary `/api/v2` requests or low-level command flags.
 - Changing the existing v2 command set or its shared TUI semantics.
 - Making API state, command records, or wait observations durable workflow authority.
@@ -101,7 +101,7 @@ Socket transport, protocol shielding, intent-based enqueue, machine output, and 
 
 ## Rollout
 
-This is additive. Existing TUI, `run`, Web UI, and direct `/api/v2` clients remain compatible. Documentation should recommend `cflx control` for agent delegation while retaining the API as the lower-level generated contract.
+This is additive. Existing TUI, `run`, Web UI, and direct `/api/v2` clients remain compatible. Documentation should recommend `cflx client` for agent delegation while retaining the API as the lower-level generated contract.
 
 ## Completeness Checklist
 
