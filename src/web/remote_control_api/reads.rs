@@ -6,17 +6,19 @@
 //! event ever described. Keeping the projection fed from disk is the refresh
 //! task's job, not the reader's.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use serde::Deserialize;
 
 use super::auth::CorrelationId;
 
 use super::dto::{
     ApiError, CapabilitiesResponse, CapabilityLimits, ChangeExecutionState, ChangeExecutionStatus,
-    ChangeResponse, ChangesResponse, ErrorCode, ExecutionPhase, ExecutionStatusResponse,
-    HealthResponse, InstanceResponse, LatestLogProjection, LogsResponse, ParallelCapabilities,
+    ChangeResponse, ChangesResponse, CommandExecutionCapability, ErrorCode,
+    ExecutionContractResponse, ExecutionPhase, ExecutionStatusResponse, HealthResponse,
+    InstanceResponse, LatestLogProjection, LogsResponse, ParallelCapabilities,
     ProcessExecutionStatus, StateResponse, TransportDescriptor, ALL_ERROR_CODES,
     ALL_PARALLEL_BLOCKED_REASONS, API_VERSION, COMMAND_RECORD_TTL_SECS, MAX_COMMAND_RECORDS,
     MAX_CORRELATION_ID_LEN, MAX_EVENTS, MAX_LOGS, SUPPORTED_COMMANDS,
@@ -92,6 +94,9 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
             max_correlation_id_len: MAX_CORRELATION_ID_LEN,
         },
         authentication_required: state.auth.is_enforced(),
+        command_execution: CommandExecutionCapability {
+            available: state.executor.is_command_capable().await,
+        },
         worktrees: WorktreeCapabilities::default(),
         parallel: ParallelCapabilities {
             max_concurrent: parallel.max_concurrent,
@@ -338,6 +343,47 @@ pub async fn execution_status(State(state): State<RemoteControlState>) -> Respon
                 .map(LatestLogProjection::from_entry),
         },
         changes,
+    })
+}
+
+/// Change selector accepted by the execution-contract resource.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ContractParams {
+    /// Resolve the change-scoped branch identity for this change.
+    #[serde(default)]
+    pub change_id: Option<String>,
+}
+
+/// The minimal typed contract that says what would *prove* a change finished.
+///
+/// A client cannot derive this from the snapshot: `display_status: merged` is a
+/// presentation of what the owner believes, while completion has to be certified
+/// from repository evidence, and which evidence counts depends on whether this
+/// owner merges to base, publishes base, or pushes the change branch. This
+/// resource names the base branch and that mode, and nothing else — it holds no
+/// per-change commit, and it is never authoritative for routing.
+///
+/// The revision is read *after* the contract so a client joining this response
+/// with `/api/v2/state` cannot be handed a contract older than the revision it
+/// is reconciling at.
+#[utoipa::path(
+    get,
+    path = "/api/v2/execution-contract",
+    tag = "remote-control",
+    params(("change_id" = Option<String>, Query, description = "Resolve change-scoped branch identity for this change")),
+    responses((status = 200, description = "Owner execution contract at an instance and revision", body = ExecutionContractResponse))
+)]
+pub async fn execution_contract(
+    State(state): State<RemoteControlState>,
+    Query(params): Query<ContractParams>,
+) -> Response {
+    let contract = state
+        .execution_contract
+        .resolve(params.change_id.as_deref());
+    no_store(ExecutionContractResponse {
+        instance_id: state.projection.instance_id().to_string(),
+        state_revision: state.projection.revision(),
+        contract,
     })
 }
 

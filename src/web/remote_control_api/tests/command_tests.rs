@@ -427,12 +427,29 @@ async fn commands_are_refused_while_no_orchestration_runtime_is_bound() {
         ),
     );
 
+    // Discovery says so before a command is ever submitted, so a client never
+    // has to learn it from a refusal.
+    let (_, capabilities) =
+        status_and_json(send(&router, get("/api/v2/capabilities", None)).await).await;
+    assert_eq!(capabilities["command_execution"]["available"], false);
+
     let body = envelope(json!({"type": "start"}), 0, "k1");
     let (status, response) =
         status_and_json(send(&router, post_json("/api/v2/commands", None, &body)).await).await;
 
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(response["error_code"], "lifecycle_conflict");
+    // Its own code, not `lifecycle_conflict`: a lifecycle conflict can clear on
+    // its own, while an unbound executor never does within this incarnation, and
+    // a client that conflated them would retry a headless `cflx run` forever.
+    assert_eq!(response["error_code"], "command_executor_unbound");
+}
+
+#[tokio::test]
+async fn a_bound_runtime_advertises_command_execution() {
+    let h = harness(None, &[]);
+    let (_, capabilities) =
+        status_and_json(send(&h.router, get("/api/v2/capabilities", None)).await).await;
+    assert_eq!(capabilities["command_execution"]["available"], true);
 }
 
 // ── Shared-service mapping ───────────────────────────────────────────────────

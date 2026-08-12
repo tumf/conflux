@@ -160,6 +160,16 @@ pub trait RemoteControlExecutor: Send + Sync {
     /// caller that holds none.
     async fn execute(&self, command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure>;
 
+    /// Whether this port can execute a command at all.
+    ///
+    /// Published as a typed capability so a client learns "this process cannot
+    /// mutate" from discovery rather than from a refusal it has to classify.
+    /// The default is `true` because a port that exists can act; only the
+    /// late-bound runtime can be capability-free.
+    async fn is_command_capable(&self) -> bool {
+        true
+    }
+
     /// Decide how an admitted command will be executed, under the caller's gate.
     ///
     /// This is *not* where the command runs. It exists so a command that must
@@ -541,7 +551,7 @@ impl SharedServiceExecutor {
 /// Wire an executor the way production wires one: one core mode, one
 /// process-lifetime dispatch owner over the shared reducer, one coordinator.
 ///
-/// Test-only, and deliberately *not* a stub. A test that assembled a different
+/// Test wiring, and deliberately *not* a stub. A test that assembled a different
 /// shape here would stop covering the property these tests exist for — that a
 /// remote command takes the same path a keypress takes.
 ///
@@ -549,7 +559,12 @@ impl SharedServiceExecutor {
 /// authority: a test that let this build a second one would arrange a mode the
 /// transaction never sees, and every lifecycle assertion would silently become
 /// an assertion about `Select`.
-#[cfg(test)]
+///
+/// Reachable outside `cfg(test)` so `tests/client_cli_tests.rs` can drive the
+/// compiled CLI against this same assembly rather than against an easier one; it
+/// is hidden from the documented surface and nothing in the binary calls it.
+#[doc(hidden)]
+#[allow(dead_code)] // Used by unit tests and by `tests/client_cli_tests.rs`.
 pub fn wired_for_test(
     reducer: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     run_control: Arc<crate::orchestration::run_control::RunControlService>,

@@ -43,7 +43,7 @@ use conflux::web::remote_control_api::dto::{
     EventCategory, EventEnvelope, ExecutionPhase, ExecutionStatusResponse, InstanceSnapshot,
     LatestLogProjection, ParallelEligibility, ParallelRuntimeState, ProcessExecutionStatus,
     QueueIntent, SnapshotTotals, StateResponse, ALL_CHANGE_EXECUTION_STATES, ALL_ERROR_CODES,
-    ALL_EXECUTION_PHASES, SUPPORTED_COMMANDS,
+    ALL_EXECUTION_PHASES, ALL_TERMINAL_MODES, SUPPORTED_COMMANDS,
 };
 use conflux::web::remote_control_api::worktrees::{
     WorktreeConflict, WorktreeEligibility, WorktreeResource, WorktreeResponse,
@@ -776,9 +776,108 @@ fn execution_observability_errors(doc: &Value) -> Vec<String> {
     errors
 }
 
+/// The owner execution contract: what would *prove* a change finished.
+///
+/// A client cannot derive this from the snapshot. `display_status: merged` says
+/// what the owner believes; which repository evidence certifies that depends on
+/// whether the owner merges to base, publishes base, or pushes the change
+/// branch. If any of these fields is unpublished, a generated client has no way
+/// to verify completion and can only fall back to trusting presentation — which
+/// is the exact failure this resource exists to remove.
+fn owner_contract_errors(doc: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let expected_modes: BTreeSet<String> = ALL_TERMINAL_MODES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    if published_enum(doc, "TerminalMode") != expected_modes {
+        errors.push(format!(
+            "TerminalMode must publish exactly {expected_modes:?}, found {:?}",
+            published_enum(doc, "TerminalMode")
+        ));
+    }
+
+    let contract: BTreeSet<&str> = schemas(doc)["OwnerExecutionContract"]["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    for member in ["base_branch", "terminal_mode", "remote", "pushed_branch"] {
+        if !contract.contains(member) {
+            errors.push(format!("OwnerExecutionContract must publish `{member}`"));
+        }
+    }
+    // Only the two universal facts are required: `remote` and `pushed_branch`
+    // are omitted when inapplicable, and publishing them as required would make
+    // a generated client demand a value a `merged` owner never has.
+    let required: BTreeSet<&str> = schemas(doc)["OwnerExecutionContract"]["required"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for member in ["base_branch", "terminal_mode"] {
+        if !required.contains(member) {
+            errors.push(format!(
+                "OwnerExecutionContract.{member} must be required: every mode has one"
+            ));
+        }
+    }
+    for member in ["remote", "pushed_branch"] {
+        if required.contains(member) {
+            errors.push(format!(
+                "OwnerExecutionContract.{member} must stay optional: it is absent for the modes \
+                 it does not apply to"
+            ));
+        }
+    }
+
+    // The response joins the contract to an incarnation and a revision, which is
+    // what makes it combinable with `/api/v2/state` in one coherent observation.
+    let response: BTreeSet<&str> = schemas(doc)["ExecutionContractResponse"]["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    for member in ["instance_id", "state_revision", "contract"] {
+        if !response.contains(member) {
+            errors.push(format!(
+                "ExecutionContractResponse must publish `{member}`; without it the contract \
+                 cannot be reconciled with a snapshot"
+            ));
+        }
+    }
+
+    // Typed command capability, so a client learns "this process cannot mutate"
+    // from discovery rather than from a refusal it has to classify.
+    let capability: BTreeSet<&str> = schemas(doc)["CommandExecutionCapability"]["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    if !capability.contains("available") {
+        errors.push("CommandExecutionCapability must publish `available`".to_string());
+    }
+    let capabilities: BTreeSet<&str> = schemas(doc)["CapabilitiesResponse"]["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    if !capabilities.contains("command_execution") {
+        errors.push(
+            "CapabilitiesResponse must publish `command_execution`; discovery is where a client \
+             learns an executor is unbound"
+                .to_string(),
+        );
+    }
+
+    errors
+}
+
 // ============================================================================
 // The generated document is complete
 // ============================================================================
+
+/// The owner execution contract is published with its closed mode vocabulary.
+#[test]
+fn owner_execution_contract_is_published_with_its_terminal_modes() {
+    assert_eq!(owner_contract_errors(&generated()), Vec::<String>::new());
+}
 
 /// The execution-status resource is published with its closed vocabularies.
 #[test]
