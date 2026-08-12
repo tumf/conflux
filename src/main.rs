@@ -5,6 +5,7 @@ mod agent;
 mod ai_command_runner;
 mod analyzer;
 mod archive_layout;
+mod bounded_git;
 mod embedded_skills;
 mod install_skills;
 
@@ -841,7 +842,14 @@ fn run_logs_subcommand(args: LogsArgs) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // `try_parse` rather than `parse`, so a rejected invocation is answered here
+    // instead of inside Clap's own exit. `cflx client ... --json` promises one
+    // versioned envelope on stdout for *every* outcome, and a parse failure is
+    // an outcome; every other invocation keeps Clap's human diagnostics.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => client::exit_on_parse_error(error),
+    };
 
     // Top-level upstream options only reach the bare local TUI. An explicit
     // subcommand parses its own copies, so accepting them here would silently

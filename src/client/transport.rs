@@ -10,8 +10,9 @@
 //! Security posture:
 //!
 //! * the socket path and every query value are data, never shell fragments;
-//! * the bearer token is read from a named environment variable, is sent only in
-//!   the `Authorization` header, and is never placed in a message;
+//! * the bearer token is read from a named environment variable, is validated as
+//!   an HTTP header value *before* a connection is opened, is sent only in the
+//!   `Authorization` header, and is never placed in a message;
 //! * a response is refused once it exceeds [`MAX_RESPONSE_BYTES`], before any
 //!   parse, so a hostile or broken peer cannot make the client allocate without
 //!   bound.
@@ -93,6 +94,65 @@ impl HttpResponse {
     }
 }
 
+/// Why a bearer token cannot be presented as an HTTP header value.
+///
+/// The value itself is never carried: the whole point of rejecting it is that
+/// its bytes are hostile, and a diagnostic that echoed them would put a
+/// credential — and a header injection someone attempted — into a log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenRejection {
+    /// A carriage return: the classic header-injection byte.
+    CarriageReturn,
+    /// A line feed: likewise.
+    LineFeed,
+    /// Any other C0 control byte.
+    ControlCharacter,
+    /// `DEL` (0x7F), which HTTP forbids in a field value.
+    Delete,
+}
+
+impl TokenRejection {
+    /// Stable, value-free description of the offending byte class.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CarriageReturn => "a carriage return (CR)",
+            Self::LineFeed => "a line feed (LF)",
+            Self::ControlCharacter => "an ASCII control character",
+            Self::Delete => "the DEL character",
+        }
+    }
+}
+
+impl std::fmt::Display for TokenRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether a resolved token may be sent as an `Authorization` header value.
+///
+/// A bearer token is opaque secret data to this client, but it is *not* opaque
+/// to HTTP: a CR or LF inside it would terminate the header and let whatever
+/// followed be read as another header or as the body. So the check happens once,
+/// at the boundary where the value enters the process, and the request is never
+/// built at all when it fails — "reject before connecting" is what makes the
+/// injection unreachable rather than merely unlikely.
+///
+/// Everything from `0x20` up stays untouched, including non-ASCII `obs-text`
+/// bytes, so a valid token is transmitted exactly as configured.
+pub fn validate_token(value: &str) -> Result<(), TokenRejection> {
+    for byte in value.bytes() {
+        match byte {
+            b'\r' => return Err(TokenRejection::CarriageReturn),
+            b'\n' => return Err(TokenRejection::LineFeed),
+            0x7F => return Err(TokenRejection::Delete),
+            0x00..=0x1F => return Err(TokenRejection::ControlCharacter),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// A client bound to one owner's socket and one credential source.
 #[derive(Clone)]
 pub struct UnixApiClient {
@@ -127,8 +187,16 @@ impl std::fmt::Debug for UnixApiClient {
 
 impl UnixApiClient {
     /// Bind a client to a socket path and an optional bearer token.
-    pub fn new(socket: PathBuf, token: Option<String>) -> Self {
-        Self { socket, token }
+    ///
+    /// Fallible because the token is validated here rather than at the write:
+    /// a client that exists is a client whose credential can be framed, so no
+    /// caller can reach [`Self::encode_request`] with a value that would inject
+    /// a header.
+    pub fn new(socket: PathBuf, token: Option<String>) -> Result<Self, TokenRejection> {
+        if let Some(token) = &token {
+            validate_token(token)?;
+        }
+        Ok(Self { socket, token })
     }
 
     /// The socket this client talks to.
@@ -476,6 +544,7 @@ mod tests {
 
     fn client() -> UnixApiClient {
         UnixApiClient::new(PathBuf::from("/tmp/cflx.sock"), Some("s3cret".to_string()))
+            .expect("a plain token is a valid header value")
     }
 
     #[test]
@@ -499,14 +568,15 @@ mod tests {
         assert!(rendered.contains("<redacted>"), "{rendered}");
         let anonymous = format!(
             "{:?}",
-            UnixApiClient::new(PathBuf::from("/tmp/cflx.sock"), None)
+            UnixApiClient::new(PathBuf::from("/tmp/cflx.sock"), None).expect("no token")
         );
         assert!(anonymous.contains("<none>"), "{anonymous}");
     }
 
     #[test]
     fn a_tokenless_client_sends_no_authorization_header() {
-        let anonymous = UnixApiClient::new(PathBuf::from("/tmp/cflx.sock"), None);
+        let anonymous =
+            UnixApiClient::new(PathBuf::from("/tmp/cflx.sock"), None).expect("no token");
         let request = anonymous.encode_request("GET", "/api/v2/health", None);
         assert!(!request.contains("Authorization"));
         assert!(!anonymous.has_token());
@@ -581,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn an_absent_socket_reports_no_owner_rather_than_an_io_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let client = UnixApiClient::new(tmp.path().join("missing.sock"), None);
+        let client = UnixApiClient::new(tmp.path().join("missing.sock"), None).expect("no token");
         let error = client.get("/api/v2/health").await.expect_err("no owner");
         assert!(matches!(error, TransportError::NotListening { .. }));
         assert!(error.to_string().contains("no Conflux owner is listening"));

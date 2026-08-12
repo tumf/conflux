@@ -22,8 +22,23 @@
 //! command — not on error, not on a blocked change, not on timeout. If the work
 //! needs a push, that is an operator's decision, and a waiter that quietly made
 //! it would be an owner wearing a client's name.
+//!
+//! # One deadline, not several budgets
+//!
+//! `--timeout D` is a promise about the whole operation, so exactly one
+//! monotonic deadline is built when the wait begins and every step that can
+//! block is bounded by what is left of it: the first observation, each reread,
+//! the event-stream budget, repository classification, and every Git child.
+//! Without that, the per-request transport valve and an unreachable Git remote
+//! are each free to outlive `D` on their own, and the caller's timeout would
+//! bound only the parts that were already fast. Expiry is an *operation*
+//! outcome: whatever the inner step would have reported afterwards, the answer
+//! is `timeout`, and nothing was submitted.
 
+use std::future::Future;
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
 use crate::client::repo::{self, Verdict};
@@ -46,13 +61,28 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// They trigger *verification*, never a success claim of their own.
 const CLAIMED_SUCCESS_STATUSES: [&str; 3] = ["archived", "merged", "pushed"];
 
+/// Run one step under the operation deadline.
+///
+/// `None` means the deadline passed. The inner future is dropped at that point,
+/// which is safe precisely because everything reachable from here is read-only:
+/// `wait` submits no command, so a cancelled step can never have half-applied
+/// one. Git children are the exception that needs more than dropping, and they
+/// carry the deadline down to the spawn site themselves.
+async fn within<F: Future>(deadline: Instant, future: F) -> Option<F::Output> {
+    tokio::time::timeout_at(deadline, future).await.ok()
+}
+
 /// Observe one change until verified completion, a typed failure, or timeout.
 pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) -> ResultEnvelope {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
 
-    let initial = match observe(connection, Some(change_id)).await {
-        Ok(initial) => initial,
-        Err(error) => return error.into_envelope(Operation::Wait).with_change(change_id),
+    // Bounded from the very first read: a socket that accepts a connection and
+    // then stops talking must cost the caller its own timeout, not the
+    // transport's much longer safety valve.
+    let initial = match within(deadline, observe(connection, Some(change_id))).await {
+        Some(Ok(initial)) => initial,
+        Some(Err(error)) => return error.into_envelope(Operation::Wait).with_change(change_id),
+        None => return unobserved_timeout_envelope(change_id, timeout),
     };
     let instance_id = initial.instance_id.clone();
 
@@ -79,10 +109,22 @@ pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) ->
 
     let mut observation = initial;
     loop {
-        match evaluate(&observation, &instance_id, change_id, &repo_root, &contract).await {
+        match evaluate(
+            &observation,
+            &instance_id,
+            change_id,
+            &repo_root,
+            &contract,
+            deadline,
+        )
+        .await
+        {
             Step::Settled(envelope) => return *envelope,
+            Step::Expired { detail } => {
+                return timeout_envelope(change_id, &instance_id, timeout, detail)
+            }
             Step::KeepObserving { detail } => {
-                if tokio::time::Instant::now() >= deadline {
+                if Instant::now() >= deadline {
                     return timeout_envelope(change_id, &instance_id, timeout, detail);
                 }
             }
@@ -91,7 +133,7 @@ pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) ->
         // Wake on published activity, and fall back to the poll cadence. The
         // budget never outlives the caller's deadline, so a quiet owner cannot
         // stretch the wait past what was asked for.
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return timeout_envelope(change_id, &instance_id, timeout, None);
         }
@@ -106,10 +148,13 @@ pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) ->
         debug_assert!(matches!(wake, Wake::Activity | Wake::Gap | Wake::Idle));
 
         observation = loop {
-            match observe(connection, Some(change_id)).await {
+            let Some(result) = within(deadline, observe(connection, Some(change_id))).await else {
+                return timeout_envelope(change_id, &instance_id, timeout, None);
+            };
+            match result {
                 Ok(next) => break next,
                 Err(error) if error.is_transient() => {
-                    if tokio::time::Instant::now() >= deadline {
+                    if Instant::now() >= deadline {
                         return timeout_envelope(
                             change_id,
                             &instance_id,
@@ -117,14 +162,26 @@ pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) ->
                             Some(error.message().to_string()),
                         );
                     }
-                    tokio::time::sleep(RETRY_INTERVAL).await;
+                    tokio::time::sleep(
+                        RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
                 }
                 // A socket that stopped answering mid-wait is an owner that is
                 // gone. It is never completion: the repository has to say so.
                 Err(error) => {
-                    let verdict = repo::verify(change_id, &repo_root, &contract).await;
-                    if let Verdict::Completed { evidence } = verdict {
-                        return completed_envelope(change_id, &instance_id, &contract, evidence);
+                    match repo::verify(change_id, &repo_root, &contract, deadline).await {
+                        Verdict::Completed { evidence } => {
+                            return completed_envelope(change_id, &instance_id, &contract, evidence)
+                        }
+                        // The deadline passed while the last proof was being
+                        // read. `timeout` is the operation's answer; the
+                        // transport error that arrived first was already too
+                        // late to replace it.
+                        Verdict::DeadlineExpired => {
+                            return timeout_envelope(change_id, &instance_id, timeout, None)
+                        }
+                        _ => {}
                     }
                     return error.into_envelope(Operation::Wait).with_change(change_id);
                 }
@@ -139,6 +196,8 @@ enum Step {
     Settled(Box<ResultEnvelope>),
     /// Nothing terminal yet; `detail` explains what is still missing.
     KeepObserving { detail: Option<String> },
+    /// The operation deadline passed inside repository verification.
+    Expired { detail: Option<String> },
 }
 
 impl Step {
@@ -153,11 +212,12 @@ async fn evaluate(
     change_id: &str,
     repo_root: &std::path::Path,
     contract: &OwnerExecutionContract,
+    deadline: Instant,
 ) -> Step {
     // Owner replacement first: everything below would otherwise be read from a
     // process that never saw the work this wait is about.
     if observation.instance_id != instance_id {
-        let verdict = repo::verify(change_id, repo_root, contract).await;
+        let verdict = repo::verify(change_id, repo_root, contract, deadline).await;
         return match verdict {
             // Repository evidence alone is enough, and it is the *only* thing
             // that is: the new incarnation cannot vouch for the old one's
@@ -168,6 +228,11 @@ async fn evaluate(
                 contract,
                 evidence,
             )),
+            // Owner replacement is only reportable once the repository has been
+            // asked; a deadline that passed first leaves that question
+            // unanswered, so the operation timed out rather than observing a
+            // restart it could not qualify.
+            Verdict::DeadlineExpired => Step::Expired { detail: None },
             _ => Step::settled(
                 ResultEnvelope::new(Operation::Wait, Outcome::OwnerRestarted)
                     .with_change(change_id)
@@ -226,7 +291,7 @@ async fn evaluate(
         };
     }
 
-    match repo::verify(change_id, repo_root, contract).await {
+    match repo::verify(change_id, repo_root, contract, deadline).await {
         Verdict::Completed { evidence } => Step::settled(completed_envelope(
             change_id,
             instance_id,
@@ -252,6 +317,7 @@ async fn evaluate(
                 .with_message(detail)
                 .with_detail(contract_detail(contract)),
         ),
+        Verdict::DeadlineExpired => Step::Expired { detail: None },
     }
 }
 
@@ -283,6 +349,20 @@ fn contract_detail(contract: &OwnerExecutionContract) -> serde_json::Value {
         "pushed_branch": contract.pushed_branch,
         "commands_submitted": 0,
     })
+}
+
+/// The timeout that happened before any owner incarnation was observed.
+///
+/// It carries no `instance_id` because none was ever reconciled — reporting one
+/// would claim an observation the operation never made.
+fn unobserved_timeout_envelope(change_id: &str, timeout: Duration) -> ResultEnvelope {
+    ResultEnvelope::new(Operation::Wait, Outcome::Timeout)
+        .with_change(change_id)
+        .with_message(format!(
+            "the owner did not answer the first observation within {}ms",
+            timeout.as_millis()
+        ))
+        .with_detail(serde_json::json!({ "commands_submitted": 0 }))
 }
 
 fn timeout_envelope(

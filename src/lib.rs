@@ -27,6 +27,7 @@ mod agent;
 pub mod ai_command_runner;
 mod analyzer;
 mod archive_layout;
+mod bounded_git;
 pub mod cli;
 pub mod client;
 mod command_queue;
