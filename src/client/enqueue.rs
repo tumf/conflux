@@ -80,9 +80,37 @@ impl Refusal {
     }
 }
 
+/// The commands this invocation actually submitted, in submission order.
+///
+/// A command joins the list the moment the owner answers the POST with a
+/// command record, because that record *is* the owner's proof that the command
+/// was admitted for execution. Settlement decides whether a command succeeded,
+/// never whether it happened, so nothing is ever removed: an audit that dropped
+/// a failed Start would understate the side effects an operator has to reason
+/// about and would disagree with the owner's own command records. Commands that
+/// were skipped, or refused before any record existed, never join it at all.
+///
+/// The audit spans the whole invocation rather than one revision-scoped
+/// attempt, because a recomputation submits real commands too.
+#[derive(Debug, Default)]
+struct CommandAudit {
+    submitted: Vec<&'static str>,
+}
+
+impl CommandAudit {
+    fn record(&mut self, command: &'static str) {
+        self.submitted.push(command);
+    }
+
+    fn submitted(&self) -> &[&'static str] {
+        &self.submitted
+    }
+}
+
 /// Run the enqueue intent.
 pub async fn run(connection: &Connection, change_id: &str) -> ResultEnvelope {
     let mut first_instance: Option<String> = None;
+    let mut audit = CommandAudit::default();
 
     for attempt in 0..MAX_REVISION_ATTEMPTS {
         let observation = match observe(connection, Some(change_id)).await {
@@ -104,7 +132,7 @@ pub async fn run(connection: &Connection, change_id: &str) -> ResultEnvelope {
             Some(_) => {}
         }
 
-        match attempt_intent(connection, &observation, change_id).await {
+        match attempt_intent(connection, &observation, change_id, &mut audit).await {
             Attempt::Settled(envelope) => return *envelope,
             Attempt::Stale => continue,
         }
@@ -138,6 +166,7 @@ async fn attempt_intent(
     connection: &Connection,
     observation: &Observation,
     change_id: &str,
+    audit: &mut CommandAudit,
 ) -> Attempt {
     let instance = Some(observation.instance_id.clone());
 
@@ -216,6 +245,7 @@ async fn attempt_intent(
                     change_id: change_id.to_string(),
                 },
                 "retry_change",
+                audit,
             )
             .await
         }
@@ -229,10 +259,11 @@ async fn attempt_intent(
                     queued: true,
                 },
                 "set_queue_intent",
+                audit,
             )
             .await
         }
-        Route::MarkAndStart => mark_and_start(connection, observation, change_id).await,
+        Route::MarkAndStart => mark_and_start(connection, observation, change_id, audit).await,
     }
 }
 
@@ -381,6 +412,7 @@ async fn mark_and_start(
     connection: &Connection,
     observation: &Observation,
     change_id: &str,
+    audit: &mut CommandAudit,
 ) -> Attempt {
     let instance = Some(observation.instance_id.clone());
 
@@ -393,7 +425,6 @@ async fn mark_and_start(
 
     // A change that is already marked needs no mark command; submitting one
     // would settle as a no-op and add nothing but a record.
-    let mut submitted = Vec::new();
     if !observation
         .change(change_id)
         .is_some_and(|change| change.execution_marked)
@@ -404,8 +435,10 @@ async fn mark_and_start(
                 change_id: change_id.to_string(),
                 marked: true,
             },
+            "set_execution_mark",
             observation.state_revision,
             &observation.instance_id,
+            audit,
         )
         .await
         {
@@ -414,12 +447,12 @@ async fn mark_and_start(
             // because the owner may have advanced for unrelated reasons in
             // between and a mark that isolated the target set a moment ago may
             // no longer.
-            Ok(_) => submitted.push("set_execution_mark"),
+            Ok(_) => {}
             Err(SubmitFailure::Stale { .. }) => return Attempt::Stale,
             Err(failure) => {
                 return Attempt::settled(failure.into_envelope(change_id, instance).with_detail(
                     serde_json::json!({
-                        "commands_submitted": ["set_execution_mark"],
+                        "commands_submitted": audit.submitted(),
                         "phase": "mark",
                     }),
                 ))
@@ -432,7 +465,12 @@ async fn mark_and_start(
     let after_mark = match observe(connection, Some(change_id)).await {
         Ok(after_mark) => after_mark,
         Err(error) => {
-            return Attempt::settled(partial_after_mark(change_id, instance, &submitted, &error))
+            return Attempt::settled(partial_after_mark(
+                change_id,
+                instance,
+                audit.submitted(),
+                &error,
+            ))
         }
     };
     if after_mark.instance_id != observation.instance_id {
@@ -452,7 +490,7 @@ async fn mark_and_start(
         return Attempt::settled(partial_start(
             change_id,
             instance,
-            &submitted,
+            audit.submitted(),
             format!(
                 "an unrelated execution mark appeared before Start ({}), so starting would have \
                  consumed it",
@@ -463,38 +501,42 @@ async fn mark_and_start(
     match submit_and_settle(
         connection,
         CommandSpec::Start,
+        "start",
         after_mark.state_revision,
         &observation.instance_id,
+        audit,
     )
     .await
     {
-        Ok(record) => {
-            submitted.push("start");
-            Attempt::settled(
-                ResultEnvelope::new(Operation::Enqueue, Outcome::Admitted)
-                    .with_change(change_id)
-                    .with_instance(instance)
-                    .with_message("the owner marked and started the requested change")
-                    .with_detail(serde_json::json!({
-                        "route": "mark_and_start",
-                        "commands_submitted": submitted,
-                        "command_state": record.state,
-                        "result_revision": record.result_revision,
-                        "detail": record.detail,
-                    })),
-            )
-        }
+        Ok(record) => Attempt::settled(
+            ResultEnvelope::new(Operation::Enqueue, Outcome::Admitted)
+                .with_change(change_id)
+                .with_instance(instance)
+                .with_message("the owner marked and started the requested change")
+                .with_detail(serde_json::json!({
+                    "route": "mark_and_start",
+                    "commands_submitted": audit.submitted(),
+                    "command_state": record.state,
+                    "result_revision": record.result_revision,
+                    "detail": record.detail,
+                })),
+        ),
         // A stale Start after a settled mark is still partial intent: the mark
         // exists, and a recomputation would submit a second one.
         Err(SubmitFailure::Stale { .. }) => Attempt::settled(partial_start(
             change_id,
             instance,
-            &submitted,
+            audit.submitted(),
             "the owner's state advanced between the settled mark and Start",
         )),
         Err(failure) => {
             let message = failure.message();
-            Attempt::settled(partial_start(change_id, instance, &submitted, message))
+            Attempt::settled(partial_start(
+                change_id,
+                instance,
+                audit.submitted(),
+                message,
+            ))
         }
     }
 }
@@ -534,12 +576,16 @@ fn partial_after_mark(
 
 /// The partial-intent result, reporting the commands *this invocation* sent.
 ///
-/// `submitted` is the live audit list, not a description of the situation: a
-/// change that was already execution-marked before the client looked reaches
-/// this same path with nothing submitted, and naming `set_execution_mark` there
-/// would tell an operator that the client wrote a mark it merely found. The
-/// remaining mark and the warning that a later Start can consume it are reported
-/// either way, because that part is true of the repository, not of the audit.
+/// `submitted` is the live audit list, not a description of the situation, and
+/// the two disagree in both directions. A change that was already
+/// execution-marked before the client looked reaches this same path without a
+/// mark command, and naming `set_execution_mark` there would tell an operator
+/// that the client wrote a mark it merely found. A Start that was submitted and
+/// then settled as a failure is the mirror case: it is still an external effect
+/// the owner recorded, so omitting it would understate what has to be reasoned
+/// about next. The remaining mark and the warning that a later Start can consume
+/// it are reported either way, because that part is true of the repository, not
+/// of the audit.
 fn partial_start(
     change_id: &str,
     instance: Option<String>,
@@ -587,14 +633,17 @@ async fn submit_single(
     observation: &Observation,
     change_id: &str,
     spec: CommandSpec,
-    route: &str,
+    route: &'static str,
+    audit: &mut CommandAudit,
 ) -> Attempt {
     let instance = Some(observation.instance_id.clone());
     match submit_and_settle(
         connection,
         spec,
+        route,
         observation.state_revision,
         &observation.instance_id,
+        audit,
     )
     .await
     {
@@ -605,7 +654,7 @@ async fn submit_single(
                 .with_message(format!("the owner accepted the '{route}' admission"))
                 .with_detail(serde_json::json!({
                     "route": route,
-                    "commands_submitted": [route],
+                    "commands_submitted": audit.submitted(),
                     "command_state": record.state,
                     "result_revision": record.result_revision,
                     "detail": record.detail,
@@ -615,7 +664,7 @@ async fn submit_single(
         Err(failure) => Attempt::settled(failure.into_envelope(change_id, instance).with_detail(
             serde_json::json!({
                 "route": route,
-                "commands_submitted": [route],
+                "commands_submitted": audit.submitted(),
             }),
         )),
     }
@@ -696,8 +745,10 @@ impl From<TransportError> for SubmitFailure {
 async fn submit_and_settle(
     connection: &Connection,
     command: CommandSpec,
+    name: &'static str,
     expected_revision: u64,
     expected_instance: &str,
+    audit: &mut CommandAudit,
 ) -> Result<CommandRecord, SubmitFailure> {
     let request = CommandRequest {
         command,
@@ -727,6 +778,12 @@ async fn submit_and_settle(
     // same status with an `ApiError`. Reading the record first is what keeps a
     // settled `target_ineligible` from being reported as a generic failure.
     if let Ok(record) = response.json::<CommandRecord>() {
+        // The record is the owner's own proof that this command was admitted for
+        // execution, so the audit is written here — before settlement is even
+        // polled, let alone interpreted. Whether the command then succeeds
+        // changes what the caller should do next, not what this invocation
+        // already did.
+        audit.record(name);
         return settle(connection, record, expected_instance).await;
     }
 
@@ -1007,10 +1064,12 @@ mod tests {
 
     #[test]
     fn partial_intent_names_the_mark_and_refuses_to_claim_rollback() {
+        // Both commands were submitted; only the mark settled. The audit is
+        // about submission, so the failed Start belongs in it.
         let envelope = partial_start(
             "alpha",
             Some("i-1".to_string()),
-            &["set_execution_mark"],
+            &["set_execution_mark", "start"],
             "Start was refused",
         );
         assert_eq!(envelope.outcome, Outcome::PartialIntent);
@@ -1022,20 +1081,25 @@ mod tests {
         assert_eq!(envelope.detail["rolled_back"], false);
         assert_eq!(
             envelope.detail["commands_submitted"],
-            serde_json::json!(["set_execution_mark"])
+            serde_json::json!(["set_execution_mark", "start"])
         );
     }
 
     #[test]
     fn a_pre_existing_mark_is_never_audited_as_a_submitted_command() {
-        // The mark was already there, so this invocation sent nothing at all
-        // before Start failed. The remaining-mark warning still has to be
-        // reported: it describes the repository, not what the client did.
-        let envelope = partial_start("alpha", Some("i-1".to_string()), &[], "Start was refused");
+        // The mark was already there, so Start is the only command this
+        // invocation sent. The remaining-mark warning still has to be reported:
+        // it describes the repository, not what the client did.
+        let envelope = partial_start(
+            "alpha",
+            Some("i-1".to_string()),
+            &["start"],
+            "Start was refused",
+        );
         assert_eq!(envelope.outcome, Outcome::PartialIntent);
         assert_eq!(
             envelope.detail["commands_submitted"],
-            serde_json::json!([]),
+            serde_json::json!(["start"]),
             "a mark this client did not submit must not appear in its audit list"
         );
         let message = envelope.message.clone().unwrap();
@@ -1046,6 +1110,18 @@ mod tests {
         assert!(message.contains("left in place"), "{message}");
         assert_eq!(envelope.detail["remaining_mark"], "alpha");
         assert_eq!(envelope.detail["rolled_back"], false);
+    }
+
+    #[test]
+    fn a_skipped_command_never_enters_the_audit_while_a_failed_one_stays() {
+        // The audit is append-only in submission order: settlement decides
+        // whether a command succeeded, never whether it was sent, and a command
+        // that was never POSTed leaves no trace at all.
+        let mut audit = CommandAudit::default();
+        assert!(audit.submitted().is_empty());
+        audit.record("set_execution_mark");
+        audit.record("start");
+        assert_eq!(audit.submitted(), ["set_execution_mark", "start"]);
     }
 
     #[test]
