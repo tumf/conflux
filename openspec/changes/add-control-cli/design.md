@@ -18,7 +18,7 @@ Connection options belong to the `control` namespace. `--auth-token-env` names a
 
 ## Transport and discovery
 
-The default socket is derived with the same canonical Git common-directory helper as the owner. An override supports tests and explicitly configured owners. The client performs health, capabilities, instance, state, and execution-status reads before deciding an action.
+The default socket is derived with the same canonical Git common-directory helper as the owner. An override supports tests and explicitly configured owners. The client performs health, capabilities, instance, state, execution-status, and owner execution-contract reads before deciding an action. Because these are separate resources, one coherent observation requires the same `instance_id` and matching `state_revision`; event cursors must not move backwards. A mismatch triggers a bounded full reread, then `observation_conflict` rather than a mixed snapshot.
 
 The client should reuse the source v2 DTOs. Transport code should add only the minimum HTTP-over-UDS machinery needed by this repository; do not introduce a general HTTP client dependency if the existing Tokio/Axum/HTTP stack or a small local codec suffices.
 
@@ -52,6 +52,7 @@ Initial stable unsuccessful outcomes include:
 - `target_ineligible`
 - `operator_intent_conflict`
 - `revision_conflict`
+- `observation_conflict`
 - `command_failed`
 - `change_rejected`
 - `process_failed`
@@ -79,13 +80,14 @@ When idle Start requires a mark followed by Start, this is intentionally a two-c
 
 `wait` is an observer, not a workflow engine.
 
-1. Capture `instance_id`, base branch identity, initial change snapshot, and execution status.
-2. Observe events when available, with polling as recovery for gaps; always rehydrate from `/state` after a gap.
+1. Capture `instance_id`, the typed owner execution contract, initial change snapshot, and execution status at a reconciled revision.
+2. Observe events when available, with polling as recovery for gaps; always rehydrate all observation resources after a gap.
 3. Treat command/API presentation as progress evidence, not durable completion authority.
-4. Return successful completion only when the active change is gone or terminal-success presentation is paired with repository-verifiable archive and base integration evidence appropriate to the configured flow.
-5. Return unsuccessful outcomes for rejection, process-fatal failure, incompatible owner replacement, or timeout.
+4. For terminal mode `merged`, require terminal `merged` presentation plus an archived proposal and Git ancestry proving the owner-published terminal commit is reachable from the owner-published base branch.
+5. For terminal mode `pushed`, require terminal `pushed` presentation plus an archived proposal and typed owner evidence naming the selected remote and remotely confirmed terminal commit; do not substitute local branch ancestry.
+6. Return unsuccessful outcomes for rejection, process-fatal failure, incompatible owner replacement, missing/ambiguous completion evidence, or timeout.
 
-Push post-archive mode cannot prove local base integration. In that mode the first implementation may return a typed unsupported/incompatible outcome rather than weaken completion truth. Supporting pushed completion later requires an explicit repository-verifiable contract.
+The owner execution contract is a minimal source-owned v2 DTO projected with `instance_id` and `state_revision`. It publishes base branch identity, terminal success mode, selected remote when applicable, and the exact terminal commit evidence already owned by the orchestration boundary. It is observability only and cannot drive workflow routing.
 
 ## Security and failure handling
 

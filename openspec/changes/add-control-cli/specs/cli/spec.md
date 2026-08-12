@@ -99,9 +99,9 @@ The CLI MUST submit the smallest supported sequence through the existing shared 
 
 ### Requirement: Observation-only completion wait
 
-`cflx control wait <change-id>` MUST observe one owner and repository until the requested change reaches a repository-verifiable successful archive/integration outcome, a typed unsuccessful terminal outcome, owner replacement, or timeout. It MUST use event streaming when available and authoritative snapshot polling to recover from gaps. API presentation and command records MAY provide progress but MUST NOT alone certify implementation or integration completion.
+`cflx control wait <change-id>` MUST observe one owner and repository until the requested change reaches a repository-verifiable terminal success, a typed unsuccessful terminal outcome, owner replacement, or timeout. It MUST use event streaming when available and authoritative multi-resource polling to recover from gaps. Reads MUST agree on `instance_id` and `state_revision`; incompatible reads require bounded reread or typed observation conflict. API presentation and command records MAY provide progress but MUST NOT alone certify implementation or integration completion.
 
-Wait MUST submit no mutation command. Change disappearance alone MUST NOT count as success. If the configured publication mode cannot provide repository-verifiable local integration evidence, the CLI MUST return a typed unsupported/incompatible outcome rather than weaken truthful completion.
+Wait MUST submit no mutation command. Change disappearance alone MUST NOT count as success. For owner terminal mode `merged`, success requires archived proposal evidence and Git ancestry from the owner-published terminal commit to the owner-published base branch. For terminal mode `pushed`, success requires archived proposal evidence plus owner-published selected-remote and remotely confirmed terminal commit evidence. Missing or ambiguous typed owner evidence MUST fail closed rather than weaken truthful completion.
 
 #### Scenario: Wait proves successful local integration
 
@@ -109,6 +109,20 @@ Wait MUST submit no mutation command. Change disappearance alone MUST NOT count 
 **When**: archive completes and repository evidence proves the resulting change is integrated into the intended base
 **Then**: `cflx control wait alpha --json` exits zero with outcome `completed`
 **And**: it identifies the observed owner instance and repository completion evidence
+
+#### Scenario: Wait proves pushed publication
+
+**Given**: `alpha` is processed by one owner in pushed terminal mode
+**When**: the owner reports terminal `pushed`, an archived proposal exists, and typed owner evidence identifies the selected remote and remotely confirmed terminal commit
+**Then**: `cflx control wait alpha --json` exits zero with outcome `completed`
+**And**: it does not substitute local branch ancestry for remote confirmation
+
+#### Scenario: Mixed observation is not completion
+
+**Given**: state and execution-contract reads carry different revisions or owner incarnations
+**When**: wait evaluates terminal completion
+**Then**: it performs a bounded coherent reread or returns `observation_conflict`
+**And**: it does not combine the mixed values into a success claim
 
 #### Scenario: Disappearance does not prove success
 

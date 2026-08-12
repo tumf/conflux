@@ -52,7 +52,7 @@ The client also needs truthful waiting semantics. A successful enqueue command o
 
 Add a `cflx control` namespace for a thin local client of the existing repository owner:
 
-- `cflx control status --json` discovers the repository-scoped Unix socket, reads capabilities, instance, authoritative state, and execution status, and emits one stable summary envelope without mutation.
+- `cflx control status --json` discovers the repository-scoped Unix socket, reads capabilities, instance, authoritative state, execution status, and the typed owner execution contract, then emits one stable summary envelope without mutation. Multi-resource reads are coherent only when `instance_id`, `state_revision`, and compatible `event_sequence` boundaries agree; otherwise the client performs bounded rereads or returns a typed observation conflict.
 - `cflx control enqueue <change-id> --json` expresses the high-level intent “admit this change to the existing owner.” The client reads authoritative action/lifecycle fields and uses the smallest supported sequence of existing typed commands. It owns revision refresh, idempotency keys, command-record settlement, bounded stale-revision retries, and mode-aware choice of execution mark, queue intent, retry, and start. It never starts a second owner.
 - `cflx control wait <change-id> --json [--timeout <duration>]` observes the same owner until repository-verifiable success or a typed unsuccessful terminal result. It does not mutate, retry, archive, merge, or repair work.
 
@@ -63,7 +63,7 @@ The public CLI contract is intent-based. It must not expose flags for `expected_
 ## Acceptance Criteria
 
 1. `cflx control` is a separate namespace and does not change `cflx run` ownership, lock, or target semantics.
-2. `status --json` is read-only and reports owner instance, app mode, scheduler/activity state, and per-change authoritative status from one coherent observation.
+2. `status --json` is read-only and reports owner instance, app mode, scheduler/activity state, execution contract, and per-change authoritative status only after incarnation/revision reconciliation produces one coherent observation.
 3. `enqueue <change-id> --json` can admit an eligible idle change to a command-capable TUI owner and can add eligible work to a live owner using existing shared operator-command semantics.
 4. Enqueue handles retry-eligible changes through authoritative action eligibility and refuses blocked, terminal, unknown, worktree-ineligible, or active-run-limited targets without hidden mutation.
 5. Idle-owner admission never starts unrelated pre-marked changes. If Start would consume marks other than the requested change, enqueue returns a typed operator-intent conflict without clearing or starting those marks.
@@ -77,8 +77,10 @@ The public CLI contract is intent-based. It must not expose flags for `expected_
 ## Explicit Completion Conditions
 
 - CLI parsing and help expose only `status`, `enqueue`, and `wait` under `control`, plus shared connection/output options.
-- A reusable internal client connects over Unix domain sockets and deserializes generated v2 DTOs rather than duplicating ad-hoc JSON field parsing.
+- A reusable internal client connects over Unix domain sockets and reuses the source-owned v2 DTOs rather than duplicating ad-hoc JSON field parsing; generated OpenAPI remains the external schema contract.
+- The owner publishes a minimal typed execution contract containing base branch identity and terminal success mode (`merged` or `pushed`, including selected remote when applicable), at the same owner incarnation and revision boundary used by control observations.
 - Integration fixtures run a real local v2 router with bound and unbound executors and prove the success, no-op, refusal, stale-revision, restart, timeout, and no-side-effect paths.
+- One bounded smoke test runs the compiled control CLI against a production shared operator coordinator/real local owner and proves actual admission and terminal completion, rather than only fixture executor calls.
 - Tests prove `status` and `wait` submit zero commands and that failed `enqueue` paths do not start a second process, acquire the repository lock, or mutate Git/workspace state.
 - JSON schema/version and exit-code mappings are asserted as executable CLI behavior, including clean stdout/stderr separation.
 - `cargo test --features web-monitoring --test control_cli_tests`, `cargo fmt --check`, and `cargo clippy --features web-monitoring -- -D warnings` pass.
