@@ -1914,7 +1914,24 @@ mod enabled {
     // `commands_submitted` is an audit list, not a description of the situation.
     // A mark the client *found* and a mark the client *set* leave the repository
     // in the same shape but say different things about who to ask next, and only
-    // one of them is this invocation's doing.
+    // one of them is this invocation's doing. The mirror error is just as bad: a
+    // Start that was submitted and then failed is still an external effect the
+    // owner recorded, so the list must carry it. In every case the list has to
+    // equal what the executor behind the real endpoint actually saw.
+
+    /// The audit spelling of each command the spy observed, in order.
+    fn submitted_names(spy: &SpyExecutor) -> Vec<&'static str> {
+        spy.calls()
+            .iter()
+            .map(|command| match command {
+                CommandSpec::SetExecutionMark { .. } => "set_execution_mark",
+                CommandSpec::Start => "start",
+                CommandSpec::SetQueueIntent { .. } => "set_queue_intent",
+                CommandSpec::RetryChange { .. } => "retry_change",
+                _ => "other",
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn partial_intent_command_audit_lists_the_mark_this_invocation_submitted() {
@@ -1938,22 +1955,19 @@ mod enabled {
         assert_eq!(output.status.code(), Some(15));
         assert_eq!(
             parsed["detail"]["commands_submitted"],
-            serde_json::json!(["set_execution_mark"])
+            serde_json::json!(["set_execution_mark", "start"]),
+            "a Start that was submitted and then failed is still an effect the \
+             owner recorded"
         );
         assert_eq!(parsed["detail"]["remaining_mark"], "alpha");
         assert_eq!(parsed["detail"]["rolled_back"], false);
 
         // The audit list and the executor agree on exactly which commands ran.
-        let submitted: Vec<&str> = spy
-            .calls()
-            .iter()
-            .map(|command| match command {
-                CommandSpec::SetExecutionMark { .. } => "set_execution_mark",
-                CommandSpec::Start => "start",
-                _ => "other",
-            })
-            .collect();
-        assert_eq!(submitted, vec!["set_execution_mark", "start"]);
+        assert_eq!(
+            parsed["detail"]["commands_submitted"],
+            serde_json::json!(submitted_names(&spy)),
+            "the envelope audit must equal the executor's submission sequence"
+        );
         owner.stop().await;
     }
 
@@ -1977,8 +1991,9 @@ mod enabled {
         assert_eq!(output.status.code(), Some(15));
         assert_eq!(
             parsed["detail"]["commands_submitted"],
-            serde_json::json!([]),
-            "a pre-existing mark is state, not a command this invocation sent"
+            serde_json::json!(["start"]),
+            "a pre-existing mark is state, not a command this invocation sent, \
+             but the Start that failed was still submitted"
         );
 
         // The truthful parts of the report survive: the mark is still there and
@@ -1999,6 +2014,87 @@ mod enabled {
             "{:?}",
             spy.calls()
         );
+        assert_eq!(
+            parsed["detail"]["commands_submitted"],
+            serde_json::json!(submitted_names(&spy)),
+            "the envelope audit must equal the executor's submission sequence"
+        );
+        owner.stop().await;
+    }
+
+    #[tokio::test]
+    async fn partial_intent_command_audit_omits_a_start_it_never_submitted() {
+        // An unrelated mark appearing between our settled mark and Start makes
+        // Start unsafe, so it is never POSTed. The audit must stop at the mark:
+        // "we intended two commands" is not the same claim as "we sent two".
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![
+                change("alpha", "select", "not queued"),
+                change("beta", "select", "not queued"),
+            ],
+        ));
+
+        // The racing mark lands from inside the mark command's own execution, so
+        // the client's pre-Start reread is guaranteed to observe it.
+        struct Racing {
+            inner: Arc<SpyExecutor>,
+            projection: Arc<Projection>,
+        }
+        #[async_trait]
+        impl RemoteControlExecutor for Racing {
+            async fn execute(
+                &self,
+                command: &CommandSpec,
+            ) -> Result<ExecutionSummary, CommandFailure> {
+                let result = self.inner.execute(command).await;
+                let mut alpha = change("alpha", "select", "not queued");
+                alpha.execution_marked = true;
+                let mut beta = change("beta", "select", "not queued");
+                beta.execution_marked = true;
+                self.projection.apply_state(
+                    "test_snapshot",
+                    None,
+                    serde_json::json!({}),
+                    snapshot("select", vec![alpha, beta]),
+                );
+                result
+            }
+        }
+        owner
+            .runtime
+            .bind(Arc::new(Racing {
+                inner: spy.clone(),
+                projection: owner.projection.clone(),
+            }))
+            .await;
+
+        let output = enqueue(&owner, "alpha").await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "partial_intent");
+        assert_eq!(output.status.code(), Some(15));
+        assert_eq!(
+            parsed["detail"]["commands_submitted"],
+            serde_json::json!(["set_execution_mark"]),
+            "a Start that was never POSTed must not appear in the audit"
+        );
+        assert_eq!(
+            parsed["detail"]["commands_submitted"],
+            serde_json::json!(submitted_names(&spy)),
+            "the envelope audit must equal the executor's submission sequence"
+        );
+        assert!(
+            matches!(
+                spy.calls().as_slice(),
+                [CommandSpec::SetExecutionMark { .. }]
+            ),
+            "{:?}",
+            spy.calls()
+        );
+        assert_eq!(parsed["detail"]["remaining_mark"], "alpha");
+        assert_eq!(parsed["detail"]["rolled_back"], false);
         owner.stop().await;
     }
 
