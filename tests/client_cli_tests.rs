@@ -198,6 +198,122 @@ mod enabled {
         }
     }
 
+    /// What one `POST /api/v2/commands` asked for and what the owner answered.
+    #[derive(Debug, Clone)]
+    struct CommandExchange {
+        command_type: String,
+        expected_revision: u64,
+        idempotency_key: String,
+        status: u16,
+        /// `Some` when the owner answered with a command record — its own proof
+        /// that the command was admitted for execution, which is exactly what
+        /// the client's audit claims to list.
+        record_id: Option<String>,
+        /// `Some` when the owner refused with a typed error instead.
+        error_code: Option<String>,
+    }
+
+    /// A recorder and injection point wrapped *around* the real `/api/v2` router.
+    ///
+    /// It replaces no part of the production path: every request it sees is one
+    /// the compiled client actually sent, every response it records is one the
+    /// production handlers produced, and an advance it injects lands strictly
+    /// between the client's observation and the endpoint's own revision check.
+    /// That window is where a stale revision is born, so a test can force one by
+    /// request ordering alone — no sleeps, no wall-clock races.
+    #[derive(Default)]
+    struct ApiSpy {
+        /// `METHOD path` for every request, in arrival order.
+        requests: Mutex<Vec<String>>,
+        /// One entry per `POST /api/v2/commands`, in submission order.
+        exchanges: Mutex<Vec<CommandExchange>>,
+        /// Advances applied just before each command POST reaches the handler,
+        /// popped in order; an exhausted script injects nothing.
+        before_command: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl ApiSpy {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn inject_before_commands(&self, script: Vec<Box<dyn Fn() + Send + Sync>>) {
+            *self.before_command.lock().unwrap() = script;
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn exchanges(&self) -> Vec<CommandExchange> {
+            self.exchanges.lock().unwrap().clone()
+        }
+
+        async fn intercept(
+            self: Arc<Self>,
+            request: axum::extract::Request,
+            next: axum::middleware::Next,
+        ) -> axum::response::Response {
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            self.requests
+                .lock()
+                .unwrap()
+                .push(format!("{method} {path}"));
+
+            // Everything else is forwarded untouched: buffering a body here
+            // would break the streaming endpoints this router also serves.
+            if method != "POST" || path != "/api/v2/commands" {
+                return next.run(request).await;
+            }
+
+            let (parts, body) = request.into_parts();
+            let submitted_bytes = axum::body::to_bytes(body, usize::MAX)
+                .await
+                .expect("the command request body is readable");
+            let submitted: serde_json::Value =
+                serde_json::from_slice(&submitted_bytes).expect("the command request body is JSON");
+
+            let advance = {
+                let mut script = self.before_command.lock().unwrap();
+                (!script.is_empty()).then(|| script.remove(0))
+            };
+            if let Some(advance) = advance {
+                advance();
+            }
+
+            let response = next
+                .run(axum::extract::Request::from_parts(
+                    parts,
+                    axum::body::Body::from(submitted_bytes),
+                ))
+                .await;
+            let status = response.status().as_u16();
+            let (parts, body) = response.into_parts();
+            let answered_bytes = axum::body::to_bytes(body, usize::MAX)
+                .await
+                .expect("the command response body is readable");
+            let answered: serde_json::Value =
+                serde_json::from_slice(&answered_bytes).unwrap_or(serde_json::Value::Null);
+
+            self.exchanges.lock().unwrap().push(CommandExchange {
+                // `CommandRequest` flattens its `CommandSpec`, so the
+                // discriminant is a top-level `type` on the wire.
+                command_type: submitted["type"].as_str().unwrap_or_default().to_string(),
+                expected_revision: submitted["expected_revision"].as_u64().unwrap_or_default(),
+                idempotency_key: submitted["idempotency_key"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                status,
+                record_id: answered["command_id"].as_str().map(str::to_string),
+                error_code: answered["error_code"].as_str().map(str::to_string),
+            });
+
+            axum::response::Response::from_parts(parts, axum::body::Body::from(answered_bytes))
+        }
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     // Owner fixture
     // ────────────────────────────────────────────────────────────────────────
@@ -228,6 +344,22 @@ mod enabled {
             owner
         }
 
+        /// Start an owner whose real router is wrapped by a recording layer.
+        ///
+        /// Used where a test has to know what the client put on the wire, or has
+        /// to make the owner advance at one exact point in the exchange.
+        async fn start_intercepted(
+            executor: Option<Arc<dyn RemoteControlExecutor>>,
+            token: Option<&str>,
+            api: Arc<ApiSpy>,
+        ) -> Self {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let socket = dir.path().join("cflx-api.sock");
+            let mut owner = Self::start_layered(socket, executor, token, Some(api)).await;
+            owner._dir = Some(dir);
+            owner
+        }
+
         /// Start an owner on a caller-owned socket path.
         ///
         /// Used where a test has to replace the process serving one endpoint, so
@@ -236,6 +368,15 @@ mod enabled {
             socket: PathBuf,
             executor: Option<Arc<dyn RemoteControlExecutor>>,
             token: Option<&str>,
+        ) -> Self {
+            Self::start_layered(socket, executor, token, None).await
+        }
+
+        async fn start_layered(
+            socket: PathBuf,
+            executor: Option<Arc<dyn RemoteControlExecutor>>,
+            token: Option<&str>,
+            api: Option<Arc<ApiSpy>>,
         ) -> Self {
             let runtime = Arc::new(RemoteControlRuntime::new());
             if let Some(executor) = executor {
@@ -254,6 +395,15 @@ mod enabled {
                     .with_execution_facts(runtime.execution_facts())
                     .with_execution_contract(runtime.execution_contract()),
             );
+            let app = match api {
+                Some(api) => app.layer(axum::middleware::from_fn(
+                    move |request: axum::extract::Request, next: axum::middleware::Next| {
+                        let api = api.clone();
+                        async move { api.intercept(request, next).await }
+                    },
+                )),
+                None => app,
+            };
 
             let listener = tokio::net::UnixListener::bind(&socket).expect("binds the test socket");
             let shutdown = tokio_util::sync::CancellationToken::new();
@@ -2095,6 +2245,144 @@ mod enabled {
         );
         assert_eq!(parsed["detail"]["remaining_mark"], "alpha");
         assert_eq!(parsed["detail"]["rolled_back"], false);
+        owner.stop().await;
+    }
+
+    // ------------------------------------------------------------------------
+    // stale_revision_command_audit
+    // ------------------------------------------------------------------------
+    //
+    // The audit spans a whole invocation, and a recomputation is the only place
+    // where that span covers more than one attempt. Two opposite lies are
+    // available there: a submission the owner refused as stale created no
+    // command record and must not be counted, while the recomputed submission
+    // that *did* produce one must be counted exactly once. Both are invisible to
+    // every other test in this file, because no other test makes the endpoint
+    // reject a submission and then watches what the next one does to the list.
+
+    #[tokio::test]
+    async fn stale_revision_command_audit_matches_the_records_across_a_recomputation() {
+        let spy = SpyExecutor::new();
+        let api = ApiSpy::new();
+        let owner = Owner::start_intercepted(Some(spy.clone()), None, api.clone()).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+
+        // One advance, injected in the only window that can produce a stale
+        // submission: after the client took its observation, before the real
+        // endpoint compares `expected_revision`. It is deliberately routing-
+        // irrelevant progress — the owner moved on with its own work, so the
+        // recomputed attempt must reach the same conclusion at a newer revision.
+        let projection = owner.projection.clone();
+        api.inject_before_commands(vec![Box::new(move || {
+            let mut advanced = change("alpha", "select", "not queued");
+            advanced.completed_tasks = 1;
+            advanced.progress_percent = 50.0;
+            projection.apply_state(
+                "test_snapshot",
+                None,
+                serde_json::json!({}),
+                snapshot("select", vec![advanced]),
+            );
+        })]);
+
+        let output = enqueue(&owner, "alpha").await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "admitted", "{}", stderr_of(&output));
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(parsed["detail"]["route"], "mark_and_start");
+
+        // The injection fired and the *real* endpoint refused the first mutation
+        // this invocation attempted, before any command record existed.
+        let exchanges = api.exchanges();
+        assert_eq!(
+            exchanges.len(),
+            3,
+            "one refused mark, one recomputed mark, one start: {exchanges:#?}"
+        );
+        assert_eq!(exchanges[0].command_type, "set_execution_mark");
+        assert_eq!(exchanges[0].status, 409);
+        assert_eq!(exchanges[0].error_code.as_deref(), Some("stale_revision"));
+        assert!(
+            exchanges[0].record_id.is_none(),
+            "a stale submission is refused before admission, so no record can exist: {:#?}",
+            exchanges[0]
+        );
+
+        // The reread and recomputation happened inside this one invocation: a
+        // fresh authoritative read landed between the refusal and the next
+        // submission, and that submission carried a revision the first attempt
+        // never observed.
+        let trace = api.requests();
+        let first_post = trace
+            .iter()
+            .position(|request| request == "POST /api/v2/commands")
+            .expect("the client must submit a command");
+        let second_post = first_post
+            + 1
+            + trace[first_post + 1..]
+                .iter()
+                .position(|request| request == "POST /api/v2/commands")
+                .expect("the client must recompute and submit again");
+        assert_eq!(
+            trace[first_post + 1..second_post]
+                .iter()
+                .filter(|request| *request == "GET /api/v2/state")
+                .count(),
+            1,
+            "the client must reread authoritative state between the stale refusal and its \
+             recomputed submission: {trace:#?}"
+        );
+        assert!(
+            exchanges[1].expected_revision > exchanges[0].expected_revision,
+            "the recomputed submission must carry the advanced revision: {exchanges:#?}"
+        );
+        assert_eq!(exchanges[1].command_type, "set_execution_mark");
+        assert_eq!(exchanges[2].command_type, "start");
+        let mut keys: Vec<&str> = exchanges
+            .iter()
+            .map(|exchange| exchange.idempotency_key.as_str())
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            3,
+            "a recomputed submission must mint its own key, or the owner would replay the \
+             refused identity: {exchanges:#?}"
+        );
+
+        // The audit equals, in order, exactly the submissions the owner answered
+        // with a command record. The refused attempt is absent because no record
+        // was created for it, and the mark appears once rather than twice.
+        let recorded: Vec<&str> = exchanges
+            .iter()
+            .filter(|exchange| exchange.record_id.is_some())
+            .map(|exchange| exchange.command_type.as_str())
+            .collect();
+        assert_eq!(
+            recorded,
+            vec!["set_execution_mark", "start"],
+            "{exchanges:#?}"
+        );
+        assert_eq!(
+            parsed["detail"]["commands_submitted"],
+            serde_json::json!(recorded),
+            "the envelope audit must equal the owner's own command records"
+        );
+        assert_eq!(
+            parsed["detail"]["commands_submitted"],
+            serde_json::json!(submitted_names(&spy)),
+            "the envelope audit must equal the executor's submission sequence"
+        );
+        assert_eq!(
+            spy.call_count(),
+            2,
+            "the refused attempt must not have reached the executor: {:?}",
+            spy.calls()
+        );
         owner.stop().await;
     }
 
