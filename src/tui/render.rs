@@ -11,7 +11,7 @@ use ratatui::{
 };
 use std::time::Duration;
 
-use crate::orchestration::operator_command::is_markable_status;
+use crate::orchestration::operator_command::{is_active_status, is_markable_status};
 
 use super::state::{
     guards, log_logic, AppState, ChangeState, CopyFeedback, ErrorDetailsPopup,
@@ -1397,23 +1397,55 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 }
 
 /// Render status panel
-fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
-    // Per spec (update-tui-status-display):
-    // Status line shows only progress bar + elapsed time
-    // Progress is calculated from selected (x) changes in all modes
+/// Display statuses that mean the change reached final success.
+///
+/// Narrower than the shared final-status vocabulary on purpose: `rejected` is
+/// also final, but it is a non-success outcome and never an execution target.
+const OVERALL_PROGRESS_SUCCESS_STATUSES: [&str; 3] = ["archived", "merged", "pushed"];
 
-    // Calculate progress based on selected changes only
+/// Whether a row contributes its stored task counts to the Status aggregate.
+///
+/// The aggregate target set is the unique union of successful completed work,
+/// work currently executing, and unfinished work carrying an execution mark.
+/// This is one predicate rather than three passes precisely so an overlapping
+/// row — active *and* marked, or completed *and* still marked — is counted once.
+///
+/// An execution mark is next-run intent, not a record of what this run already
+/// covered, so mark presence alone can never be the sole inclusion evidence:
+/// archive completion revokes the mark by design, and dropping the row then
+/// would make a successful completion *reduce* the displayed progress.
+fn contributes_to_overall_progress(change: &ChangeState) -> bool {
+    // Rejection is final and unsuccessful, so stale presentation state still
+    // claiming a mark must not pull the row back into the aggregate.
+    if change.display_status_cache == "rejected" {
+        return false;
+    }
+
+    // Completed: the reducer-observed archive milestone covers post-archive
+    // `resolving` / `resolve pending` / `merge wait`, none of which is terminal.
+    change.archive_complete_cache
+        || OVERALL_PROGRESS_SUCCESS_STATUSES.contains(&change.display_status_cache.as_str())
+        // In progress: the shared vocabulary, not a TUI-local phase list.
+        || is_active_status(&change.display_status_cache)
+        // Marked for execution: idle, queued, waiting, or retryable error.
+        || change.selected
+}
+
+fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
+    // Per spec (update-tui-status-display, fix-tui-overall-progress-scope):
+    // Status line shows only progress bar + elapsed time. Progress covers the
+    // unique union of completed, actively executing, and execution-marked work.
     let (total_tasks, completed_tasks) = app
         .changes
         .iter()
-        .filter(|c| c.selected) // Only count selected (x) changes
+        .filter(|c| contributes_to_overall_progress(c))
         .fold((0u32, 0u32), |(total, completed), c| {
             (total + c.total_tasks, completed + c.completed_tasks)
         });
 
     let mut spans = vec![];
 
-    // Show progress bar if there are selected changes with tasks
+    // Show progress bar only when the included rows carry tasks at all.
     if total_tasks > 0 {
         let percent = (completed_tasks as f32 / total_tasks as f32) * 100.0;
         let bar_width = 20;
@@ -4574,6 +4606,167 @@ mod tests {
         let buffer = render_buffer(&mut stopping_app, 100, 24);
         let content = buffer_to_string(&buffer);
         assert!(content.contains("F5/!: continue"));
+    }
+
+    // === Tests for fix-tui-overall-progress-scope ===
+
+    /// One Status-aggregate input row: display status, execution mark, and the
+    /// last known task counts.
+    type ProgressRow = (&'static str, bool, u32, u32);
+
+    /// Render only the Status panel, so the asserted text is the real widget
+    /// output rather than a test-local recalculation of the same rule.
+    fn render_status_panel(app: &AppState) -> String {
+        let backend = TestBackend::new(100, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal init");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_status(frame, app, area);
+            })
+            .expect("draw");
+        buffer_to_string(terminal.backend().buffer())
+    }
+
+    fn overall_progress_app(rows: &[ProgressRow]) -> AppState {
+        let changes = (0..rows.len())
+            .map(|i| create_test_change(&format!("change-{i}")))
+            .collect();
+        let mut app = create_test_app(changes);
+        for (state, (status, marked, completed, total)) in app.changes.iter_mut().zip(rows) {
+            state.display_status_cache = (*status).to_string();
+            state.selected = *marked;
+            state.completed_tasks = *completed;
+            state.total_tasks = *total;
+        }
+        app
+    }
+
+    fn assert_status_aggregate(app: &AppState, expected: &str, context: &str) {
+        let content = render_status_panel(app);
+        assert!(
+            content.contains(expected),
+            "{context}: expected Status aggregate {expected} in:\n{content}"
+        );
+    }
+
+    #[test]
+    fn tui_status_overall_progress_mixed_lifecycle_and_mark_states() {
+        let app = overall_progress_app(&[
+            ("merged", false, 3, 3),
+            ("applying", false, 1, 4),
+            ("not queued", true, 0, 2),
+            ("not queued", false, 0, 5),
+        ]);
+
+        let content = render_status_panel(&app);
+        assert!(
+            content.contains("(4/9)"),
+            "completed, active, and marked rows form the aggregate:\n{content}"
+        );
+        assert!(
+            content.contains("44.4%"),
+            "the percentage follows the same aggregate:\n{content}"
+        );
+    }
+
+    #[test]
+    fn tui_status_overall_progress_retains_completed_work_after_mark_revocation() {
+        for final_success in ["archived", "merged", "pushed"] {
+            let mut app =
+                overall_progress_app(&[(final_success, true, 3, 3), ("applying", true, 1, 4)]);
+            assert_status_aggregate(&app, "(4/7)", final_success);
+
+            // Archive completion revokes the process-local mark by design.
+            app.changes[0].selected = false;
+            assert_status_aggregate(
+                &app,
+                "(4/7)",
+                &format!("{final_success} after mark revocation"),
+            );
+        }
+    }
+
+    #[test]
+    fn tui_status_overall_progress_includes_archive_complete_post_archive_rows() {
+        for post_archive in ["resolving", "resolve pending", "merge wait"] {
+            let mut app = overall_progress_app(&[(post_archive, false, 3, 3)]);
+            app.changes[0].archive_complete_cache = true;
+
+            assert_status_aggregate(&app, "(3/3)", post_archive);
+        }
+    }
+
+    #[test]
+    fn tui_status_overall_progress_includes_every_active_status_without_a_mark() {
+        for status in crate::orchestration::operator_command::ACTIVE_STATUSES {
+            let app = overall_progress_app(&[(status, false, 1, 4)]);
+
+            assert_status_aggregate(&app, "(1/4)", status);
+        }
+    }
+
+    #[test]
+    fn tui_status_overall_progress_includes_marked_unfinished_rows() {
+        for status in [
+            "not queued",
+            "queued",
+            "merge wait",
+            "resolve pending",
+            "error",
+        ] {
+            let app = overall_progress_app(&[(status, true, 1, 2)]);
+
+            assert_status_aggregate(&app, "(1/2)", status);
+        }
+    }
+
+    #[test]
+    fn tui_status_overall_progress_excludes_unmarked_idle_and_rejected_rows() {
+        // An `error` row whose own failure revoked its mark, an idle unmarked
+        // row, and a rejected row that stale presentation state still marks.
+        let app = overall_progress_app(&[
+            ("applying", false, 1, 4),
+            ("error", false, 2, 6),
+            ("not queued", false, 0, 5),
+            ("rejected", true, 3, 3),
+        ]);
+
+        assert_status_aggregate(&app, "(1/4)", "only the active row contributes");
+    }
+
+    #[test]
+    fn tui_status_overall_progress_counts_overlapping_rows_once() {
+        let mut app = overall_progress_app(&[
+            // active + marked
+            ("applying", true, 1, 4),
+            // completed + marked
+            ("merged", true, 3, 3),
+            // archive-complete + active + marked
+            ("resolving", true, 2, 2),
+        ]);
+        app.changes[2].archive_complete_cache = true;
+
+        assert_status_aggregate(&app, "(6/9)", "each overlapping row counts once");
+    }
+
+    #[test]
+    fn tui_status_overall_progress_zero_total_rows_render_no_bar() {
+        let app = overall_progress_app(&[
+            ("merged", false, 0, 0),
+            ("applying", false, 0, 0),
+            ("not queued", true, 0, 0),
+        ]);
+
+        let content = render_status_panel(&app);
+        assert!(
+            !content.contains('%') && !content.contains('█') && !content.contains('░'),
+            "included rows with no tasks keep the existing no-task rendering:\n{content}"
+        );
+        assert!(
+            content.contains("Status"),
+            "the Status panel still renders:\n{content}"
+        );
     }
 
     #[test]
