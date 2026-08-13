@@ -1772,3 +1772,136 @@ async fn shutdown_never_removes_artifacts_on_a_secondary_timeout() {
 
     owner.stop().await;
 }
+
+/// The `start=` record a holding callback writes, read from outside any runtime.
+///
+/// Bounded so a missing record fails rather than hangs. Blocking because the
+/// runtime that owns the dispatcher must stay free to run it while the test
+/// waits for the callback it spawned to announce itself.
+fn await_start_blocking(log: &Path) -> String {
+    for _ in 0..400 {
+        if let Some(line) = std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .find(|line| line.starts_with("start="))
+        {
+            return line.to_string();
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("no callback start record appeared at {}", log.display());
+}
+
+/// A dropped acknowledgement is not a reap, so it authorizes no cleanup.
+///
+/// Runtime A owns the dispatcher and the callback it spawns; `owner_stopping`
+/// runs on runtime B. Polling it exactly once queues the acknowledgement sender
+/// on runtime A — the send is synchronous and happens before the first await —
+/// and the callback that request starts is still holding its artifact when
+/// runtime A is dropped underneath it. The sender goes with the dispatcher task,
+/// so the wait resolves as a drop rather than an acknowledgement, and it does so
+/// *before* the shutdown deadline: the branch a positive acknowledgement would
+/// otherwise have taken.
+///
+/// What the callback child did is exactly what nobody knows here, which is the
+/// whole point — a dispatcher that ended without acknowledging proves nothing
+/// about a child it may have spawned. No public abort hook is used to force it:
+/// that would be a production API able to silently disable delivery.
+#[test]
+fn shutdown_retains_artifacts_when_the_reap_acknowledgement_is_dropped() {
+    let owner_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("the runtime that owns the dispatcher");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let command = holding_callback(dir.path(), "dropped");
+    let log = log_of(&command);
+
+    let (owner, registry) = owner_runtime.block_on(async {
+        let mut owner = Owner::start(&["alpha"]).await;
+        register_sink(&mut owner, "alpha", &command).await;
+        let registry = owner.registry();
+        // Long on purpose: this test is about the sender being dropped *before*
+        // the deadline, so the deadline must not be what resolves the wait. No
+        // assertion below waits for it.
+        registry.set_shutdown_deadline(Duration::from_secs(300));
+        (owner, registry)
+    });
+
+    let shutdown_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the runtime that drives shutdown");
+    let (queued, queued_rx) = std::sync::mpsc::channel::<()>();
+    let shutdown = std::thread::spawn(move || {
+        shutdown_runtime.block_on(async move {
+            let stopping = registry.owner_stopping();
+            tokio::pin!(stopping);
+            // One poll, which is what queues `Task::Stopping` and its
+            // acknowledgement sender. `timeout` polls the value before its own
+            // zero delay, so this is an ordering step, not a wait.
+            assert!(
+                tokio::time::timeout(Duration::ZERO, &mut stopping)
+                    .await
+                    .is_err(),
+                "shutdown waits for an acknowledgement instead of returning immediately"
+            );
+            queued
+                .send(())
+                .expect("the test observes the queued acknowledgement request");
+            stopping.await;
+        });
+    });
+    queued_rx
+        .recv()
+        .expect("shutdown queues its acknowledgement request");
+
+    // The dispatcher took that request and started the delivery it describes, so
+    // there is a live callback holding a real artifact to be wrong about.
+    let started = await_start_blocking(&log);
+    let pid: i32 = field(&started, "pid").parse().expect("a numeric pid");
+    let event_path = PathBuf::from(field(&started, "event_path"));
+    let event_dir = event_path
+        .parent()
+        .expect("the artifact lives in the owner-private directory")
+        .to_path_buf();
+    assert!(
+        event_path.exists(),
+        "the callback was handed an artifact that exists: {}",
+        event_path.display()
+    );
+
+    // Drops the dispatcher task, and the queued acknowledgement sender with it.
+    drop(owner_runtime);
+    shutdown
+        .join()
+        .expect("graceful shutdown returns on a dropped acknowledgement");
+
+    assert!(
+        event_path.exists(),
+        "a dropped acknowledgement authorizes no removal: {}",
+        event_path.display()
+    );
+    assert!(
+        event_dir.exists(),
+        "nor removal of the owner-private directory holding it: {}",
+        event_dir.display()
+    );
+
+    // Registry destruction is the other implicit authority this change removed:
+    // dropping the last reference must still leave the artifacts alone.
+    drop(owner);
+    assert!(
+        event_path.exists(),
+        "and registry destruction does not delete it either: {}",
+        event_path.display()
+    );
+    assert!(event_dir.exists(), "nor its owner-private directory");
+
+    // Nothing owns the retained directory now, which is exactly the property
+    // under test, so the test cleans up after itself.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    std::fs::remove_dir_all(&event_dir).expect("the test removes what the owner deliberately kept");
+}

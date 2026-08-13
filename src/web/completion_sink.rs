@@ -211,7 +211,13 @@ pub struct CompletionSinkRegistry {
     contract: Arc<ExecutionContractHandle>,
     repo_root: Mutex<Option<PathBuf>>,
     /// Owner-private directory event files are written into.
-    event_dir: Mutex<Option<Arc<tempfile::TempDir>>>,
+    ///
+    /// An owned path rather than a `TempDir`: a temporary-directory handle makes
+    /// registry destruction an implicit cleanup authority, and dropping the
+    /// registry is not proof that a callback child was reaped. Removal has to be
+    /// a decision this owner takes once, explicitly, and only against a positive
+    /// acknowledgement.
+    event_dir: Mutex<Option<PathBuf>>,
     tasks: mpsc::UnboundedSender<Task>,
     /// True once graceful shutdown started: admission stops, so no episode
     /// transition and no late registration opens new delivery work.
@@ -508,39 +514,93 @@ impl CompletionSinkRegistry {
     /// kill-and-wait followed by a bounded drain, and a dispatcher that died
     /// drops the sender, which resolves the wait with an error rather than
     /// never.
+    ///
+    /// Only a *positive* acknowledgement authorizes cleanup. Every other way
+    /// this can end — the task channel already closed, the sender dropped before
+    /// the deadline, the sender dropped after cancellation — proves only that
+    /// the dispatcher task ended. That is not a reap: a child it spawned may
+    /// still be running with the artifact open. Those paths retain the
+    /// owner-private directory and say so with its path, because a leftover
+    /// directory is recoverable and a file pulled out from under a live callback
+    /// is not.
     pub async fn owner_stopping(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         let (done, mut wait) = tokio::sync::oneshot::channel();
         if self.tasks.send(Task::Stopping(done)).is_err() {
-            // A closed task channel means the dispatcher is gone, and the
-            // dispatcher is the only place a callback is ever spawned: nothing
-            // can be holding an artifact, and nothing can start now.
-            self.cleanup_events();
+            // The dispatcher is gone and can no longer be asked anything. It is
+            // also the only place a callback is ever spawned — but it may have
+            // spawned one before it went, and nothing here can tell.
+            self.retain_events(
+                "the dispatcher was gone before it could be asked to acknowledge a reap",
+            );
             return;
         }
 
         let deadline = self.limits().shutdown_deadline;
-        if tokio::time::timeout(deadline, &mut wait).await.is_err() {
-            self.cancel.cancel();
-            // Only an acknowledged (or impossible) reap authorizes cleanup.
-            if wait.await.is_err() {
-                debug!(
-                    "the completion-sink dispatcher stopped before acknowledging cancellation, so \
-                     no callback can still hold an event artifact"
+        let acknowledged = match tokio::time::timeout(deadline, &mut wait).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => {
+                self.retain_events(
+                    "the dispatcher dropped its acknowledgement before the shutdown deadline",
                 );
+                false
             }
+            Err(_) => {
+                self.cancel.cancel();
+                match wait.await {
+                    Ok(()) => true,
+                    Err(_) => {
+                        self.retain_events(
+                            "the dispatcher dropped its acknowledgement after shutdown \
+                             cancellation",
+                        );
+                        false
+                    }
+                }
+            }
+        };
+        if acknowledged {
+            self.remove_events();
         }
-        self.cleanup_events();
     }
 
     /// Remove the owner-private event directory and everything left in it.
     ///
     /// Every artifact still present belongs to a callback that has already been
-    /// reaped: this runs only after the dispatcher acknowledged the reap, or
-    /// after the dispatcher turned out to be gone entirely, and there is no
-    /// third path into it.
-    fn cleanup_events(&self) {
-        self.lock_event_dir().take();
+    /// reaped: this runs only after the dispatcher acknowledged the reap, and
+    /// there is no second path into it. The directory is an owned path rather
+    /// than a `TempDir`, so registry destruction cannot remove it either.
+    fn remove_events(&self) {
+        let Some(dir) = self.lock_event_dir().take() else {
+            return;
+        };
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                debug!(
+                    event_dir = %dir.display(),
+                    error = %error,
+                    "the acknowledged owner-private event directory could not be removed"
+                );
+            }
+        }
+    }
+
+    /// Keep the event directory, because no reap was ever acknowledged.
+    ///
+    /// The fail-safe half of the same rule cleanup obeys. The diagnostic carries
+    /// the retained directory path and a fixed reason, and nothing else: no
+    /// payload, no callback output, no environment value, no token. The slot is
+    /// deliberately left populated — there is no state in which something else
+    /// later decides to delete it.
+    fn retain_events(&self, reason: &'static str) {
+        let Some(dir) = self.lock_event_dir().clone() else {
+            return;
+        };
+        warn!(
+            event_dir = %dir.display(),
+            reason,
+            "callback reap was not acknowledged, so the owner-private event directory is retained"
+        );
     }
 
     /// Install the test-only gate held between cancellation and kill-and-reap.
@@ -580,7 +640,7 @@ impl CompletionSinkRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn lock_event_dir(&self) -> MutexGuard<'_, Option<Arc<tempfile::TempDir>>> {
+    fn lock_event_dir(&self) -> MutexGuard<'_, Option<PathBuf>> {
         self.event_dir
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -911,17 +971,20 @@ impl CompletionSinkRegistry {
             match slot.as_ref() {
                 Some(dir) => dir.clone(),
                 None => {
-                    let created =
-                        Arc::new(tempfile::Builder::new().prefix("cflx-events-").tempdir()?);
+                    // Still randomized exclusive creation: a predictable path or
+                    // a plain `create_dir_all` under a shared `TMPDIR` could be
+                    // pre-created or symlinked into by another user. Only the
+                    // automatic Drop cleanup is disarmed, by taking ownership of
+                    // the path with `keep()`.
+                    let created = tempfile::Builder::new().prefix("cflx-events-").tempdir()?;
                     restrict(created.path(), 0o700)?;
-                    *slot = Some(created.clone());
-                    created
+                    let path = created.keep();
+                    *slot = Some(path.clone());
+                    path
                 }
             }
         };
-        let path = dir
-            .path()
-            .join(format!("{execution_id}-{}.json", event_type.as_str()));
+        let path = dir.join(format!("{execution_id}-{}.json", event_type.as_str()));
         let body = serde_json::to_vec_pretty(payload)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         write_owner_only(&path, &body)?;

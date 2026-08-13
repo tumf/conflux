@@ -138,6 +138,16 @@ Constraints worth knowing before you wire one up:
   removed. An external adapter that needs to cover the crash keeps its own
   bounded owner-continuity check and reports typed `owner_restarted` — never
   success.
+- **Only a confirmed reap removes anything.** Cleanup waits for the dispatcher's
+  reap acknowledgement, and that acknowledgement is the *sole* authority: the
+  owner-private directory is an owned path, not a temporary-directory handle, so
+  dropping the registry deletes nothing. If the acknowledgement never arrives —
+  the dispatcher was already gone, or it dropped the acknowledgement instead of
+  sending it — the directory and its artifacts are **retained** and their path is
+  logged, because an unacknowledged reap says nothing about whether a callback
+  child is still holding the file. A retained directory is recoverable; a payload
+  pulled out from under a live callback is not. Nothing cleans those retained
+  files up for you.
 - **Delivery is observability.** A callback that fails, hangs, or exits non-zero
   cannot roll back, retry, or re-classify anything.
 
