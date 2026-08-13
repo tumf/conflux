@@ -904,7 +904,7 @@ For each delivery the owner MUST create a versioned bounded event file and provi
 
 Callback runtime and stdout/stderr capture MUST be bounded during collection, not merely truncated after collection, and the owner MUST continue draining both streams past the retention limit so a callback is never blocked by a full pipe. Spawn failure, timeout, non-zero exit, malformed callback behavior, and output overflow MUST produce bounded diagnostics only. Output overflow alone MUST NOT terminate a callback. Timeout and shutdown cancellation MUST terminate and explicitly reap the callback. One terminal delivery attempt is permitted per execution; failures MUST NOT retry forever, alter orchestration state, roll back completion, or change the repository-verifiable result.
 
-Graceful owner shutdown MUST stop admission and apply one finite shutdown deadline across all queued or running callbacks. Delivery MUST remain serialized. Shutdown MUST start no new delivery and create or recreate no event directory or artifact after it begins. Before event artifact cleanup and registry destruction, every callback MUST either finish and be reaped or be terminated and reaped.
+Graceful owner shutdown MUST stop admission and apply one finite shutdown deadline across all queued or running callbacks. Delivery MUST remain serialized. Shutdown MUST start no new delivery and create or recreate no event directory or artifact after it begins. When the deadline expires, the owner MUST cancel unfinished delivery and MUST wait for dispatcher acknowledgement that every active callback has been terminated and reaped before event artifact cleanup and registry destruction. A secondary timeout or missing acknowledgement MUST NOT authorize cleanup while a callback may remain alive.
 
 #### Scenario: Callback failure cannot change completion
 
@@ -947,3 +947,10 @@ Graceful owner shutdown MUST stop admission and apply one finite shutdown deadli
 - **AND** no event artifact is removed while its callback remains alive
 - **AND** no queued delivery starts after the deadline
 - **AND** no event artifact is created after shutdown begins
+
+#### Scenario: Delayed reap acknowledgement blocks artifact cleanup
+
+- **GIVEN** shutdown cancellation has been issued but dispatcher reap acknowledgement is delayed
+- **WHEN** any secondary acknowledgement wait would otherwise expire
+- **THEN** the owner retains the event directory and active callback artifact
+- **AND** cleanup occurs only after dispatcher acknowledgement confirms the callback was reaped
