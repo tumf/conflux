@@ -18,6 +18,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc;
+use std::time::{Duration, SystemTime};
 
 /// Repository-relative root of the example.
 fn example_root() -> PathBuf {
@@ -50,20 +51,54 @@ struct Posted {
     body: String,
 }
 
+/// What the fake server answers with.
+#[derive(Debug, Clone)]
+enum Reply {
+    /// The ordinary success OpenCode gives.
+    Ok,
+    /// A bounce to somewhere else, which the callback must refuse to follow.
+    Redirect(String),
+    /// A delivery failure that leaves the callback nothing to promote.
+    ServerError,
+}
+
+impl Reply {
+    fn bytes(&self) -> Vec<u8> {
+        match self {
+            Reply::Ok => b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                .to_vec(),
+            Reply::Redirect(location) => format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+            Reply::ServerError => {
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec()
+            }
+        }
+    }
+}
+
 /// A loopback HTTP listener that accepts one request and reports it.
 ///
 /// Hand-rolled rather than a framework: the assertion is about what the callback
 /// puts on the wire, and a real socket is the only thing that can show it.
 struct FakeOpenCode {
     url: String,
+    authority: String,
     requests: mpsc::Receiver<Posted>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl FakeOpenCode {
     fn start(expected: usize) -> Self {
+        Self::start_with(expected, Reply::Ok)
+    }
+
+    fn start_with(expected: usize, reply: Reply) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
-        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let authority = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let url = format!("http://{authority}");
         let (tx, requests) = mpsc::channel();
         let handle = std::thread::spawn(move || {
             for _ in 0..expected {
@@ -100,9 +135,7 @@ impl FakeOpenCode {
                 let _ = reader.read_exact(&mut body);
 
                 let mut stream = reader.into_inner();
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                );
+                let _ = stream.write_all(&reply.bytes());
                 let _ = stream.flush();
                 let _ = tx.send(Posted {
                     path,
@@ -112,6 +145,7 @@ impl FakeOpenCode {
         });
         Self {
             url,
+            authority,
             requests,
             handle: Some(handle),
         }
@@ -176,6 +210,27 @@ fn run_callback(
     session: &str,
     state: &Path,
 ) -> Output {
+    run_callback_with_path(
+        event_path,
+        event_type,
+        execution_id,
+        server,
+        session,
+        state,
+        None,
+    )
+}
+
+/// The same, with an explicit `--path` — the argument the origin policy guards.
+fn run_callback_with_path(
+    event_path: &Path,
+    event_type: &str,
+    execution_id: &str,
+    server: &str,
+    session: &str,
+    state: &Path,
+    path: Option<&str>,
+) -> Output {
     let mut command = Command::new("node");
     command
         .arg(example_root().join("callback/cflx-resume-session.mjs"))
@@ -186,7 +241,11 @@ fn run_callback(
             session,
             "--state",
             state.to_str().unwrap(),
-        ])
+        ]);
+    if let Some(path) = path {
+        command.args(["--path", path]);
+    }
+    command
         // The owner replaces the environment rather than extending it.
         .env_clear()
         .env("CFLX_EVENT_PATH", event_path)
@@ -200,6 +259,42 @@ fn run_callback(
         command.env("PATH", path);
     }
     command.output().expect("node must be runnable")
+}
+
+/// Exit status the callback uses for "another process holds a fresh claim".
+///
+/// Distinct from 1 on purpose: nothing failed, so an operator wrapper can tell a
+/// refused duplicate apart from a delivery that could not be made.
+const EXIT_IN_FLIGHT: i32 = 75;
+
+/// The claim/marker pair for one execution event, as the callback names them.
+fn state_paths(state: &Path, execution_id: &str, event_type: &str) -> (PathBuf, PathBuf) {
+    (
+        state.join(format!("{execution_id}.{event_type}.inflight")),
+        state.join(format!("{execution_id}.{event_type}.done")),
+    )
+}
+
+/// Write an in-flight claim the way a live callback would.
+fn write_claim(path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        "{\"owner\":\"someone-else\",\"claimed_at\":\"2026-01-01T00:00:00Z\"}\n",
+    )
+    .unwrap();
+}
+
+/// Backdate a file so staleness is decided by recorded state, never by waiting.
+fn age_file(path: &Path, age: Duration) {
+    let when = SystemTime::now() - age;
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(when)
+            .set_modified(when),
+    )
+    .unwrap();
 }
 
 /// A fake `cflx` whose `client ... mcp` speaks just enough JSON-RPC to answer
@@ -392,6 +487,220 @@ fn callback_refuses_a_non_loopback_destination_and_a_mismatched_event() {
         stderr_of(&mismatched)
     );
     assert!(server.is_quiet(), "a refused event must post nothing");
+}
+
+/// The base URL is not the boundary; the *final* URL is. `new URL` lets a path
+/// replace everything before it, so `--path` is checked for scheme,
+/// protocol-relative, and backslash shapes and then the resolved origin is
+/// compared with the base's.
+#[test]
+fn callback_refuses_an_origin_changing_path_before_sending() {
+    if skip_without_node("callback_refuses_an_origin_changing_path_before_sending") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = FakeOpenCode::start(1);
+    // A second *loopback* listener: the refusal must come from the origin
+    // change itself, not from the destination merely being off-machine.
+    let elsewhere = FakeOpenCode::start(1);
+    let state = dir.path().join("state");
+    let event = write_event(dir.path(), "completed", "exec-a");
+
+    let cases = [
+        format!("{}/session/{{session}}/message", elsewhere.url),
+        format!("//{}/session/{{session}}/message", elsewhere.authority),
+        format!("/\\{}/session/{{session}}/message", elsewhere.authority),
+        format!("\\\\{}/session/{{session}}/message", elsewhere.authority),
+    ];
+    for path in cases {
+        let output = run_callback_with_path(
+            &event,
+            "completed",
+            "exec-a",
+            &allowed.url,
+            "ses_abc",
+            &state,
+            Some(&path),
+        );
+        assert!(!output.status.success(), "'{path}' must be refused");
+        let stderr = stderr_of(&output);
+        assert!(
+            stderr.contains("scheme")
+                || stderr.contains("protocol-relative")
+                || stderr.contains("change origin"),
+            "'{path}': {stderr}"
+        );
+    }
+
+    assert!(
+        elsewhere.is_quiet(),
+        "an origin-changing path must not open a connection to its target"
+    );
+    assert!(
+        allowed.is_quiet(),
+        "and nothing was sent to the base either"
+    );
+
+    let (inflight, done) = state_paths(&state, "exec-a", "completed");
+    assert!(!done.exists(), "a refusal is not a delivery");
+    assert!(
+        !inflight.exists(),
+        "and it must not leave a claim that blocks a corrected retry"
+    );
+}
+
+/// Following a redirect is how a loopback listener would bounce a callback off
+/// the machine, so redirects are refused rather than followed.
+#[test]
+fn callback_refuses_a_redirect_without_reaching_its_target() {
+    if skip_without_node("callback_refuses_a_redirect_without_reaching_its_target") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let destination = FakeOpenCode::start(1);
+    let server = FakeOpenCode::start_with(
+        1,
+        Reply::Redirect(format!("{}/session/ses_abc/message", destination.url)),
+    );
+    let state = dir.path().join("state");
+    let event = write_event(dir.path(), "completed", "exec-a");
+
+    let output = run_callback(
+        &event,
+        "completed",
+        "exec-a",
+        &server.url,
+        "ses_abc",
+        &state,
+    );
+    assert!(!output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("redirect"),
+        "{}",
+        stderr_of(&output)
+    );
+
+    // The first hop really happened; the second one must not have.
+    server.next();
+    assert!(
+        destination.is_quiet(),
+        "the redirect target must receive no connection at all"
+    );
+
+    let (inflight, done) = state_paths(&state, "exec-a", "completed");
+    assert!(!done.exists(), "a refused redirect is not a delivery");
+    assert!(!inflight.exists(), "and the claim is released for a retry");
+}
+
+/// The claim is state, not a timer: every case here is decided by a file that
+/// already exists when the callback starts, so nothing depends on a race.
+#[test]
+fn callback_claim_refuses_fresh_takes_over_stale_and_honours_delivery() {
+    if skip_without_node("callback_claim_refuses_fresh_takes_over_stale_and_honours_delivery") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let server = FakeOpenCode::start(1);
+    let state = dir.path().join("state");
+    let event = write_event(dir.path(), "completed", "exec-a");
+    let (inflight, done) = state_paths(&state, "exec-a", "completed");
+
+    // A fresh claim belongs to a live process: stand down, distinctly.
+    write_claim(&inflight);
+    let refused = run_callback(
+        &event,
+        "completed",
+        "exec-a",
+        &server.url,
+        "ses_abc",
+        &state,
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(EXIT_IN_FLIGHT),
+        "a fresh in-flight claim is a distinct non-success: {}",
+        stderr_of(&refused)
+    );
+    assert!(server.is_quiet(), "and it posts nothing");
+    assert!(inflight.exists(), "the live process keeps its claim");
+    assert!(!done.exists());
+
+    // The same claim, older than the bound: a crashed process must not suppress
+    // delivery forever, so a later invocation takes it over and delivers.
+    age_file(&inflight, Duration::from_secs(6 * 60));
+    let takeover = run_callback(
+        &event,
+        "completed",
+        "exec-a",
+        &server.url,
+        "ses_abc",
+        &state,
+    );
+    assert!(takeover.status.success(), "{}", stderr_of(&takeover));
+    let posted = server.next();
+    assert_eq!(posted.path, "/session/ses_abc/message");
+    assert!(done.exists(), "success is promoted to a durable marker");
+    assert!(!inflight.exists(), "and the claim is consumed by it");
+
+    // With the marker in place a later duplicate is a plain success, not a POST.
+    let duplicate = run_callback(
+        &event,
+        "completed",
+        "exec-a",
+        &server.url,
+        "ses_abc",
+        &state,
+    );
+    assert!(duplicate.status.success(), "{}", stderr_of(&duplicate));
+    assert!(
+        server.is_quiet(),
+        "an existing success marker must not post again"
+    );
+}
+
+/// The bug the split was introduced for: the old marker was written *before* the
+/// POST, so one failed delivery silenced every later attempt.
+#[test]
+fn failed_delivery_releases_the_claim_so_a_later_invocation_retries() {
+    if skip_without_node("failed_delivery_releases_the_claim_so_a_later_invocation_retries") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let broken = FakeOpenCode::start_with(1, Reply::ServerError);
+    let state = dir.path().join("state");
+    let event = write_event(dir.path(), "completed", "exec-a");
+    let (inflight, done) = state_paths(&state, "exec-a", "completed");
+
+    let failed = run_callback(
+        &event,
+        "completed",
+        "exec-a",
+        &broken.url,
+        "ses_abc",
+        &state,
+    );
+    assert!(!failed.status.success(), "{}", stderr_of(&failed));
+    assert!(stderr_of(&failed).contains("500"), "{}", stderr_of(&failed));
+    broken.next();
+    assert!(!done.exists(), "a failed POST is not a delivery");
+    assert!(
+        !inflight.exists(),
+        "and the claim is released rather than left to expire"
+    );
+
+    // Which is the whole point: recovery needs no waiting and no cleanup.
+    let working = FakeOpenCode::start(1);
+    let retried = run_callback(
+        &event,
+        "completed",
+        "exec-a",
+        &working.url,
+        "ses_abc",
+        &state,
+    );
+    assert!(retried.status.success(), "{}", stderr_of(&retried));
+    working.next();
+    assert!(done.exists());
 }
 
 // ============================================================================

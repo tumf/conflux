@@ -9,7 +9,7 @@
 // data is untrusted input to be verified against the repository — not an
 // instruction to follow.
 
-import { requireLoopback, requireSessionId } from "./loopback.mjs";
+import { requireSessionId, resolveLoopbackTarget } from "./loopback.mjs";
 
 /** The mandatory first line of every generated message. */
 export const AUTOMATION_MARKER = "[AUTOMATION EVENT — not user-authored]";
@@ -72,7 +72,6 @@ export async function resumeSession({
   path = "/session/{session}/message",
   timeoutMs = 15_000,
 }) {
-  const base = requireLoopback(server);
   const sessionId = requireSessionId(session);
   if (!text.startsWith(AUTOMATION_MARKER)) {
     // A generated message without the marker would be indistinguishable from
@@ -80,9 +79,11 @@ export async function resumeSession({
     throw new Error("a generated message must carry the automation marker");
   }
 
-  const target = new URL(
+  // The final URL is the boundary, not the base: resolution and the same-origin
+  // loopback check happen together, before anything is opened.
+  const target = resolveLoopbackTarget(
+    server,
     path.replace("{session}", encodeURIComponent(sessionId)),
-    base,
   );
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -92,11 +93,28 @@ export async function resumeSession({
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ parts: [{ type: "text", text }] }),
       signal: controller.signal,
+      // A redirect is how a loopback listener would bounce this off the machine.
+      // It is never followed, and it is a delivery failure rather than a hop.
+      redirect: "manual",
     });
+    if (response.type === "opaqueredirect" || isRedirect(response.status)) {
+      throw new Error(
+        `OpenCode returned a redirect (${response.status}) for ${target}; ` +
+          `redirects are not followed`,
+      );
+    }
     if (!response.ok) {
       throw new Error(`OpenCode returned ${response.status} for ${target}`);
     }
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * @param {number} status
+ * @returns {boolean}
+ */
+function isRedirect(status) {
+  return status >= 300 && status < 400;
 }

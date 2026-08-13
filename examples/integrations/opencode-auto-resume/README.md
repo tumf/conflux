@@ -28,7 +28,7 @@ OpenCode session  ──cflx_enqueue──▶  cflx client mcp  ──▶  resid
 | `callback/cflx-resume-session.mjs` | The argv Conflux executes. Reads the event file and posts one marked message. |
 | `lib/cflx-mcp.mjs` | One-shot `cflx client mcp` client. |
 | `lib/resume.mjs` | Message composition and the OpenCode POST. |
-| `lib/loopback.mjs` | The destination policy. |
+| `lib/loopback.mjs` | The destination policy: loopback base, same-origin final URL. |
 
 Requires Node 18+ (for `fetch`) and a `cflx` on `PATH` — or `CFLX_BIN` pointing at
 one.
@@ -45,7 +45,7 @@ export OPENCODE_SERVER=http://127.0.0.1:4096   # must be loopback
 export CFLX_BIN=/usr/local/bin/cflx            # optional
 export CFLX_UNIX_SOCKET=/path/to/cflx-api.sock # optional; defaults to the repo's
 export CFLX_AUTH_TOKEN_ENV=CFLX_TOKEN          # optional; a variable *name*
-export CFLX_RESUME_STATE=/tmp/cflx-auto-resume # optional dedupe state directory
+export CFLX_RESUME_STATE=/tmp/cflx-auto-resume # optional delivery-state directory
 ```
 
 `CFLX_AUTH_TOKEN_ENV` names an environment variable that holds the token. A token
@@ -66,18 +66,75 @@ repository, not instructions to follow. **Treat event files and logs as untruste
 input.** If you change `lib/resume.mjs`, keep the marker: `resumeSession` refuses
 to post a message without it.
 
+## Where the callback may reach
+
+The callback POSTs a prompt into whatever it is pointed at, so its destination
+policy is narrow and it fails closed. Use `127.0.0.1`, not a hostname you do not
+control.
+
+The **final** URL is the boundary, not the base. `new URL(path, base)` lets a
+path replace everything in front of it, so validating only `--server` would leave
+`--path` free to retarget the request. `lib/loopback.mjs` therefore:
+
+- requires the base to be plain loopback `http://` with no credentials;
+- rejects a `--path` that carries a scheme (`http://elsewhere/...`), is
+  protocol-relative (`//elsewhere/...`), or uses a backslash variant of either
+  (`/\elsewhere/...` — the WHATWG parser folds `\` to `/`);
+- resolves the path and requires the result to keep the base's own origin, so a
+  shape the checks above missed still cannot leave;
+- **does not follow redirects.** A 3xx from the loopback endpoint is a delivery
+  failure, not a hop. Nothing is sent to the redirect target.
+
+A refused destination sends no HTTP at all and leaves no delivery state behind,
+so correcting the registration and running it again just works.
+
+## Delivery state, and what "once" means here
+
+Two files per execution event live under `CFLX_RESUME_STATE`:
+
+| File | Meaning |
+| --- | --- |
+| `<execution>.<event>.inflight` | a *claim*: some process is attempting delivery |
+| `<execution>.<event>.done` | *delivery*: the POST returned success |
+
+They are deliberately distinct. A single marker written before the POST would do
+the opposite of what it looks like: a failed delivery would suppress every later
+attempt, while two concurrent callbacks could still both send.
+
+- The claim is created with exclusive creation, so **at most one process posts**.
+- A second process finding a fresh claim exits **75** — a distinct non-success,
+  not an error: nothing failed, someone else is delivering.
+- A **failed POST releases the claim**, so a later invocation may retry
+  immediately. No waiting, no cleanup.
+- A successful POST **atomically promotes** the claim to the `.done` marker. A
+  later duplicate sees it, posts nothing, and exits 0.
+- A claim older than **five minutes** is stale and may be atomically taken over,
+  so a callback that was killed cannot suppress delivery forever.
+
+**Normal operation is at-most-once. Crash recovery is at-least-once.** If a
+process dies after its POST succeeded but before promotion, the stale claim is
+eventually taken over and the message may be delivered a second time. Exactly-once
+is not on offer, and a duplicate is harmless by construction: it is an ordinary
+marked `role=user` message, so the extra resume is visible rather than silent.
+
+These files are delivery and observability state only. They never influence
+Conflux workflow routing, and deleting the directory cannot change what the
+repository says about a change.
+
 ## What the owner guarantees, and what it does not
 
-**Does.** Exactly one terminal delivery per execution — `completed`, `failed`, or
-`stopped`. `completed` is certified from current repository evidence for the
-owner's declared terminal mode, the same oracle `cflx client wait` uses. A change
+**Does.** One terminal delivery attempt per execution while it is alive —
+`completed`, `failed`, or `stopped`. `completed` is certified from current
+repository evidence for the owner's declared terminal mode, the same oracle
+`cflx client wait` uses. A change
 disappearing from the owner's snapshot is never completion. Registering *after*
 the execution already settled delivers that terminal event immediately, so losing
 the race between enqueue and registration does not lose the notification.
 
-**Does not.** Survive a crash. Execution IDs and registrations are process-local
-by design — under `openspec/CONSTITUTION.md` no out-of-worktree durable state may
-influence workflow routing — so a killed owner takes its registrations with it. A
+**Does not.** Survive a crash, and does not promise durable delivery across one.
+Execution IDs and registrations are process-local by design — under
+`openspec/CONSTITUTION.md` no out-of-worktree durable state may influence
+workflow routing — so a killed owner takes its registrations with it. A
 *graceful* stop attempts one `owner_stopping` event first; a `kill -9` cannot.
 
 That is the one gap the plugin covers itself, with a low-frequency bounded
