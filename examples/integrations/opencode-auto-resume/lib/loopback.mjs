@@ -5,8 +5,26 @@
 // host would turn "a change finished" into an outbound request to anywhere, so
 // the policy is narrow and lives in one place: only a loopback address, only
 // http, and only a port.
+//
+// # Only a literal address, never a name
+//
+// A hostname is not a destination, it is a question asked of the operating
+// system. `localhost` is conventionally loopback, but what it resolves to is
+// decided by `/etc/hosts`, NSS, DNS search domains, and the resolver's
+// A/AAAA ordering — all of which are somebody else's state. Accepting it would
+// mean this policy asserts something it cannot check. So the two canonical
+// loopback literals are accepted by exact spelling and every name is refused,
+// including the one that would almost always have been fine.
 
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+/**
+ * The only destinations this integration will open a connection to.
+ *
+ * Compared against `URL.hostname`, which the WHATWG parser has already
+ * canonicalised: `http://2130706433/` and `http://[0:0:0:0:0:0:0:1]/` arrive
+ * here as `127.0.0.1` and `[::1]`, and are the same literal addresses spelled
+ * differently. Anything a resolver would have to answer for is not in this set.
+ */
+const LOOPBACK_LITERALS = new Set(["127.0.0.1", "[::1]"]);
 
 /**
  * Parse and validate an OpenCode server base URL.
@@ -27,10 +45,12 @@ export function requireLoopback(value) {
       `only http:// is accepted for a local OpenCode server, got '${url.protocol}'`,
     );
   }
-  if (!LOOPBACK_HOSTS.has(url.hostname) && !LOOPBACK_HOSTS.has(url.host)) {
+  if (!LOOPBACK_LITERALS.has(url.hostname)) {
     throw new Error(
-      `only loopback destinations are accepted, got '${url.hostname}'. ` +
-        `A completion callback must not be able to reach the network`,
+      `only the literal loopback addresses 127.0.0.1 and [::1] are accepted, ` +
+        `got '${url.hostname}'. A name is resolved by the operating system, so ` +
+        `it cannot prove where the request lands, and a completion callback ` +
+        `must not be able to reach the network`,
     );
   }
   if (url.username || url.password) {

@@ -15,10 +15,24 @@
 // reads three fields out of a versioned envelope, and makes one call.
 
 import { callTool } from "../lib/cflx-mcp.mjs";
+import { requireLoopback } from "../lib/loopback.mjs";
 import { composeMessage, resumeSession } from "../lib/resume.mjs";
 
 /** Tool name suffix this plugin reacts to, after any MCP server prefix. */
 const ENQUEUE_TOOL = "cflx_enqueue";
+
+/** Client envelope versions this plugin knows how to read. */
+const SUPPORTED_SCHEMA_VERSIONS = new Set([1]);
+
+/**
+ * The only outcomes that mean an execution episode exists to bind a sink to.
+ *
+ * `ok: true` is not enough on its own: the envelope is versioned and typed
+ * precisely so a caller branches on `outcome` rather than on prose, and every
+ * other outcome — refusals included — started nothing there is anything to
+ * notify about.
+ */
+const ADMITTED_OUTCOMES = new Set(["admitted", "already_admitted"]);
 
 /** How often the owner-continuity observer checks, in milliseconds. */
 const OBSERVER_INTERVAL_MS = 60_000;
@@ -43,8 +57,12 @@ export function isEnqueueTool(name) {
 /**
  * Pull the execution binding out of a tool result, or return null.
  *
- * Fails closed: an unsuccessful outcome, a missing execution ID, or anything
- * that is not the versioned envelope produces no registration at all.
+ * Fails closed on every axis the envelope has, because what is built out of the
+ * result is an argv the owner will execute: an envelope this plugin does not
+ * understand the version of, an outcome that admitted nothing, or an identifier
+ * that is not a non-empty string produces no registration at all. Checking
+ * `ok` alone would let a future schema, or a differently-shaped value that
+ * merely happens to be truthy, decide what gets registered.
  *
  * @param {unknown} output
  * @returns {{change_id: string, execution_id: string, instance_id: string} | null}
@@ -59,11 +77,26 @@ export function extractBinding(output) {
     }
   }
   if (!envelope || typeof envelope !== "object") return null;
+  if (!SUPPORTED_SCHEMA_VERSIONS.has(envelope.schema_version)) return null;
   if (envelope.ok !== true) return null;
   if (envelope.operation !== "enqueue") return null;
-  const { change_id, execution_id, instance_id } = envelope;
+  if (!ADMITTED_OUTCOMES.has(envelope.outcome)) return null;
+  const change_id = bindingId(envelope.change_id);
+  const execution_id = bindingId(envelope.execution_id);
+  const instance_id = bindingId(envelope.instance_id);
   if (!change_id || !execution_id || !instance_id) return null;
   return { change_id, execution_id, instance_id };
+}
+
+/**
+ * One binding identifier, or null when it is not a usable one.
+ *
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+function bindingId(value) {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  return value;
 }
 
 /**
@@ -84,6 +117,16 @@ export const CflxAutoResume = async (context = {}) => {
     node: process.execPath,
     cwd: context.worktree ?? context.directory ?? process.cwd(),
   };
+
+  // The destination is proven once, here, rather than at delivery time: the
+  // registered argv carries it out of this process, and an owner running a
+  // callback pointed at a name would be reaching wherever that name resolves to.
+  let serverRefusal = null;
+  try {
+    requireLoopback(config.server);
+  } catch (error) {
+    serverRefusal = error.message;
+  }
 
   const observers = new Map();
 
@@ -162,6 +205,13 @@ export const CflxAutoResume = async (context = {}) => {
         output?.output ?? output?.metadata?.structuredContent ?? output,
       );
       if (!binding) return;
+
+      if (serverRefusal) {
+        process.stderr.write(
+          `cflx-auto-resume: not registering a callback: ${serverRefusal}\n`,
+        );
+        return;
+      }
 
       const command = [
         config.node,

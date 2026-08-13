@@ -86,6 +86,7 @@ impl Reply {
 struct FakeOpenCode {
     url: String,
     authority: String,
+    port: u16,
     requests: mpsc::Receiver<Posted>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -96,8 +97,21 @@ impl FakeOpenCode {
     }
 
     fn start_with(expected: usize, reply: Reply) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
-        let authority = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        Self::bind("127.0.0.1", expected, reply).expect("bind an IPv4 loopback listener")
+    }
+
+    /// Listen on an explicit loopback address, or `None` when this machine has
+    /// no such stack. A host without IPv6 is a real configuration rather than a
+    /// test failure, so the caller decides what to do about it.
+    fn bind(host: &str, expected: usize, reply: Reply) -> Option<Self> {
+        let listener = TcpListener::bind((host, 0)).ok()?;
+        let port = listener.local_addr().ok()?.port();
+        // The URL authority form for an IPv6 literal is bracketed.
+        let authority = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
         let url = format!("http://{authority}");
         let (tx, requests) = mpsc::channel();
         let handle = std::thread::spawn(move || {
@@ -143,12 +157,13 @@ impl FakeOpenCode {
                 });
             }
         });
-        Self {
+        Some(Self {
             url,
             authority,
+            port,
             requests,
             handle: Some(handle),
-        }
+        })
     }
 
     fn next(&self) -> Posted {
@@ -261,6 +276,63 @@ fn run_callback_with_path(
     command.output().expect("node must be runnable")
 }
 
+/// Run the callback with no `--state`, so it derives its own default, and with
+/// the home directory the default is derived from.
+///
+/// `HOME` is what the owner does *not* pass — the environment is replaced — so
+/// a real delivery falls through to the passwd entry for the same uid. Naming
+/// it here points the identical derivation at a directory this test owns.
+fn run_callback_default_state(
+    event_path: &Path,
+    event_type: &str,
+    execution_id: &str,
+    server: &str,
+    session: &str,
+    home: &Path,
+) -> Output {
+    let mut command = Command::new("node");
+    command
+        .arg(example_root().join("callback/cflx-resume-session.mjs"))
+        .args(["--server", server, "--session", session])
+        .env_clear()
+        .env("HOME", home)
+        .env("CFLX_EVENT_PATH", event_path)
+        .env("CFLX_EVENT_TYPE", event_type)
+        .env("CFLX_EXECUTION_ID", execution_id)
+        .env("CFLX_CHANGE_ID", "alpha")
+        .env("CFLX_INSTANCE_ID", "i-1");
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    command.output().expect("node must be runnable")
+}
+
+/// Where the callback keeps delivery state when nobody names a directory.
+fn default_state_dir(home: &Path) -> PathBuf {
+    home.join(".local/state/cflx/opencode-auto-resume")
+}
+
+/// Create a directory with exactly the permission bits asked for.
+fn dir_with_mode(path: &Path, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path.to_path_buf()
+}
+
+/// The permission bits of an existing path.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// Whether a state directory holds any claim or delivery record at all.
+fn has_delivery_records(state: &Path) -> bool {
+    std::fs::read_dir(state)
+        .map(|entries| entries.flatten().count() > 0)
+        .unwrap_or(false)
+}
+
 /// Exit status the callback uses for "another process holds a fresh claim".
 ///
 /// Distinct from 1 on purpose: nothing failed, so an operator wrapper can tell a
@@ -276,8 +348,12 @@ fn state_paths(state: &Path, execution_id: &str, event_type: &str) -> (PathBuf, 
 }
 
 /// Write an in-flight claim the way a live callback would.
+///
+/// Including the directory it would have created: the callback makes its state
+/// directory `0700` and refuses one that is not, so a fixture left at the
+/// process umask would be describing a state no live callback produces.
 fn write_claim(path: &Path) {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    dir_with_mode(path.parent().unwrap(), 0o700);
     std::fs::write(
         path,
         "{\"owner\":\"someone-else\",\"claimed_at\":\"2026-01-01T00:00:00Z\"}\n",
@@ -487,6 +563,135 @@ fn callback_refuses_a_non_loopback_destination_and_a_mismatched_event() {
         stderr_of(&mismatched)
     );
     assert!(server.is_quiet(), "a refused event must post nothing");
+}
+
+/// A hostname is not a destination, it is a question for the resolver. What
+/// `localhost` answers is decided by `/etc/hosts`, NSS, and search domains, so
+/// accepting it would mean asserting something this policy cannot check. Only
+/// the two literal loopback addresses are accepted.
+#[test]
+fn only_literal_loopback_destinations_are_accepted() {
+    if skip_without_node("only_literal_loopback_destinations_are_accepted") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let server = FakeOpenCode::start(1);
+    let event = write_event(dir.path(), "completed", "exec-a");
+    let state = dir.path().join("state");
+
+    // `localhost` on this machine almost certainly *is* the listener below —
+    // which is the point. It is refused for being a name, not for where it
+    // happens to point today.
+    let refused = run_callback(
+        &event,
+        "completed",
+        "exec-a",
+        &format!("http://localhost:{}", server.port),
+        "ses_abc",
+        &state,
+    );
+    assert!(!refused.status.success(), "a hostname must be refused");
+    let stderr = stderr_of(&refused);
+    assert!(stderr.contains("loopback"), "{stderr}");
+    assert!(
+        server.is_quiet(),
+        "a hostname must be refused before a connection is opened"
+    );
+    assert!(
+        !state.exists(),
+        "and before any delivery state is created, so a corrected retry is unblocked"
+    );
+
+    // The same listener, named by its literal address, is delivered to.
+    let accepted = run_callback(
+        &event,
+        "completed",
+        "exec-a",
+        &server.url,
+        "ses_abc",
+        &state,
+    );
+    assert!(accepted.status.success(), "{}", stderr_of(&accepted));
+    assert_eq!(server.next().path, "/session/ses_abc/message");
+}
+
+/// The IPv6 half of the same policy, against a real `[::1]` listener.
+#[test]
+fn literal_loopback_includes_the_ipv6_address() {
+    if skip_without_node("literal_loopback_includes_the_ipv6_address") {
+        return;
+    }
+    let Some(server) = FakeOpenCode::bind("::1", 1, Reply::Ok) else {
+        eprintln!("SKIP literal_loopback_includes_the_ipv6_address: no IPv6 loopback on this host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let event = write_event(dir.path(), "completed", "exec-a");
+
+    let output = run_callback(
+        &event,
+        "completed",
+        "exec-a",
+        &server.url,
+        "ses_abc",
+        &dir.path().join("state"),
+    );
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(server.next().path, "/session/ses_abc/message");
+}
+
+/// The plugin builds an argv the *owner* will execute, so its destination is
+/// proven before registration rather than when something finally posts to it.
+#[test]
+fn plugin_registers_nothing_for_a_non_literal_loopback_server() {
+    if skip_without_node("plugin_registers_nothing_for_a_non_literal_loopback_server") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cflx = fake_cflx(
+        dir.path(),
+        serde_json::json!({
+            "schema_version": 1, "ok": true, "operation": "notify_set",
+            "outcome": "subscribed", "detail": {}
+        }),
+    );
+    let plugin = example_root().join("plugin/cflx-auto-resume.mjs");
+
+    let source = format!(
+        r#"
+import {{ CflxAutoResume }} from "{plugin}";
+
+const plugin = await CflxAutoResume({{ directory: process.cwd() }});
+const envelope = JSON.stringify({{
+  schema_version: 1, ok: true, operation: "enqueue", outcome: "admitted",
+  instance_id: "i-1", execution_id: "exec-a", change_id: "alpha", detail: {{}},
+}});
+// A qualifying call in every other respect. The destination is what refuses it.
+await plugin["tool.execute.after"]({{ tool: "cflx_enqueue", sessionID: "ses_abc" }}, {{ output: envelope }});
+process.stdout.write("ok");
+"#,
+        plugin = plugin.display(),
+    );
+
+    let output = run_plugin_harness(
+        dir.path(),
+        &source,
+        &[
+            ("CFLX_BIN", cflx.to_str().unwrap()),
+            ("OPENCODE_SERVER", "http://localhost:4096"),
+        ],
+    );
+    // Refusing is not crashing: the hook declines and says so on stderr.
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("loopback"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !dir.path().join("cflx-calls.log").exists(),
+        "a hostname destination must register no sink at all"
+    );
 }
 
 /// The base URL is not the boundary; the *final* URL is. `new URL` lets a path
@@ -703,6 +908,145 @@ fn failed_delivery_releases_the_claim_so_a_later_invocation_retries() {
     assert!(done.exists());
 }
 
+/// The claim and the marker decide whether a message is sent, so a directory
+/// anybody else on the machine can reach is not one to keep them in. Each
+/// refusal happens before a record is read or created, and before any HTTP.
+///
+/// Foreign ownership is checked by the callback but not exercised here: an
+/// unprivileged test cannot create a file owned by another user, and a test
+/// that needed root would not run.
+#[test]
+fn callback_requires_private_state_before_it_claims_anything() {
+    if skip_without_node("callback_requires_private_state_before_it_claims_anything") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let server = FakeOpenCode::start(1);
+    let event = write_event(dir.path(), "completed", "exec-a");
+
+    // A symlink: what it points at can be changed after it is checked.
+    let real = dir_with_mode(&dir.path().join("real"), 0o700);
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let output = run_callback(&event, "completed", "exec-a", &server.url, "ses_abc", &link);
+    assert!(!output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("symlink"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !has_delivery_records(&real),
+        "a refused state path must leave no claim behind its link either"
+    );
+
+    // A plain file where a directory belongs.
+    let file = dir.path().join("not-a-directory");
+    std::fs::write(&file, b"x").unwrap();
+    let output = run_callback(&event, "completed", "exec-a", &server.url, "ses_abc", &file);
+    assert!(!output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("not a directory"),
+        "{}",
+        stderr_of(&output)
+    );
+
+    // A directory the rest of the machine can read, write, or list.
+    for mode in [0o755, 0o770, 0o707] {
+        let open = dir_with_mode(&dir.path().join(format!("open-{mode:o}")), mode);
+        let output = run_callback(&event, "completed", "exec-a", &server.url, "ses_abc", &open);
+        assert!(!output.status.success(), "mode {mode:o} must be refused");
+        assert!(
+            stderr_of(&output).contains("0700"),
+            "{}",
+            stderr_of(&output)
+        );
+        assert!(
+            !has_delivery_records(&open),
+            "mode {mode:o} must be refused before a claim is created"
+        );
+    }
+
+    assert!(
+        server.is_quiet(),
+        "an unsafe state directory must send no OpenCode request"
+    );
+
+    // And the private one still delivers, with the ordinary claim semantics.
+    let private = dir_with_mode(&dir.path().join("private"), 0o700);
+    let output = run_callback(
+        &event,
+        "completed",
+        "exec-a",
+        &server.url,
+        "ses_abc",
+        &private,
+    );
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    server.next();
+    let (inflight, done) = state_paths(&private, "exec-a", "completed");
+    assert!(done.exists(), "a delivered event is marked delivered");
+    assert!(
+        !inflight.exists(),
+        "and its claim was promoted, not left behind"
+    );
+}
+
+/// The default path is derived per user rather than shared. A predictable path
+/// under the system temporary directory could be created first by anybody, and
+/// whoever owns it owns every other user's delivery decisions.
+#[test]
+fn private_state_defaults_to_an_owner_private_directory() {
+    if skip_without_node("private_state_defaults_to_an_owner_private_directory") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server = FakeOpenCode::start(1);
+    let event = write_event(dir.path(), "completed", "exec-a");
+
+    let output =
+        run_callback_default_state(&event, "completed", "exec-a", &server.url, "ses_abc", &home);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    server.next();
+
+    let state = default_state_dir(&home);
+    let (_, done) = state_paths(&state, "exec-a", "completed");
+    assert!(
+        done.exists(),
+        "the default state directory must be the one under this user's home"
+    );
+    assert_eq!(
+        mode_of(&state),
+        0o700,
+        "and it must be created closed, not relaxed afterwards"
+    );
+
+    // Pre-created wide open — the shape a second local user would leave behind.
+    // The default is checked exactly like a supplied one.
+    dir_with_mode(&state, 0o755);
+    let quiet = FakeOpenCode::start(1);
+    let event_b = write_event(dir.path(), "completed", "exec-b");
+    let output = run_callback_default_state(
+        &event_b,
+        "completed",
+        "exec-b",
+        &quiet.url,
+        "ses_abc",
+        &home,
+    );
+    assert!(!output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("0700"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(quiet.is_quiet(), "and nothing was posted");
+    let (inflight_b, done_b) = state_paths(&state, "exec-b", "completed");
+    assert!(!inflight_b.exists() && !done_b.exists());
+}
+
 // ============================================================================
 // plugin
 // ============================================================================
@@ -784,6 +1128,95 @@ process.stdout.write("ok");
     );
     assert!(calls.contains("client"), "{calls}");
     assert!(calls.contains("mcp"), "{calls}");
+}
+
+/// The result of an enqueue becomes an argv the owner executes, so the plugin
+/// reads it as the versioned contract it is: a version it understands, an
+/// outcome that admitted something, and three identifiers that are actually
+/// identifiers. Anything else registers nothing.
+#[test]
+fn plugin_rejects_an_incompatible_enqueue_envelope() {
+    if skip_without_node("plugin_rejects_an_incompatible_enqueue_envelope") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cflx = fake_cflx(
+        dir.path(),
+        serde_json::json!({
+            "schema_version": 1, "ok": true, "operation": "notify_set",
+            "outcome": "subscribed", "detail": {}
+        }),
+    );
+    let plugin = example_root().join("plugin/cflx-auto-resume.mjs");
+
+    let source = format!(
+        r#"
+import {{ CflxAutoResume, extractBinding }} from "{plugin}";
+
+const base = {{
+  schema_version: 1, ok: true, operation: "enqueue", outcome: "admitted",
+  instance_id: "i-1", execution_id: "exec-a", change_id: "alpha", detail: {{}},
+}};
+const reject = (patch, why) => {{
+  if (extractBinding({{ ...base, ...patch }})) throw new Error(why);
+}};
+
+// The version gate: an envelope whose shape this plugin has never seen is not
+// one to read three fields out of.
+reject({{ schema_version: undefined }}, "an unversioned envelope must not bind");
+reject({{ schema_version: 2 }}, "a future schema version must not bind");
+reject({{ schema_version: "1" }}, "a non-numeric schema version must not bind");
+
+// The outcome gate: success is narrow, and only an admission created an episode.
+reject({{ outcome: undefined }}, "a missing outcome must not bind");
+reject({{ outcome: "owner_not_running" }}, "a refusal must not bind");
+reject({{ outcome: "observed" }}, "another operation's success must not bind");
+
+// The identifier gate: truthiness is not a type.
+reject({{ change_id: 7 }}, "a non-string change id must not bind");
+reject({{ execution_id: {{ id: "exec-a" }} }}, "an object execution id must not bind");
+reject({{ instance_id: "" }}, "an empty instance id must not bind");
+reject({{ execution_id: "   " }}, "a blank execution id must not bind");
+
+// And what the current contract actually returns.
+if (!extractBinding(base)) throw new Error("an admitted envelope must bind");
+if (!extractBinding({{ ...base, outcome: "already_admitted" }}))
+  throw new Error("already_admitted is an admission too");
+if (!extractBinding(JSON.stringify(base))) throw new Error("the JSON text form must bind");
+
+// End to end: an incompatible envelope reaches the hook and registers nothing.
+const plugin = await CflxAutoResume({{ directory: process.cwd() }});
+await plugin["tool.execute.after"](
+  {{ tool: "cflx_enqueue", sessionID: "ses_abc" }},
+  {{ output: JSON.stringify({{ ...base, schema_version: 99 }}) }},
+);
+await plugin["tool.execute.after"](
+  {{ tool: "cflx_enqueue", sessionID: "ses_abc" }},
+  {{ output: JSON.stringify({{ ...base, outcome: "target_ineligible" }}) }},
+);
+process.stdout.write("ok");
+"#,
+        plugin = plugin.display(),
+    );
+
+    let output = run_plugin_harness(
+        dir.path(),
+        &source,
+        &[
+            ("CFLX_BIN", cflx.to_str().unwrap()),
+            ("OPENCODE_SERVER", "http://127.0.0.1:4096"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr_of(&output)
+    );
+    assert!(
+        !dir.path().join("cflx-calls.log").exists(),
+        "an incompatible envelope must register no completion sink"
+    );
 }
 
 // ============================================================================
