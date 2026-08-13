@@ -40,7 +40,7 @@ Automates the OpenSpec change workflow:
 SUBCOMMANDS:
   run      Execute orchestration loop (non-interactive)
   tui      Launch interactive TUI dashboard (default)
-  client   Operate an existing owner (status/enqueue/wait) without becoming one
+  client   Operate an existing owner (status/enqueue/wait/mcp) without becoming one
   init     Generate configuration template
   openapi  Print the generated /api/v2 OpenAPI 3.1 schema to stdout
 
@@ -286,6 +286,7 @@ pub enum Commands {
     ///   cflx client status --json               # Read the owner without mutating it
     ///   cflx client enqueue alpha --json        # Ask the owner to admit one change
     ///   cflx client wait alpha --timeout 30m    # Observe until verified completion
+    ///   cflx client mcp                         # Serve the same intents over stdio MCP
     Client(ClientArgs),
 
     /// Print the generated /api/v2 OpenAPI 3.1 schema to standard output
@@ -958,6 +959,7 @@ EXAMPLES:
   cflx client status --json
   cflx client enqueue alpha --json
   cflx client wait alpha --timeout 45m --json
+  cflx client mcp
   cflx client --unix-socket /tmp/cflx-api.sock status"
 )]
 pub struct ClientArgs {
@@ -1008,7 +1010,41 @@ pub enum ClientCommands {
     /// for the owner's terminal mode; a change merely disappearing from the
     /// snapshot is never completion.
     Wait(ClientWaitArgs),
+
+    /// Serve the same client intents to an MCP host over stdio
+    ///
+    /// A stdio Model Context Protocol server over exactly this namespace. It
+    /// stays a client — no repository lock, no listener, no orchestration run —
+    /// and exposes no raw `/api/v2` command construction, so a model cannot name
+    /// a command type, an expected revision, an idempotency key, an execution
+    /// mark, or shell source.
+    ///
+    /// Six closed tools: cflx_status, cflx_enqueue, cflx_wait, cflx_notify_set,
+    /// cflx_notify_get, and cflx_notify_clear. Each one calls the same client
+    /// boundary the corresponding command does, so routing, typed outcomes, and
+    /// the completion oracle are shared rather than reimplemented.
+    ///
+    /// cflx_enqueue returns as soon as admission settles and carries the
+    /// execution_id of that exact admitted episode; it never holds the tool call
+    /// open for the life of a change. Pass that execution_id to cflx_notify_set
+    /// for asynchronous continuation, or use cflx_wait for a bounded synchronous
+    /// observation.
+    ///
+    /// Connection defaults come from this namespace's --unix-socket and
+    /// --auth-token-env, and each tool may override them. A token value is never
+    /// accepted in argv or in a tool argument: only the name of an environment
+    /// variable holding it.
+    ///
+    /// stdout carries JSON-RPC frames and nothing else; diagnostics go to stderr.
+    Mcp(ClientMcpArgs),
 }
+
+/// Arguments for `cflx client mcp`.
+///
+/// Empty on purpose: the connection options are the namespace's globals, and a
+/// protocol server has no per-invocation output mode to select.
+#[derive(Parser, Debug)]
+pub struct ClientMcpArgs {}
 
 /// Arguments for `cflx client status`.
 #[derive(Parser, Debug)]

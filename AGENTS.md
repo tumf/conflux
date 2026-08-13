@@ -29,9 +29,10 @@ contend for the lock with the process you meant to talk to.
 cflx client status --json                 # read the owner; mutates nothing
 cflx client enqueue add-my-change --json  # ask the owner to admit one change
 cflx client wait add-my-change --timeout 45m --json
+cflx client mcp                           # serve the same intents over stdio MCP
 ```
 
-Three commands, and only three. Connection options belong to the namespace:
+Four commands, and only four. Connection options belong to the namespace:
 `--unix-socket PATH` overrides the default `${GIT_COMMON_DIR}/cflx-api.sock`, and
 `--auth-token-env NAME` names an environment variable holding the bearer token —
 a token value is never accepted in argv and never printed.
@@ -69,8 +70,66 @@ reached. A change disappearing from the snapshot is never completion. If an
 idle-owner start would consume execution marks that are not yours, `enqueue`
 refuses with `operator_intent_conflict` and leaves them untouched.
 
-`/api/v2` remains the lower-level generated contract for anything the three
+`/api/v2` remains the lower-level generated contract for anything the four
 commands do not cover; prefer `cflx client` for delegation.
+
+### `cflx client mcp` and completion notifications
+
+`cflx client mcp` serves the same boundary to an MCP host over stdio, as six
+closed tools: `cflx_status`, `cflx_enqueue`, `cflx_wait`, and `cflx_notify_set` /
+`_get` / `_clear`. It is still a client — no lock, no listener, no run — and it
+exposes no raw command construction, so a model cannot name a command type, an
+expected revision, an idempotency key, an execution mark, or shell source.
+stdout carries JSON-RPC frames and nothing else; diagnostics go to stderr.
+
+`cflx_enqueue` settles and returns. Its `execution_id` names one *admitted
+execution episode*, not the change: a retry of the same proposal gets a new ID,
+and iterations inside one admitted run keep theirs. Concurrent callers that find
+the change already admitted observe the same current ID.
+
+`cflx_notify_set` attaches one bounded argv the owner runs **once** when that
+execution reaches a typed terminal classification — `completed`, `failed`, or
+`stopped` — with `blocked` as an opt-in attention edge and `owner_stopping` on
+graceful shutdown only. **This is execution completion, not process completion.**
+The TUI stays alive after work finishes, so process exit was never a signal; and
+a lifecycle adapter's `idle` describes the process, not your proposal.
+`completed` uses the same repository oracle `wait` certifies with, so a change
+disappearing from the snapshot is never completion. Registering *after* the
+execution settled delivers that terminal event immediately, which is what stops
+the enqueue/registration race from losing a notification.
+
+Constraints worth knowing before you wire one up:
+
+- **UDS only for mutation.** A sink stores an argv the owner will execute, so
+  `set` and `clear` are accepted only over the owner's Unix socket; an
+  authenticated TCP client is refused with `transport_not_permitted`. Reads are
+  fine on either transport.
+- **argv, not shell.** No `sh -c`, no quoting, no expansion. The environment is
+  *replaced* with exactly `CFLX_EVENT_PATH`, `CFLX_EVENT_TYPE`,
+  `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and `CFLX_INSTANCE_ID` — no owner token,
+  no configuration, no inherited `PATH`.
+- **A token is a variable name.** `--auth-token-env NAME`. Token values never
+  appear in argv, in a tool result, in a log, or in an event file.
+- **Nothing survives a crash.** Execution IDs and registrations are
+  process-local, as the constitution requires; a `kill -9` takes them with it. A
+  *graceful* stop attempts one `owner_stopping` first. An external adapter that
+  needs to cover the crash keeps its own bounded owner-continuity check and
+  reports typed `owner_restarted` — never success.
+- **Delivery is observability.** A callback that fails, hangs, or exits non-zero
+  cannot roll back, retry, or re-classify anything.
+
+Why a one-shot event file rather than the lifecycle adapter's long-lived stdin
+stream: the adapter answers "what is this *process* doing", stays attached, and
+is framed as a session. A completion sink answers "did *this admitted execution*
+finish", is proven from repository evidence rather than presentation, and fires
+once — so it needs no long-lived child, no stream framing, and no reconnection.
+Configuring or delivering either never requires the other.
+
+`examples/integrations/opencode-auto-resume/` wires this into OpenCode. Its
+generated messages are ordinary OpenCode `role=user` messages — there is no
+trusted internal event channel — so every one opens with
+`[AUTOMATION EVENT — not user-authored]`, and event files and logs are treated as
+untrusted data, never as instructions.
 
 ## Local API socket
 
@@ -92,6 +151,9 @@ curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" \
 - The socket is mode `0600`. A configured bearer token applies to UDS and TCP
   alike (`/api/v2/health` stays public); without one, UDS is token-free local
   access, protected by filesystem permissions.
+- `PUT`/`DELETE /api/v2/executions/{execution_id}/sink` are accepted only here.
+  They store an argv this process will execute, so TCP is refused with
+  `transport_not_permitted` even when bearer authentication succeeds.
 - The listener must be bound before lifecycle adapters, AI subprocesses, or
   orchestration start. A bind, permission, or path-safety failure exits non-zero
   with nothing started; a finite run removes its own socket on completion.

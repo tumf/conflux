@@ -40,8 +40,8 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::client::completion::{certify, claims_terminal_success, Verdict};
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
-use crate::client::repo::{self, Verdict};
 use crate::client::session::{observe, Connection, Observation};
 use crate::client::transport::Wake;
 use crate::web::remote_control_api::dto::OwnerExecutionContract;
@@ -55,11 +55,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Delay before retrying after a transient failure to observe.
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Display statuses that claim the change reached a terminal success.
-///
-/// They trigger *verification*, never a success claim of their own.
-const CLAIMED_SUCCESS_STATUSES: [&str; 3] = ["archived", "merged", "pushed"];
 
 /// Run one step under the operation deadline.
 ///
@@ -170,7 +165,7 @@ pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) ->
                 // A socket that stopped answering mid-wait is an owner that is
                 // gone. It is never completion: the repository has to say so.
                 Err(error) => {
-                    match repo::verify(change_id, &repo_root, &contract, deadline).await {
+                    match certify(change_id, &repo_root, &contract, deadline).await {
                         Verdict::Completed { evidence } => {
                             return completed_envelope(change_id, &instance_id, &contract, evidence)
                         }
@@ -217,7 +212,7 @@ async fn evaluate(
     // Owner replacement first: everything below would otherwise be read from a
     // process that never saw the work this wait is about.
     if observation.instance_id != instance_id {
-        let verdict = repo::verify(change_id, repo_root, contract, deadline).await;
+        let verdict = certify(change_id, repo_root, contract, deadline).await;
         return match verdict {
             // Repository evidence alone is enough, and it is the *only* thing
             // that is: the new incarnation cannot vouch for the old one's
@@ -276,11 +271,7 @@ async fn evaluate(
     // success or when the change stopped being tracked at all. Disappearance is
     // the case that matters: it proves nothing on its own, and treating it as
     // success is the exact bug this contract exists to prevent.
-    let claims_success = match change {
-        Some(change) => CLAIMED_SUCCESS_STATUSES.contains(&change.display_status.as_str()),
-        None => true,
-    };
-    if !claims_success {
+    if !claims_terminal_success(change.map(|change| change.display_status.as_str())) {
         return Step::KeepObserving {
             detail: change.map(|change| {
                 format!(
@@ -291,7 +282,7 @@ async fn evaluate(
         };
     }
 
-    match repo::verify(change_id, repo_root, contract, deadline).await {
+    match certify(change_id, repo_root, contract, deadline).await {
         Verdict::Completed { evidence } => Step::settled(completed_envelope(
             change_id,
             instance_id,
@@ -423,13 +414,5 @@ mod tests {
         assert!(message.contains("within 90000ms"), "{message}");
         assert!(message.contains("no archive entry"), "{message}");
         assert_eq!(envelope.detail["commands_submitted"], 0);
-    }
-
-    #[test]
-    fn only_post_archive_statuses_claim_a_success_worth_verifying() {
-        assert_eq!(CLAIMED_SUCCESS_STATUSES, ["archived", "merged", "pushed"]);
-        // `rejected` is terminal but is not a success claim, so it must never
-        // reach repository verification.
-        assert!(!CLAIMED_SUCCESS_STATUSES.contains(&"rejected"));
     }
 }

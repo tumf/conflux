@@ -81,6 +81,19 @@ pub enum ErrorCode {
     WorktreeDirtyUnknown,
     /// The base merge conflicted and its intermediate state was preserved.
     MergeConflict,
+    /// The addressed execution exists, but the presented instance/change
+    /// binding is not the one it belongs to.
+    ///
+    /// Its own code rather than [`Self::NotFound`]: "no such execution" and
+    /// "that execution is not yours" ask different things of a client, and a
+    /// caller that confused them would rebind a sink onto someone else's work.
+    ExecutionBindingMismatch,
+    /// The request is legitimate but this transport may not carry it.
+    ///
+    /// Registering an executable argv is accepted only over the owner-only Unix
+    /// socket, so an authenticated TCP client is refused here rather than at the
+    /// bearer gate: the credentials were fine, the channel was not.
+    TransportNotPermitted,
     /// Sanitized server-side failure.
     InternalError,
 }
@@ -101,7 +114,9 @@ impl ErrorCode {
             | Self::WorktreeExists
             | Self::WorktreeDirty
             | Self::WorktreeDirtyUnknown
-            | Self::MergeConflict => StatusCode::CONFLICT,
+            | Self::MergeConflict
+            | Self::ExecutionBindingMismatch => StatusCode::CONFLICT,
+            Self::TransportNotPermitted => StatusCode::FORBIDDEN,
             Self::RegistryCapacity => StatusCode::SERVICE_UNAVAILABLE,
             Self::ValidationFailed => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
@@ -127,13 +142,15 @@ impl ErrorCode {
             Self::WorktreeDirty => "worktree_dirty",
             Self::WorktreeDirtyUnknown => "worktree_dirty_unknown",
             Self::MergeConflict => "merge_conflict",
+            Self::ExecutionBindingMismatch => "execution_binding_mismatch",
+            Self::TransportNotPermitted => "transport_not_permitted",
             Self::InternalError => "internal_error",
         }
     }
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 17] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 19] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
@@ -150,6 +167,8 @@ pub const ALL_ERROR_CODES: [ErrorCode; 17] = [
     ErrorCode::WorktreeDirty,
     ErrorCode::WorktreeDirtyUnknown,
     ErrorCode::MergeConflict,
+    ErrorCode::ExecutionBindingMismatch,
+    ErrorCode::TransportNotPermitted,
     ErrorCode::InternalError,
 ];
 
@@ -210,9 +229,11 @@ pub fn is_valid_correlation_id(value: &str) -> bool {
 }
 
 /// Generate a random 128-bit lowercase hexadecimal identifier.
-pub fn new_hex_id() -> String {
-    format!("{:032x}", rand::random::<u128>())
-}
+///
+/// Re-exported rather than reimplemented: the orchestration-side execution
+/// registry mints the same shape in builds that have no web feature, and two
+/// generators would eventually disagree about width or case.
+pub use crate::ids::new_hex_id;
 
 // ============================================================================
 // Commands
@@ -568,6 +589,14 @@ pub struct CapabilitiesResponse {
     pub authentication_required: bool,
     /// Whether this process can execute a command at all.
     pub command_execution: CommandExecutionCapability,
+    /// Whether this process serves execution-scoped completion sinks.
+    ///
+    /// `#[serde(default)]` so a *client* built against this contract can still
+    /// read an older owner that predates the surface: the absent field means
+    /// "unavailable", which is exactly what such an owner is. The server always
+    /// writes it.
+    #[serde(default)]
+    pub execution_sinks: ExecutionSinkCapability,
     /// The complete worktree surface, including its conflict-recovery boundary.
     pub worktrees: super::worktrees::WorktreeCapabilities,
     /// The parallel execution surface, including its blocked-reason vocabulary.
@@ -586,6 +615,26 @@ pub struct CapabilitiesResponse {
 pub struct CommandExecutionCapability {
     /// True once a command executor is bound to this process incarnation.
     pub available: bool,
+}
+
+/// Whether execution-scoped completion sinks can be registered at all.
+///
+/// Published as its own typed fact so a client discovers the surface instead of
+/// inferring it from a 404: an older owner has no `/api/v2/executions/...`
+/// route, and "the route is missing" and "this owner refuses sinks" would
+/// otherwise be indistinguishable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct ExecutionSinkCapability {
+    /// True when this build serves the execution-sink resources.
+    pub available: bool,
+    /// Longest accepted callback argv.
+    pub max_command_args: usize,
+    /// Longest accepted single argv element, in bytes.
+    pub max_command_arg_len: usize,
+    /// Wall-clock ceiling one callback may run for, in milliseconds.
+    pub callback_timeout_ms: u64,
+    /// Captured-output ceiling per callback stream, in bytes.
+    pub max_callback_output_bytes: usize,
 }
 
 /// One supported event transport.
@@ -1260,6 +1309,20 @@ pub struct ProcessExecutionStatus {
 pub struct ChangeExecutionStatus {
     /// Change ID.
     pub id: String,
+    /// Process-local identity of the most recent admitted execution episode.
+    ///
+    /// `null` until this incarnation admitted the change. Retained after the
+    /// episode settles so a late subscriber can still address it, and replaced
+    /// — never reused — by the next admission, which is what makes a retry a
+    /// distinct execution rather than a continuation.
+    ///
+    /// Observability only: nothing in scheduling, acceptance, archive, merge,
+    /// retry, or completion classification reads it.
+    ///
+    /// `#[serde(default)]` so a client built against this contract can still
+    /// read an owner that predates execution identity.
+    #[serde(default)]
+    pub execution_id: Option<String>,
     /// Closed execution state.
     pub execution_state: ChangeExecutionState,
     /// Phase the reducer currently holds.
@@ -1306,6 +1369,171 @@ pub struct ExecutionStatusResponse {
     /// Per-change facts, in snapshot order.
     pub changes: Vec<ChangeExecutionStatus>,
 }
+
+// ============================================================================
+// Execution-scoped completion sinks
+// ============================================================================
+//
+// A sink is a bounded argv command the owner runs *once* when one admitted
+// execution reaches a typed terminal classification. It is observability, not
+// control: nothing here is read back to decide a workflow action, delivery
+// failure cannot roll anything back, and the whole registry dies with the
+// process. What makes it useful is that it is scoped to one *execution* rather
+// than to a change or to the process — a long-lived TUI stays alive after work
+// finishes, so process exit was never a completion signal.
+
+/// Closed vocabulary of events a completion sink can receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEventType {
+    /// Repository evidence proved this owner's declared terminal mode.
+    Completed,
+    /// The owner reached a typed terminal unsuccessful state.
+    Failed,
+    /// A settled stop or dequeue removed the execution.
+    Stopped,
+    /// Optional, non-terminal attention: the execution entered a blocked state.
+    Blocked,
+    /// The owner is shutting down gracefully with this execution still live.
+    OwnerStopping,
+}
+
+impl ExecutionEventType {
+    /// Wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+            Self::Blocked => "blocked",
+            Self::OwnerStopping => "owner_stopping",
+        }
+    }
+
+    /// Whether this event ends the execution's delivery budget.
+    ///
+    /// `blocked` and `owner_stopping` do not: the first is an attention edge a
+    /// recovery can follow, and the second says the owner is leaving, not that
+    /// the work reached an outcome.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Stopped)
+    }
+}
+
+/// Every event type, in the order the contract advertises them.
+#[allow(dead_code)] // Read by the OpenAPI contract assertions, not by the binary.
+pub const ALL_EXECUTION_EVENT_TYPES: [ExecutionEventType; 5] = [
+    ExecutionEventType::Completed,
+    ExecutionEventType::Failed,
+    ExecutionEventType::Stopped,
+    ExecutionEventType::Blocked,
+    ExecutionEventType::OwnerStopping,
+];
+
+/// The bounded callback attached to one execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ExecutionSinkSpec {
+    /// Callback argv, executed directly.
+    ///
+    /// Data, never shell source: element 0 is the program and the rest are its
+    /// arguments, so no quoting, expansion, or `sh -c` interpretation exists to
+    /// be exploited by a change ID or an event path.
+    pub command: Vec<String>,
+    /// Deliver the optional non-terminal `blocked` attention edge as well.
+    ///
+    /// Terminal events are never opt-out: a caller that could disable them
+    /// would be registering a sink that can silently never fire.
+    pub notify_blocked: bool,
+}
+
+/// `PUT /api/v2/executions/{execution_id}/sink` request body.
+///
+/// The binding fields are mandatory and are *checked*, not trusted: a sink that
+/// attached itself to whatever execution currently holds an ID would silently
+/// follow a retry it was never told about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionSinkRequest {
+    /// Owner incarnation the caller believes it is talking to.
+    pub instance_id: String,
+    /// Change the caller believes this execution belongs to.
+    pub change_id: String,
+    /// Callback argv.
+    pub command: Vec<String>,
+    /// Opt in to the non-terminal blocked attention edge.
+    #[serde(default)]
+    pub notify_blocked: bool,
+}
+
+/// Binding a `GET` or `DELETE` sink request asserts.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ExecutionSinkParams {
+    /// Owner incarnation the caller believes it is talking to.
+    pub instance_id: Option<String>,
+    /// Change the caller believes this execution belongs to.
+    pub change_id: Option<String>,
+}
+
+/// `GET`/`PUT`/`DELETE /api/v2/executions/{execution_id}/sink` body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ExecutionSinkResponse {
+    /// Owner incarnation that answered.
+    pub instance_id: String,
+    /// The addressed execution.
+    pub execution_id: String,
+    /// Change the execution belongs to.
+    pub change_id: String,
+    /// Currently attached sink; `null` when none is.
+    pub sink: Option<ExecutionSinkSpec>,
+    /// The execution's current closed state.
+    pub execution_state: ChangeExecutionState,
+    /// True once a terminal event has been dispatched for this execution.
+    pub terminal_dispatched: bool,
+    /// Event types already delivered, in delivery order.
+    ///
+    /// Typed rather than free strings: a client deciding whether it still owes
+    /// a resume should branch on the vocabulary, not on spelling.
+    pub delivered_events: Vec<ExecutionEventType>,
+}
+
+/// The versioned payload written to `CFLX_EVENT_PATH` for one delivery.
+///
+/// Bounded typed data and paths only. No prompt, terminal capture, environment
+/// dump, credential, or unrestricted error body may appear here: the file is
+/// handed to an arbitrary callback, and everything in it is data that callback
+/// will treat as untrusted input.
+///
+/// Deliberately *not* an OpenAPI schema: it is never an HTTP request or response
+/// body. It is an on-disk artifact handed to a local subprocess, and registering
+/// an unreachable schema would make the published contract claim a surface no
+/// operation serves. Its shape is documented in the API description instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionEventFile {
+    /// Payload schema version.
+    pub schema_version: u32,
+    /// What happened.
+    pub event_type: ExecutionEventType,
+    /// Owner incarnation that produced the event.
+    pub instance_id: String,
+    /// Execution the event belongs to.
+    pub execution_id: String,
+    /// Change the execution belongs to.
+    pub change_id: String,
+    /// When the owner classified the event (absolute UTC RFC 3339).
+    pub emitted_at: String,
+    /// Whether this event ends the execution's delivery budget.
+    pub terminal: bool,
+    /// How this owner finishes changes, when it had published a contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_mode: Option<TerminalMode>,
+    /// Bounded server-authored statement of the repository evidence that
+    /// certified a `completed` event. Absent for every other type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+/// Version of [`ExecutionEventFile`].
+pub const EXECUTION_EVENT_SCHEMA_VERSION: u32 = 1;
 
 // ============================================================================
 // Owner execution contract

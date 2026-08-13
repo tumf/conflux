@@ -224,6 +224,24 @@ impl UnixApiClient {
         self.request("POST", path_and_query, Some(body)).await
     }
 
+    /// PUT a JSON body.
+    ///
+    /// Used only by the execution-sink resources, which are idempotent
+    /// replacements of one named subscription rather than submissions to a
+    /// collection — the reason they are `PUT` and not `POST /commands`.
+    pub async fn put_json(
+        &self,
+        path_and_query: &str,
+        body: &str,
+    ) -> Result<HttpResponse, TransportError> {
+        self.request("PUT", path_and_query, Some(body)).await
+    }
+
+    /// DELETE one resource.
+    pub async fn delete(&self, path_and_query: &str) -> Result<HttpResponse, TransportError> {
+        self.request("DELETE", path_and_query, None).await
+    }
+
     async fn request(
         &self,
         method: &str,

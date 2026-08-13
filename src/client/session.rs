@@ -208,6 +208,25 @@ impl Observation {
     pub fn command_capable(&self) -> bool {
         self.capabilities.command_execution.available
     }
+
+    /// The process-local execution episode the owner publishes for one change.
+    ///
+    /// `None` on an owner that predates execution identity, and on a change
+    /// this incarnation never admitted. Both are honest absences rather than
+    /// something to synthesize: an episode ID this client invented would name
+    /// no subscription the owner could ever deliver.
+    pub fn execution_id(&self, change_id: &str) -> Option<String> {
+        self.execution
+            .changes
+            .iter()
+            .find(|status| status.id == change_id)
+            .and_then(|status| status.execution_id.clone())
+    }
+
+    /// Whether this owner serves execution-scoped completion sinks.
+    pub fn execution_sinks_available(&self) -> bool {
+        self.capabilities.execution_sinks.available
+    }
 }
 
 /// Why one observation attempt did not produce a usable result.

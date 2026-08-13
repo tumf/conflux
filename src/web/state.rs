@@ -611,7 +611,27 @@ impl WebState {
         facts: Arc<crate::orchestration::execution_facts::ExecutionFactsStore>,
     ) {
         *self.execution_facts.write().await = Some(facts.clone());
-        self.remote_control.bind_execution_facts(facts);
+        self.remote_control.bind_execution_facts(facts.clone());
+        // The registry observes the same store, so an execution episode and the
+        // status resource describing it can never come from two sources. Started
+        // here rather than at listener bind time because this is the first point
+        // a typed transition can exist at all.
+        let registry = crate::web::completion_sink::CompletionSinkRegistry::start(
+            self.remote_control.projection().instance_id().to_string(),
+            facts,
+            self.remote_control.execution_contract(),
+        );
+        if let Some(repo_root) = self.operator_facts.read().await.repo_root() {
+            registry.bind_repo_root(repo_root);
+        }
+        self.remote_control.bind_completion_sinks(registry);
+    }
+
+    /// The completion-sink registry, once an orchestration runtime bound one.
+    pub fn completion_sinks(
+        &self,
+    ) -> Option<Arc<crate::web::completion_sink::CompletionSinkRegistry>> {
+        self.remote_control.completion_sinks().get()
     }
 
     /// Publish this owner's minimal execution contract.
@@ -628,7 +648,14 @@ impl WebState {
     }
 
     /// Bind the repository root used to redact published worktree paths.
+    ///
+    /// It is also the root completion sinks certify terminal success against,
+    /// so the same value that keeps a published path inside the repository is
+    /// the one an event is proven from.
     pub async fn set_repo_root(&self, repo_root: std::path::PathBuf) {
+        if let Some(registry) = self.completion_sinks() {
+            registry.bind_repo_root(repo_root.clone());
+        }
         self.operator_facts.write().await.set_repo_root(repo_root);
     }
 
