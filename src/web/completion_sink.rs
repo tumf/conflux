@@ -77,15 +77,6 @@ pub const MAX_CALLBACK_OUTPUT_BYTES: usize = 8 * 1024;
 /// callbacks hold shutdown for n times as long.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(40);
 
-/// How long the owner waits for the dispatcher to report that the callback it
-/// just cancelled is terminated and reaped.
-///
-/// Only a hang guard: cancellation kills the child, so the acknowledgement it is
-/// waiting for is normally immediate. Artifact cleanup happens after it, because
-/// removing an event file while its callback still holds it is exactly the race
-/// this ordering exists to prevent.
-const REAP_GRACE: Duration = Duration::from_secs(10);
-
 /// How long a stream drain may outlive the callback that owned it.
 ///
 /// A callback that leaves a grandchild holding the inherited pipe keeps the
@@ -230,6 +221,67 @@ pub struct CompletionSinkRegistry {
     /// terminated and explicitly reaped.
     cancel: CancellationToken,
     limits: Mutex<Limits>,
+    /// Test-only hold between shutdown cancellation and the kill-and-reap it
+    /// forces; `None` in every production path.
+    reap_gate: Mutex<Option<Arc<ReapGate>>>,
+}
+
+/// Test-only synchronization around the kill-and-reap shutdown cancellation
+/// forces.
+///
+/// Injectable because "cleanup happens only after a confirmed reap" is an
+/// *ordering* property. Proving it needs a test that can hold the
+/// acknowledgement outstanding while a callback is demonstrably still alive,
+/// and then observe what the owner did *not* do meanwhile — not one that infers
+/// the ordering from how long a wait happened to take.
+#[derive(Debug)]
+pub struct ReapGate {
+    /// A permit appears when the owner reaches the gate holding a live callback.
+    reached: tokio::sync::Semaphore,
+    /// Notified by the test once it has observed the retained artifacts.
+    released: tokio::sync::Notify,
+}
+
+impl Default for ReapGate {
+    fn default() -> Self {
+        Self {
+            reached: tokio::sync::Semaphore::new(0),
+            released: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl ReapGate {
+    // Read by the sink tests, which link the library rather than the binary.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Wait until shutdown cancellation has reached a callback that is still
+    /// alive and about to be terminated and reaped.
+    // Read by the sink tests, which link the library rather than the binary.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn reached(&self) {
+        self.reached
+            .acquire()
+            .await
+            .expect("the reap gate is never closed")
+            .forget();
+    }
+
+    /// Let the owner finish the kill-and-reap it is holding at the gate.
+    // Read by the sink tests, which link the library rather than the binary.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn release(&self) {
+        self.released.notify_one();
+    }
+
+    /// Owner side: announce arrival, then hold until the test releases.
+    async fn hold(&self) {
+        self.reached.add_permits(1);
+        self.released.notified().await;
+    }
 }
 
 impl std::fmt::Debug for CompletionSinkRegistry {
@@ -265,6 +317,7 @@ impl CompletionSinkRegistry {
                 stopping: AtomicBool::new(false),
                 cancel: CancellationToken::new(),
                 limits: Mutex::new(Limits::default()),
+                reap_gate: Mutex::new(None),
             }),
             tasks: rx,
         }
@@ -444,11 +497,24 @@ impl CompletionSinkRegistry {
     /// acknowledged that are the artifacts removed — a file pulled out from
     /// under a live callback would be the one race this whole path exists to
     /// prevent.
+    ///
+    /// That acknowledgement has no second deadline of its own, deliberately.
+    /// The finite deadline bounds how long a *graceful* callback may run; it
+    /// says nothing about whether the child it just cancelled has been reaped.
+    /// A secondary timeout that removed artifacts anyway would reintroduce
+    /// exactly the live-callback cleanup race the first wait exists to avoid,
+    /// and it would do so in the one situation where a callback is provably
+    /// still being torn down. Waiting cannot hang instead: cancellation is
+    /// kill-and-wait followed by a bounded drain, and a dispatcher that died
+    /// drops the sender, which resolves the wait with an error rather than
+    /// never.
     pub async fn owner_stopping(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         let (done, mut wait) = tokio::sync::oneshot::channel();
         if self.tasks.send(Task::Stopping(done)).is_err() {
-            // No dispatcher means no callback is holding anything.
+            // A closed task channel means the dispatcher is gone, and the
+            // dispatcher is the only place a callback is ever spawned: nothing
+            // can be holding an artifact, and nothing can start now.
             self.cleanup_events();
             return;
         }
@@ -456,10 +522,11 @@ impl CompletionSinkRegistry {
         let deadline = self.limits().shutdown_deadline;
         if tokio::time::timeout(deadline, &mut wait).await.is_err() {
             self.cancel.cancel();
-            if tokio::time::timeout(REAP_GRACE, &mut wait).await.is_err() {
-                warn!(
-                    "the completion-sink dispatcher did not acknowledge cancellation, so event \
-                     artifacts are removed without its confirmation"
+            // Only an acknowledged (or impossible) reap authorizes cleanup.
+            if wait.await.is_err() {
+                debug!(
+                    "the completion-sink dispatcher stopped before acknowledging cancellation, so \
+                     no callback can still hold an event artifact"
                 );
             }
         }
@@ -469,9 +536,18 @@ impl CompletionSinkRegistry {
     /// Remove the owner-private event directory and everything left in it.
     ///
     /// Every artifact still present belongs to a callback that has already been
-    /// reaped, because this only runs after the dispatcher acknowledged.
+    /// reaped: this runs only after the dispatcher acknowledged the reap, or
+    /// after the dispatcher turned out to be gone entirely, and there is no
+    /// third path into it.
     fn cleanup_events(&self) {
         self.lock_event_dir().take();
+    }
+
+    /// Install the test-only gate held between cancellation and kill-and-reap.
+    // Read by the sink tests, which link the library rather than the binary.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_reap_gate(&self, gate: Arc<ReapGate>) {
+        *self.lock_reap_gate() = Some(gate);
     }
 
     /// Shorten the per-callback runtime ceiling.
@@ -508,6 +584,16 @@ impl CompletionSinkRegistry {
         self.event_dir
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_reap_gate(&self) -> MutexGuard<'_, Option<Arc<ReapGate>>> {
+        self.reap_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn reap_gate(&self) -> Option<Arc<ReapGate>> {
+        self.lock_reap_gate().clone()
     }
 
     // ── Dispatcher ──────────────────────────────────────────────────────────
@@ -639,6 +725,12 @@ impl CompletionSinkRegistry {
     ///
     /// The same oracle `cflx client wait` uses, so an owner-side subscription
     /// and a bounded client wait cannot disagree about what "done" means.
+    ///
+    /// Gives up the moment shutdown cancels. Cleanup waits for the dispatcher's
+    /// reap acknowledgement with no deadline of its own, and this loop runs on
+    /// that same dispatcher: re-reading a repository nobody is waiting on any
+    /// more would hold the acknowledgement — and therefore shutdown — for
+    /// verification rounds whose answer can no longer be delivered.
     async fn certify(&self, change_id: &str) -> Option<String> {
         let repo_root = self.lock_repo_root().clone();
         let Some(repo_root) = repo_root else {
@@ -657,6 +749,13 @@ impl CompletionSinkRegistry {
         };
 
         for attempt in 0..VERIFY_ATTEMPTS {
+            if self.cancel.is_cancelled() {
+                debug!(
+                    change_id = %change_id,
+                    "the shutdown deadline passed, so completion verification stops"
+                );
+                return None;
+            }
             let deadline = tokio::time::Instant::now() + VERIFY_ROUND_BUDGET;
             match crate::client::completion::certify(change_id, &repo_root, &contract, deadline)
                 .await
@@ -683,7 +782,10 @@ impl CompletionSinkRegistry {
                 }
             }
             if attempt + 1 < VERIFY_ATTEMPTS {
-                tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(VERIFY_RETRY_INTERVAL) => {}
+                    _ = self.cancel.cancelled() => {}
+                }
             }
         }
         None
@@ -755,6 +857,7 @@ impl CompletionSinkRegistry {
             &payload,
             self.limits().callback_timeout,
             &self.cancel,
+            self.reap_gate(),
         )
         .await;
         // Removed only now, which is after the child has been reaped — by its own
@@ -1031,6 +1134,7 @@ async fn run_callback(
     payload: &ExecutionEventFile,
     timeout: Duration,
     cancel: &CancellationToken,
+    reap_gate: Option<Arc<ReapGate>>,
 ) -> CallbackReport {
     /// How the child stopped running.
     enum Ended {
@@ -1082,6 +1186,13 @@ async fn run_callback(
         _ = cancel.cancelled() => Ended::Cancelled,
     };
     if matches!(ended, Ended::TimedOut | Ended::Cancelled) {
+        if matches!(ended, Ended::Cancelled) {
+            if let Some(gate) = &reap_gate {
+                // Never installed outside the tests that prove shutdown cleanup
+                // waits for this reap rather than for a clock.
+                gate.hold().await;
+            }
+        }
         // `kill` is terminate-and-wait, so the child is reaped before anything
         // downstream removes its event file.
         if let Err(error) = spawned.kill().await {

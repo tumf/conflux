@@ -1457,6 +1457,90 @@ async fn delivery_drains_a_callback_that_overflows_both_streams_without_killing_
 // shutdown
 // ============================================================================
 
+/// A callback that records what it was handed and then holds on.
+///
+/// It records first, then becomes a long sleep *in place*: `exec` keeps the
+/// PID, so terminating it terminates the sleeper and closes the inherited pipe,
+/// rather than orphaning a grandchild.
+fn holding_callback(dir: &Path, name: &str) -> Vec<String> {
+    let script = dir.join(format!("{name}.sh"));
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         echo \"start=$CFLX_CHANGE_ID pid=$$ event_path=$CFLX_EVENT_PATH \
+         held=$([ -f \"$CFLX_EVENT_PATH\" ] && echo yes || echo no)\" >> \"$1\"\n\
+         exec sleep 30\n",
+    )
+    .expect("write the holding script");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).expect("stat").permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+    }
+    let log = dir.join(format!("{name}.log"));
+    vec![
+        "/bin/sh".to_string(),
+        script.display().to_string(),
+        log.display().to_string(),
+    ]
+}
+
+/// Register `command` as the sink of a freshly admitted execution.
+async fn register_sink(owner: &mut Owner, change_id: &str, command: &[String]) -> String {
+    let instance_id = owner.instance_id();
+    let execution_id = owner.admit(change_id);
+    let body = serde_json::json!({
+        "instance_id": instance_id,
+        "change_id": change_id,
+        "command": command,
+    })
+    .to_string();
+    let (status, _) =
+        unix_request(&owner.socket, "PUT", &sink_path(&execution_id), Some(&body)).await;
+    assert_eq!(status, 200);
+    execution_id
+}
+
+/// The `start=` record a holding callback writes before it sleeps.
+///
+/// Bounded because a missing record must fail rather than hang; the callback
+/// writes it before `exec`, so its presence proves the callback is running.
+async fn await_start(log: &Path) -> String {
+    for _ in 0..400 {
+        if let Some(line) = std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .find(|line| line.starts_with("start="))
+        {
+            return line.to_string();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no callback start record appeared at {}", log.display());
+}
+
+/// One `name=value` field of a callback start record.
+fn field<'a>(record: &'a str, name: &str) -> &'a str {
+    record
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("the callback publishes {name}: {record}"))
+}
+
+/// How many callbacks have started, from the records they wrote themselves.
+fn started_count(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("start="))
+        .count()
+}
+
+fn alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
 /// Graceful shutdown is bounded by one deadline across *every* queued or running
 /// callback, and the ordering around it is the contract: nothing new starts
 /// after the deadline, the callback that was running is terminated and reaped,
@@ -1467,47 +1551,14 @@ async fn delivery_drains_a_callback_that_overflows_both_streams_without_killing_
 #[tokio::test]
 async fn shutdown_reaps_every_callback_before_removing_any_artifact() {
     let mut owner = Owner::start(&["alpha", "beta", "gamma"]).await;
-    let instance_id = owner.instance_id();
     let dir = tempfile::tempdir().expect("temp dir");
-    let log = dir.path().join("slow.log");
-
-    // Records what it was handed, then becomes a long sleep *in place*: `exec`
-    // keeps the PID, so terminating it terminates the sleeper and closes the
-    // inherited pipe, rather than orphaning a grandchild.
-    let script = dir.path().join("slow.sh");
-    std::fs::write(
-        &script,
-        "#!/bin/sh\n\
-         echo \"start=$CFLX_CHANGE_ID pid=$$ event_path=$CFLX_EVENT_PATH \
-         held=$([ -f \"$CFLX_EVENT_PATH\" ] && echo yes || echo no)\" >> \"$1\"\n\
-         exec sleep 30\n",
-    )
-    .expect("write the slow script");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&script).expect("stat").permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&script, permissions).expect("chmod");
-    }
-    let command = vec![
-        "/bin/sh".to_string(),
-        script.display().to_string(),
-        log.display().to_string(),
-    ];
+    let command = holding_callback(dir.path(), "slow");
+    let log = log_of(&command);
 
     // More than two live registrations, which is the case a per-callback budget
     // would have got wrong.
     for change_id in ["alpha", "beta", "gamma"] {
-        let execution_id = owner.admit(change_id);
-        let body = serde_json::json!({
-            "instance_id": instance_id,
-            "change_id": change_id,
-            "command": command,
-        })
-        .to_string();
-        let (status, _) =
-            unix_request(&owner.socket, "PUT", &sink_path(&execution_id), Some(&body)).await;
-        assert_eq!(status, 200);
+        register_sink(&mut owner, change_id, &command).await;
     }
 
     owner
@@ -1551,14 +1602,173 @@ async fn shutdown_reaps_every_callback_before_removing_any_artifact() {
         "and the owner-private event directory with it"
     );
 
-    let pid: i32 = started
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("pid="))
-        .and_then(|pid| pid.parse().ok())
-        .expect("the callback publishes its own pid");
-    assert_eq!(
-        unsafe { libc::kill(pid, 0) },
-        -1,
+    let pid: i32 = field(started, "pid").parse().expect("a numeric pid");
+    assert!(
+        !alive(pid),
         "the cancelled callback was terminated before the owner returned, not left running"
     );
+}
+
+/// Cancelling is not the end of shutdown's obligations. The owner still owes a
+/// confirmed reap before it removes anything, and the acknowledgement it waits
+/// for has no deadline of its own: a secondary timeout that cleaned up anyway
+/// would pull an event file out from under a callback that is provably still
+/// being torn down.
+///
+/// The gate is what makes that observable as ordering rather than as latency.
+/// It is held at exactly the point cancellation has reached a live callback and
+/// is about to reap it, so every assertion below is about state — the child is
+/// running, its artifact is on disk, shutdown has not returned, and the queued
+/// deliveries never started — and none of them is about how long anything took.
+#[tokio::test]
+async fn shutdown_retains_artifacts_until_the_reap_is_acknowledged() {
+    let mut owner = Owner::start(&["alpha", "beta", "gamma"]).await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let command = holding_callback(dir.path(), "held");
+    let log = log_of(&command);
+    // Queued deliveries behind the one that is cancelled, so "nothing starts
+    // after cancellation" has something to be true of.
+    for change_id in ["alpha", "beta", "gamma"] {
+        register_sink(&mut owner, change_id, &command).await;
+    }
+
+    let registry = owner.registry();
+    // Only so the cancellation branch is reachable inside a bounded test; no
+    // assertion below depends on it.
+    registry.set_shutdown_deadline(Duration::from_millis(200));
+    let gate = conflux::web::completion_sink::ReapGate::new();
+    registry.set_reap_gate(gate.clone());
+
+    let stopping = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.owner_stopping().await }
+    });
+
+    // Arrival at the gate *is* the state transition under test: cancellation
+    // has fired and the callback it cancelled has not been reaped yet.
+    tokio::time::timeout(Duration::from_secs(30), gate.reached())
+        .await
+        .expect("shutdown cancellation reaches the callback it must reap");
+
+    let started = await_start(&log).await;
+    let pid: i32 = field(&started, "pid").parse().expect("a numeric pid");
+    let event_path = PathBuf::from(field(&started, "event_path"));
+    let event_dir = event_path
+        .parent()
+        .expect("the artifact lives in the owner-private directory")
+        .to_path_buf();
+
+    assert!(
+        alive(pid),
+        "the callback is still being torn down while its reap is unacknowledged"
+    );
+    assert!(
+        event_path.exists(),
+        "so its event artifact is still there to be taken away: {}",
+        event_path.display()
+    );
+    assert!(
+        event_dir.exists(),
+        "and so is the owner-private directory holding it"
+    );
+    assert!(
+        !stopping.is_finished(),
+        "shutdown has not returned, because the reap it requires is outstanding"
+    );
+    assert_eq!(
+        started_count(&log),
+        1,
+        "delivery is serialized, and cancellation started none of the queued ones"
+    );
+
+    gate.release();
+    stopping.await.expect("graceful shutdown completes");
+
+    assert_eq!(
+        started_count(&log),
+        1,
+        "and none started while the reap was being acknowledged either"
+    );
+    assert!(
+        !alive(pid),
+        "the acknowledged reap is what shutdown waited for, and it terminated the callback"
+    );
+    assert!(
+        !event_path.exists(),
+        "cleanup then removes the event artifact"
+    );
+    assert!(
+        !event_dir.exists(),
+        "and the owner-private event directory with it"
+    );
+
+    owner.stop().await;
+}
+
+/// The same ordering, held long enough that any secondary acknowledgement
+/// timeout of the kind this change removed would have expired and cleaned up
+/// behind the owner's back.
+///
+/// Heavy, and the one observation here that cannot be made cheaply: proving a
+/// fallback deadline is *absent* means outlasting it. It is still an absence
+/// check, not a latency assertion — nothing is required to happen within the
+/// hold, only that nothing does.
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn shutdown_never_removes_artifacts_on_a_secondary_timeout() {
+    /// Comfortably past the 10s grace the removed fallback used.
+    const BEYOND_ANY_REMOVED_GRACE: Duration = Duration::from_secs(15);
+
+    let mut owner = Owner::start(&["alpha"]).await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let command = holding_callback(dir.path(), "outlast");
+    let log = log_of(&command);
+    register_sink(&mut owner, "alpha", &command).await;
+
+    let registry = owner.registry();
+    registry.set_shutdown_deadline(Duration::from_millis(200));
+    // The callback must outlive the hold, so it may not hit its own ceiling.
+    registry.set_callback_timeout(Duration::from_secs(120));
+    let gate = conflux::web::completion_sink::ReapGate::new();
+    registry.set_reap_gate(gate.clone());
+
+    let stopping = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.owner_stopping().await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), gate.reached())
+        .await
+        .expect("shutdown cancellation reaches the callback it must reap");
+
+    let started = await_start(&log).await;
+    let event_path = PathBuf::from(field(&started, "event_path"));
+    let event_dir = event_path
+        .parent()
+        .expect("the artifact lives in the owner-private directory")
+        .to_path_buf();
+
+    tokio::time::sleep(BEYOND_ANY_REMOVED_GRACE).await;
+
+    assert!(
+        event_path.exists(),
+        "no elapsed time authorizes removing a live callback's artifact: {}",
+        event_path.display()
+    );
+    assert!(
+        event_dir.exists(),
+        "nor the owner-private directory holding it"
+    );
+    assert!(
+        !stopping.is_finished(),
+        "and shutdown is still waiting for the reap acknowledgement"
+    );
+
+    gate.release();
+    stopping.await.expect("graceful shutdown completes");
+    assert!(
+        !event_dir.exists(),
+        "cleanup runs once the reap is confirmed"
+    );
+
+    owner.stop().await;
 }
