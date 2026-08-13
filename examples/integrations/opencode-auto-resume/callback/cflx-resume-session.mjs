@@ -17,7 +17,17 @@
 // never `eval`'d, and never used to choose a destination: the destination comes
 // from the operator's own registration and must be loopback.
 
-import { readFileSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -86,39 +96,195 @@ function readEvent() {
   return event;
 }
 
+/** How long an in-flight claim is honoured before a later invocation may take it. */
+const STALE_CLAIM_MS = 5 * 60 * 1000;
+
+/** Exit status for "another process holds a fresh claim", distinct from a failure. */
+const EXIT_IN_FLIGHT = 75;
+
 /**
- * Deduplicate locally by execution and event type.
+ * The two files one execution event can have, and what each one means.
  *
- * The owner already delivers a terminal at most once per execution, but a
- * callback can be re-run by an operator, and a duplicate resume would look to
- * the agent like a second completion.
+ * `.inflight` is a *claim*: someone is trying. `.done` is *delivery*: the POST
+ * returned success. Keeping them apart is the whole point — the old single
+ * marker was written before the POST, so a failed delivery permanently
+ * suppressed every later retry while a concurrent pair could still both send.
+ *
+ * @param {string} stateDir
+ * @param {{execution_id: string, event_type: string}} event
  */
-function claim(stateDir, event) {
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const marker = join(
-    stateDir,
-    `${event.execution_id}.${event.event_type}.done`.replace(/[^A-Za-z0-9._-]/g, "_"),
+function paths(stateDir, event) {
+  const key = `${event.execution_id}.${event.event_type}`.replace(
+    /[^A-Za-z0-9._-]/g,
+    "_",
   );
-  if (existsSync(marker)) return false;
-  writeFileSync(marker, `${new Date().toISOString()}\n`, { mode: 0o600 });
-  return true;
+  return {
+    inflight: join(stateDir, `${key}.inflight`),
+    done: join(stateDir, `${key}.done`),
+  };
+}
+
+/**
+ * Try to become the one process delivering this event.
+ *
+ * The owner already caps terminal delivery at one attempt per execution, but a
+ * callback can be re-run by an operator or raced by a second registration, and
+ * a duplicate resume would look to the agent like a second completion.
+ *
+ * Exclusive creation (`wx`) is the atomic primitive: check-then-write let two
+ * processes both pass the check. Taking over a stale claim uses a rename as a
+ * compare-and-swap — the first process to rename the claim away owns it, and
+ * every other one gets `ENOENT`.
+ *
+ * @param {string} stateDir
+ * @param {{execution_id: string, event_type: string}} event
+ * @param {number} [now]
+ * @returns {{state: "delivered" | "in_flight" | "claimed", owner?: string,
+ *            inflight: string, done: string}}
+ */
+function claimDelivery(stateDir, event, now = Date.now()) {
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const { inflight, done } = paths(stateDir, event);
+  if (existsSync(done)) return { state: "delivered", inflight, done };
+
+  const owner = tryClaim(inflight, now);
+  if (owner) return { state: "claimed", owner, inflight, done };
+
+  let held;
+  try {
+    held = statSync(inflight);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    // It was released between our attempt and this look. One retry, then defer:
+    // an unbounded loop here would be the retry policy this callback must not have.
+    const second = tryClaim(inflight, now);
+    return second
+      ? { state: "claimed", owner: second, inflight, done }
+      : { state: "in_flight", inflight, done };
+  }
+  if (now - held.mtimeMs < STALE_CLAIM_MS) {
+    return { state: "in_flight", inflight, done };
+  }
+
+  // Stale. Rename is the compare-and-swap: exactly one process moves this name.
+  const taken = `${inflight}.${randomUUID()}.taken`;
+  try {
+    renameSync(inflight, taken);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return { state: "in_flight", inflight, done };
+  }
+  // We hold it exclusively now, so its age can be read without a race. If it
+  // turned fresh between the stat and the rename we took someone's live claim;
+  // put it back if the slot is still free and stand down either way.
+  if (now - statSync(taken).mtimeMs < STALE_CLAIM_MS) {
+    try {
+      linkSync(taken, inflight);
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    unlinkSync(taken);
+    return { state: "in_flight", inflight, done };
+  }
+  unlinkSync(taken);
+  const seized = tryClaim(inflight, now);
+  return seized
+    ? { state: "claimed", owner: seized, inflight, done }
+    : { state: "in_flight", inflight, done };
+}
+
+/**
+ * Create the claim exclusively, returning our owner token or null if it exists.
+ *
+ * @param {string} inflight
+ * @param {number} now
+ * @returns {string | null}
+ */
+function tryClaim(inflight, now) {
+  const owner = randomUUID();
+  try {
+    writeFileSync(
+      inflight,
+      `${JSON.stringify({ owner, claimed_at: new Date(now).toISOString() })}\n`,
+      { flag: "wx", mode: 0o600 },
+    );
+    return owner;
+  } catch (error) {
+    if (error.code === "EEXIST") return null;
+    throw error;
+  }
+}
+
+/**
+ * Promote our claim to durable evidence that the POST succeeded.
+ *
+ * A rename, so there is no window in which the marker exists half-written.
+ *
+ * @param {{owner: string, inflight: string, done: string}} claim
+ */
+function markDelivered(claim) {
+  try {
+    renameSync(claim.inflight, claim.done);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    // Our claim was taken over while we were posting. The delivery still
+    // happened, so the marker is still the truth.
+    writeFileSync(claim.done, `${new Date().toISOString()}\n`, { mode: 0o600 });
+  }
+}
+
+/**
+ * Release our claim after a failed POST so a later invocation may retry.
+ *
+ * Only ours: a claim carrying a different owner token belongs to whoever took
+ * this one over as stale, and removing it would defeat their delivery.
+ *
+ * @param {{owner: string, inflight: string}} claim
+ */
+function releaseClaim(claim) {
+  try {
+    const held = JSON.parse(readFileSync(claim.inflight, "utf8"));
+    if (held.owner !== claim.owner) return;
+    unlinkSync(claim.inflight);
+  } catch {
+    // Already gone, or unreadable. Either way there is nothing of ours to release.
+  }
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const event = readEvent();
-  if (!claim(args.state, event)) {
-    process.stderr.write(
-      `cflx-resume-session: ${event.execution_id}/${event.event_type} was already delivered\n`,
-    );
+  const claim = claimDelivery(args.state, event);
+  const subject = `${event.execution_id}/${event.event_type}`;
+
+  if (claim.state === "delivered") {
+    process.stderr.write(`cflx-resume-session: ${subject} was already delivered\n`);
     return;
   }
-  await resumeSession({
-    server: args.server,
-    session: args.session,
-    text: composeMessage(event),
-    path: args.path,
-  });
+  if (claim.state === "in_flight") {
+    // Distinct from failure on purpose: nothing went wrong, another process is
+    // simply delivering this event. Retrying it here would be the duplicate.
+    process.stderr.write(
+      `cflx-resume-session: ${subject} is in flight in another process\n`,
+    );
+    process.exitCode = EXIT_IN_FLIGHT;
+    return;
+  }
+
+  try {
+    await resumeSession({
+      server: args.server,
+      session: args.session,
+      text: composeMessage(event),
+      path: args.path,
+    });
+  } catch (error) {
+    // The claim must not outlive the attempt it stood for, or a single failed
+    // POST would suppress delivery until the stale bound expires.
+    releaseClaim(claim);
+    throw error;
+  }
+  markDelivered(claim);
 }
 
 main().catch((error) => {

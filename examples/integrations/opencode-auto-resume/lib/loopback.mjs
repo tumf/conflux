@@ -54,3 +54,56 @@ export function requireSessionId(value) {
   }
   return value;
 }
+
+/**
+ * Resolve a callback path against a validated base and prove it stayed home.
+ *
+ * The base alone is not the security boundary — the *final* URL is. `new URL`
+ * lets a path replace everything before it, so an absolute `--path`, a
+ * protocol-relative `//host`, or a backslash variant (the WHATWG parser folds
+ * `\` to `/` for http) would silently retarget a callback that passed
+ * `requireLoopback` on its base. Those shapes are rejected by inspection, and
+ * then the resolved origin is compared to the base's and re-validated as
+ * loopback, so anything the inspection missed still cannot leave.
+ *
+ * @param {string | URL} base an OpenCode server base URL
+ * @param {string} path the callback path to resolve against it
+ * @returns {URL} the resolved, same-origin, loopback URL
+ * @throws {Error} when the resolved destination is not the base's own origin
+ */
+export function resolveLoopbackTarget(base, path) {
+  const validated = requireLoopback(base instanceof URL ? base.href : base);
+  if (typeof path !== "string" || path.length === 0) {
+    throw new Error("a callback path is required");
+  }
+  // Fold the backslash variants into the shapes below rather than testing for
+  // them separately: `/\evil`, `\\evil`, and `//evil` are one attack.
+  const folded = path.replace(/\\/g, "/");
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(folded)) {
+    throw new Error(
+      `a callback path must not carry a scheme, got '${path}'. ` +
+        `The destination comes from the operator's registration, not from the path`,
+    );
+  }
+  if (folded.startsWith("//")) {
+    throw new Error(
+      `a callback path must not be protocol-relative, got '${path}'`,
+    );
+  }
+
+  let target;
+  try {
+    target = new URL(path, validated);
+  } catch {
+    throw new Error(`'${path}' is not a usable callback path`);
+  }
+  if (target.origin !== validated.origin) {
+    throw new Error(
+      `a callback path must not change origin: '${path}' resolves to ` +
+        `'${target.origin}', not '${validated.origin}'`,
+    );
+  }
+  // Belt and braces: the resolved URL is validated on its own terms too.
+  requireLoopback(target.href);
+  return target;
+}
