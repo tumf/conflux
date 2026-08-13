@@ -900,11 +900,11 @@ A graceful owner shutdown MAY attempt `owner_stopping` for live registrations. A
 
 ### Requirement: Completion-sink delivery is bounded and non-authoritative
 
-For each delivery the owner MUST create a versioned bounded event file and provide only fixed metadata through `CFLX_EVENT_PATH`, `CFLX_EVENT_TYPE`, `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and `CFLX_INSTANCE_ID`. Payloads MUST exclude prompts, terminal screen contents, environment dumps, credential values, and unrestricted error bodies. The event file MUST be created inside an owner-private directory with owner-read-only permissions (`0400` inside a `0700` directory), so an ordinary callback cannot open it for writing. The owner MUST NOT re-read or trust the event file after writing it, MUST remove it only after its callback is reaped, and MUST remove it on owner shutdown after every callback has been reaped. A callback runs under the owner's UID and can defeat file permissions; this is default mutation refusal, not an integrity guarantee against a hostile callback, and no owner decision may depend on the file contents. An event artifact MUST NOT be overwritten or removed while a different callback still holds it.
+For each delivery the owner MUST create a versioned bounded event file and provide only fixed metadata through `CFLX_EVENT_PATH`, `CFLX_EVENT_TYPE`, `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and `CFLX_INSTANCE_ID`. Payloads MUST exclude prompts, terminal screen contents, environment dumps, credential values, and unrestricted error bodies. The event file MUST be created inside an owner-private directory with owner-read-only permissions (`0400` inside a `0700` directory), so an ordinary callback cannot open it for writing. The owner MUST NOT re-read or trust the event file after writing it, MUST remove it only after its callback is reaped, and MUST remove it on owner shutdown only after every callback is positively acknowledged as reaped. A callback runs under the owner's UID and can defeat file permissions; this is default mutation refusal, not an integrity guarantee against a hostile callback, and no owner decision may depend on the file contents. An event artifact MUST NOT be overwritten or removed while a different callback still holds it.
 
 Callback runtime and stdout/stderr capture MUST be bounded during collection, not merely truncated after collection, and the owner MUST continue draining both streams past the retention limit so a callback is never blocked by a full pipe. Spawn failure, timeout, non-zero exit, malformed callback behavior, and output overflow MUST produce bounded diagnostics only. Output overflow alone MUST NOT terminate a callback. Timeout and shutdown cancellation MUST terminate and explicitly reap the callback. One terminal delivery attempt is permitted per execution; failures MUST NOT retry forever, alter orchestration state, roll back completion, or change the repository-verifiable result.
 
-Graceful owner shutdown MUST stop admission and apply one finite shutdown deadline across all queued or running callbacks. Delivery MUST remain serialized. Shutdown MUST start no new delivery and create or recreate no event directory or artifact after it begins. When the deadline expires, the owner MUST cancel unfinished delivery and MUST wait for dispatcher acknowledgement that every active callback has been terminated and reaped before event artifact cleanup and registry destruction. A secondary timeout or missing acknowledgement MUST NOT authorize cleanup while a callback may remain alive.
+Graceful owner shutdown MUST stop admission and apply one finite shutdown deadline across all queued or running callbacks. Delivery MUST remain serialized. Shutdown MUST start no new delivery and create or recreate no event directory or artifact after it begins. When the deadline expires, the owner MUST cancel unfinished delivery and MUST wait for dispatcher acknowledgement that every active callback has been terminated and reaped before event artifact cleanup and registry destruction. Only positive acknowledgement MUST authorize cleanup. A secondary timeout, task-send failure, or acknowledgement sender drop MUST retain the owner-private directory and artifacts while a callback may remain alive, and MUST emit a bounded path-only diagnostic.
 
 #### Scenario: Callback failure cannot change completion
 
@@ -954,3 +954,11 @@ Graceful owner shutdown MUST stop admission and apply one finite shutdown deadli
 - **WHEN** any secondary acknowledgement wait would otherwise expire
 - **THEN** the owner retains the event directory and active callback artifact
 - **AND** cleanup occurs only after dispatcher acknowledgement confirms the callback was reaped
+
+#### Scenario: Dropped acknowledgement retains artifacts
+
+- **GIVEN** a callback artifact exists and dispatcher acknowledgement is dropped without confirming child reap
+- **WHEN** graceful shutdown receives the dropped acknowledgement
+- **THEN** the owner-private directory and artifact remain
+- **AND** no code path or drop-cleanup type other than positive acknowledgement performs removal
+- **AND** a bounded warning identifies only the retained directory path
