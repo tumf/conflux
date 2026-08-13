@@ -988,3 +988,146 @@ async fn mcp_reports_an_owner_without_execution_sinks_as_incompatible() {
     host.stop();
     handle.shutdown().await;
 }
+
+/// A peer that never sends a newline must not be able to make the adapter hold
+/// its input. The compiled binary is the subject on purpose: the bound has to
+/// hold on real stdio, where `read_line` would have buffered every byte while
+/// waiting for a terminator that never arrives.
+///
+/// The session ends unread rather than resynchronizing — the remaining bytes
+/// belong to a frame this server already refused to hold, and guessing where the
+/// next one starts is how a desynchronized stream turns into a dispatched tool
+/// call nobody sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn mcp_terminates_on_a_newline_free_oversized_frame_without_dispatching() {
+    let repo = Repo::new();
+    repo.stage_active("alpha");
+    let socket = repo.path().join("cflx-api.sock");
+    let owner = Owner::start(&repo, socket.clone(), &["alpha"]).await;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .args(["client", "--unix-socket", socket.to_str().unwrap(), "mcp"])
+        .current_dir(repo.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the compiled cflx binary must be runnable");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+
+    // Well past the frame limit, and not one newline in it. The writer stops as
+    // soon as the adapter drops its end, which is the behaviour under test.
+    let writer = std::thread::spawn(move || {
+        let mut opening = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"#.to_vec();
+        opening.resize(64 * 1024, b'x');
+        for _ in 0..48 {
+            if stdin.write_all(&opening).is_err() {
+                break;
+            }
+        }
+        let _ = stdin.flush();
+    });
+
+    let output = child.wait_with_output().expect("the adapter must exit");
+    let _ = writer.join();
+
+    assert_eq!(
+        output.status.code(),
+        Some(21),
+        "an unreadable stream is the transport-error exit status"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "an unread frame is answered with nothing, not with a guess: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        owner.executor.submitted().is_empty(),
+        "no owner request may be dispatched from a frame that was never interpreted"
+    );
+
+    owner.stop().await;
+}
+
+/// The handshake is a gate and the envelope is checked. A host that skips
+/// `initialize`, or sends something that is not a JSON-RPC 2.0 request, gets a
+/// machine-readable protocol error — and the owner never hears about it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn mcp_refuses_tool_traffic_before_initialization_and_off_protocol_frames() {
+    let repo = Repo::new();
+    repo.stage_active("alpha");
+    let socket = repo.path().join("cflx-api.sock");
+    let owner = Owner::start(&repo, socket.clone(), &["alpha"]).await;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .args(["client", "--unix-socket", socket.to_str().unwrap(), "mcp"])
+        .current_dir(repo.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the compiled cflx binary must be runnable");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+
+    let mut exchange = |frame: serde_json::Value| -> serde_json::Value {
+        writeln!(stdin, "{frame}").expect("write a frame");
+        stdin.flush().expect("flush");
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read a response frame");
+        serde_json::from_str(line.trim())
+            .unwrap_or_else(|error| panic!("stdout must carry only JSON-RPC frames: {error}"))
+    };
+
+    // Before initialization, the tools are not reachable.
+    for method in ["tools/list", "tools/call"] {
+        let response = exchange(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": method,
+            "params": {"name": "cflx_enqueue", "arguments": {"change_id": "alpha"}}
+        }));
+        assert_eq!(
+            response["error"]["code"], -32002,
+            "{method} must be refused before the handshake: {response}"
+        );
+    }
+
+    // `ping` is allowed before it, and the handshake itself works afterwards.
+    let response = exchange(serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+    assert_eq!(response["result"], serde_json::json!({}));
+    let response = exchange(serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}}
+    }));
+    assert_eq!(response["result"]["serverInfo"]["name"], "cflx-client");
+
+    // The envelope is still checked afterwards: no version, wrong version, and a
+    // batch array are all invalid requests.
+    let response = exchange(serde_json::json!({"id": 4, "method": "tools/list"}));
+    assert_eq!(response["error"]["code"], -32600, "{response}");
+    let response = exchange(serde_json::json!({
+        "jsonrpc": "1.0", "id": 5, "method": "tools/list"
+    }));
+    assert_eq!(response["error"]["code"], -32600, "{response}");
+    let response = exchange(serde_json::json!([
+        {"jsonrpc": "2.0", "id": 6, "method": "tools/list"}
+    ]));
+    assert_eq!(response["error"]["code"], -32600, "{response}");
+    assert!(response["id"].is_null(), "a batch has no id to echo");
+
+    // And a properly initialized, properly enveloped call still works.
+    let response = exchange(serde_json::json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tools/list"
+    }));
+    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 6);
+
+    assert!(
+        owner.executor.submitted().is_empty(),
+        "not one refused frame reached the owner"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+    owner.stop().await;
+}

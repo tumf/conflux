@@ -147,7 +147,24 @@ after the work finishes, so process exit was never a completion signal.
   `CFLX_EVENT_TYPE`, `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and
   `CFLX_INSTANCE_ID`. No owner token or configuration reaches it.
 - Registration is accepted **only over the owner's Unix socket**. An
-  authenticated TCP client is refused with `transport_not_permitted`.
+  authenticated TCP client is refused with `transport_not_permitted`, and it is
+  not told the registered argv on a read either — it sees `sink_registered`,
+  execution state, and delivery history instead. Every sink request, inspection
+  included, carries the complete `(instance_id, execution_id, change_id)`
+  binding.
+- The event payload is created `0400` inside a `0700` owner-private directory, so
+  a callback cannot open `CFLX_EVENT_PATH` for writing by default. That is
+  default mutation refusal, not an integrity guarantee against a same-UID
+  callback — what makes it safe is that the owner writes the file once and
+  never reads it back. It is removed once the callback is reaped.
+- Callback stdout and stderr are drained for the whole life of the callback and
+  retained only up to a fixed ceiling, so a chatty callback neither blocks on a
+  full pipe nor grows the owner. Overflow is a truncation diagnostic and never
+  terminates the callback; only the runtime ceiling and shutdown cancellation do,
+  and both kill and reap.
+- Delivery stays serialized, including through graceful shutdown: one finite
+  deadline covers every queued or running callback, nothing new starts after it,
+  and no event artifact is removed until its callback has been reaped.
 - Registrations are process-local and die with the owner: nothing here is
   durable workflow state, and delivery failure cannot change any outcome.
 

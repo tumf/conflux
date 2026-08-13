@@ -12,7 +12,7 @@
 //! else" is not something an in-memory double can prove.
 //!
 //! Group names match the change's tasks: `transport`, `capability`,
-//! `registration`, `delivery`, `restart`.
+//! `registration`, `delivery`, `restart`, `shutdown`.
 
 #![cfg(all(unix, feature = "web-monitoring"))]
 
@@ -167,6 +167,18 @@ impl Owner {
             .change(change_id)
             .execution_id
             .expect("admission opens an execution episode")
+    }
+
+    /// The process-local registry this owner serves.
+    ///
+    /// Reached so a test can shorten the injected shutdown deadline. The
+    /// assertions that follow are about ordering and state, never about how long
+    /// anything took: the deadline only makes the cancellation branch reachable
+    /// inside a bounded test.
+    fn registry(&self) -> Arc<conflux::web::completion_sink::CompletionSinkRegistry> {
+        self.state
+            .completion_sinks()
+            .expect("an owner with an orchestration runtime holds a registry")
     }
 
     async fn stop(mut self) {
@@ -393,7 +405,9 @@ async fn transport_accepts_sink_mutation_on_the_socket_and_refuses_it_on_tcp() {
     assert_eq!(status, 403);
     assert_eq!(error["error_code"], "transport_not_permitted");
 
-    // Reading is not a mutation, so TCP may do it.
+    // Reading is not a mutation, so TCP may do it — but the argv is a command
+    // this process will run, and a channel that may not register one may not
+    // read one back either.
     let (status, read) = tcp_request(
         &owner.tcp,
         "GET",
@@ -406,7 +420,8 @@ async fn transport_accepts_sink_mutation_on_the_socket_and_refuses_it_on_tcp() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(read["sink"]["command"][0], "/bin/sh");
+    assert_eq!(read["sink_registered"], true);
+    assert!(read["sink"].is_null(), "TCP is told presence, not argv");
 
     owner.stop().await;
 }
@@ -1095,5 +1110,455 @@ async fn restart_graceful_shutdown_attempts_owner_stopping_for_live_registration
     assert_eq!(
         event["terminal"], false,
         "the owner leaving is not a terminal classification"
+    );
+}
+
+// ============================================================================
+// binding
+// ============================================================================
+
+/// Inspection asserts the same complete binding a registration does, and the
+/// registered argv is disclosed only over the owner's own socket.
+///
+/// The binding is coherence, not access control — every identifier in it is
+/// readable through another authenticated resource. What it buys is that a
+/// caller and the owner cannot silently mean two different execution episodes.
+/// The argv is the part that is genuinely privileged: it is a command this
+/// process will run, and a channel that may not register one may not read one
+/// back either.
+#[tokio::test]
+async fn binding_is_required_for_inspection_and_argv_is_disclosed_only_over_the_socket() {
+    let mut owner = Owner::start(&["alpha", "beta"]).await;
+    let execution_id = owner.admit("alpha");
+    owner.admit("beta");
+    let instance_id = owner.instance_id();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let command = recorder(dir.path(), "cb");
+
+    let body = serde_json::json!({
+        "instance_id": instance_id,
+        "change_id": "alpha",
+        "command": command,
+    })
+    .to_string();
+    let (status, registered) =
+        unix_request(&owner.socket, "PUT", &sink_path(&execution_id), Some(&body)).await;
+    assert_eq!(status, 200);
+    assert_eq!(registered["sink_registered"], true);
+    assert_eq!(registered["sink"]["command"][0], "/bin/sh");
+
+    // An omitted half of the binding is a typed validation refusal, not a
+    // silently-permissive read.
+    for query in [
+        String::new(),
+        format!("instance_id={instance_id}"),
+        "change_id=alpha".to_string(),
+    ] {
+        let (status, error) = unix_request(
+            &owner.socket,
+            "GET",
+            &format!("{}?{}", sink_path(&execution_id), query),
+            None,
+        )
+        .await;
+        assert_eq!(status, 422, "'{query}' is not a complete binding");
+        assert_eq!(error["error_code"], "validation_failed");
+        assert!(
+            !error.to_string().contains("/bin/sh"),
+            "a refusal discloses no argv: {error}"
+        );
+    }
+
+    // A complete but wrong binding is the mismatch it always was.
+    for query in [
+        binding(&instance_id, "beta"),
+        binding("not-this-owner", "alpha"),
+    ] {
+        let (status, error) = unix_request(
+            &owner.socket,
+            "GET",
+            &format!("{}?{}", sink_path(&execution_id), query),
+            None,
+        )
+        .await;
+        assert_eq!(status, 409, "'{query}' must be refused");
+        assert_eq!(error["error_code"], "execution_binding_mismatch");
+        assert!(
+            !error.to_string().contains("/bin/sh"),
+            "a mismatch discloses no argv: {error}"
+        );
+    }
+
+    // Clearing asserts the same complete binding.
+    let (status, error) = unix_request(
+        &owner.socket,
+        "DELETE",
+        &format!("{}?instance_id={instance_id}", sink_path(&execution_id)),
+        None,
+    )
+    .await;
+    assert_eq!(status, 422);
+    assert_eq!(error["error_code"], "validation_failed");
+
+    // An authenticated TCP reader learns everything it needs to decide whether
+    // it still owes a resume — except the command line.
+    let (status, read) = tcp_request(
+        &owner.tcp,
+        "GET",
+        &format!(
+            "{}?{}",
+            sink_path(&execution_id),
+            binding(&instance_id, "alpha")
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        read["sink"].is_null(),
+        "TCP must not be told the argv: {read}"
+    );
+    assert_eq!(
+        read["sink_registered"], true,
+        "but subscription presence is not the secret"
+    );
+    assert_eq!(read["execution_state"], "queued");
+    assert_eq!(read["delivered_events"], serde_json::json!([]));
+    assert_eq!(read["terminal_dispatched"], false);
+
+    // The same read over the socket carries it.
+    let (status, read) = unix_request(
+        &owner.socket,
+        "GET",
+        &format!(
+            "{}?{}",
+            sink_path(&execution_id),
+            binding(&instance_id, "alpha")
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(read["sink"]["command"][0], "/bin/sh");
+    assert_eq!(read["sink_registered"], true);
+
+    owner.stop().await;
+}
+
+// ============================================================================
+// artifact
+// ============================================================================
+
+/// The event payload is created `0400` inside a `0700` owner-private directory,
+/// so an ordinary callback opening it for writing is refused by the permissions.
+///
+/// This is *default* mutation refusal, not an integrity boundary: a callback
+/// runs under the owner's own UID and can `chmod` its way past it, which this
+/// test then does. What makes that harmless is the other half of the contract —
+/// the owner never reads the artifact back, so rewriting it changes no delivered
+/// classification.
+#[tokio::test]
+async fn artifact_is_owner_read_only_by_default_and_is_never_read_back() {
+    // Under a privileged EUID the permission check does not apply at all, so the
+    // assertion would be vacuous rather than wrong.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: default write refusal is only observable under an unprivileged EUID");
+        return;
+    }
+
+    let mut owner = Owner::start(&["alpha"]).await;
+    let execution_id = owner.admit("alpha");
+    let instance_id = owner.instance_id();
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    let script = dir.path().join("mutate.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         {\n\
+         echo \"event_path=$CFLX_EVENT_PATH\"\n\
+         echo \"perm=$(ls -l \"$CFLX_EVENT_PATH\" | cut -c1-10)\"\n\
+         echo \"dir_perm=$(ls -ld \"$(dirname \"$CFLX_EVENT_PATH\")\" | cut -c1-10)\"\n\
+         if : > \"$CFLX_EVENT_PATH\" 2>/dev/null; then\n\
+         echo 'write=allowed'\n\
+         else\n\
+         echo 'write=refused'\n\
+         fi\n\
+         echo \"still_readable=$(head -c 1 \"$CFLX_EVENT_PATH\" >/dev/null 2>&1 && echo yes || echo no)\"\n\
+         chmod u+w \"$CFLX_EVENT_PATH\" 2>/dev/null\n\
+         echo 'this is not an event file' > \"$CFLX_EVENT_PATH\"\n\
+         echo '--- end ---'\n\
+         } >> \"$1\"\n",
+    )
+    .expect("write the mutating script");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).expect("stat").permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+    }
+    let log = dir.path().join("mutate.log");
+    let command = vec![
+        "/bin/sh".to_string(),
+        script.display().to_string(),
+        log.display().to_string(),
+    ];
+
+    let body = serde_json::json!({
+        "instance_id": instance_id,
+        "change_id": "alpha",
+        "command": command,
+    })
+    .to_string();
+    unix_request(&owner.socket, "PUT", &sink_path(&execution_id), Some(&body)).await;
+
+    owner.dispatch(ExecutionEvent::ApplyFailed {
+        change_id: "alpha".to_string(),
+        error: "boom".to_string(),
+    });
+    let record = await_log(&log).await;
+
+    assert!(
+        record.contains("perm=-r--------"),
+        "the payload is owner-read-only: {record}"
+    );
+    assert!(
+        record.contains("dir_perm=drwx------"),
+        "and it lives in an owner-private directory: {record}"
+    );
+    assert!(
+        record.contains("write=refused"),
+        "an ordinary callback cannot open it for writing: {record}"
+    );
+    assert!(
+        record.contains("still_readable=yes"),
+        "and the payload it was handed stays readable: {record}"
+    );
+
+    // The callback then defeated the permissions and rewrote the file. Nothing
+    // the owner reports about the delivery changed, because nothing the owner
+    // decides reads that file.
+    let (_, read) = unix_request(
+        &owner.socket,
+        "GET",
+        &format!(
+            "{}?{}",
+            sink_path(&execution_id),
+            binding(&instance_id, "alpha")
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(read["terminal_dispatched"], true);
+    assert_eq!(read["delivered_events"], serde_json::json!(["failed"]));
+
+    // And the artifact is removed once the child is reaped.
+    let path = record
+        .lines()
+        .find_map(|line| line.strip_prefix("event_path="))
+        .expect("the path is published");
+    let path = PathBuf::from(path);
+    for _ in 0..400 {
+        if !path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !path.exists(),
+        "the event file must not outlive its callback"
+    );
+
+    owner.stop().await;
+}
+
+/// Output volume is bounded by the owner, not by the callback: both streams keep
+/// draining past the retention limit, so a callback that writes far more than
+/// the limit is never blocked on a full pipe, is never terminated for it, and
+/// exits with its own status.
+#[tokio::test]
+async fn delivery_drains_a_callback_that_overflows_both_streams_without_killing_it() {
+    let mut owner = Owner::start(&["alpha"]).await;
+    let execution_id = owner.admit("alpha");
+    let instance_id = owner.instance_id();
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    // 256 KiB per stream: far past the 8 KiB retention limit and past any pipe
+    // buffer, so an owner that stopped reading would deadlock the callback until
+    // its runtime ceiling killed it — and the marker below would never appear.
+    let script = dir.path().join("loud.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         dd if=/dev/zero bs=1024 count=256 2>/dev/null | tr '\\0' 'a'\n\
+         dd if=/dev/zero bs=1024 count=256 2>/dev/null | tr '\\0' 'b' 1>&2\n\
+         echo 'exited=0' >> \"$1\"\n\
+         echo '--- end ---' >> \"$1\"\n\
+         exit 0\n",
+    )
+    .expect("write the loud script");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).expect("stat").permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+    }
+    let log = dir.path().join("loud.log");
+    let command = vec![
+        "/bin/sh".to_string(),
+        script.display().to_string(),
+        log.display().to_string(),
+    ];
+
+    // A short runtime ceiling turns "the owner stopped draining" into a bounded
+    // failure instead of a twenty-second wait. It is a hang guard: the assertion
+    // below is that the callback reached its own successful exit, not that it
+    // did so quickly.
+    owner
+        .registry()
+        .set_callback_timeout(Duration::from_secs(10));
+
+    let body = serde_json::json!({
+        "instance_id": instance_id,
+        "change_id": "alpha",
+        "command": command,
+    })
+    .to_string();
+    unix_request(&owner.socket, "PUT", &sink_path(&execution_id), Some(&body)).await;
+
+    owner.dispatch(ExecutionEvent::ChangeDequeued {
+        change_id: "alpha".to_string(),
+    });
+    let record = await_log(&log).await;
+    assert!(
+        record.contains("exited=0"),
+        "the callback ran to its own successful exit rather than being terminated: {record}"
+    );
+
+    // Overflow alone changed nothing about the delivery.
+    let (_, read) = unix_request(
+        &owner.socket,
+        "GET",
+        &format!(
+            "{}?{}",
+            sink_path(&execution_id),
+            binding(&instance_id, "alpha")
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(read["terminal_dispatched"], true);
+    assert_eq!(read["delivered_events"], serde_json::json!(["stopped"]));
+
+    owner.stop().await;
+}
+
+// ============================================================================
+// shutdown
+// ============================================================================
+
+/// Graceful shutdown is bounded by one deadline across *every* queued or running
+/// callback, and the ordering around it is the contract: nothing new starts
+/// after the deadline, the callback that was running is terminated and reaped,
+/// and only then are the artifacts removed.
+///
+/// Asserted from state and ordering, never from elapsed time: the injected
+/// deadline exists only to make the cancellation branch reachable.
+#[tokio::test]
+async fn shutdown_reaps_every_callback_before_removing_any_artifact() {
+    let mut owner = Owner::start(&["alpha", "beta", "gamma"]).await;
+    let instance_id = owner.instance_id();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let log = dir.path().join("slow.log");
+
+    // Records what it was handed, then becomes a long sleep *in place*: `exec`
+    // keeps the PID, so terminating it terminates the sleeper and closes the
+    // inherited pipe, rather than orphaning a grandchild.
+    let script = dir.path().join("slow.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         echo \"start=$CFLX_CHANGE_ID pid=$$ event_path=$CFLX_EVENT_PATH \
+         held=$([ -f \"$CFLX_EVENT_PATH\" ] && echo yes || echo no)\" >> \"$1\"\n\
+         exec sleep 30\n",
+    )
+    .expect("write the slow script");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).expect("stat").permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+    }
+    let command = vec![
+        "/bin/sh".to_string(),
+        script.display().to_string(),
+        log.display().to_string(),
+    ];
+
+    // More than two live registrations, which is the case a per-callback budget
+    // would have got wrong.
+    for change_id in ["alpha", "beta", "gamma"] {
+        let execution_id = owner.admit(change_id);
+        let body = serde_json::json!({
+            "instance_id": instance_id,
+            "change_id": change_id,
+            "command": command,
+        })
+        .to_string();
+        let (status, _) =
+            unix_request(&owner.socket, "PUT", &sink_path(&execution_id), Some(&body)).await;
+        assert_eq!(status, 200);
+    }
+
+    owner
+        .registry()
+        .set_shutdown_deadline(Duration::from_millis(300));
+
+    // Returns only after every callback is terminated and reaped.
+    owner.stop().await;
+
+    let record = std::fs::read_to_string(&log).unwrap_or_default();
+    let started: Vec<&str> = record
+        .lines()
+        .filter(|line| line.starts_with("start="))
+        .collect();
+    assert_eq!(
+        started.len(),
+        1,
+        "delivery is serialized and no queued delivery starts after the deadline: {record}"
+    );
+    let started = started[0];
+    assert!(
+        started.contains("held=yes"),
+        "the running callback held its own artifact: {started}"
+    );
+
+    // The artifact is gone, and it was removed only after the child was reaped.
+    let event_path = started
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("event_path="))
+        .expect("the callback publishes the path it was handed");
+    let event_path = PathBuf::from(event_path);
+    assert!(
+        !event_path.exists(),
+        "shutdown removes the event artifact it created"
+    );
+    assert!(
+        !event_path
+            .parent()
+            .expect("the artifact lives in the owner-private directory")
+            .exists(),
+        "and the owner-private event directory with it"
+    );
+
+    let pid: i32 = started
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("pid="))
+        .and_then(|pid| pid.parse().ok())
+        .expect("the callback publishes its own pid");
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "the cancelled callback was terminated before the owner returned, not left running"
     );
 }

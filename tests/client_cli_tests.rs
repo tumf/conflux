@@ -3686,6 +3686,34 @@ mod enabled {
                 document.contains("--auth-token-env"),
                 "the credential rule must be stated"
             );
+            // The argv is disclosed only over the socket that may register one.
+            assert!(
+                document.contains("sink_registered"),
+                "a reader that is not told the argv needs the field that answers presence"
+            );
+            // The event artifact is read-only by default and never read back.
+            assert!(
+                document.contains("`0400`") && document.contains("`0700`"),
+                "the event artifact's default permissions must be documented"
+            );
+            assert!(
+                document.contains("never reads it back") || document.contains("never read back"),
+                "and why those permissions are not an integrity guarantee"
+            );
+            // Output is bounded during collection, not merely cut afterwards.
+            assert!(
+                document.contains("full pipe"),
+                "an operator writing a chatty callback needs to know it will not wedge"
+            );
+            assert!(
+                document.contains("truncation diagnostic"),
+                "and that overflow is a diagnostic rather than a delivery failure"
+            );
+            // Shutdown ordering: one deadline, serialized, reap before cleanup.
+            assert!(
+                document.contains("reaped"),
+                "shutdown must promise termination and reaping, not just a wait"
+            );
         }
 
         // The four-command namespace, stated as a closed set.

@@ -34,7 +34,7 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
 
@@ -51,7 +51,9 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = ["2025-06-18", "2025-03-26"];
 /// Longest accepted single JSON-RPC frame.
 ///
 /// A stdio peer that never emits a newline would otherwise grow the read buffer
-/// without bound. The ceiling is far above any legitimate tool call.
+/// without bound, so the bound is enforced *while bytes are read* rather than
+/// after a newline finally arrives. The ceiling is far above any legitimate tool
+/// call.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Every tool this adapter exposes, in listing order.
@@ -451,13 +453,33 @@ mod rpc {
     pub const INVALID_REQUEST: i64 = -32600;
     /// No such method.
     pub const METHOD_NOT_FOUND: i64 = -32601;
+    /// The method exists but the handshake has not completed.
+    ///
+    /// In the implementation-defined range on purpose: a host that skipped
+    /// `initialize` needs to tell "you have not initialized" apart from "no such
+    /// method", and neither of the standard codes says that.
+    pub const SERVER_NOT_INITIALIZED: i64 = -32002;
+}
+
+/// Whether a JSON-RPC `id` member is one this server can echo back.
+///
+/// JSON-RPC 2.0 allows a string, a number, or `null`. An object or an array is
+/// an invalid request object, and the response to one has to carry `null`
+/// rather than the malformed value.
+fn is_usable_id(value: &serde_json::Value) -> bool {
+    matches!(
+        value,
+        serde_json::Value::Null | serde_json::Value::String(_) | serde_json::Value::Number(_)
+    )
 }
 
 /// One MCP session over a pair of byte streams.
 pub struct Session<H: ToolHost> {
     host: H,
-    /// True once `initialize` succeeded. Kept because a host that skips the
-    /// handshake is a protocol violation worth naming rather than serving.
+    /// True once this server has *answered* `initialize`. Tool listing and tool
+    /// calls are gated on it: a host that skipped the handshake is a protocol
+    /// violation worth naming rather than serving, and an unanswered handshake
+    /// enables nothing.
     initialized: bool,
 }
 
@@ -471,8 +493,7 @@ impl<H: ToolHost> Session<H> {
     }
 
     /// Whether `initialize` has been answered.
-    // Observed by the handshake assertions; the serving loop answers every
-    // method regardless, so nothing in the binary branches on it.
+    // Observed by the handshake assertions, and by the tool gate below.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_initialized(&self) -> bool {
         self.initialized
@@ -481,7 +502,9 @@ impl<H: ToolHost> Session<H> {
     /// Handle one JSON-RPC frame, returning the frame to write back.
     ///
     /// `None` means the message was a notification, which by JSON-RPC has no
-    /// response at all — writing one would desynchronize a strict host.
+    /// response at all — writing one would desynchronize a strict host. That
+    /// holds for an *invalid* notification too: a malformed message with no
+    /// `id` is still a message this server may not answer.
     pub async fn handle(&mut self, line: &str) -> Option<String> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -498,34 +521,74 @@ impl<H: ToolHost> Session<H> {
             }
         };
 
-        let id = message.get("id").cloned();
-        let Some(method) = message.get("method").and_then(|value| value.as_str()) else {
+        // Batch support is not advertised, so an array is an invalid request
+        // rather than a set of calls this server would half-answer.
+        if message.is_array() {
             return Some(error_frame(
-                id.unwrap_or(serde_json::Value::Null),
+                serde_json::Value::Null,
                 rpc::INVALID_REQUEST,
-                "the frame carries no method",
+                "this server does not accept JSON-RPC batches; send one request object per line",
+            ));
+        }
+        let Some(object) = message.as_object() else {
+            return Some(error_frame(
+                serde_json::Value::Null,
+                rpc::INVALID_REQUEST,
+                "a JSON-RPC message must be an object",
             ));
         };
-        let params = message
+
+        // An `id` member that this server cannot echo makes the whole request
+        // object invalid, and JSON-RPC 2.0 reserves `null` for answering it.
+        let raw_id = object.get("id");
+        if raw_id.is_some_and(|value| !is_usable_id(value)) {
+            return Some(error_frame(
+                serde_json::Value::Null,
+                rpc::INVALID_REQUEST,
+                "a JSON-RPC id must be a string, a number, or null",
+            ));
+        }
+        // Absent `id` means notification: no response, whatever else is wrong.
+        let respond = raw_id.cloned();
+
+        if object.get("jsonrpc").and_then(|value| value.as_str()) != Some("2.0") {
+            return respond.map(|id| {
+                error_frame(
+                    id,
+                    rpc::INVALID_REQUEST,
+                    "every frame must identify JSON-RPC 2.0 with \"jsonrpc\": \"2.0\"",
+                )
+            });
+        }
+
+        let Some(method) = object.get("method").and_then(|value| value.as_str()) else {
+            return respond
+                .map(|id| error_frame(id, rpc::INVALID_REQUEST, "the frame carries no method"));
+        };
+        let params = object
             .get("params")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
-        // A notification has no `id`, so it gets no response — including the
-        // one method that legitimately arrives as one.
-        let Some(id) = id else {
-            if method == "notifications/initialized" {
-                self.initialized = true;
-            }
+        let Some(id) = respond else {
+            // `notifications/initialized` is accepted idempotently and is never
+            // a substitute for the handshake: only this server's own successful
+            // `initialize` response enables the tools.
             return None;
         };
 
         match method {
             "initialize" => {
+                let result = self.initialize_result(&params);
                 self.initialized = true;
-                Some(result_frame(id, self.initialize_result(&params)))
+                Some(result_frame(id, result))
             }
             "ping" => Some(result_frame(id, serde_json::json!({}))),
+            "tools/list" | "tools/call" if !self.initialized => Some(error_frame(
+                id,
+                rpc::SERVER_NOT_INITIALIZED,
+                format!("'{method}' is served only after a successful initialize handshake"),
+            )),
             "tools/list" => Some(result_frame(id, tool_descriptors())),
             "tools/call" => Some(result_frame(id, self.call_tool(&params).await)),
             other => Some(error_frame(
@@ -626,6 +689,100 @@ fn error_frame(id: serde_json::Value, code: i64, message: impl Into<String>) -> 
     })
 }
 
+/// What one bounded framing attempt produced.
+enum Frame {
+    /// A complete line, without its newline terminator.
+    Line(String),
+    /// The peer closed the stream with nothing buffered.
+    Eof,
+    /// The frame can never be interpreted, so the session ends.
+    Unusable(String),
+    /// The stream itself failed.
+    Failed(std::io::Error),
+}
+
+/// Read one newline-delimited frame, never retaining more than the bound.
+///
+/// `read_line` cannot do this: it grows its `String` until a newline arrives, so
+/// a peer that sends a gigabyte without one has already been buffered by the
+/// time any ceiling could be checked. Here the limit is enforced against every
+/// chunk as it is taken from the reader, so retained input stays inside
+/// [`MAX_FRAME_BYTES`] plus the reader's own fixed buffer.
+///
+/// An oversized or non-UTF-8 frame is terminal for the session. There is no
+/// resynchronization: the remaining bytes belong to a frame this server already
+/// refused to hold, and guessing where the next one starts is how a desynchronized
+/// stream turns into a dispatched tool call nobody sent.
+async fn read_frame<R>(reader: &mut R, buffer: &mut Vec<u8>) -> Frame
+where
+    R: AsyncBufRead + Unpin,
+{
+    /// What one pass over the reader's buffer accomplished.
+    enum Step {
+        /// A newline was found; the frame is complete.
+        Complete,
+        /// Bytes were retained; keep reading.
+        Partial,
+        /// The peer closed the stream.
+        Eof,
+        /// Retaining this chunk would exceed the bound.
+        Overflow,
+    }
+
+    buffer.clear();
+    loop {
+        let (step, used) = {
+            let available = match reader.fill_buf().await {
+                Ok(available) => available,
+                Err(error) => return Frame::Failed(error),
+            };
+            if available.is_empty() {
+                (Step::Eof, 0)
+            } else if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
+                if buffer.len() + index > MAX_FRAME_BYTES {
+                    (Step::Overflow, 0)
+                } else {
+                    buffer.extend_from_slice(&available[..index]);
+                    (Step::Complete, index + 1)
+                }
+            } else if buffer.len() + available.len() > MAX_FRAME_BYTES {
+                (Step::Overflow, 0)
+            } else {
+                let len = available.len();
+                buffer.extend_from_slice(available);
+                (Step::Partial, len)
+            }
+        };
+        reader.consume(used);
+        match step {
+            Step::Partial => continue,
+            Step::Overflow => {
+                buffer.clear();
+                return Frame::Unusable(format!(
+                    "a frame exceeded {MAX_FRAME_BYTES} bytes without a newline"
+                ));
+            }
+            Step::Complete => return decode(buffer),
+            Step::Eof => {
+                return if buffer.is_empty() {
+                    Frame::Eof
+                } else {
+                    // A final frame the peer never terminated is still one frame.
+                    decode(buffer)
+                };
+            }
+        }
+    }
+}
+
+/// Turn retained bytes into a frame, keeping the buffer's capacity.
+fn decode(buffer: &[u8]) -> Frame {
+    match std::str::from_utf8(buffer) {
+        Ok(line) => Frame::Line(line.to_string()),
+        Err(_) => Frame::Unusable("a frame was not valid UTF-8".to_string()),
+    }
+}
+
 /// Serve one stdio MCP session and return the process exit status.
 ///
 /// Reads newline-delimited JSON-RPC from `input` and writes newline-delimited
@@ -638,23 +795,20 @@ where
 {
     let mut session = Session::new(host);
     let mut reader = BufReader::new(input);
-    let mut line = String::new();
+    let mut buffer: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        let read = match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) => {
+        let line = match read_frame(&mut reader, &mut buffer).await {
+            Frame::Line(line) => line,
+            Frame::Eof => break,
+            Frame::Unusable(reason) => {
+                eprintln!("cflx client mcp: {reason}; the session ends unread");
+                return Outcome::TransportError.exit_code();
+            }
+            Frame::Failed(error) => {
                 eprintln!("cflx client mcp: stdin failed: {error}");
                 return Outcome::TransportError.exit_code();
             }
         };
-        if read > MAX_FRAME_BYTES {
-            // Answering would mean parsing a frame this server already refused
-            // to hold, so the session ends instead of guessing at its shape.
-            eprintln!("cflx client mcp: a frame exceeded {MAX_FRAME_BYTES} bytes");
-            return Outcome::TransportError.exit_code();
-        }
         let Some(response) = session.handle(&line).await else {
             continue;
         };
@@ -750,6 +904,23 @@ mod tests {
         Session::new(FakeHost::default())
     }
 
+    /// A session that has completed the handshake, which is what every tool
+    /// assertion needs now that the gate is real.
+    async fn initialized(host: FakeHost) -> Session<FakeHost> {
+        let mut session = Session::new(host);
+        let response = respond(
+            &mut session,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {}}
+            }),
+        )
+        .await;
+        assert!(response["result"].is_object());
+        assert!(session.is_initialized());
+        session
+    }
+
     #[tokio::test]
     async fn initialize_echoes_a_revision_it_speaks_and_proposes_its_own_otherwise() {
         let mut session = session();
@@ -780,6 +951,8 @@ mod tests {
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
     }
 
+    /// A notification is absorbed silently — and `notifications/initialized` is
+    /// an acknowledgement, never a substitute for the handshake it acknowledges.
     #[tokio::test]
     async fn a_notification_is_absorbed_without_any_response_frame() {
         let mut session = session();
@@ -787,9 +960,120 @@ mod tests {
             .handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
             .await
             .is_none());
-        assert!(session.is_initialized());
+        assert!(
+            !session.is_initialized(),
+            "a client cannot enable the tools by announcing itself initialized"
+        );
         // A blank keepalive line is not a message either.
         assert!(session.handle("   ").await.is_none());
+
+        let mut session = initialized(FakeHost::default()).await;
+        // Idempotent: repeating it changes nothing and answers nothing.
+        for _ in 0..2 {
+            assert!(session
+                .handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .await
+                .is_none());
+            assert!(session.is_initialized());
+        }
+    }
+
+    /// The handshake is a gate, not a formality: a peer that skips it must not
+    /// be able to reach a tool, and the refusal has to be machine-readable.
+    #[tokio::test]
+    async fn tools_are_refused_until_the_handshake_completes() {
+        for method in ["tools/list", "tools/call"] {
+            let mut session = Session::new(FakeHost::refusing("unreachable"));
+            let response = respond(
+                &mut session,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": method,
+                    "params": {"name": "cflx_status", "arguments": {}}
+                }),
+            )
+            .await;
+            assert_eq!(
+                response["error"]["code"],
+                rpc::SERVER_NOT_INITIALIZED,
+                "{method} must be gated"
+            );
+            assert!(
+                session.host.calls.lock().unwrap().is_empty(),
+                "{method} must reach no owner before initialization"
+            );
+        }
+
+        // `ping` is explicitly allowed before initialization.
+        let mut session = session();
+        let response = respond(
+            &mut session,
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+        )
+        .await;
+        assert_eq!(response["result"], serde_json::json!({}));
+        assert!(!session.is_initialized());
+    }
+
+    /// Every request envelope must identify JSON-RPC 2.0, and an invalid
+    /// *notification* is still a notification: it gets no response at all.
+    #[tokio::test]
+    async fn a_frame_that_does_not_identify_json_rpc_2_is_an_invalid_request() {
+        let mut session = initialized(FakeHost::refusing("unreachable")).await;
+        for envelope in [
+            serde_json::json!({"id": 1, "method": "tools/list"}),
+            serde_json::json!({"jsonrpc": "1.0", "id": 1, "method": "tools/list"}),
+            serde_json::json!({"jsonrpc": 2.0, "id": 1, "method": "tools/list"}),
+        ] {
+            let response = respond(&mut session, envelope.clone()).await;
+            assert_eq!(
+                response["error"]["code"],
+                rpc::INVALID_REQUEST,
+                "{envelope} must be refused"
+            );
+            assert_eq!(response["id"], 1, "a valid id is echoed even on refusal");
+        }
+        assert!(session.host.calls.lock().unwrap().is_empty());
+
+        // No `jsonrpc` and no `id`: invalid, but still a notification.
+        assert!(session
+            .handle(r#"{"method":"notifications/initialized"}"#)
+            .await
+            .is_none());
+    }
+
+    /// Batch support is not advertised, and a malformed id cannot be echoed.
+    #[tokio::test]
+    async fn batches_and_unusable_ids_are_invalid_requests_answered_with_null() {
+        let mut session = initialized(FakeHost::refusing("unreachable")).await;
+
+        let frame = session
+            .handle(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#)
+            .await
+            .expect("a batch owes one refusal");
+        let response = parse(&frame);
+        assert_eq!(response["error"]["code"], rpc::INVALID_REQUEST);
+        assert!(response["id"].is_null());
+
+        for unusable in [
+            serde_json::json!({"jsonrpc": "2.0", "id": {"a": 1}, "method": "ping"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": [1], "method": "ping"}),
+        ] {
+            let frame = session
+                .handle(&unusable.to_string())
+                .await
+                .expect("an invalid request object owes a refusal");
+            let response = parse(&frame);
+            assert_eq!(response["error"]["code"], rpc::INVALID_REQUEST);
+            assert!(
+                response["id"].is_null(),
+                "an id this server cannot echo is answered with null"
+            );
+        }
+
+        // A bare scalar is not a JSON-RPC message either.
+        let frame = session.handle("42").await.expect("owed a refusal");
+        assert_eq!(parse(&frame)["error"]["code"], rpc::INVALID_REQUEST);
+        assert!(session.host.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -832,7 +1116,7 @@ mod tests {
     /// an idempotency key, an execution mark, or shell source.
     #[tokio::test]
     async fn tools_list_exposes_exactly_the_closed_intent_set() {
-        let mut session = session();
+        let mut session = initialized(FakeHost::default()).await;
         let response = respond(
             &mut session,
             serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
@@ -883,7 +1167,7 @@ mod tests {
             .with_change("alpha")
             .with_instance(Some("i-1".to_string()))
             .with_execution(Some("e-1".to_string()));
-        let mut session = Session::new(FakeHost::answering(envelope));
+        let mut session = initialized(FakeHost::answering(envelope)).await;
         let response = respond(
             &mut session,
             serde_json::json!({
@@ -908,7 +1192,7 @@ mod tests {
         let envelope = ResultEnvelope::new(Operation::Enqueue, Outcome::TargetIneligible)
             .with_change("alpha")
             .with_message("'alpha' has reached the final status 'merged'");
-        let mut session = Session::new(FakeHost::answering(envelope));
+        let mut session = initialized(FakeHost::answering(envelope)).await;
         let response = respond(
             &mut session,
             serde_json::json!({
@@ -927,8 +1211,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_tool_is_refused_without_reaching_the_host() {
-        let host = FakeHost::refusing("unreachable");
-        let mut session = Session::new(host);
+        let mut session = initialized(FakeHost::refusing("unreachable")).await;
         let response = respond(
             &mut session,
             serde_json::json!({
@@ -943,7 +1226,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_host_refusal_becomes_an_error_result_rather_than_a_protocol_error() {
-        let mut session = Session::new(FakeHost::refusing("the tool arguments were not accepted"));
+        let mut session =
+            initialized(FakeHost::refusing("the tool arguments were not accepted")).await;
         let response = respond(
             &mut session,
             serde_json::json!({
@@ -991,6 +1275,67 @@ mod tests {
             assert_eq!(value["jsonrpc"], "2.0");
             assert!(value.get("result").is_some() || value.get("error").is_some());
         }
+    }
+
+    /// A peer that never sends a newline must not be able to make this process
+    /// hold its input. The bound is checked while bytes are read, so the frame
+    /// never becomes a `String` at all, and the session ends unread rather than
+    /// guessing where the next frame starts.
+    #[tokio::test]
+    async fn a_newline_free_oversized_frame_is_bounded_and_ends_the_session() {
+        let mut input = Vec::with_capacity(MAX_FRAME_BYTES * 2);
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"#);
+        input.resize(MAX_FRAME_BYTES * 2, b'x');
+        // Deliberately no trailing newline: the whole point is that waiting for
+        // one is what an unbounded reader would do.
+
+        let host = FakeHost::default();
+        let mut output = Vec::new();
+        let status = serve(host, input.as_slice(), &mut output).await;
+        assert_eq!(status, Outcome::TransportError.exit_code());
+        assert!(
+            output.is_empty(),
+            "an unread frame is answered with nothing, not with a guess"
+        );
+    }
+
+    /// The bound is on retained bytes, not on how the peer chunks them: an
+    /// oversized frame that *does* eventually terminate is refused just the same,
+    /// and nothing after it is interpreted as another frame.
+    #[tokio::test]
+    async fn an_oversized_terminated_frame_dispatches_nothing_after_it() {
+        let mut input = Vec::new();
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+        input.push(b'\n');
+        let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+        input.extend_from_slice(&oversized);
+        input.push(b'\n');
+        input.extend_from_slice(
+            br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cflx_status"}}"#,
+        );
+        input.push(b'\n');
+
+        let host = FakeHost::refusing("unreachable");
+        let mut output = Vec::new();
+        let status = serve(host, input.as_slice(), &mut output).await;
+        assert_eq!(status, Outcome::TransportError.exit_code());
+        let text = String::from_utf8(output).expect("the stream is UTF-8");
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "only the initialize that preceded the oversized frame was answered: {text}"
+        );
+    }
+
+    /// A frame that is not UTF-8 cannot be a JSON-RPC message, and resynchronizing
+    /// past it would mean interpreting bytes of unknown provenance.
+    #[tokio::test]
+    async fn a_non_utf8_frame_ends_the_session_without_dispatching() {
+        let input: Vec<u8> = vec![0xff, 0xfe, b'\n'];
+        let mut output = Vec::new();
+        let status = serve(FakeHost::default(), input.as_slice(), &mut output).await;
+        assert_eq!(status, Outcome::TransportError.exit_code());
+        assert!(output.is_empty());
     }
 
     /// Argument parsing fails closed: an unknown field is a refusal, never a

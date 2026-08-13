@@ -121,6 +121,15 @@ pub struct RemoteControlRuntime {
 /// must be bound before orchestration starts, so the router is assembled while
 /// no registry exists yet. Sharing the handle rather than the registry is what
 /// lets the already-serving router pick the binding up.
+///
+/// The three sink resources it serves are transport-aware in both directions.
+/// `PUT` and `DELETE` store or remove an argv this process will execute, so they
+/// are accepted only on the owner Unix socket. `GET` is served on either
+/// transport, but the registered argv is disclosed only on that same socket —
+/// a channel that may not register a command may not read one back — while
+/// subscription presence, execution state, and delivery history are answered
+/// everywhere. Every one of the three asserts the complete
+/// `(instance_id, execution_id, change_id)` binding.
 #[derive(Default)]
 pub struct CompletionSinkHandle {
     registry: std::sync::RwLock<Option<Arc<crate::web::completion_sink::CompletionSinkRegistry>>>,
