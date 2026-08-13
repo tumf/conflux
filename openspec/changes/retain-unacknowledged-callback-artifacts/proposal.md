@@ -29,8 +29,10 @@ verifications:
 ## Proposed Solution
 
 - Replace automatic `TempDir` cleanup with an explicitly managed owner-private event-directory path.
-- Delete the directory only after positive dispatcher acknowledgement confirms callback reap.
-- On task-send failure or acknowledgement sender drop, retain the directory and artifacts as the fail-safe behavior.
+- Delete the directory only when the shutdown wait resolves as `Ok(Ok(()))`: positive dispatcher acknowledgement confirms callback reap.
+- Treat pre-deadline sender drop, post-cancellation sender drop, and task-send failure identically: retain the directory and artifacts as the fail-safe behavior.
+- Preserve randomized exclusive temporary-directory creation and disarm only automatic Drop cleanup.
+- Emit one bounded warning containing only the retained directory path on every missing-acknowledgement path.
 - Keep shutdown admission, cancellation, serialization, and callback limits unchanged.
 
 ## Acceptance Criteria
@@ -39,12 +41,14 @@ verifications:
 - Missing acknowledgement, including task-send failure or sender drop, never deletes event artifacts.
 - Registry destruction cannot implicitly delete an unacknowledged artifact.
 - A deterministic regression test proves the sender-drop path retains the artifact.
+- Retained-artifact warnings identify the directory without exposing payloads, tokens, or callback output.
+- `AGENTS.md` documents fail-safe retention when reap acknowledgement is unavailable.
 - Existing shutdown, completion-sink, and full regression suites pass.
 
 ## Explicit Completion Conditions
 
-- `src/web/completion_sink.rs` uses explicit path ownership rather than `TempDir` Drop cleanup.
-- `cargo test --test client_completion_sink` includes and passes the sender-drop regression.
+- `src/web/completion_sink.rs` uses `TempDir::keep()`-backed explicit path ownership rather than Drop cleanup, while preserving randomized exclusive creation and `0700` restriction.
+- `cargo test --test client_completion_sink` includes and passes a hook-free pre-deadline sender-drop regression.
 - `cargo test`, format, and clippy pass.
 - Strict and archive-gate validation pass.
 
@@ -52,4 +56,5 @@ verifications:
 
 - Durable callback delivery across process crashes.
 - Automatic cleanup of fail-safe retained files.
+- A public dispatcher abort/kill test hook.
 - Changes to callback serialization or deadlines.
