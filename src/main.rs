@@ -21,6 +21,7 @@ mod events;
 mod execution;
 mod history;
 mod hooks;
+mod ids;
 mod lifecycle_integration;
 mod log_viewer;
 mod openspec;

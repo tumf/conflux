@@ -171,6 +171,13 @@ impl ProcessActivity {
 /// One change's observed execution facts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChangeExecutionFacts {
+    /// Process-local identity of the most recent admitted execution episode.
+    ///
+    /// `None` until any admission source moved this change into queued or
+    /// active work in *this* incarnation. It survives the episode's terminal
+    /// settlement so a late subscriber can still address the execution that
+    /// just finished, and is replaced — never reused — by the next admission.
+    pub execution_id: Option<String>,
     /// Closed execution state.
     pub execution_state: ChangeExecutionState,
     /// Phase the reducer currently holds.
@@ -194,6 +201,7 @@ impl ChangeExecutionFacts {
     /// change the store has never seen.
     pub fn unknown() -> Self {
         Self {
+            execution_id: None,
             execution_state: ChangeExecutionState::Unknown,
             current_phase: ExecutionPhase::Unknown,
             phase_started_at: None,
@@ -236,8 +244,95 @@ impl ExecutionFactsSnapshot {
     }
 }
 
+/// The states that mean "this change is admitted work right now".
+///
+/// Admission — not activity — is what opens an execution episode: a change that
+/// is queued behind a slot has already been admitted by whichever source asked
+/// for it, and a subscriber that only learned about it once a phase started
+/// would miss the window an enqueue caller is actually in.
+pub fn is_admitted_execution_state(state: ChangeExecutionState) -> bool {
+    matches!(
+        state,
+        ChangeExecutionState::Queued
+            | ChangeExecutionState::Active
+            | ChangeExecutionState::Waiting
+            | ChangeExecutionState::Stopping
+    )
+}
+
+/// How one admitted execution episode ended, in the owner's own typed terms.
+///
+/// Derived from the reducer's terminal state, never from a display string, an
+/// error body, or a change disappearing from the snapshot. `Completed` here is a
+/// *claim worth verifying*, not a completion: the repository oracle decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeTerminal {
+    /// The reducer reached a terminal success for this change.
+    Completed,
+    /// The reducer reached a terminal failure or rejection.
+    Failed,
+    /// The episode was stopped or dequeued, including before any active work.
+    Stopped,
+}
+
+impl EpisodeTerminal {
+    /// Stable wire token.
+    // Read by the episode-vocabulary assertions; the binary maps the enum onto
+    // the API's own event type instead.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// What happened to one execution episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeTransitionKind {
+    /// A non-admitted change became admitted work; the episode ID is new.
+    Started,
+    /// The open episode entered a typed blocked/waiting condition.
+    BlockedEntered,
+    /// The open episode left that condition, arming the next attention edge.
+    BlockedLeft,
+    /// The episode settled; no further transition can belong to this ID.
+    Terminal(EpisodeTerminal),
+}
+
+/// One published episode transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeTransition {
+    /// Change the episode belongs to.
+    pub change_id: String,
+    /// Process-local episode identity.
+    pub execution_id: String,
+    /// What happened.
+    pub kind: EpisodeTransitionKind,
+}
+
+/// A process-local consumer of episode transitions.
+///
+/// Observability only. An observer cannot refuse, delay, or redirect a
+/// transition, and nothing it does is read back as a workflow input — it is
+/// called after the store's own lock is released precisely so it can never
+/// influence the projection it is describing.
+pub trait EpisodeObserver: std::fmt::Debug + Send + Sync {
+    /// Absorb one transition. Must not block for long.
+    fn observe_episode(&self, transition: &EpisodeTransition);
+}
+
 #[derive(Debug, Clone, Default)]
 struct ChangeFactsState {
+    /// Identity of the most recent admitted episode, retained after it settles.
+    execution_id: Option<String>,
+    /// True while that episode is still admitted, which is what makes the next
+    /// admission a *new* episode rather than a continuation of this one.
+    episode_open: bool,
+    /// True while the open episode is inside a blocked attention edge.
+    blocked_edge: bool,
     execution_state: ChangeExecutionState,
     current_phase: ExecutionPhase,
     phase_started_at: Option<DateTime<Utc>>,
@@ -282,18 +377,83 @@ struct Inner {
     activities: HashSet<ProcessActivity>,
     stop_requested: bool,
     absorbed: AbsorbedDispatches,
+    /// Episode transitions produced by the current absorption, drained and
+    /// published *after* the store lock is released so an observer can never
+    /// re-enter the store from inside its own mutex.
+    pending: Vec<EpisodeTransition>,
 }
 
 /// The shared process-local execution-facts store.
 #[derive(Debug, Default)]
 pub struct ExecutionFactsStore {
     inner: Mutex<Inner>,
+    /// Late-bound episode consumer. Unbound is the ordinary case: a build or a
+    /// frontend with no completion-sink dispatcher still tracks episodes, it
+    /// simply has nobody to tell.
+    observer: std::sync::RwLock<Option<std::sync::Arc<dyn EpisodeObserver>>>,
 }
 
 impl ExecutionFactsStore {
     /// A store for a fresh process incarnation.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind the process-local episode consumer.
+    ///
+    /// Idempotent replacement rather than a list: exactly one dispatcher owns
+    /// completion sinks in a process, and a second one would double-deliver.
+    pub fn bind_episode_observer(&self, observer: std::sync::Arc<dyn EpisodeObserver>) {
+        *self
+            .observer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    /// Publish drained transitions without holding the store lock.
+    fn publish(&self, transitions: Vec<EpisodeTransition>) {
+        if transitions.is_empty() {
+            return;
+        }
+        let observer = self
+            .observer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(observer) = observer else {
+            return;
+        };
+        for transition in &transitions {
+            observer.observe_episode(transition);
+        }
+    }
+
+    /// The most recent episode identity for one change, if this incarnation
+    /// admitted it at all.
+    // A convenience read over the same field `snapshot()` and `change()`
+    // publish; the API resources reach it through those.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn execution_id(&self, change_id: &str) -> Option<String> {
+        self.lock()
+            .changes
+            .get(change_id)
+            .and_then(|facts| facts.execution_id.clone())
+    }
+
+    /// The change one episode identity belongs to, if this incarnation owns it.
+    ///
+    /// Linear over tracked changes on purpose: the map is bounded by the number
+    /// of changes a process tracks, and a second index would be one more thing
+    /// to keep consistent with the reducer.
+    // The sink registry keeps its own binding, so this exists for assertions
+    // that the store's own view agrees with it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn change_of_execution(&self, execution_id: &str) -> Option<String> {
+        self.lock()
+            .changes
+            .iter()
+            .find(|(_, facts)| facts.execution_id.as_deref() == Some(execution_id))
+            .map(|(id, _)| id.clone())
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -319,16 +479,20 @@ impl ExecutionFactsStore {
         state: Option<&OrchestratorState>,
         now: DateTime<Utc>,
     ) -> bool {
-        let mut inner = self.lock();
-        if !inner.absorbed.admit(dispatch_id) {
-            return false;
-        }
-        Self::observe_completion(&mut inner, event, now);
-        Self::observe_push(&mut inner, event);
-        Self::observe_process(&mut inner, event);
-        if let Some(state) = state {
-            Self::refresh_from_reducer(&mut inner, state, now);
-        }
+        let transitions = {
+            let mut inner = self.lock();
+            if !inner.absorbed.admit(dispatch_id) {
+                return false;
+            }
+            Self::observe_completion(&mut inner, event, now);
+            Self::observe_push(&mut inner, event);
+            Self::observe_process(&mut inner, event);
+            if let Some(state) = state {
+                Self::refresh_from_reducer(&mut inner, state, now);
+            }
+            std::mem::take(&mut inner.pending)
+        };
+        self.publish(transitions);
         true
     }
 
@@ -448,18 +612,101 @@ impl ExecutionFactsStore {
     /// publish a phase the reducer had already left.
     fn refresh_from_reducer(inner: &mut Inner, state: &OrchestratorState, now: DateTime<Utc>) {
         let stop_requested = inner.stop_requested;
+        // Split the borrow so one pass can both update a change's facts and
+        // append the episode transition that update produced.
+        let Inner {
+            changes, pending, ..
+        } = inner;
         for change_id in state.tracked_change_ids() {
             let Some(runtime) = state.change_runtime(&change_id) else {
                 continue;
             };
-            let facts = inner.changes.entry(change_id).or_default();
+            let change_key = change_id.clone();
+            let facts = changes.entry(change_id).or_default();
             let phase = project_phase(runtime, facts.push_open);
             if phase != facts.current_phase {
                 facts.current_phase = phase;
                 facts.phase_started_at = phase.is_active().then_some(now);
             }
-            facts.execution_state = project_execution_state(runtime, phase, stop_requested);
+            let next = project_execution_state(runtime, phase, stop_requested);
+            facts.execution_state = next;
+            Self::advance_episode(pending, &change_key, facts, next);
         }
+    }
+
+    /// Move one change's execution episode in step with its projected state.
+    ///
+    /// The rule is deliberately narrow: admission opens an episode, leaving
+    /// admission settles it, and nothing else creates identity. A change that
+    /// simply stops being tracked never settles here — disappearance proves
+    /// nothing, and inventing a terminal for it is exactly the lie the
+    /// completion contract exists to prevent.
+    fn advance_episode(
+        pending: &mut Vec<EpisodeTransition>,
+        change_id: &str,
+        facts: &mut ChangeFactsState,
+        next: ChangeExecutionState,
+    ) {
+        let admitted = is_admitted_execution_state(next);
+
+        if admitted && !facts.episode_open {
+            let execution_id = crate::ids::new_hex_id();
+            facts.execution_id = Some(execution_id.clone());
+            facts.episode_open = true;
+            facts.blocked_edge = false;
+            pending.push(EpisodeTransition {
+                change_id: change_id.to_string(),
+                execution_id,
+                kind: EpisodeTransitionKind::Started,
+            });
+        }
+
+        let Some(execution_id) = facts.execution_id.clone() else {
+            return;
+        };
+
+        if !facts.episode_open {
+            return;
+        }
+
+        if admitted {
+            // Attention is edge-triggered: an unchanged waiting state publishes
+            // nothing, while leaving and re-entering it arms a new edge.
+            let blocked = matches!(next, ChangeExecutionState::Waiting);
+            if blocked != facts.blocked_edge {
+                facts.blocked_edge = blocked;
+                pending.push(EpisodeTransition {
+                    change_id: change_id.to_string(),
+                    execution_id,
+                    kind: if blocked {
+                        EpisodeTransitionKind::BlockedEntered
+                    } else {
+                        EpisodeTransitionKind::BlockedLeft
+                    },
+                });
+            }
+            return;
+        }
+
+        let terminal = match next {
+            ChangeExecutionState::Completed => EpisodeTerminal::Completed,
+            ChangeExecutionState::Failed => EpisodeTerminal::Failed,
+            // `Stopped` is settled stop/dequeue removal. `Unknown` reaches here
+            // only by leaving admission without a typed terminal — a revoked
+            // queue intent — which is the same fact from the caller's side.
+            ChangeExecutionState::Stopped | ChangeExecutionState::Unknown => {
+                EpisodeTerminal::Stopped
+            }
+            // Unreachable: every remaining variant is an admitted state.
+            _ => return,
+        };
+        facts.episode_open = false;
+        facts.blocked_edge = false;
+        pending.push(EpisodeTransition {
+            change_id: change_id.to_string(),
+            execution_id,
+            kind: EpisodeTransitionKind::Terminal(terminal),
+        });
     }
 
     /// A coherent read of every fact this incarnation has observed.
@@ -475,6 +722,7 @@ impl ExecutionFactsStore {
                     (
                         id.clone(),
                         ChangeExecutionFacts {
+                            execution_id: facts.execution_id.clone(),
                             execution_state: facts.execution_state,
                             current_phase: facts.current_phase,
                             phase_started_at: facts.phase_started_at,
@@ -496,6 +744,7 @@ impl ExecutionFactsStore {
             .changes
             .get(change_id)
             .map(|facts| ChangeExecutionFacts {
+                execution_id: facts.execution_id.clone(),
                 execution_state: facts.execution_state,
                 current_phase: facts.current_phase,
                 phase_started_at: facts.phase_started_at,

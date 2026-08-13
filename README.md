@@ -93,6 +93,68 @@ cflx install-skills --claude
 cflx install-skills --claude --global
 ```
 
+## Delegating to an existing owner
+
+When a Conflux process already holds this repository, another agent hands work to
+it with `cflx client` — a **client**, never a second owner. It takes no
+repository lock, binds no listener, starts no run, and writes nothing to the
+workspace. That is the whole difference from `cflx run`, which *is* an owner and
+would contend for the lock with the process you meant to talk to.
+
+```bash
+cflx client status --json                 # read the owner; mutates nothing
+cflx client enqueue add-my-change --json  # ask the owner to admit one change
+cflx client wait add-my-change --timeout 45m --json
+cflx client mcp                           # serve the same intents over stdio MCP
+```
+
+Four commands, and only four. `--unix-socket PATH` overrides the default
+`${GIT_COMMON_DIR}/cflx-api.sock`, and `--auth-token-env NAME` names an
+environment variable holding the bearer token — a token value is never accepted
+in argv and never printed.
+
+**Admission is not completion.** A successful `enqueue` proves only that the
+owner accepted the intent. `wait` is the observation-only counterpart, and it
+returns `completed` only when current Git/OpenSpec evidence proves the owner's
+declared terminal mode. Read the envelope's `outcome`, never prose.
+
+### `cflx client mcp`
+
+`cflx client mcp` is a stdio Model Context Protocol server over exactly that
+boundary, with six closed tools: `cflx_status`, `cflx_enqueue`, `cflx_wait`, and
+`cflx_notify_set` / `_get` / `_clear`. It exposes no raw `/api/v2` command
+construction, so a model cannot name a command type, an expected revision, an
+idempotency key, an execution mark, or shell source. stdout carries JSON-RPC
+frames and nothing else.
+
+`cflx_enqueue` returns as soon as admission settles and carries an
+`execution_id` naming that exact admitted episode — a retry of the same proposal
+is a *different* execution. It never holds the tool call open for the life of a
+change.
+
+### Completion notifications
+
+`cflx_notify_set` attaches one bounded argv the owner runs **once** when that
+execution reaches a typed terminal classification (`completed`, `failed`,
+`stopped`), with `blocked` available as an opt-in attention edge and
+`owner_stopping` on graceful shutdown. This exists because the TUI stays alive
+after the work finishes, so process exit was never a completion signal.
+
+- `completed` uses the same repository oracle `cflx client wait` certifies with.
+  A change disappearing from the owner's snapshot is never completion.
+- The callback is argv, not shell source — no `sh -c`, no quoting, no expansion —
+  and its environment is *replaced* with exactly `CFLX_EVENT_PATH`,
+  `CFLX_EVENT_TYPE`, `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and
+  `CFLX_INSTANCE_ID`. No owner token or configuration reaches it.
+- Registration is accepted **only over the owner's Unix socket**. An
+  authenticated TCP client is refused with `transport_not_permitted`.
+- Registrations are process-local and die with the owner: nothing here is
+  durable workflow state, and delivery failure cannot change any outcome.
+
+`examples/integrations/opencode-auto-resume/` is an optional reference
+integration that wires this into OpenCode. It is repository-distributed and not
+part of the published crate.
+
 ## Configuration
 
 The configuration file format is JSONC.
@@ -139,6 +201,7 @@ cargo install cflx
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | Development guide |
 | [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | Release guide |
+| [examples/integrations/opencode-auto-resume/README.md](examples/integrations/opencode-auto-resume/README.md) | Optional OpenCode auto-resume reference integration |
 | `cflx openapi` / `GET /api/v2/openapi.yaml` | Canonical `/api/v2` contract (generated at runtime; not tracked in the repository) |
 
 ## License

@@ -30,6 +30,12 @@ pub enum Operation {
     Enqueue,
     /// `cflx client wait`
     Wait,
+    /// `cflx_notify_set` through `cflx client mcp`
+    NotifySet,
+    /// `cflx_notify_get` through `cflx client mcp`
+    NotifyGet,
+    /// `cflx_notify_clear` through `cflx client mcp`
+    NotifyClear,
 }
 
 impl Operation {
@@ -39,9 +45,23 @@ impl Operation {
             Self::Status => "status",
             Self::Enqueue => "enqueue",
             Self::Wait => "wait",
+            Self::NotifySet => "notify_set",
+            Self::NotifyGet => "notify_get",
+            Self::NotifyClear => "notify_clear",
         }
     }
 }
+
+/// Every operation, in the order the contract advertises them.
+#[allow(dead_code)] // Read by the operation-contract assertions, not by the binary.
+pub const ALL_OPERATIONS: [Operation; 6] = [
+    Operation::Status,
+    Operation::Enqueue,
+    Operation::Wait,
+    Operation::NotifySet,
+    Operation::NotifyGet,
+    Operation::NotifyClear,
+];
 
 /// Every stable outcome token this CLI can report.
 ///
@@ -60,6 +80,12 @@ pub enum Outcome {
     AlreadyAdmitted,
     /// `wait` verified the change's successful terminal outcome.
     Completed,
+    /// A notification sink was attached, replaced, read, or cleared.
+    ///
+    /// One token for all three notify operations because `operation` already
+    /// says which one ran, and a caller branching on success must not have to
+    /// learn three spellings of "it worked".
+    Subscribed,
 
     // ── Unsuccessful ──────────────────────────────────────────────────────
     /// No Git repository, so no default socket identity exists.
@@ -109,6 +135,17 @@ pub enum Outcome {
     TransportError,
     /// The invocation itself was not usable.
     UsageError,
+    /// The addressed execution episode is not one this owner incarnation has.
+    ///
+    /// Distinct from [`Self::ChangeNotFound`]: the change may be perfectly well
+    /// known while the episode it names belongs to a run that already ended or
+    /// to a different owner, and a caller that confused the two would rebind a
+    /// callback onto work it never admitted.
+    ExecutionNotFound,
+    /// The presented instance/execution/change binding does not agree.
+    ExecutionBindingMismatch,
+    /// The owner refused an executable registration on this transport.
+    TransportNotPermitted,
 }
 
 impl Outcome {
@@ -119,6 +156,7 @@ impl Outcome {
             Self::Admitted => "admitted",
             Self::AlreadyAdmitted => "already_admitted",
             Self::Completed => "completed",
+            Self::Subscribed => "subscribed",
             Self::NotInRepository => "not_in_repository",
             Self::OwnerNotRunning => "owner_not_running",
             Self::AuthenticationFailed => "authentication_failed",
@@ -140,6 +178,9 @@ impl Outcome {
             Self::FeatureUnavailable => "feature_unavailable",
             Self::TransportError => "transport_error",
             Self::UsageError => "usage_error",
+            Self::ExecutionNotFound => "execution_not_found",
+            Self::ExecutionBindingMismatch => "execution_binding_mismatch",
+            Self::TransportNotPermitted => "transport_not_permitted",
         }
     }
 
@@ -151,7 +192,11 @@ impl Outcome {
     pub fn is_success(self) -> bool {
         matches!(
             self,
-            Self::Observed | Self::Admitted | Self::AlreadyAdmitted | Self::Completed
+            Self::Observed
+                | Self::Admitted
+                | Self::AlreadyAdmitted
+                | Self::Completed
+                | Self::Subscribed
         )
     }
 
@@ -163,7 +208,11 @@ impl Outcome {
     /// already follows.
     pub fn exit_code(self) -> i32 {
         match self {
-            Self::Observed | Self::Admitted | Self::AlreadyAdmitted | Self::Completed => 0,
+            Self::Observed
+            | Self::Admitted
+            | Self::AlreadyAdmitted
+            | Self::Completed
+            | Self::Subscribed => 0,
             Self::UsageError => 2,
             Self::NotInRepository => 3,
             Self::OwnerNotRunning => 4,
@@ -185,6 +234,9 @@ impl Outcome {
             Self::Timeout => 19,
             Self::FeatureUnavailable => 20,
             Self::TransportError => 21,
+            Self::ExecutionNotFound => 23,
+            Self::ExecutionBindingMismatch => 24,
+            Self::TransportNotPermitted => 25,
         }
     }
 }
@@ -194,11 +246,12 @@ impl Outcome {
 /// Read by the CLI's own contract assertions, which is what stops an added
 /// variant from silently reusing an exit status.
 #[allow(dead_code)] // Read by the outcome-contract assertions, not by the binary.
-pub const ALL_OUTCOMES: [Outcome; 25] = [
+pub const ALL_OUTCOMES: [Outcome; 29] = [
     Outcome::Observed,
     Outcome::Admitted,
     Outcome::AlreadyAdmitted,
     Outcome::Completed,
+    Outcome::Subscribed,
     Outcome::NotInRepository,
     Outcome::OwnerNotRunning,
     Outcome::AuthenticationFailed,
@@ -220,6 +273,9 @@ pub const ALL_OUTCOMES: [Outcome; 25] = [
     Outcome::FeatureUnavailable,
     Outcome::TransportError,
     Outcome::UsageError,
+    Outcome::ExecutionNotFound,
+    Outcome::ExecutionBindingMismatch,
+    Outcome::TransportNotPermitted,
 ];
 
 /// The single object a `--json` invocation writes to stdout.
@@ -236,6 +292,16 @@ pub struct ResultEnvelope {
     /// Owner incarnation the result was observed at, when one was reached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// Process-local execution episode this result addresses, when the owner
+    /// published one.
+    ///
+    /// Additive: absent on every owner that does not publish execution
+    /// identity, and never load-bearing for an existing caller — `outcome` and
+    /// the exit status keep their exact prior meanings. It exists so a caller
+    /// that wants a completion callback can name the exact admitted episode
+    /// rather than a change ID that a retry would silently reuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
     /// Change the operation addressed, when it addressed one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_id: Option<String>,
@@ -255,6 +321,7 @@ impl ResultEnvelope {
             operation,
             outcome,
             instance_id: None,
+            execution_id: None,
             change_id: None,
             message: None,
             detail: serde_json::Value::Object(serde_json::Map::new()),
@@ -264,6 +331,12 @@ impl ResultEnvelope {
     /// Attach the owner incarnation this result belongs to.
     pub fn with_instance(mut self, instance_id: Option<String>) -> Self {
         self.instance_id = instance_id;
+        self
+    }
+
+    /// Attach the addressed execution episode.
+    pub fn with_execution(mut self, execution_id: Option<String>) -> Self {
+        self.execution_id = execution_id;
         self
     }
 
@@ -349,7 +422,7 @@ mod tests {
                 outcome.exit_code()
             );
         }
-        assert_eq!(codes.len(), ALL_OUTCOMES.len() - 4);
+        assert_eq!(codes.len(), ALL_OUTCOMES.len() - 5);
     }
 
     #[test]
@@ -379,7 +452,13 @@ mod tests {
             .collect();
         assert_eq!(
             successes,
-            vec!["observed", "admitted", "already_admitted", "completed"]
+            vec![
+                "observed",
+                "admitted",
+                "already_admitted",
+                "completed",
+                "subscribed"
+            ]
         );
     }
 
@@ -397,6 +476,8 @@ mod tests {
         assert_eq!(parsed["outcome"], "admitted");
         assert_eq!(parsed["instance_id"], "abc");
         assert_eq!(parsed["change_id"], "alpha");
+        // Additive and omitted rather than nulled when the owner published none.
+        assert!(!parsed.as_object().unwrap().contains_key("execution_id"));
         assert!(parsed["detail"].is_object());
     }
 
@@ -406,10 +487,64 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&envelope.to_json_line()).unwrap();
         let object = parsed.as_object().unwrap();
         assert!(!object.contains_key("instance_id"));
+        assert!(!object.contains_key("execution_id"));
         assert!(!object.contains_key("change_id"));
         assert!(!object.contains_key("message"));
         assert_eq!(parsed["ok"], false);
         assert_eq!(envelope.exit_code(), 4);
+    }
+
+    /// Execution identity is additive: present when the owner published one,
+    /// absent otherwise, and never a change to what an existing caller reads.
+    #[test]
+    fn execution_identity_is_an_additive_optional_field() {
+        let envelope = ResultEnvelope::new(Operation::Enqueue, Outcome::Admitted)
+            .with_instance(Some("i-1".to_string()))
+            .with_change("alpha")
+            .with_execution(Some("e-1".to_string()));
+        let parsed: serde_json::Value = serde_json::from_str(&envelope.to_json_line()).unwrap();
+        assert_eq!(parsed["execution_id"], "e-1");
+        // The fields an existing caller already branches on keep their meaning.
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["outcome"], "admitted");
+        assert_eq!(envelope.exit_code(), 0);
+
+        let without = ResultEnvelope::new(Operation::Enqueue, Outcome::Admitted)
+            .with_change("alpha")
+            .with_execution(None);
+        let parsed: serde_json::Value = serde_json::from_str(&without.to_json_line()).unwrap();
+        assert!(!parsed.as_object().unwrap().contains_key("execution_id"));
+    }
+
+    /// Notify operations report success with one token, because `operation`
+    /// already says which of the three ran.
+    #[test]
+    fn notify_operations_share_one_success_token_and_their_own_names() {
+        for operation in [
+            Operation::NotifySet,
+            Operation::NotifyGet,
+            Operation::NotifyClear,
+        ] {
+            let envelope = ResultEnvelope::new(operation, Outcome::Subscribed);
+            assert!(envelope.ok);
+            assert_eq!(envelope.exit_code(), 0);
+            assert_eq!(envelope.outcome.as_str(), "subscribed");
+        }
+        assert_eq!(Operation::NotifySet.as_str(), "notify_set");
+        assert_eq!(Operation::NotifyGet.as_str(), "notify_get");
+        assert_eq!(Operation::NotifyClear.as_str(), "notify_clear");
+        let names: Vec<&str> = ALL_OPERATIONS.iter().map(|op| op.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "status",
+                "enqueue",
+                "wait",
+                "notify_set",
+                "notify_get",
+                "notify_clear"
+            ]
+        );
     }
 
     #[test]

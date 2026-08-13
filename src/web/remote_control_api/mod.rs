@@ -26,6 +26,7 @@ pub mod executor;
 pub mod projection;
 pub mod reads;
 pub mod registry;
+pub mod sinks;
 pub mod stream;
 pub mod worktrees;
 
@@ -52,6 +53,20 @@ use worktrees::{UnboundWorktreeOperations, WorktreeListing, WorktreeOperations};
 
 /// The only v2 path that is served without authentication.
 pub const HEALTH_PATH: &str = "/api/v2/health";
+
+/// Which listener a request arrived on.
+///
+/// Injected per listener rather than derived inside a handler, because by the
+/// time a request reaches a route the two listeners are indistinguishable: they
+/// share one router, one `WebState`, and one auth policy. Only the code that
+/// bound the socket knows which channel it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiTransport {
+    /// The owner-only Unix socket, mode `0600` under the Git common directory.
+    Unix,
+    /// The browser-facing TCP listener `--web` adds.
+    Tcp,
+}
 
 /// This build's canonical contract, byte-for-byte the same document that
 /// `cflx openapi` writes to stdout.
@@ -95,6 +110,38 @@ pub struct RemoteControlRuntime {
     /// The owner execution contract, bound once startup has resolved the base
     /// branch and the terminal mode this process will finish changes with.
     execution_contract: Arc<ExecutionContractHandle>,
+    /// Execution-scoped completion sinks, bound with the orchestration runtime
+    /// whose typed transitions they observe.
+    completion_sinks: Arc<CompletionSinkHandle>,
+}
+
+/// Late-bound holder of this incarnation's completion-sink registry.
+///
+/// Late for the same reason every other orchestration handle is: the listener
+/// must be bound before orchestration starts, so the router is assembled while
+/// no registry exists yet. Sharing the handle rather than the registry is what
+/// lets the already-serving router pick the binding up.
+#[derive(Default)]
+pub struct CompletionSinkHandle {
+    registry: std::sync::RwLock<Option<Arc<crate::web::completion_sink::CompletionSinkRegistry>>>,
+}
+
+impl CompletionSinkHandle {
+    /// Bind the registry this incarnation serves.
+    pub fn bind(&self, registry: Arc<crate::web::completion_sink::CompletionSinkRegistry>) {
+        *self
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(registry);
+    }
+
+    /// The bound registry, if any.
+    pub fn get(&self) -> Option<Arc<crate::web::completion_sink::CompletionSinkRegistry>> {
+        self.registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 /// Late-bound holder of this owner's minimal execution contract.
@@ -256,6 +303,7 @@ impl RemoteControlRuntime {
             gate: Arc::new(CommandGate::default()),
             execution_facts: Arc::new(ExecutionFactsHandle::default()),
             execution_contract: Arc::new(ExecutionContractHandle::default()),
+            completion_sinks: Arc::new(CompletionSinkHandle::default()),
         }
     }
 
@@ -277,6 +325,19 @@ impl RemoteControlRuntime {
     /// The execution-contract handle the contract resource reads.
     pub fn execution_contract(&self) -> Arc<ExecutionContractHandle> {
         self.execution_contract.clone()
+    }
+
+    /// The late-bound completion-sink handle the router reads.
+    pub fn completion_sinks(&self) -> Arc<CompletionSinkHandle> {
+        self.completion_sinks.clone()
+    }
+
+    /// Bind the completion-sink registry this incarnation serves.
+    pub fn bind_completion_sinks(
+        &self,
+        registry: Arc<crate::web::completion_sink::CompletionSinkRegistry>,
+    ) {
+        self.completion_sinks.bind(registry);
     }
 
     /// Publish this owner's execution contract.
@@ -431,6 +492,12 @@ pub struct RemoteControlState {
     /// Defaults to unbound, which is a process that has not resolved a base
     /// branch or terminal mode yet and says exactly that.
     pub execution_contract: Arc<ExecutionContractHandle>,
+    /// Execution-scoped completion sinks.
+    ///
+    /// Unbound is a process that holds no subscriptions at all — capability
+    /// discovery reports exactly that, so a client never has to infer support
+    /// from a refusal.
+    pub completion_sinks: Arc<CompletionSinkHandle>,
 }
 
 impl RemoteControlState {
@@ -455,7 +522,14 @@ impl RemoteControlState {
             gate: Arc::new(CommandGate::default()),
             execution_facts: Arc::new(ExecutionFactsHandle::default()),
             execution_contract: Arc::new(ExecutionContractHandle::default()),
+            completion_sinks: Arc::new(CompletionSinkHandle::default()),
         }
+    }
+
+    /// Attach the completion-sink handle this router serves.
+    pub fn with_completion_sinks(mut self, handle: Arc<CompletionSinkHandle>) -> Self {
+        self.completion_sinks = handle;
+        self
     }
 
     /// Attach the owner execution contract this router publishes.
@@ -502,6 +576,12 @@ pub fn router(state: RemoteControlState) -> Router {
         .route("/api/v2/state", get(reads::state))
         .route("/api/v2/execution-status", get(reads::execution_status))
         .route("/api/v2/execution-contract", get(reads::execution_contract))
+        .route(
+            "/api/v2/executions/{execution_id}/sink",
+            get(sinks::get_sink)
+                .put(sinks::put_sink)
+                .delete(sinks::delete_sink),
+        )
         .route("/api/v2/changes", get(reads::list_changes))
         .route("/api/v2/changes/{change_id}", get(reads::get_change))
         .route("/api/v2/logs", get(reads::logs))

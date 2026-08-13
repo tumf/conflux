@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use super::auth::CorrelationId;
 
+use super::dto;
 use super::dto::{
     ApiError, CapabilitiesResponse, CapabilityLimits, ChangeExecutionState, ChangeExecutionStatus,
     ChangeResponse, ChangesResponse, CommandExecutionCapability, ErrorCode,
@@ -96,6 +97,17 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
         authentication_required: state.auth.is_enforced(),
         command_execution: CommandExecutionCapability {
             available: state.executor.is_command_capable().await,
+        },
+        // Published as an explicit fact rather than left to be inferred from a
+        // 404: an older owner has no execution-sink route at all, and a client
+        // must be able to tell "this build cannot" from "that execution is
+        // gone".
+        execution_sinks: match state.completion_sinks.get() {
+            Some(_) => crate::web::completion_sink::capability(),
+            None => dto::ExecutionSinkCapability {
+                available: false,
+                ..crate::web::completion_sink::capability()
+            },
         },
         worktrees: WorktreeCapabilities::default(),
         parallel: ParallelCapabilities {
@@ -304,6 +316,7 @@ pub async fn execution_status(State(state): State<RemoteControlState>) -> Respon
             let change_facts = facts.change(&change.id);
             ChangeExecutionStatus {
                 id: change.id.clone(),
+                execution_id: change_facts.execution_id.clone(),
                 execution_state: ChangeExecutionState::from_shared(change_facts.execution_state),
                 current_phase: ExecutionPhase::from_shared(change_facts.current_phase),
                 last_completed_phase: change_facts

@@ -74,6 +74,31 @@ fn feature_disabled_or_enabled_client_never_takes_the_repository_lock() {
 mod feature_disabled {
     use super::*;
 
+    /// The MCP server has no envelope to emit — a host parsing stdout as
+    /// JSON-RPC must not be handed prose — so its refusal is stderr-only, and
+    /// it still happens before anything observable exists.
+    #[test]
+    fn feature_disabled_mcp_refuses_on_stderr_without_any_side_effect() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let output = run_cli(tmp.path(), &["client", "mcp"], &[]);
+        assert_eq!(output.status.code(), Some(20));
+        assert!(
+            stdout_of(&output).is_empty(),
+            "the protocol stream must carry nothing at all"
+        );
+        assert!(
+            stderr_of(&output).contains("web-monitoring"),
+            "the refusal must name the missing feature"
+        );
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .expect("temp dir readable")
+                .next()
+                .is_none(),
+            "a refused client command must write nothing"
+        );
+    }
+
     #[test]
     fn feature_disabled_client_refuses_before_any_side_effect() {
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -534,7 +559,7 @@ mod enabled {
     // ========================================================================
 
     #[test]
-    fn cli_surface_exposes_only_status_enqueue_and_wait() {
+    fn cli_surface_exposes_only_status_enqueue_wait_and_mcp() {
         let tmp = neutral_cwd();
         let output = run_cli(tmp.path(), &["client", "--help"], &[]);
         assert!(output.status.success(), "{}", stderr_of(&output));
@@ -543,6 +568,7 @@ mod enabled {
             "status",
             "enqueue",
             "wait",
+            "mcp",
             "--unix-socket",
             "--auth-token-env",
         ] {
@@ -570,6 +596,48 @@ mod enabled {
             assert!(
                 !help.contains(&format!("  {absent} ")),
                 "client must not offer a {absent} subcommand:\n{help}"
+            );
+        }
+    }
+
+    /// The MCP server's own help has to state the two things a caller gets
+    /// wrong: that it is still a client, and that enqueue settles rather than
+    /// completes.
+    #[test]
+    fn cli_surface_documents_the_mcp_server_as_a_bounded_client() {
+        let tmp = neutral_cwd();
+        let output = run_cli(tmp.path(), &["client", "mcp", "--help"], &[]);
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        let help = stdout_of(&output);
+
+        for tool in [
+            "cflx_status",
+            "cflx_enqueue",
+            "cflx_wait",
+            "cflx_notify_set",
+            "cflx_notify_get",
+            "cflx_notify_clear",
+        ] {
+            assert!(help.contains(tool), "help must name {tool}:\n{help}");
+        }
+        assert!(
+            help.contains("execution_id"),
+            "help must explain the execution binding:\n{help}"
+        );
+        assert!(
+            help.contains("never holds the tool call open"),
+            "help must say enqueue is bounded:\n{help}"
+        );
+        assert!(
+            help.contains("token value is never accepted"),
+            "help must state the credential rule:\n{help}"
+        );
+        // The connection options are the namespace's, and the protocol is not
+        // reachable through them.
+        for forbidden in ["--expected-revision", "--idempotency-key", "--auth-token "] {
+            assert!(
+                !help.contains(forbidden),
+                "help must not expose {forbidden}:\n{help}"
             );
         }
     }
@@ -3569,5 +3637,93 @@ mod enabled {
                 "the delegation guidance must not tell a caller to construct {forbidden}"
             );
         }
+    }
+
+    /// The four-command namespace, the client-only MCP server, and the
+    /// completion-sink semantics an operator gets wrong if nobody writes them
+    /// down.
+    #[test]
+    fn documentation_states_the_mcp_and_completion_sink_contract() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let agents = std::fs::read_to_string(repo_root.join("AGENTS.md")).expect("AGENTS.md");
+        let readme = std::fs::read_to_string(repo_root.join("README.md")).expect("README.md");
+        let example = std::fs::read_to_string(
+            repo_root.join("examples/integrations/opencode-auto-resume/README.md"),
+        )
+        .expect("the example README");
+
+        for document in [&agents, &readme] {
+            assert!(
+                document.contains("cflx client mcp"),
+                "every document must show the MCP server"
+            );
+            assert!(
+                document.contains("cflx_notify_set"),
+                "and the notify tool that makes it useful"
+            );
+            // UDS-only sink mutation.
+            assert!(
+                document.contains("transport_not_permitted"),
+                "the transport refusal is the rule an operator hits first"
+            );
+            // The environment contract, verbatim.
+            for variable in [
+                "CFLX_EVENT_PATH",
+                "CFLX_EVENT_TYPE",
+                "CFLX_EXECUTION_ID",
+                "CFLX_CHANGE_ID",
+                "CFLX_INSTANCE_ID",
+            ] {
+                assert!(document.contains(variable), "{variable} must be documented");
+            }
+            // Execution completion, not process completion.
+            assert!(
+                document.contains("process exit was never"),
+                "a resident TUI's liveness must be distinguished from completion"
+            );
+            // A token is a variable name, never a value.
+            assert!(
+                document.contains("--auth-token-env"),
+                "the credential rule must be stated"
+            );
+        }
+
+        // The four-command namespace, stated as a closed set.
+        assert!(
+            agents.contains("Four commands, and only four"),
+            "AGENTS.md must state the namespace is closed"
+        );
+        assert!(agents.contains("cflx client mcp"), "and name the fourth");
+
+        // Why a one-shot event file is separate from the lifecycle adapter's
+        // long-lived stdin stream.
+        assert!(
+            agents.contains("lifecycle adapter") && agents.contains("one-shot"),
+            "AGENTS.md must explain why sinks are not the lifecycle adapter"
+        );
+
+        // Crash limitations and the external fallback.
+        assert!(
+            agents.contains("owner_restarted"),
+            "AGENTS.md must name the typed answer for a lost owner"
+        );
+
+        // The example's own contract: ordinary role=user messages, untrusted events.
+        assert!(
+            example.contains("role=user"),
+            "the example must say what OpenCode actually stores"
+        );
+        assert!(
+            example.contains("[AUTOMATION EVENT — not user-authored]"),
+            "and show the mandatory marker"
+        );
+        assert!(
+            example.contains("untrusted"),
+            "and say event files are data, not instructions"
+        );
+        assert!(
+            example.contains("lifecycle adapter"),
+            "and explain why this is not the lifecycle adapter"
+        );
     }
 }

@@ -51,6 +51,20 @@ const SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Gap between command-record polls while a command is still running.
 const SETTLEMENT_POLL: Duration = Duration::from_millis(25);
 
+/// How long the client waits for the owner to publish the execution episode a
+/// settled admission created.
+///
+/// A settled command proves the owner accepted the intent; the episode ID
+/// appears once the reducer's own transition reaches the execution-status
+/// resource, which is a different instant. Bounded and *optional*: an owner that
+/// never publishes one — an older build, or one where the admission did not
+/// actually move the change — still returns an ordinary successful admission
+/// rather than being reported as a failure over a field nobody asked for.
+const EXECUTION_ID_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Gap between those reads.
+const EXECUTION_ID_POLL: Duration = Duration::from_millis(25);
+
 /// What the client decided to do about one change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
@@ -133,7 +147,9 @@ pub async fn run(connection: &Connection, change_id: &str) -> ResultEnvelope {
         }
 
         match attempt_intent(connection, &observation, change_id, &mut audit).await {
-            Attempt::Settled(envelope) => return *envelope,
+            Attempt::Settled(envelope) => {
+                return resolve_execution(connection, change_id, *envelope).await
+            }
             Attempt::Stale => continue,
         }
     }
@@ -146,6 +162,49 @@ pub async fn run(connection: &Connection, change_id: &str) -> ResultEnvelope {
              {MAX_REVISION_ATTEMPTS} bounded recomputations were exhausted without a settled \
              admission"
         ))
+}
+
+/// Name the execution episode a successful admission belongs to.
+///
+/// Only successes carry one: a refusal admitted nothing, so an episode ID on it
+/// would name work this invocation is not responsible for. Concurrent callers
+/// that each observe the *same* already-admitted episode read the same ID, which
+/// is what makes `already_admitted` a usable subscription target rather than a
+/// dead end.
+///
+/// Every failure here is silent by construction. The admission already settled;
+/// downgrading it because an additive observability field could not be read
+/// would be reporting a worse outcome than the one that happened.
+async fn resolve_execution(
+    connection: &Connection,
+    change_id: &str,
+    envelope: ResultEnvelope,
+) -> ResultEnvelope {
+    if !matches!(
+        envelope.outcome,
+        Outcome::Admitted | Outcome::AlreadyAdmitted
+    ) {
+        return envelope;
+    }
+    let deadline = tokio::time::Instant::now() + EXECUTION_ID_TIMEOUT;
+    loop {
+        if let Ok(observation) = observe(connection, Some(change_id)).await {
+            // A different incarnation cannot vouch for the episode this
+            // admission created, and binding to its ID would attach a later
+            // subscription to work nobody asked for.
+            if envelope.instance_id.as_deref() != Some(observation.instance_id.as_str()) {
+                return envelope;
+            }
+            if let Some(execution_id) = observation.execution_id(change_id) {
+                return envelope.with_execution(Some(execution_id));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return envelope;
+        }
+        tokio::time::sleep(EXECUTION_ID_POLL.min(remaining)).await;
+    }
 }
 
 /// The result of one revision-scoped attempt.

@@ -10,8 +10,10 @@
 //! mark/queue/start routing, and truthful completion. The second option makes
 //! every caller break whenever the orchestration state model moves.
 //!
-//! So this is a thin, intent-shaped client: three commands, stable JSON, stable
-//! exit statuses, and no protocol details in the public surface at all.
+//! So this is a thin, intent-shaped client: four commands, stable JSON, stable
+//! exit statuses, and no protocol details in the public surface at all. The
+//! fourth, `mcp`, is the same boundary spoken as Model Context Protocol, so an
+//! agent gets the identical routing and the identical typed outcomes.
 //!
 //! # What it must never do
 //!
@@ -37,9 +39,15 @@ use std::ffi::OsString;
 use clap::CommandFactory;
 
 #[cfg(feature = "web-monitoring")]
+pub mod completion;
+#[cfg(feature = "web-monitoring")]
 mod enqueue;
 #[cfg(feature = "web-monitoring")]
-mod repo;
+pub mod mcp;
+#[cfg(feature = "web-monitoring")]
+mod notify;
+#[cfg(feature = "web-monitoring")]
+pub mod repo;
 #[cfg(feature = "web-monitoring")]
 mod session;
 #[cfg(feature = "web-monitoring")]
@@ -116,6 +124,8 @@ fn operation_of(subcommand: &str) -> Option<Operation> {
         "status" => Some(Operation::Status),
         "enqueue" => Some(Operation::Enqueue),
         "wait" => Some(Operation::Wait),
+        // `mcp` is a server, not an operation: a usage failure there has no
+        // envelope to belong to, so it keeps Clap's human behavior.
         _ => None,
     }
 }
@@ -211,6 +221,13 @@ pub fn exit_on_parse_error(error: clap::Error) -> ! {
 /// Returns rather than exits so the entrypoint owns process termination and a
 /// test can drive the same function the binary does.
 pub async fn run(args: ClientArgs) -> i32 {
+    // The MCP server is not an operation with an envelope: it is a long-lived
+    // protocol session whose *tools* produce envelopes. Answering it here keeps
+    // the single-envelope contract of the other three exactly as it was.
+    if matches!(args.command, ClientCommands::Mcp(_)) {
+        return serve_mcp(args).await;
+    }
+
     let (operation, mode, change_id) = match &args.command {
         ClientCommands::Status(status) => (
             Operation::Status,
@@ -227,6 +244,8 @@ pub async fn run(args: ClientArgs) -> i32 {
             OutputMode::from_json_flag(wait.json),
             Some(wait.change_id.clone()),
         ),
+        // Answered above; reaching here would mean the guard was removed.
+        ClientCommands::Mcp(_) => unreachable!("the MCP session is served before this point"),
     };
 
     let envelope = execute(args, operation).await;
@@ -251,6 +270,25 @@ async fn execute(_args: ClientArgs, operation: Operation) -> ResultEnvelope {
     )
 }
 
+/// Serve one stdio MCP session, or refuse in a build that cannot reach an owner.
+///
+/// The refusal is written to stderr rather than to the protocol stream: a host
+/// parsing stdout as JSON-RPC must not be handed prose, and a server that cannot
+/// serve has no frame it could honestly send.
+#[cfg(feature = "web-monitoring")]
+async fn serve_mcp(args: ClientArgs) -> i32 {
+    mcp::run(args.unix_socket, args.auth_token_env).await
+}
+
+#[cfg(not(feature = "web-monitoring"))]
+async fn serve_mcp(_args: ClientArgs) -> i32 {
+    eprintln!(
+        "cflx client mcp: this build has no local /api/v2 support, so it cannot reach an \
+         existing owner. Rebuild with `--features web-monitoring`"
+    );
+    Outcome::FeatureUnavailable.exit_code()
+}
+
 #[cfg(feature = "web-monitoring")]
 async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
     let connection = match session::Connection::resolve(
@@ -265,6 +303,7 @@ async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
         ClientCommands::Status(_) => session::status(&connection).await,
         ClientCommands::Enqueue(enqueue) => enqueue::run(&connection, &enqueue.change_id).await,
         ClientCommands::Wait(wait) => wait::run(&connection, &wait.change_id, wait.timeout).await,
+        ClientCommands::Mcp(_) => unreachable!("the MCP session is served before this point"),
     }
 }
 

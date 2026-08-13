@@ -1534,6 +1534,7 @@ fn execution_status() -> ExecutionStatusResponse {
         },
         changes: vec![ChangeExecutionStatus {
             id: "a-change".to_string(),
+            execution_id: Some("0123456789abcdef0123456789abcdef".to_string()),
             execution_state: ChangeExecutionState::Active,
             current_phase: ExecutionPhase::Acceptance,
             last_completed_phase: Some(ExecutionPhase::Apply),

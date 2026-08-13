@@ -9,6 +9,8 @@
 mod url;
 
 #[cfg(feature = "web-monitoring")]
+pub mod completion_sink;
+#[cfg(feature = "web-monitoring")]
 pub mod openapi;
 #[cfg(feature = "web-monitoring")]
 pub mod operator_facts;
@@ -270,6 +272,10 @@ pub fn remote_control_router(
         // base branch and terminal mode after the listener is already bound, so
         // the resource reports "not published yet" until it does.
         .with_execution_contract(runtime.execution_contract())
+        // Bound only once an orchestration runtime exists; until then the
+        // capability reports the surface as unavailable rather than serving a
+        // route that could never deliver.
+        .with_completion_sinks(runtime.completion_sinks())
         // The runtime is both the command target and the worktree read port, so
         // both halves of the API see the same late binding.
         .with_worktrees(runtime),
@@ -328,7 +334,6 @@ impl ListenerPlan {
 /// owned socket even on an abrupt error path; [`ServerHandle::shutdown`] also
 /// waits for the listener tasks to finish.
 #[cfg(feature = "web-monitoring")]
-#[derive(Debug)]
 pub struct ServerHandle {
     endpoints: Vec<String>,
     tcp_url: Option<String>,
@@ -336,6 +341,22 @@ pub struct ServerHandle {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     #[cfg(unix)]
     socket: Option<unix_socket::SocketGuard>,
+    /// Held so a graceful stop can tell live completion sinks the owner is
+    /// leaving. A crash cannot run this, which is exactly why an external
+    /// adapter still needs its own owner-continuity check.
+    state: Arc<WebState>,
+}
+
+/// Hand-written because the held [`WebState`] is a large runtime object rather
+/// than a value: rendering it would print the whole projection.
+#[cfg(feature = "web-monitoring")]
+impl std::fmt::Debug for ServerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerHandle")
+            .field("endpoints", &self.endpoints)
+            .field("tcp_url", &self.tcp_url)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "web-monitoring")]
@@ -359,6 +380,11 @@ impl ServerHandle {
     /// Finite `run` completion and graceful TUI termination both call this, so
     /// neither needs a second Ctrl+C to give the endpoint back.
     pub async fn shutdown(mut self) {
+        // Before the listeners stop, so a callback that wants to read the API
+        // one last time still can.
+        if let Some(registry) = self.state.completion_sinks() {
+            registry.owner_stopping().await;
+        }
         self.shutdown.cancel();
         for task in std::mem::take(&mut self.tasks) {
             let _ = task.await;
@@ -422,7 +448,12 @@ pub async fn start_listeners(
             unix_socket::unix_endpoint(path)
         );
 
-        let app = app.clone();
+        // The transport marker is per listener because the router is shared:
+        // once a request is inside a handler the two listeners look identical,
+        // and sink mutation has to be able to tell them apart.
+        let app = app
+            .clone()
+            .layer(axum::Extension(remote_control_api::ApiTransport::Unix));
         let token = shutdown.clone();
         tasks.push(tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app)
@@ -461,7 +492,9 @@ pub async fn start_listeners(
         endpoints.push(url.clone());
         tcp_url = Some(url);
 
-        let app = app.clone();
+        let app = app
+            .clone()
+            .layer(axum::Extension(remote_control_api::ApiTransport::Tcp));
         let token = shutdown.clone();
         tasks.push(tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app)
@@ -507,6 +540,7 @@ pub async fn start_listeners(
         tasks,
         #[cfg(unix)]
         socket: socket_guard,
+        state,
     })
 }
 

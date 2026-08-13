@@ -12,6 +12,7 @@
 // Public modules for OpenAPI generator
 pub mod embedded_skills;
 pub mod events;
+pub mod ids;
 pub mod install_skills;
 pub mod lifecycle_integration;
 pub mod log_viewer;

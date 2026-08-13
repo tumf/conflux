@@ -131,6 +131,11 @@ impl OperatorFactsStore {
         self.reproject_worktrees();
     }
 
+    /// The bound repository root, when one was published.
+    pub fn repo_root(&self) -> Option<PathBuf> {
+        self.repo_root.clone()
+    }
+
     /// Facts for one change, or the empty defaults.
     pub fn facts(&self, change_id: &str) -> ChangeOperatorFacts {
         self.facts.get(change_id).cloned().unwrap_or_default()

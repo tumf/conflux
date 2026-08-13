@@ -7,6 +7,7 @@
 use super::*;
 
 use chrono::TimeZone;
+use std::sync::Mutex;
 
 fn at(seconds: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000 + seconds, 0)
@@ -459,4 +460,367 @@ fn agent_execution_observability_phase_wire_tokens_are_stable() {
     assert_eq!(ChangeExecutionState::Failed.as_str(), "failed");
     assert_eq!(ChangeExecutionState::Completed.as_str(), "completed");
     assert_eq!(ChangeExecutionState::Unknown.as_str(), "unknown");
+}
+
+// ============================================================================
+// Process-local execution identity
+// ============================================================================
+//
+// Unit-scoped like everything above: an in-memory reducer, an in-memory store,
+// injected instants, and a recording observer. Nothing here starts a process,
+// opens a socket, or reads a repository — the episode registry is pure
+// bookkeeping over reducer transitions, and that is exactly what is asserted.
+
+/// A recording episode consumer.
+///
+/// Deliberately inert: it appends and nothing else, because an observer that
+/// could influence the store would make "observability only" untestable.
+#[derive(Debug, Default)]
+struct RecordingObserver {
+    seen: Mutex<Vec<EpisodeTransition>>,
+}
+
+impl RecordingObserver {
+    fn kinds(&self) -> Vec<EpisodeTransitionKind> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|transition| transition.kind)
+            .collect()
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|transition| transition.execution_id.clone())
+            .collect()
+    }
+}
+
+impl EpisodeObserver for RecordingObserver {
+    fn observe_episode(&self, transition: &EpisodeTransition) {
+        self.seen.lock().unwrap().push(transition.clone());
+    }
+}
+
+/// The event the operator command path dispatches when it commits a staged
+/// reducer effect. It carries reducer state, which is what refreshes the store.
+fn operator_applied(change_id: &str, queued: bool) -> ExecutionEvent {
+    ExecutionEvent::OperatorCommandApplied {
+        effect: crate::events::OperatorCommandEffect::QueueDelta {
+            change_id: change_id.to_string(),
+            queued,
+        },
+    }
+}
+
+/// Admit a change the way every admission source ultimately does: a reducer
+/// transition into queued work, committed with a state-owning dispatch.
+fn admit(
+    store: &ExecutionFactsStore,
+    state: &mut OrchestratorState,
+    change_id: &str,
+    now: DateTime<Utc>,
+) {
+    state.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+        change_id.to_string(),
+    ));
+    dispatch(store, state, operator_applied(change_id, true), now);
+}
+
+#[test]
+fn execution_identity_admission_opens_one_episode_every_later_reader_agrees_on() {
+    let store = ExecutionFactsStore::new();
+    let mut state = state_with(&["alpha"]);
+
+    // Not admitted: no identity exists to hand out, and inventing one would
+    // name a subscription the owner could never deliver.
+    assert_eq!(store.change("alpha").execution_id, None);
+
+    admit(&store, &mut state, "alpha", at(0));
+    let first = store
+        .change("alpha")
+        .execution_id
+        .expect("admission opens an episode");
+
+    // A concurrent caller that finds the change already admitted must observe
+    // the *same* episode: two IDs for one episode would let two callers
+    // subscribe to work only one of them can ever be told about.
+    admit(&store, &mut state, "alpha", at(1));
+    dispatch(&store, &mut state, apply_started("alpha"), at(2));
+    assert_eq!(store.change("alpha").execution_id.as_deref(), Some(&*first));
+    assert_eq!(store.execution_id("alpha").as_deref(), Some(&*first));
+    assert_eq!(
+        store.change_of_execution(&first).as_deref(),
+        Some("alpha"),
+        "the binding must be resolvable in both directions"
+    );
+
+    // Iterations inside one admitted run keep the identity: an Apply that ran
+    // twice is one execution episode, not two.
+    dispatch(&store, &mut state, apply_completed("alpha", "oid"), at(3));
+    dispatch(&store, &mut state, apply_started("alpha"), at(4));
+    assert_eq!(store.change("alpha").execution_id.as_deref(), Some(&*first));
+}
+
+#[test]
+fn execution_identity_dequeue_then_readmission_is_a_distinct_episode() {
+    let store = ExecutionFactsStore::new();
+    let mut state = state_with(&["alpha"]);
+
+    admit(&store, &mut state, "alpha", at(0));
+    let first = store.change("alpha").execution_id.expect("first episode");
+
+    dispatch(
+        &store,
+        &mut state,
+        ExecutionEvent::ChangeDequeued {
+            change_id: "alpha".to_string(),
+        },
+        at(1),
+    );
+    assert_eq!(
+        store.change("alpha").execution_state,
+        ChangeExecutionState::Stopped
+    );
+
+    admit(&store, &mut state, "alpha", at(2));
+    let second = store.change("alpha").execution_id.expect("second episode");
+    assert_ne!(
+        first, second,
+        "a re-admission is a new episode, so a sink bound to the first cannot \
+         observe or control the second"
+    );
+    assert_eq!(store.change_of_execution(&first), None);
+}
+
+#[test]
+fn execution_identity_retry_after_a_terminal_error_is_a_distinct_episode() {
+    let store = ExecutionFactsStore::new();
+    let mut state = state_with(&["alpha"]);
+
+    admit(&store, &mut state, "alpha", at(0));
+    let first = store.change("alpha").execution_id.expect("first episode");
+
+    dispatch(
+        &store,
+        &mut state,
+        ExecutionEvent::ApplyFailed {
+            change_id: "alpha".to_string(),
+            error: "boom".to_string(),
+        },
+        at(1),
+    );
+    assert_eq!(
+        store.change("alpha").execution_state,
+        ChangeExecutionState::Failed
+    );
+
+    state.retry_terminal_error("alpha");
+    dispatch(&store, &mut state, operator_applied("alpha", true), at(2));
+    let second = store.change("alpha").execution_id.expect("retry episode");
+    assert_ne!(first, second, "a retry is its own execution episode");
+}
+
+#[test]
+fn execution_identity_does_not_survive_a_restart() {
+    let store = ExecutionFactsStore::new();
+    let mut state = state_with(&["alpha"]);
+    admit(&store, &mut state, "alpha", at(0));
+    assert!(store.change("alpha").execution_id.is_some());
+
+    // A new incarnation. Under the constitution nothing process-local may
+    // survive it, so every prior binding is simply gone rather than silently
+    // rebound onto whatever this process is doing now.
+    let restarted = ExecutionFactsStore::new();
+    assert_eq!(restarted.change("alpha").execution_id, None);
+    assert_eq!(restarted.execution_id("alpha"), None);
+}
+
+#[test]
+fn execution_identity_publishes_start_blocked_edges_and_exactly_one_terminal() {
+    let observer = std::sync::Arc::new(RecordingObserver::default());
+    let store = ExecutionFactsStore::new();
+    store.bind_episode_observer(observer.clone());
+    let mut state = state_with(&["alpha"]);
+
+    admit(&store, &mut state, "alpha", at(0));
+    dispatch(
+        &store,
+        &mut state,
+        ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "r1".to_string(),
+        },
+        at(1),
+    );
+
+    assert_eq!(
+        observer.kinds(),
+        vec![
+            EpisodeTransitionKind::Started,
+            EpisodeTransitionKind::Terminal(EpisodeTerminal::Completed),
+        ]
+    );
+    let ids = observer.ids();
+    assert_eq!(ids[0], ids[1], "both transitions belong to one episode");
+
+    // A settled episode publishes nothing more, however many refreshes follow.
+    dispatch(&store, &mut state, apply_started("alpha"), at(2));
+    assert_eq!(observer.kinds().len(), 2);
+}
+
+#[test]
+fn execution_identity_treats_disappearance_as_settling_nothing() {
+    let observer = std::sync::Arc::new(RecordingObserver::default());
+    let store = ExecutionFactsStore::new();
+    store.bind_episode_observer(observer.clone());
+    let mut state = state_with(&["alpha", "beta"]);
+
+    admit(&store, &mut state, "alpha", at(0));
+    admit(&store, &mut state, "beta", at(1));
+
+    // `alpha` stops being tracked. That is ambiguous evidence, so the episode
+    // stays open: settling it would be exactly the "it vanished, so it must
+    // have worked" inference the completion contract forbids.
+    let mut without_alpha = state_with(&["beta"]);
+    without_alpha.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+        "beta".to_string(),
+    ));
+    dispatch(
+        &store,
+        &mut without_alpha,
+        operator_applied("beta", true),
+        at(2),
+    );
+
+    assert!(
+        !observer
+            .kinds()
+            .iter()
+            .any(|kind| matches!(kind, EpisodeTransitionKind::Terminal(_))),
+        "a change leaving the snapshot must never settle its episode"
+    );
+}
+
+/// Edge-triggering is the whole contract for attention: an unchanged blocked
+/// state must not redeliver, while leaving and re-entering it must arm a new
+/// edge. Asserted on the transition function directly so the wait condition is
+/// exact rather than whatever the reducer happens to produce.
+#[test]
+fn execution_identity_blocked_attention_is_edge_triggered() {
+    let mut pending = Vec::new();
+    let mut facts = ChangeFactsState::default();
+
+    ExecutionFactsStore::advance_episode(
+        &mut pending,
+        "alpha",
+        &mut facts,
+        ChangeExecutionState::Queued,
+    );
+    ExecutionFactsStore::advance_episode(
+        &mut pending,
+        "alpha",
+        &mut facts,
+        ChangeExecutionState::Waiting,
+    );
+    // Unchanged: no new edge.
+    ExecutionFactsStore::advance_episode(
+        &mut pending,
+        "alpha",
+        &mut facts,
+        ChangeExecutionState::Waiting,
+    );
+    // Recovery, then a second block: a new edge.
+    ExecutionFactsStore::advance_episode(
+        &mut pending,
+        "alpha",
+        &mut facts,
+        ChangeExecutionState::Active,
+    );
+    ExecutionFactsStore::advance_episode(
+        &mut pending,
+        "alpha",
+        &mut facts,
+        ChangeExecutionState::Waiting,
+    );
+
+    let kinds: Vec<EpisodeTransitionKind> = pending.iter().map(|t| t.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            EpisodeTransitionKind::Started,
+            EpisodeTransitionKind::BlockedEntered,
+            EpisodeTransitionKind::BlockedLeft,
+            EpisodeTransitionKind::BlockedEntered,
+        ]
+    );
+}
+
+/// Every way an episode can leave admission maps onto exactly one typed
+/// terminal, and `Unknown` — a revoked queue intent with no terminal state — is
+/// a stop rather than an invented success.
+#[test]
+fn execution_identity_terminal_classes_come_from_typed_state_only() {
+    let cases = [
+        (ChangeExecutionState::Completed, EpisodeTerminal::Completed),
+        (ChangeExecutionState::Failed, EpisodeTerminal::Failed),
+        (ChangeExecutionState::Stopped, EpisodeTerminal::Stopped),
+        (ChangeExecutionState::Unknown, EpisodeTerminal::Stopped),
+    ];
+    for (state, expected) in cases {
+        let mut pending = Vec::new();
+        let mut facts = ChangeFactsState::default();
+        ExecutionFactsStore::advance_episode(
+            &mut pending,
+            "alpha",
+            &mut facts,
+            ChangeExecutionState::Queued,
+        );
+        ExecutionFactsStore::advance_episode(&mut pending, "alpha", &mut facts, state);
+        assert_eq!(
+            pending.last().map(|transition| transition.kind),
+            Some(EpisodeTransitionKind::Terminal(expected)),
+            "{state:?} must settle as {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn execution_identity_terminal_tokens_are_stable() {
+    assert_eq!(EpisodeTerminal::Completed.as_str(), "completed");
+    assert_eq!(EpisodeTerminal::Failed.as_str(), "failed");
+    assert_eq!(EpisodeTerminal::Stopped.as_str(), "stopped");
+}
+
+/// Identity is observability, so binding an observer must not change a single
+/// fact the store publishes.
+#[test]
+fn execution_identity_is_observability_only() {
+    let observed = ExecutionFactsStore::new();
+    observed.bind_episode_observer(std::sync::Arc::new(RecordingObserver::default()));
+    let unobserved = ExecutionFactsStore::new();
+
+    let mut left = state_with(&["alpha"]);
+    let mut right = state_with(&["alpha"]);
+    admit(&observed, &mut left, "alpha", at(0));
+    admit(&unobserved, &mut right, "alpha", at(0));
+    dispatch(&observed, &mut left, apply_started("alpha"), at(1));
+    dispatch(&unobserved, &mut right, apply_started("alpha"), at(1));
+
+    assert_eq!(
+        observed.change("alpha").execution_state,
+        unobserved.change("alpha").execution_state
+    );
+    assert_eq!(
+        observed.change("alpha").current_phase,
+        unobserved.change("alpha").current_phase
+    );
+    assert_eq!(
+        observed.snapshot().has_active_work(),
+        unobserved.snapshot().has_active_work()
+    );
 }

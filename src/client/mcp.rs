@@ -1,0 +1,1023 @@
+//! `cflx client mcp` — the client boundary, spoken as Model Context Protocol.
+//!
+//! # What this is
+//!
+//! A stdio JSON-RPC frontend over exactly the intents `cflx client` already
+//! offers, plus the three notify operations. It is a *client*: it takes no
+//! repository lock, binds no listener, starts no run, and holds no orchestration
+//! state. Every tool call resolves a connection, asks the owner, and returns the
+//! same versioned envelope the CLI prints.
+//!
+//! # Why the tool set is closed
+//!
+//! The obvious design — expose `/api/v2` and let the model compose commands — is
+//! the one thing this must not do. `POST /api/v2/commands` needs an expected
+//! revision, an idempotency key, and mode-aware routing between mark/queue/start;
+//! a model that got any of those wrong would consume another operator's execution
+//! marks or double-submit under a stale revision. So the tools are intents, the
+//! routing stays in `enqueue`, and there is no way to name a raw command type,
+//! revision, idempotency key, queue mark, or shell string at all.
+//!
+//! # Why stdout is protocol-only
+//!
+//! An MCP host parses stdout as a JSON-RPC stream. A single stray log line
+//! desynchronizes the session, so nothing here writes to stdout except complete
+//! frames, and every diagnostic goes to stderr.
+//!
+//! # Bounded calls
+//!
+//! `cflx_enqueue` returns as soon as admission settles; it never holds the call
+//! open for the life of a change. Asynchronous continuation is what the
+//! execution-scoped sinks are for, and `cflx_wait` keeps its explicit timeout for
+//! bounded synchronous observation.
+
+use std::path::PathBuf;
+
+use serde::Deserialize;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
+
+/// The MCP revision this adapter implements.
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Revisions this adapter will echo back when a client asks for one of them.
+///
+/// A client that asks for something else is answered with [`PROTOCOL_VERSION`],
+/// which the MCP handshake defines as the server proposing its own revision
+/// rather than failing the session.
+pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = ["2025-06-18", "2025-03-26"];
+
+/// Longest accepted single JSON-RPC frame.
+///
+/// A stdio peer that never emits a newline would otherwise grow the read buffer
+/// without bound. The ceiling is far above any legitimate tool call.
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Every tool this adapter exposes, in listing order.
+pub const TOOL_NAMES: [&str; 6] = [
+    "cflx_status",
+    "cflx_enqueue",
+    "cflx_wait",
+    "cflx_notify_set",
+    "cflx_notify_get",
+    "cflx_notify_clear",
+];
+
+/// Connection settings every tool accepts.
+///
+/// A token *value* is deliberately absent: the field names an environment
+/// variable, so nothing that can read this process's arguments — or the model's
+/// own transcript — ever sees a credential.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ConnectionArgs {
+    #[serde(default)]
+    unix_socket: Option<PathBuf>,
+    #[serde(default)]
+    auth_token_env: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusArgs {
+    #[serde(flatten)]
+    connection: ConnectionArgs,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnqueueArgs {
+    change_id: String,
+    #[serde(flatten)]
+    connection: ConnectionArgs,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitArgs {
+    change_id: String,
+    /// Duration spelling accepted by `--timeout`: `500ms`, `30s`, `45m`, `2h`.
+    #[serde(default)]
+    timeout: Option<String>,
+    #[serde(flatten)]
+    connection: ConnectionArgs,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotifySetArgs {
+    change_id: String,
+    execution_id: String,
+    /// Owner incarnation the execution was admitted by, when the caller kept it.
+    #[serde(default)]
+    instance_id: Option<String>,
+    command: Vec<String>,
+    #[serde(default)]
+    notify_blocked: bool,
+    #[serde(flatten)]
+    connection: ConnectionArgs,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotifyRefArgs {
+    change_id: String,
+    execution_id: String,
+    /// Owner incarnation the execution was admitted by, when the caller kept it.
+    #[serde(default)]
+    instance_id: Option<String>,
+    #[serde(flatten)]
+    connection: ConnectionArgs,
+}
+
+/// Why a tool call could not be attempted at all.
+///
+/// Distinct from an unsuccessful envelope: a rejected argument list never
+/// reached the owner, so reporting it as a client outcome would claim an
+/// observation that never happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolError {
+    /// Sanitized explanation. Never carries a credential.
+    pub message: String,
+}
+
+impl ToolError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// What actually talks to an owner.
+///
+/// Behind a trait so the protocol layer is testable without a socket: framing,
+/// negotiation, schema exposure, and error mapping are contract, and none of
+/// them should need a running owner to assert.
+#[async_trait::async_trait]
+pub trait ToolHost: Send + Sync {
+    /// Run one named tool and return the envelope it produced.
+    async fn call(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<ResultEnvelope, ToolError>;
+}
+
+/// The production host: every call goes through the same client modules the CLI
+/// uses, so a tool and a command cannot disagree about routing or truthfulness.
+pub struct ClientToolHost {
+    default_socket: Option<PathBuf>,
+    default_token_env: Option<String>,
+}
+
+impl ClientToolHost {
+    /// Build a host whose per-call connection settings default to the ones the
+    /// `cflx client` namespace was invoked with.
+    pub fn new(default_socket: Option<PathBuf>, default_token_env: Option<String>) -> Self {
+        Self {
+            default_socket,
+            default_token_env,
+        }
+    }
+
+    /// Resolve a connection, or return the refusal envelope to answer with.
+    ///
+    /// `Box`ed because the envelope is much larger than the connection handle,
+    /// and an unboxed error variant would make every successful call carry the
+    /// failure's footprint.
+    fn connect(
+        &self,
+        args: &ConnectionArgs,
+        operation: Operation,
+    ) -> Result<crate::client::session::Connection, Box<ResultEnvelope>> {
+        let socket = args
+            .unix_socket
+            .clone()
+            .or_else(|| self.default_socket.clone());
+        let token_env = args
+            .auth_token_env
+            .clone()
+            .or_else(|| self.default_token_env.clone());
+        crate::client::session::Connection::resolve(socket.as_deref(), token_env.as_deref())
+            .map_err(|refusal| Box::new(refusal.into_envelope(operation)))
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolHost for ClientToolHost {
+    async fn call(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<ResultEnvelope, ToolError> {
+        match name {
+            "cflx_status" => {
+                let args: StatusArgs = parse_args(arguments)?;
+                let connection = match self.connect(&args.connection, Operation::Status) {
+                    Ok(connection) => connection,
+                    Err(envelope) => return Ok(*envelope),
+                };
+                Ok(crate::client::session::status(&connection).await)
+            }
+            "cflx_enqueue" => {
+                let args: EnqueueArgs = parse_args(arguments)?;
+                let change_id = validated_change_id(&args.change_id)?;
+                let connection = match self.connect(&args.connection, Operation::Enqueue) {
+                    Ok(connection) => connection,
+                    Err(envelope) => return Ok((*envelope).with_change(change_id)),
+                };
+                Ok(crate::client::enqueue::run(&connection, &change_id).await)
+            }
+            "cflx_wait" => {
+                let args: WaitArgs = parse_args(arguments)?;
+                let change_id = validated_change_id(&args.change_id)?;
+                let timeout = match args.timeout.as_deref() {
+                    Some(value) => {
+                        crate::cli::parse_client_timeout(value).map_err(ToolError::new)?
+                    }
+                    None => DEFAULT_WAIT_TIMEOUT,
+                };
+                let connection = match self.connect(&args.connection, Operation::Wait) {
+                    Ok(connection) => connection,
+                    Err(envelope) => return Ok((*envelope).with_change(change_id)),
+                };
+                Ok(crate::client::wait::run(&connection, &change_id, timeout).await)
+            }
+            "cflx_notify_set" => {
+                let args: NotifySetArgs = parse_args(arguments)?;
+                let change_id = validated_change_id(&args.change_id)?;
+                let connection = match self.connect(&args.connection, Operation::NotifySet) {
+                    Ok(connection) => connection,
+                    Err(envelope) => return Ok((*envelope).with_change(change_id)),
+                };
+                Ok(crate::client::notify::run(
+                    &connection,
+                    &change_id,
+                    &args.execution_id,
+                    args.instance_id.as_deref(),
+                    crate::client::notify::Intent::Set {
+                        command: args.command,
+                        notify_blocked: args.notify_blocked,
+                    },
+                )
+                .await)
+            }
+            "cflx_notify_get" | "cflx_notify_clear" => {
+                let args: NotifyRefArgs = parse_args(arguments)?;
+                let change_id = validated_change_id(&args.change_id)?;
+                let (operation, intent) = if name == "cflx_notify_get" {
+                    (Operation::NotifyGet, crate::client::notify::Intent::Get)
+                } else {
+                    (Operation::NotifyClear, crate::client::notify::Intent::Clear)
+                };
+                let connection = match self.connect(&args.connection, operation) {
+                    Ok(connection) => connection,
+                    Err(envelope) => return Ok((*envelope).with_change(change_id)),
+                };
+                Ok(crate::client::notify::run(
+                    &connection,
+                    &change_id,
+                    &args.execution_id,
+                    args.instance_id.as_deref(),
+                    intent,
+                )
+                .await)
+            }
+            other => Err(ToolError::new(format!(
+                "'{other}' is not a tool this server exposes"
+            ))),
+        }
+    }
+}
+
+/// Default `cflx_wait` budget, matching the CLI's own `--timeout` default.
+const DEFAULT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Parse one tool's arguments, failing closed on anything unexpected.
+fn parse_args<T: serde::de::DeserializeOwned>(
+    arguments: &serde_json::Value,
+) -> Result<T, ToolError> {
+    let arguments = if arguments.is_null() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        arguments.clone()
+    };
+    serde_json::from_value(arguments).map_err(|error| {
+        // The model's own text is never echoed back: only serde's structural
+        // complaint, which names fields rather than values.
+        ToolError::new(format!("the tool arguments were not accepted: {error}"))
+    })
+}
+
+/// Apply the CLI's own change-ID rule to a tool argument.
+///
+/// The same narrow shape, for the same reason: a change ID reaches a URL query
+/// and a Git ref derivation, and a model is exactly the kind of caller that
+/// would send `../` if nothing stopped it.
+fn validated_change_id(value: &str) -> Result<String, ToolError> {
+    crate::cli::parse_change_id(value).map_err(ToolError::new)
+}
+
+/// The published `tools/list` payload.
+pub fn tool_descriptors() -> serde_json::Value {
+    let connection_properties = serde_json::json!({
+        "unix_socket": {
+            "type": "string",
+            "description": "Path to the owner's /api/v2 Unix socket. Defaults to ${GIT_COMMON_DIR}/cflx-api.sock."
+        },
+        "auth_token_env": {
+            "type": "string",
+            "description": "Name of an environment variable holding the bearer token. A token value is never accepted."
+        }
+    });
+    let with_connection = |mut properties: serde_json::Value| {
+        if let (Some(target), Some(source)) = (
+            properties.as_object_mut(),
+            connection_properties.as_object(),
+        ) {
+            for (key, value) in source {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        properties
+    };
+
+    serde_json::json!({
+        "tools": [
+            {
+                "name": "cflx_status",
+                "title": "Read the existing Conflux owner",
+                "description": "Read one coherent snapshot of the Conflux process that owns this repository. Mutates nothing and submits no command.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": with_connection(serde_json::json!({})),
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "cflx_enqueue",
+                "title": "Ask the owner to admit one change",
+                "description": "Ask the existing owner to admit one change. Returns as soon as admission settles — it is not a completion signal. The returned execution_id names the exact admitted episode; pass it to cflx_notify_set to be told when that episode finishes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": with_connection(serde_json::json!({
+                        "change_id": {"type": "string", "description": "Change to admit."}
+                    })),
+                    "required": ["change_id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "cflx_wait",
+                "title": "Observe one change until verified completion",
+                "description": "Observe one change until current repository evidence proves the owner's terminal mode, a typed failure settles, or the bounded timeout passes. Submits no command. A change disappearing from the owner's snapshot is never completion.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": with_connection(serde_json::json!({
+                        "change_id": {"type": "string", "description": "Change to observe."},
+                        "timeout": {
+                            "type": "string",
+                            "description": "Bounded budget: a whole number optionally suffixed with ms, s, m, or h (for example 500ms, 30s, 45m, 2h). Defaults to 60m."
+                        }
+                    })),
+                    "required": ["change_id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "cflx_notify_set",
+                "title": "Attach a completion callback to one execution",
+                "description": "Attach one bounded argv the owner runs once when this exact execution reaches a typed terminal classification. argv is data, never shell source. Accepted only over the owner's Unix socket. Registering after the execution already settled delivers that terminal event immediately.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": with_connection(serde_json::json!({
+                        "change_id": {"type": "string", "description": "Change the execution belongs to."},
+                        "execution_id": {"type": "string", "description": "Execution episode returned by cflx_enqueue."},
+                        "instance_id": {"type": "string", "description": "Owner incarnation cflx_enqueue reported. Supplying it turns an owner restart into a typed owner_restarted refusal instead of a lost execution."},
+                        "command": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Callback argv. Element 0 is the program; no shell interpretation is applied."
+                        },
+                        "notify_blocked": {
+                            "type": "boolean",
+                            "description": "Also deliver the non-terminal blocked attention edge. Terminal events are always delivered and cannot be disabled."
+                        }
+                    })),
+                    "required": ["change_id", "execution_id", "command"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "cflx_notify_get",
+                "title": "Read one execution's completion callback",
+                "description": "Read the callback currently attached to one execution, along with which events have already been delivered.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": with_connection(serde_json::json!({
+                        "change_id": {"type": "string", "description": "Change the execution belongs to."},
+                        "execution_id": {"type": "string", "description": "Execution episode to read."},
+                        "instance_id": {"type": "string", "description": "Owner incarnation cflx_enqueue reported. Supplying it turns an owner restart into a typed owner_restarted refusal instead of a lost execution."}
+                    })),
+                    "required": ["change_id", "execution_id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "cflx_notify_clear",
+                "title": "Detach one execution's completion callback",
+                "description": "Detach the callback attached to one execution. Accepted only over the owner's Unix socket.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": with_connection(serde_json::json!({
+                        "change_id": {"type": "string", "description": "Change the execution belongs to."},
+                        "execution_id": {"type": "string", "description": "Execution episode to clear."},
+                        "instance_id": {"type": "string", "description": "Owner incarnation cflx_enqueue reported. Supplying it turns an owner restart into a typed owner_restarted refusal instead of a lost execution."}
+                    })),
+                    "required": ["change_id", "execution_id"],
+                    "additionalProperties": false
+                }
+            }
+        ]
+    })
+}
+
+/// JSON-RPC error codes this adapter emits.
+mod rpc {
+    /// The frame was not valid JSON.
+    pub const PARSE_ERROR: i64 = -32700;
+    /// The frame was JSON but not a JSON-RPC request.
+    pub const INVALID_REQUEST: i64 = -32600;
+    /// No such method.
+    pub const METHOD_NOT_FOUND: i64 = -32601;
+}
+
+/// One MCP session over a pair of byte streams.
+pub struct Session<H: ToolHost> {
+    host: H,
+    /// True once `initialize` succeeded. Kept because a host that skips the
+    /// handshake is a protocol violation worth naming rather than serving.
+    initialized: bool,
+}
+
+impl<H: ToolHost> Session<H> {
+    /// Build a session over one tool host.
+    pub fn new(host: H) -> Self {
+        Self {
+            host,
+            initialized: false,
+        }
+    }
+
+    /// Whether `initialize` has been answered.
+    // Observed by the handshake assertions; the serving loop answers every
+    // method regardless, so nothing in the binary branches on it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Handle one JSON-RPC frame, returning the frame to write back.
+    ///
+    /// `None` means the message was a notification, which by JSON-RPC has no
+    /// response at all — writing one would desynchronize a strict host.
+    pub async fn handle(&mut self, line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let message: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(message) => message,
+            Err(error) => {
+                return Some(error_frame(
+                    serde_json::Value::Null,
+                    rpc::PARSE_ERROR,
+                    format!("the frame is not valid JSON: {error}"),
+                ))
+            }
+        };
+
+        let id = message.get("id").cloned();
+        let Some(method) = message.get("method").and_then(|value| value.as_str()) else {
+            return Some(error_frame(
+                id.unwrap_or(serde_json::Value::Null),
+                rpc::INVALID_REQUEST,
+                "the frame carries no method",
+            ));
+        };
+        let params = message
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        // A notification has no `id`, so it gets no response — including the
+        // one method that legitimately arrives as one.
+        let Some(id) = id else {
+            if method == "notifications/initialized" {
+                self.initialized = true;
+            }
+            return None;
+        };
+
+        match method {
+            "initialize" => {
+                self.initialized = true;
+                Some(result_frame(id, self.initialize_result(&params)))
+            }
+            "ping" => Some(result_frame(id, serde_json::json!({}))),
+            "tools/list" => Some(result_frame(id, tool_descriptors())),
+            "tools/call" => Some(result_frame(id, self.call_tool(&params).await)),
+            other => Some(error_frame(
+                id,
+                rpc::METHOD_NOT_FOUND,
+                format!("'{other}' is not a method this server implements"),
+            )),
+        }
+    }
+
+    fn initialize_result(&self, params: &serde_json::Value) -> serde_json::Value {
+        // Echo the client's revision when it is one this adapter speaks;
+        // otherwise propose our own, which is what the handshake is for.
+        let requested = params
+            .get("protocolVersion")
+            .and_then(|value| value.as_str())
+            .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+            .unwrap_or(PROTOCOL_VERSION);
+        serde_json::json!({
+            "protocolVersion": requested,
+            "capabilities": {"tools": {"listChanged": false}},
+            "serverInfo": {
+                "name": "cflx-client",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "instructions": "Intent-shaped client of the Conflux process that already owns this \
+                             repository. cflx_enqueue admits one change and returns immediately \
+                             with an execution_id; admission is not completion. Use \
+                             cflx_notify_set with that execution_id for asynchronous \
+                             continuation, or cflx_wait for a bounded synchronous observation. \
+                             Branch on the envelope's `outcome` field, never on prose.",
+        })
+    }
+
+    /// Run one `tools/call`.
+    ///
+    /// A refused argument list and an unsuccessful owner outcome are both
+    /// `isError: true` tool results rather than JSON-RPC errors, because the
+    /// *call* succeeded — the model needs to read the reason and decide, which a
+    /// protocol-level error would hide from it.
+    async fn call_tool(&self, params: &serde_json::Value) -> serde_json::Value {
+        let Some(name) = params.get("name").and_then(|value| value.as_str()) else {
+            return tool_failure("the call names no tool");
+        };
+        if !TOOL_NAMES.contains(&name) {
+            return tool_failure(format!("'{name}' is not a tool this server exposes"));
+        }
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        match self.host.call(name, &arguments).await {
+            Ok(envelope) => {
+                let value =
+                    serde_json::to_value(&envelope).unwrap_or_else(|_| serde_json::json!({}));
+                serde_json::json!({
+                    "content": [{"type": "text", "text": envelope.to_json_line()}],
+                    "structuredContent": value,
+                    "isError": !envelope.ok,
+                })
+            }
+            Err(error) => tool_failure(error.message),
+        }
+    }
+}
+
+/// Build the `isError` tool result for a call that never reached an owner.
+fn tool_failure(message: impl Into<String>) -> serde_json::Value {
+    let message = message.into();
+    serde_json::json!({
+        "content": [{"type": "text", "text": message}],
+        "isError": true,
+    })
+}
+
+fn result_frame(id: serde_json::Value, result: serde_json::Value) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    }))
+    .unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"result is not encodable"}}"#
+            .to_string()
+    })
+}
+
+fn error_frame(id: serde_json::Value, code: i64, message: impl Into<String>) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message.into()},
+    }))
+    .unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"error is not encodable"}}"#
+            .to_string()
+    })
+}
+
+/// Serve one stdio MCP session and return the process exit status.
+///
+/// Reads newline-delimited JSON-RPC from `input` and writes newline-delimited
+/// JSON-RPC to `output`, and nothing else to `output` ever.
+pub async fn serve<H, R, W>(host: H, input: R, mut output: W) -> i32
+where
+    H: ToolHost,
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut session = Session::new(host);
+    let mut reader = BufReader::new(input);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => {
+                eprintln!("cflx client mcp: stdin failed: {error}");
+                return Outcome::TransportError.exit_code();
+            }
+        };
+        if read > MAX_FRAME_BYTES {
+            // Answering would mean parsing a frame this server already refused
+            // to hold, so the session ends instead of guessing at its shape.
+            eprintln!("cflx client mcp: a frame exceeded {MAX_FRAME_BYTES} bytes");
+            return Outcome::TransportError.exit_code();
+        }
+        let Some(response) = session.handle(&line).await else {
+            continue;
+        };
+        if output
+            .write_all(response.as_bytes())
+            .await
+            .and(output.write_all(b"\n").await)
+            .is_err()
+            || output.flush().await.is_err()
+        {
+            eprintln!("cflx client mcp: the host closed the protocol stream");
+            return Outcome::TransportError.exit_code();
+        }
+    }
+    0
+}
+
+/// Run `cflx client mcp` over the process's own stdio.
+pub async fn run(default_socket: Option<PathBuf>, default_token_env: Option<String>) -> i32 {
+    serve(
+        ClientToolHost::new(default_socket, default_token_env),
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A host that answers from a script, so protocol behavior is assertable
+    /// without a socket, a repository, or an owner.
+    #[derive(Default)]
+    struct FakeHost {
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
+        answer: Mutex<Option<Result<ResultEnvelope, ToolError>>>,
+    }
+
+    impl FakeHost {
+        fn answering(envelope: ResultEnvelope) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                answer: Mutex::new(Some(Ok(envelope))),
+            }
+        }
+
+        fn refusing(message: &str) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                answer: Mutex::new(Some(Err(ToolError::new(message)))),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolHost for FakeHost {
+        async fn call(
+            &self,
+            name: &str,
+            arguments: &serde_json::Value,
+        ) -> Result<ResultEnvelope, ToolError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), arguments.clone()));
+            self.answer
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| Err(ToolError::new("no scripted answer")))
+        }
+    }
+
+    fn parse(frame: &str) -> serde_json::Value {
+        serde_json::from_str(frame).expect("every response frame must be one JSON object")
+    }
+
+    async fn respond(
+        session: &mut Session<FakeHost>,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        let frame = session
+            .handle(&request.to_string())
+            .await
+            .expect("a request with an id owes a response");
+        assert!(!frame.contains('\n'), "a frame must be one line: {frame}");
+        parse(&frame)
+    }
+
+    fn session() -> Session<FakeHost> {
+        Session::new(FakeHost::default())
+    }
+
+    #[tokio::test]
+    async fn initialize_echoes_a_revision_it_speaks_and_proposes_its_own_otherwise() {
+        let mut session = session();
+        assert!(!session.is_initialized());
+        let response = respond(
+            &mut session,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26", "capabilities": {}}
+            }),
+        )
+        .await;
+        assert_eq!(response["result"]["protocolVersion"], "2025-03-26");
+        assert_eq!(response["result"]["serverInfo"]["name"], "cflx-client");
+        assert!(response["result"]["capabilities"]["tools"].is_object());
+        assert!(session.is_initialized());
+
+        // An unknown revision is answered with this server's own rather than
+        // failing the session, which is what the handshake exists for.
+        let response = respond(
+            &mut session,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "initialize",
+                "params": {"protocolVersion": "1999-01-01"}
+            }),
+        )
+        .await;
+        assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn a_notification_is_absorbed_without_any_response_frame() {
+        let mut session = session();
+        assert!(session
+            .handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await
+            .is_none());
+        assert!(session.is_initialized());
+        // A blank keepalive line is not a message either.
+        assert!(session.handle("   ").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ping_answers_an_empty_result() {
+        let mut session = session();
+        let response = respond(
+            &mut session,
+            serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}),
+        )
+        .await;
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn framing_faults_are_reported_as_json_rpc_errors_not_as_silence() {
+        let mut session = session();
+        let frame = session.handle("{not json").await.expect("owed a response");
+        let response = parse(&frame);
+        assert_eq!(response["error"]["code"], rpc::PARSE_ERROR);
+        assert!(response["id"].is_null());
+
+        let response = respond(
+            &mut session,
+            serde_json::json!({"jsonrpc": "2.0", "id": 3, "params": {}}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], rpc::INVALID_REQUEST);
+
+        let response = respond(
+            &mut session,
+            serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "resources/list"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], rpc::METHOD_NOT_FOUND);
+    }
+
+    /// The tool set is the security boundary, so it is asserted exactly rather
+    /// than sampled: nothing here may name a command type, an expected revision,
+    /// an idempotency key, an execution mark, or shell source.
+    #[tokio::test]
+    async fn tools_list_exposes_exactly_the_closed_intent_set() {
+        let mut session = session();
+        let response = respond(
+            &mut session,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        let tools = response["result"]["tools"].as_array().expect("a tool list");
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, TOOL_NAMES.to_vec());
+
+        let rendered = response.to_string();
+        for forbidden in [
+            "expected_revision",
+            "idempotency_key",
+            "set_execution_mark",
+            "command_type",
+            "/api/v2/commands",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "the closed tool surface must not mention {forbidden}"
+            );
+        }
+
+        for tool in tools {
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["type"], "object");
+            assert_eq!(
+                schema["additionalProperties"], false,
+                "{} must fail closed on unknown fields",
+                tool["name"]
+            );
+            // Connection settings are on every tool, and the token is always a
+            // variable *name*.
+            assert!(schema["properties"]["auth_token_env"].is_object());
+            assert!(
+                schema["properties"].get("auth_token").is_none(),
+                "a token value must never be an accepted argument"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_call_returns_the_envelope_as_text_and_structured_content() {
+        let envelope = ResultEnvelope::new(Operation::Enqueue, Outcome::Admitted)
+            .with_change("alpha")
+            .with_instance(Some("i-1".to_string()))
+            .with_execution(Some("e-1".to_string()));
+        let mut session = Session::new(FakeHost::answering(envelope));
+        let response = respond(
+            &mut session,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "cflx_enqueue", "arguments": {"change_id": "alpha"}}
+            }),
+        )
+        .await;
+        let result = &response["result"];
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["outcome"], "admitted");
+        assert_eq!(result["structuredContent"]["execution_id"], "e-1");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(reparsed["outcome"], "admitted");
+    }
+
+    /// An unsuccessful *owner* outcome is a tool error the model can read, not a
+    /// protocol error that would hide the reason from it.
+    #[tokio::test]
+    async fn an_unsuccessful_outcome_is_an_error_tool_result_carrying_its_reason() {
+        let envelope = ResultEnvelope::new(Operation::Enqueue, Outcome::TargetIneligible)
+            .with_change("alpha")
+            .with_message("'alpha' has reached the final status 'merged'");
+        let mut session = Session::new(FakeHost::answering(envelope));
+        let response = respond(
+            &mut session,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "cflx_enqueue", "arguments": {"change_id": "alpha"}}
+            }),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "the call itself succeeded");
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["outcome"],
+            "target_ineligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_tool_is_refused_without_reaching_the_host() {
+        let host = FakeHost::refusing("unreachable");
+        let mut session = Session::new(host);
+        let response = respond(
+            &mut session,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "cflx_force_stop", "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], true);
+        assert!(session.host.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_host_refusal_becomes_an_error_result_rather_than_a_protocol_error() {
+        let mut session = Session::new(FakeHost::refusing("the tool arguments were not accepted"));
+        let response = respond(
+            &mut session,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "cflx_status", "arguments": {"nope": 1}}
+            }),
+        )
+        .await;
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not accepted"));
+    }
+
+    /// Every byte the server writes has to be a protocol frame, because an MCP
+    /// host parses this stream and one stray line desynchronizes the session.
+    #[tokio::test]
+    async fn the_protocol_stream_carries_only_complete_json_rpc_frames() {
+        let requests = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "\n",
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            "\n",
+            "not json at all\n",
+        );
+        let mut output = Vec::new();
+        let status = serve(FakeHost::default(), requests.as_bytes(), &mut output).await;
+        assert_eq!(status, 0);
+
+        let text = String::from_utf8(output).expect("the stream is UTF-8");
+        let frames: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            frames.len(),
+            3,
+            "one frame per request with an id, and nothing for notifications or blank lines"
+        );
+        for frame in frames {
+            let value: serde_json::Value =
+                serde_json::from_str(frame).expect("every line is one JSON-RPC object");
+            assert_eq!(value["jsonrpc"], "2.0");
+            assert!(value.get("result").is_some() || value.get("error").is_some());
+        }
+    }
+
+    /// Argument parsing fails closed: an unknown field is a refusal, never a
+    /// silently-ignored instruction.
+    #[test]
+    fn tool_arguments_reject_unknown_fields() {
+        let ok: Result<EnqueueArgs, _> = parse_args(&serde_json::json!({"change_id": "alpha"}));
+        assert!(ok.is_ok());
+        let extra: Result<EnqueueArgs, _> =
+            parse_args(&serde_json::json!({"change_id": "alpha", "force": true}));
+        assert!(extra.is_err());
+        let missing: Result<EnqueueArgs, _> = parse_args(&serde_json::json!({}));
+        assert!(missing.is_err());
+        // Absent arguments are an empty object, not a parse failure, for the one
+        // tool that needs none.
+        let none: Result<StatusArgs, _> = parse_args(&serde_json::Value::Null);
+        assert!(none.is_ok());
+    }
+
+    #[test]
+    fn a_change_id_argument_obeys_the_same_rule_as_the_cli() {
+        assert_eq!(validated_change_id("alpha").unwrap(), "alpha");
+        for rejected in ["../escape", "-leading", ".hidden", "with space", ""] {
+            assert!(
+                validated_change_id(rejected).is_err(),
+                "{rejected} must be refused"
+            );
+        }
+    }
+}

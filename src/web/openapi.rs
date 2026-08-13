@@ -33,6 +33,7 @@ pub const SUPPORTED_V2_PATHS: &[&str] = &[
     "/api/v2/state",
     "/api/v2/execution-status",
     "/api/v2/execution-contract",
+    "/api/v2/executions/{execution_id}/sink",
     "/api/v2/changes",
     "/api/v2/changes/{change_id}",
     "/api/v2/logs",
@@ -107,6 +108,24 @@ another incarnation, the stream emits a `gap` envelope; the client must re-read
 different typed command identity fails with `idempotency_mismatch`; replaying the
 same identity returns the original record instead of acting twice.
 
+**Execution sinks.** `PUT /api/v2/executions/{execution_id}/sink` attaches one
+bounded argv the owner runs once when that admitted execution reaches a typed
+terminal classification. It is not a command: it creates no command record, needs
+no `expected_revision` or `idempotency_key`, and advances no revision. Because it
+stores an argv this process will execute, `PUT` and `DELETE` are accepted only
+over the owner's Unix socket and are refused over TCP with
+`transport_not_permitted`, even when bearer authentication succeeds.
+`GET /api/v2/capabilities` reports whether the surface exists at all.
+
+The callback itself is not an HTTP surface and has no schema here. It receives
+exactly `CFLX_EVENT_PATH`, `CFLX_EVENT_TYPE`, `CFLX_EXECUTION_ID`,
+`CFLX_CHANGE_ID`, and `CFLX_INSTANCE_ID` — the environment is replaced, not
+extended — and reads a versioned JSON file holding `schema_version`,
+`event_type`, `instance_id`, `execution_id`, `change_id`, `emitted_at`,
+`terminal`, an optional `terminal_mode`, and, for a proven completion only, a
+bounded `evidence` string. It never carries prompts, terminal contents,
+environment dumps, credentials, or unrestricted error bodies.
+
 **Worktree safety.** Worktrees are addressed only by the opaque process-local
 `worktree_id` handed out by a v2 read. Paths, branches, and base commits are
 server-derived and are rejected as mutation input, so no client can steer where a
@@ -128,6 +147,9 @@ worktree lands or what it is cut from.";
         crate::web::remote_control_api::reads::state,
         crate::web::remote_control_api::reads::execution_status,
         crate::web::remote_control_api::reads::execution_contract,
+        crate::web::remote_control_api::sinks::get_sink,
+        crate::web::remote_control_api::sinks::put_sink,
+        crate::web::remote_control_api::sinks::delete_sink,
         crate::web::remote_control_api::reads::list_changes,
         crate::web::remote_control_api::reads::get_change,
         crate::web::remote_control_api::reads::logs,
@@ -162,6 +184,14 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::dto::ExecutionStatusResponse,
             // The owner execution contract: what would *prove* a change finished.
             crate::web::remote_control_api::dto::ExecutionContractResponse,
+            // Execution-scoped completion sinks: subscription, not command.
+            // The event *file* is not here on purpose — it is an on-disk
+            // artifact for a local callback, never an HTTP body.
+            crate::web::remote_control_api::dto::ExecutionEventType,
+            crate::web::remote_control_api::dto::ExecutionSinkCapability,
+            crate::web::remote_control_api::dto::ExecutionSinkRequest,
+            crate::web::remote_control_api::dto::ExecutionSinkResponse,
+            crate::web::remote_control_api::dto::ExecutionSinkSpec,
             crate::web::remote_control_api::dto::OwnerExecutionContract,
             crate::web::remote_control_api::dto::TerminalMode,
             crate::web::remote_control_api::dto::LatestLogProjection,
