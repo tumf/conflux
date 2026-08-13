@@ -28,7 +28,8 @@ OpenCode session  ──cflx_enqueue──▶  cflx client mcp  ──▶  resid
 | `callback/cflx-resume-session.mjs` | The argv Conflux executes. Reads the event file and posts one marked message. |
 | `lib/cflx-mcp.mjs` | One-shot `cflx client mcp` client. |
 | `lib/resume.mjs` | Message composition and the OpenCode POST. |
-| `lib/loopback.mjs` | The destination policy: loopback base, same-origin final URL. |
+| `lib/loopback.mjs` | The destination policy: literal loopback base, same-origin final URL. |
+| `lib/state.mjs` | The delivery-state policy: where state lives, and proving it is yours alone. |
 
 Requires Node 18+ (for `fetch`) and a `cflx` on `PATH` — or `CFLX_BIN` pointing at
 one.
@@ -41,11 +42,11 @@ one.
 3. Point it at your local OpenCode server:
 
 ```bash
-export OPENCODE_SERVER=http://127.0.0.1:4096   # must be loopback
+export OPENCODE_SERVER=http://127.0.0.1:4096   # a literal loopback address, not a name
 export CFLX_BIN=/usr/local/bin/cflx            # optional
 export CFLX_UNIX_SOCKET=/path/to/cflx-api.sock # optional; defaults to the repo's
 export CFLX_AUTH_TOKEN_ENV=CFLX_TOKEN          # optional; a variable *name*
-export CFLX_RESUME_STATE=/tmp/cflx-auto-resume # optional delivery-state directory
+export CFLX_RESUME_STATE=$HOME/.cflx-resume    # optional; must be a 0700 directory you own
 ```
 
 `CFLX_AUTH_TOKEN_ENV` names an environment variable that holds the token. A token
@@ -69,8 +70,16 @@ to post a message without it.
 ## Where the callback may reach
 
 The callback POSTs a prompt into whatever it is pointed at, so its destination
-policy is narrow and it fails closed. Use `127.0.0.1`, not a hostname you do not
-control.
+policy is narrow and it fails closed: **only the literal addresses `127.0.0.1`
+and `[::1]`.**
+
+A hostname is refused, `localhost` included. A name is not a destination — it is
+a question answered by `/etc/hosts`, NSS, DNS search domains, and the resolver's
+A/AAAA ordering, none of which this integration controls. `localhost` almost
+always *is* loopback, and that is exactly the problem: accepting it would mean
+asserting something that cannot be checked at the point of use. The plugin
+applies the same rule to `OPENCODE_SERVER` when it registers, so a name never
+reaches an argv the owner would run.
 
 The **final** URL is the boundary, not the base. `new URL(path, base)` lets a
 path replace everything in front of it, so validating only `--server` would leave
@@ -90,7 +99,22 @@ so correcting the registration and running it again just works.
 
 ## Delivery state, and what "once" means here
 
-Two files per execution event live under `CFLX_RESUME_STATE`:
+Delivery state defaults to `~/.local/state/cflx/opencode-auto-resume`, created
+mode `0700`. It is deliberately *not* a shared path under the system temporary
+directory: `/tmp` is world-writable, so the first user to create
+`/tmp/cflx-auto-resume` would own every other user's delivery decisions. The
+callback runs with a replaced environment and no `HOME`, so the same derivation
+falls through to the passwd entry for its own uid.
+
+Whether it is the default or your own `CFLX_RESUME_STATE`, the directory is
+proven before a single record is read or written. It must be a real directory
+rather than a symlink, owned by the invoking user where the platform reports
+ownership, and closed to group and world (`0700`). Anything else is refused
+before a claim exists and before any HTTP: whoever can write these files can
+suppress a delivery by pre-creating a marker, or hold one hostage with a claim
+that never goes stale.
+
+Two files per execution event live there:
 
 | File | Meaning |
 | --- | --- |

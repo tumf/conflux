@@ -4,8 +4,11 @@
 // Registered with `cflx_notify_set` as, for example:
 //
 //   ["/usr/bin/env", "node", "<this file>",
-//    "--server", "http://127.0.0.1:4096", "--session", "ses_abc",
-//    "--state", "/tmp/cflx-auto-resume"]
+//    "--server", "http://127.0.0.1:4096", "--session", "ses_abc"]
+//
+// `--server` must be a literal loopback address, and `--state` — which defaults
+// to an owner-private directory under the invoking user's home — must name a
+// directory only that user can reach.
 //
 // The owner passes the event through exactly five environment variables and one
 // file. Nothing else is inherited — no PATH, no HOME, no owner token — so the
@@ -20,7 +23,6 @@
 import {
   existsSync,
   linkSync,
-  mkdirSync,
   readFileSync,
   renameSync,
   statSync,
@@ -29,9 +31,10 @@ import {
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 
+import { requireLoopback } from "../lib/loopback.mjs";
 import { composeMessage, resumeSession } from "../lib/resume.mjs";
+import { defaultStateDir, requirePrivateStateDir } from "../lib/state.mjs";
 
 /** Payload versions this callback understands. */
 const SUPPORTED_SCHEMA_VERSIONS = new Set([1]);
@@ -60,7 +63,12 @@ function parseArgs(argv) {
   }
   if (!args.server) throw new Error("--server is required");
   if (!args.session) throw new Error("--session is required");
-  if (!args.state) args.state = join(tmpdir(), "cflx-auto-resume");
+  // Checked here rather than at delivery time: a destination this callback will
+  // never be allowed to reach must cost nothing — no connection opened, and no
+  // claim or marker left behind to block a corrected registration.
+  requireLoopback(args.server);
+  // The default is derived and owner-private, never shared. See lib/state.mjs.
+  if (!args.state) args.state = defaultStateDir();
   return args;
 }
 
@@ -143,7 +151,9 @@ function paths(stateDir, event) {
  *            inflight: string, done: string}}
  */
 function claimDelivery(stateDir, event, now = Date.now()) {
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  // Before the first read or write. These files decide whether a message is
+  // sent, so a directory anybody else can reach is not one to keep them in.
+  requirePrivateStateDir(stateDir);
   const { inflight, done } = paths(stateDir, event);
   if (existsSync(done)) return { state: "delivered", inflight, done };
 
