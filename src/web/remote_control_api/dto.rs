@@ -1466,6 +1466,11 @@ pub struct ExecutionSinkRequest {
 }
 
 /// Binding a `GET` or `DELETE` sink request asserts.
+///
+/// Both members are optional only at the parsing layer, so an omission is
+/// reported as the typed validation refusal it is rather than as a malformed
+/// query string. Every sink request — inspection included — has to present the
+/// complete `(instance_id, execution_id, change_id)` binding.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ExecutionSinkParams {
     /// Owner incarnation the caller believes it is talking to.
@@ -1483,8 +1488,21 @@ pub struct ExecutionSinkResponse {
     pub execution_id: String,
     /// Change the execution belongs to.
     pub change_id: String,
-    /// Currently attached sink; `null` when none is.
+    /// Currently attached sink, argv included.
+    ///
+    /// `null` when none is attached — *and* when the request did not arrive on
+    /// the owner's Unix socket. Reaching that socket already means local
+    /// filesystem access to the owner's repository; a bearer token over TCP is a
+    /// weaker claim than that, and the argv is a command this process will
+    /// execute. Read [`ExecutionSinkResponse::sink_registered`] to tell "no sink"
+    /// apart from "not disclosed here".
     pub sink: Option<ExecutionSinkSpec>,
+    /// Whether a sink is attached at all.
+    ///
+    /// Always answered, on either transport, because subscription *presence* is
+    /// not the secret — the argv is.
+    #[serde(default)]
+    pub sink_registered: bool,
     /// The execution's current closed state.
     pub execution_state: ChangeExecutionState,
     /// True once a terminal event has been dispatched for this execution.

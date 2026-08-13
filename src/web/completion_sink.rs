@@ -32,10 +32,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::client::completion::Verdict;
@@ -60,8 +63,36 @@ pub const MAX_COMMAND_ARG_LEN: usize = 4096;
 /// Wall-clock ceiling one callback may run for.
 pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Captured-output ceiling per callback stream.
+/// Retained-output ceiling per callback stream.
+///
+/// Retained, not produced: both streams keep draining past this so a callback
+/// can never block on a full pipe, and the excess is discarded as it arrives
+/// rather than collected and cut afterwards.
 pub const MAX_CALLBACK_OUTPUT_BYTES: usize = 8 * 1024;
+
+/// Default ceiling on the whole graceful-shutdown callback drain.
+///
+/// One budget for *every* queued or running callback rather than one per
+/// callback: with delivery serialized, a per-callback budget would let n slow
+/// callbacks hold shutdown for n times as long.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(40);
+
+/// How long the owner waits for the dispatcher to report that the callback it
+/// just cancelled is terminated and reaped.
+///
+/// Only a hang guard: cancellation kills the child, so the acknowledgement it is
+/// waiting for is normally immediate. Artifact cleanup happens after it, because
+/// removing an event file while its callback still holds it is exactly the race
+/// this ordering exists to prevent.
+const REAP_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a stream drain may outlive the callback that owned it.
+///
+/// A callback that leaves a grandchild holding the inherited pipe keeps the
+/// stream open after the callback itself is reaped. The owner reports what it
+/// retained and stops waiting rather than letting somebody else's orphan hold
+/// shutdown open.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Longest evidence string copied into an event file.
 const MAX_EVIDENCE_BYTES: usize = 512;
@@ -160,6 +191,27 @@ enum Task {
     Stopping(tokio::sync::oneshot::Sender<()>),
 }
 
+/// Budgets a test can shorten without asserting on wall-clock latency.
+///
+/// Injectable because the shutdown ordering these govern — nothing starts after
+/// the deadline, every child is reaped before any artifact is removed — is only
+/// observable if a test can reach the deadline in bounded time. The assertions
+/// are still about ordering and state, never about how long anything took.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    callback_timeout: Duration,
+    shutdown_deadline: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            callback_timeout: CALLBACK_TIMEOUT,
+            shutdown_deadline: SHUTDOWN_DEADLINE,
+        }
+    }
+}
+
 /// The process-local completion-sink registry.
 pub struct CompletionSinkRegistry {
     instance_id: String,
@@ -170,6 +222,14 @@ pub struct CompletionSinkRegistry {
     /// Owner-private directory event files are written into.
     event_dir: Mutex<Option<Arc<tempfile::TempDir>>>,
     tasks: mpsc::UnboundedSender<Task>,
+    /// True once graceful shutdown started: admission stops, so no episode
+    /// transition and no late registration opens new delivery work.
+    stopping: AtomicBool,
+    /// Fired when the shutdown deadline expires. Past it nothing starts, no
+    /// event directory or artifact is created, and the running callback is
+    /// terminated and explicitly reaped.
+    cancel: CancellationToken,
+    limits: Mutex<Limits>,
 }
 
 impl std::fmt::Debug for CompletionSinkRegistry {
@@ -202,6 +262,9 @@ impl CompletionSinkRegistry {
                 repo_root: Mutex::new(None),
                 event_dir: Mutex::new(None),
                 tasks: tx,
+                stopping: AtomicBool::new(false),
+                cancel: CancellationToken::new(),
+                limits: Mutex::new(Limits::default()),
             }),
             tasks: rx,
         }
@@ -265,12 +328,18 @@ impl CompletionSinkRegistry {
         ChangeExecutionState::from_shared(self.facts.change(change_id).execution_state)
     }
 
-    /// Read one execution's subscription, validating the presented binding.
+    /// Read one execution's subscription, validating the complete binding.
+    ///
+    /// Inspection asserts the same `(instance_id, execution_id, change_id)` a
+    /// registration does. Not because reading is privileged — all three are
+    /// readable through other authenticated resources — but because a partial
+    /// binding lets a caller and the owner disagree about *which* execution is
+    /// being discussed, and a retry opens a new episode under the same change.
     pub fn view(
         &self,
         execution_id: &str,
-        instance_id: Option<&str>,
-        change_id: Option<&str>,
+        instance_id: &str,
+        change_id: &str,
     ) -> Result<SinkView, SinkRefusal> {
         let entries = self.lock();
         let entry = self.resolve(&entries, execution_id, instance_id, change_id)?;
@@ -286,25 +355,16 @@ impl CompletionSinkRegistry {
         &self,
         entries: &'a HashMap<String, Entry>,
         execution_id: &str,
-        instance_id: Option<&str>,
-        change_id: Option<&str>,
+        instance_id: &str,
+        change_id: &str,
     ) -> Result<&'a Entry, SinkRefusal> {
         let entry = entries
             .get(execution_id)
             .ok_or(SinkRefusal::UnknownExecution)?;
-        if let Some(instance_id) = instance_id {
-            if instance_id != self.instance_id {
-                return Err(SinkRefusal::BindingMismatch {
-                    actual_change_id: entry.change_id.clone(),
-                });
-            }
-        }
-        if let Some(change_id) = change_id {
-            if change_id != entry.change_id {
-                return Err(SinkRefusal::BindingMismatch {
-                    actual_change_id: entry.change_id.clone(),
-                });
-            }
+        if instance_id != self.instance_id || change_id != entry.change_id {
+            return Err(SinkRefusal::BindingMismatch {
+                actual_change_id: entry.change_id.clone(),
+            });
         }
         Ok(entry)
     }
@@ -327,7 +387,7 @@ impl CompletionSinkRegistry {
             let mut entries = self.lock();
             // Validate against an immutable borrow first so a refusal cannot
             // have mutated anything.
-            self.resolve(&entries, execution_id, Some(instance_id), Some(change_id))?;
+            self.resolve(&entries, execution_id, instance_id, change_id)?;
             let entry = entries
                 .get_mut(execution_id)
                 .ok_or(SinkRefusal::UnknownExecution)?;
@@ -339,9 +399,13 @@ impl CompletionSinkRegistry {
                 delivered_events: entry.delivered.clone(),
             }
         };
-        let _ = self.tasks.send(Task::Registered {
-            execution_id: execution_id.to_string(),
-        });
+        // Admission stops at shutdown: the registration is recorded and readable,
+        // but it opens no new delivery work in a process that is leaving.
+        if !self.stopping.load(Ordering::SeqCst) {
+            let _ = self.tasks.send(Task::Registered {
+                execution_id: execution_id.to_string(),
+            });
+        }
         Ok(view)
     }
 
@@ -353,7 +417,7 @@ impl CompletionSinkRegistry {
         change_id: &str,
     ) -> Result<SinkView, SinkRefusal> {
         let mut entries = self.lock();
-        self.resolve(&entries, execution_id, Some(instance_id), Some(change_id))?;
+        self.resolve(&entries, execution_id, instance_id, change_id)?;
         let entry = entries
             .get_mut(execution_id)
             .ok_or(SinkRefusal::UnknownExecution)?;
@@ -371,15 +435,73 @@ impl CompletionSinkRegistry {
     /// Best effort by construction: a crash cannot run this at all, which is
     /// exactly why an external adapter must treat a vanished owner as
     /// `owner_restarted` rather than as an outcome.
+    ///
+    /// The ordering is the contract. Admission stops first, so nothing new is
+    /// queued. One finite deadline then governs every queued or running callback
+    /// together. Reaching it cancels the rest: no further delivery starts, no
+    /// event directory or artifact is created, and the callback that is still
+    /// running is killed and explicitly reaped. Only once the dispatcher has
+    /// acknowledged that are the artifacts removed — a file pulled out from
+    /// under a live callback would be the one race this whole path exists to
+    /// prevent.
     pub async fn owner_stopping(&self) {
-        let (done, wait) = tokio::sync::oneshot::channel();
+        self.stopping.store(true, Ordering::SeqCst);
+        let (done, mut wait) = tokio::sync::oneshot::channel();
         if self.tasks.send(Task::Stopping(done)).is_err() {
+            // No dispatcher means no callback is holding anything.
+            self.cleanup_events();
             return;
         }
-        let _ = tokio::time::timeout(CALLBACK_TIMEOUT * 2, wait).await;
-        // Remaining event files belong to callbacks that never reaped; the
-        // owner owns their removal.
+
+        let deadline = self.limits().shutdown_deadline;
+        if tokio::time::timeout(deadline, &mut wait).await.is_err() {
+            self.cancel.cancel();
+            if tokio::time::timeout(REAP_GRACE, &mut wait).await.is_err() {
+                warn!(
+                    "the completion-sink dispatcher did not acknowledge cancellation, so event \
+                     artifacts are removed without its confirmation"
+                );
+            }
+        }
+        self.cleanup_events();
+    }
+
+    /// Remove the owner-private event directory and everything left in it.
+    ///
+    /// Every artifact still present belongs to a callback that has already been
+    /// reaped, because this only runs after the dispatcher acknowledged.
+    fn cleanup_events(&self) {
         self.lock_event_dir().take();
+    }
+
+    /// Shorten the per-callback runtime ceiling.
+    ///
+    /// For tests that need to reach a bounded terminal state; production uses
+    /// [`CALLBACK_TIMEOUT`].
+    // Read by the sink tests, which link the library rather than the binary.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_callback_timeout(&self, timeout: Duration) {
+        self.lock_limits().callback_timeout = timeout;
+    }
+
+    /// Shorten the single global shutdown deadline.
+    ///
+    /// For tests that need shutdown cancellation to be reachable in bounded
+    /// time; production uses [`SHUTDOWN_DEADLINE`].
+    // Read by the sink tests, which link the library rather than the binary.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_shutdown_deadline(&self, deadline: Duration) {
+        self.lock_limits().shutdown_deadline = deadline;
+    }
+
+    fn limits(&self) -> Limits {
+        *self.lock_limits()
+    }
+
+    fn lock_limits(&self) -> MutexGuard<'_, Limits> {
+        self.limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn lock_event_dir(&self) -> MutexGuard<'_, Option<Arc<tempfile::TempDir>>> {
@@ -481,6 +603,11 @@ impl CompletionSinkRegistry {
         self.deliver(execution_id, event_type, evidence).await;
     }
 
+    /// Deliver `owner_stopping` to every live registration, one at a time.
+    ///
+    /// Serialized like every other delivery, and abandoned the moment the global
+    /// deadline cancels: a queued delivery that has not started must not start
+    /// after it.
     async fn handle_stopping(&self) {
         let live: Vec<String> = {
             let mut entries = self.lock();
@@ -496,6 +623,13 @@ impl CompletionSinkRegistry {
                 .collect()
         };
         for execution_id in live {
+            if self.cancel.is_cancelled() {
+                debug!(
+                    remaining = %execution_id,
+                    "the shutdown deadline passed, so no further owner_stopping delivery starts"
+                );
+                break;
+            }
             self.deliver(&execution_id, ExecutionEventType::OwnerStopping, None)
                 .await;
         }
@@ -562,6 +696,9 @@ impl CompletionSinkRegistry {
         event_type: ExecutionEventType,
         evidence: Option<String>,
     ) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
         let Some((change_id, sink)) = ({
             let entries = self.lock();
             entries.get(execution_id).and_then(|entry| {
@@ -612,17 +749,31 @@ impl CompletionSinkRegistry {
             }
         }
 
-        let outcome = run_callback(&sink.command, &path, &payload).await;
-        // The file is immutable for the callback's lifetime and removed once it
-        // is reaped, so a slow callback can never read a rewritten payload and a
-        // finished one leaves nothing behind.
+        let report = run_callback(
+            &sink.command,
+            &path,
+            &payload,
+            self.limits().callback_timeout,
+            &self.cancel,
+        )
+        .await;
+        // Removed only now, which is after the child has been reaped — by its own
+        // exit, by the timeout, or by shutdown cancellation. A live callback
+        // never has its payload taken away from underneath it, and a finished one
+        // leaves nothing behind. The owner has not read the file back at any
+        // point: it is an output, and a same-UID callback can defeat its
+        // permissions, so no owner decision may depend on its contents.
         let _ = std::fs::remove_file(&path);
 
-        match outcome {
+        let truncated = report.truncated();
+        match &report.outcome {
             Ok(()) => debug!(
                 change_id = %change_id,
                 execution_id = %execution_id,
                 event = event_type.as_str(),
+                stdout_bytes = report.stdout.total,
+                stderr_bytes = report.stderr.total,
+                output_truncated = truncated,
                 "completion callback finished"
             ),
             // Observability only. Nothing below this line can change a workflow
@@ -633,6 +784,9 @@ impl CompletionSinkRegistry {
                 execution_id = %execution_id,
                 event = event_type.as_str(),
                 detail = %detail,
+                stdout_bytes = report.stdout.total,
+                stderr_bytes = report.stderr.total,
+                output_truncated = truncated,
                 "completion callback failed"
             ),
         }
@@ -644,6 +798,11 @@ impl CompletionSinkRegistry {
         event_type: ExecutionEventType,
         payload: &ExecutionEventFile,
     ) -> std::io::Result<PathBuf> {
+        if self.cancel.is_cancelled() {
+            return Err(std::io::Error::other(
+                "the shutdown deadline passed, so no event directory or artifact is created",
+            ));
+        }
         let dir = {
             let mut slot = self.lock_event_dir();
             match slot.as_ref() {
@@ -662,14 +821,18 @@ impl CompletionSinkRegistry {
             .join(format!("{execution_id}-{}.json", event_type.as_str()));
         let body = serde_json::to_vec_pretty(payload)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        std::fs::write(&path, body)?;
-        restrict(&path, 0o600)?;
+        write_owner_only(&path, &body)?;
         Ok(path)
     }
 }
 
 impl EpisodeObserver for CompletionSinkRegistry {
     fn observe_episode(&self, transition: &EpisodeTransition) {
+        // Admission stops at shutdown, so a transition arriving while the owner
+        // is leaving opens no new delivery work.
+        if self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
         // Never blocks and never runs a callback inline: the reducer's dispatch
         // boundary must not be able to wait on somebody's shell script.
         let _ = self.tasks.send(Task::Episode(transition.clone()));
@@ -685,6 +848,42 @@ fn restrict(path: &Path, mode: u32) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn restrict(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Write one event payload as an owner-read-only file.
+///
+/// `0400` inside the `0700` event directory, so an ordinary callback opening
+/// `CFLX_EVENT_PATH` for writing or truncation is refused by the file
+/// permissions. That is *default* mutation refusal, not an integrity boundary: a
+/// callback runs under the owner's own UID and can `chmod` its way past it. What
+/// makes that harmless is the other half of the contract — the owner writes the
+/// file once and never reads it back, so no owner decision can be changed by
+/// editing it.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Delivery is serialized and an artifact is removed only after its callback
+    // is reaped, so any file still at this path is nobody's. Removing it first
+    // keeps the create exclusive — and a `0400` file cannot be reopened for
+    // writing anyway, not even by the owner that made it.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(path)?;
+    file.write_all(body)
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, body)
 }
 
 /// Reject an argv that is not a bounded, directly-executable command.
@@ -721,16 +920,126 @@ pub fn validate_command(command: &[String]) -> Result<(), SinkRefusal> {
     Ok(())
 }
 
-/// Run one callback with a bounded runtime and bounded captured output.
+/// What one bounded stream drain retained, and what the callback actually wrote.
+#[derive(Debug, Default)]
+struct Drained {
+    /// Retained bytes; never more than the configured limit.
+    retained: Vec<u8>,
+    /// Total bytes the callback produced, including the discarded excess.
+    total: usize,
+}
+
+impl Drained {
+    fn truncated(&self) -> bool {
+        self.total > self.retained.len()
+    }
+
+    /// The retained bytes as bounded diagnostic text.
+    fn text(&self) -> String {
+        let text = String::from_utf8_lossy(&self.retained);
+        match self.truncated() {
+            true => format!("{text}… ({} bytes total)", self.total),
+            false => text.to_string(),
+        }
+    }
+}
+
+/// What one delivery attempt observed, in bounded form.
+#[derive(Debug)]
+struct CallbackReport {
+    /// `Ok` when the callback exited successfully.
+    outcome: Result<(), String>,
+    stdout: Drained,
+    stderr: Drained,
+}
+
+impl CallbackReport {
+    /// A report for an attempt that never produced a child at all.
+    fn unstarted(detail: String) -> Self {
+        Self {
+            outcome: Err(detail),
+            stdout: Drained::default(),
+            stderr: Drained::default(),
+        }
+    }
+
+    fn truncated(&self) -> bool {
+        self.stdout.truncated() || self.stderr.truncated()
+    }
+}
+
+/// Read one stream to its end, retaining at most `limit` bytes.
+///
+/// The reading does not stop at the limit — that is the point. A drain that
+/// stopped would leave the pipe full and the callback blocked in `write()`
+/// forever, which is a way of hanging a callback rather than bounding it. So the
+/// excess is read and dropped as it arrives, and owner memory stays inside the
+/// limit no matter how much the callback produces.
+async fn drain<R>(mut stream: R, limit: usize) -> Drained
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut drained = Drained {
+        retained: Vec::new(),
+        total: 0,
+    };
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                drained.total = drained.total.saturating_add(read);
+                if drained.retained.len() < limit {
+                    let room = limit - drained.retained.len();
+                    drained.retained.extend_from_slice(&chunk[..read.min(room)]);
+                }
+            }
+        }
+    }
+    drained
+}
+
+/// Collect one drain, without letting an orphan that inherited the pipe hold on.
+async fn collect(handle: tokio::task::JoinHandle<Drained>) -> Drained {
+    let mut handle = handle;
+    match tokio::time::timeout(DRAIN_GRACE, &mut handle).await {
+        Ok(Ok(drained)) => drained,
+        Ok(Err(_)) => Drained::default(),
+        Err(_) => {
+            handle.abort();
+            Drained::default()
+        }
+    }
+}
+
+/// Run one callback with a bounded runtime and bounded retained output.
 ///
 /// The environment is *replaced*, not extended: the callback receives exactly
 /// the five documented variables, so an owner's configured token, provider
 /// credentials, and terminal settings cannot reach a third-party helper.
+///
+/// Both streams are drained concurrently for the whole life of the child, so
+/// output volume can never block the callback and can never grow the owner.
+/// Reaching the retention limit is a diagnostic, not a delivery failure, and it
+/// never terminates the callback. Only the runtime ceiling and shutdown
+/// cancellation do that, and both kill *and* explicitly reap: `wait_with_output`
+/// cannot be interrupted, and `kill_on_drop` schedules a reap rather than
+/// guaranteeing one has happened by the time this returns.
 async fn run_callback(
     command: &[String],
     event_path: &Path,
     payload: &ExecutionEventFile,
-) -> Result<(), String> {
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> CallbackReport {
+    /// How the child stopped running.
+    enum Ended {
+        Exited(std::process::ExitStatus),
+        Broken(String),
+        TimedOut,
+        Cancelled,
+    }
+
     let mut child = tokio::process::Command::new(&command[0]);
     child
         .args(&command[1..])
@@ -745,24 +1054,64 @@ async fn run_callback(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
-    let spawned = child.spawn().map_err(|error| error.to_string())?;
-    match tokio::time::timeout(CALLBACK_TIMEOUT, spawned.wait_with_output()).await {
-        Ok(Ok(output)) if output.status.success() => Ok(()),
-        Ok(Ok(output)) => Err(format!(
+    let mut spawned = match child.spawn() {
+        Ok(spawned) => spawned,
+        Err(error) => return CallbackReport::unstarted(error.to_string()),
+    };
+    let stdout = spawned.stdout.take();
+    let stderr = spawned.stderr.take();
+    let stdout = tokio::spawn(async move {
+        match stdout {
+            Some(stream) => drain(stream, MAX_CALLBACK_OUTPUT_BYTES).await,
+            None => Drained::default(),
+        }
+    });
+    let stderr = tokio::spawn(async move {
+        match stderr {
+            Some(stream) => drain(stream, MAX_CALLBACK_OUTPUT_BYTES).await,
+            None => Drained::default(),
+        }
+    });
+
+    let mut ended = tokio::select! {
+        result = spawned.wait() => match result {
+            Ok(status) => Ended::Exited(status),
+            Err(error) => Ended::Broken(error.to_string()),
+        },
+        _ = tokio::time::sleep(timeout) => Ended::TimedOut,
+        _ = cancel.cancelled() => Ended::Cancelled,
+    };
+    if matches!(ended, Ended::TimedOut | Ended::Cancelled) {
+        // `kill` is terminate-and-wait, so the child is reaped before anything
+        // downstream removes its event file.
+        if let Err(error) = spawned.kill().await {
+            ended = Ended::Broken(format!("the callback could not be terminated: {error}"));
+        }
+    }
+
+    let stdout = collect(stdout).await;
+    let stderr = collect(stderr).await;
+
+    let outcome = match ended {
+        Ended::Exited(status) if status.success() => Ok(()),
+        Ended::Exited(status) => Err(format!(
             "exit {:?}: {}",
-            output.status.code(),
-            truncate(
-                &String::from_utf8_lossy(&output.stderr),
-                MAX_CALLBACK_OUTPUT_BYTES
-            )
+            status.code(),
+            truncate(&stderr.text(), MAX_CALLBACK_OUTPUT_BYTES)
         )),
-        Ok(Err(error)) => Err(error.to_string()),
-        // Dropping the future kills the child because of `kill_on_drop`, so a
-        // hung callback cannot outlive its budget and keep a file handle open.
-        Err(_) => Err(format!(
-            "the callback did not finish within {}ms",
-            CALLBACK_TIMEOUT.as_millis()
+        Ended::Broken(error) => Err(error),
+        Ended::TimedOut => Err(format!(
+            "the callback did not finish within {}ms and was terminated",
+            timeout.as_millis()
         )),
+        Ended::Cancelled => Err(
+            "the owner reached its shutdown deadline, so the callback was terminated".to_string(),
+        ),
+    };
+    CallbackReport {
+        outcome,
+        stdout,
+        stderr,
     }
 }
 
@@ -823,6 +1172,44 @@ mod tests {
         assert_eq!(truncate("abcdef", 3), "abc…");
         // A multi-byte character straddling the limit is dropped whole.
         assert_eq!(truncate("aé", 2), "a…");
+    }
+
+    /// The retention bound is on what the owner *keeps*, and the draining does
+    /// not stop when it is reached — a drain that stopped would leave the pipe
+    /// full and the callback blocked in `write()`, which is a way of hanging a
+    /// callback rather than bounding it.
+    #[tokio::test]
+    async fn a_drain_retains_at_most_the_limit_and_still_consumes_the_rest() {
+        let produced = vec![b'a'; MAX_CALLBACK_OUTPUT_BYTES * 4 + 7];
+        let drained = drain(produced.as_slice(), MAX_CALLBACK_OUTPUT_BYTES).await;
+
+        assert_eq!(
+            drained.retained.len(),
+            MAX_CALLBACK_OUTPUT_BYTES,
+            "owner memory stays inside the configured bound"
+        );
+        assert_eq!(
+            drained.total,
+            produced.len(),
+            "and every byte was still read, so the writer is never blocked"
+        );
+        assert!(drained.truncated());
+        // The diagnostic says it was cut, and how much there was.
+        let text = drained.text();
+        assert!(
+            text.ends_with(&format!("({} bytes total)", produced.len())),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drain_under_the_limit_retains_everything_and_reports_no_truncation() {
+        let produced = b"one bounded line\n".to_vec();
+        let drained = drain(produced.as_slice(), MAX_CALLBACK_OUTPUT_BYTES).await;
+        assert_eq!(drained.retained, produced);
+        assert_eq!(drained.total, produced.len());
+        assert!(!drained.truncated());
+        assert_eq!(drained.text(), "one bounded line\n");
     }
 
     #[test]

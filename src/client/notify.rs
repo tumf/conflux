@@ -217,10 +217,13 @@ fn classify(
                     );
                 }
                 let detail = serde_json::to_value(&body).unwrap_or_else(|_| serde_json::json!({}));
+                // Presence comes from `sink_registered`, not from whether the
+                // argv is present: an owner discloses the argv only over its own
+                // Unix socket, so a redacted `sink` is not an absent one.
                 envelope(Outcome::Subscribed)
-                    .with_message(match &body.sink {
-                        Some(_) => "the owner holds a completion sink for this execution",
-                        None => "this execution has no completion sink",
+                    .with_message(match body.sink_registered {
+                        true => "the owner holds a completion sink for this execution",
+                        false => "this execution has no completion sink",
                     })
                     .with_detail(detail)
             }
@@ -324,6 +327,7 @@ mod tests {
             "execution_id": "e-1",
             "change_id": "alpha",
             "sink": {"command": ["/bin/true"], "notify_blocked": false},
+            "sink_registered": true,
             "execution_state": "active",
             "terminal_dispatched": false,
             "delivered_events": [],

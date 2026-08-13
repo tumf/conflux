@@ -100,21 +100,44 @@ the enqueue/registration race from losing a notification.
 
 Constraints worth knowing before you wire one up:
 
-- **UDS only for mutation.** A sink stores an argv the owner will execute, so
-  `set` and `clear` are accepted only over the owner's Unix socket; an
-  authenticated TCP client is refused with `transport_not_permitted`. Reads are
-  fine on either transport.
+- **UDS only for mutation, and for argv.** A sink stores an argv the owner will
+  execute, so `set` and `clear` are accepted only over the owner's Unix socket;
+  an authenticated TCP client is refused with `transport_not_permitted`. Reads
+  work on either transport, but the *registered argv* comes back only over that
+  same socket: a channel that may not register a command may not read one back.
+  Everything else a caller needs — subscription presence, execution state,
+  delivery history — is answered on both. Every request, inspection included,
+  carries the complete `(instance_id, execution_id, change_id)` binding; a
+  partial one is refused, because a coherence check that accepted half a binding
+  would let you and the owner mean two different episodes.
 - **argv, not shell.** No `sh -c`, no quoting, no expansion. The environment is
   *replaced* with exactly `CFLX_EVENT_PATH`, `CFLX_EVENT_TYPE`,
   `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and `CFLX_INSTANCE_ID` — no owner token,
   no configuration, no inherited `PATH`.
 - **A token is a variable name.** `--auth-token-env NAME`. Token values never
   appear in argv, in a tool result, in a log, or in an event file.
+- **The event file is read-only by default, and never read back.** The payload is
+  created `0400` inside a `0700` owner-private directory, so opening
+  `CFLX_EVENT_PATH` for writing is refused. That is default mutation refusal, not
+  an integrity guarantee: your callback runs under the owner's UID and can
+  `chmod` past it. What makes that harmless is that the owner writes the file
+  once and never reads it back, so editing it changes no delivered
+  classification. It is removed once your callback is reaped.
+- **Output is bounded but never blocked.** stdout and stderr are drained for the
+  whole life of the callback; past the retained ceiling the excess is read and
+  discarded, so a chatty callback never wedges on a full pipe and never grows the
+  owner. Overflow is a truncation diagnostic, not a delivery failure, and it does
+  not terminate the callback. Only the runtime ceiling and shutdown cancellation
+  do, and both kill *and* reap.
 - **Nothing survives a crash.** Execution IDs and registrations are
   process-local, as the constitution requires; a `kill -9` takes them with it. A
-  *graceful* stop attempts one `owner_stopping` first. An external adapter that
-  needs to cover the crash keeps its own bounded owner-continuity check and
-  reports typed `owner_restarted` — never success.
+  *graceful* stop attempts one `owner_stopping` first. Delivery stays serialized
+  through shutdown under a single finite deadline covering every queued or
+  running callback: past it nothing new starts, no event artifact is created, and
+  the callback still running is terminated and reaped *before* any artifact is
+  removed. An external adapter that needs to cover the crash keeps its own
+  bounded owner-continuity check and reports typed `owner_restarted` — never
+  success.
 - **Delivery is observability.** A callback that fails, hangs, or exits non-zero
   cannot roll back, retry, or re-classify anything.
 
@@ -153,7 +176,11 @@ curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" \
   access, protected by filesystem permissions.
 - `PUT`/`DELETE /api/v2/executions/{execution_id}/sink` are accepted only here.
   They store an argv this process will execute, so TCP is refused with
-  `transport_not_permitted` even when bearer authentication succeeds.
+  `transport_not_permitted` even when bearer authentication succeeds. `GET` is
+  served on both listeners, but it returns the registered argv only here;
+  elsewhere it answers `sink_registered`, execution state, and delivery history
+  with `sink: null`. All three require the complete
+  `(instance_id, execution_id, change_id)` binding in the query or body.
 - The listener must be bound before lifecycle adapters, AI subprocesses, or
   orchestration start. A bind, permission, or path-safety failure exits non-zero
   with nothing started; a finite run removes its own socket on completion.
