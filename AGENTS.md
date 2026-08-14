@@ -29,13 +29,18 @@ contend for the lock with the process you meant to talk to.
 cflx client status --json                 # read the owner; mutates nothing
 cflx client enqueue add-my-change --json  # ask the owner to admit one change
 cflx client wait add-my-change --timeout 45m --json
+cflx client notify set add-my-change "$EXEC" --json -- /absolute/callback --flag v
+cflx client notify get add-my-change "$EXEC" --json
+cflx client notify clear add-my-change "$EXEC" --json
 cflx client mcp                           # serve the same intents over stdio MCP
 ```
 
-Four commands, and only four. Connection options belong to the namespace:
-`--unix-socket PATH` overrides the default `${GIT_COMMON_DIR}/cflx-api.sock`, and
-`--auth-token-env NAME` names an environment variable holding the bearer token —
-a token value is never accepted in argv and never printed.
+Four verbs, and only four: `status`, `enqueue`, `wait`, and the `notify` group,
+plus `mcp` for hosts that speak the protocol instead. Connection options belong
+to the namespace: `--unix-socket PATH` overrides the default
+`${GIT_COMMON_DIR}/cflx-api.sock`, and `--auth-token-env NAME` names an
+environment variable holding the bearer token — a token value is never accepted
+in argv and never printed.
 
 **It is intent-based on purpose.** The CLI reads authoritative capabilities,
 instance identity, state, execution status, and per-change action eligibility,
@@ -70,29 +75,54 @@ reached. A change disappearing from the snapshot is never completion. If an
 idle-owner start would consume execution marks that are not yours, `enqueue`
 refuses with `operator_intent_conflict` and leaves them untouched.
 
-`/api/v2` remains the lower-level generated contract for anything the four
+`/api/v2` remains the lower-level generated contract for anything these
 commands do not cover; prefer `cflx client` for delegation.
 
-### `cflx client mcp` and completion notifications
+### `cflx client mcp`
 
 `cflx client mcp` serves the same boundary to an MCP host over stdio, as six
 closed tools: `cflx_status`, `cflx_enqueue`, `cflx_wait`, and `cflx_notify_set` /
-`_get` / `_clear`. It is still a client — no lock, no listener, no run — and it
-exposes no raw command construction, so a model cannot name a command type, an
-expected revision, an idempotency key, an execution mark, or shell source.
-stdout carries JSON-RPC frames and nothing else; diagnostics go to stderr.
+`_get` / `_clear`. It is the alternative for a host that speaks the protocol
+rather than a shell, and it calls exactly the modules the commands do. It is
+still a client — no lock, no listener, no run — and it exposes no raw command
+construction, so a model cannot name a command type, an expected revision, an
+idempotency key, an execution mark, or shell source. stdout carries JSON-RPC
+frames and nothing else; diagnostics go to stderr.
 
 `cflx_enqueue` settles and returns. Its `execution_id` names one *admitted
 execution episode*, not the change: a retry of the same proposal gets a new ID,
 and iterations inside one admitted run keep theirs. Concurrent callers that find
 the change already admitted observe the same current ID.
 
-`cflx_notify_set` attaches one bounded argv the owner runs **once** when that
-execution reaches a typed terminal classification — `completed`, `failed`, or
-`stopped` — with `blocked` as an opt-in attention edge and `owner_stopping` on
-graceful shutdown only. **This is execution completion, not process completion.**
-The TUI stays alive after work finishes, so process exit was never a signal; and
-a lifecycle adapter's `idle` describes the process, not your proposal.
+### Completion notifications
+
+**If you have a shell, use `cflx client notify`.** It is the direct adapter over
+the same execution-scoped completion sink, so nothing about it requires an MCP
+host:
+
+```bash
+EXEC=$(cflx client enqueue add-my-change --json | jq -r .execution_id)
+cflx client notify set add-my-change "$EXEC" --json -- /absolute/callback --flag v
+cflx client notify get add-my-change "$EXEC" --json
+cflx client notify clear add-my-change "$EXEC" --json
+```
+
+Each operation names an *admitted execution episode*, not a change: pass the
+`execution_id` the enqueue reported, and pass `--instance-id` too when you kept
+it, so a replaced owner is reported as typed `owner_restarted` instead of the
+`execution_not_found` a new incarnation would otherwise answer with. `--blocked`
+opts into the non-terminal attention edge. Everything after `--` is the callback
+argv — one element per argument, exactly as typed — and the CLI never parses
+shell source. The envelopes are the namespace's own: `notify_set`, `notify_get`,
+`notify_clear`, with `subscribed` as the single success token.
+
+`cflx client notify set`, and `cflx_notify_set` behind it, attach one bounded
+argv the owner runs **once** when that execution reaches a typed terminal
+classification — `completed`, `failed`, or `stopped` — with `blocked` as an
+opt-in attention edge and `owner_stopping` on graceful shutdown only. **This is
+execution completion, not process completion.** The TUI stays alive after work
+finishes, so process exit was never a signal; and a lifecycle adapter's `idle`
+describes the process, not your proposal.
 `completed` uses the same repository oracle `wait` certifies with, so a change
 disappearing from the snapshot is never completion. Registering *after* the
 execution settled delivers that terminal event immediately, which is what stops

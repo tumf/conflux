@@ -105,13 +105,15 @@ would contend for the lock with the process you meant to talk to.
 cflx client status --json                 # read the owner; mutates nothing
 cflx client enqueue add-my-change --json  # ask the owner to admit one change
 cflx client wait add-my-change --timeout 45m --json
+cflx client notify set add-my-change "$EXEC" --json -- /absolute/callback
 cflx client mcp                           # serve the same intents over stdio MCP
 ```
 
-Four commands, and only four. `--unix-socket PATH` overrides the default
-`${GIT_COMMON_DIR}/cflx-api.sock`, and `--auth-token-env NAME` names an
-environment variable holding the bearer token — a token value is never accepted
-in argv and never printed.
+Four verbs, and only four: `status`, `enqueue`, `wait`, and the `notify` group,
+plus `mcp` for hosts that speak the protocol instead of a shell. `--unix-socket
+PATH` overrides the default `${GIT_COMMON_DIR}/cflx-api.sock`, and
+`--auth-token-env NAME` names an environment variable holding the bearer token —
+a token value is never accepted in argv and never printed.
 
 **Admission is not completion.** A successful `enqueue` proves only that the
 owner accepted the intent. `wait` is the observation-only counterpart, and it
@@ -122,8 +124,9 @@ declared terminal mode. Read the envelope's `outcome`, never prose.
 
 `cflx client mcp` is a stdio Model Context Protocol server over exactly that
 boundary, with six closed tools: `cflx_status`, `cflx_enqueue`, `cflx_wait`, and
-`cflx_notify_set` / `_get` / `_clear`. It exposes no raw `/api/v2` command
-construction, so a model cannot name a command type, an expected revision, an
+`cflx_notify_set` / `_get` / `_clear`. It is the alternative for a host that
+speaks the protocol rather than a shell, and each tool calls the same module its
+command does. It exposes no raw `/api/v2` command construction, so a model cannot name a command type, an expected revision, an
 idempotency key, an execution mark, or shell source. stdout carries JSON-RPC
 frames and nothing else.
 
@@ -134,7 +137,26 @@ change.
 
 ### Completion notifications
 
-`cflx_notify_set` attaches one bounded argv the owner runs **once** when that
+A shell reaches this directly through `cflx client notify`; an MCP host reaches
+the same implementation through `cflx_notify_set` / `_get` / `_clear`. Neither
+requires the other.
+
+```bash
+EXEC=$(cflx client enqueue add-my-change --json | jq -r .execution_id)
+cflx client notify set add-my-change "$EXEC" --json -- /absolute/callback --flag v
+cflx client notify get add-my-change "$EXEC" --json
+cflx client notify clear add-my-change "$EXEC" --json
+```
+
+Every operation names an *admitted execution episode* rather than a change: pass
+the `execution_id` the enqueue reported, and pass `--instance-id` as well when
+you kept it, so a replaced owner comes back as typed `owner_restarted` instead
+of the `execution_not_found` a new incarnation would otherwise answer with.
+Everything after `--` is the callback argv, one element per argument exactly as
+typed; the CLI never parses shell source. `--blocked` opts into the non-terminal
+attention edge.
+
+The registration attaches one bounded argv the owner runs **once** when that
 execution reaches a typed terminal classification (`completed`, `failed`,
 `stopped`), with `blocked` available as an opt-in attention edge and
 `owner_stopping` on graceful shutdown. This exists because the TUI stays alive

@@ -282,10 +282,19 @@ pub enum Commands {
     /// chooses the commands, so no caller constructs a revision, an idempotency
     /// key, an execution mark, or a queue intent.
     ///
+    /// `notify` manages the one-shot completion callback the owner runs when an
+    /// admitted execution finishes. That is execution completion, not process
+    /// completion: a resident TUI stays alive after the work is done, so its
+    /// exit was never the signal. The callback is an argv after `--`, never
+    /// shell source.
+    ///
     /// EXAMPLES:
     ///   cflx client status --json               # Read the owner without mutating it
     ///   cflx client enqueue alpha --json        # Ask the owner to admit one change
     ///   cflx client wait alpha --timeout 30m    # Observe until verified completion
+    ///   cflx client notify set alpha EXEC --json -- /absolute/callback --flag value
+    ///   cflx client notify get alpha EXEC --json     # Read the registration
+    ///   cflx client notify clear alpha EXEC --json   # Detach the callback
     ///   cflx client mcp                         # Serve the same intents over stdio MCP
     Client(ClientArgs),
 
@@ -935,6 +944,44 @@ pub fn parse_change_id(value: &str) -> std::result::Result<String, String> {
     Ok(value.to_string())
 }
 
+/// Longest process-local identifier this CLI will forward to an owner.
+///
+/// The owner mints these as 32 hex digits, so the ceiling is slack rather than a
+/// format assertion: a future widening stays acceptable, an unbounded argument
+/// does not.
+const MAX_PROCESS_LOCAL_ID_LEN: usize = 128;
+
+/// Parse an owner-minted process-local identifier (execution or instance).
+///
+/// These are opaque to the caller — an execution ID names one admitted episode
+/// and an instance ID names one owner incarnation — but they still reach a URL
+/// path segment and a query value, so an empty, oversized, or
+/// separator-carrying value is rejected as usage here rather than escaped into
+/// a request that would come back as an unrelated `execution_not_found`.
+pub fn parse_process_local_id(value: &str) -> std::result::Result<String, String> {
+    let invalid = |reason: &str| {
+        Err(format!(
+            "'{value}' is not an owner-issued identifier: {reason}. These are 1-{MAX_PROCESS_LOCAL_ID_LEN} characters of [A-Za-z0-9._-] and may not start with '.' or '-'"
+        ))
+    };
+    if value.is_empty() {
+        return invalid("it is empty");
+    }
+    if value.len() > MAX_PROCESS_LOCAL_ID_LEN {
+        return invalid("it is too long");
+    }
+    if value.starts_with('.') || value.starts_with('-') {
+        return invalid("it starts with a reserved character");
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return invalid("it contains characters outside [A-Za-z0-9._-]");
+    }
+    Ok(value.to_string())
+}
+
 /// Arguments for the `client` subcommand group.
 #[derive(Parser, Debug)]
 #[command(
@@ -959,6 +1006,9 @@ EXAMPLES:
   cflx client status --json
   cflx client enqueue alpha --json
   cflx client wait alpha --timeout 45m --json
+  cflx client notify set alpha <execution-id> --json -- /absolute/callback --flag value
+  cflx client notify get alpha <execution-id> --json
+  cflx client notify clear alpha <execution-id> --json
   cflx client mcp
   cflx client --unix-socket /tmp/cflx-api.sock status"
 )]
@@ -1010,6 +1060,38 @@ pub enum ClientCommands {
     /// for the owner's terminal mode; a change merely disappearing from the
     /// snapshot is never completion.
     Wait(ClientWaitArgs),
+
+    /// Manage the completion callback attached to one admitted execution
+    ///
+    /// Observability only: a callback registration submits no workflow command,
+    /// creates no command record, advances no revision, and cannot move a
+    /// change. The owner runs the argv once when that execution reaches a typed
+    /// terminal classification — which is execution completion, not process
+    /// completion, because a resident TUI stays alive after the work finishes
+    /// and its exit was therefore never the signal.
+    ///
+    /// Every operation names the complete (instance_id, execution_id,
+    /// change_id) binding the owner checks. The execution ID is the one
+    /// `enqueue` reported for that admitted episode: a retry opens a
+    /// *different* execution.
+    ///
+    /// The callback is an argv vector given after `--`, never shell source: no
+    /// `sh -c`, no quoting, no expansion, and every argument boundary is
+    /// preserved exactly as typed. The owner replaces the callback's
+    /// environment with exactly CFLX_EVENT_PATH, CFLX_EVENT_TYPE,
+    /// CFLX_EXECUTION_ID, CFLX_CHANGE_ID, and CFLX_INSTANCE_ID.
+    ///
+    /// Setting and clearing store or remove an argv this owner will execute, so
+    /// they are accepted only over the owner's Unix socket; a TCP client is
+    /// refused with `transport_not_permitted` and is not told a registered argv
+    /// on a read either.
+    ///
+    /// EXAMPLES:
+    ///   cflx client notify set alpha EXEC -- /absolute/callback --flag value
+    ///   cflx client notify set alpha EXEC --blocked --json -- /absolute/callback
+    ///   cflx client notify get alpha EXEC --json
+    ///   cflx client notify clear alpha EXEC --json
+    Notify(ClientNotifyArgs),
 
     /// Serve the same client intents to an MCP host over stdio
     ///
@@ -1076,6 +1158,110 @@ pub struct ClientWaitArgs {
     /// How long to observe before giving up (for example 500ms, 30s, 45m, 2h)
     #[arg(long, value_name = "DURATION", default_value = "60m", value_parser = parse_client_timeout)]
     pub timeout: std::time::Duration,
+
+    /// Emit one versioned JSON envelope on stdout
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `cflx client notify`.
+///
+/// A group rather than an operation: the help a caller reads lives on the
+/// [`ClientCommands::Notify`] variant, the way every other subcommand's does.
+#[derive(Parser, Debug)]
+pub struct ClientNotifyArgs {
+    #[command(subcommand)]
+    pub command: ClientNotifyCommands,
+}
+
+/// Subcommands for `cflx client notify`.
+#[derive(Subcommand, Debug)]
+pub enum ClientNotifyCommands {
+    /// Attach or replace this execution's completion callback
+    ///
+    /// The argv after `--` is executed directly, never as shell source, and
+    /// each argument boundary is preserved exactly as typed. Registering after
+    /// the execution already settled delivers that terminal event immediately,
+    /// which is what stops the enqueue/registration race from losing a
+    /// notification.
+    ///
+    /// Registration is not delivery and delivery is not workflow state: a
+    /// callback that fails, hangs, or exits non-zero cannot roll back, retry, or
+    /// re-classify anything.
+    ///
+    /// EXAMPLES:
+    ///   cflx client notify set alpha EXEC -- /absolute/callback --flag value
+    ///   cflx client notify set alpha EXEC --blocked --json -- /absolute/callback
+    Set(ClientNotifySetArgs),
+
+    /// Read the current callback registration for this execution
+    ///
+    /// Reports whether a subscription exists, the execution's state, and the
+    /// events already delivered. The registered argv itself comes back only
+    /// over the owner's own Unix socket.
+    Get(ClientNotifyRefArgs),
+
+    /// Detach this execution's completion callback
+    ///
+    /// Removes only that execution's registration; no other execution and no
+    /// workflow state is touched.
+    Clear(ClientNotifyRefArgs),
+}
+
+/// Arguments for `cflx client notify set`.
+#[derive(Parser, Debug)]
+pub struct ClientNotifySetArgs {
+    /// Change the execution belongs to
+    #[arg(value_parser = parse_change_id)]
+    pub change_id: String,
+
+    /// Execution episode the callback is bound to, as `enqueue` reported it
+    #[arg(value_parser = parse_process_local_id)]
+    pub execution_id: String,
+
+    /// Owner incarnation that admitted the execution
+    ///
+    /// Supply the instance ID an earlier `enqueue` reported to be told
+    /// `owner_restarted` when the socket has begun serving a different
+    /// incarnation, instead of the `execution_not_found` a new one would
+    /// otherwise answer with.
+    #[arg(long, value_name = "ID", value_parser = parse_process_local_id)]
+    pub instance_id: Option<String>,
+
+    /// Also deliver the non-terminal `blocked` attention edge
+    #[arg(long)]
+    pub blocked: bool,
+
+    /// Emit one versioned JSON envelope on stdout
+    #[arg(long)]
+    pub json: bool,
+
+    /// Callback argv, given after `--` and executed directly
+    ///
+    /// Never shell source: no `sh -c`, no quoting, no expansion. Every argument
+    /// after `--` is one argv element, exactly as typed.
+    #[arg(last = true, required = true, num_args = 1.., value_name = "COMMAND")]
+    pub command: Vec<String>,
+}
+
+/// Arguments for `cflx client notify get` and `cflx client notify clear`.
+///
+/// One struct for both because a read and a detach name the same thing: neither
+/// carries a callback, and a caller that can name an execution for one can name
+/// it for the other.
+#[derive(Parser, Debug)]
+pub struct ClientNotifyRefArgs {
+    /// Change the execution belongs to
+    #[arg(value_parser = parse_change_id)]
+    pub change_id: String,
+
+    /// Execution episode to address, as `enqueue` reported it
+    #[arg(value_parser = parse_process_local_id)]
+    pub execution_id: String,
+
+    /// Owner incarnation that admitted the execution
+    #[arg(long, value_name = "ID", value_parser = parse_process_local_id)]
+    pub instance_id: Option<String>,
 
     /// Emit one versioned JSON envelope on stdout
     #[arg(long)]
