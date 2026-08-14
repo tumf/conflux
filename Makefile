@@ -1,4 +1,4 @@
-.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy test-running-mark-reanalysis test-change-error-f5-retry check-scenario-set check pre-commit audit publish build-linux build-linux-x86 build-linux-arm
+.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy test-running-mark-reanalysis test-change-error-f5-retry test-orphaned-apply-index-locks check-scenario-set check pre-commit audit publish build-linux build-linux-x86 build-linux-arm
 
 # Ensure rustup-managed toolchain is used (not Homebrew rustc)
 RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-$(shell rustup show active-toolchain 2>/dev/null | awk '{print $$1}' | sed 's/^stable-//')/bin
@@ -134,6 +134,46 @@ test-change-error-f5-retry:
 	  echo "Discovered $$count focused lib-target test(s)"
 	@echo "Running focused lib-target tests..."
 	cargo test --lib $(F5_RETRY_FILTER)
+
+# Filters selecting the orphaned-Apply-index-lock contract's focused tests.
+# Overridable so the discovery gate below can be proven fail-safe:
+#   make test-orphaned-apply-index-locks INDEX_LOCK_RECLAIM_FILTER=no_such_test
+#
+# Three filters because the contract spans three modules: the reclamation
+# decision, its consumption at Apply's finalization boundaries, and the retry
+# budgets that recover live contention afterwards.
+INDEX_LOCK_RECLAIM_FILTER ?= index_lock_reclaim
+INDEX_LOCK_APPLY_FILTER ?= index_lock_convergence
+INDEX_LOCK_RETRY_FILTER ?= lock_retry
+
+# Focused verification for same-dispatch orphaned index-lock reclamation.
+#
+# Discovery runs before execution on purpose. `cargo test <filter>` exits 0 when
+# the filter matches nothing at all, so a renamed, deleted, or never-written test
+# would otherwise read as a pass. Listing first and failing on an empty match is
+# what makes the evidence this target produces mean something.
+#
+# The default set is deterministic: the dwell and the retry waits are injected,
+# so nothing here sleeps for real. The real-process orphan cases live in the
+# heavy tier and are reported below rather than run silently.
+test-orphaned-apply-index-locks:
+	@for filter in $(INDEX_LOCK_RECLAIM_FILTER) $(INDEX_LOCK_APPLY_FILTER) $(INDEX_LOCK_RETRY_FILTER); do \
+	  echo "Discovering '$$filter' lib-target tests..."; \
+	  count=$$(cargo test --lib $$filter -- --list 2>/dev/null | grep -c ': test$$'); \
+	  if [ "$$count" -eq 0 ]; then \
+	    echo "FAIL: no '$$filter' lib-target test was discovered"; \
+	    exit 1; \
+	  fi; \
+	  echo "Discovered $$count focused lib-target test(s) for '$$filter'"; \
+	done
+	@echo "Running focused lib-target tests..."
+	cargo test --lib $(INDEX_LOCK_RECLAIM_FILTER)
+	cargo test --lib $(INDEX_LOCK_APPLY_FILTER)
+	cargo test --lib $(INDEX_LOCK_RETRY_FILTER)
+	@echo "NOTE: real-process orphan coverage is heavy-tier and is NOT run here."
+	@echo "      Run it explicitly with:"
+	@echo "        cargo test --features heavy-tests --lib heavy_orphaned_index_lock"
+	@echo "        cargo test --features heavy-tests --lib heavy_pre_existing_index_lock"
 
 # Archive-preparation guard: promotion must not drop a canonical scenario.
 #

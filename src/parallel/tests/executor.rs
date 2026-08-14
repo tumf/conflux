@@ -7297,6 +7297,11 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
         }
     }
 
+    // Held for the whole capture: tracing's max-level hint is process-global, so
+    // this WARN-only subscriber disables `info!` on every thread while it is
+    // installed, and would blank out an overlapping INFO capture test's records.
+    // See `crate::test_support::tracing_capture_lock`.
+    let _capture_exclusion = crate::test_support::tracing_capture_lock().lock().await;
     let captured_logs = Arc::new(StdMutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -7305,6 +7310,7 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
         .with_writer(CapturedLogs(captured_logs.clone()))
         .finish();
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    crate::test_support::refresh_tracing_interest();
 
     let config = create_test_config();
     let repo_dir = tempfile::tempdir().or_fail("create temp repo");

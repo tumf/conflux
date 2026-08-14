@@ -530,8 +530,11 @@ pub const DEFAULT_PROCESS_GROUP_CLEANUP_TIMEOUT_MS: u64 = 10_000;
 ///
 /// The window is polled rather than slept through, so a SIGTERM-responsive
 /// group still finishes in milliseconds. It is wide enough for a cooperative
-/// descendant to release resources it owns — notably a Git `index.lock` it must
-/// remove itself, because Conflux never deletes lock files.
+/// descendant to release resources it owns — notably a Git `index.lock`, which
+/// its creator is expected to remove itself. A lock that survives forced
+/// cleanup is not repaired here: only the post-quiescence boundary in
+/// [`crate::execution::index_lock_reclaim`] may reclaim one, and only against
+/// same-dispatch evidence this grace period exists to make unnecessary.
 pub const DEFAULT_PROCESS_GROUP_SIGTERM_GRACE_MS: u64 = 2_000;
 
 /// Interval between process-group membership probes during cleanup.

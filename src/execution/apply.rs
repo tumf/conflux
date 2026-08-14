@@ -20,6 +20,10 @@ use crate::events::{ApplyCommitPhase, CommitOutputStream};
 use crate::execution::final_commit_lock_retry::{
     run_final_commit_with_retry, FinalCommitEnvironment, GitFinalCommitEnvironment,
 };
+use crate::execution::index_lock_reclaim::{
+    reclaim_orphaned_index_lock, IndexLockReclaimEnvironment, IndexLockReclaimOutcome,
+    PreDispatchLockObservation, RealIndexLockReclaimEnvironment,
+};
 use crate::execution::stage_gate::{classify_porcelain_status, WorkspaceStageStatus};
 use crate::execution::wip_lock_retry::{
     run_wip_snapshot_with_retry, GitWipSnapshotEnvironment, WipSnapshotEnvironment,
@@ -258,6 +262,135 @@ pub(crate) fn evaluate_process_group_barrier(
     )))
 }
 
+/// One dispatch's authority to converge its own `index.lock` residue.
+///
+/// The observation and the filesystem boundary travel together because neither
+/// is meaningful alone: the observation names what was absent before *this*
+/// spawn, and the environment is what re-reads those pathnames afterwards.
+/// Bundling them also keeps the finalization signatures from growing two more
+/// parameters each.
+pub(crate) struct ApplyLockReclamation<'a> {
+    observation: PreDispatchLockObservation,
+    environment: &'a dyn IndexLockReclaimEnvironment,
+}
+
+impl<'a> ApplyLockReclamation<'a> {
+    pub(crate) fn new(
+        observation: PreDispatchLockObservation,
+        environment: &'a dyn IndexLockReclaimEnvironment,
+    ) -> Self {
+        Self {
+            observation,
+            environment,
+        }
+    }
+
+    /// Capture the pre-dispatch observation against the real filesystem.
+    ///
+    /// Called immediately before an Apply command is spawned. Failure to
+    /// observe never blocks the spawn; it only leaves this dispatch without
+    /// reclamation authority, so residue is refused instead of deleted.
+    pub(crate) async fn capture(
+        environment: &'a dyn IndexLockReclaimEnvironment,
+        workspace_path: &Path,
+        is_git: bool,
+    ) -> Self {
+        Self::new(
+            PreDispatchLockObservation::capture(environment, workspace_path, is_git).await,
+            environment,
+        )
+    }
+}
+
+/// Evaluates the Apply `index.lock` convergence barrier.
+///
+/// Runs once per completed dispatch, after the process-group barrier and before
+/// any repository observation that may refresh or mutate the index. The
+/// observation is consumed here, so one capture can authorize at most one
+/// reclamation and a restarted process — which has no capture at all — has no
+/// authority whatsoever.
+///
+/// A refusal is terminal for this finalization boundary: the caller must not
+/// create a WIP snapshot, a final Apply commit, a cleanup review, a rejecting
+/// handoff, or an Acceptance dispatch after one.
+pub(crate) async fn evaluate_index_lock_convergence_barrier(
+    reclamation: ApplyLockReclamation<'_>,
+    report: &crate::process_manager::ProcessGroupCleanupReport,
+    change_id: &str,
+    workspace_path: &Path,
+    iteration: u32,
+) -> Result<()> {
+    let quiescence = report.quiescence();
+    let outcome =
+        reclaim_orphaned_index_lock(reclamation.observation, quiescence, reclamation.environment)
+            .await;
+
+    match &outcome {
+        IndexLockReclaimOutcome::Reclaimed { path } => {
+            warn!(
+                change_id = change_id,
+                iteration = iteration,
+                workspace = %workspace_path.display(),
+                lock_path = %path.display(),
+                quiescence = quiescence.as_str(),
+                outcome = outcome.as_str(),
+                "Reclaimed an orphaned managed-worktree index.lock left by this Apply dispatch \
+                 after confirmed process-group quiescence"
+            );
+        }
+        IndexLockReclaimOutcome::NaturallyConverged { path } => {
+            info!(
+                change_id = change_id,
+                iteration = iteration,
+                workspace = %workspace_path.display(),
+                lock_path = %path.display(),
+                quiescence = quiescence.as_str(),
+                outcome = outcome.as_str(),
+                "A managed-worktree index.lock left by this Apply dispatch converged on its own"
+            );
+        }
+        IndexLockReclaimOutcome::NotPresent | IndexLockReclaimOutcome::NotAuthorized { .. } => {
+            debug!(
+                change_id = change_id,
+                iteration = iteration,
+                workspace = %workspace_path.display(),
+                quiescence = quiescence.as_str(),
+                outcome = outcome.as_str(),
+                "{}",
+                outcome.diagnostics()
+            );
+        }
+        IndexLockReclaimOutcome::Refused(refusal) => {
+            error!(
+                change_id = change_id,
+                iteration = iteration,
+                workspace = %workspace_path.display(),
+                lock_path = %refusal.path().display(),
+                quiescence = quiescence.as_str(),
+                outcome = outcome.as_str(),
+                evidence = %refusal.evidence(),
+                "Managed-worktree index.lock residue is not a provable same-dispatch orphan; \
+                 skipping WIP snapshot, final commit, cleanup review, and handoff"
+            );
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Apply for '{}' in workspace '{}' (iteration {}) left a managed worktree \
+                 index.lock that Conflux will not remove: {}. Process-group quiescence was \
+                 '{}'. Repository finalization was not started and the workspace, index, and \
+                 lock were left untouched. Inspect '{}', remove it once no Git process owns \
+                 it, then retry apply.",
+                change_id,
+                workspace_path.display(),
+                iteration,
+                outcome.diagnostics(),
+                quiescence.as_str(),
+                refusal.path().display(),
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Why an active Apply invocation stopped before it could finish its work.
 ///
 /// Both variants are boundary decisions rather than command failures, so both
@@ -400,6 +533,7 @@ pub(crate) async fn preserve_interrupted_apply_progress(
     change_id: &str,
     progress_at_dispatch: &TaskProgress,
     iteration: u32,
+    reclamation: ApplyLockReclamation<'_>,
 ) -> OrchestratorError {
     warn!(
         change_id = change_id,
@@ -414,6 +548,35 @@ pub(crate) async fn preserve_interrupted_apply_progress(
     // escalation, so this awaits proof rather than re-implementing it.
     let _ = child.terminate();
     let cleanup_report = child.process_group_cleanup().await;
+
+    // Same convergence boundary the normal finalization path uses, in the same
+    // position: after cleanup evidence exists and before anything reads or
+    // mutates the index. A forced cleanup is precisely what orphans a lock, so
+    // this path needs it more than the normal one does.
+    //
+    // Quiescence still outranks it. An unconfirmed group yields `NotAuthorized`
+    // rather than a refusal, so the plan below reports the barrier failure — the
+    // more specific fact — instead of a lock diagnostic.
+    if let Err(convergence_error) = evaluate_index_lock_convergence_barrier(
+        reclamation,
+        &cleanup_report,
+        change_id,
+        workspace_path,
+        iteration,
+    )
+    .await
+    {
+        error!(
+            change_id = change_id,
+            iteration = iteration,
+            interruption = interruption.as_str(),
+            workspace = %workspace_path.display(),
+            error = %convergence_error,
+            "Interrupted Apply left unreclaimable index.lock residue; no WIP snapshot was \
+             attempted and the workspace and index contents are left in place for recovery"
+        );
+        return convergence_error;
+    }
 
     let snapshot_supported = is_git && workspace_manager.is_some();
     let plan = if cleanup_report.is_confirmed() && snapshot_supported {
@@ -2060,6 +2223,12 @@ where
     // Check if VCS is Git for WIP/stall features
     let is_git = matches!(vcs_backend, VcsBackend::Git);
 
+    // The real filesystem and a real dwell back every dispatch's `index.lock`
+    // convergence check. It is stateless — each dispatch's authority lives
+    // entirely in its own pre-spawn observation, never here.
+    let lock_reclaim_environment: &dyn IndexLockReclaimEnvironment =
+        &RealIndexLockReclaimEnvironment;
+
     // A wiring without a workspace manager takes no WIP snapshot, so it has no
     // empty-commit signal. Repository fingerprints around each dispatch supply
     // the Git/file evidence its stall accounting would otherwise lack.
@@ -2311,6 +2480,16 @@ where
             None
         };
 
+        // Same-dispatch `index.lock` provenance, taken immediately before the
+        // spawn. It is the only thing that can later distinguish "this dispatch
+        // orphaned a lock" from "a lock was already here", so it must be the
+        // last observation before the child exists. It is ephemeral in-memory
+        // state for the lifetime of this one command: consumed by value at the
+        // finalization barrier below, never persisted, and never consulted by
+        // restart routing.
+        let reclamation =
+            ApplyLockReclamation::capture(lock_reclaim_environment, workspace_path, is_git).await;
+
         // Execute apply command with history context via AiCommandRunner
         let (mut child, mut rx, start_time, command) = if escalation_eligible {
             apply_escalation_uses_for_current_stall =
@@ -2552,6 +2731,7 @@ where
                 change_id,
                 &progress,
                 iteration,
+                reclamation,
             )
             .await);
         }
@@ -2650,6 +2830,20 @@ where
             force_killed = cleanup_report.force_killed(),
             "Apply process-group quiescence confirmed; repository finalization may start"
         );
+
+        // Filesystem convergence, immediately after process convergence and
+        // before the first repository read below. A quiescent group can still
+        // have left a lock behind — that is exactly the incident this boundary
+        // exists for — and every gate past this point either reads or mutates
+        // the index.
+        evaluate_index_lock_convergence_barrier(
+            reclamation,
+            &cleanup_report,
+            change_id,
+            workspace_path,
+            iteration,
+        )
+        .await?;
 
         ensure_runtime_acceptance_follow_up(workspace_path, change_id, agent)?;
 
@@ -3233,6 +3427,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A dispatch that provably left no `index.lock` residue.
+    ///
+    /// `NoManagedWorktree` is the honest observation for a workspace with no
+    /// managed Git worktree, and it converges trivially — so tests about
+    /// something other than lock convergence keep that barrier a no-op without
+    /// pretending an unproven authority exists.
+    pub(super) fn no_lock_residue() -> ApplyLockReclamation<'static> {
+        ApplyLockReclamation::new(
+            PreDispatchLockObservation::NoManagedWorktree,
+            &RealIndexLockReclaimEnvironment,
+        )
+    }
+
     /// What an interrupted Apply owes the operator.
     ///
     /// An Apply that is cancelled or stopped by its runtime limit has usually
@@ -3395,6 +3602,7 @@ mod tests {
                 "change-a",
                 &TaskProgress::new(),
                 2,
+                no_lock_residue(),
             )
             .await;
             assert!(cancelled.is_cancellation(), "got: {cancelled}");
@@ -3411,6 +3619,7 @@ mod tests {
                 "change-a",
                 &TaskProgress::new(),
                 2,
+                no_lock_residue(),
             )
             .await;
             assert!(limited.is_runtime_limit(), "got: {limited}");
@@ -3440,6 +3649,7 @@ mod tests {
                 "change-a",
                 &TaskProgress::new(),
                 3,
+                no_lock_residue(),
             )
             .await;
 
@@ -3561,6 +3771,7 @@ mod tests {
                 change_id,
                 &TaskProgress::new(),
                 4,
+                no_lock_residue(),
             )
             .await;
 
@@ -3637,6 +3848,7 @@ mod tests {
                 change_id,
                 &TaskProgress::new(),
                 4,
+                no_lock_residue(),
             )
             .await;
 
@@ -3683,6 +3895,509 @@ mod tests {
                 ahead.trim(),
                 "2",
                 "the initial commit plus exactly one preserved WIP snapshot"
+            );
+        }
+    }
+
+    /// What the `index.lock` convergence barrier does to Apply finalization.
+    ///
+    /// The reclamation decision itself is proven exhaustively in
+    /// `execution::index_lock_reclaim`. What these pin is the *consumption* of
+    /// that decision at Apply's two finalization boundaries: that both use the
+    /// same operation in the same position, that a refusal stops every
+    /// repository and handoff effect rather than merely being logged, and that
+    /// a reclaimed orphan lets exactly the expected commit through.
+    ///
+    /// Evidence class: integration-shaped — a real Git worktree, a real
+    /// `index.lock`, and the real workspace manager. Only the dwell is injected,
+    /// so the cases stay in the default fast tier.
+    #[cfg(unix)]
+    mod index_lock_convergence {
+        use super::*;
+        use crate::execution::index_lock_reclaim::test_support::InstantDwellEnvironment;
+        use crate::process_manager::{
+            CommandTermination, ProcessGroupCleanupReport, ProcessGroupQuiescence,
+            StreamingChildHandle,
+        };
+        use crate::vcs::GitWorkspaceManager;
+
+        const CHANGE_ID: &str = "converge-change";
+        const ITERATION: u32 = 7;
+
+        fn git_out(repo: &Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+
+        fn cleanup(quiescence: ProcessGroupQuiescence) -> ProcessGroupCleanupReport {
+            ProcessGroupCleanupReport::for_test(quiescence, Some(4242), "cleanup evidence")
+        }
+
+        fn child(quiescence: ProcessGroupQuiescence) -> StreamingChildHandle {
+            use std::os::unix::process::ExitStatusExt;
+            StreamingChildHandle::for_test(
+                cleanup(quiescence),
+                CommandTermination::Cancelled,
+                std::process::ExitStatus::from_raw(1 << 8),
+            )
+        }
+
+        /// A worktree holding unpreserved agent work, exactly as an interrupted
+        /// dispatch leaves it.
+        fn arrange_workspace(workspace: &Path) {
+            init_git_repo(workspace);
+            let change_dir = workspace.join("openspec").join("changes").join(CHANGE_ID);
+            std::fs::create_dir_all(&change_dir).unwrap();
+            std::fs::write(
+                change_dir.join("tasks.md"),
+                "## Implementation Tasks\n- [x] first\n- [ ] second\n",
+            )
+            .unwrap();
+            std::fs::write(workspace.join("agent-output.rs"), "agent work\n").unwrap();
+        }
+
+        fn manager(workspace: &Path) -> GitWorkspaceManager {
+            GitWorkspaceManager::new(
+                workspace.to_path_buf(),
+                workspace.to_path_buf(),
+                1,
+                OrchestratorConfig::default(),
+            )
+        }
+
+        fn lock_path(workspace: &Path) -> PathBuf {
+            workspace.join(".git").join("index.lock")
+        }
+
+        fn write_empty_lock(workspace: &Path) -> PathBuf {
+            let lock = lock_path(workspace);
+            std::fs::write(&lock, b"").unwrap();
+            lock
+        }
+
+        fn commit_count(workspace: &Path) -> usize {
+            git_out(workspace, &["rev-list", "--count", "HEAD"])
+                .trim()
+                .parse()
+                .expect("rev-list --count is a number")
+        }
+
+        // -- the normal post-agent finalization boundary --------------------
+
+        /// The orphan case the whole change exists for: a zero-byte lock that
+        /// was absent before the dispatch and survived confirmed quiescence is
+        /// removed, and finalization is allowed to continue.
+        #[tokio::test]
+        async fn a_same_dispatch_orphan_is_reclaimed_and_finalization_may_continue() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            arrange_workspace(workspace);
+
+            let environment = InstantDwellEnvironment::new();
+            // Captured before the (simulated) spawn, while nothing holds a lock.
+            let reclamation = ApplyLockReclamation::capture(&environment, workspace, true).await;
+            let lock = write_empty_lock(workspace);
+
+            evaluate_index_lock_convergence_barrier(
+                reclamation,
+                &cleanup(ProcessGroupQuiescence::Confirmed),
+                CHANGE_ID,
+                workspace,
+                ITERATION,
+            )
+            .await
+            .expect("a same-dispatch orphan must not block finalization");
+
+            assert!(!lock.exists(), "the orphaned lock must be gone");
+            assert_eq!(
+                environment.dwells(),
+                vec![crate::execution::index_lock_reclaim::RECLAIM_DWELL],
+                "exactly one dwell is paid, for the one candidate that existed"
+            );
+        }
+
+        /// A lock already present before the spawn is somebody else's. It is
+        /// never removed, and it stops finalization instead.
+        #[tokio::test]
+        async fn a_pre_existing_lock_is_left_alone_and_refuses_finalization() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            arrange_workspace(workspace);
+
+            let lock = write_empty_lock(workspace);
+            let environment = InstantDwellEnvironment::new();
+            // Captured with the lock already there: this dispatch cannot have
+            // created it.
+            let reclamation = ApplyLockReclamation::capture(&environment, workspace, true).await;
+
+            let error = evaluate_index_lock_convergence_barrier(
+                reclamation,
+                &cleanup(ProcessGroupQuiescence::Confirmed),
+                CHANGE_ID,
+                workspace,
+                ITERATION,
+            )
+            .await
+            .expect_err("a pre-existing lock must refuse finalization");
+
+            assert!(lock.exists(), "a pre-existing lock must survive untouched");
+            assert!(
+                environment.dwells().is_empty(),
+                "pre-existence is decided without observing the file twice"
+            );
+
+            let rendered = error.to_string();
+            for expected in [
+                CHANGE_ID,
+                &workspace.display().to_string(),
+                &ITERATION.to_string(),
+                "confirmed",
+                &lock.display().to_string(),
+                "already existed",
+            ] {
+                assert!(
+                    rendered.contains(expected),
+                    "the refusal must name {expected:?}: {rendered}"
+                );
+            }
+        }
+
+        /// No residue is the ordinary outcome, and it must cost nothing and
+        /// block nothing.
+        #[tokio::test]
+        async fn a_dispatch_that_left_no_lock_converges_trivially() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            arrange_workspace(workspace);
+
+            let environment = InstantDwellEnvironment::new();
+            let reclamation = ApplyLockReclamation::capture(&environment, workspace, true).await;
+
+            evaluate_index_lock_convergence_barrier(
+                reclamation,
+                &cleanup(ProcessGroupQuiescence::Confirmed),
+                CHANGE_ID,
+                workspace,
+                ITERATION,
+            )
+            .await
+            .expect("no residue is not a refusal");
+
+            assert!(environment.dwells().is_empty());
+        }
+
+        /// A live writer owns the pathname. Unlinking it would destroy a real
+        /// index write, so the barrier refuses and leaves the content alone.
+        #[tokio::test]
+        async fn a_lock_that_changes_during_the_dwell_refuses_finalization() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            arrange_workspace(workspace);
+
+            let environment = {
+                let lock = lock_path(workspace);
+                InstantDwellEnvironment::mutating_during_dwell(move || {
+                    std::fs::write(&lock, b"DIRC a live index write").unwrap();
+                })
+            };
+            let reclamation = ApplyLockReclamation::capture(&environment, workspace, true).await;
+            let lock = write_empty_lock(workspace);
+
+            let error = evaluate_index_lock_convergence_barrier(
+                reclamation,
+                &cleanup(ProcessGroupQuiescence::Confirmed),
+                CHANGE_ID,
+                workspace,
+                ITERATION,
+            )
+            .await
+            .expect_err("an unstable lock must refuse finalization");
+
+            assert_eq!(
+                std::fs::read(&lock).unwrap(),
+                b"DIRC a live index write",
+                "the live writer's content must survive"
+            );
+            assert!(
+                error.to_string().contains("changed during"),
+                "the failed evidence condition must travel with the error: {error}"
+            );
+        }
+
+        /// `NotApplicable` is not deletion authority, but it is also not a new
+        /// blocking authority: the process-group barrier already decides whether
+        /// such a dispatch may finalize, and this boundary must not second-guess
+        /// it or touch the lock.
+        #[tokio::test]
+        async fn unconfirmed_quiescence_neither_unlinks_nor_adds_its_own_refusal() {
+            for quiescence in [
+                ProcessGroupQuiescence::NotApplicable,
+                ProcessGroupQuiescence::MembersRemain,
+                ProcessGroupQuiescence::Unverifiable,
+            ] {
+                let temp = TempDir::new().unwrap();
+                let workspace = temp.path();
+                arrange_workspace(workspace);
+
+                let environment = InstantDwellEnvironment::new();
+                let reclamation =
+                    ApplyLockReclamation::capture(&environment, workspace, true).await;
+                let lock = write_empty_lock(workspace);
+
+                evaluate_index_lock_convergence_barrier(
+                    reclamation,
+                    &cleanup(quiescence),
+                    CHANGE_ID,
+                    workspace,
+                    ITERATION,
+                )
+                .await
+                .expect("this boundary adds no authority of its own");
+
+                assert!(lock.exists(), "{quiescence:?} is not deletion authority",);
+                assert!(environment.dwells().is_empty());
+            }
+        }
+
+        // -- the interrupted-progress boundary ------------------------------
+
+        /// Forced cleanup is exactly what orphans a lock, so the interrupted
+        /// path needs the same convergence — and gets it before the snapshot, so
+        /// the agent's work is still preserved.
+        #[tokio::test]
+        async fn an_interrupted_apply_reclaims_its_orphan_and_still_preserves_progress() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            arrange_workspace(workspace);
+            let before = commit_count(workspace);
+
+            let environment = InstantDwellEnvironment::new();
+            let reclamation = ApplyLockReclamation::capture(&environment, workspace, true).await;
+            let lock = write_empty_lock(workspace);
+
+            let manager = manager(workspace);
+            let mut child = child(ProcessGroupQuiescence::Confirmed);
+            let error = preserve_interrupted_apply_progress(
+                ApplyInterruption::Cancelled,
+                &mut child,
+                Some(&manager),
+                true,
+                workspace,
+                CHANGE_ID,
+                &TaskProgress::new(),
+                ITERATION,
+                reclamation,
+            )
+            .await;
+
+            assert!(
+                error.is_cancellation(),
+                "the interruption still ends the run: {error}"
+            );
+            assert!(!lock.exists(), "the orphaned lock must be gone");
+            assert_eq!(
+                commit_count(workspace),
+                before + 1,
+                "reclamation must permit exactly one WIP snapshot"
+            );
+            let subject = git_out(workspace, &["log", "-1", "--format=%s"]);
+            assert!(
+                subject.starts_with(&format!("WIP: {CHANGE_ID} (")),
+                "the agent's work is preserved in the usual snapshot: {subject}"
+            );
+            assert!(
+                git_out(workspace, &["status", "--porcelain"])
+                    .trim()
+                    .is_empty(),
+                "nothing may be left unpreserved"
+            );
+        }
+
+        /// A refusal on the interrupted path takes no repository action at all.
+        /// The work stays in the worktree, which is what keeps it recoverable.
+        #[tokio::test]
+        async fn a_refused_interruption_creates_no_snapshot_and_touches_nothing() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            arrange_workspace(workspace);
+            let before = commit_count(workspace);
+            let head_before = git_out(workspace, &["rev-parse", "HEAD"]);
+
+            let lock = write_empty_lock(workspace);
+            let environment = InstantDwellEnvironment::new();
+            let reclamation = ApplyLockReclamation::capture(&environment, workspace, true).await;
+
+            let manager = manager(workspace);
+            let mut child = child(ProcessGroupQuiescence::Confirmed);
+            let error = preserve_interrupted_apply_progress(
+                ApplyInterruption::RuntimeLimit { limit_secs: 3600 },
+                &mut child,
+                Some(&manager),
+                true,
+                workspace,
+                CHANGE_ID,
+                &TaskProgress::new(),
+                ITERATION,
+                reclamation,
+            )
+            .await;
+
+            assert!(
+                !error.is_terminal_interruption(),
+                "an unreclaimable lock is not a clean stop: {error}"
+            );
+            assert!(
+                error.to_string().contains("already existed"),
+                "the refusal reason must reach the operator: {error}"
+            );
+
+            assert!(lock.exists(), "the lock must be left for explicit recovery");
+            assert_eq!(
+                commit_count(workspace),
+                before,
+                "no WIP snapshot may be created after a refusal"
+            );
+            assert_eq!(
+                git_out(workspace, &["rev-parse", "HEAD"]),
+                head_before,
+                "HEAD must not move"
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("agent-output.rs")).unwrap(),
+                "agent work\n",
+                "the agent's work must stay in the worktree, untouched"
+            );
+            assert!(
+                !git_out(workspace, &["status", "--porcelain"])
+                    .trim()
+                    .is_empty(),
+                "the worktree stays dirty because nothing was preserved or discarded"
+            );
+        }
+
+        /// Quiescence outranks lock convergence. An unproven process group must
+        /// report *that*, because "descendants may still be running" is the more
+        /// specific and more dangerous fact.
+        #[tokio::test]
+        async fn an_unproven_group_reports_cleanup_rather_than_the_lock() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            arrange_workspace(workspace);
+
+            let lock = write_empty_lock(workspace);
+            let environment = InstantDwellEnvironment::new();
+            let reclamation = ApplyLockReclamation::capture(&environment, workspace, true).await;
+
+            let manager = manager(workspace);
+            let mut child = child(ProcessGroupQuiescence::MembersRemain);
+            let error = preserve_interrupted_apply_progress(
+                ApplyInterruption::Cancelled,
+                &mut child,
+                Some(&manager),
+                true,
+                workspace,
+                CHANGE_ID,
+                &TaskProgress::new(),
+                ITERATION,
+                reclamation,
+            )
+            .await;
+
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("cleanup could not be confirmed"),
+                "the barrier failure must win: {rendered}"
+            );
+            assert!(lock.exists(), "no lock is inspected or removed");
+            assert!(environment.dwells().is_empty());
+        }
+
+        /// A dispatch that could not observe its candidates before spawning has
+        /// no authority at all — the safe answer is refusal, not a guess.
+        #[tokio::test]
+        async fn a_dispatch_without_a_pre_observation_refuses_residue() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            arrange_workspace(workspace);
+
+            let environment = InstantDwellEnvironment::new();
+            // What a restarted process holds: no capture from this dispatch.
+            let reclamation = ApplyLockReclamation::new(
+                PreDispatchLockObservation::Unresolved {
+                    workspace: workspace.to_path_buf(),
+                    reason: "no pre-dispatch observation exists".to_string(),
+                },
+                &environment,
+            );
+            let lock = write_empty_lock(workspace);
+
+            let error = evaluate_index_lock_convergence_barrier(
+                reclamation,
+                &cleanup(ProcessGroupQuiescence::Confirmed),
+                CHANGE_ID,
+                workspace,
+                ITERATION,
+            )
+            .await
+            .expect_err("unproven provenance must refuse");
+
+            assert!(
+                lock.exists(),
+                "a lock of unknown provenance is never removed"
+            );
+            assert!(
+                error.to_string().contains("never proven"),
+                "the missing evidence must be named: {error}"
+            );
+        }
+
+        /// Every outcome the operator can meet is distinguishable in the
+        /// diagnostics, and none of them exposes file contents.
+        #[tokio::test]
+        async fn refusal_diagnostics_carry_identity_evidence_without_file_contents() {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path();
+            arrange_workspace(workspace);
+
+            let environment = {
+                let lock = lock_path(workspace);
+                InstantDwellEnvironment::mutating_during_dwell(move || {
+                    std::fs::remove_file(&lock).unwrap();
+                    std::fs::write(&lock, b"secret index bytes").unwrap();
+                })
+            };
+            let reclamation = ApplyLockReclamation::capture(&environment, workspace, true).await;
+            write_empty_lock(workspace);
+
+            let error = evaluate_index_lock_convergence_barrier(
+                reclamation,
+                &cleanup(ProcessGroupQuiescence::Confirmed),
+                CHANGE_ID,
+                workspace,
+                ITERATION,
+            )
+            .await
+            .expect_err("a replaced lock must refuse");
+
+            let rendered = error.to_string();
+            for expected in ["dev=", "ino=", "size=", "mtime=", "identity_changed"] {
+                assert!(
+                    rendered.contains(expected),
+                    "identity evidence must include {expected:?}: {rendered}"
+                );
+            }
+            assert!(
+                !rendered.contains("secret index bytes"),
+                "diagnostics must never quote file contents: {rendered}"
             );
         }
     }
@@ -4984,8 +5699,10 @@ mod tests {
         // sweep signals it. The handler first ignores further SIGTERMs, and an
         // ignored disposition is inherited across exec, so its `sleep` cannot be
         // cut short: the lock is deterministically held for one second *after*
-        // the leader exits, far longer than the WIP snapshot retry budget
-        // (3 x 200ms) and well inside the cleanup grace window. Because Git
+        // the leader exits, well inside the cleanup grace window. That is what
+        // makes this the *live* case rather than the orphan case — the creator
+        // removes its own lock, so post-quiescence reclamation never has a
+        // candidate to consider and finalization proceeds normally. Because Git
         // refuses to commit while index.lock exists, and because the marker only
         // appears at release time, a final Apply commit containing the marker
         // proves finalization started after the descendant was gone.
@@ -5061,7 +5778,8 @@ mod tests {
 
         assert!(
             released_marker.exists(),
-            "the descendant must have released index.lock itself; Conflux never deletes lock files"
+            "the descendant must have released index.lock itself; a lock this dispatch \
+             saw released is never a reclamation candidate"
         );
         assert!(
             !index_lock.exists(),
@@ -5091,6 +5809,237 @@ mod tests {
         assert!(
             tracked.contains("released-after-cleanup.txt"),
             "final commit must have snapshotted the workspace after the descendant exited: {tracked}"
+        );
+    }
+
+    /// The production incident, reproduced against real processes.
+    ///
+    /// A descendant creates a real zero-byte `index.lock` and is then *killed*
+    /// rather than allowed to clean up, so the lock outlives every owned
+    /// process. That is the state no amount of retry can repair: process-group
+    /// quiescence is true while filesystem convergence is false. The claim is
+    /// that Apply converges it and then produces exactly the one Git
+    /// finalization it would have produced if the lock had never existed.
+    ///
+    /// Heavy: it spawns real processes, kills a real process group, and pays the
+    /// real 500ms dwell, so it cannot meet the default suite's per-test budget.
+    #[cfg(unix)]
+    #[cfg(feature = "heavy-tests")]
+    #[tokio::test]
+    async fn heavy_orphaned_index_lock_is_reclaimed_and_permits_exactly_one_final_commit() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "orphan-lock";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] one\n",
+        )
+        .unwrap();
+
+        let index_lock = workspace.join(".git").join("index.lock");
+        // Creates the lock and then ignores SIGTERM forever, so only the cleanup
+        // sweep's SIGKILL ends it — and a killed process runs no trap. The lock
+        // is therefore still on disk when quiescence is confirmed, which is
+        // exactly the orphan this boundary exists to converge.
+        let holder = write_script(
+            temp_dir.path(),
+            "holder.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 trap '' TERM\n\
+                 : > {lock}\n\
+                 while :; do sleep 60; done\n",
+                lock = index_lock.display()
+            ),
+        );
+        let apply_script = write_script(
+            temp_dir.path(),
+            "apply.sh",
+            &format!(
+                // Apply agents own file selection, so this one stages its work
+                // exactly like a compliant agent — and does so *before* the
+                // lock-holding descendant starts, because `git add` cannot run
+                // against a held index either.
+                "#!/bin/sh\n\
+                 printf '## Implementation Tasks\\n- [x] one\\n' > {tasks}\n\
+                 echo 'agent output' > {output}\n\
+                 git -C {workspace} add -A\n\
+                 sh {holder} >/dev/null 2>&1 </dev/null &\n\
+                 sleep 120\n",
+                tasks = change_dir.join("tasks.md").display(),
+                output = workspace.join("agent-output.txt").display(),
+                workspace = workspace.display(),
+                holder = holder.display()
+            ),
+        );
+
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh {}", apply_script.display())),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let result = scoped_apply_completion_grace_secs_for_test(
+            1,
+            scoped_apply_completion_check_interval_ms_for_test(
+                200,
+                execute_apply_loop(
+                    change_id,
+                    workspace,
+                    &config,
+                    &mut agent,
+                    VcsBackend::Git,
+                    Some(&workspace_manager),
+                    None,
+                    &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
+                    &NoOpEventHandler,
+                    None,
+                    &ai_runner,
+                    &ApplyBudget::new(),
+                    |_line| async move {},
+                ),
+            ),
+        )
+        .await
+        .expect("apply must succeed once the orphaned lock is reclaimed");
+
+        assert!(
+            !index_lock.exists(),
+            "the orphaned lock must have been reclaimed, not merely waited on"
+        );
+        assert!(result.completed);
+
+        // Git cannot commit while index.lock exists, so these commits could only
+        // have been created after reclamation — and there must be exactly one
+        // final Apply commit, not one per retry attempt.
+        let subjects = git_log_subjects(workspace);
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|s| *s == &format!("Apply: {change_id}"))
+                .count(),
+            1,
+            "reclamation must permit exactly one final Apply commit, got: {subjects:?}"
+        );
+        let tracked = std::process::Command::new("git")
+            .args(["ls-tree", "-r", "HEAD", "--name-only"])
+            .current_dir(workspace)
+            .output()
+            .expect("git ls-tree should run");
+        let tracked = String::from_utf8_lossy(&tracked.stdout).to_string();
+        assert!(
+            tracked.contains("agent-output.txt"),
+            "the agent's work must be in the commit reclamation unblocked: {tracked}"
+        );
+    }
+
+    /// The paired safety case: same real machinery, but the lock was already
+    /// there before the dispatch started. It belongs to something else, so it is
+    /// left exactly as found and no Git finalization or handoff happens at all.
+    ///
+    /// Heavy for the same reason as its counterpart: real processes and a real
+    /// process-group kill.
+    #[cfg(unix)]
+    #[cfg(feature = "heavy-tests")]
+    #[tokio::test]
+    async fn heavy_pre_existing_index_lock_is_untouched_and_blocks_finalization() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "pre-existing-lock";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] one\n",
+        )
+        .unwrap();
+
+        // Present before Apply is ever dispatched, so no dispatch can claim it.
+        let index_lock = workspace.join(".git").join("index.lock");
+        std::fs::write(&index_lock, b"").unwrap();
+
+        let head_before = git_log_subjects(workspace);
+        let apply_script = write_script(
+            temp_dir.path(),
+            "apply.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 printf '## Implementation Tasks\\n- [x] one\\n' > {tasks}\n\
+                 echo 'agent output' > {output}\n\
+                 sleep 120\n",
+                tasks = change_dir.join("tasks.md").display(),
+                output = workspace.join("agent-output.txt").display()
+            ),
+        );
+
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh {}", apply_script.display())),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let error = scoped_apply_completion_grace_secs_for_test(
+            1,
+            scoped_apply_completion_check_interval_ms_for_test(
+                200,
+                execute_apply_loop(
+                    change_id,
+                    workspace,
+                    &config,
+                    &mut agent,
+                    VcsBackend::Git,
+                    Some(&workspace_manager),
+                    None,
+                    &ApplyLoopHookContext::new(0, 1, 1, "/tmp/managed-workspace".to_string(), 0),
+                    &NoOpEventHandler,
+                    None,
+                    &ai_runner,
+                    &ApplyBudget::new(),
+                    |_line| async move {},
+                ),
+            ),
+        )
+        .await
+        .expect_err("a pre-existing lock must refuse repository finalization");
+
+        assert!(
+            error.to_string().contains("already existed"),
+            "the refusal must name pre-existence: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&index_lock).unwrap(),
+            Vec::<u8>::new(),
+            "the pre-existing lock must be left exactly as found"
+        );
+        assert_eq!(
+            git_log_subjects(workspace),
+            head_before,
+            "no WIP snapshot and no final commit may be created after a refusal"
+        );
+        assert!(
+            std::fs::read_to_string(workspace.join("agent-output.txt")).unwrap()
+                == "agent output\n",
+            "the agent's work stays in the worktree for recovery"
         );
     }
 
@@ -6711,8 +7660,24 @@ mod apply_commit_recovery {
         }
     }
 
+    /// Everything that must stay alive while a capture is being collected.
+    ///
+    /// The exclusion guard is listed first so it is released *after* the
+    /// subscriber guard: dropping it earlier would let another capture test's
+    /// WARN-scoped subscriber disable `info!` while this one is still running.
+    struct PersistentLogCapture {
+        _exclusive: tokio::sync::MutexGuard<'static, ()>,
+        _subscriber: tracing::subscriber::DefaultGuard,
+    }
+
     /// Install a tracing subscriber that captures what the persistent log gets.
-    fn capture_persistent_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    ///
+    /// Serialized against every other capturing test in the crate: tracing's
+    /// max-level hint is process-global, so an overlapping WARN-only capture
+    /// would silently drop the `info!` records these tests assert on. See
+    /// [`crate::test_support::tracing_capture_lock`].
+    async fn capture_persistent_logs() -> (CapturedLogs, PersistentLogCapture) {
+        let exclusive = crate::test_support::tracing_capture_lock().lock().await;
         let captured = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -6720,8 +7685,15 @@ mod apply_commit_recovery {
             .with_max_level(tracing::Level::INFO)
             .with_writer(captured.clone())
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (captured, guard)
+        let subscriber = tracing::subscriber::set_default(subscriber);
+        crate::test_support::refresh_tracing_interest();
+        (
+            captured,
+            PersistentLogCapture {
+                _exclusive: exclusive,
+                _subscriber: subscriber,
+            },
+        )
     }
 
     /// Assert every flooded hook line reached the persistent log.
@@ -6741,7 +7713,7 @@ mod apply_commit_recovery {
     #[cfg_attr(windows, ignore)]
     #[tokio::test]
     async fn successful_final_commit_output_is_persisted_in_full_without_a_frontend() {
-        let (captured, guard) = capture_persistent_logs();
+        let (captured, guard) = capture_persistent_logs().await;
 
         let repo = recovery_repo("log-flood-commit", COMPLETE_TASKS);
         use_flooding_hook(&repo);
@@ -6791,7 +7763,7 @@ mod apply_commit_recovery {
     #[cfg_attr(windows, ignore)]
     #[tokio::test]
     async fn rejected_final_commit_output_is_persisted_in_full_while_the_prompt_stays_bounded() {
-        let (captured, guard) = capture_persistent_logs();
+        let (captured, guard) = capture_persistent_logs().await;
 
         let repo = recovery_repo("log-flood-reject", COMPLETE_TASKS);
         use_flooding_hook(&repo);
@@ -7225,7 +8197,7 @@ mod apply_commit_recovery {
         );
         assert!(
             environment.lock_was_untouched(),
-            "Conflux must never delete or rewrite a lock it does not own"
+            "a lock this dispatch did not create is never deleted or rewritten"
         );
         assert_eq!(repo.head_subject(), "Apply: lock-then-commit");
         assert!(
@@ -7295,7 +8267,10 @@ mod apply_commit_recovery {
             0,
             "contention stops before repository verification runs"
         );
-        assert!(lock.exists(), "Conflux must never delete a live lock");
+        assert!(
+            lock.exists(),
+            "a live lock is never deleted by the retry policy"
+        );
         assert_ne!(repo.head_subject(), "Apply: lock-forever");
     }
 

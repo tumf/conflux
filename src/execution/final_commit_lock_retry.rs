@@ -19,8 +19,15 @@
 //! failure here at all: it arrives as
 //! [`VerifiedCommitOutcome::RepositoryRejected`] and is returned untouched, so
 //! it never consumes the lock retry budget and still enters the existing
-//! bounded Apply repair flow. Conflux never deletes or bypasses a lock, and it
-//! never adds `--no-verify` to the final commit.
+//! bounded Apply repair flow. This policy never deletes or bypasses a lock, and
+//! it never adds `--no-verify` to the final commit.
+//!
+//! Deletion authority lives outside every retry policy. An orphaned lock — one
+//! whose creator was force-killed after creating it — cannot clear by waiting,
+//! so it is converged by [`crate::execution::index_lock_reclaim`] at the Apply
+//! post-quiescence barrier, before finalization starts. By the time this policy
+//! runs, a remaining lock is by construction a *live* one, and waiting is the
+//! only correct response to it.
 //!
 //! The policy is deliberately separate from
 //! [`crate::execution::wip_lock_retry`]: a WIP snapshot proves completion from
@@ -46,14 +53,20 @@ use crate::vcs::git::commands::{parents_of, rev_parse_commit, run_git};
 use crate::vcs::{VcsBackend, VcsError, VcsResult, VerifiedCommitOutcome};
 
 /// Total attempts (initial attempt plus retries) for one final Apply commit.
-pub const FINAL_COMMIT_MAX_ATTEMPTS: u32 = 3;
+pub const FINAL_COMMIT_MAX_ATTEMPTS: u32 = 5;
 
 /// Delay between finalization attempts.
 ///
 /// Deliberately flat rather than exponential, for the same reason the WIP
 /// snapshot policy is: index-lock contention is short-lived, and backoff only
 /// widens the window where finished apply output sits uncommitted.
-pub const FINAL_COMMIT_RETRY_DELAY: Duration = Duration::from_millis(200);
+///
+/// Five attempts at this delay give the same bounded two-second window the WIP
+/// policy uses. Like that one, it is a recovery window for *live* contention
+/// only: an orphaned lock is converged by
+/// [`crate::execution::index_lock_reclaim`] before finalization begins, because
+/// waiting can never repair a lock whose creator is already gone.
+pub const FINAL_COMMIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// The staging command the add-and-commit finalization path runs.
 const FINALIZATION_STAGE_COMMAND: &str = "git add -A";
@@ -606,7 +619,7 @@ pub(crate) mod test_support {
         }
 
         /// Whether the held lock still carried its sentinel every time the
-        /// policy waited, i.e. Conflux never deleted or rewrote it.
+        /// policy waited, i.e. this retry policy never deleted or rewrote it.
         pub(crate) fn lock_was_untouched(&self) -> bool {
             self.lock_untouched.lock().unwrap().unwrap_or(false)
         }
@@ -1195,7 +1208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_apply_commit_lock_retry_policy_stops_after_three_attempts() {
+    async fn final_apply_commit_lock_retry_policy_stops_after_five_attempts() {
         let environment = FakeEnvironment::clean();
         let attempts = Mutex::new(0_u32);
 
@@ -1213,10 +1226,22 @@ mod tests {
         .expect_err("exhausted contention must fail");
 
         assert_eq!(*attempts.lock().unwrap(), FINAL_COMMIT_MAX_ATTEMPTS);
+        // Exactly one wait between each pair of attempts, all identical: five
+        // attempts means four waits, and no backoff means none of them grow.
         assert_eq!(
             environment.sleeps(),
-            vec![FINAL_COMMIT_RETRY_DELAY, FINAL_COMMIT_RETRY_DELAY],
+            vec![FINAL_COMMIT_RETRY_DELAY; (FINAL_COMMIT_MAX_ATTEMPTS - 1) as usize],
             "fixed delay with no backoff"
+        );
+        assert_eq!(
+            environment.sleeps().len(),
+            4,
+            "five total attempts are separated by four waits"
+        );
+        assert_eq!(
+            FINAL_COMMIT_RETRY_DELAY,
+            Duration::from_millis(500),
+            "the contract fixes the interval, not just its uniformity"
         );
 
         let VcsError::Command {
@@ -1229,7 +1254,7 @@ mod tests {
         else {
             panic!("expected command error, got {:?}", error);
         };
-        assert!(message.contains("attempt 3/3"), "message: {}", message);
+        assert!(message.contains("attempt 5/5"), "message: {}", message);
         assert!(message.contains("did not clear"), "message: {}", message);
         assert_eq!(
             command.as_deref(),

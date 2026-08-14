@@ -120,7 +120,10 @@ async fn transient_wip_commit_lock_recovers_when_contention_clears() {
         "apply output missing from snapshot: {}",
         committed
     );
-    assert!(!lock.exists(), "Conflux must never delete a live lock");
+    assert!(
+        !lock.exists(),
+        "the WIP retry policy must never delete a live lock"
+    );
 }
 
 #[tokio::test]
@@ -141,8 +144,8 @@ async fn transient_wip_commit_lock_exhaustion_preserves_workspace() {
     .await
     .expect_err("a lock held past the retry budget must fail");
     assert!(
-        started.elapsed() >= WIP_SNAPSHOT_RETRY_DELAY * 2,
-        "three attempts must be separated by two fixed delays"
+        started.elapsed() >= WIP_SNAPSHOT_RETRY_DELAY * (WIP_SNAPSHOT_MAX_ATTEMPTS - 1),
+        "five attempts must be separated by four fixed delays"
     );
 
     let VcsError::Command {
@@ -168,7 +171,10 @@ async fn transient_wip_commit_lock_exhaustion_preserves_workspace() {
     assert!(stderr.as_deref().unwrap_or_default().contains("index.lock"));
 
     // The lock is untouched and the apply output is still verifiable.
-    assert!(lock.exists(), "Conflux must never delete a live lock");
+    assert!(
+        lock.exists(),
+        "the WIP retry policy must never delete a live lock"
+    );
     assert_eq!(
         fs::read_to_string(repo.path().join("applied.txt")).unwrap(),
         "apply output\n"

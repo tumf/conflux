@@ -1020,11 +1020,29 @@ mod tests {
         }
     }
 
-    fn capture_tracing() -> (CaptureLayer, tracing::subscriber::DefaultGuard) {
+    /// Everything that must stay alive while a capture is being collected.
+    ///
+    /// The exclusion guard drops last, after the subscriber guard, so this
+    /// capture's WARN-only max-level hint is gone before another capture test
+    /// is allowed to start.
+    struct TracingCapture {
+        _exclusive: tokio::sync::MutexGuard<'static, ()>,
+        _subscriber: tracing::subscriber::DefaultGuard,
+    }
+
+    /// Install a WARN-scoped capturing subscriber for the current test.
+    ///
+    /// Serialized against every other capturing test in the crate. That hint is
+    /// process-global, not thread-local: while it is held, `info!` callsites are
+    /// disabled everywhere, which would blank out the records an overlapping
+    /// INFO-scoped capture test is asserting on. See
+    /// [`crate::test_support::tracing_capture_lock`].
+    async fn capture_tracing() -> (CaptureLayer, TracingCapture) {
         use tracing_subscriber::filter::LevelFilter;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Layer;
 
+        let exclusive = crate::test_support::tracing_capture_lock().lock().await;
         let capture = CaptureLayer::default();
         // WARN and above is everything these assertions inspect. Keeping the filter
         // tight also keeps tracing's process-wide max-level hint from opening up to
@@ -1033,8 +1051,15 @@ mod tests {
             tracing_subscriber::registry().with(capture.clone().with_filter(LevelFilter::WARN));
         // `set_default` (not `with_default`) keeps the subscriber installed across
         // `.await` points inside single-threaded `#[tokio::test]` runtimes.
-        let guard = tracing::subscriber::set_default(subscriber);
-        (capture, guard)
+        let subscriber = tracing::subscriber::set_default(subscriber);
+        crate::test_support::refresh_tracing_interest();
+        (
+            capture,
+            TracingCapture {
+                _exclusive: exclusive,
+                _subscriber: subscriber,
+            },
+        )
     }
 
     /// Minimal config satisfying the executor's required command fields.
@@ -1605,7 +1630,7 @@ mod tests {
             create_test_change("gateway", vec![]),
         ];
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
-        let (capture, _tracing_guard) = capture_tracing();
+        let (capture, _tracing_guard) = capture_tracing().await;
 
         for _ in 0..2 {
             service
@@ -1709,7 +1734,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("tempdir");
         let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
         let changes = vec![create_test_change("route", vec!["policy"])];
-        let (capture, _tracing_guard) = capture_tracing();
+        let (capture, _tracing_guard) = capture_tracing().await;
 
         for _ in 0..3 {
             service
@@ -1733,11 +1758,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_recoverable_fallback_log_uses_warn_level_only() {
+    // `async` only so the capture can take the process-wide tracing exclusion
+    // lock; the assertions themselves are synchronous.
+    #[tokio::test]
+    async fn test_recoverable_fallback_log_uses_warn_level_only() {
         use tracing::Level;
 
-        let (capture, guard) = capture_tracing();
+        let (capture, guard) = capture_tracing().await;
         ParallelRunService::log_recoverable_analysis_fallback(&"invalid dependency graph");
         drop(guard);
 

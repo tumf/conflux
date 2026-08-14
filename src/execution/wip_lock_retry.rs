@@ -8,8 +8,14 @@
 //! This module owns the narrow policy for that case only: the Conflux-owned
 //! snapshot commands, an existing-`index.lock` failure, and a lock that
 //! resolves to the managed worktree being snapshotted. Every other VCS failure
-//! stays terminal, and Conflux never removes a lock file - it waits and
+//! stays terminal, and this policy never removes a lock file - it waits and
 //! re-attempts the normal Git operations.
+//!
+//! Waiting is the right answer only for *live* contention. A lock whose creator
+//! is already dead never clears, so it is converged before finalization begins
+//! by [`crate::execution::index_lock_reclaim`], which holds Conflux's only lock
+//! deletion authority and requires same-dispatch evidence this module has no
+//! access to. Retry policy and deletion authority stay separate on purpose.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -26,14 +32,21 @@ use crate::vcs::git::commands::run_git;
 use crate::vcs::{VcsBackend, VcsError, VcsResult};
 
 /// Total attempts (initial attempt plus retries) for a single WIP snapshot.
-pub const WIP_SNAPSHOT_MAX_ATTEMPTS: u32 = 3;
+pub const WIP_SNAPSHOT_MAX_ATTEMPTS: u32 = 5;
 
 /// Delay between snapshot attempts.
 ///
 /// Deliberately flat rather than exponential: index-lock contention is
 /// short-lived, and backoff only widens the window where finished apply output
 /// sits uncommitted in the workspace.
-pub const WIP_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(200);
+///
+/// Five attempts at this delay give a two-second total recovery window, which
+/// is long enough for ordinary live contention while staying bounded and
+/// cancellation-aware. It is deliberately not sized to outlast an *orphaned*
+/// lock: no amount of waiting repairs a lock whose creator is dead, and
+/// [`crate::execution::index_lock_reclaim`] owns that case before this policy
+/// ever runs.
+pub const WIP_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Identity of the snapshot whose failures may be retried.
 ///
@@ -661,7 +674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_wip_commit_lock_retry_policy_stops_after_three_attempts() {
+    async fn transient_wip_commit_lock_retry_policy_stops_after_five_attempts() {
         let environment = FakeEnvironment::new();
         let attempts = Mutex::new(0_u32);
 
@@ -679,10 +692,22 @@ mod tests {
         .expect_err("exhausted contention must fail");
 
         assert_eq!(*attempts.lock().unwrap(), WIP_SNAPSHOT_MAX_ATTEMPTS);
+        // Exactly one wait between each pair of attempts, all identical: five
+        // attempts means four waits, and no backoff means none of them grow.
         assert_eq!(
             environment.sleeps(),
-            vec![WIP_SNAPSHOT_RETRY_DELAY, WIP_SNAPSHOT_RETRY_DELAY],
+            vec![WIP_SNAPSHOT_RETRY_DELAY; (WIP_SNAPSHOT_MAX_ATTEMPTS - 1) as usize],
             "fixed delay with no backoff"
+        );
+        assert_eq!(
+            environment.sleeps().len(),
+            4,
+            "five total attempts are separated by four waits"
+        );
+        assert_eq!(
+            WIP_SNAPSHOT_RETRY_DELAY,
+            Duration::from_millis(500),
+            "the contract fixes the interval, not just its uniformity"
         );
 
         let VcsError::Command {
@@ -695,7 +720,7 @@ mod tests {
         else {
             panic!("expected command error, got {:?}", error);
         };
-        assert!(message.contains("attempt 3/3"), "message: {}", message);
+        assert!(message.contains("attempt 5/5"), "message: {}", message);
         assert!(message.contains("did not clear"), "message: {}", message);
         assert!(command.is_some());
         assert!(working_dir.is_some());
