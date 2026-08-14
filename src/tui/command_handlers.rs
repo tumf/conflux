@@ -42,6 +42,10 @@ mod mark_settlement_tests;
 #[cfg(all(test, feature = "web-monitoring"))]
 mod change_error_f5_retry_tests;
 
+/// Core ↔ TUI ↔ `/api/v2` convergence for accepted persistent-idle Start.
+#[cfg(all(test, feature = "web-monitoring"))]
+mod idle_start_running_tests;
+
 #[cfg(test)]
 #[derive(Clone, Debug)]
 enum DeleteWorktreeTestOutcome {

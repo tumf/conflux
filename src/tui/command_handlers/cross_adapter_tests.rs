@@ -909,9 +909,10 @@ async fn tui_and_v2_settle_every_lifecycle_intent_identically() {
 ///
 /// The parity table above already proves both adapters settle the stop family
 /// identically from this mode. What is left is the behaviour that is specific to
-/// it: Start notifies instead of spawning and does not claim Running, marks stay
-/// mark-only, graceful stop wakes the parked waiter, the controls stay
-/// discoverable, and an idle-origin cancel-stop returns to Ready.
+/// it: Start notifies instead of spawning and opens the run episode from the
+/// accepted outcome, marks stay mark-only, graceful stop wakes the parked
+/// waiter, the controls stay discoverable, and an idle-origin cancel-stop —
+/// one that never had an accepted Start — returns to Ready.
 #[tokio::test]
 async fn persistent_idle_commands_use_live_scheduler() {
     use crate::events::persistent_idle_may_project_ready;
@@ -964,12 +965,12 @@ async fn persistent_idle_commands_use_live_scheduler() {
     }
     assert_eq!(
         app.execution_mode,
-        AppExecutionMode::Select,
-        "a notified Start has started nothing yet, so Ready stands"
+        AppExecutionMode::Running,
+        "an accepted Start opens the run episode the operator asked for"
     );
     assert!(
-        app.persistent_scheduler_idle,
-        "a Start notification does not close the idle episode"
+        !app.persistent_scheduler_idle,
+        "the accepted Start closes the idle presentation episode"
     );
 
     // ── The controls are discoverable, and pre-run Select's are not ────────

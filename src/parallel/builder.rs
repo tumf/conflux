@@ -149,6 +149,7 @@ impl ParallelExecutor {
             pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             scheduler_lifetime: SchedulerLifetime::Finite,
             persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            persistent_idle_baseline: Arc::new(std::sync::Mutex::new(None)),
             post_archive_action: PostArchiveAction::MergeToBase,
             shared_orchestrator_state: None,
             last_dispatched_resolve_wait_changes: HashSet::new(),

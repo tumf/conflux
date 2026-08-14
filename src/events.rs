@@ -1072,6 +1072,42 @@ pub fn persistent_idle_may_project_ready(current_mode: &str) -> bool {
     current_mode == PERSISTENT_IDLE_SOURCE_MODE
 }
 
+/// The `app_mode` token a persistent-idle Ready episode is presented as.
+pub const PERSISTENT_IDLE_READY_MODE: &str = "select";
+
+/// Whether an accepted `RunDispatched` outcome opens the operator-visible run
+/// episode over persistent-idle Ready.
+///
+/// `RunDispatched` distinguishes only whether a *new* scheduler was spawned, so
+/// this reads the rest of the transition from the projection's own ordered
+/// facts: Ready presented over a live parked scheduler, no new scheduler, and at
+/// least one target the shared transaction actually committed. Together those
+/// mean exactly one thing — shared run control revalidated the existing
+/// scheduler, committed reducer queue or explicit-retry intent, and woke it —
+/// which is what makes an accepted F5 visible immediately instead of after
+/// dependency analysis.
+///
+/// Every publisher of this effect shape must therefore carry scheduler-wake
+/// evidence for a non-empty committed target set. The one publisher that never
+/// held any — a bare retry *plan*, which is a reducer transition rather than a
+/// dispatch — publishes nothing rather than reusing this shape.
+///
+/// Raw key input, a refused Start, an empty target set, and a generic scheduler
+/// notification all fail one of the conjuncts, so none of them can project
+/// Running. Core, TUI, Web, and the lifecycle mirror route the decision through
+/// here so they cannot disagree about the same dispatch.
+pub fn accepted_start_opens_idle_run_episode(
+    current_mode: &str,
+    persistent_scheduler_idle: bool,
+    scheduler_started: bool,
+    change_ids: &[String],
+) -> bool {
+    current_mode == PERSISTENT_IDLE_READY_MODE
+        && persistent_scheduler_idle
+        && !scheduler_started
+        && !change_ids.is_empty()
+}
+
 /// Whether this event is typed evidence that admitted work actually started.
 ///
 /// This is the shared "the idle episode is over" trigger: it names the
@@ -1520,25 +1556,48 @@ pub fn lifecycle_event_for_execution_event(
 }
 
 /// The app-mode token a fresh process starts in.
-const INITIAL_APP_MODE: &str = "select";
+const INITIAL_APP_MODE: &str = PERSISTENT_IDLE_READY_MODE;
+
+/// What one absorbed event owes the external lifecycle adapter.
+///
+/// Only the two guarded *mode* transitions live here. Every other lifecycle
+/// meaning is still derived per event by
+/// [`lifecycle_event_for_execution_event`], so this stays the narrow set the
+/// mirror alone can decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleModeTransition {
+    /// The event carries no mirror-owned lifecycle transition.
+    None,
+    /// The guarded Running-to-Ready persistent-idle transition was accepted.
+    Idle,
+    /// An accepted Start opened the run episode over persistent-idle Ready.
+    AcceptedIdleStart,
+}
 
 /// Process-local mirror of frontend execution mode for the dispatch lifecycle
 /// projection.
 ///
 /// The authoritative dispatch has no frontend to ask which mode an idle event
 /// arrived in, so it derives the same answer TUI and Web derive, from the same
-/// ordered events, through the same shared guard
-/// ([`persistent_idle_may_project_ready`]). It is observation state only: it
+/// ordered events, through the same shared guards
+/// ([`persistent_idle_may_project_ready`] and
+/// [`accepted_start_opens_idle_run_episode`]). It is observation state only: it
 /// never authorizes a command and never reaches the reducer.
 #[derive(Debug, Clone)]
 pub struct LifecycleModeMirror {
     mode: String,
+    /// The idle-episode qualifier, mirrored for exactly the same reason the mode
+    /// is: an accepted Start's `RunDispatched` says nothing about which kind of
+    /// `select` it arrived in, and without that half the mirror would either
+    /// miss the `working` edge or refuse the no-work `idle` edge that closes it.
+    persistent_idle: bool,
 }
 
 impl Default for LifecycleModeMirror {
     fn default() -> Self {
         Self {
             mode: INITIAL_APP_MODE.to_string(),
+            persistent_idle: false,
         }
     }
 }
@@ -1554,29 +1613,63 @@ impl LifecycleModeMirror {
         &self.mode
     }
 
-    /// Absorb one event, reporting whether it performed the guarded
-    /// Running-to-Ready persistent-idle transition.
+    /// Absorb one event, reporting the guarded mode transition it performed.
     ///
-    /// `true` is the *only* thing that authorizes an `idle` lifecycle
-    /// publication for a persistent scheduler: a late or duplicate idle event
-    /// leaves the mirrored mode untouched and reports `false`.
-    pub fn absorb(&mut self, event: &ExecutionEvent) -> bool {
+    /// [`LifecycleModeTransition::Idle`] is the *only* thing that authorizes an
+    /// `idle` lifecycle publication for a persistent scheduler: a late or
+    /// duplicate idle event leaves the mirrored mode untouched and reports
+    /// [`LifecycleModeTransition::None`].
+    ///
+    /// [`LifecycleModeTransition::AcceptedIdleStart`] is the same contract for
+    /// the other end of the episode. Absorbing it is what lets the *next*
+    /// no-work park be published: without it the mirror would still read
+    /// `select`, the guard would reject that idle edge, and an adapter would sit
+    /// at `working` for a scheduler that had already parked.
+    pub fn absorb(&mut self, event: &ExecutionEvent) -> LifecycleModeTransition {
         match event {
             ExecutionEvent::PersistentSchedulerIdle => {
                 if !persistent_idle_may_project_ready(&self.mode) {
-                    return false;
+                    return LifecycleModeTransition::None;
                 }
                 self.mode = INITIAL_APP_MODE.to_string();
-                return true;
+                self.persistent_idle = true;
+                return LifecycleModeTransition::Idle;
+            }
+            // The accepted operator outcome, read through the same shared gate
+            // Core, TUI, and Web read. A refused Start publishes no outcome at
+            // all, and a no-op one carries no committed target, so neither can
+            // reach the transition below.
+            ExecutionEvent::OperatorCommandApplied {
+                effect:
+                    OperatorCommandEffect::RunDispatched {
+                        change_ids,
+                        scheduler_started,
+                        ..
+                    },
+            } => {
+                if accepted_start_opens_idle_run_episode(
+                    &self.mode,
+                    self.persistent_idle,
+                    *scheduler_started,
+                    change_ids,
+                ) {
+                    self.mode = PERSISTENT_IDLE_SOURCE_MODE.to_string();
+                    self.persistent_idle = false;
+                    return LifecycleModeTransition::AcceptedIdleStart;
+                }
             }
             ExecutionEvent::Stopping => self.mode = "stopping".to_string(),
             // Both mean "this run is no longer executing"; the guard treats them
             // the same, so they share one token rather than inviting a second
             // terminal vocabulary here.
             ExecutionEvent::Stopped | ExecutionEvent::AllCompleted => {
-                self.mode = "stopped".to_string()
+                self.mode = "stopped".to_string();
+                self.persistent_idle = false;
             }
-            ExecutionEvent::Error { .. } => self.mode = "error".to_string(),
+            ExecutionEvent::Error { .. } => {
+                self.mode = "error".to_string();
+                self.persistent_idle = false;
+            }
             // A change-scoped failure is not a process mode. The failed change
             // still projects `blocked` through
             // [`lifecycle_event_for_execution_event`]; what must not happen is
@@ -1587,13 +1680,18 @@ impl LifecycleModeMirror {
             ExecutionEvent::ProcessingError { .. } => {}
             // A pending graceful stop outranks work that started after it was
             // requested: the operator's stop is still owed. Every other mode
-            // yields to typed evidence that something is really executing.
-            event if is_admitted_work_start(event) && self.mode != "stopping" => {
-                self.mode = "running".to_string()
+            // yields to typed evidence that something is really executing. The
+            // idle-episode qualifier ends either way — the same rule Core, TUI,
+            // and Web apply — because work really did start.
+            event if is_admitted_work_start(event) => {
+                self.persistent_idle = false;
+                if self.mode != "stopping" {
+                    self.mode = PERSISTENT_IDLE_SOURCE_MODE.to_string();
+                }
             }
             _ => {}
         }
-        false
+        LifecycleModeTransition::None
     }
 }
 
@@ -1628,16 +1726,29 @@ impl EventSink for LifecycleEventSink {
     async fn on_event(&self, event: &ExecutionEvent) {
         // The mirror sees every event, so its answer for the next persistent-idle
         // dispatch is derived from the same ordered stream the frontends read.
-        let accepted_persistent_idle = self
+        let transition = self
             .mode
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .absorb(event);
 
-        if accepted_persistent_idle {
-            use crate::lifecycle_integration::{LifecycleEvent, LifecycleState};
+        // Both guarded transitions are published from the mirror's answer rather
+        // than from the event variant, because the variant alone carries neither
+        // meaning: an idle event delivered over a stopped run is not `idle`, and
+        // a `RunDispatched` that woke nothing is not `working`.
+        let mirrored_state = match transition {
+            LifecycleModeTransition::Idle => {
+                Some(crate::lifecycle_integration::LifecycleState::Idle)
+            }
+            LifecycleModeTransition::AcceptedIdleStart => {
+                Some(crate::lifecycle_integration::LifecycleState::Working)
+            }
+            LifecycleModeTransition::None => None,
+        };
+        if let Some(state) = mirrored_state {
+            use crate::lifecycle_integration::LifecycleEvent;
             self.handle.publish(LifecycleEvent::StateChanged {
-                state: LifecycleState::Idle,
+                state,
                 context: crate::lifecycle_integration::LifecycleContext {
                     workspace: self.workspace.clone(),
                     ..Default::default()
@@ -2735,24 +2846,32 @@ mod lifecycle_bridge_tests {
         let mut mirror = LifecycleModeMirror::default();
         assert_eq!(mirror.app_mode(), "select");
 
-        assert!(
-            !mirror.absorb(&ExecutionEvent::WorkspacePreparationStarted {
+        assert_eq!(
+            mirror.absorb(&ExecutionEvent::WorkspacePreparationStarted {
                 change_id: "change-a".to_string(),
-            })
+            }),
+            LifecycleModeTransition::None
         );
         assert_eq!(mirror.app_mode(), "running");
 
-        assert!(mirror.absorb(&ExecutionEvent::PersistentSchedulerIdle));
+        assert_eq!(
+            mirror.absorb(&ExecutionEvent::PersistentSchedulerIdle),
+            LifecycleModeTransition::Idle
+        );
         assert_eq!(mirror.app_mode(), "select");
 
         // A stop requested from idle Ready leaves Stopping, and work starting
         // under a pending stop does not withdraw it.
-        assert!(!mirror.absorb(&ExecutionEvent::Stopping));
+        assert_eq!(
+            mirror.absorb(&ExecutionEvent::Stopping),
+            LifecycleModeTransition::None
+        );
         assert_eq!(mirror.app_mode(), "stopping");
-        assert!(
-            !mirror.absorb(&ExecutionEvent::WorkspacePreparationStarted {
+        assert_eq!(
+            mirror.absorb(&ExecutionEvent::WorkspacePreparationStarted {
                 change_id: "change-a".to_string(),
-            })
+            }),
+            LifecycleModeTransition::None
         );
         assert_eq!(mirror.app_mode(), "stopping");
     }
@@ -2768,6 +2887,7 @@ mod lifecycle_bridge_tests {
         for arranged in ["select", "running", "stopping", "stopped", "error"] {
             let mut mirror = LifecycleModeMirror {
                 mode: arranged.to_string(),
+                persistent_idle: false,
             };
 
             for error in [
@@ -2776,11 +2896,12 @@ mod lifecycle_bridge_tests {
                 // the text, so identical prose must not change the answer.
                 "fatal: the orchestrator could not start",
             ] {
-                assert!(
-                    !mirror.absorb(&ExecutionEvent::ProcessingError {
+                assert_eq!(
+                    mirror.absorb(&ExecutionEvent::ProcessingError {
                         id: "alpha".to_string(),
                         error: error.to_string(),
                     }),
+                    LifecycleModeTransition::None,
                     "a change-scoped failure authorizes no idle publication"
                 );
                 assert_eq!(
@@ -2799,15 +2920,185 @@ mod lifecycle_bridge_tests {
         for arranged in ["select", "running", "stopping", "stopped"] {
             let mut mirror = LifecycleModeMirror {
                 mode: arranged.to_string(),
+                persistent_idle: false,
             };
 
-            assert!(!mirror.absorb(&ExecutionEvent::Error {
-                message: "the orchestrator could not start".to_string(),
-            }));
+            assert_eq!(
+                mirror.absorb(&ExecutionEvent::Error {
+                    message: "the orchestrator could not start".to_string(),
+                }),
+                LifecycleModeTransition::None
+            );
             assert_eq!(
                 mirror.app_mode(),
                 "error",
                 "a typed global Error is still process-fatal (from {arranged})"
+            );
+        }
+    }
+
+    /// One accepted Start's `RunDispatched`, shaped exactly as run control
+    /// publishes it for a woken live scheduler.
+    fn accepted_idle_start(change_ids: &[&str]) -> ExecutionEvent {
+        ExecutionEvent::OperatorCommandApplied {
+            effect: OperatorCommandEffect::RunDispatched {
+                change_ids: change_ids.iter().map(|id| (*id).to_string()).collect(),
+                explicit_retry: false,
+                scheduler_started: false,
+            },
+        }
+    }
+
+    /// Verification `idle-start-running-regressions`: the lifecycle adapter
+    /// leaves `idle` on the accepted Start outcome and returns to it when the
+    /// woken scheduler admits nothing.
+    ///
+    /// Driven through the real sink over one ordered stream, because the defect
+    /// this closes is a *sequence* defect: absorbing the accepted Start is what
+    /// makes the later no-work idle edge publishable at all.
+    #[tokio::test]
+    async fn idle_start_running_lifecycle_publishes_working_then_returns_to_idle() {
+        let (dispatcher, sink) = mock_sink();
+
+        // A run that is really executing, then parks.
+        sink.on_event(&ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "change-a".to_string(),
+        })
+        .await;
+        sink.on_event(&ExecutionEvent::PersistentSchedulerIdle)
+            .await;
+
+        // The accepted Start opens the run episode.
+        sink.on_event(&accepted_idle_start(&["change-a"])).await;
+
+        // Nothing in between is another edge: a second identical outcome finds
+        // the episode already closed, and analysis is not admitted work.
+        sink.on_event(&accepted_idle_start(&["change-a"])).await;
+        sink.on_event(&ExecutionEvent::AnalysisStarted {
+            remaining_changes: 1,
+            attempt_id: "attempt-1".to_string(),
+        })
+        .await;
+
+        // No work was admitted, so the rearmed park closes the episode again —
+        // once.
+        sink.on_event(&ExecutionEvent::PersistentSchedulerIdle)
+            .await;
+        sink.on_event(&ExecutionEvent::PersistentSchedulerIdle)
+            .await;
+
+        assert_eq!(
+            dispatcher.states(),
+            vec![
+                LifecycleState::Working,
+                LifecycleState::Idle,
+                LifecycleState::Working,
+                LifecycleState::Idle,
+            ],
+            "accepted Start must publish working and the no-work park must close it"
+        );
+    }
+
+    /// Verification `idle-start-running-regressions`: every shape that is not an
+    /// accepted Start against an open idle episode publishes nothing.
+    #[tokio::test]
+    async fn idle_start_running_lifecycle_ignores_non_accepted_start_shapes() {
+        let (dispatcher, sink) = mock_sink();
+        sink.on_event(&ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "change-a".to_string(),
+        })
+        .await;
+        sink.on_event(&ExecutionEvent::PersistentSchedulerIdle)
+            .await;
+        let baseline = dispatcher.states();
+
+        for quiet in [
+            // A committed-nothing dispatch is not an accepted Start.
+            accepted_idle_start(&[]),
+            // A queue delta admits work through a non-Start path; typed
+            // admitted-work evidence remains its `working` trigger.
+            ExecutionEvent::OperatorCommandApplied {
+                effect: OperatorCommandEffect::QueueDelta {
+                    change_id: "change-a".to_string(),
+                    queued: true,
+                },
+            },
+            ExecutionEvent::OperatorCommandApplied {
+                effect: OperatorCommandEffect::MarkDelta {
+                    change_ids: vec!["change-a".to_string()],
+                    marked: true,
+                },
+            },
+            // Analysis and a catalog refresh prove nothing is executing.
+            ExecutionEvent::AnalysisStarted {
+                remaining_changes: 1,
+                attempt_id: "attempt-1".to_string(),
+            },
+            ExecutionEvent::WorktreesRefreshed {
+                worktrees: Vec::new(),
+            },
+            // A rearmed no-work idle edge reaching an already-idle projection.
+            ExecutionEvent::PersistentSchedulerIdle,
+        ] {
+            sink.on_event(&quiet).await;
+            assert_eq!(
+                dispatcher.states(),
+                baseline,
+                "{} must publish no lifecycle transition here",
+                event_variant_name(&quiet)
+            );
+        }
+    }
+
+    /// Verification `idle-start-running-regressions`: the accepted Start gate is
+    /// a conjunction, and each conjunct is load-bearing.
+    #[test]
+    fn idle_start_running_gate_requires_every_conjunct() {
+        let targets = vec!["change-a".to_string()];
+        assert!(accepted_start_opens_idle_run_episode(
+            "select", true, false, &targets
+        ));
+
+        for (label, mode, idle, started, ids) in [
+            (
+                "a pre-run Select owns no idle episode",
+                "select",
+                false,
+                false,
+                targets.clone(),
+            ),
+            (
+                "a live run is already Running",
+                "running",
+                true,
+                false,
+                targets.clone(),
+            ),
+            (
+                "a pending stop is not a run episode",
+                "stopping",
+                true,
+                false,
+                targets.clone(),
+            ),
+            (
+                "a spawned scheduler is the other projection",
+                "select",
+                true,
+                true,
+                targets.clone(),
+            ),
+            (
+                "a dispatch that committed nothing",
+                "select",
+                true,
+                false,
+                Vec::new(),
+            ),
+        ] {
+            assert!(
+                !accepted_start_opens_idle_run_episode(mode, idle, started, &ids),
+                "{label}"
             );
         }
     }

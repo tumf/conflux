@@ -1,4 +1,4 @@
-.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy test-running-mark-reanalysis test-change-error-f5-retry check-scenario-set check pre-commit audit publish build-linux build-linux-x86 build-linux-arm
+.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy test-running-mark-reanalysis test-change-error-f5-retry test-idle-start-running check-scenario-set check pre-commit audit publish build-linux build-linux-x86 build-linux-arm
 
 # Ensure rustup-managed toolchain is used (not Homebrew rustc)
 RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-$(shell rustup show active-toolchain 2>/dev/null | awk '{print $$1}' | sed 's/^stable-//')/bin
@@ -134,6 +134,28 @@ test-change-error-f5-retry:
 	  echo "Discovered $$count focused lib-target test(s)"
 	@echo "Running focused lib-target tests..."
 	cargo test --lib $(F5_RETRY_FILTER)
+
+# Filter selecting the accepted-idle-Start Running projection's focused tests.
+# Overridable so the discovery gate below can be proven fail-safe:
+#   make test-idle-start-running IDLE_START_FILTER=no_such_test
+IDLE_START_FILTER ?= idle_start_running
+
+# Focused verification for immediate Running feedback after a persistent-idle
+# Start, and for the truthfulness that projection must not cost.
+#
+# Discovery runs before execution for the same reason as above: `cargo test`
+# exits 0 on a filter that matches nothing, so a renamed or never-written test
+# would read as a pass.
+test-idle-start-running:
+	@echo "Discovering '$(IDLE_START_FILTER)' lib-target tests..."
+	@count=$$(cargo test --lib $(IDLE_START_FILTER) -- --list 2>/dev/null | grep -c ': test$$'); \
+	  if [ "$$count" -eq 0 ]; then \
+	    echo "FAIL: no '$(IDLE_START_FILTER)' lib-target test was discovered"; \
+	    exit 1; \
+	  fi; \
+	  echo "Discovered $$count focused lib-target test(s)"
+	@echo "Running focused lib-target tests..."
+	cargo test --lib $(IDLE_START_FILTER)
 
 # Archive-preparation guard: promotion must not drop a canonical scenario.
 #
