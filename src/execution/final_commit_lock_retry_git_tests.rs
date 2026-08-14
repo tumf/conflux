@@ -214,7 +214,7 @@ async fn final_apply_commit_lock_recovers_add_and_commit_when_contention_clears(
     );
     assert!(
         environment.lock_was_untouched(),
-        "Conflux must never delete or rewrite a lock it does not own"
+        "the finalization retry policy must never delete or rewrite a lock it does not own"
     );
     assert!(
         !repo.lock_path().exists(),
@@ -267,7 +267,7 @@ async fn final_apply_commit_lock_recovers_amend_when_contention_clears() {
     );
     assert!(
         environment.lock_was_untouched(),
-        "Conflux must never delete or rewrite a lock it does not own"
+        "the finalization retry policy must never delete or rewrite a lock it does not own"
     );
     assert!(!repo.lock_path().exists());
     assert_eq!(
@@ -298,8 +298,8 @@ async fn final_apply_commit_lock_exhaustion_preserves_workspace_and_lock() {
         .expect_err("a lock held past the retry budget must fail");
 
     assert!(
-        started.elapsed() >= FINAL_COMMIT_RETRY_DELAY * 2,
-        "three attempts must be separated by two fixed delays"
+        started.elapsed() >= FINAL_COMMIT_RETRY_DELAY * (FINAL_COMMIT_MAX_ATTEMPTS - 1),
+        "five attempts must be separated by four fixed delays"
     );
     let VcsError::Command {
         message,
@@ -326,7 +326,7 @@ async fn final_apply_commit_lock_exhaustion_preserves_workspace_and_lock() {
     assert_eq!(
         fs::read_to_string(&lock).unwrap(),
         LOCK_SENTINEL,
-        "Conflux must never delete or rewrite a live lock"
+        "the finalization retry policy must never delete or rewrite a live lock"
     );
     assert_eq!(
         fs::read_to_string(repo.path.join("applied.txt")).unwrap(),

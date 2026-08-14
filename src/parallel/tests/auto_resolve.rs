@@ -437,13 +437,16 @@ async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action()
         .await
         .is_merged());
 
-    let retry_result = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        merge_result_rx.recv(),
-    )
-    .await
-    .expect("promotion should spawn a retry task result")
-    .expect("promotion result channel closed");
+    // The assertion is that promotion spawns a retry *at all*, not that it does
+    // so within some interval: the spawned task runs real Git against a real
+    // worktree, so its latency tracks machine load. The timeout is a hang
+    // safeguard only, and is sized generously so a loaded CI run cannot turn a
+    // correct convergence into a failure.
+    let retry_result =
+        tokio::time::timeout(std::time::Duration::from_secs(30), merge_result_rx.recv())
+            .await
+            .expect("promotion should spawn a retry task result")
+            .expect("promotion result channel closed");
     assert_eq!(retry_result.change_id, "change-a");
     assert_eq!(retry_result.origin, MergeResultOrigin::ResolveWaitRetry);
     assert!(
