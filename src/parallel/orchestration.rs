@@ -253,10 +253,78 @@ impl ParallelExecutor {
         {
             return false;
         }
+        // The baseline is recorded from the same coherent view the park was
+        // decided from, and *before* the edge is latched, so the intent this
+        // episode is parking on can never be mistaken for intent that arrived
+        // after it.
+        let captured;
+        let work_snapshot = match work_snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                captured = self.capture_reducer_work_snapshot().await;
+                &captured
+            }
+        };
+        self.record_persistent_idle_baseline(work_snapshot);
         if self.latch_persistent_idle() {
             send_event(&self.event_tx, ParallelEvent::PersistentSchedulerIdle).await;
         }
         true
+    }
+
+    /// Record the queue intent the episode about to park has already evaluated.
+    pub(super) fn record_persistent_idle_baseline(&self, work_snapshot: &ReducerWorkSnapshot) {
+        let baseline: HashSet<String> = work_snapshot.queued_intent_ids().iter().cloned().collect();
+        *self
+            .persistent_idle_baseline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(baseline);
+    }
+
+    /// Rearm the idle edge when this pass observes intent the episode has not
+    /// already parked on.
+    ///
+    /// Level-based on purpose. An individual `AddToQueue` reduction can be a
+    /// no-op — a concurrent client enqueue may have queued the same row a moment
+    /// earlier — while the coherent queue intent an accepted Start committed is
+    /// plainly there to see; rearming from the reduction outcome would lose that
+    /// episode's closing Ready edge and leave the frontends Running forever.
+    ///
+    /// An accepted explicit-retry hold consumed by *this* pass counts the same
+    /// way: it is committed operator intent that admits no queued row of its
+    /// own.
+    ///
+    /// A bare notification, a catalog refresh, and dependency analysis observe
+    /// neither, so none of them rearms. Neither does a blocked-only park being
+    /// woken: its rows are in the baseline, so nothing about them is new.
+    pub(super) fn rearm_persistent_idle_from_observed_intent(
+        &self,
+        work_snapshot: &ReducerWorkSnapshot,
+        explicit_retry_edge: bool,
+    ) {
+        // An incomplete view has observed nothing; treating it as "no new
+        // intent" is right, and treating it as new intent would rearm on a lost
+        // reducer read.
+        if !work_snapshot.is_complete() {
+            return;
+        }
+        let observed_new_intent = {
+            let baseline = self
+                .persistent_idle_baseline
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match baseline.as_ref() {
+                // No episode is open, so there is no edge to rearm.
+                None => return,
+                Some(parked) => work_snapshot
+                    .queued_intent_ids()
+                    .iter()
+                    .any(|id| !parked.contains(id)),
+            }
+        };
+        if observed_new_intent || explicit_retry_edge {
+            self.rearm_persistent_idle();
+        }
     }
 
     /// Open a persistent-idle episode, reporting whether this is its first edge.
@@ -272,13 +340,21 @@ impl ParallelExecutor {
 
     /// End the current persistent-idle episode so the next park is a new edge.
     ///
-    /// Called from the two boundaries where admitted work really begins —
-    /// ordinary workspace preparation and a scheduler-owned base-lane retry —
-    /// rather than from a wake, because a wake that admits nothing must leave
-    /// the frontend Ready.
+    /// Called from the boundaries where admitted work really begins — ordinary
+    /// workspace preparation and a scheduler-owned base-lane retry — and from
+    /// the coherent pass that observes committed queue or explicit-retry intent
+    /// the open episode never parked on. Never from a bare wake, because a wake
+    /// that admits nothing and observes nothing must leave the frontend Ready.
+    ///
+    /// The parked baseline is dropped with the episode: whatever intent the next
+    /// park observes belongs to that park, not to this one.
     pub(super) fn rearm_persistent_idle(&self) {
         self.persistent_idle_latched
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        *self
+            .persistent_idle_baseline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Whether a persistent-idle episode is currently open (tests).
@@ -624,6 +700,16 @@ impl ParallelExecutor {
             let reconciliation = self
                 .reconcile_queued_candidates_with_snapshot(&mut queued, &in_flight, &work_snapshot)
                 .await;
+
+            // An accepted Start against persistent-idle Ready has already
+            // projected Running from its own outcome. This is the other half of
+            // that episode: the pass that reconciles the intent it committed
+            // rearms the idle edge, so if analysis or classification admits
+            // nothing the next park can publish the Ready that closes it. Read
+            // as a level from the same coherent view above rather than from the
+            // reconciliation outcome, so a concurrent queue addition that made
+            // one reduction a no-op cannot swallow the closing edge.
+            self.rearm_persistent_idle_from_observed_intent(&work_snapshot, explicit_retry_edge);
             if reconciliation.has_queued_additions() || explicit_retry_edge {
                 // A consumed explicit-retry edge arms exactly one reevaluation:
                 // it is a real operator state transition, so this pass bypasses

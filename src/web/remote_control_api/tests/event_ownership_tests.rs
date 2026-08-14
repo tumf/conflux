@@ -693,6 +693,102 @@ async fn idle_origin_stop_and_cancel_preserve_ready() {
     assert_eq!(web_state.get_state().await.app_mode, "running");
 }
 
+/// One accepted Start's `RunDispatched`, shaped as run control publishes it for
+/// a woken live scheduler.
+fn accepted_idle_start(change_ids: &[&str]) -> ExecutionEvent {
+    ExecutionEvent::OperatorCommandApplied {
+        effect: crate::events::OperatorCommandEffect::RunDispatched {
+            change_ids: change_ids.iter().map(|id| (*id).to_string()).collect(),
+            explicit_retry: false,
+            scheduler_started: false,
+        },
+    }
+}
+
+/// Verification `idle-start-running-regressions`: the accepted Start's own
+/// revision is where a `/api/v2` client reads Running, and the no-work park is
+/// where it reads Ready again.
+///
+/// Revision *identity* is the property: a client that replaces local state at
+/// the revision the command reported must find the mode and the idle fact the
+/// command produced, not a later or earlier one. Duplicate and committed-nothing
+/// dispatches are checked in the same stream, because "one coherent revision"
+/// and "no spurious revision" are the same guarantee read from two directions.
+#[tokio::test]
+async fn idle_start_running_accepted_start_publishes_one_coherent_snapshot() {
+    let (web_state, reducer) = bound_web_state(&["change-a"]).await;
+    let projection = web_state.remote_control().projection();
+    let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
+
+    dispatch(
+        &reducer,
+        &sinks,
+        ExecutionEvent::WorkspacePreparationStarted {
+            change_id: "change-a".to_string(),
+        },
+    )
+    .await;
+    dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
+    let (_, parked_revision, _) = projection.snapshot();
+
+    // A dispatch that committed nothing is not an accepted Start, so it leaves
+    // the idle snapshot exactly as it found it.
+    dispatch(&reducer, &sinks, accepted_idle_start(&[])).await;
+    let (snapshot, revision, _) = projection.snapshot();
+    assert_eq!(snapshot.app_mode, "select");
+    assert!(snapshot.persistent_scheduler_idle);
+    assert_eq!(
+        revision, parked_revision,
+        "a committed-nothing dispatch must publish no state revision"
+    );
+
+    // The accepted Start, and the one revision that carries its whole effect.
+    dispatch(&reducer, &sinks, accepted_idle_start(&["change-a"])).await;
+    let (snapshot, running_revision, _) = projection.snapshot();
+    assert_eq!(snapshot.app_mode, "running");
+    assert!(
+        !snapshot.persistent_scheduler_idle,
+        "the accepted Start closes the idle episode in the same revision"
+    );
+    assert!(
+        running_revision > parked_revision,
+        "the accepted Start is a state-owning outcome"
+    );
+
+    // A second identical outcome finds the episode already open, and analysis
+    // is neither work nor an episode transition.
+    dispatch(&reducer, &sinks, accepted_idle_start(&["change-a"])).await;
+    dispatch(
+        &reducer,
+        &sinks,
+        ExecutionEvent::AnalysisStarted {
+            remaining_changes: 1,
+            attempt_id: "attempt-1".to_string(),
+        },
+    )
+    .await;
+    let (snapshot, revision, _) = projection.snapshot();
+    assert_eq!(snapshot.app_mode, "running");
+    assert_eq!(
+        revision, running_revision,
+        "a duplicate accepted outcome and an analysis start publish no new revision"
+    );
+
+    // Nothing was admitted, so the rearmed park restores the idle snapshot.
+    dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
+    let (snapshot, ready_revision, _) = projection.snapshot();
+    assert_eq!(snapshot.app_mode, "select");
+    assert!(snapshot.persistent_scheduler_idle);
+    assert!(ready_revision > running_revision);
+
+    dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
+    assert_eq!(
+        projection.snapshot().1,
+        ready_revision,
+        "duplicate idle observation still creates no additional revision"
+    );
+}
+
 /// The authoritative event an accepted cancel-stop publishes.
 fn stop_cancelled() -> ExecutionEvent {
     ExecutionEvent::OperatorCommandApplied {

@@ -563,6 +563,88 @@ async fn agent_execution_observability_status_process_activity_is_active_work() 
     assert_eq!(body["process"]["has_active_work"], false);
 }
 
+/// Verification `idle-start-running-regressions`: accepted Start is operator
+/// feedback, not evidence that anything is executing.
+///
+/// This resource is the one place the two are allowed to differ, and immediate
+/// Running is exactly the change that could have blurred them. So the interval
+/// the projection now paints as Running — after Start acceptance, before
+/// `AnalysisStarted` — is read here directly, and then again once analysis has
+/// actually opened.
+#[tokio::test]
+async fn idle_start_running_status_separates_start_feedback_from_active_work() {
+    let harness = harness(Some(TOKEN), &[]);
+    harness.boundary.set_running(true);
+    let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
+
+    // The scheduler parked, then the operator's Start was accepted against it.
+    observe(
+        &harness,
+        &mut state,
+        ExecutionEvent::PersistentSchedulerIdle,
+        1,
+    );
+    observe(
+        &harness,
+        &mut state,
+        ExecutionEvent::OperatorCommandApplied {
+            effect: crate::events::OperatorCommandEffect::RunDispatched {
+                change_ids: vec!["alpha".to_string()],
+                explicit_retry: false,
+                scheduler_started: false,
+            },
+        },
+        2,
+    );
+    // What that accepted outcome projects: Running, episode closed, row queued.
+    let mut running = snapshot_of(&[("alpha", "queued")]);
+    running.persistent_scheduler_idle = false;
+    harness
+        .projection
+        .apply_state("operator_command", None, Value::Null, running);
+
+    let body = read_status(&harness).await;
+    assert_eq!(
+        body["process"]["scheduler_running"], true,
+        "the scheduler the Start woke is still the live one"
+    );
+    assert_eq!(
+        body["process"]["has_active_work"], false,
+        "Start acceptance, queue intent, marks, and app_mode certify no active work"
+    );
+    assert_eq!(
+        body["process"]["active_activities"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        body["changes"][0]["current_phase"], "none",
+        "no phase may be invented from an accepted command"
+    );
+
+    // Typed dependency analysis is the authority, and it says so on its own.
+    observe(
+        &harness,
+        &mut state,
+        ExecutionEvent::AnalysisStarted {
+            remaining_changes: 1,
+            attempt_id: "attempt-1".to_string(),
+        },
+        3,
+    );
+
+    let body = read_status(&harness).await;
+    assert_eq!(
+        body["process"]["has_active_work"], true,
+        "typed analysis evidence is what opens active work"
+    );
+    assert_eq!(
+        body["process"]["active_activities"],
+        serde_json::json!(["dependency_analysis"])
+    );
+}
+
 /// A change the store has never observed is explicitly unknown, not "idle".
 #[tokio::test]
 async fn agent_execution_observability_status_unobserved_change_is_unknown() {

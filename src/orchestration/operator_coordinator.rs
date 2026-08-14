@@ -49,8 +49,9 @@
 use std::sync::{Arc, Mutex};
 
 use crate::events::{
-    all_completed_may_overwrite_mode, is_admitted_work_start, persistent_idle_may_project_ready,
-    EventDispatcher, ExecutionEvent, OperatorCommandEffect, OutcomeRevisions,
+    accepted_start_opens_idle_run_episode, all_completed_may_overwrite_mode,
+    is_admitted_work_start, persistent_idle_may_project_ready, EventDispatcher, ExecutionEvent,
+    OperatorCommandEffect, OutcomeRevisions,
 };
 use crate::orchestration::apply_commit_evidence::ApplyCommitEvidencePort;
 use crate::orchestration::mark_settlement::{MarkSettlementPlan, MarkSettlementRuntime};
@@ -217,15 +218,35 @@ impl CoreMode {
                 OperatorMode::Select
             }
             ExecutionEvent::OperatorCommandApplied { effect } => match effect {
-                // Only a newly spawned scheduler proves execution has begun. A
-                // dispatch that merely woke a scheduler which was already alive
-                // has admitted nothing yet, so the mode waits for the first
-                // typed work-start event rather than claiming Running here.
+                // A newly spawned scheduler proves execution has begun.
                 OperatorCommandEffect::RunDispatched {
                     scheduler_started: true,
                     ..
                 } => OperatorMode::Running,
-                OperatorCommandEffect::RunDispatched { .. } => return None,
+                // A dispatch that woke a scheduler which was already alive.
+                // Against a persistent-idle Ready episode that is the operator's
+                // accepted Start: run control revalidated the live scheduler,
+                // committed queue or explicit-retry intent, and notified it, so
+                // the run episode is open even though nothing has been admitted
+                // for execution yet. Every other wake — a Start into a live run,
+                // a refusal, a no-op — moves nothing and waits for typed
+                // work-start evidence as before.
+                OperatorCommandEffect::RunDispatched {
+                    change_ids,
+                    scheduler_started,
+                    ..
+                } => {
+                    if !accepted_start_opens_idle_run_episode(
+                        guard.mode.as_app_mode(),
+                        guard.persistent_idle,
+                        *scheduler_started,
+                        change_ids,
+                    ) {
+                        return None;
+                    }
+                    guard.persistent_idle = false;
+                    OperatorMode::Running
+                }
                 // Withdrawing a stop restores where the stop came from. A stop
                 // requested from persistent-idle Ready returns to Ready with its
                 // episode intact; claiming Running would advertise execution no
@@ -983,13 +1004,26 @@ fn run_outcome_event(outcome: &RunControlOutcome) -> Option<ExecutionEvent> {
             // not run state: the authoritative event carries only what was
             // actually dispatched.
             excluded: _,
-        } => Some(ExecutionEvent::OperatorCommandApplied {
-            effect: OperatorCommandEffect::RunDispatched {
-                change_ids: change_ids.clone(),
-                explicit_retry: *explicit_retry,
-                scheduler_started: matches!(scheduler, SchedulerEffect::Started),
-            },
-        }),
+        } => {
+            // This effect *means* scheduler-wake evidence for the targets it
+            // names: a persistent-idle frontend reads a woken dispatch as the
+            // accepted Start that opens its run episode. Run control only ever
+            // builds this outcome from a reserved dispatch, so the invariant
+            // holds by construction — asserting it is what stops a future
+            // no-dispatch path from silently teaching frontends to claim
+            // Running for a scheduler nobody woke.
+            debug_assert!(
+                scheduler.dispatched(),
+                "an accepted run dispatch must carry scheduler evidence"
+            );
+            Some(ExecutionEvent::OperatorCommandApplied {
+                effect: OperatorCommandEffect::RunDispatched {
+                    change_ids: change_ids.clone(),
+                    explicit_retry: *explicit_retry,
+                    scheduler_started: matches!(scheduler, SchedulerEffect::Started),
+                },
+            })
+        }
         RunControlOutcome::ResolveReserved {
             change_id,
             reservation,
@@ -1038,20 +1072,14 @@ fn operator_outcome_event(outcome: &OperatorOutcome) -> Option<ExecutionEvent> {
                     ),
                 },
             }),
-        OperatorOutcome::Retry(plan) => {
-            (!plan.is_empty()).then(|| ExecutionEvent::OperatorCommandApplied {
-                effect: OperatorCommandEffect::RunDispatched {
-                    change_ids: plan.change_ids.clone(),
-                    explicit_retry: plan.explicit_retry,
-                    // A plan is the reducer transition, not the dispatch that
-                    // makes it real: it carries no scheduler evidence at all.
-                    // Reporting "not started" is the only truthful reading, and
-                    // the run-control path — which does hold the scheduler
-                    // effect — is what publishes a started retry.
-                    scheduler_started: false,
-                },
-            })
-        }
+        // A plan is the reducer transition, not the dispatch that makes it real:
+        // it carries no scheduler evidence at all. `RunDispatched` now *means*
+        // scheduler-wake evidence for its committed targets — that is what lets
+        // a persistent-idle frontend read one as the accepted Start that opens
+        // the run episode — so a publisher holding no such evidence must not
+        // reuse the shape. Every production retry reaches the run-control path,
+        // which does hold the scheduler effect and does publish the outcome.
+        OperatorOutcome::Retry(_) => None,
         // `ChangeDequeued` already means exactly this and is published by the
         // two-phase settlement path.
         OperatorOutcome::Dequeued { .. } => None,

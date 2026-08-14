@@ -826,6 +826,19 @@ impl WebState {
         self.state.read().await.clone()
     }
 
+    /// Arrange the idle-episode half of the projected mode directly, test-only.
+    ///
+    /// Production only ever moves this through a dispatched event, exactly like
+    /// `CoreMode::set_persistent_idle`. A test that arranged the TUI and Core in
+    /// persistent-idle Ready and left this frontend behind would be exercising a
+    /// split state the process cannot be in — and would then read a divergence
+    /// its own arrangement created.
+    #[cfg(test)]
+    pub(crate) async fn set_persistent_scheduler_idle(&self, persistent_scheduler_idle: bool) {
+        self.state.write().await.persistent_scheduler_idle = persistent_scheduler_idle;
+        self.sync_remote_control_projection().await;
+    }
+
     /// Seed the monitoring snapshot from a workspace listing, test-only.
     ///
     /// Production has no caller left: a workspace observation reaches the
@@ -1364,15 +1377,28 @@ impl WebState {
                 ExecutionEvent::OperatorCommandApplied { effect } => {
                     use crate::events::OperatorCommandEffect as Effect;
                     match effect {
-                        // Only a newly spawned scheduler proves execution has
-                        // begun; a dispatch that merely woke a live scheduler —
-                        // including one parked in persistent-idle Ready — has
-                        // admitted nothing yet and leaves the mode alone.
+                        // A newly spawned scheduler proves execution has begun.
+                        // A dispatch that woke a live scheduler proves the same
+                        // *episode* when it lands on persistent-idle Ready with
+                        // committed targets: that is the operator's accepted
+                        // Start, and it opens the run they asked for. The gate is
+                        // the shared one TUI and Core read, so the two frontends
+                        // cannot describe the same dispatch differently.
                         Effect::RunDispatched {
-                            scheduler_started, ..
+                            change_ids,
+                            scheduler_started,
+                            ..
                         } => {
-                            if *scheduler_started {
+                            if *scheduler_started
+                                || crate::events::accepted_start_opens_idle_run_episode(
+                                    &state.app_mode,
+                                    state.persistent_scheduler_idle,
+                                    *scheduler_started,
+                                    change_ids,
+                                )
+                            {
                                 state.app_mode = "running".to_string();
+                                state.persistent_scheduler_idle = false;
                             }
                         }
                         // Withdrawing a stop restores where the stop came from:

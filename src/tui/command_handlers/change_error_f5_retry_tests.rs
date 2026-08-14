@@ -246,6 +246,12 @@ async fn arranged(setup: Setup, mode: AppExecutionMode, scheduler_running: bool)
     web.set_repo_root(std::path::PathBuf::from("/repo")).await;
     let changes: Vec<_> = CHANGES.iter().map(|id| create_test_change(id)).collect();
     web.update_with_mode(&changes, mode.app_mode_token()).await;
+    // All three halves of the arranged process carry the same idle-episode
+    // qualifier: leaving this one behind would stage a split state the process
+    // cannot be in, and the comparison would then report an arrangement gap as
+    // an adapter divergence.
+    web.set_persistent_scheduler_idle(app.persistent_scheduler_idle)
+        .await;
     web.sync_remote_control_projection().await;
 
     let runs = Arc::new(RunRecorder::default());
@@ -360,11 +366,17 @@ async fn change_error_f5_retry_persistent_idle_select_is_identical_on_both_adapt
         matches!(outcome, Ok(Some(_))),
         "the accepted command records its own outcome revision: {outcome:?}"
     );
+    // Retry routing is unchanged above; what the accepted outcome *projects* is
+    // not. An accepted Start against a persistent-idle episode opens the run
+    // episode immediately, and an explicit retry is one of those Starts — see
+    // `idle_start_running_tests` for the episode contract itself.
     assert_eq!(
         settled.mode,
-        OperatorMode::Select,
-        "a notified retry has started nothing, so Ready stands"
+        OperatorMode::Running,
+        "an accepted retry from persistent-idle Ready opens the run episode"
     );
+    assert_eq!(settled.tui_mode, AppExecutionMode::Running);
+    assert_eq!(settled.web_mode, "running");
 }
 
 /// Acceptance criterion 2 and 7: a live run retries the marked change-local
