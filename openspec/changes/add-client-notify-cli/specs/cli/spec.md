@@ -28,6 +28,8 @@ The CLI MUST expose `cflx client notify set`, `get`, and `clear` as direct shell
 
 `set` MUST accept a required non-empty callback argv after `--`, preserve each argument boundary exactly, and MAY opt into blocked-event delivery. It MUST NOT parse shell source, perform expansion, or implicitly invoke a shell. Set and clear MUST preserve the existing Unix-socket-only mutation rule. Get MUST preserve transport-dependent callback redaction. These commands MUST manage callback observability only and MUST NOT mutate workflow state or become an owner.
 
+The repository's embedded Conflux operation skill MUST document the direct CLI commands as the default shell-facing path for registering, inspecting, and clearing completion callbacks. It MUST retain the MCP tool path as an alternative for MCP-only hosts and MUST preserve the same durable-callback and untrusted-event safety guidance.
+
 #### Scenario: Operator registers one callback from the shell
 
 - **GIVEN** a command-capable TUI owns execution `exec-1` for change `alpha`
@@ -65,5 +67,13 @@ The CLI MUST expose `cflx client notify set`, `get`, and `clear` as direct shell
 - **WHEN** a caller attempts the equivalent direct notify set or clear operation
 - **THEN** the owner returns typed `transport_not_permitted`
 - **AND** no callback registration changes
+
+#### Scenario: Installed operation skill teaches the direct CLI path
+
+- **GIVEN** an agent loads the embedded `cflx-run` skill in a shell-capable environment
+- **WHEN** it delegates a long-running change to an existing TUI owner
+- **THEN** the skill instructs it to use `cflx client notify set` with the admitted execution binding
+- **AND** it documents `get` and `clear` for inspection and cancellation of the callback registration
+- **AND** MCP remains documented as an alternative rather than the only notification interface
 
 <!-- Expected canonical result after archive: the client namespace gains direct, argv-safe execution notification set/get/clear commands while retaining the existing owner, transport, and stable-envelope contracts. -->

@@ -10,6 +10,7 @@ references:
   - src/client/notify.rs
   - src/client/mcp.rs
   - tests/client_cli_tests.rs
+  - skills/cflx-run/SKILL.md
 verifications:
   - id: client-notify-cli
     requirement: CLI users can set, inspect, and clear an execution-scoped completion callback through the existing client boundary
@@ -51,11 +52,12 @@ The commands SHALL reuse `src/client/notify.rs`, existing connection resolution,
 - All three commands support concise human output and `--json` with the existing stable operation, outcome, and exit-status contract.
 - Optional `--instance-id` detects owner replacement; omitting it retains the current notify module behavior.
 - The CLI preserves the existing Unix-socket-only mutation restriction and does not become an orchestration owner.
-- Help and repository documentation show the direct CLI workflow and distinguish execution completion from TUI process exit.
+- Help, repository documentation, and the embedded `cflx-run` skill use the direct CLI workflow and distinguish execution completion from TUI process exit.
 
 ## Explicit Completion Conditions
 
 - `ClientCommands` exposes the nested notify group and routes all three operations to `client::notify::run` without duplicating sink protocol logic.
+- `skills/cflx-run/SKILL.md` directs shell-capable agents to `cflx client notify set|get|clear`, while retaining MCP as the protocol-host alternative.
 - Focused CLI tests cover help, parsing, argv preservation, JSON success/failure envelopes, blocked opt-in, get/clear, empty-command rejection, and owner-binding errors.
 - `cargo test --test client_cli_tests client_notify` passes.
 - `cflx openspec validate add-client-notify-cli --archive-gate` passes before archive.
@@ -66,4 +68,4 @@ The commands SHALL reuse `src/client/notify.rs`, existing connection resolution,
 - Adding shell parsing, `sh -c`, or command-string expansion.
 - Automatically registering a callback during `enqueue`.
 - Adding stop, retry, resolve, or raw `/api/v2` workflow commands to `cflx client`.
-- Changing the MCP tool surface.
+- Changing the MCP tool surface or removing MCP guidance for MCP-only hosts.
