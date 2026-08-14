@@ -70,6 +70,239 @@ fn feature_disabled_or_enabled_client_never_takes_the_repository_lock() {
     assert!(!output.status.success());
 }
 
+// ============================================================================
+// client_notify_help_and_usage
+// ============================================================================
+//
+// Help text and argv parsing are the same in both builds — neither needs a
+// local API — so these run wherever the binary does. A caller wiring a callback
+// up hits this surface before it ever reaches an owner, and everything asserted
+// here is refused *before* any request is sent.
+
+/// The group has to teach the three things an operator gets wrong: that the
+/// callback is argv rather than shell source, that the identity it names is an
+/// admitted execution rather than a change, and that "the TUI is still running"
+/// was never a statement about completion.
+#[test]
+fn client_notify_help_and_usage_documents_an_argv_callback_and_execution_scope() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+
+    let namespace = run_cli(tmp.path(), &["client", "--help"], &[]);
+    assert!(namespace.status.success(), "{}", stderr_of(&namespace));
+    assert!(
+        stdout_of(&namespace).contains("notify"),
+        "the namespace must offer the group:\n{}",
+        stdout_of(&namespace)
+    );
+
+    let output = run_cli(tmp.path(), &["client", "notify", "--help"], &[]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let help = stdout_of(&output);
+    for expected in [
+        "set",
+        "get",
+        "clear",
+        "never shell source",
+        "execution completion, not process completion",
+        "transport_not_permitted",
+        "CFLX_EVENT_PATH",
+        "--unix-socket",
+        "--auth-token-env",
+    ] {
+        assert!(
+            help.contains(expected),
+            "notify help must mention {expected}:\n{help}"
+        );
+    }
+    // The protocol stays out of the public surface here too: a callback
+    // registration is not a command, and nothing about it is constructible.
+    for forbidden in [
+        "--expected-revision",
+        "--idempotency-key",
+        "--command-type",
+        "--execution-mark",
+        "--auth-token ",
+        "--shell",
+    ] {
+        assert!(
+            !help.contains(forbidden),
+            "notify help must not expose {forbidden}:\n{help}"
+        );
+    }
+
+    let set = run_cli(tmp.path(), &["client", "notify", "set", "--help"], &[]);
+    assert!(set.status.success(), "{}", stderr_of(&set));
+    let set_help = stdout_of(&set);
+    assert!(
+        set_help.contains("-- <COMMAND>..."),
+        "the separator must be part of the documented usage:\n{set_help}"
+    );
+    for expected in ["--blocked", "--instance-id", "--json", "<EXECUTION_ID>"] {
+        assert!(
+            set_help.contains(expected),
+            "set help must mention {expected}:\n{set_help}"
+        );
+    }
+
+    // A refused-or-not, help is an answer rather than a side effect.
+    assert!(
+        std::fs::read_dir(tmp.path())
+            .expect("temp dir readable")
+            .next()
+            .is_none(),
+        "printing help must write nothing"
+    );
+}
+
+/// Every argv the CLI itself rejects is rejected before an owner is contacted,
+/// and a `--json` caller still gets its one envelope naming the operation it
+/// attempted.
+#[test]
+fn client_notify_help_and_usage_rejects_a_malformed_invocation_before_any_request() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let execution = "a".repeat(32);
+    let cases: Vec<(Vec<&str>, &str, &str)> = vec![
+        (
+            vec!["notify", "set", "alpha", &execution, "--json", "--"],
+            "notify_set",
+            "a callback with no program at all",
+        ),
+        (
+            vec!["notify", "set", "alpha", &execution, "--json", "/bin/true"],
+            "notify_set",
+            "a callback that skipped the separator",
+        ),
+        (
+            vec![
+                "notify",
+                "set",
+                "../escape",
+                &execution,
+                "--json",
+                "--",
+                "/bin/true",
+            ],
+            "notify_set",
+            "an escaping change ID",
+        ),
+        (
+            vec!["notify", "get", "alpha", "", "--json"],
+            "notify_get",
+            "an empty execution ID",
+        ),
+        (
+            vec!["notify", "clear", "alpha", "has space", "--json"],
+            "notify_clear",
+            "an execution ID with a separator in it",
+        ),
+        (
+            vec![
+                "notify",
+                "get",
+                "alpha",
+                &execution,
+                "--instance-id",
+                "",
+                "--json",
+            ],
+            "notify_get",
+            "an empty instance ID",
+        ),
+        (
+            vec!["notify", "--json"],
+            "notify_get",
+            "a group with no operation",
+        ),
+    ];
+
+    for (action, operation, what) in cases {
+        let mut args = vec!["client"];
+        args.extend(action);
+        let output = run_cli(tmp.path(), &args, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{what} must be a usage error, stderr={}",
+            stderr_of(&output)
+        );
+        let stdout = stdout_of(&output);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{what}: stdout must be one envelope, got {stdout:?}: {e}"));
+        assert_eq!(parsed["outcome"], "usage_error", "{what}");
+        assert_eq!(parsed["operation"], operation, "{what}");
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .expect("temp dir readable")
+                .next()
+                .is_none(),
+            "{what}: a rejected invocation must write nothing"
+        );
+    }
+}
+
+/// A flag *after* `--` is one of the callback's own arguments. Letting it
+/// select the output contract would let a value decide how the caller is
+/// answered, which is the same inference the whole-argument `--json` rule
+/// already forbids.
+#[test]
+fn client_notify_help_and_usage_keeps_a_callback_flag_out_of_the_output_mode() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let absent = tmp.path().join("absent.sock");
+    let socket = absent.display().to_string();
+    let execution = "a".repeat(32);
+
+    // `--json` is only ever the callback's, so the answer is the human line.
+    let human = run_cli(
+        tmp.path(),
+        &[
+            "client",
+            "--unix-socket",
+            &socket,
+            "notify",
+            "set",
+            "alpha",
+            &execution,
+            "--",
+            "/bin/true",
+            "--json",
+        ],
+        &[],
+    );
+    let stdout = stdout_of(&human);
+    assert!(
+        !stdout.trim_start().starts_with('{'),
+        "a callback argument must not select machine output:\n{stdout}"
+    );
+    assert!(
+        stdout.starts_with("notify_set: "),
+        "the human line still names the operation:\n{stdout}"
+    );
+
+    // The same invocation with the flag before the separator is machine output.
+    let machine = run_cli(
+        tmp.path(),
+        &[
+            "client",
+            "--unix-socket",
+            &socket,
+            "notify",
+            "set",
+            "alpha",
+            &execution,
+            "--json",
+            "--",
+            "/bin/true",
+            "--json",
+        ],
+        &[],
+    );
+    let stdout = stdout_of(&machine);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be one envelope, got {stdout:?}: {e}"));
+    assert_eq!(parsed["operation"], "notify_set");
+    assert!(!parsed["ok"].as_bool().expect("ok is a boolean"));
+}
+
 #[cfg(not(feature = "web-monitoring"))]
 mod feature_disabled {
     use super::*;
@@ -343,6 +576,36 @@ mod enabled {
     // Owner fixture
     // ────────────────────────────────────────────────────────────────────────
 
+    /// Owner surfaces only the notify group needs.
+    ///
+    /// Off by default so every pre-existing test keeps describing the owner it
+    /// always described: an owner with no execution-sink registry is a real
+    /// shape — a process that predates them — and one whose router carries no
+    /// transport marker is the shape the other groups exercise.
+    #[derive(Default, Clone, Copy)]
+    struct OwnerExtras {
+        /// Bind an execution-sink registry and publish the capability.
+        sinks: bool,
+        /// The transport marker the router labels every request with.
+        ///
+        /// Production attaches this per listener. This fixture serves exactly
+        /// one Unix socket, so a test that needs the refusal an exposed TCP
+        /// listener gets injects `Tcp` here and then drives the *production*
+        /// endpoint rule, rather than a stub the client talked to directly.
+        transport: Option<conflux::web::remote_control_api::ApiTransport>,
+    }
+
+    impl OwnerExtras {
+        /// The owner an operator registering a callback actually has: a sink
+        /// registry, reached over the owner's own socket.
+        fn sink_capable() -> Self {
+            Self {
+                sinks: true,
+                transport: Some(conflux::web::remote_control_api::ApiTransport::Unix),
+            }
+        }
+    }
+
     /// A real `/api/v2` router on a real Unix socket, plus the handles a test
     /// needs to drive it.
     struct Owner {
@@ -350,6 +613,10 @@ mod enabled {
         projection: Arc<Projection>,
         runtime: Arc<RemoteControlRuntime>,
         boundary: Arc<Boundary>,
+        facts: Arc<ExecutionFactsStore>,
+        sinks: Option<Arc<conflux::web::completion_sink::CompletionSinkRegistry>>,
+        /// Monotonic dispatch identity for the facts store's absorption check.
+        dispatch: AtomicUsize,
         shutdown: tokio_util::sync::CancellationToken,
         task: tokio::task::JoinHandle<()>,
         _dir: Option<tempfile::TempDir>,
@@ -369,6 +636,19 @@ mod enabled {
             owner
         }
 
+        /// Start an owner with the surfaces one notify test needs.
+        async fn start_with(
+            executor: Option<Arc<dyn RemoteControlExecutor>>,
+            token: Option<&str>,
+            extras: OwnerExtras,
+        ) -> Self {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let socket = dir.path().join("cflx-api.sock");
+            let mut owner = Self::start_layered(socket, executor, token, None, extras).await;
+            owner._dir = Some(dir);
+            owner
+        }
+
         /// Start an owner whose real router is wrapped by a recording layer.
         ///
         /// Used where a test has to know what the client put on the wire, or has
@@ -380,7 +660,9 @@ mod enabled {
         ) -> Self {
             let dir = tempfile::tempdir().expect("temp dir");
             let socket = dir.path().join("cflx-api.sock");
-            let mut owner = Self::start_layered(socket, executor, token, Some(api)).await;
+            let mut owner =
+                Self::start_layered(socket, executor, token, Some(api), OwnerExtras::default())
+                    .await;
             owner._dir = Some(dir);
             owner
         }
@@ -394,7 +676,7 @@ mod enabled {
             executor: Option<Arc<dyn RemoteControlExecutor>>,
             token: Option<&str>,
         ) -> Self {
-            Self::start_layered(socket, executor, token, None).await
+            Self::start_layered(socket, executor, token, None, OwnerExtras::default()).await
         }
 
         async fn start_layered(
@@ -402,15 +684,28 @@ mod enabled {
             executor: Option<Arc<dyn RemoteControlExecutor>>,
             token: Option<&str>,
             api: Option<Arc<ApiSpy>>,
+            extras: OwnerExtras,
         ) -> Self {
             let runtime = Arc::new(RemoteControlRuntime::new());
             if let Some(executor) = executor {
                 runtime.bind(executor).await;
             }
             let facts = Arc::new(ExecutionFactsStore::new());
-            runtime.bind_execution_facts(facts);
+            runtime.bind_execution_facts(facts.clone());
             let boundary = Arc::new(Boundary::default());
             runtime.bind_run_boundary(boundary.clone());
+            // Started before anything is admitted, because the registry becomes
+            // the facts store's episode observer at construction: an episode
+            // opened first would never reach it.
+            let sinks = extras.sinks.then(|| {
+                let registry = conflux::web::completion_sink::CompletionSinkRegistry::start(
+                    runtime.projection().instance_id().to_string(),
+                    facts.clone(),
+                    runtime.execution_contract(),
+                );
+                runtime.bind_completion_sinks(registry.clone());
+                registry
+            });
 
             let auth = RemoteControlAuth::new(token.map(str::to_string), &[])
                 .expect("test auth policy is valid");
@@ -418,7 +713,8 @@ mod enabled {
                 RemoteControlState::new(runtime.projection(), Arc::new(auth), runtime.clone())
                     .with_gate(runtime.gate())
                     .with_execution_facts(runtime.execution_facts())
-                    .with_execution_contract(runtime.execution_contract()),
+                    .with_execution_contract(runtime.execution_contract())
+                    .with_completion_sinks(runtime.completion_sinks()),
             );
             let app = match api {
                 Some(api) => app.layer(axum::middleware::from_fn(
@@ -427,6 +723,10 @@ mod enabled {
                         async move { api.intercept(request, next).await }
                     },
                 )),
+                None => app,
+            };
+            let app = match extras.transport {
+                Some(transport) => app.layer(axum::Extension(transport)),
                 None => app,
             };
 
@@ -444,10 +744,70 @@ mod enabled {
                 projection: runtime.projection(),
                 runtime,
                 boundary,
+                facts,
+                sinks,
+                dispatch: AtomicUsize::new(0),
                 shutdown,
                 task,
                 _dir: None,
             }
+        }
+
+        fn instance_id(&self) -> String {
+            self.projection.instance_id().to_string()
+        }
+
+        /// Admit one change the way every admission source ultimately does, and
+        /// return the execution episode it opened.
+        ///
+        /// The reducer is built per call and tracks only this change: the facts
+        /// store re-projects exactly the changes the state it is handed tracks,
+        /// so an earlier admission keeps the episode it already opened.
+        fn admit(&self, change_id: &str) -> String {
+            use conflux::events::{ExecutionEvent, OperatorCommandEffect};
+            use conflux::orchestration::state::{OrchestratorState, ReducerCommand};
+
+            let mut reducer = OrchestratorState::new(vec![change_id.to_string()], 0);
+            reducer.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+            let event = ExecutionEvent::OperatorCommandApplied {
+                effect: OperatorCommandEffect::QueueDelta {
+                    change_id: change_id.to_string(),
+                    queued: true,
+                },
+            };
+            reducer.apply_execution_event(&event);
+            let dispatch = self.dispatch.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            self.facts
+                .observe(dispatch, &event, Some(&reducer), chrono::Utc::now());
+            self.facts
+                .change(change_id)
+                .execution_id
+                .expect("admission opens an execution episode")
+        }
+
+        /// Admit one change and return once the registry knows its episode.
+        ///
+        /// Admission publishes the episode to the registry's dispatcher task,
+        /// which is what creates the entry every sink request resolves against.
+        /// This waits on that state transition rather than on a duration: the
+        /// deadline is only a hang guard, and reaching it is a failure.
+        async fn admit_registered(&self, change_id: &str) -> String {
+            let execution_id = self.admit(change_id);
+            let registry = self
+                .sinks
+                .as_ref()
+                .expect("a sink-capable owner holds a registry");
+            let instance_id = self.instance_id();
+            for _ in 0..1_000 {
+                if registry
+                    .view(&execution_id, &instance_id, change_id)
+                    .is_ok()
+                {
+                    return execution_id;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("the registry never opened an entry for execution {execution_id}");
         }
 
         fn socket(&self) -> String {
@@ -559,7 +919,7 @@ mod enabled {
     // ========================================================================
 
     #[test]
-    fn cli_surface_exposes_only_status_enqueue_wait_and_mcp() {
+    fn cli_surface_exposes_only_status_enqueue_wait_notify_and_mcp() {
         let tmp = neutral_cwd();
         let output = run_cli(tmp.path(), &["client", "--help"], &[]);
         assert!(output.status.success(), "{}", stderr_of(&output));
@@ -568,6 +928,7 @@ mod enabled {
             "status",
             "enqueue",
             "wait",
+            "notify",
             "mcp",
             "--unix-socket",
             "--auth-token-env",
@@ -3375,6 +3736,437 @@ mod enabled {
     }
 
     // ========================================================================
+    // client_notify
+    // ========================================================================
+    //
+    // `cflx client notify` is the shell-facing adapter over the same
+    // execution-scoped completion sink `cflx client mcp` exposes as three tools.
+    // Everything here therefore drives the compiled binary against a real
+    // registry behind the real `/api/v2` endpoints: the properties that matter —
+    // argv boundaries survive the shell, mutation is socket-only, an owner
+    // restart is typed rather than mistaken for a lost execution — are all
+    // invisible from an in-process call.
+
+    /// Run one `cflx client` invocation against this owner's socket.
+    ///
+    /// Blocking work off the runtime thread, the way every other group here
+    /// drives the binary.
+    async fn run_client(socket: &str, cwd: &Path, tail: &[&str]) -> Output {
+        let socket = socket.to_string();
+        let cwd = cwd.to_path_buf();
+        let tail: Vec<String> = tail.iter().map(|value| (*value).to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            let mut args = vec!["client".to_string(), "--unix-socket".to_string(), socket];
+            args.extend(tail);
+            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_cli(&cwd, &borrowed, &[])
+        })
+        .await
+        .expect("the client invocation must not panic")
+    }
+
+    /// A sink-capable owner with one admitted execution for `alpha`.
+    async fn sink_owner(spy: Arc<SpyExecutor>) -> (Owner, String) {
+        let owner = Owner::start_with(Some(spy), None, OwnerExtras::sink_capable()).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "applying")],
+        ));
+        owner.contract(merged_contract("main"));
+        let execution_id = owner.admit_registered("alpha").await;
+        (owner, execution_id)
+    }
+
+    /// The whole round trip through the owner that already exists: attach, read
+    /// back, detach. The registration must reach the *same* module the MCP tool
+    /// calls, and it must not become a workflow command on the way — a sink
+    /// creates no command record and cannot move a change, so the spy behind the
+    /// real command endpoint must never see anything.
+    #[tokio::test]
+    async fn client_notify_routes_through_existing_owner() {
+        let spy = SpyExecutor::new();
+        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+
+        let set = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "notify",
+                "set",
+                "alpha",
+                &execution_id,
+                "--json",
+                "--",
+                "/bin/true",
+            ],
+        )
+        .await;
+        let parsed = envelope(&set);
+        assert_eq!(parsed["operation"], "notify_set");
+        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&set));
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(set.status.code(), Some(0));
+        assert_eq!(parsed["change_id"], "alpha");
+        assert_eq!(parsed["execution_id"], execution_id.as_str());
+        assert_eq!(parsed["instance_id"], owner.instance_id().as_str());
+        assert_eq!(parsed["detail"]["sink"]["command"][0], "/bin/true");
+        assert_eq!(parsed["detail"]["sink"]["notify_blocked"], false);
+
+        let read = run_client(
+            &socket,
+            tmp.path(),
+            &["notify", "get", "alpha", &execution_id, "--json"],
+        )
+        .await;
+        let parsed = envelope(&read);
+        assert_eq!(parsed["operation"], "notify_get");
+        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&read));
+        assert_eq!(parsed["detail"]["sink_registered"], true);
+        assert_eq!(parsed["detail"]["sink"]["command"][0], "/bin/true");
+
+        let cleared = run_client(
+            &socket,
+            tmp.path(),
+            &["notify", "clear", "alpha", &execution_id, "--json"],
+        )
+        .await;
+        let parsed = envelope(&cleared);
+        assert_eq!(parsed["operation"], "notify_clear");
+        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&cleared));
+        assert_eq!(cleared.status.code(), Some(0));
+
+        // Detachment removed exactly that execution's callback, and left the
+        // execution itself addressable.
+        let after = run_client(
+            &socket,
+            tmp.path(),
+            &["notify", "get", "alpha", &execution_id, "--json"],
+        )
+        .await;
+        let parsed = envelope(&after);
+        assert_eq!(parsed["detail"]["sink_registered"], false);
+        assert!(parsed["detail"]["sink"].is_null());
+
+        assert_eq!(
+            spy.call_count(),
+            0,
+            "a completion sink is observability, not a workflow command"
+        );
+        owner.stop().await;
+    }
+
+    /// Everything after `--` is one argv element, exactly as typed. The values
+    /// here are the ones a shell would have mangled: an embedded space, a
+    /// leading hyphen, a glob, a variable reference, and a command separator.
+    /// The owner stores them verbatim because it never sees a shell at all.
+    #[tokio::test]
+    async fn client_notify_preserves_every_argv_boundary_without_a_shell() {
+        let spy = SpyExecutor::new();
+        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+
+        let argv = [
+            "/absolute/callback",
+            "--flag",
+            "one argument",
+            "*",
+            "$HOME",
+            "; rm -rf /",
+            "--json",
+        ];
+        let mut args = vec!["notify", "set", "alpha", &execution_id, "--json", "--"];
+        args.extend_from_slice(&argv);
+        let output = run_client(&socket, tmp.path(), &args).await;
+
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&output));
+        let stored = parsed["detail"]["sink"]["command"]
+            .as_array()
+            .expect("the socket that registered the argv is told it back")
+            .iter()
+            .map(|value| value.as_str().expect("argv elements are strings"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stored, argv,
+            "each argument after `--` must survive as exactly one argv element"
+        );
+        // The trailing `--json` was callback data, not a request for machine
+        // output: the mode came from the flag before the separator.
+        assert_eq!(stored.last(), Some(&"--json"));
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// `blocked` is a non-terminal attention edge, so it is delivered only when
+    /// the caller asked for it.
+    #[tokio::test]
+    async fn client_notify_blocked_delivery_is_an_explicit_opt_in() {
+        let spy = SpyExecutor::new();
+        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+
+        let without = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "notify",
+                "set",
+                "alpha",
+                &execution_id,
+                "--json",
+                "--",
+                "/bin/true",
+            ],
+        )
+        .await;
+        assert_eq!(
+            envelope(&without)["detail"]["sink"]["notify_blocked"],
+            false
+        );
+
+        let with = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "notify",
+                "set",
+                "alpha",
+                &execution_id,
+                "--blocked",
+                "--json",
+                "--",
+                "/bin/true",
+            ],
+        )
+        .await;
+        assert_eq!(envelope(&with)["detail"]["sink"]["notify_blocked"], true);
+        owner.stop().await;
+    }
+
+    /// Human mode is one concise line on stdout, with nothing of the machine
+    /// contract leaking into it.
+    #[tokio::test]
+    async fn client_notify_human_output_is_one_concise_line() {
+        let spy = SpyExecutor::new();
+        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+
+        let output = run_client(
+            &socket,
+            tmp.path(),
+            &["notify", "set", "alpha", &execution_id, "--", "/bin/true"],
+        )
+        .await;
+        let stdout = stdout_of(&output);
+        assert_eq!(stdout.lines().count(), 1, "human output must be one line");
+        assert!(stdout.starts_with("notify_set: subscribed"), "{stdout}");
+        assert!(!stdout.contains("schema_version"), "{stdout}");
+        assert_eq!(output.status.code(), Some(0));
+        owner.stop().await;
+    }
+
+    /// The caller kept the incarnation an earlier enqueue reported, and the
+    /// socket is now serving a different one. That is `owner_restarted` — not
+    /// the `execution_not_found` a new incarnation would otherwise answer with,
+    /// and emphatically not a registration against the replacement.
+    #[tokio::test]
+    async fn client_notify_reports_a_replaced_owner_incarnation() {
+        let spy = SpyExecutor::new();
+        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+        // Well-formed, and provably not this owner: instance IDs are 32 hex
+        // digits, so a run of zeroes parses and cannot collide.
+        let stale_instance = "0".repeat(32);
+
+        for action in ["set", "get", "clear"] {
+            let mut args = vec![
+                "notify",
+                action,
+                "alpha",
+                &execution_id,
+                "--instance-id",
+                &stale_instance,
+                "--json",
+            ];
+            if action == "set" {
+                args.extend_from_slice(&["--", "/bin/true"]);
+            }
+            let output = run_client(&socket, tmp.path(), &args).await;
+            let parsed = envelope(&output);
+            assert_eq!(parsed["outcome"], "owner_restarted", "{action}");
+            assert_eq!(output.status.code(), Some(8), "{action}");
+            assert_eq!(parsed["detail"]["expected_instance_id"], stale_instance);
+            assert_eq!(
+                parsed["detail"]["observed_instance_id"],
+                owner.instance_id().as_str()
+            );
+        }
+
+        // Nothing was registered against the owner that is actually there.
+        let read = run_client(
+            &socket,
+            tmp.path(),
+            &["notify", "get", "alpha", &execution_id, "--json"],
+        )
+        .await;
+        assert_eq!(envelope(&read)["detail"]["sink_registered"], false);
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// An execution this incarnation never admitted, and an execution that
+    /// belongs to another change, are different refusals: the first says the
+    /// episode is gone, the second says the caller and the owner mean different
+    /// things by the same ID.
+    #[tokio::test]
+    async fn client_notify_separates_a_lost_execution_from_a_stale_binding() {
+        let spy = SpyExecutor::new();
+        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        owner.publish(snapshot(
+            "select",
+            vec![
+                change("alpha", "select", "applying"),
+                change("beta", "select", "applying"),
+            ],
+        ));
+        owner.admit_registered("beta").await;
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+
+        let ghost = "f".repeat(32);
+        let missing = run_client(
+            &socket,
+            tmp.path(),
+            &["notify", "get", "alpha", &ghost, "--json"],
+        )
+        .await;
+        let parsed = envelope(&missing);
+        assert_eq!(parsed["outcome"], "execution_not_found");
+        assert_eq!(missing.status.code(), Some(23));
+        assert_eq!(parsed["execution_id"], ghost.as_str());
+
+        // The execution exists, but it is alpha's, not beta's.
+        let mismatched = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "notify",
+                "set",
+                "beta",
+                &execution_id,
+                "--json",
+                "--",
+                "/bin/true",
+            ],
+        )
+        .await;
+        let parsed = envelope(&mismatched);
+        assert_eq!(parsed["outcome"], "execution_binding_mismatch");
+        assert_eq!(mismatched.status.code(), Some(24));
+
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// An owner that binds no sink registry has no such route. That is an
+    /// owner-compatibility fact, published as a capability, and the client reads
+    /// it before submitting anything — otherwise a 404 would be
+    /// indistinguishable from "that execution is gone".
+    #[tokio::test]
+    async fn client_notify_reports_an_owner_without_sinks_as_incompatible() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "applying")],
+        ));
+        owner.contract(merged_contract("main"));
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+        let execution_id = "a".repeat(32);
+
+        for action in ["set", "get", "clear"] {
+            let mut args = vec!["notify", action, "alpha", &execution_id, "--json"];
+            if action == "set" {
+                args.extend_from_slice(&["--", "/bin/true"]);
+            }
+            let output = run_client(&socket, tmp.path(), &args).await;
+            let parsed = envelope(&output);
+            assert_eq!(parsed["outcome"], "incompatible_owner", "{action}");
+            assert_eq!(output.status.code(), Some(6), "{action}");
+            assert!(
+                stderr_of(&output).contains("incompatible_owner"),
+                "the diagnostic belongs on stderr"
+            );
+        }
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// A sink stores an argv the owner will execute, so only the owner's own
+    /// Unix socket may register or remove one. Reading is allowed anywhere, but
+    /// a channel that may not register a command is not told one back either.
+    ///
+    /// The fixture labels its router as the exposed transport, which is exactly
+    /// what production attaches per listener — so the refusal under test is the
+    /// endpoint's own rule, and the outcome under test is the client's mapping
+    /// of it.
+    #[tokio::test]
+    async fn client_notify_mutation_is_refused_off_the_owner_socket() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start_with(
+            Some(spy.clone()),
+            None,
+            OwnerExtras {
+                sinks: true,
+                transport: Some(conflux::web::remote_control_api::ApiTransport::Tcp),
+            },
+        )
+        .await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "applying")],
+        ));
+        owner.contract(merged_contract("main"));
+        let execution_id = owner.admit_registered("alpha").await;
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+
+        for action in ["set", "clear"] {
+            let mut args = vec!["notify", action, "alpha", &execution_id, "--json"];
+            if action == "set" {
+                args.extend_from_slice(&["--", "/bin/true"]);
+            }
+            let output = run_client(&socket, tmp.path(), &args).await;
+            let parsed = envelope(&output);
+            assert_eq!(parsed["outcome"], "transport_not_permitted", "{action}");
+            assert_eq!(output.status.code(), Some(25), "{action}");
+        }
+
+        // Reading still works, and still answers presence — it just does not
+        // disclose an argv to a channel that may not register one.
+        let read = run_client(
+            &socket,
+            tmp.path(),
+            &["notify", "get", "alpha", &execution_id, "--json"],
+        )
+        .await;
+        let parsed = envelope(&read);
+        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&read));
+        assert_eq!(parsed["detail"]["sink_registered"], false);
+        assert!(parsed["detail"]["sink"].is_null());
+
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    // ========================================================================
     // production_owner_smoke
     // ========================================================================
 
@@ -3716,12 +4508,47 @@ mod enabled {
             );
         }
 
-        // The four-command namespace, stated as a closed set.
+        // The namespace, stated as a closed set.
         assert!(
-            agents.contains("Four commands, and only four"),
+            agents.contains("Four verbs, and only four"),
             "AGENTS.md must state the namespace is closed"
         );
-        assert!(agents.contains("cflx client mcp"), "and name the fourth");
+        assert!(
+            agents.contains("cflx client mcp"),
+            "and name the protocol alternative"
+        );
+
+        // The direct shell-facing path, in both documents and in the embedded
+        // skill: an agent that has a shell must not be told MCP is the only
+        // way to register a callback.
+        let skill = std::fs::read_to_string(repo_root.join("skills/cflx-run/SKILL.md"))
+            .expect("the embedded cflx-run skill");
+        for (document, name) in [
+            (&agents, "AGENTS.md"),
+            (&readme, "README.md"),
+            (&skill, "the cflx-run skill"),
+        ] {
+            assert!(
+                document.contains("cflx client notify set"),
+                "{name} must show the direct callback command"
+            );
+            assert!(
+                document.contains("cflx client notify clear"),
+                "{name} must show how a registration is withdrawn"
+            );
+            assert!(
+                document.contains("cflx_notify_set"),
+                "{name} must keep MCP as the alternative for a host with no shell"
+            );
+        }
+        assert!(
+            skill.contains("no `sh -c`"),
+            "the skill must say the callback is argv rather than shell source"
+        );
+        assert!(
+            skill.contains("not process completion"),
+            "and that a resident TUI's exit is not the signal"
+        );
 
         // Why a one-shot event file is separate from the lifecycle adapter's
         // long-lived stdin stream.

@@ -10,10 +10,14 @@
 //! mark/queue/start routing, and truthful completion. The second option makes
 //! every caller break whenever the orchestration state model moves.
 //!
-//! So this is a thin, intent-shaped client: four commands, stable JSON, stable
-//! exit statuses, and no protocol details in the public surface at all. The
-//! fourth, `mcp`, is the same boundary spoken as Model Context Protocol, so an
-//! agent gets the identical routing and the identical typed outcomes.
+//! So this is a thin, intent-shaped client: `status`, `enqueue`, `wait`, the
+//! nested `notify` group, and `mcp` — stable JSON, stable exit statuses, and no
+//! protocol details in the public surface at all. `notify` manages the one-shot
+//! completion callback for one *admitted execution*, which is observability
+//! rather than workflow: it submits no command and cannot move a change. `mcp`
+//! is the same boundary spoken as Model Context Protocol, so an agent gets the
+//! identical routing and the identical typed outcomes whether it types a command
+//! or calls a tool.
 //!
 //! # What it must never do
 //!
@@ -57,7 +61,7 @@ mod wait;
 
 use envelope::{Operation, Outcome, ResultEnvelope};
 
-use crate::cli::{ClientArgs, ClientCommands};
+use crate::cli::{ClientArgs, ClientCommands, ClientNotifyCommands};
 
 /// How the caller asked for output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +122,20 @@ pub fn emit(envelope: &ResultEnvelope, mode: OutputMode) -> i32 {
 /// every other command.
 const JSON_FLAG: &str = "--json";
 
+/// The end-of-options separator.
+///
+/// Everything after it is a value by definition, so the argv scan for
+/// [`JSON_FLAG`] stops there: `cflx client notify set alpha e-1 -- /cb --json`
+/// asks the owner to run a callback whose second argument happens to be spelled
+/// `--json`, and reading that as a request for machine output would let a
+/// *value* select the output contract — the exact inference the whole-argument
+/// rule below exists to forbid.
+const END_OF_OPTIONS: &str = "--";
+
 /// Map a client subcommand name onto the operation an envelope reports.
+///
+/// `notify` is a group rather than an operation, so it is resolved by
+/// [`notify_operation_of`] against the nested subcommand instead.
 fn operation_of(subcommand: &str) -> Option<Operation> {
     match subcommand {
         "status" => Some(Operation::Status),
@@ -127,6 +144,20 @@ fn operation_of(subcommand: &str) -> Option<Operation> {
         // `mcp` is a server, not an operation: a usage failure there has no
         // envelope to belong to, so it keeps Clap's human behavior.
         _ => None,
+    }
+}
+
+/// Map a `notify` subcommand name onto the operation an envelope reports.
+///
+/// A `notify` invocation that named no operation — `cflx client notify --json` —
+/// reports [`Operation::NotifyGet`]: of the three it is the only one that
+/// neither attaches nor detaches anything, so a caller branching on `operation`
+/// cannot read a refused invocation as an attempted registration.
+fn notify_operation_of(subcommand: Option<&str>) -> Operation {
+    match subcommand {
+        Some("set") => Operation::NotifySet,
+        Some("clear") => Operation::NotifyClear,
+        _ => Operation::NotifyGet,
     }
 }
 
@@ -140,12 +171,18 @@ fn operation_of(subcommand: &str) -> Option<Operation> {
 ///
 /// When the namespace is selected but no operation is named — `cflx client
 /// --json` — the envelope still has to exist, and it reports [`Operation::Status`]:
-/// of the three, it is the only one that neither mutates nor waits, so a caller
+/// it is the only operation that neither mutates nor waits, so a caller
 /// branching on `operation` cannot read a refused invocation as an attempted
-/// admission. `outcome` is `usage_error` either way, and `message` carries
-/// Clap's own statement of what was wrong.
+/// admission. The nested `notify` group answers the same way through
+/// [`notify_operation_of`]. `outcome` is `usage_error` either way, and `message`
+/// carries Clap's own statement of what was wrong.
 pub fn json_usage_operation(argv: &[OsString]) -> Option<Operation> {
-    if !argv.iter().skip(1).any(|arg| arg == JSON_FLAG) {
+    let selects_json = argv
+        .iter()
+        .skip(1)
+        .take_while(|arg| *arg != END_OF_OPTIONS)
+        .any(|arg| arg == JSON_FLAG);
+    if !selects_json {
         return None;
     }
     let matches = crate::cli::Cli::command()
@@ -153,6 +190,9 @@ pub fn json_usage_operation(argv: &[OsString]) -> Option<Operation> {
         .try_get_matches_from(argv)
         .ok()?;
     let client = matches.subcommand_matches("client")?;
+    if let Some(notify) = client.subcommand_matches("notify") {
+        return Some(notify_operation_of(notify.subcommand_name()));
+    }
     Some(
         client
             .subcommand_name()
@@ -244,6 +284,23 @@ pub async fn run(args: ClientArgs) -> i32 {
             OutputMode::from_json_flag(wait.json),
             Some(wait.change_id.clone()),
         ),
+        ClientCommands::Notify(notify) => match &notify.command {
+            ClientNotifyCommands::Set(set) => (
+                Operation::NotifySet,
+                OutputMode::from_json_flag(set.json),
+                Some(set.change_id.clone()),
+            ),
+            ClientNotifyCommands::Get(get) => (
+                Operation::NotifyGet,
+                OutputMode::from_json_flag(get.json),
+                Some(get.change_id.clone()),
+            ),
+            ClientNotifyCommands::Clear(clear) => (
+                Operation::NotifyClear,
+                OutputMode::from_json_flag(clear.json),
+                Some(clear.change_id.clone()),
+            ),
+        },
         // Answered above; reaching here would mean the guard was removed.
         ClientCommands::Mcp(_) => unreachable!("the MCP session is served before this point"),
     };
@@ -303,6 +360,44 @@ async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
         ClientCommands::Status(_) => session::status(&connection).await,
         ClientCommands::Enqueue(enqueue) => enqueue::run(&connection, &enqueue.change_id).await,
         ClientCommands::Wait(wait) => wait::run(&connection, &wait.change_id, wait.timeout).await,
+        // The same module `cflx client mcp` calls, with the same arguments: a
+        // command and a tool that disagreed about routing, transport, or typed
+        // outcomes would be two contracts wearing one name.
+        ClientCommands::Notify(args) => match args.command {
+            ClientNotifyCommands::Set(set) => {
+                notify::run(
+                    &connection,
+                    &set.change_id,
+                    &set.execution_id,
+                    set.instance_id.as_deref(),
+                    notify::Intent::Set {
+                        command: set.command,
+                        notify_blocked: set.blocked,
+                    },
+                )
+                .await
+            }
+            ClientNotifyCommands::Get(get) => {
+                notify::run(
+                    &connection,
+                    &get.change_id,
+                    &get.execution_id,
+                    get.instance_id.as_deref(),
+                    notify::Intent::Get,
+                )
+                .await
+            }
+            ClientNotifyCommands::Clear(clear) => {
+                notify::run(
+                    &connection,
+                    &clear.change_id,
+                    &clear.execution_id,
+                    clear.instance_id.as_deref(),
+                    notify::Intent::Clear,
+                )
+                .await
+            }
+        },
         ClientCommands::Mcp(_) => unreachable!("the MCP session is served before this point"),
     }
 }
