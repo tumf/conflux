@@ -72,22 +72,24 @@ This remains one proposal because command outcome projection, scheduler idle-edg
 4. The raw key handler does not set Running. A targetless, refused, stale, or no-op Start remains Ready and surfaces the existing warning or refusal feedback.
 5. Accepted explicit retry from persistent-idle Ready receives the same immediate Running projection without changing retry routing or fresh Apply-budget rules.
 6. Reconciliation of the accepted queue or explicit-retry intent rearms the persistent-idle edge. If no work is admitted and the scheduler parks, one new typed idle event returns TUI and Web to Ready.
-7. Generic notifications, duplicate wakeups, catalog refresh, and analysis without accepted queue additions do not independently project Running or emit duplicate idle transitions.
-8. `persistent_scheduler_idle` is false after the accepted Start projection and becomes true again only when a subsequent typed persistent-idle transition projects Ready.
-9. External lifecycle output changes from `idle` to `working` for the accepted Start outcome and remains deduplicated across unchanged frames.
-10. `/api/v2/execution-status` keeps `scheduler_running` distinct from `has_active_work`: Start acceptance or `app_mode: running` alone does not certify an active phase, while typed dependency-analysis or lifecycle evidence does.
-11. Initial Start, Running-mode retry, graceful stop, cancel-stop, force stop, terminal Error/Stopped retention, and finite scheduler completion preserve their existing behavior.
-12. Focused tests use event ordering and state transitions rather than short wall-clock thresholds and complete within the repository's default fast-test policy.
+7. Generic notifications, duplicate wakeups, catalog refresh, and analysis without accepted queue or retry intent do not independently project Running or emit duplicate idle transitions.
+8. Non-Start client enqueue does not project Running from queue addition alone: typed admitted-work evidence remains its Running trigger, and a no-work rearmed idle edge is ignored while the frontend already remains Select.
+9. `persistent_scheduler_idle` is false after the accepted Start projection and becomes true again only when a subsequent typed persistent-idle transition projects Ready.
+10. External lifecycle output and `LifecycleModeMirror` change from `idle` to `working` for the accepted Start outcome and remain deduplicated across unchanged frames; a later no-work idle edge returns both to `idle`.
+11. `/api/v2/execution-status` keeps `scheduler_running` distinct from `has_active_work`: Start acceptance or `app_mode: running` alone does not certify an active phase, while typed dependency-analysis or lifecycle evidence does.
+12. Initial Start, Running-mode retry, graceful stop, force stop, terminal Error/Stopped retention, and finite scheduler completion preserve their existing behavior. Cancel-stop is covered for idle-origin Ready, accepted-Start Running, and work-start-wins ordering.
+13. Focused tests use event ordering and state transitions rather than short wall-clock thresholds and complete within the repository's default fast-test policy.
 
 ## Explicit Completion Conditions
 
 - `CoreMode`, TUI `AppState`, and Web state apply the accepted persistent-idle Start outcome through the authoritative command dispatch and produce one convergent Running projection.
 - Existing contradictory tests that require Ready to remain visible after an accepted persistent-idle Start are replaced with assertions for immediate Running, while no-op wake coverage continues to require Ready.
-- The persistent scheduler rearms its idle latch only after observing committed queue or explicit-retry additions, allowing a no-work evaluation to publish a new Ready edge without letting generic wakes flicker the mode.
+- The persistent scheduler rearms its idle latch from a coherent level observation of at least one queued row or unconsumed accepted explicit-retry hold, allowing a no-work evaluation to publish a new Ready edge without letting generic wakes flicker the mode.
 - Row queue status at the accepted outcome comes from reducer state, not a frontend-only optimistic write.
-- Execution-status tests prove that mode feedback and actual active-work evidence remain separate.
+- Execution-status tests prove that mode feedback and actual active-work evidence remain separate; lifecycle tests prove `LifecycleModeMirror` closes both accepted-Start and no-work edges.
+- Non-Start enqueue and all three cancel-stop orderings have deterministic regression coverage.
 - `Makefile` provides a discovery-guarded `test-idle-start-running` target, and `make test-idle-start-running` passes.
-- Strict OpenSpec validation and archive-gate validation pass for this change.
+- `make check-scenario-set`, strict OpenSpec validation, and archive-gate validation pass for this change.
 
 ## Out of Scope
 

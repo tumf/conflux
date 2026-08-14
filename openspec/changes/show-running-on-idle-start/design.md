@@ -23,7 +23,9 @@ That distinction is accurate for actual agent execution but poor command feedbac
 
 ## Decision: Accepted Start Opens the Operator-Visible Run Episode
 
-`OperatorCommandApplied::RunDispatched` already carries the committed target set and whether a new scheduler was spawned. The projection SHALL additionally use the existing persistent-idle episode fact at dispatch time:
+`OperatorCommandApplied::RunDispatched` carries the committed target set and `scheduler_started: bool`; it does not distinguish `Notified` from `None`. The projection therefore SHALL identify this transition from ordered local facts: current mode is Select, `persistent_scheduler_idle` is true, `scheduler_started` is false, and `change_ids` is non-empty. Shared run control has already revalidated scheduler liveness and committed intent before publishing this outcome, so the fact gate is authoritative without adding a second state machine.
+
+Every publisher that can emit this idle-Ready Running outcome MUST guarantee that the live scheduler was woken for the committed intent. A publisher that lacks scheduler-wake evidence MUST NOT reuse this projection shape. The projection matrix is:
 
 | Current state | Accepted targets | Scheduler effect | Projection |
 |---|---:|---|---|
@@ -40,7 +42,9 @@ The event remains the one source for TUI and Web. Reducer queue status travels i
 
 The accepted persistent-idle Start closes the presentation episode and clears `persistent_scheduler_idle` in Core/TUI/Web. This is intentionally earlier than workspace execution, but it is not evidence of an active phase.
 
-The scheduler's edge latch must be able to publish Ready again if analysis admits no work. Rearming at the raw wake would be wrong because stop notifications, duplicate notifications, and generic queue wakeups may admit nothing. Rearming occurs only when the coherent scheduler pass observes at least one reducer queue addition or consumes an accepted explicit-retry edge.
+The scheduler's edge latch must be able to publish Ready again if analysis admits no work. Rearming at the raw wake would be wrong because stop notifications, duplicate notifications, and generic wakeups may admit nothing. The rearm predicate is level-based, not reducer-outcome-based: a coherent scheduler pass rearms when it observes at least one queued row or an unconsumed accepted explicit-retry hold. This closes the prepare/commit race where a concurrent queue addition makes an individual `AddToQueue` reduction a no-op while coherent queue intent still exists.
+
+A non-Start client enqueue also satisfies that level predicate. It does not project Running because no accepted Start outcome exists; typed admitted-work evidence remains its Running trigger. If it produces no work, the resulting rearmed idle edge reaches frontends that are already Select and is guarded as a no-op.
 
 After that rearm:
 
@@ -78,7 +82,7 @@ The accepted command outcome is state-owning and already advances the remote pro
 - admitted targets with reducer-derived queue intent;
 - unchanged execution facts until their own typed events arrive.
 
-External lifecycle projection SHALL emit `working` from the same mode transition. Unchanged frames remain deduplicated. If no work is admitted after analysis, the later persistent-idle event emits `idle` again.
+External lifecycle projection SHALL emit `working` from the same mode transition. `LifecycleModeMirror` SHALL absorb the accepted idle-Start outcome as Running; otherwise its guarded persistent-idle handler would reject the later no-work idle edge and leave adapters stuck at `working`. Unchanged frames remain deduplicated. If no work is admitted after analysis, the later persistent-idle event emits `idle` again. Non-Start enqueue preserves the existing mirror path: it remains idle until typed admitted work starts, and any no-work idle edge observed while Select is ignored.
 
 ## Verification Strategy
 
