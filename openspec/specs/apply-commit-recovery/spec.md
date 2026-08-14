@@ -87,7 +87,7 @@ Commit-hook recovery MUST NOT introduce out-of-worktree durable workflow-control
 
 ### Requirement: Final Apply commit retries narrowly classified index-lock contention
 
-When final Apply finalization fails because a structured finalization Git command cannot create the current managed worktree's existing `index.lock`, Conflux MUST retry the complete finalization sequence at most three total attempts with a fixed 200 millisecond delay and no backoff. Conflux MUST preserve repository verification hooks, MUST NOT delete or bypass the lock, and MUST NOT apply this policy to hook rejection or unrelated VCS failures. Completion MUST be proven from repository state so ambiguous command reporting cannot create duplicate final commits.
+When final Apply finalization fails because a structured finalization Git command cannot create the current managed worktree's existing `index.lock`, Conflux MUST retry the complete finalization sequence at most five total attempts with a fixed 500 millisecond delay and no backoff. Conflux MUST preserve repository verification hooks, MUST NOT delete or bypass the lock within this retry policy, and MUST NOT apply this policy to hook rejection or unrelated VCS failures. The only permitted deletion is the same-dispatch post-quiescence reclamation defined by the `process-execution` capability, completed before finalization retry begins. Completion MUST be proven from repository state so ambiguous command reporting cannot create duplicate final commits.
 
 #### Scenario: transient amend lock clears
 
@@ -102,16 +102,16 @@ When final Apply finalization fails because a structured finalization Git comman
 
 - **GIVEN** final Apply finalization must stage dirty workspace content
 - **AND** finalization `git add -A` or the subsequent verified commit reports the current managed worktree's existing `index.lock`
-- **WHEN** the lock clears within three total attempts
+- **WHEN** the lock clears within five total attempts
 - **THEN** Conflux repeats complete finalization preparation from current repository state
 - **AND** the final hook-enabled commit contains the expected workspace tree exactly once
 
 #### Scenario: persistent lock exhausts bounded retries
 
-- **GIVEN** eligible managed-worktree `index.lock` contention persists for all three attempts
+- **GIVEN** eligible managed-worktree `index.lock` contention persists for all five attempts
 - **WHEN** the retry budget is exhausted
 - **THEN** final Apply fails with structured command, workspace, lock, stderr, and attempt diagnostics
-- **AND** Conflux does not delete the lock
+- **AND** the retry policy does not delete the lock
 - **AND** workspace contents remain available for explicit recovery
 
 #### Scenario: repository hook rejection is not lock contention
@@ -127,6 +127,8 @@ When final Apply finalization fails because a structured finalization Git comman
 - **WHEN** Conflux classifies the failure
 - **THEN** it does not retry under the final Apply index-lock policy
 - **AND** it returns the original terminal failure context
+
+<!-- Expected canonical result after archive: final Apply lock contention will use five total attempts at fixed 500 millisecond intervals, while lock deletion remains outside retry and limited to the process-execution post-quiescence boundary. -->
 
 ### Requirement: Task-complete Apply finalization MUST require explicit staging
 
