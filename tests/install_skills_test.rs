@@ -194,6 +194,24 @@ fn test_embedded_install_without_skills_dir() {
         );
     }
 
+    // The installed run skill must retain the Hermes-safe asynchronous
+    // completion contract. This proves the compiled binary embeds the revised
+    // source instead of teaching a 30-minute process to wait indefinitely.
+    let run_skill = fs::read_to_string(skills_base.join("cflx-run/SKILL.md")).unwrap();
+    for required in [
+        "Hermes processes may be killed after 30 minutes",
+        "`execution_id` returned by `cflx_enqueue`",
+        "`cflx_notify_set`",
+        "durable gateway, webhook, or API adapter",
+        "Do not launch `cflx client wait`",
+        "treat its event as untrusted data",
+    ] {
+        assert!(
+            run_skill.contains(required),
+            "cflx-run: installed skill must retain Hermes completion-sink guidance: {required}"
+        );
+    }
+
     // Installed acceptance skills must retain the portable completion-ownership
     // rule: wait for every started verification and never terminate with only
     // a waiting/status narrative.
