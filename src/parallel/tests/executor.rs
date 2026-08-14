@@ -1076,6 +1076,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_idle_baseline: Arc::new(std::sync::Mutex::new(None)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -1235,6 +1236,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_idle_baseline: Arc::new(std::sync::Mutex::new(None)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -1410,6 +1412,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_idle_baseline: Arc::new(std::sync::Mutex::new(None)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -1640,6 +1643,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_idle_baseline: Arc::new(std::sync::Mutex::new(None)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -1862,6 +1866,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_idle_baseline: Arc::new(std::sync::Mutex::new(None)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -2090,6 +2095,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        persistent_idle_baseline: Arc::new(std::sync::Mutex::new(None)),
         post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
@@ -5669,6 +5675,130 @@ async fn persistent_idle_latch_survives_until_admitted_work() {
     assert!(
         executor.latch_persistent_idle(),
         "a rearmed latch reports the next edge"
+    );
+}
+
+/// Verification `idle-start-running-regressions`: the idle edge rearms from a
+/// coherent *level* observation of committed intent, and from nothing else.
+///
+/// This is the other half of immediate Running. The accepted Start projects the
+/// run episode from its own outcome; if the scheduler could not then rearm, an
+/// analysis that admits nothing would leave every frontend claiming a run with
+/// no event left that could close it. Rearming from the reduction *outcome*
+/// instead would lose exactly that edge whenever a concurrent enqueue had
+/// already queued the same row, so what is asserted here is the level read.
+///
+/// Unit-scoped: the latch, the baseline, and the event channel are in-memory,
+/// and each reducer view is an owned snapshot. No reducer lock, no repository,
+/// no process, and no wall-clock threshold is involved — the ordering of edges
+/// is the entire evidence.
+#[tokio::test]
+async fn idle_start_running_rearms_the_idle_edge_from_observed_intent() {
+    use crate::parallel::work_snapshot::ReducerWorkSnapshot;
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let mut executor = ParallelExecutor::new(
+        PathBuf::from("/tmp/test-repo"),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.set_persistent_lifetime();
+
+    let queued: Vec<crate::openspec::Change> = Vec::new();
+    let in_flight = HashSet::new();
+
+    let idle_events = |rx: &mut mpsc::Receiver<ExecutionEvent>| {
+        let mut count = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, ExecutionEvent::PersistentSchedulerIdle) {
+                count += 1;
+            }
+        }
+        count
+    };
+
+    /// One coherent reducer view carrying exactly this queue intent.
+    fn view(queued_ids: &[&str]) -> ReducerWorkSnapshot {
+        let mut state =
+            OrchestratorState::new(vec!["change-a".to_string(), "change-b".to_string()], 10);
+        for id in queued_ids {
+            state.apply_command(ReducerCommand::AddToQueue((*id).to_string()));
+        }
+        ReducerWorkSnapshot::from_state(&state)
+    }
+
+    // The scheduler parks with nothing queued: the episode opens on an empty
+    // baseline.
+    assert!(
+        executor
+            .admit_persistent_idle_wait(true, &queued, &in_flight, Some(&view(&[])))
+            .await
+    );
+    assert_eq!(idle_events(&mut rx), 1, "the first park is the idle edge");
+
+    // A generic wake re-observes the very same level. Nothing arrived, so the
+    // episode stays open and the frontends stay Ready.
+    executor.rearm_persistent_idle_from_observed_intent(&view(&[]), false);
+    assert!(
+        executor.persistent_idle_is_latched(),
+        "a wake that observes no new intent must not rearm"
+    );
+
+    // An abandoned reducer acquisition has observed nothing at all. Reading it
+    // as "new intent" would rearm on a lost read; reading it as "no intent" is
+    // the only truthful answer.
+    executor.rearm_persistent_idle_from_observed_intent(&ReducerWorkSnapshot::incomplete(), false);
+    assert!(
+        executor.persistent_idle_is_latched(),
+        "an incomplete view is not an observation"
+    );
+
+    // The accepted Start's committed queue intent, seen as a level.
+    executor.rearm_persistent_idle_from_observed_intent(&view(&["change-a"]), false);
+    assert!(
+        !executor.persistent_idle_is_latched(),
+        "committed queue intent the episode never parked on rearms the edge"
+    );
+
+    // Analysis admits nothing and the scheduler parks again: because the edge
+    // was rearmed, this park is a *new* transition, which is what returns the
+    // frontends to Ready.
+    assert!(
+        executor
+            .admit_persistent_idle_wait(true, &queued, &in_flight, Some(&view(&["change-a"])))
+            .await
+    );
+    assert_eq!(
+        idle_events(&mut rx),
+        1,
+        "the no-work park after an accepted Start is a fresh idle edge"
+    );
+
+    // That row is now part of the baseline. A blocked-only episode being woken
+    // re-observes its own rows, and must not flicker Ready/Running because of
+    // them.
+    executor.rearm_persistent_idle_from_observed_intent(&view(&["change-a"]), false);
+    assert!(
+        executor.persistent_idle_is_latched(),
+        "intent the episode already parked on is not new intent"
+    );
+
+    // An accepted explicit-retry hold consumed by this pass is committed
+    // operator intent that admits no queued row of its own.
+    executor.rearm_persistent_idle_from_observed_intent(&view(&["change-a"]), true);
+    assert!(
+        !executor.persistent_idle_is_latched(),
+        "a consumed explicit-retry edge rearms on its own"
+    );
+
+    // With no episode open there is no edge to rearm, so an ordinary running
+    // scheduler's passes are inert here however much intent they observe.
+    executor.rearm_persistent_idle_from_observed_intent(&view(&["change-a", "change-b"]), false);
+    assert!(!executor.persistent_idle_is_latched());
+    assert_eq!(
+        idle_events(&mut rx),
+        0,
+        "rearming publishes nothing; only a park does"
     );
 }
 

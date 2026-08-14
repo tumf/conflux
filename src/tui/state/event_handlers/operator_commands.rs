@@ -19,17 +19,33 @@ impl AppState {
     /// Project one accepted operator command's decision facts.
     pub(crate) fn handle_operator_command_applied(&mut self, effect: OperatorCommandEffect) {
         match effect {
-            // Which of the two run projections applies is carried by the
-            // dispatch, not re-derived here: only a newly spawned scheduler
-            // proves execution has begun, while a dispatch that woke a scheduler
-            // already alive — including one parked in persistent-idle Ready —
-            // leaves the execution axis to the first typed work-start event.
+            // Which of the two run projections applies is decided from the
+            // dispatch plus this frontend's own ordered facts, through the gate
+            // Core and Web read too. A newly spawned scheduler proves execution
+            // has begun. A dispatch that woke a scheduler already alive proves
+            // the same *episode* when it arrives against persistent-idle Ready
+            // with committed targets: the operator's Start was accepted, so the
+            // run they asked for is theirs to see now rather than after
+            // dependency analysis. Every other wake — into a live run, or with
+            // nothing committed — leaves the mode to the first typed work-start
+            // event as before.
             OperatorCommandEffect::RunDispatched {
                 change_ids,
                 scheduler_started,
                 ..
             } => {
-                if scheduler_started {
+                if scheduler_started
+                    || crate::events::accepted_start_opens_idle_run_episode(
+                        self.execution_mode.app_mode_token(),
+                        self.persistent_scheduler_idle,
+                        scheduler_started,
+                        &change_ids,
+                    )
+                {
+                    // The accepted Start closes the presentation episode: it is
+                    // deliberately earlier than admitted work, and the rows stay
+                    // queued to say so.
+                    self.persistent_scheduler_idle = false;
                     self.begin_run(&change_ids);
                 } else {
                     self.queue_run(&change_ids);

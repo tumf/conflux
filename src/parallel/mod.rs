@@ -264,6 +264,20 @@ pub struct ParallelExecutor {
     /// invocation-scoped like every other runtime latch here: a restart begins
     /// with no open episode.
     persistent_idle_latched: Arc<std::sync::atomic::AtomicBool>,
+    /// Reducer-visible queue intent this idle episode already parked on.
+    ///
+    /// `None` while no episode is open. Recorded from the same coherent view the
+    /// park was decided from, so a later pass can answer the only question the
+    /// rearm needs — "is there intent this episode has not already evaluated?" —
+    /// as a *level* observation rather than from an individual reducer command's
+    /// outcome. That is what closes the prepare/commit race where a concurrent
+    /// queue addition makes an accepted Start's own `AddToQueue` a no-op while
+    /// coherent queue intent plainly exists.
+    ///
+    /// Comparing against the episode baseline rather than against emptiness is
+    /// what keeps a blocked-only park quiet: its rows were already there, so a
+    /// generic wake observes nothing new and emits no second idle edge.
+    persistent_idle_baseline: Arc<std::sync::Mutex<Option<HashSet<String>>>>,
     /// Post-archive terminal action.
     post_archive_action: PostArchiveAction,
     /// Optional reducer shared state used for scheduler-owned resolve/merge retry intent.
