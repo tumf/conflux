@@ -315,6 +315,7 @@ async fn per_change_upstream_later_result_is_deferred_at_the_merge_boundary() {
             &["wt-beta".to_string()],
             &["beta".to_string()],
             &[root.join("nonexistent-workspace")],
+            None,
         )
         .await
         .expect("attempt_merge");
@@ -461,6 +462,7 @@ async fn per_change_upstream_base_lane_orders_merge_hook_verification_and_public
             &["ws-alpha".to_string()],
             &["alpha".to_string()],
             std::slice::from_ref(&workspace_path),
+            None,
         )
         .await
         .expect("attempt_merge");

@@ -749,6 +749,29 @@ pub async fn commit_diff_entries<P: AsRef<Path>>(
     Ok(entries)
 }
 
+/// Return every path that differs between two revisions.
+///
+/// Rename detection is disabled on purpose: the caller uses this as the
+/// *superset* of paths one merge may legitimately touch, so a rename must
+/// contribute both its source and its destination rather than the destination
+/// alone.
+pub async fn diff_paths_between<P: AsRef<Path>>(
+    cwd: P,
+    from: &str,
+    to: &str,
+) -> VcsResult<Vec<String>> {
+    let output = run_git(&["diff", "--no-renames", "--name-only", from, to], cwd).await?;
+    let mut paths: Vec<String> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 /// Check whether the index and working tree exactly match `HEAD`, untracked
 /// files included.
 ///

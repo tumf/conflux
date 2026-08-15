@@ -167,6 +167,7 @@ use super::dependency::{DependencyContext, EffectiveDependencyBaseEvidence};
 use super::dispatch::archived_dirty_repair_candidate_from_workspace;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
+use super::manual_continuation::ManualContinuationAuthorization;
 use super::merge::base_dirty_reason;
 use super::work_snapshot::ReducerWorkSnapshot;
 use super::{
@@ -1417,10 +1418,12 @@ impl ParallelExecutor {
         match wait_state {
             crate::orchestration::state::WaitState::ResolveWait => {
                 self.resolve_wait_changes.insert(change_id.clone());
+                let authorization = self.manual_continuation_for(&change_id).await;
                 self.spawn_base_lane_retry_task(
                     change_id,
                     MergeResultOrigin::ResolveWaitRetry,
                     merge_result_tx,
+                    authorization,
                 );
             }
             crate::orchestration::state::WaitState::RejectWait => {
@@ -1429,6 +1432,7 @@ impl ParallelExecutor {
                     change_id,
                     MergeResultOrigin::RejectWaitRetry,
                     merge_result_tx,
+                    None,
                 );
             }
             other => {
@@ -1444,11 +1448,29 @@ impl ParallelExecutor {
         self.resolve_wait_retry_triggered = false;
     }
 
+    /// Build the one-dispatch continuation authorization for `change_id`, when
+    /// the reducer records an explicit operator resolve intent for it.
+    ///
+    /// The reducer permission is read, not taken: only the dispatch that owns
+    /// the base lane may consume it.
+    async fn manual_continuation_for(
+        &self,
+        change_id: &str,
+    ) -> Option<Arc<ManualContinuationAuthorization>> {
+        let shared = self.shared_orchestrator_state.as_ref()?;
+        shared
+            .read()
+            .await
+            .has_manual_resolve_retry(change_id)
+            .then(|| Arc::new(ManualContinuationAuthorization::new(change_id)))
+    }
+
     fn spawn_base_lane_retry_task(
         &self,
         change_id: String,
         origin: MergeResultOrigin,
         merge_result_tx: mpsc::Sender<MergeResult>,
+        manual_continuation: Option<Arc<ManualContinuationAuthorization>>,
     ) {
         let mut retry_executor = ParallelExecutor::new(
             self.repo_root.clone(),
@@ -1483,7 +1505,7 @@ impl ParallelExecutor {
                             workspace_name = workspace_info.workspace_name;
                         }
                         retry_executor
-                            .retry_deferred_merges_for(vec![change_id.clone()])
+                            .retry_deferred_merges_for(vec![change_id.clone()], manual_continuation)
                             .await
                     }
                     MergeResultOrigin::RejectWaitRetry => {
@@ -1538,7 +1560,10 @@ impl ParallelExecutor {
         match promoted {
             Some((change_id, crate::orchestration::state::WaitState::ResolveWait)) => {
                 self.resolve_wait_changes.insert(change_id.clone());
-                let _ = self.retry_deferred_merges_for(vec![change_id]).await;
+                let authorization = self.manual_continuation_for(&change_id).await;
+                let _ = self
+                    .retry_deferred_merges_for(vec![change_id], authorization)
+                    .await;
             }
             Some((change_id, crate::orchestration::state::WaitState::RejectWait)) => {
                 self.reject_wait_changes.insert(change_id.clone());
@@ -1580,7 +1605,7 @@ impl ParallelExecutor {
         }
 
         let deferred: Vec<String> = self.resolve_wait_changes.iter().cloned().collect();
-        let _ = self.retry_deferred_merges_for(deferred).await;
+        let _ = self.retry_deferred_merges_for(deferred, None).await;
     }
 
     pub(super) fn stale_retry_reason(workspace_info: &crate::vcs::WorkspaceInfo) -> Option<String> {
@@ -1597,6 +1622,7 @@ impl ParallelExecutor {
     pub(super) async fn retry_deferred_merges_for(
         &mut self,
         deferred: Vec<String>,
+        manual_continuation: Option<Arc<ManualContinuationAuthorization>>,
     ) -> MergeTaskOutcome {
         let mut outcome = MergeTaskOutcome::Merged;
         for change_id in deferred.into_iter().take(1) {
@@ -1705,10 +1731,32 @@ impl ParallelExecutor {
             let change_ids = vec![change_id.clone()];
             let archive_paths = vec![workspace_info.path.clone()];
 
-            match self
-                .attempt_merge(&revisions, &change_ids, &archive_paths)
-                .await
+            let attempt = self
+                .attempt_merge(
+                    &revisions,
+                    &change_ids,
+                    &archive_paths,
+                    manual_continuation.as_deref(),
+                )
+                .await;
+
+            // Clearing follows the dispatch that actually consumed the
+            // authorization, never the promotion that merely carried it: a
+            // retry deferred by base-lane occupancy consumed nothing and must
+            // keep its permission for the auto-resumed attempt.
+            if manual_continuation
+                .as_ref()
+                .is_some_and(|authorization| authorization.is_consumed())
             {
+                if let Some(shared) = &self.shared_orchestrator_state {
+                    shared
+                        .write()
+                        .await
+                        .consume_manual_resolve_retry(&change_id);
+                }
+            }
+
+            match attempt {
                 Ok(super::merge::MergeAttempt::Merged { revision }) => {
                     info!("Deferred merge succeeded for '{}' on retry", change_id);
 

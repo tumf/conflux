@@ -297,6 +297,16 @@ pub struct ChangeRuntimeState {
     /// other next-action decision — those are re-derived from the workspace
     /// after a restart, which is exactly when this field is gone.
     pub commit_phase_attempt: Option<u32>,
+    /// Ephemeral, process-local permission for one manual resolve retry to
+    /// continue this change's own unfinished target merge.
+    ///
+    /// Set only by an explicit operator resolve intent, and cleared the moment a
+    /// dispatch that owns the base lane consumes it. It is never persisted and
+    /// never routes work on its own: it only decides whether the single admitted
+    /// dispatch uses the scoped merge-continuation evidence check instead of the
+    /// generic base-dirty preflight. A restart drops it, and the next action is
+    /// re-derived from the workspace exactly as before.
+    pub manual_resolve_retry: bool,
 }
 
 impl ChangeRuntimeState {
@@ -327,6 +337,9 @@ impl ChangeRuntimeState {
     fn clear_activity_wait_and_blocker(&mut self) {
         self.activity = ActivityState::Idle;
         self.wait_state = WaitState::None;
+        // The permission only means anything while this row is waiting on the
+        // base-mutating lane; losing the wait loses the retry it authorized.
+        self.manual_resolve_retry = false;
         self.clear_blocked_metadata();
     }
 
@@ -335,6 +348,7 @@ impl ChangeRuntimeState {
         self.terminal = terminal;
         self.activity = ActivityState::Idle;
         self.wait_state = WaitState::None;
+        self.manual_resolve_retry = false;
         self.clear_blocked_metadata();
     }
 
@@ -1460,6 +1474,28 @@ impl OrchestratorState {
         None
     }
 
+    /// Whether `change_id` currently carries an unconsumed manual resolve retry
+    /// permission.
+    ///
+    /// Read — never taken — at promotion, so a dispatch that is deferred by
+    /// base-lane occupancy leaves the permission for the auto-resumed retry.
+    pub fn has_manual_resolve_retry(&self, change_id: &str) -> bool {
+        self.change_runtime
+            .get(change_id)
+            .is_some_and(|rt| rt.manual_resolve_retry)
+    }
+
+    /// Consume `change_id`'s manual resolve retry permission.
+    ///
+    /// Answers what the permission was, and clears it, so the next ordinary
+    /// scheduled attempt observes the unchanged generic preflight.
+    pub fn consume_manual_resolve_retry(&mut self, change_id: &str) -> bool {
+        match self.change_runtime.get_mut(change_id) {
+            Some(rt) => std::mem::take(&mut rt.manual_resolve_retry),
+            None => false,
+        }
+    }
+
     /// Return change IDs that still carry queued intent and are not terminal.
     ///
     /// Scheduler reconciliation uses this as reducer-visible source of truth for
@@ -1911,6 +1947,10 @@ impl OrchestratorState {
             rt.activity = ActivityState::Idle;
             rt.wait_state = WaitState::ResolveWait;
             rt.queue_intent = QueueIntent::NotQueued;
+            // Explicit operator intent is the only source of this permission.
+            // Auto-resumable deferrals re-enter `ResolveWait` without it, so
+            // they keep the unchanged generic preflight.
+            rt.manual_resolve_retry = true;
             rt.clear_blocked_metadata();
         }
         self.remove_from_reject_wait_queue(&change_id);
@@ -3345,6 +3385,75 @@ mod tests {
         assert_eq!(state.display_status("b"), "reject pending");
         assert_eq!(state.reject_wait_change_ids(), vec!["b".to_string()]);
         assert!(state.has_other_post_archive_lane_blocker("b"));
+        assert!(state.global_invariants_hold());
+    }
+
+    /// Only explicit operator intent grants the scoped merge-continuation
+    /// permission; an auto-resumable deferral re-enters `ResolveWait` without it
+    /// and therefore keeps the unchanged generic dirty preflight.
+    #[test]
+    fn manual_resolve_permission_is_granted_only_by_explicit_operator_intent() {
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "merge lane busy".to_string(),
+            auto_resumable: true,
+        });
+        assert!(
+            !state.has_manual_resolve_retry("alpha"),
+            "an auto-resumable deferral is not operator intent"
+        );
+
+        state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+        assert!(state.has_manual_resolve_retry("alpha"));
+    }
+
+    /// The permission is consumed by the dispatch that owns the base lane, and a
+    /// later ordinary scheduled attempt must not inherit it.
+    #[test]
+    fn manual_resolve_permission_is_consumed_once_and_is_not_sticky() {
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "bounded resolve exhausted".to_string(),
+            auto_resumable: false,
+        });
+        state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+
+        // Promotion only reads the permission: a dispatch deferred by lane
+        // occupancy has to find it again.
+        assert_eq!(
+            state.promote_next_base_mutating_lane_waiter(),
+            Some(("alpha".to_string(), WaitState::ResolveWait))
+        );
+        assert!(state.has_manual_resolve_retry("alpha"));
+
+        assert!(state.consume_manual_resolve_retry("alpha"));
+        assert!(!state.has_manual_resolve_retry("alpha"));
+        assert!(
+            !state.consume_manual_resolve_retry("alpha"),
+            "a second dispatch gets the unchanged generic preflight"
+        );
+        assert!(!state.consume_manual_resolve_retry("unknown-change"));
+    }
+
+    /// Losing the wait loses the retry the permission authorized, so a dequeue
+    /// must not leave a live permission behind for a later requeue.
+    #[test]
+    fn manual_resolve_permission_does_not_survive_dequeue() {
+        let mut state = OrchestratorState::new(vec!["alpha".to_string()], 0);
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "bounded resolve exhausted".to_string(),
+            auto_resumable: false,
+        });
+        state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+        assert!(state.has_manual_resolve_retry("alpha"));
+
+        state.apply_command(ReducerCommand::DequeueChange("alpha".to_string()));
+
+        assert!(!state.has_manual_resolve_retry("alpha"));
         assert!(state.global_invariants_hold());
     }
 

@@ -21,6 +21,8 @@ mod idle_parallel_stop;
 #[cfg(test)]
 mod manual_resolve;
 #[cfg(test)]
+mod manual_resolve_continuation;
+#[cfg(test)]
 mod per_change_upstream;
 #[cfg(test)]
 mod reanalysis_trigger_lifetime;
