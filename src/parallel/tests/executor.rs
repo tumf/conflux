@@ -6088,7 +6088,7 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
     // Attempt merge should be deferred because change directory exists
     let archive_paths = vec![repo_root.to_path_buf()];
     let result = executor
-        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .attempt_merge(&revisions, &change_ids, &archive_paths, None)
         .await;
 
     match result {
@@ -6210,7 +6210,7 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
     // Attempt merge should succeed because change is properly archived
     let archive_paths = vec![workspace_path.clone()];
     let result = executor
-        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .attempt_merge(&revisions, &change_ids, &archive_paths, None)
         .await;
 
     match result {
@@ -6447,7 +6447,7 @@ async fn resolve_retry_workspace_lookup_failure_is_operator_visible() {
         .insert("missing-ws".to_string());
 
     let outcome = executor
-        .retry_deferred_merges_for(vec!["missing-ws".to_string()])
+        .retry_deferred_merges_for(vec!["missing-ws".to_string()], None)
         .await;
 
     assert_eq!(outcome, MergeTaskOutcome::Merged);
@@ -6569,7 +6569,7 @@ async fn stale_deferred_merge_retry_with_proven_base_integration_settles_merged(
     executor.resolve_wait_changes.insert("alpha".to_string());
 
     let outcome = executor
-        .retry_deferred_merges_for(vec!["alpha".to_string()])
+        .retry_deferred_merges_for(vec!["alpha".to_string()], None)
         .await;
 
     assert_eq!(outcome, MergeTaskOutcome::Merged);
@@ -6654,7 +6654,7 @@ async fn stale_deferred_merge_retry_preserves_dirty_repository_content() {
     executor.resolve_wait_changes.insert("alpha".to_string());
 
     let outcome = executor
-        .retry_deferred_merges_for(vec!["alpha".to_string()])
+        .retry_deferred_merges_for(vec!["alpha".to_string()], None)
         .await;
 
     assert_eq!(outcome, MergeTaskOutcome::Merged);
@@ -6718,7 +6718,7 @@ async fn stale_deferred_merge_retry_with_unreadable_evidence_remains_merge_wait(
     executor.resolve_wait_changes.insert("alpha".to_string());
 
     let outcome = executor
-        .retry_deferred_merges_for(vec!["alpha".to_string()])
+        .retry_deferred_merges_for(vec!["alpha".to_string()], None)
         .await;
 
     assert_eq!(outcome, MergeTaskOutcome::Merged);
@@ -6807,7 +6807,7 @@ async fn stale_deferred_merge_retry_with_stale_workspace_path_remains_merge_wait
     executor.resolve_wait_changes.insert("alpha".to_string());
 
     let outcome = executor
-        .retry_deferred_merges_for(vec!["alpha".to_string()])
+        .retry_deferred_merges_for(vec!["alpha".to_string()], None)
         .await;
 
     assert_eq!(outcome, MergeTaskOutcome::Merged);
@@ -6948,7 +6948,7 @@ async fn resolve_give_up_promotes_next_waiter_without_user_action() {
     executor.resolve_wait_changes.insert("first".to_string());
 
     let outcome = executor
-        .retry_deferred_merges_for(vec!["first".to_string()])
+        .retry_deferred_merges_for(vec!["first".to_string()], None)
         .await;
     assert_eq!(outcome, MergeTaskOutcome::Merged);
 
@@ -7023,6 +7023,7 @@ async fn retry_lane_busy_release_allows_subsequent_repromotion() {
             &["retry-rev".to_string()],
             &["change-a".to_string()],
             &[PathBuf::from("/tmp/retry-archive")],
+            None,
         )
         .await
         .or_fail("attempt_merge should report lock contention as a deferred retry");
@@ -9497,6 +9498,7 @@ async fn parallel_pass_to_archive_to_merge_never_creates_or_cleans_an_acceptance
             std::slice::from_ref(&workspace.workspace_name),
             &[change_id.to_string()],
             std::slice::from_ref(&workspace.path),
+            None,
         )
         .await;
     if let Ok(crate::parallel::merge::MergeAttempt::Deferred(deferred)) = &attempt {
@@ -11450,7 +11452,7 @@ async fn test_attempt_merge_deferred_when_resolve_active() {
     let archive_paths = vec![repo_root.to_path_buf()];
 
     let result = executor
-        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .attempt_merge(&revisions, &change_ids, &archive_paths, None)
         .await;
 
     match result {
@@ -11553,7 +11555,7 @@ async fn test_merge_deferred_when_worktree_dirty() {
 
     // Attempt merge should be deferred because worktree is dirty
     let result = executor
-        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .attempt_merge(&revisions, &change_ids, &archive_paths, None)
         .await;
 
     match result {
@@ -11636,7 +11638,7 @@ async fn test_merge_deferred_when_archive_entry_missing() {
 
     // Attempt merge should be deferred because archive entry is missing
     let result = executor
-        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .attempt_merge(&revisions, &change_ids, &archive_paths, None)
         .await;
 
     match result {
@@ -11756,7 +11758,7 @@ async fn test_merge_proceeds_when_archive_complete() {
     // Attempt merge should succeed because change is properly archived
     let archive_paths = vec![workspace_path.clone()];
     let result = executor
-        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .attempt_merge(&revisions, &change_ids, &archive_paths, None)
         .await;
 
     match result {
@@ -11890,7 +11892,7 @@ async fn test_attempt_merge_errors_on_detached_head() {
     let archive_paths = vec![workspace_path.clone()];
 
     let result = executor
-        .attempt_merge(&revisions, &change_ids, &archive_paths)
+        .attempt_merge(&revisions, &change_ids, &archive_paths, None)
         .await;
 
     match result {

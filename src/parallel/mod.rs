@@ -23,6 +23,7 @@ mod dispatch;
 mod dynamic_queue;
 mod events;
 mod executor;
+mod manual_continuation;
 mod merge;
 mod orchestration;
 mod output_bridge;

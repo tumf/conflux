@@ -14,6 +14,10 @@ use std::path::PathBuf;
 
 use super::conflict::{self, ResolveFailure};
 use super::events::send_event;
+use super::manual_continuation::{
+    classify_manual_continuation, ContinuationDecision, GitContinuationEvidence,
+    ManualContinuationAuthorization,
+};
 use super::resolve_state::{self, GitResolveEvidence};
 use super::AlreadyReportedFailureKind;
 use super::MergeTaskOutcome;
@@ -532,8 +536,10 @@ impl ParallelExecutor {
                 workspace_result.workspace_name
             );
 
+            // Ordinary scheduled post-archive merge: no manual continuation
+            // authorization, so the generic dirty preflight stays authoritative.
             match self
-                .attempt_merge(&revisions, &change_ids, &archive_paths)
+                .attempt_merge(&revisions, &change_ids, &archive_paths, None)
                 .await
             {
                 Ok(MergeAttempt::Merged { revision }) => {
@@ -868,6 +874,7 @@ impl ParallelExecutor {
         revisions: &[String],
         change_ids: &[String],
         archive_paths: &[PathBuf],
+        manual_continuation: Option<&ManualContinuationAuthorization>,
     ) -> BaseLaneResult<MergeAttempt> {
         use crate::execution::archive::is_archive_commit_complete;
 
@@ -891,7 +898,51 @@ impl ParallelExecutor {
             )));
         };
 
-        if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
+        let primary_change_id = change_ids
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<unknown>");
+
+        // Occupancy above is evaluated first and deliberately: a retry that
+        // never owned the base lane must stay auto-resumable with its
+        // authorization intact. Only here, with the lane owned, may the single
+        // admitted dispatch consume it.
+        let authorized_continuation = manual_continuation
+            .is_some_and(|authorization| authorization.consume_for(primary_change_id));
+
+        if authorized_continuation {
+            match classify_manual_continuation(
+                &GitContinuationEvidence::new(&self.repo_root),
+                primary_change_id,
+                revisions,
+                change_ids,
+            )
+            .await
+            {
+                ContinuationDecision::Admit { merge_head } => {
+                    tracing::info!(
+                        change_id = %primary_change_id,
+                        merge_head = %merge_head,
+                        "Manual resolve retry continues its own unfinished target merge"
+                    );
+                }
+                // No merge to continue: nothing was superseded, so the ordinary
+                // preflight still decides.
+                ContinuationDecision::GenericPreflight => {
+                    if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
+                        return Ok(MergeAttempt::Deferred(DeferredMerge::manual(reason)));
+                    }
+                }
+                ContinuationDecision::Refuse { reason } => {
+                    tracing::warn!(
+                        change_id = %primary_change_id,
+                        reason = %reason,
+                        "Manual resolve retry refused before any agent started"
+                    );
+                    return Ok(MergeAttempt::Deferred(DeferredMerge::manual(reason)));
+                }
+            }
+        } else if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
             return Ok(MergeAttempt::Deferred(DeferredMerge::manual(reason)));
         }
 
@@ -900,11 +951,6 @@ impl ParallelExecutor {
         // worktree evidence.
         let batch = SequentialMergeItem::batch(revisions, change_ids, archive_paths)
             .map_err(OrchestratorError::GitCommand)?;
-
-        let primary_change_id = change_ids
-            .first()
-            .map(String::as_str)
-            .unwrap_or("<unknown>");
 
         // Only one completed result may occupy the base lane through local
         // integration, verification, publication, and remote confirmation. While
@@ -1263,7 +1309,7 @@ impl ParallelExecutor {
 
         let archive_paths = vec![workspace.path.clone()];
         match self
-            .attempt_merge(&revisions, &change_ids, &archive_paths)
+            .attempt_merge(&revisions, &change_ids, &archive_paths, None)
             .await
             .map_err(|failure| OrchestratorError::GitCommand(failure.to_string()))?
         {
@@ -1785,6 +1831,7 @@ mod tests {
                 &["dummy-revision".to_string()],
                 &["change-a".to_string()],
                 &[temp.path().to_path_buf()],
+                None,
             )
             .await;
 
@@ -1840,6 +1887,7 @@ mod tests {
                 &["dummy-revision".to_string()],
                 &["change-a".to_string()],
                 &[temp.path().to_path_buf()],
+                None,
             ),
         )
         .await
@@ -1883,6 +1931,7 @@ mod tests {
                 &["dummy-revision".to_string()],
                 &["change-a".to_string()],
                 &[temp.path().to_path_buf()],
+                None,
             ),
         )
         .await
