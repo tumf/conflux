@@ -34,7 +34,9 @@ The workspace remains dirty by design, while the only advertised recovery contro
 
 ## Proposed Solution
 
-Treat an explicit manual resolve retry as continuation of the selected change's existing resolve state. After the retry intent is admitted and the base-mutation lane is exclusively owned, route the request into repository-derived sequential resolve classification before rejecting the target merely because `MERGE_HEAD` exists.
+Treat an explicit manual resolve retry as continuation of the selected change's existing resolve state. After the retry intent is admitted and the base-mutation lane is exclusively owned, replace the generic dirty preflight for that single dispatch with a scoped repository-evidence check before entering sequential resolve classification.
+
+The scoped check must prove that target `MERGE_HEAD` belongs uniquely to the selected change and that every deviation from `HEAD` is attributable to that in-progress merge. The working tree must match the index; unrelated staged or unstaged changes and conflicting untracked paths must fail closed before any agent starts. This authorization is change-scoped, per-dispatch, consumed once, and never stored as durable workflow state. All ordinary and later scheduled attempts continue to use the unchanged generic dirty preflight.
 
 The resolver must retain all existing fail-closed identity, topology, conflict-stage, resurrection-cleanup, and terminal checks. Unrelated dirty changes, an unowned or ambiguous `MERGE_HEAD`, unresolved conflicts, and unreadable evidence remain blocked without mutation.
 
@@ -44,12 +46,14 @@ The resolver must retain all existing fail-closed identity, topology, conflict-s
 - The retry reaches sequential repository classification despite the existing `MERGE_HEAD`, performs only the required continuation action, and re-verifies completion.
 - A successful retry commits with exact subject `Merge change: <change_id>`, clears `MERGE_HEAD`, and advances the change through the normal merged lifecycle.
 - An unrelated dirty workspace, ambiguous or foreign `MERGE_HEAD`, unresolved conflict, or invalid topology remains unmodified and reports actionable failure evidence.
+- If another resolve or base mutation owns the lane, the retry remains an auto-resumable deferral and does not consume its one-dispatch authorization.
 - Other changes may continue running; recovery remains change-scoped and does not convert the TUI to a global error state.
 
 ## Explicit Completion Conditions
 
 - A regression test reproduces `ResolveFailed` followed by `M` while the target has a conflict-free `MERGE_HEAD`, and fails if the retry is short-circuited as `MergeDeferred`.
-- Repository-level tests prove the valid continuation path reaches a clean committed state and invalid/foreign evidence performs no commit or cleanup.
+- Repository-level tests prove the valid continuation path reaches `on_merged`, `MergeCompleted`, cleanup, and a clean committed state; invalid, foreign, or unrelated dirty evidence starts no agent and performs no commit or cleanup.
+- Tests prove the one-dispatch authorization is not sticky and that ordinary scheduled attempts retain the generic dirty preflight.
 - Focused verification `cargo test --lib manual_resolve -- --nocapture` passes.
 - `cflx openspec validate fix-manual-resolve-unfinished-merge --strict --evidence warn` emits no warnings.
 
