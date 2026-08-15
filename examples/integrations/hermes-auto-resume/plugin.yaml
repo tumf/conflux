@@ -1,0 +1,9 @@
+name: cflx-auto-resume
+version: 2.0.0
+description: >-
+  Bind an admitted Conflux execution to the Hermes messaging thread that
+  requested it, and send that thread the typed event once the execution reaches
+  a terminal classification. Reference integration — copy it, read it, change it.
+author: Conflux
+provides_hooks:
+  - post_tool_call

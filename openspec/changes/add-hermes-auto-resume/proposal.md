@@ -13,7 +13,7 @@ verifications:
     trigger: pull-request-validation
     automation: Cargo.toml
     evidence: Repository tests exercise binding validation, fixed callback argv registration, scrubbed-environment reconstruction, marked thread delivery, and delivery failure without real credentials.
-    rerun: cargo test --test hermes_auto_resume_example
+    rerun: cargo test --features heavy-tests --test hermes_auto_resume_example
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -45,14 +45,14 @@ The integration remains reference material outside the `cflx` crate and bundled 
 - Unsupported, malformed, unsuccessful, or non-admitted tool results register nothing.
 - The callback destination is derived only from Hermes request-scoped platform/chat/thread bindings, is preserved as fixed argv, and never comes from Conflux event contents.
 - The callback invokes an absolute Hermes executable with `send --quiet --to <target>` under explicit `HOME`, `PATH`, and `HERMES_HOME`; it does not use the API Server, webhook, a shell command string, polling, or a watcher.
-- The generated message has an explicit automation marker and the exact execution binding, and asks the receiving Hermes thread to verify typed outcome and repository evidence.
+- The generated assistant message starts with `[AUTO: ...]`, includes `event: <typed-event>`, carries the exact execution binding, and asks the receiving Hermes thread to verify typed outcome and repository evidence. A separately configured responder may use that message to start the continuation turn; the callback does not directly wake Hermes.
 - Repository-local tests prove registration and delivery behavior without a running Hermes gateway, a live Conflux owner, or real credentials.
 
 ## Explicit Completion Conditions
 
 - `examples/integrations/hermes-auto-resume/` contains the plugin, callback, shared helpers, manifest, and setup documentation.
 - `tests/hermes_auto_resume_example.rs` executes the reference code against local fixtures and a fake Hermes executable and covers success plus fail-closed cases.
-- `cargo test --test hermes_auto_resume_example` passes.
+- `cargo test --features heavy-tests --test hermes_auto_resume_example` passes.
 - `cflx openspec validate add-hermes-auto-resume --archive-gate` passes before archive.
 - The change is archived and merged with no modification to Hermes user configuration or secret files.
 
@@ -63,4 +63,5 @@ The integration remains reference material outside the `cflx` crate and bundled 
 - Persisting Conflux workflow authority outside the repository.
 - Guaranteeing delivery after the configured messaging adapter returns failure.
 - Treating an automation callback as proof that the Conflux change succeeded.
+- Implementing or configuring the responder that turns assistant notifications into follow-up turns.
 - Installing the reference integration through `cflx install-skills` or packaging it in the crate.
