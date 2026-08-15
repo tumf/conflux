@@ -13,7 +13,7 @@ verifications:
     trigger: pull-request-validation
     automation: Cargo.toml
     evidence: Repository tests exercise binding validation, fixed callback argv registration, scrubbed-environment reconstruction, marked thread delivery, and delivery failure without real credentials.
-    rerun: cargo test --test hermes_auto_resume_example
+    rerun: cargo test --features heavy-tests --test hermes_auto_resume_example
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -25,7 +25,7 @@ verifications:
 
 ## Problem / Context
 
-The existing `examples/integrations/opencode-auto-resume` example binds an admitted Conflux execution to the OpenCode session that requested it. On a Hermes messaging gateway the durable return address is the originating platform/chat/thread, and `hermes send` is the supported one-shot delivery adapter for that address. Conflux does not provide a runnable reference integration that captures that routing context and registers it as an execution-scoped callback.
+The existing `examples/integrations/opencode-auto-resume` example binds an admitted Conflux execution to the OpenCode session that requested it. In the Hermes deployment targeted by this example, the durable return address is the originating Slack channel/thread, `hermes send --to` is the supported one-shot bot-message delivery adapter, and a separately deployed responder observes matching bot messages and starts the continuation loop. Conflux does not provide a runnable reference integration that captures that routing context and registers it as an execution-scoped callback.
 
 Without that integration, a Hermes agent must remain alive in `cflx client wait`, poll repeatedly, or rely on prompt compliance to construct a callback. Hermes gateway turns may be terminated before a long Conflux execution completes, so those paths are not durable continuation.
 
@@ -44,15 +44,15 @@ The integration remains reference material outside the `cflx` crate and bundled 
 - A successful `cflx_enqueue` / namespaced `*_cflx_enqueue` tool result with a supported schema and admitted outcome automatically registers one callback for its exact `(instance_id, execution_id, change_id)` binding.
 - Unsupported, malformed, unsuccessful, or non-admitted tool results register nothing.
 - The callback destination is derived only from Hermes request-scoped platform/chat/thread bindings, is preserved as fixed argv, and never comes from Conflux event contents.
-- The callback invokes an absolute Hermes executable with `send --quiet --to <target>` under explicit `HOME`, `PATH`, and `HERMES_HOME`; it does not use the API Server, webhook, a shell command string, polling, or a watcher.
-- The generated message has an explicit automation marker and the exact execution binding, and asks the receiving Hermes thread to verify typed outcome and repository evidence.
+- The callback invokes an absolute Hermes executable with `send --quiet --to slack:<channel-id>:<thread-ts>` under explicit `HOME`, `PATH`, and `HERMES_HOME`; `--to` is the delivery destination and no separate `deliver` option exists. It does not use the API Server, native wake, webhook, a shell command string, polling, or a watcher.
+- The generated Hermes bot message starts with `[AUTO: ...]`, includes `event: <typed-event>`, carries the exact execution binding, and asks the continuation turn to verify typed outcome and repository evidence. The separately configured responder observes that Slack bot message and starts the Hermes continuation loop; the callback itself only posts to Slack and does not directly run an agent loop.
 - Repository-local tests prove registration and delivery behavior without a running Hermes gateway, a live Conflux owner, or real credentials.
 
 ## Explicit Completion Conditions
 
 - `examples/integrations/hermes-auto-resume/` contains the plugin, callback, shared helpers, manifest, and setup documentation.
 - `tests/hermes_auto_resume_example.rs` executes the reference code against local fixtures and a fake Hermes executable and covers success plus fail-closed cases.
-- `cargo test --test hermes_auto_resume_example` passes.
+- `cargo test --features heavy-tests --test hermes_auto_resume_example` passes.
 - `cflx openspec validate add-hermes-auto-resume --archive-gate` passes before archive.
 - The change is archived and merged with no modification to Hermes user configuration or secret files.
 
@@ -63,4 +63,5 @@ The integration remains reference material outside the `cflx` crate and bundled 
 - Persisting Conflux workflow authority outside the repository.
 - Guaranteeing delivery after the configured messaging adapter returns failure.
 - Treating an automation callback as proof that the Conflux change succeeded.
+- Implementing or configuring the responder that turns matching Slack bot notifications into follow-up Hermes turns.
 - Installing the reference integration through `cflx install-skills` or packaging it in the crate.

@@ -2,17 +2,19 @@
 
 ### Requirement: Reference Hermes completion callback notifies the bound messaging thread safely
 
-The reference Hermes auto-resume integration MUST register an execution-scoped completion sink only from a supported versioned enqueue envelope with a successful admitted outcome and non-empty string `change_id`, `execution_id`, and `instance_id`. It MUST bind that execution to the originating messaging platform, chat ID, and optional thread ID supplied by Hermes request-scoped context.
+The reference Hermes auto-resume integration MUST extract the enqueue envelope from Hermes host tool-result representation, including its `structuredContent` and textual `result` wrapper fields. It MUST register an execution-scoped completion sink only from a supported versioned enqueue envelope with a successful admitted outcome and non-empty string `change_id`, `execution_id`, and `instance_id`. It MUST bind that execution to the originating messaging platform, chat ID, and optional thread ID supplied by Hermes request-scoped context.
 
-The callback MUST invoke an absolute Hermes executable as a fixed argv equivalent to `hermes send --quiet --to <platform:chat[:thread]> <message>`. It MUST set explicit `HOME`, `PATH`, and `HERMES_HOME` values because Conflux scrubs the callback environment. It MUST NOT use the Hermes API Server, a webhook, shell evaluation, polling, or a watcher. Secret values MUST NOT appear in callback argv or diagnostics.
+The callback MUST invoke an absolute Hermes executable as a fixed argv equivalent to `hermes send --quiet --to <platform>:<chat-id>[:<thread-id>] <message>`. `--to` MUST be the complete delivery destination. It MUST set explicit `HOME`, `PATH`, and `HERMES_HOME` values because Conflux scrubs the callback environment. It MUST NOT use the Hermes API Server, native wake, a webhook, shell evaluation, polling, or a watcher. Secret values MUST NOT appear in callback argv or diagnostics.
 
 The callback MUST validate `CFLX_EVENT_PATH`, `CFLX_EVENT_TYPE`, `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and `CFLX_INSTANCE_ID`, and MUST treat event contents only as data. Callback failure MUST remain observability only and MUST NOT change Conflux workflow outcome.
 
-The generated message MUST identify itself as an automation event rather than user-authored instruction and MUST require verification of current owner and repository evidence before success is reported. Callback delivery remains observability and continuation only and MUST NOT alter Conflux workflow routing or terminal classification.
+The generated bot message MUST identify itself as an automation event rather than user-authored instruction, MUST contain a typed `event:` line and the exact `instance_id`, `execution_id`, and `change_id` binding, and MUST require verification of current owner and repository evidence before success is reported. Callback delivery remains observability and a responder-compatible trigger only; it MUST NOT itself run an agent loop or alter Conflux workflow routing or terminal classification. A deployment that wants automatic continuation MUST separately provide a responder capable of observing the delivered bot post; this integration does not establish that observation path.
+
+The post-tool hook MUST be observational: refusal, malformed output, or registration failure MUST NOT replace the tool result or fail the Hermes turn, and diagnostics MUST remain bounded and secret-free. Request-scoped routing context MUST be authoritative; a process-global environment mirror MAY be used only when no request-scoped session has been bound.
 
 #### Scenario: Admitted enqueue registers the originating messaging thread
 
-- **GIVEN** Hermes completes a `cflx_enqueue` or segment-exact namespaced equivalent
+- **GIVEN** Hermes completes `cflx_enqueue` or an MCP name such as `mcp__cflx__cflx_enqueue`
 - **AND** the result is a supported successful admitted envelope with complete binding identifiers
 - **AND** Hermes request context identifies a messaging platform and chat, with an optional thread
 - **WHEN** the post-tool hook runs
@@ -26,14 +28,29 @@ The generated message MUST identify itself as an automation event rather than us
 - **THEN** it registers no callback
 - **AND** it starts no wait or polling process
 
-#### Scenario: Callback notifies the existing Hermes thread
+#### Scenario: Callback posts a responder-compatible Slack bot message
 
 - **GIVEN** Conflux invokes the callback for a terminal execution event
 - **AND** the selected Hermes profile can deliver to the bound messaging target
 - **WHEN** callback delivery succeeds
-- **THEN** the callback invokes `hermes send --quiet --to` with the bound target
+- **THEN** the callback invokes `hermes send --quiet --to` with the bound Slack channel/thread target
 - **AND** the body contains an explicit non-user-authored automation marker
-- **AND** the body instructs the receiving agent to verify repository evidence rather than trust event fields
+- **AND** the body contains a typed event the responder can classify
+- **AND** the callback does not directly start an agent loop
+
+#### Scenario: Hermes host wrapper yields the admitted envelope
+
+- **GIVEN** Hermes wraps the admitted enqueue envelope in `structuredContent` and textual `result` fields
+- **WHEN** the post-tool hook runs
+- **THEN** it extracts the typed envelope from the host wrapper
+- **AND** it registers the exact execution binding once
+
+#### Scenario: Concurrent turns retain request-scoped routing
+
+- **GIVEN** concurrent Hermes turns have different messaging targets
+- **WHEN** their post-tool hooks register callbacks
+- **THEN** each callback uses its request-scoped target
+- **AND** neither callback reads another turns process-global environment mirror
 
 #### Scenario: Missing or non-messaging routing context registers nothing
 
