@@ -21,15 +21,21 @@ Copy it into `~/.hermes/plugins/`, read it, and change it to fit your setup.
 4. When that execution reaches a terminal classification, the Conflux owner runs
    the callback once. The callback rebuilds `HOME`, `PATH` and `HERMES_HOME`,
    and invokes `hermes send --quiet --to <platform:chat[:thread]> <message>`.
-5. The assistant-authored message starts with `[AUTO: ...]` and includes
+5. The Hermes bot-authored Slack message starts with `[AUTO: ...]` and includes
    `event: completed` for a successful terminal event. A responder that treats
    this marker as a continuation signal can then add a concrete follow-up turn
    for the original work. The callback itself does not call or wake an agent.
 
-Nothing here polls, waits, watches a file, opens a socket, or keeps a Hermes
+Nothing here polls, waits, watches a file, or keeps a Hermes
 turn alive. There is no API Server call and no webhook. Delivery and automatic
-continuation are separate: this integration sends the assistant message, while
+continuation are separate: this integration sends the Hermes bot message, while
 the configured responder decides whether and how to continue.
+
+The responder is a deployment prerequisite, not part of this example. It must
+observe the Slack bot post itself and turn the `[AUTO: ...]` / `event: ...`
+contract into a follow-up Hermes turn. `hermes send` does not write an assistant
+message to Hermes session state, and Hermes own Slack ingress ignores its bot
+echo, so neither path supplies that observation automatically.
 
 ## Why the plugin and not the model
 
@@ -84,7 +90,7 @@ holds one, never registers one, and has none to leak.
 
 The destination comes only from the Hermes request the enqueue was made in:
 
-- `HERMES_SESSION_PLATFORM` — the platform, e.g. `telegram`
+- `HERMES_SESSION_PLATFORM` — the platform, e.g. `slack`
 - `HERMES_SESSION_CHAT_ID` — the chat; required, because `--to telegram` alone
   means the profile's *home* channel, which is somebody else's chat
 - `HERMES_SESSION_THREAD_ID` — the thread, when the platform has one
@@ -107,7 +113,7 @@ List what your profile can actually reach:
 
 ```bash
 hermes send --list
-hermes send --list telegram
+hermes send --list slack
 ```
 
 ## Test delivery before you trust it
@@ -118,7 +124,7 @@ works first, in the same scrubbed shape the owner will use:
 ```bash
 env -i \
   HOME="$HOME" PATH="/usr/local/bin:/usr/bin:/bin" HERMES_HOME="$HOME/.hermes" \
-  "$(command -v hermes)" send --quiet --to telegram:-1001234567890:17585 \
+  "$(command -v hermes)" send --quiet --to slack:C0123ABCD:1786797000.000100 \
   "[AUTO: Conflux execution event — not user-authored] delivery test"
 echo "exit $?"
 ```

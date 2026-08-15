@@ -562,13 +562,19 @@ fn plugin_registers_through_a_namespaced_tool_and_explicit_connection_options() 
     };
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("cflx-api.sock");
+    let envelope = admitted_envelope();
+    let host_result = serde_json::json!({
+        "result": envelope.to_string(),
+        "structuredContent": envelope,
+    });
     let output = Plugin::new(dir.path(), &python)
-        .tool("conflux_cflx_enqueue")
-        .result(serde_json::Value::String(admitted_envelope().to_string()))
+        .tool("mcp__cflx__cflx_enqueue")
+        .result(serde_json::Value::String(host_result.to_string()))
         .env("CFLX_UNIX_SOCKET", &socket.display().to_string())
         .env("CFLX_AUTH_TOKEN_ENV", "CFLX_TOKEN")
-        // No thread ID: a platform without threads still has a chat.
-        .env("HERMES_SESSION_THREAD_ID", "")
+        .env("HERMES_SESSION_PLATFORM", "slack")
+        .env("HERMES_SESSION_CHAT_ID", "C0123ABCD")
+        .env("HERMES_SESSION_THREAD_ID", "1786797000.000100")
         .run();
     assert!(output.status.success(), "{}", stderr_of(&output));
 
@@ -589,12 +595,8 @@ fn plugin_registers_through_a_namespaced_tool_and_explicit_connection_options() 
     // A token is a variable *name*. The value is never accepted in argv.
     assert_eq!(argv[4], "CFLX_TOKEN", "{argv:?}");
     assert!(
-        argv.contains(&format!("{PLATFORM}:{CHAT_ID}")),
-        "a thread-less turn is still addressable: {argv:?}"
-    );
-    assert!(
-        !argv.iter().any(|item| item.contains(THREAD_ID)),
-        "and must not invent a thread: {argv:?}"
+        argv.contains(&"slack:C0123ABCD:1786797000.000100".to_string()),
+        "the real Slack channel/thread target survives host wrapping: {argv:?}"
     );
 }
 

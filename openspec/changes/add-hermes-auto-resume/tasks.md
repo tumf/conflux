@@ -5,6 +5,10 @@
 - [x] Add the optional example manifest and concise setup/security documentation covering plugin enablement, messaging-route capture, callback env scrubbing, pre-registration delivery testing, responder-owned continuation, sink readback, repository verification after notification, and explicit non-goals. Completion: a deterministic repository test asserts the documented commands, variables, marker, typed event, and opt-in packaging boundary. (verification-id: hermes-auto-resume-example) (verification: heavy integration - `cargo test --features heavy-tests --test hermes_auto_resume_example documentation_`)
 - [x] Add repository-local regression tests that run the Python reference code without external credentials or live services. The subprocess-based integration binary is feature-gated as heavy so it does not run in the default suite. Completion: all named success and fail-closed cases execute via the heavy test binary. (verification-id: hermes-auto-resume-example) (verification: heavy integration - `cargo test --features heavy-tests --test hermes_auto_resume_example`)
 
+- [x] Handle Hermes real MCP tool-result wrapper and cover it with a regression test. (verification-id: hermes-auto-resume-example) (verification: heavy integration - `cargo test --features heavy-tests --test hermes_auto_resume_example plugin_registers_through_a_namespaced_tool_and_explicit_connection_options`)
+- [x] Separate the responder observation prerequisite from the repository-owned notification contract. (verification-id: hermes-auto-resume-example) (verification: heavy integration - `cargo test --features heavy-tests --test hermes_auto_resume_example documentation_covers_setup_security_and_the_packaging_boundary`)
+- [x] Cover a Slack channel/thread target and include the complete owner execution binding in the message. (verification-id: hermes-auto-resume-example) (verification: heavy integration - `cargo test --features heavy-tests --test hermes_auto_resume_example`)
+
 ## Future Work
 
 Consider a reusable Hermes ingress abstraction only if a supported non-messaging surface needs the same execution callback semantics.

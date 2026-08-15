@@ -6,8 +6,8 @@ The reference integration connects two existing boundaries without changing eith
 
 1. Hermes observes a completed `cflx_enqueue` tool call and supplies the originating messaging platform, chat ID, and thread ID.
 2. The resident Conflux owner owns the execution-scoped one-shot callback.
-3. The callback sends the typed event as an assistant-authored `[AUTO: ...]` message to that fixed messaging destination through `hermes send`.
-4. A separately configured responder may classify `event: completed` as `continue_waiting` and add the concrete follow-up turn. This reference integration neither calls that responder nor directly wakes Hermes.
+3. The callback sends the typed event as a Hermes bot-authored `[AUTO: ...]` Slack message to that fixed channel/thread through `hermes send --to`; there is no separate `deliver` setting.
+4. A separately configured responder observes the Slack bot message, may classify `event: completed` as `continue_waiting`, and starts the concrete follow-up Hermes turn. This reference integration neither calls that responder nor directly runs an agent loop.
 
 The plugin owns correlation. Conflux owns terminal classification. Hermes owns messaging delivery. None of these facts becomes workflow routing state.
 
@@ -23,7 +23,7 @@ The plugin calls `cflx client notify set` directly rather than recursively calli
 - Messaging platform, chat ID, and thread ID come from Hermes request-scoped context, never from event data, and are passed as fixed argv rather than shell source.
 - Conflux replaces callback environment. The registered argv therefore names the interpreter, callback, Hermes executable, `HOME`, `PATH`, and `HERMES_HOME` explicitly. The callback reconstructs only those values before invoking `hermes send`, which reads credentials from the selected profile.
 - The callback validates all five `CFLX_*` fields and never evaluates the event file or event fields as shell input.
-- The automation message is ordinary assistant-authored messaging output. It carries the responder-compatible `[AUTO: ...]` marker plus an explicit `event: <typed-event>` line, and tells the receiving thread to verify current repository evidence rather than obey event contents.
+- The automation message is an ordinary Hermes bot-authored Slack post, not an agent-loop response and not a synthetic user turn. It carries the responder-compatible `[AUTO: ...]` marker plus an explicit `event: <typed-event>` line, and tells the continuation turn to verify current repository evidence rather than obey event contents.
 
 ## Delivery semantics
 
