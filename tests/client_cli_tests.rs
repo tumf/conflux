@@ -161,6 +161,7 @@ fn client_notify_help_and_usage_documents_an_argv_callback_and_execution_scope()
 fn client_notify_help_and_usage_rejects_a_malformed_invocation_before_any_request() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let execution = "a".repeat(32);
+    let oversized_execution = "a".repeat(129);
     let cases: Vec<(Vec<&str>, &str, &str)> = vec![
         (
             vec!["notify", "set", "alpha", &execution, "--json", "--"],
@@ -194,6 +195,16 @@ fn client_notify_help_and_usage_rejects_a_malformed_invocation_before_any_reques
             vec!["notify", "clear", "alpha", "has space", "--json"],
             "notify_clear",
             "an execution ID with a separator in it",
+        ),
+        (
+            vec!["notify", "get", "alpha", ".reserved", "--json"],
+            "notify_get",
+            "an execution ID starting with a reserved character",
+        ),
+        (
+            vec!["notify", "get", "alpha", &oversized_execution, "--json"],
+            "notify_get",
+            "an oversized execution ID",
         ),
         (
             vec![
@@ -339,6 +350,18 @@ mod feature_disabled {
             vec!["client", "status", "--json"],
             vec!["client", "enqueue", "alpha", "--json"],
             vec!["client", "wait", "alpha", "--json"],
+            vec![
+                "client",
+                "notify",
+                "set",
+                "alpha",
+                "execution",
+                "--json",
+                "--",
+                "/bin/true",
+            ],
+            vec!["client", "notify", "get", "alpha", "execution", "--json"],
+            vec!["client", "notify", "clear", "alpha", "execution", "--json"],
         ] {
             let output = run_cli(tmp.path(), &action, &[]);
             let stdout = stdout_of(&output);

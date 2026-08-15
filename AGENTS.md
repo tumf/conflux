@@ -27,7 +27,7 @@ contend for the lock with the process you meant to talk to.
 
 ```bash
 cflx client status --json                 # read the owner; mutates nothing
-cflx client enqueue add-my-change --json  # ask the owner to admit one change
+EXEC=$(cflx client enqueue add-my-change --json | jq -r '.execution_id')
 cflx client wait add-my-change --timeout 45m --json
 cflx client notify set add-my-change "$EXEC" --json -- /absolute/callback --flag v
 cflx client notify get add-my-change "$EXEC" --json
