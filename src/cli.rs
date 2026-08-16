@@ -1013,11 +1013,31 @@ EXAMPLES:
   cflx client --unix-socket /tmp/cflx-api.sock status"
 )]
 pub struct ClientArgs {
+    /// Absolute directory inside the project whose owner to talk to
+    ///
+    /// The normal explicit route. Conflux resolves the directory's Git working
+    /// tree, then uses that project's canonical repository root as completion
+    /// evidence and `<git-common-dir>/cflx-api.sock` as the owner socket — so
+    /// one client invocation can name any project without knowing where its
+    /// socket lives. A linked worktree, a submodule, or a directory below the
+    /// working-tree root all resolve. Conflicts with `--unix-socket`.
+    #[arg(
+        long,
+        value_name = "ABSOLUTE_PATH",
+        global = true,
+        conflicts_with = "unix_socket"
+    )]
+    pub project_dir: Option<PathBuf>,
+
     /// Path to the owner's `/api/v2` Unix socket
     ///
-    /// Overrides the default `${GIT_COMMON_DIR}/cflx-api.sock`. Required when
-    /// the working directory is not inside a Git repository, because there is
-    /// no repository identity to derive a default from.
+    /// The low-level override, for diagnostics, tests, and transports that are
+    /// not a repository. Overrides the default
+    /// `${GIT_COMMON_DIR}/cflx-api.sock`. Prefer `--project-dir`, which names
+    /// the stable identity of the work rather than one owner incarnation's
+    /// transport. Required when the working directory is not inside a Git
+    /// repository and no `--project-dir` is given, because there is no
+    /// repository identity to derive a default from.
     #[arg(long, value_name = "PATH", global = true)]
     pub unix_socket: Option<PathBuf>,
 

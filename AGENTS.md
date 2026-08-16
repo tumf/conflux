@@ -33,14 +33,25 @@ cflx client notify set add-my-change "$EXEC" --json -- /absolute/callback --flag
 cflx client notify get add-my-change "$EXEC" --json
 cflx client notify clear add-my-change "$EXEC" --json
 cflx client mcp                           # serve the same intents over stdio MCP
+
+# Another project, from anywhere: name the project, not its socket.
+cflx client --project-dir /absolute/path/to/repo status --json
 ```
 
 Four verbs, and only four: `status`, `enqueue`, `wait`, and the `notify` group,
 plus `mcp` for hosts that speak the protocol instead. Connection options belong
-to the namespace: `--unix-socket PATH` overrides the default
-`${GIT_COMMON_DIR}/cflx-api.sock`, and `--auth-token-env NAME` names an
-environment variable holding the bearer token — a token value is never accepted
-in argv and never printed.
+to the namespace. `--project-dir ABSOLUTE_PATH` is the normal explicit route:
+it names any directory inside the project's Git working tree — the root, a
+subdirectory, a linked worktree, a submodule — and Conflux derives *both* the
+owner socket (`<git-common-dir>/cflx-api.sock`) and the repository that
+certifies completion from that one project, so `wait` can never pair one
+project's owner with another project's evidence. `--unix-socket PATH` is the
+low-level override for diagnostics, tests, and owners that are not reachable
+through a repository; it overrides the same default. The two conflict at parse
+time, and `--auth-token-env NAME` names an environment variable holding the
+bearer token — a token value is never accepted in argv and never printed. With
+neither route option, the current working directory's repository is used,
+exactly as before.
 
 **It is intent-based on purpose.** The CLI reads authoritative capabilities,
 instance identity, state, execution status, and per-change action eligibility,
@@ -63,8 +74,9 @@ its own stable exit status. Success is narrow: `observed`, `admitted`,
 **Prerequisites.** An owner has to be running and command-capable. A headless
 `cflx run` serves every read resource but binds no command executor, so
 `enqueue` against it returns `owner_not_command_capable` rather than queueing for
-later; `status` and `wait` still work there. `wait` must run inside the owner's
-Git repository, because it certifies completion from repository evidence.
+later; `status` and `wait` still work there. `wait` needs the owner's Git
+repository, because it certifies completion from repository evidence: run it
+inside that repository, or name the repository with `--project-dir`.
 
 **`enqueue` admits; it does not complete.** A successful enqueue proves the owner
 accepted the intent, nothing more. `wait` is the observation-only counterpart: it
@@ -82,7 +94,26 @@ commands do not cover; prefer `cflx client` for delegation.
 
 `cflx client mcp` serves the same boundary to an MCP host over stdio, as six
 closed tools: `cflx_status`, `cflx_enqueue`, `cflx_wait`, and `cflx_notify_set` /
-`_get` / `_clear`. It is the alternative for a host that speaks the protocol
+`_get` / `_clear`. Every one of them accepts an optional absolute `project_dir`
+— the normal per-call selector — and an optional `unix_socket` low-level
+override, so **register the server once, globally, with no route option at all**
+and let each call name its project:
+
+```json
+{"name": "cflx_enqueue",
+ "arguments": {"change_id": "add-my-change", "project_dir": "/absolute/path/to/repo"}}
+```
+
+One server process drives any number of projects that way, and nothing is
+remembered between calls: a call-scoped selector shadows the namespace default
+rather than writing to it, so two concurrent calls cannot move each other's
+route. `project_dir` and `unix_socket` in the *same* call are refused through
+the normal MCP validation error before any owner is contacted — no new envelope
+outcome — and so is a relative path, a bare repository, or a directory that is
+not a usable Git working tree. `cflx_wait` certifies completion from the
+selected project's repository only, never from the server process's own.
+
+It is the alternative for a host that speaks the protocol
 rather than a shell, and it calls exactly the modules the commands do. It is
 still a client — no lock, no listener, no run — and it exposes no raw command
 construction, so a model cannot name a command type, an expected revision, an
@@ -105,6 +136,11 @@ EXEC=$(cflx client enqueue add-my-change --json | jq -r .execution_id)
 cflx client notify set add-my-change "$EXEC" --json -- /absolute/callback --flag v
 cflx client notify get add-my-change "$EXEC" --json
 cflx client notify clear add-my-change "$EXEC" --json
+
+# The same four against another project, routed by directory rather than socket:
+P=/absolute/path/to/repo
+EXEC=$(cflx client --project-dir "$P" enqueue add-my-change --json | jq -r .execution_id)
+cflx client --project-dir "$P" notify set add-my-change "$EXEC" --json -- /absolute/callback
 ```
 
 Each operation names an *admitted execution episode*, not a change: pass the
@@ -187,6 +223,14 @@ is framed as a session. A completion sink answers "did *this admitted execution*
 finish", is proven from repository evidence rather than presentation, and fires
 once — so it needs no long-lived child, no stream framing, and no reconnection.
 Configuring or delivering either never requires the other.
+
+`examples/integrations/hermes-auto-resume/` wires this into Hermes: its
+`post_tool_call` hook preserves the qualifying enqueue call's own `project_dir`
+(or its low-level `unix_socket`) and registers through
+`cflx client --project-dir … notify set`, so one gateway process can serve
+several projects. A call that named no route at all fails closed rather than
+guessing from `CFLX_UNIX_SOCKET`, which remains a compatibility fallback only
+for hosts that expose no tool arguments at all.
 
 `examples/integrations/opencode-auto-resume/` wires this into OpenCode. Its
 generated messages are ordinary OpenCode `role=user` messages — there is no

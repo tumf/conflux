@@ -37,6 +37,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
+use crate::client::RouteSelector;
 
 /// The MCP revision this adapter implements.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -71,8 +72,15 @@ pub const TOOL_NAMES: [&str; 6] = [
 /// A token *value* is deliberately absent: the field names an environment
 /// variable, so nothing that can read this process's arguments — or the model's
 /// own transcript — ever sees a credential.
+///
+/// `project_dir` is the normal public selector and `unix_socket` the low-level
+/// override. Both are optional, and both are call-scoped: nothing a call
+/// supplies is remembered, so one server process can serve several projects
+/// without holding a project-to-socket map that could go stale between turns.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ConnectionArgs {
+    #[serde(default)]
+    project_dir: Option<PathBuf>,
     #[serde(default)]
     unix_socket: Option<PathBuf>,
     #[serde(default)]
@@ -169,18 +177,45 @@ pub trait ToolHost: Send + Sync {
 /// The production host: every call goes through the same client modules the CLI
 /// uses, so a tool and a command cannot disagree about routing or truthfulness.
 pub struct ClientToolHost {
-    default_socket: Option<PathBuf>,
+    default_route: RouteSelector,
     default_token_env: Option<String>,
 }
 
 impl ClientToolHost {
     /// Build a host whose per-call connection settings default to the ones the
     /// `cflx client` namespace was invoked with.
-    pub fn new(default_socket: Option<PathBuf>, default_token_env: Option<String>) -> Self {
+    pub fn new(default_route: RouteSelector, default_token_env: Option<String>) -> Self {
         Self {
-            default_socket,
+            default_route,
             default_token_env,
         }
+    }
+
+    /// Decide this call's route, or refuse it before any owner is contacted.
+    ///
+    /// A [`ToolError`] rather than an envelope on purpose. The two refusals
+    /// this can produce — two selectors in one call, and a path that is not a
+    /// usable Git working tree — are complaints about the *arguments*, and no
+    /// socket was opened for either. Reporting them as a client outcome would
+    /// claim an owner conversation that never happened, and adding a new
+    /// envelope outcome for them would put a validation failure into the stable
+    /// result contract.
+    ///
+    /// The call-scoped selector shadows [`Self::default_route`] rather than
+    /// replacing it, so a namespace default survives a call that overrode it.
+    fn route(&self, args: &ConnectionArgs) -> Result<RouteSelector, ToolError> {
+        let selector =
+            RouteSelector::from_inputs(args.project_dir.as_deref(), args.unix_socket.as_deref())
+                .map_err(|error| ToolError::new(error.message))?;
+        let selector = selector.or_default(&self.default_route);
+        // Resolved eagerly so an unusable project is a bounded validation
+        // failure here, before contact, rather than a connection refusal that
+        // reads as though an owner answered.
+        if let RouteSelector::Project(project_dir) = &selector {
+            crate::client::resolve_project(project_dir)
+                .map_err(|error| ToolError::new(error.message))?;
+        }
+        Ok(selector)
     }
 
     /// Resolve a connection, or return the refusal envelope to answer with.
@@ -190,18 +225,15 @@ impl ClientToolHost {
     /// failure's footprint.
     fn connect(
         &self,
+        route: &RouteSelector,
         args: &ConnectionArgs,
         operation: Operation,
     ) -> Result<crate::client::session::Connection, Box<ResultEnvelope>> {
-        let socket = args
-            .unix_socket
-            .clone()
-            .or_else(|| self.default_socket.clone());
         let token_env = args
             .auth_token_env
             .clone()
             .or_else(|| self.default_token_env.clone());
-        crate::client::session::Connection::resolve(socket.as_deref(), token_env.as_deref())
+        crate::client::session::Connection::resolve_route(route, token_env.as_deref())
             .map_err(|refusal| Box::new(refusal.into_envelope(operation)))
     }
 }
@@ -216,7 +248,8 @@ impl ToolHost for ClientToolHost {
         match name {
             "cflx_status" => {
                 let args: StatusArgs = parse_args(arguments)?;
-                let connection = match self.connect(&args.connection, Operation::Status) {
+                let route = self.route(&args.connection)?;
+                let connection = match self.connect(&route, &args.connection, Operation::Status) {
                     Ok(connection) => connection,
                     Err(envelope) => return Ok(*envelope),
                 };
@@ -225,7 +258,8 @@ impl ToolHost for ClientToolHost {
             "cflx_enqueue" => {
                 let args: EnqueueArgs = parse_args(arguments)?;
                 let change_id = validated_change_id(&args.change_id)?;
-                let connection = match self.connect(&args.connection, Operation::Enqueue) {
+                let route = self.route(&args.connection)?;
+                let connection = match self.connect(&route, &args.connection, Operation::Enqueue) {
                     Ok(connection) => connection,
                     Err(envelope) => return Ok((*envelope).with_change(change_id)),
                 };
@@ -240,7 +274,8 @@ impl ToolHost for ClientToolHost {
                     }
                     None => DEFAULT_WAIT_TIMEOUT,
                 };
-                let connection = match self.connect(&args.connection, Operation::Wait) {
+                let route = self.route(&args.connection)?;
+                let connection = match self.connect(&route, &args.connection, Operation::Wait) {
                     Ok(connection) => connection,
                     Err(envelope) => return Ok((*envelope).with_change(change_id)),
                 };
@@ -249,7 +284,9 @@ impl ToolHost for ClientToolHost {
             "cflx_notify_set" => {
                 let args: NotifySetArgs = parse_args(arguments)?;
                 let change_id = validated_change_id(&args.change_id)?;
-                let connection = match self.connect(&args.connection, Operation::NotifySet) {
+                let route = self.route(&args.connection)?;
+                let connection = match self.connect(&route, &args.connection, Operation::NotifySet)
+                {
                     Ok(connection) => connection,
                     Err(envelope) => return Ok((*envelope).with_change(change_id)),
                 };
@@ -273,7 +310,8 @@ impl ToolHost for ClientToolHost {
                 } else {
                     (Operation::NotifyClear, crate::client::notify::Intent::Clear)
                 };
-                let connection = match self.connect(&args.connection, operation) {
+                let route = self.route(&args.connection)?;
+                let connection = match self.connect(&route, &args.connection, operation) {
                     Ok(connection) => connection,
                     Err(envelope) => return Ok((*envelope).with_change(change_id)),
                 };
@@ -324,9 +362,13 @@ fn validated_change_id(value: &str) -> Result<String, ToolError> {
 /// The published `tools/list` payload.
 pub fn tool_descriptors() -> serde_json::Value {
     let connection_properties = serde_json::json!({
+        "project_dir": {
+            "type": "string",
+            "description": "Absolute directory inside the project whose owner to talk to. The normal selector: it names the project rather than one owner incarnation's transport, so a single server process can serve several projects by passing a different directory per call. A linked worktree, a submodule, or any directory below the working-tree root resolves. The owner socket and the repository that certifies completion both come from this project. Mutually exclusive with unix_socket in one call."
+        },
         "unix_socket": {
             "type": "string",
-            "description": "Path to the owner's /api/v2 Unix socket. Defaults to ${GIT_COMMON_DIR}/cflx-api.sock."
+            "description": "Low-level override: path to the owner's /api/v2 Unix socket, for diagnostics, tests, and non-repository transports. Prefer project_dir. Defaults to ${GIT_COMMON_DIR}/cflx-api.sock. Mutually exclusive with project_dir in one call."
         },
         "auth_token_env": {
             "type": "string",
@@ -373,7 +415,7 @@ pub fn tool_descriptors() -> serde_json::Value {
             {
                 "name": "cflx_wait",
                 "title": "Observe one change until verified completion",
-                "description": "Observe one change until current repository evidence proves the owner's terminal mode, a typed failure settles, or the bounded timeout passes. Submits no command. A change disappearing from the owner's snapshot is never completion.",
+                "description": "Observe one change until current repository evidence proves the owner's terminal mode, a typed failure settles, or the bounded timeout passes. Submits no command. A change disappearing from the owner's snapshot is never completion. The evidence is read from the selected project's repository, never from this server's own working directory.",
                 "inputSchema": {
                     "type": "object",
                     "properties": with_connection(serde_json::json!({
@@ -827,9 +869,9 @@ where
 }
 
 /// Run `cflx client mcp` over the process's own stdio.
-pub async fn run(default_socket: Option<PathBuf>, default_token_env: Option<String>) -> i32 {
+pub async fn run(default_route: RouteSelector, default_token_env: Option<String>) -> i32 {
     serve(
-        ClientToolHost::new(default_socket, default_token_env),
+        ClientToolHost::new(default_route, default_token_env),
         tokio::io::stdin(),
         tokio::io::stdout(),
     )

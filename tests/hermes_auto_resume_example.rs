@@ -179,8 +179,13 @@ fn admitted_envelope() -> serde_json::Value {
 }
 
 /// The owner socket the default fixture's call names.
-fn owner_socket(dir: &Path) -> String {
-    dir.join("cflx-api.sock").display().to_string()
+/// The absolute project directory a call names when it routes the normal way.
+///
+/// A directory rather than a socket path: the plugin passes it straight to
+/// `cflx client --project-dir`, which is what resolves the Git working tree, so
+/// nothing in the plugin needs the fixture to be a repository.
+fn owner_project(dir: &Path) -> String {
+    dir.join("project").display().to_string()
 }
 
 fn stderr_of(output: &Output) -> String {
@@ -251,11 +256,12 @@ struct Call {
 }
 
 impl Call {
-    /// A qualifying enqueue for one owner, naming that owner in its arguments.
-    fn enqueue(change_id: &str, execution_id: &str, instance_id: &str, socket: &str) -> Self {
+    /// A qualifying enqueue routed the normal way: by the project directory the
+    /// call itself named.
+    fn enqueue(change_id: &str, execution_id: &str, instance_id: &str, project: &str) -> Self {
         Self {
             tool_name: "cflx_enqueue".to_string(),
-            args: serde_json::json!({"change_id": change_id, "unix_socket": socket}),
+            args: serde_json::json!({"change_id": change_id, "project_dir": project}),
             result: admitted_envelope_for(change_id, execution_id, instance_id),
         }
     }
@@ -293,7 +299,7 @@ impl<'a> Plugin<'a> {
         Self {
             dir,
             python,
-            calls: vec![Call::enqueue("alpha", "exec-a", "i-1", &owner_socket(dir))],
+            calls: vec![Call::enqueue("alpha", "exec-a", "i-1", &owner_project(dir))],
             env: vec![
                 ("CFLX_BIN", dir.join("cflx").display().to_string()),
                 ("CFLX_HERMES_BIN", hermes.display().to_string()),
@@ -399,15 +405,28 @@ fn registrations(dir: &Path) -> Vec<Invocation> {
     invocations(&dir.join("cflx.record"))
 }
 
-/// The owner socket one recorded registration was sent to.
-fn socket_argument(argv: &[String]) -> &str {
+/// The route one recorded registration was sent through: the option, and its
+/// value.
+///
+/// Returned as a pair rather than as a bare path because *which* option was
+/// used is half the contract: a project-routed call that arrived as
+/// `--unix-socket` would still reach an owner, and would still be wrong.
+fn route_argument(argv: &[String]) -> (&str, &str) {
     let index = argv
         .iter()
-        .position(|item| item == "--unix-socket")
+        .position(|item| item == "--project-dir" || item == "--unix-socket")
         .unwrap_or_else(|| panic!("every registration must name its owner: {argv:?}"));
-    argv.get(index + 1)
+    assert!(
+        !argv[index + 1..]
+            .iter()
+            .any(|item| item == "--project-dir" || item == "--unix-socket"),
+        "exactly one route option may be emitted: {argv:?}"
+    );
+    let value = argv
+        .get(index + 1)
         .map(String::as_str)
-        .unwrap_or_else(|| panic!("--unix-socket must carry a value: {argv:?}"))
+        .unwrap_or_else(|| panic!("{} must carry a value: {argv:?}", argv[index]));
+    (argv[index].as_str(), value)
 }
 
 /// What the fake `hermes` was asked to do.
@@ -585,8 +604,8 @@ fn plugin_registers_one_callback_for_an_admitted_enqueue() {
         argv[..separator],
         [
             "client",
-            "--unix-socket",
-            &owner_socket(dir.path()),
+            "--project-dir",
+            &owner_project(dir.path()),
             "notify",
             "set",
             "alpha",
@@ -657,9 +676,9 @@ fn plugin_registers_through_a_namespaced_tool_and_explicit_connection_options() 
     });
     let output = Plugin::new(dir.path(), &python)
         .tool("mcp__cflx__cflx_enqueue")
-        // A host that exposes no call-scoped socket: the compatibility
+        // A host that exposes no arguments object at all: the compatibility
         // fallback is what has to supply the owner here.
-        .args(serde_json::json!({"change_id": "alpha"}))
+        .args(serde_json::Value::Null)
         .result(serde_json::Value::String(host_result.to_string()))
         .env("CFLX_UNIX_SOCKET", &socket.display().to_string())
         .env("CFLX_AUTH_TOKEN_ENV", "CFLX_TOKEN")
@@ -683,6 +702,7 @@ fn plugin_registers_through_a_namespaced_tool_and_explicit_connection_options() 
         .map(str::to_string),
         "connection options belong to the namespace, before the verb: {argv:?}"
     );
+    assert_eq!(route_argument(argv).0, "--unix-socket", "{argv:?}");
     // A token is a variable *name*. The value is never accepted in argv.
     assert_eq!(argv[4], "CFLX_TOKEN", "{argv:?}");
     assert!(
@@ -692,51 +712,51 @@ fn plugin_registers_through_a_namespaced_tool_and_explicit_connection_options() 
 }
 
 /// The reason `args` is read at all: one Hermes process, two Conflux projects,
-/// two owners. Each registration goes to the owner its own call named, and
+/// two owners. Each registration goes to the project its own call named, and
 /// neither call can move the other — there is no remembered route to move.
 #[test]
-fn plugin_routes_registration_by_call_scoped_socket() {
-    let Some(python) = skip_without_python("plugin_routes_registration_by_call_scoped_socket")
+fn plugin_routes_registration_by_call_scoped_project() {
+    let Some(python) = skip_without_python("plugin_routes_registration_by_call_scoped_project")
     else {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let socket_a = dir.path().join("project-a.sock").display().to_string();
-    let socket_b = dir.path().join("project-b.sock").display().to_string();
-    // A third socket in the environment, so a registration that read the
+    let project_a = dir.path().join("project-a").display().to_string();
+    let project_b = dir.path().join("project-b").display().to_string();
+    // A socket in the environment, so a registration that read the
     // process-global mirror instead of the call is visible as *this* value
     // rather than as either project's.
     let elsewhere = dir.path().join("elsewhere.sock").display().to_string();
 
     let output = Plugin::new(dir.path(), &python)
         .env("CFLX_UNIX_SOCKET", &elsewhere)
-        .args(serde_json::json!({"change_id": "alpha", "unix_socket": socket_a}))
-        .then(Call::enqueue("beta", "exec-b", "i-2", &socket_b).tool("mcp__cflx__cflx_enqueue"))
+        .args(serde_json::json!({"change_id": "alpha", "project_dir": project_a}))
+        .then(Call::enqueue("beta", "exec-b", "i-2", &project_b).tool("mcp__cflx__cflx_enqueue"))
         .run();
     assert!(output.status.success(), "{}", stderr_of(&output));
 
     let calls = registrations(dir.path());
     assert_eq!(calls.len(), 2, "one registration per call: {calls:?}");
-    for (index, (socket, change, execution, instance, other)) in [
-        (&socket_a, "alpha", "exec-a", "i-1", &socket_b),
-        (&socket_b, "beta", "exec-b", "i-2", &socket_a),
+    for (index, (project, change, execution, instance, other)) in [
+        (&project_a, "alpha", "exec-a", "i-1", &project_b),
+        (&project_b, "beta", "exec-b", "i-2", &project_a),
     ]
     .into_iter()
     .enumerate()
     {
         let argv = &calls[index].argv;
         assert_eq!(
-            socket_argument(argv),
-            socket,
-            "call {index} must reach its own owner: {argv:?}"
+            route_argument(argv),
+            ("--project-dir", project.as_str()),
+            "call {index} must reach its own project: {argv:?}"
         );
         let separator = argv.iter().position(|item| item == "--").expect("a `--`");
         assert_eq!(
             argv[..separator],
             [
                 "client",
-                "--unix-socket",
-                socket,
+                "--project-dir",
+                project,
                 "notify",
                 "set",
                 change,
@@ -746,7 +766,7 @@ fn plugin_routes_registration_by_call_scoped_socket() {
                 "--json"
             ]
             .map(str::to_string),
-            "the binding travels with the socket it was admitted by: {argv:?}"
+            "the binding travels with the project it was admitted through: {argv:?}"
         );
         assert!(
             !argv.iter().any(|item| item == other || item == &elsewhere),
@@ -755,28 +775,60 @@ fn plugin_routes_registration_by_call_scoped_socket() {
     }
 }
 
-/// The call-scoped socket is authoritative, not merely preferred: a process
-/// configured for one project registers project B's callback with project B.
+/// The low-level override survives: a call that selected `unix_socket` — and
+/// only `unix_socket` — is registered through `--unix-socket`, not translated
+/// into a project this plugin would have to invent.
 #[test]
-fn plugin_prefers_the_call_scoped_socket_over_the_environment() {
-    let Some(python) =
-        skip_without_python("plugin_prefers_the_call_scoped_socket_over_the_environment")
-    else {
+fn plugin_preserves_the_low_level_socket_route() {
+    let Some(python) = skip_without_python("plugin_preserves_the_low_level_socket_route") else {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let configured = dir.path().join("configured.sock").display().to_string();
-    let called = dir.path().join("called.sock").display().to_string();
-
+    let socket = dir
+        .path()
+        .join("diagnostic-owner.sock")
+        .display()
+        .to_string();
     let output = Plugin::new(dir.path(), &python)
-        .env("CFLX_UNIX_SOCKET", &configured)
-        .args(serde_json::json!({"change_id": "alpha", "unix_socket": called}))
+        .args(serde_json::json!({"change_id": "alpha", "unix_socket": socket}))
         .run();
     assert!(output.status.success(), "{}", stderr_of(&output));
 
     let calls = registrations(dir.path());
     assert_eq!(calls.len(), 1, "{calls:?}");
-    assert_eq!(socket_argument(&calls[0].argv), called);
+    assert_eq!(
+        route_argument(&calls[0].argv),
+        ("--unix-socket", socket.as_str()),
+        "{:?}",
+        calls[0].argv
+    );
+}
+
+/// The call-scoped project is authoritative, not merely preferred: a process
+/// configured for one owner registers project B's callback with project B.
+#[test]
+fn plugin_prefers_the_call_scoped_project_over_the_environment() {
+    let Some(python) =
+        skip_without_python("plugin_prefers_the_call_scoped_project_over_the_environment")
+    else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let configured = dir.path().join("configured.sock").display().to_string();
+    let called = dir.path().join("project-b").display().to_string();
+
+    let output = Plugin::new(dir.path(), &python)
+        .env("CFLX_UNIX_SOCKET", &configured)
+        .args(serde_json::json!({"change_id": "alpha", "project_dir": called}))
+        .run();
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let calls = registrations(dir.path());
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(
+        route_argument(&calls[0].argv),
+        ("--project-dir", called.as_str())
+    );
     assert!(
         !calls[0].argv.iter().any(|item| item == &configured),
         "the configured owner must not be contacted at all: {:?}",
@@ -784,9 +836,9 @@ fn plugin_prefers_the_call_scoped_socket_over_the_environment() {
     );
 }
 
-/// A host that exposes no call-scoped socket keeps working: `CFLX_UNIX_SOCKET`
-/// remains a compatibility fallback, in every shape "no socket was named" can
-/// arrive in.
+/// A legacy host that exposes no arguments object at all keeps working:
+/// `CFLX_UNIX_SOCKET` remains a compatibility fallback for exactly that case,
+/// in every shape "there is no arguments object" can arrive in.
 #[test]
 fn plugin_falls_back_to_the_environment_socket_for_a_host_without_call_arguments() {
     let Some(python) = skip_without_python(
@@ -797,20 +849,12 @@ fn plugin_falls_back_to_the_environment_socket_for_a_host_without_call_arguments
     for (label, args) in [
         ("no arguments at all", serde_json::Value::Null),
         (
-            "no socket among them",
-            serde_json::json!({"change_id": "alpha"}),
-        ),
-        (
-            "an explicitly absent socket",
-            serde_json::json!({"change_id": "alpha", "unix_socket": null}),
-        ),
-        (
-            "arguments as a JSON string",
-            serde_json::Value::String("{\"change_id\": \"alpha\"}".to_string()),
-        ),
-        (
             "a shape this code cannot read",
             serde_json::json!(["change_id", "alpha"]),
+        ),
+        (
+            "text that is not JSON at all",
+            serde_json::Value::String("change_id=alpha".to_string()),
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -822,28 +866,73 @@ fn plugin_falls_back_to_the_environment_socket_for_a_host_without_call_arguments
         assert!(output.status.success(), "{label}: {}", stderr_of(&output));
         let calls = registrations(dir.path());
         assert_eq!(calls.len(), 1, "{label}: {calls:?}");
-        assert_eq!(socket_argument(&calls[0].argv), fallback, "{label}");
+        assert_eq!(
+            route_argument(&calls[0].argv),
+            ("--unix-socket", fallback.as_str()),
+            "{label}"
+        );
     }
 }
 
-/// No route, no registration. A call that names a socket this plugin cannot use
-/// is never quietly sent to the configured owner instead: that is the
-/// cross-project misroute the call-scoped value exists to prevent.
+/// No route, no registration. A call whose route this plugin cannot use is
+/// never quietly sent to the configured owner instead: that is the
+/// cross-project misroute the call-scoped selector exists to prevent. The
+/// arguments being *present* is what makes the environment unusable here — a
+/// host that exposes them has told us this call chose a route, and a call that
+/// chose the MCP server's own default chose one this process cannot see.
 #[test]
-fn plugin_registers_nothing_without_a_usable_owner_socket() {
-    let Some(python) =
-        skip_without_python("plugin_registers_nothing_without_a_usable_owner_socket")
+fn plugin_registers_nothing_without_a_usable_owner_route() {
+    let Some(python) = skip_without_python("plugin_registers_nothing_without_a_usable_owner_route")
     else {
         return;
     };
     let configured = "/nonexistent/configured.sock";
     for (label, args, fallback) in [
         (
-            "neither a call socket nor a fallback",
+            "arguments naming no route, with a fallback available",
             serde_json::json!({"change_id": "alpha"}),
-            "",
+            configured,
+        ),
+        (
+            "an explicitly absent project and socket",
+            serde_json::json!({"change_id": "alpha", "project_dir": null, "unix_socket": null}),
+            configured,
+        ),
+        (
+            "arguments as a JSON string naming no route",
+            serde_json::Value::String("{\"change_id\": \"alpha\"}".to_string()),
+            configured,
+        ),
+        (
+            "both selectors in one call",
+            serde_json::json!({
+                "change_id": "alpha",
+                "project_dir": "/srv/project-b",
+                "unix_socket": "/tmp/project-a.sock"
+            }),
+            configured,
         ),
         ("no arguments and no fallback", serde_json::Value::Null, ""),
+        (
+            "a project that is not a string",
+            serde_json::json!({"change_id": "alpha", "project_dir": 7}),
+            configured,
+        ),
+        (
+            "an empty project",
+            serde_json::json!({"change_id": "alpha", "project_dir": ""}),
+            configured,
+        ),
+        (
+            "a relative project",
+            serde_json::json!({"change_id": "alpha", "project_dir": "project"}),
+            configured,
+        ),
+        (
+            "a project carrying a newline",
+            serde_json::json!({"change_id": "alpha", "project_dir": "/srv/pro\nject"}),
+            configured,
+        ),
         (
             "a socket that is not a string",
             serde_json::json!({"change_id": "alpha", "unix_socket": 7}),
@@ -871,7 +960,7 @@ fn plugin_registers_nothing_without_a_usable_owner_socket() {
         ),
         (
             "a relative fallback",
-            serde_json::json!({"change_id": "alpha"}),
+            serde_json::Value::Null,
             "cflx-api.sock",
         ),
     ] {
@@ -1667,25 +1756,33 @@ fn documentation_covers_setup_security_and_the_packaging_boundary() {
 }
 
 /// Per-call project routing is a setup instruction, not just a code path: an
-/// operator who pins the MCP server to one socket gets exactly the misroute
+/// operator who pins the MCP server to one project gets exactly the misroute
 /// this change removed, so the README has to say not to.
 #[test]
-fn documentation_describes_call_scoped_socket_routing() {
+fn documentation_describes_project_scoped_routing() {
     let readme = std::fs::read_to_string(example_root().join("README.md"))
         .expect("the example must ship a README");
 
-    // Registering the server without a project in it, and naming the owner per
-    // call instead.
+    // Registering the server without a project in it, and naming the project
+    // per call instead.
     for needle in [
         "cflx client mcp",
-        "unix_socket",
+        "project_dir",
         "call-scoped",
-        "cflx client --unix-socket",
-        "rev-parse --git-common-dir",
+        "cflx client --project-dir",
+        "absolute",
     ] {
         assert!(
             readme.contains(needle),
             "the README must document `{needle}`"
+        );
+    }
+
+    // The low-level override is still documented as such, not erased.
+    for needle in ["unix_socket", "--unix-socket", "low-level"] {
+        assert!(
+            readme.contains(needle),
+            "the README must still document the low-level override `{needle}`"
         );
     }
 
@@ -1697,10 +1794,11 @@ fn documentation_describes_call_scoped_socket_routing() {
         );
     }
 
-    // And it must not hand the operator the pinned registration back.
+    // And it must not hand the operator a project-pinned registration back.
     for forbidden in [
         "cflx client mcp --unix-socket",
         "cflx client --unix-socket PATH mcp",
+        "cflx client --project-dir PATH mcp",
     ] {
         assert!(
             !readme.contains(forbidden),
@@ -1711,7 +1809,7 @@ fn documentation_describes_call_scoped_socket_routing() {
     // The routing the README describes is the routing the code implements.
     let plugin = std::fs::read_to_string(example_root().join("__init__.py")).unwrap();
     assert!(
-        plugin.contains("resolve_owner_socket(args, config[\"unix_socket\"])"),
+        plugin.contains("resolve_owner_route(") && plugin.contains("ROUTE_OPTIONS["),
         "the hook must resolve the route from the call's own arguments"
     );
     assert!(
@@ -1719,10 +1817,15 @@ fn documentation_describes_call_scoped_socket_routing() {
         "the hook may no longer discard the call's arguments"
     );
     let module = std::fs::read_to_string(callback_script()).unwrap();
-    assert!(
-        module.contains("CALL_SOCKET_ARGUMENT = \"unix_socket\""),
-        "the call argument the route is read from must still be `unix_socket`"
-    );
+    for needle in [
+        "CALL_PROJECT_ARGUMENT = \"project_dir\"",
+        "CALL_SOCKET_ARGUMENT = \"unix_socket\"",
+    ] {
+        assert!(
+            module.contains(needle),
+            "the call arguments the route is read from must include `{needle}`"
+        );
+    }
 }
 
 /// The packaged crate itself, asserted against `cargo` rather than against the

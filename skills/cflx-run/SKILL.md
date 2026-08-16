@@ -127,12 +127,18 @@ Execution expectations:
 Use asynchronous completion when an already-running Conflux owner owns a change that may outlive the current Hermes process:
 
 1. Admit the change and retain its complete `(instance_id, execution_id, change_id)` binding — `cflx client enqueue <change-id> --json` in a shell, or `cflx_enqueue` from an MCP host. The `execution_id` names that one admitted episode; a retry opens a different execution.
-2. Register the callback over the owner's Unix socket with that exact binding and one bounded argv:
+2. Register the callback with that exact binding and one bounded argv, against the *same project* the enqueue was admitted through:
 
 ```bash
 cflx client notify set <change-id> <execution-id> --instance-id <instance-id> --json -- \
   /absolute/callback --flag value
+
+# The same registration for a project you are not standing in:
+cflx client --project-dir <absolute-project-path> notify set <change-id> <execution-id> \
+  --instance-id <instance-id> --json -- /absolute/callback --flag value
 ```
+
+   `--project-dir` is the normal route selector: any absolute directory inside the project's Git working tree, including a linked worktree or a submodule. Conflux derives both the owner socket and the repository that certifies completion from it, so a `wait` in one project can never be answered with another project's evidence. Omit it to use the current working directory's repository; use `--unix-socket PATH` only as a low-level override for diagnostics or an owner that is not reachable through a repository. The two conflict, and supplying both is refused before the owner is contacted. From an MCP host the same selectors are the optional `project_dir` and `unix_socket` arguments every `cflx_*` tool accepts — register the server once with no route option and name the project per call.
 
    Everything after `--` is the callback argv, one element per argument exactly as typed. Do not build a shell command string: there is no `sh -c`, no quoting, and no expansion, and the owner replaces the callback's environment with exactly `CFLX_EVENT_PATH`, `CFLX_EVENT_TYPE`, `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and `CFLX_INSTANCE_ID`. Passing `--instance-id` is what turns an owner replacement into typed `owner_restarted` instead of a missing execution. `cflx client notify get` inspects the registration and `cflx client notify clear` removes it. An MCP-only host calls `cflx_notify_set` with the same binding instead.
 3. Point the callback at an already-configured durable Hermes ingress such as its gateway, webhook, or API adapter. The callback must start a new turn; it must not depend on the current Hermes process remaining alive.

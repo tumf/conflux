@@ -39,6 +39,7 @@
 pub mod envelope;
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use clap::CommandFactory;
 
@@ -62,6 +63,189 @@ mod wait;
 use envelope::{Operation, Outcome, ResultEnvelope};
 
 use crate::cli::{ClientArgs, ClientCommands, ClientNotifyCommands};
+
+// ============================================================================
+// Which owner one operation talks to
+// ============================================================================
+
+/// The route one client operation takes to an owner.
+///
+/// # Why the public selector is a directory rather than a socket
+///
+/// A socket path is an implementation detail of one owner incarnation: it lives
+/// under a Git common directory a caller has to discover, and naming it forces
+/// every agent to reimplement that derivation. The stable identity of the work
+/// is the *project* — a directory inside the repository the owner holds. So
+/// `project_dir` is the normal selector, and `unix_socket` stays as the
+/// low-level override for diagnostics, tests, and non-repository transports.
+///
+/// # Why one selector rather than two merged fields
+///
+/// A route is one decision. Modelling it as two optional fields would let a
+/// call arrive naming both, and the only honest answers to that are "refuse"
+/// or "silently prefer one" — and silently preferring one is exactly how a
+/// registration for project B reaches project A's owner. Building the selector
+/// is therefore where the conflict is caught, once, before any owner is
+/// contacted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RouteSelector {
+    /// No explicit selector: fall back to the namespace default, then to
+    /// current-working-directory repository discovery.
+    #[default]
+    Default,
+    /// An absolute directory inside the project's Git working tree.
+    Project(PathBuf),
+    /// An explicit owner `/api/v2` Unix socket.
+    Socket(PathBuf),
+}
+
+/// Why a route could not be built, stated without echoing a credential.
+///
+/// Deliberately not an [`Outcome`]: a rejected selector never reached an owner,
+/// so it is a bounded validation failure on the caller's own arguments — the
+/// existing MCP `ToolError` / CLI usage-error channel — rather than a new
+/// stable-envelope outcome describing an owner conversation that never happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteError {
+    /// Sanitized explanation. May name the rejected path; never a secret.
+    pub message: String,
+}
+
+impl RouteError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl RouteSelector {
+    /// Build one call's selector from the two optional inputs it may carry.
+    ///
+    /// Pure: it inspects the arguments and nothing else — no filesystem, no
+    /// Git, no owner. That is what lets the conflict and the relative-path
+    /// refusals happen provably *before* contact.
+    pub fn from_inputs(
+        project_dir: Option<&Path>,
+        unix_socket: Option<&Path>,
+    ) -> Result<Self, RouteError> {
+        match (project_dir, unix_socket) {
+            (Some(_), Some(_)) => Err(RouteError::new(
+                "project_dir and unix_socket select two different routes, so supplying both in \
+                 one call is ambiguous. Name the project directory, or the socket, not both",
+            )),
+            (Some(project), None) => {
+                if project.as_os_str().is_empty() {
+                    return Err(RouteError::new("project_dir is empty"));
+                }
+                if !project.is_absolute() {
+                    return Err(RouteError::new(format!(
+                        "project_dir '{}' is relative. It must be absolute: this process's \
+                         working directory has nothing to do with the project the work belongs to",
+                        project.display()
+                    )));
+                }
+                Ok(Self::Project(project.to_path_buf()))
+            }
+            (None, Some(socket)) => {
+                if socket.as_os_str().is_empty() {
+                    return Err(RouteError::new("unix_socket is empty"));
+                }
+                Ok(Self::Socket(socket.to_path_buf()))
+            }
+            (None, None) => Ok(Self::Default),
+        }
+    }
+
+    /// This selector when it names a route, otherwise the fallback.
+    ///
+    /// The precedence the contract requires: a call-scoped selector overrides a
+    /// namespace-level default, and it does so by *shadowing* it rather than by
+    /// writing to it — nothing here mutates the default, so two concurrent
+    /// calls cannot change each other's route.
+    pub fn or_default(self, fallback: &RouteSelector) -> Self {
+        match self {
+            Self::Default => fallback.clone(),
+            explicit => explicit,
+        }
+    }
+}
+
+/// One project's owner socket and the repository that proves completion.
+///
+/// Both come from the *same* selected project on purpose. A route that took the
+/// socket from one repository and the completion evidence from another would
+/// certify project A's archive as project B's success, which is the exact
+/// failure truthful `wait` exists to prevent.
+#[cfg(feature = "web-monitoring")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRoute {
+    /// `<git-common-dir>/cflx-api.sock` for the selected project.
+    pub socket: PathBuf,
+    /// The selected project's canonical working-tree root.
+    pub repo_root: PathBuf,
+}
+
+/// Resolve one absolute project directory into an owner route.
+///
+/// Read-only by construction: it stats a path, asks Git where the working tree
+/// and the common directory are, and derives a socket path. It creates nothing,
+/// starts no owner, and never infers a project from a change ID.
+///
+/// A linked worktree, a submodule, a symlinked path, and a directory below the
+/// working-tree root all resolve, because the common directory is derived the
+/// same way the repository lock derives it — and the lock is what guarantees
+/// there is only one default owner to reach.
+#[cfg(feature = "web-monitoring")]
+pub fn resolve_project(project_dir: &Path) -> Result<ProjectRoute, RouteError> {
+    if !project_dir.is_absolute() {
+        return Err(RouteError::new(format!(
+            "project_dir '{}' is relative. It must be absolute",
+            project_dir.display()
+        )));
+    }
+    let metadata = std::fs::metadata(project_dir).map_err(|error| {
+        RouteError::new(format!(
+            "project_dir '{}' could not be read: {error}",
+            project_dir.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(RouteError::new(format!(
+            "project_dir '{}' is not a directory",
+            project_dir.display()
+        )));
+    }
+    let canonical =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+
+    // Asked of Git rather than walked by hand: a bare repository and a path
+    // outside any repository both fail here, and neither may be answered with a
+    // guessed socket.
+    let repo_root = session::discover_repo_root(&canonical).ok_or_else(|| {
+        RouteError::new(format!(
+            "project_dir '{}' is not inside a usable Git working tree, so no owner socket can \
+             be derived from it",
+            project_dir.display()
+        ))
+    })?;
+    let common_dir = crate::repo_lock::discover_common_dir(&canonical).ok_or_else(|| {
+        RouteError::new(format!(
+            "the Git common directory of project_dir '{}' could not be resolved",
+            project_dir.display()
+        ))
+    })?;
+    Ok(ProjectRoute {
+        socket: crate::web::unix_socket::default_socket_path(&common_dir),
+        repo_root,
+    })
+}
 
 /// How the caller asked for output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,7 +518,20 @@ async fn execute(_args: ClientArgs, operation: Operation) -> ResultEnvelope {
 /// serve has no frame it could honestly send.
 #[cfg(feature = "web-monitoring")]
 async fn serve_mcp(args: ClientArgs) -> i32 {
-    mcp::run(args.unix_socket, args.auth_token_env).await
+    // Clap already refused the two-selector conflict, so this cannot fail for
+    // ambiguity; a relative `--project-dir` is still worth refusing before a
+    // long-lived protocol session starts advertising tools it cannot route.
+    let default_route = match RouteSelector::from_inputs(
+        args.project_dir.as_deref(),
+        args.unix_socket.as_deref(),
+    ) {
+        Ok(selector) => selector,
+        Err(error) => {
+            eprintln!("cflx client mcp: {error}");
+            return Outcome::UsageError.exit_code();
+        }
+    };
+    mcp::run(default_route, args.auth_token_env).await
 }
 
 #[cfg(not(feature = "web-monitoring"))]
@@ -348,13 +545,23 @@ async fn serve_mcp(_args: ClientArgs) -> i32 {
 
 #[cfg(feature = "web-monitoring")]
 async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
-    let connection = match session::Connection::resolve(
+    // One selector, built once, before anything is contacted. Clap enforces the
+    // mutual exclusion at parse time, so reaching here with both is impossible;
+    // the refusal below covers the remaining shape rules.
+    let selector = match RouteSelector::from_inputs(
+        args.project_dir.as_deref(),
         args.unix_socket.as_deref(),
-        args.auth_token_env.as_deref(),
     ) {
-        Ok(connection) => connection,
-        Err(refusal) => return refusal.into_envelope(operation),
+        Ok(selector) => selector,
+        Err(error) => {
+            return ResultEnvelope::new(operation, Outcome::UsageError).with_message(error.message)
+        }
     };
+    let connection =
+        match session::Connection::resolve_route(&selector, args.auth_token_env.as_deref()) {
+            Ok(connection) => connection,
+            Err(refusal) => return refusal.into_envelope(operation),
+        };
 
     match args.command {
         ClientCommands::Status(_) => session::status(&connection).await,
@@ -515,6 +722,116 @@ mod tests {
         assert!(!message.starts_with("error: "), "{message}");
         assert!(!message.contains("Usage:"), "{message}");
         assert!(!envelope.to_json_line().contains('\n'));
+    }
+
+    // ------------------------------------------------------------------
+    // Route selection
+    //
+    // Unit-scoped on purpose: every assertion below is about the *arguments*
+    // a call carried, so none of it touches Git, a filesystem repository, a
+    // socket, or an owner. That is the same boundary the contract draws —
+    // these refusals must be provable before contact — so proving them here
+    // without a repository is the honest test, not a convenience.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_call_naming_no_selector_takes_the_default_route() {
+        assert_eq!(
+            RouteSelector::from_inputs(None, None).unwrap(),
+            RouteSelector::Default
+        );
+    }
+
+    #[test]
+    fn a_project_directory_is_the_normal_selector_and_a_socket_the_override() {
+        assert_eq!(
+            RouteSelector::from_inputs(Some(Path::new("/srv/project-b")), None).unwrap(),
+            RouteSelector::Project(PathBuf::from("/srv/project-b"))
+        );
+        assert_eq!(
+            RouteSelector::from_inputs(None, Some(Path::new("/tmp/owner.sock"))).unwrap(),
+            RouteSelector::Socket(PathBuf::from("/tmp/owner.sock"))
+        );
+    }
+
+    #[test]
+    fn two_selectors_in_one_call_are_refused_rather_than_silently_ranked() {
+        // Preferring one would be the cross-project misroute the selector
+        // exists to prevent: a registration meant for the project directory
+        // would reach whatever owner the socket named.
+        let error = RouteSelector::from_inputs(
+            Some(Path::new("/srv/project-b")),
+            Some(Path::new("/tmp/project-a.sock")),
+        )
+        .expect_err("two routes in one call are ambiguous");
+        assert!(error.message.contains("project_dir"), "{error}");
+        assert!(error.message.contains("unix_socket"), "{error}");
+    }
+
+    #[test]
+    fn a_relative_or_empty_project_directory_is_refused() {
+        // This process's working directory is the Hermes gateway's, or an MCP
+        // host's — never the project's — so a relative path resolves against
+        // the wrong tree by construction.
+        for value in ["relative/project", "./project", "..", ""] {
+            let error = RouteSelector::from_inputs(Some(Path::new(value)), None)
+                .expect_err("{value} must be refused");
+            assert!(
+                error.message.contains("empty") || error.message.contains("relative"),
+                "{value}: {error}"
+            );
+        }
+        assert!(RouteSelector::from_inputs(None, Some(Path::new(""))).is_err());
+    }
+
+    #[test]
+    fn a_call_scoped_selector_overrides_the_namespace_default_without_mutating_it() {
+        let namespace = RouteSelector::Socket(PathBuf::from("/tmp/project-a.sock"));
+
+        let call = RouteSelector::from_inputs(Some(Path::new("/srv/project-b")), None)
+            .unwrap()
+            .or_default(&namespace);
+        assert_eq!(
+            call,
+            RouteSelector::Project(PathBuf::from("/srv/project-b"))
+        );
+
+        // The default is a shared value, not a cursor: the next call still sees
+        // it, which is what keeps two concurrent calls from changing each
+        // other's route.
+        let plain = RouteSelector::from_inputs(None, None)
+            .unwrap()
+            .or_default(&namespace);
+        assert_eq!(plain, namespace);
+    }
+
+    #[test]
+    fn the_cli_refuses_both_route_options_through_the_existing_usage_contract() {
+        let error = <crate::cli::Cli as clap::Parser>::try_parse_from(argv(&[
+            "client",
+            "--project-dir",
+            "/srv/project-b",
+            "--unix-socket",
+            "/tmp/project-a.sock",
+            "status",
+        ]))
+        .expect_err("two routes on one namespace are ambiguous");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        // A usage error, not a new envelope outcome: nothing was contacted.
+        let envelope = usage_error_envelope(&error, Operation::Status);
+        assert_eq!(envelope.outcome, Outcome::UsageError);
+        assert_eq!(envelope.exit_code(), 2);
+
+        // Either one alone parses.
+        for route in [
+            ["--project-dir", "/srv/project-b"],
+            ["--unix-socket", "/tmp/project-a.sock"],
+        ] {
+            <crate::cli::Cli as clap::Parser>::try_parse_from(argv(&[
+                "client", route[0], route[1], "status",
+            ]))
+            .unwrap_or_else(|error| panic!("{route:?} must parse: {error}"));
+        }
     }
 
     #[test]

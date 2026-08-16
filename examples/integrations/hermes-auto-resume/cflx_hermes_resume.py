@@ -344,23 +344,42 @@ def delivery_environment(home: str, search_path: str, hermes_home: str) -> dict:
 # Which owner the registration is sent to
 # ============================================================================
 
-#: The tool argument naming the Conflux owner one call was made against.
+#: The tool argument naming the Conflux *project* one call was made against.
 #:
-#: ``cflx client mcp`` accepts ``unix_socket`` on every tool, so a single Hermes
-#: process can drive several projects. The enqueue that just succeeded reached
-#: exactly one owner, and its sink has to be registered with that same owner: a
-#: registration is stored by the process that will run it, and the execution ID
-#: it names is process-local to that one incarnation.
+#: The normal public selector. ``cflx client mcp`` accepts ``project_dir`` on
+#: every tool, and it names the stable identity of the work — a directory inside
+#: the repository — rather than one owner incarnation's transport. A single
+#: Hermes process can therefore drive several projects without any of them
+#: knowing where the others' sockets live.
+CALL_PROJECT_ARGUMENT = "project_dir"
+
+#: The low-level alternative: the owner socket one call was made against.
+#:
+#: Kept because diagnostics, tests, and non-repository transports still need it.
+#: When a call used it, the registration has to use it too: the enqueue that
+#: just succeeded reached exactly one owner, and its sink has to be registered
+#: with that same owner — a registration is stored by the process that will run
+#: it, and the execution ID it names is process-local to that one incarnation.
 CALL_SOCKET_ARGUMENT = "unix_socket"
+
+#: How a resolved route is spelled back to the caller: which CLI option, and
+#: which value. ``build_registration_argv`` renders the pair and nothing else,
+#: so there is no second place that could disagree about which one won.
+PROJECT_ROUTE = "project"
+SOCKET_ROUTE = "socket"
+
+#: The ``cflx client`` option each route kind is passed as.
+ROUTE_OPTIONS = {PROJECT_ROUTE: "--project-dir", SOCKET_ROUTE: "--unix-socket"}
 
 
 def call_arguments(args: object):
     """The qualifying call's arguments as a mapping, or ``None``.
 
-    A host that hands the hook a shape this code cannot read as a mapping has
-    not said which owner the call was for — the same position a host that
-    passes no arguments at all is in — so it is reported the same way, as
-    absent, and the compatibility fallback decides. It is never guessed at.
+    ``None`` means *this host exposes no arguments object at all* — a legacy
+    host, or one that hands the hook a shape this code cannot read as a
+    mapping. That is the only situation in which the process-global
+    compatibility fallback applies, so the distinction between "no arguments"
+    and "arguments naming no route" is load-bearing and is never guessed at.
     """
     payload = args
     if isinstance(payload, (bytes, bytearray)):
@@ -392,21 +411,45 @@ def require_socket_path(value: object, label: str = "the owner Unix socket") -> 
     return require_absolute_path(value, label)
 
 
-def resolve_owner_socket(args: object, fallback: object = "") -> str:
-    """The owner socket this registration belongs to, or refuse to have one.
+def require_project_dir(value: object, label: str = "the project directory") -> str:
+    """An absolute directory naming the Conflux project a call was made against.
+
+    Absolute for the same reason a socket path is, and for one more: the
+    directory is handed to ``cflx client --project-dir``, which resolves it
+    against *its own* working directory, and that working directory is the
+    Hermes gateway's. Existence is not checked here — ``cflx client`` refuses a
+    path that is not a usable Git working tree with its own bounded validation
+    error, and duplicating that check here would only add a second answer that
+    could disagree with the first.
+    """
+    if not isinstance(value, str):
+        raise ValueError("%s is not a string" % (label,))
+    return require_absolute_path(value, label)
+
+
+def resolve_owner_route(args: object, fallback: object = "") -> tuple:
+    """The route this registration belongs to, or refuse to have one.
+
+    Returns ``(kind, value)`` where ``kind`` is :data:`PROJECT_ROUTE` or
+    :data:`SOCKET_ROUTE`.
 
     Precedence, and the reason for each step:
 
-    * A call-scoped ``unix_socket`` is authoritative. It names the owner the
-      enqueue actually reached, and it is the only value that stays right when
-      one Hermes process serves more than one project.
+    * A call-scoped ``project_dir`` is the normal authoritative route. It names
+      the project the enqueue actually reached, and it stays right when one
+      Hermes process serves more than one project.
+    * A call-scoped ``unix_socket`` is the low-level alternative, used when that
+      was the call's own selector.
+    * Both in one call is refused. Preferring either one would silently send a
+      registration to an owner the caller did not mean, which is the whole
+      failure the call-scoped selector exists to prevent.
+    * Arguments that name *neither* are refused too. That call used the MCP
+      server's own current-directory or namespace default route, and this
+      process cannot observe either; guessing from the environment would
+      register project B's execution against project A's owner.
     * ``CFLX_UNIX_SOCKET`` is a backward-compatible fallback, read only when the
-      host exposes no call-scoped argument at all. It is process-global, so it
-      can describe one project and no more.
-    * A call that *names* a socket this code cannot use is refused outright
-      rather than fallen back on. Falling back there would send project B's
-      registration to project A's owner — the exact cross-project misroute the
-      call-scoped value exists to prevent.
+      host exposes no arguments object at all. It is process-global, so it can
+      describe one project and no more.
 
     Nothing is remembered between calls: the route is derived from this call's
     own arguments every time, so there is no project-to-socket map to go stale
@@ -414,16 +457,35 @@ def resolve_owner_socket(args: object, fallback: object = "") -> str:
     """
     arguments = call_arguments(args)
     if arguments is not None:
-        supplied = arguments.get(CALL_SOCKET_ARGUMENT)
         # `None` is how a JSON-schema-optional argument spells "not supplied",
-        # so it means the fallback, while any other unusable value means refuse.
-        if supplied is not None:
-            return require_socket_path(supplied, "the call's %s" % (CALL_SOCKET_ARGUMENT,))
+        # so it is treated as absent rather than as an unusable value.
+        project = arguments.get(CALL_PROJECT_ARGUMENT)
+        socket = arguments.get(CALL_SOCKET_ARGUMENT)
+        if project is not None and socket is not None:
+            raise ValueError(
+                "the enqueue call named both %s and %s, which select two different owners"
+                % (CALL_PROJECT_ARGUMENT, CALL_SOCKET_ARGUMENT)
+            )
+        if project is not None:
+            return (
+                PROJECT_ROUTE,
+                require_project_dir(project, "the call's %s" % (CALL_PROJECT_ARGUMENT,)),
+            )
+        if socket is not None:
+            return (
+                SOCKET_ROUTE,
+                require_socket_path(socket, "the call's %s" % (CALL_SOCKET_ARGUMENT,)),
+            )
+        raise ValueError(
+            "the enqueue call named neither %s nor %s, so it used the MCP server's own "
+            "default route and this process cannot tell which owner that was"
+            % (CALL_PROJECT_ARGUMENT, CALL_SOCKET_ARGUMENT)
+        )
     if isinstance(fallback, str) and fallback.strip():
-        return require_socket_path(fallback, "CFLX_UNIX_SOCKET")
+        return (SOCKET_ROUTE, require_socket_path(fallback, "CFLX_UNIX_SOCKET"))
     raise ValueError(
-        "the enqueue call named no %s and CFLX_UNIX_SOCKET is unset, "
-        "so there is no owner to register with" % (CALL_SOCKET_ARGUMENT,)
+        "this host exposed no tool arguments and CFLX_UNIX_SOCKET is unset, "
+        "so there is no owner to register with"
     )
 
 
