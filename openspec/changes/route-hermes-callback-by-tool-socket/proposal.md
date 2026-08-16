@@ -3,6 +3,7 @@ change_type: implementation
 priority: high
 dependencies: []
 references:
+  - openspec/changes/archive/2026-08-16-add-hermes-auto-resume
   - src/client
   - examples/integrations/hermes-auto-resume/__init__.py
   - examples/integrations/hermes-auto-resume/README.md
@@ -32,6 +33,8 @@ Change Type: implementation
 > The change slug retains the initial socket-routing name for history continuity; the reviewed public design is project-directory routing.
 
 ## Problem / Context
+
+This is a follow-up to the archived `add-hermes-auto-resume` change. That change remains the source of the Hermes callback, Slack notification, and responder integration already merged into `main`; this change updates that implementation and its canonical requirements rather than replacing or reopening the archive.
 
 Conflux's stdio MCP server is currently started with one working directory or a fixed `--unix-socket`. Each tool may override `unix_socket`, but that exposes a transport implementation detail to the model and still requires callers to discover `.git/cflx-api.sock` correctly. A globally configured Hermes MCP server therefore covers only one project unless every call manually supplies a socket path.
 
