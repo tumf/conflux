@@ -13,8 +13,15 @@ sink, while the return address is still known.
 
 It does not rewrite tool results, inspect unrelated tools, parse shell commands,
 or interpret the model's text. It filters one exact tool name, reads three
-fields out of a versioned envelope, reads three more out of the session
-context, and makes one bounded subprocess call.
+fields out of a versioned envelope, three more out of the session context and
+one connection argument out of the call itself, and makes one bounded
+subprocess call.
+
+Everything it reads is scoped to the call in front of it. The owner a
+registration is sent to comes from that call's own ``project_dir`` argument —
+or its low-level ``unix_socket`` when that was the selector — so one Hermes
+process can serve several Conflux projects without keeping, or being able to
+stale, a project-to-socket map.
 
 It calls ``cflx client notify set`` directly rather than re-entering the MCP
 tool from inside a hook: that keeps the hook independent of the model and the
@@ -34,14 +41,20 @@ import sys
 from typing import Any, Dict, Optional
 
 from .cflx_hermes_resume import (
+    CALL_PROJECT_ARGUMENT,
+    CALL_SOCKET_ARGUMENT,
     CALLBACK_ENVIRONMENT_KEYS,
     DEFAULT_SEARCH_PATH,
+    PROJECT_ROUTE,
+    ROUTE_OPTIONS,
+    SOCKET_ROUTE,
     build_target,
     delivery_environment,
     extract_binding,
     is_enqueue_tool,
     require_executable,
     require_messaging_surface,
+    resolve_owner_route,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,6 +147,10 @@ def resolve_config() -> Dict[str, str]:
     )
     return {
         "cflx": os.environ.get("CFLX_BIN", "cflx"),
+        # A *fallback* only, and only for a host that exposes no tool arguments
+        # at all. Which owner a registration belongs to is decided by the
+        # enqueue call that produced the execution, not by a process-global
+        # variable that can name one project at a time; see `resolve_owner_route`.
         "unix_socket": os.environ.get("CFLX_UNIX_SOCKET", ""),
         "auth_token_env": os.environ.get("CFLX_AUTH_TOKEN_ENV", ""),
         "hermes": os.environ.get("CFLX_HERMES_BIN") or (shutil.which("hermes") or ""),
@@ -173,12 +190,20 @@ def build_registration_argv(config: Dict[str, str], binding: Dict[str, str], cal
     """The ``cflx client notify set`` invocation that attaches the callback.
 
     Connection options belong to the ``client`` namespace, so they come before
-    the verb. ``--auth-token-env`` names a variable; a token value is never
-    accepted in argv and never printed.
+    the verb. Exactly one route option is emitted, and it is the one the
+    qualifying enqueue call itself selected: ``--project-dir`` for the normal
+    project route, ``--unix-socket`` only when that low-level override was the
+    call's own selector. Neither is ever omitted, because leaving both out would
+    let the client derive a default from a working directory that is the Hermes
+    gateway's rather than the project's. ``--auth-token-env`` names a variable;
+    a token value is never accepted in argv and never printed.
     """
-    argv = [config["cflx"], "client"]
-    if config["unix_socket"]:
-        argv += ["--unix-socket", config["unix_socket"]]
+    argv = [
+        config["cflx"],
+        "client",
+        ROUTE_OPTIONS[config["route_kind"]],
+        config["route_value"],
+    ]
     if config["auth_token_env"]:
         argv += ["--auth-token-env", config["auth_token_env"]]
     argv += [
@@ -255,7 +280,6 @@ def on_post_tool_call(
     **_: Any,
 ) -> None:
     """React to one completed tool call. Observational; it changes no result."""
-    del args
     if not is_enqueue_tool(tool_name):
         return
 
@@ -268,6 +292,16 @@ def on_post_tool_call(
     config = resolve_config()
     try:
         target = resolve_target(read_session_bindings())
+        # Which owner, from this call's own arguments. `args` is the only thing
+        # in scope that knows: the result names an execution episode, and an
+        # execution ID is process-local to the owner that admitted it, so the
+        # same ID registered against a different owner is a different episode
+        # or none at all. A call that named no route at all is refused here
+        # rather than answered from `CFLX_UNIX_SOCKET`, which describes one
+        # project and would silently misroute every other.
+        config["route_kind"], config["route_value"] = resolve_owner_route(
+            args, config["unix_socket"]
+        )
         # The destination and the environment are proven once, here, rather than
         # at delivery time: the registered argv carries them out of this process,
         # and an operator watching a hook fail can fix a registration that a
@@ -288,11 +322,17 @@ def register(ctx) -> None:
 
 __all__ = [
     "CALLBACK_ENVIRONMENT_KEYS",
+    "CALL_PROJECT_ARGUMENT",
+    "CALL_SOCKET_ARGUMENT",
+    "PROJECT_ROUTE",
+    "ROUTE_OPTIONS",
+    "SOCKET_ROUTE",
     "build_callback_argv",
     "build_registration_argv",
     "on_post_tool_call",
     "read_session_bindings",
     "register",
     "resolve_config",
+    "resolve_owner_route",
     "resolve_target",
 ]

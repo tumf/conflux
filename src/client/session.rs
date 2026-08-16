@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
 use crate::client::transport::{TransportError, UnixApiClient};
+use crate::client::RouteSelector;
 use crate::web::remote_control_api::dto::{
     ApiError, CapabilitiesResponse, ChangeResource, ExecutionContractResponse,
     ExecutionStatusResponse, InstanceResponse, StateResponse, API_VERSION,
@@ -70,36 +71,56 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Resolve the socket path and the bearer token without contacting anyone.
+    /// Resolve one already-selected route into a connection.
     ///
-    /// The default path is derived from the canonical Git common directory —
-    /// the same identity the repository lock excludes on — so every linked
-    /// worktree of one repository reaches the one owner that lock permits.
-    pub fn resolve(
-        explicit_socket: Option<&Path>,
+    /// Nothing is contacted here: the socket path and the bearer token are
+    /// derived, and that is all.
+    ///
+    /// The socket and the repository-evidence root are decided *together* here,
+    /// from one selector, so no operation can mix one project's owner with
+    /// another project's evidence:
+    ///
+    /// * [`RouteSelector::Project`] takes both from the named project.
+    /// * [`RouteSelector::Socket`] takes the socket verbatim and keeps the
+    ///   process's own repository as evidence, which is the pre-existing
+    ///   low-level behavior an explicit socket has always had.
+    /// * [`RouteSelector::Default`] derives both from the current directory.
+    pub fn resolve_route(
+        selector: &RouteSelector,
         auth_token_env: Option<&str>,
     ) -> Result<Self, ConnectionRefusal> {
-        let workspace = std::env::current_dir().map_err(|error| ConnectionRefusal {
-            outcome: Outcome::NotInRepository,
-            message: format!("the current directory could not be resolved: {error}"),
-        })?;
-        let common_dir = crate::repo_lock::discover_common_dir(&workspace);
-        let repo_root = discover_repo_root(&workspace);
-
-        let socket =
-            match explicit_socket {
-                Some(path) => path.to_path_buf(),
-                None => match &common_dir {
-                    Some(common_dir) => crate::web::unix_socket::default_socket_path(common_dir),
-                    None => return Err(ConnectionRefusal {
+        let (socket, repo_root) = match selector {
+            RouteSelector::Project(project_dir) => {
+                let route = crate::client::resolve_project(project_dir).map_err(|error| {
+                    ConnectionRefusal {
                         outcome: Outcome::NotInRepository,
-                        message:
-                            "the default owner socket needs a Git repository: run inside one, or \
-                             name the socket with --unix-socket PATH"
+                        message: error.message,
+                    }
+                })?;
+                (route.socket, Some(route.repo_root))
+            }
+            RouteSelector::Socket(path) => {
+                let workspace = current_workspace()?;
+                (path.to_path_buf(), discover_repo_root(&workspace))
+            }
+            RouteSelector::Default => {
+                let workspace = current_workspace()?;
+                let repo_root = discover_repo_root(&workspace);
+                let socket = match crate::repo_lock::discover_common_dir(&workspace) {
+                    Some(common_dir) => crate::web::unix_socket::default_socket_path(&common_dir),
+                    None => {
+                        return Err(ConnectionRefusal {
+                            outcome: Outcome::NotInRepository,
+                            message: "the default owner socket needs a Git repository: run \
+                                      inside one, name the project with --project-dir PATH, or \
+                                      name the socket with --unix-socket PATH"
                                 .to_string(),
-                    }),
-                },
-            };
+                        })
+                    }
+                };
+                (socket, repo_root)
+            }
+        };
 
         let token = match auth_token_env {
             Some(name) => match std::env::var(name) {
@@ -153,11 +174,23 @@ impl Connection {
     }
 }
 
+/// The process's own working directory, or the refusal that replaces it.
+///
+/// Only the two selectors that legitimately fall back to this process ask for
+/// it; a project route never does, which is what keeps a selected project's
+/// evidence independent of where the client happens to be running.
+fn current_workspace() -> Result<PathBuf, ConnectionRefusal> {
+    std::env::current_dir().map_err(|error| ConnectionRefusal {
+        outcome: Outcome::NotInRepository,
+        message: format!("the current directory could not be resolved: {error}"),
+    })
+}
+
 /// Locate the repository root without mutating anything.
 ///
 /// A plain `rev-parse` rather than a walk up the tree, so a worktree, a
 /// submodule, and a plain clone all resolve the way Git itself resolves them.
-fn discover_repo_root(workspace: &Path) -> Option<PathBuf> {
+pub(crate) fn discover_repo_root(workspace: &Path) -> Option<PathBuf> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(workspace)
@@ -530,7 +563,7 @@ mod tests {
         // observe the no-identity refusal, and the directory is restored before
         // the assertion so a failure cannot strand the test process.
         std::env::set_current_dir(tmp.path()).unwrap();
-        let resolved = Connection::resolve(None, None);
+        let resolved = Connection::resolve_route(&RouteSelector::Default, None);
         std::env::set_current_dir(previous).unwrap();
 
         // A temp dir on a machine whose /tmp happens to be inside a repository
@@ -543,8 +576,8 @@ mod tests {
 
     #[test]
     fn an_unset_token_variable_fails_closed_instead_of_connecting_anonymously() {
-        let refusal = Connection::resolve(
-            Some(Path::new("/tmp/cflx-client-test.sock")),
+        let refusal = Connection::resolve_route(
+            &RouteSelector::Socket(PathBuf::from("/tmp/cflx-client-test.sock")),
             Some("CFLX_CLIENT_TEST_TOKEN_THAT_IS_NOT_SET"),
         )
         .expect_err("an unset variable must refuse");
@@ -554,8 +587,11 @@ mod tests {
 
     #[test]
     fn an_explicit_socket_needs_no_repository_identity() {
-        let connection = Connection::resolve(Some(Path::new("/tmp/explicit.sock")), None)
-            .expect("an explicit socket always resolves");
+        let connection = Connection::resolve_route(
+            &RouteSelector::Socket(PathBuf::from("/tmp/explicit.sock")),
+            None,
+        )
+        .expect("an explicit socket always resolves");
         assert_eq!(
             connection.client().socket(),
             Path::new("/tmp/explicit.sock")

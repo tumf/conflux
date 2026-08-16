@@ -407,8 +407,21 @@ struct McpHost {
 
 impl McpHost {
     fn start(cwd: &Path, socket: &Path) -> Self {
+        Self::spawn(
+            cwd,
+            &["client", "--unix-socket", socket.to_str().unwrap(), "mcp"],
+        )
+    }
+
+    /// The registration the contract actually recommends: one server, no route
+    /// option at all, every call naming its own project.
+    fn start_unrouted(cwd: &Path) -> Self {
+        Self::spawn(cwd, &["client", "mcp"])
+    }
+
+    fn spawn(cwd: &Path, args: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_cflx"))
-            .args(["client", "--unix-socket", socket.to_str().unwrap(), "mcp"])
+            .args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -462,6 +475,17 @@ impl McpHost {
 
     /// Call one tool and return its structured envelope.
     fn call(&mut self, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let result = self.call_raw(name, arguments);
+        assert!(
+            result.get("structuredContent").is_some(),
+            "the call must have reached an owner: {result}"
+        );
+        result["structuredContent"].clone()
+    }
+
+    /// Call one tool and return the whole tool result, including a refusal that
+    /// produced no envelope because nothing was ever contacted.
+    fn call_raw(&mut self, name: &str, arguments: serde_json::Value) -> serde_json::Value {
         let response = self.request(
             "tools/call",
             serde_json::json!({"name": name, "arguments": arguments}),
@@ -470,7 +494,7 @@ impl McpHost {
             response.get("error").is_none(),
             "a tool call is not a protocol error: {response}"
         );
-        response["result"]["structuredContent"].clone()
+        response["result"].clone()
     }
 
     fn stop(mut self) {
@@ -509,6 +533,30 @@ fn recorder(dir: &Path, name: &str) -> Vec<String> {
         script.display().to_string(),
         log.display().to_string(),
     ]
+}
+
+/// The owner socket a project route derives: `<git-common-dir>/cflx-api.sock`.
+///
+/// Asked of Git rather than assembled by hand, so a linked worktree and its
+/// main repository are proven to agree on one path rather than assumed to.
+fn project_socket(repo: &Repo) -> PathBuf {
+    common_dir_of(repo.path()).join("cflx-api.sock")
+}
+
+fn common_dir_of(dir: &Path) -> PathBuf {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(dir)
+        .output()
+        .expect("git must be available");
+    assert!(output.status.success(), "git rev-parse must succeed");
+    let raw = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let absolute = if raw.is_absolute() {
+        raw
+    } else {
+        dir.join(raw)
+    };
+    std::fs::canonicalize(&absolute).unwrap_or(absolute)
 }
 
 fn log_of(command: &[String]) -> PathBuf {
@@ -1129,5 +1177,336 @@ async fn mcp_refuses_tool_traffic_before_initialization_and_off_protocol_frames(
 
     drop(stdin);
     let _ = child.wait();
+    owner.stop().await;
+}
+
+// ============================================================================
+// Project-directory routing
+// ============================================================================
+
+/// The reason the selector is a directory: one server process, two independent
+/// Conflux projects, two owners. Each call reaches only the owner its own
+/// `project_dir` names, and neither call changes anything the other reads.
+// Multi-threaded on purpose: the MCP host is driven with blocking stdio
+// reads, and the owners it is talking to are tasks in this same runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn mcp_routes_two_projects_by_their_own_project_directories() {
+    let project_a = Repo::new();
+    project_a.stage_active("alpha");
+    let project_b = Repo::new();
+    project_b.stage_active("beta");
+    let owner_a = Owner::start(&project_a, project_socket(&project_a), &["alpha"]).await;
+    let owner_b = Owner::start(&project_b, project_socket(&project_b), &["beta"]).await;
+    assert_ne!(owner_a.instance_id(), owner_b.instance_id());
+
+    // Deliberately outside both projects and with no namespace route, so
+    // nothing but the call itself can decide where a request goes.
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let mut host = McpHost::start_unrouted(elsewhere.path());
+
+    for (repo, expected) in [(&project_a, &owner_a), (&project_b, &owner_b)] {
+        let status = host.call(
+            "cflx_status",
+            serde_json::json!({"project_dir": repo.path().to_str().unwrap()}),
+        );
+        assert_eq!(status["outcome"], "observed", "{status}");
+        assert_eq!(status["instance_id"], expected.instance_id(), "{status}");
+    }
+
+    // And an intent, not just a read: each admission lands in its own reducer.
+    let admitted_a = host.call(
+        "cflx_enqueue",
+        serde_json::json!({
+            "change_id": "alpha",
+            "project_dir": project_a.path().to_str().unwrap(),
+        }),
+    );
+    assert_eq!(admitted_a["outcome"], "admitted", "{admitted_a}");
+    assert_eq!(admitted_a["instance_id"], owner_a.instance_id());
+
+    let admitted_b = host.call(
+        "cflx_enqueue",
+        serde_json::json!({
+            "change_id": "beta",
+            "project_dir": project_b.path().to_str().unwrap(),
+        }),
+    );
+    assert_eq!(admitted_b["outcome"], "admitted", "{admitted_b}");
+    assert_eq!(admitted_b["instance_id"], owner_b.instance_id());
+
+    assert_eq!(
+        owner_a.executor.submitted(),
+        vec![CommandSpec::SetQueueIntent {
+            change_id: "alpha".to_string(),
+            queued: true
+        }],
+        "project A saw only its own admission"
+    );
+    assert_eq!(
+        owner_b.executor.submitted(),
+        vec![CommandSpec::SetQueueIntent {
+            change_id: "beta".to_string(),
+            queued: true
+        }],
+        "project B saw only its own admission"
+    );
+
+    host.stop();
+    owner_a.stop().await;
+    owner_b.stop().await;
+}
+
+/// A linked worktree is a different working tree of the *same* repository, and
+/// the repository lock lets that repository have exactly one default owner. So
+/// naming the worktree has to reach the owner under the shared Git common
+/// directory — the same one the main working tree resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn mcp_resolves_a_linked_worktree_to_the_common_owner_socket() {
+    let repo = Repo::new();
+    repo.stage_active("alpha");
+    let worktrees = tempfile::tempdir().expect("temp dir");
+    let linked = worktrees.path().join("feature");
+    repo.git(&["worktree", "add", "-b", "feature", linked.to_str().unwrap()]);
+    assert_eq!(
+        common_dir_of(&linked),
+        common_dir_of(repo.path()),
+        "a linked worktree shares the repository's common directory"
+    );
+
+    let owner = Owner::start(&repo, project_socket(&repo), &["alpha"]).await;
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let mut host = McpHost::start_unrouted(elsewhere.path());
+
+    // The worktree root, a directory below it, and a symlink pointing at it:
+    // all three resolve the way Git itself resolves them, so none of them needs
+    // the caller to know where the socket is.
+    let nested = linked.join("openspec");
+    std::fs::create_dir_all(&nested).unwrap();
+    let symlinked = worktrees.path().join("by-symlink");
+    std::os::unix::fs::symlink(&linked, &symlinked).expect("a symlink must be creatable");
+    for directory in [&linked, &nested, &symlinked] {
+        let status = host.call(
+            "cflx_status",
+            serde_json::json!({"project_dir": directory.to_str().unwrap()}),
+        );
+        assert_eq!(
+            status["instance_id"],
+            owner.instance_id(),
+            "{}: {status}",
+            directory.display()
+        );
+    }
+
+    host.stop();
+    owner.stop().await;
+}
+
+/// Two selectors in one call is ambiguous, and the only honest answers are
+/// "refuse" or "silently pick one" — so it is refused, through the ordinary
+/// validation channel, before a byte reaches either owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn mcp_refuses_two_call_selectors_before_contacting_any_owner() {
+    let project_a = Repo::new();
+    project_a.stage_active("alpha");
+    let project_b = Repo::new();
+    project_b.stage_active("alpha");
+    let owner_a = Owner::start(&project_a, project_socket(&project_a), &["alpha"]).await;
+    let owner_b = Owner::start(&project_b, project_socket(&project_b), &["alpha"]).await;
+
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let mut host = McpHost::start_unrouted(elsewhere.path());
+
+    let refused = host.call_raw(
+        "cflx_enqueue",
+        serde_json::json!({
+            "change_id": "alpha",
+            "project_dir": project_b.path().to_str().unwrap(),
+            "unix_socket": project_socket(&project_a).to_str().unwrap(),
+        }),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        refused.get("structuredContent").is_none(),
+        "a refusal that contacted nobody has no owner envelope to report: {refused}"
+    );
+    let text = refused["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("project_dir") && text.contains("unix_socket"),
+        "the refusal must name both selectors: {text}"
+    );
+
+    // Nothing was admitted anywhere: the refusal is not a routed failure.
+    assert!(owner_a.executor.submitted().is_empty());
+    assert!(owner_b.executor.submitted().is_empty());
+
+    // Every unusable project path is refused the same bounded way, and none of
+    // them falls through to an owner.
+    let not_a_repository = tempfile::tempdir().expect("temp dir");
+    let bare = tempfile::tempdir().expect("temp dir");
+    let bare_path = bare.path().join("bare.git");
+    Command::new("git")
+        .args(["init", "--bare", bare_path.to_str().unwrap()])
+        .output()
+        .expect("git must be available");
+    for (label, project_dir) in [
+        ("relative", "relative/project".to_string()),
+        (
+            "missing",
+            project_a.path().join("no-such-dir").display().to_string(),
+        ),
+        (
+            "a file rather than a directory",
+            project_a.path().join("README.md").display().to_string(),
+        ),
+        (
+            "outside any repository",
+            not_a_repository.path().display().to_string(),
+        ),
+        ("bare", bare_path.display().to_string()),
+    ] {
+        let refused = host.call_raw(
+            "cflx_status",
+            serde_json::json!({"project_dir": project_dir}),
+        );
+        assert_eq!(refused["isError"], true, "{label}: {refused}");
+        assert!(
+            refused.get("structuredContent").is_none(),
+            "{label} must not report an owner observation: {refused}"
+        );
+    }
+    assert!(owner_a.executor.submitted().is_empty());
+    assert!(owner_b.executor.submitted().is_empty());
+
+    host.stop();
+    owner_a.stop().await;
+    owner_b.stop().await;
+}
+
+/// The namespace default is a default, not a pin: a call that names a project
+/// overrides it, a call that names nothing still gets it, and the override
+/// leaves it exactly where it was for the next call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn mcp_lets_a_call_selector_override_the_namespace_default_without_moving_it() {
+    let project_a = Repo::new();
+    project_a.stage_active("alpha");
+    let project_b = Repo::new();
+    project_b.stage_active("beta");
+    let default_socket = project_a.path().join("cflx-api.sock");
+    let owner_a = Owner::start(&project_a, default_socket.clone(), &["alpha"]).await;
+    let owner_b = Owner::start(&project_b, project_socket(&project_b), &["beta"]).await;
+
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let mut host = McpHost::start(elsewhere.path(), &default_socket);
+
+    // The namespace default answers a call that names nothing.
+    let default_first = host.call("cflx_status", serde_json::json!({}));
+    assert_eq!(default_first["instance_id"], owner_a.instance_id());
+
+    // A call-scoped project overrides it.
+    let overridden = host.call(
+        "cflx_status",
+        serde_json::json!({"project_dir": project_b.path().to_str().unwrap()}),
+    );
+    assert_eq!(overridden["instance_id"], owner_b.instance_id());
+
+    // And the override moved nothing: the default is still the default.
+    let default_again = host.call("cflx_status", serde_json::json!({}));
+    assert_eq!(
+        default_again["instance_id"],
+        owner_a.instance_id(),
+        "one call's selector must not become the server's route"
+    );
+
+    // The low-level override still works on its own, unchanged.
+    let by_socket = host.call(
+        "cflx_status",
+        serde_json::json!({"unix_socket": project_socket(&project_b).to_str().unwrap()}),
+    );
+    assert_eq!(by_socket["instance_id"], owner_b.instance_id());
+
+    host.stop();
+    owner_a.stop().await;
+    owner_b.stop().await;
+}
+
+/// The truthfulness half of the route. Completion is proven from a repository,
+/// so a call that selected project B must read project B's repository — even
+/// when the server is standing in project A and both projects contain the same
+/// change ID. Reading the server's own repository here would certify one
+/// project's archive as another project's success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn mcp_wait_certifies_evidence_from_the_selected_project_only() {
+    // Project A: 'alpha' is still active — its repository proves nothing.
+    let project_a = Repo::new();
+    project_a.stage_active("alpha");
+    // Project B: the same change ID, archived — the evidence `merged` needs.
+    let project_b = Repo::new();
+    project_b.stage_active("alpha");
+    project_b.archive("alpha");
+
+    // Neither owner tracks the change, so nothing but the repository can settle
+    // the wait: a tracked change would let a snapshot answer instead of Git.
+    let owner_a = Owner::start(&project_a, project_socket(&project_a), &[]).await;
+    let owner_b = Owner::start(&project_b, project_socket(&project_b), &[]).await;
+
+    // The server stands inside project A, which is also its default route.
+    let mut host = McpHost::start_unrouted(project_a.path());
+
+    let completed = host.call(
+        "cflx_wait",
+        serde_json::json!({
+            "change_id": "alpha",
+            "project_dir": project_b.path().to_str().unwrap(),
+            "timeout": "30s",
+        }),
+    );
+    assert_eq!(
+        completed["outcome"], "completed",
+        "project B's archive is the only evidence that could have settled this: {completed}"
+    );
+    assert_eq!(completed["instance_id"], owner_b.instance_id());
+
+    // The mirror image, with the same server and the same change ID: project A
+    // has no archive entry, so it cannot be completed and must time out rather
+    // than borrow project B's proof.
+    let unproven = host.call(
+        "cflx_wait",
+        serde_json::json!({
+            "change_id": "alpha",
+            "project_dir": project_a.path().to_str().unwrap(),
+            "timeout": "2s",
+        }),
+    );
+    assert_eq!(
+        unproven["outcome"], "timeout",
+        "an unarchived change is never completion: {unproven}"
+    );
+
+    host.stop();
+    owner_a.stop().await;
+    owner_b.stop().await;
+}
+
+/// Nothing above may cost the old behavior: a server started inside a
+/// repository with no route option at all still reaches that repository's
+/// owner, and certifies from that repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn mcp_without_any_selector_still_uses_the_current_repository() {
+    let repo = Repo::new();
+    repo.stage_active("alpha");
+    let owner = Owner::start(&repo, project_socket(&repo), &["alpha"]).await;
+
+    let mut host = McpHost::start_unrouted(repo.path());
+    let status = host.call("cflx_status", serde_json::json!({}));
+    assert_eq!(status["outcome"], "observed", "{status}");
+    assert_eq!(status["instance_id"], owner.instance_id());
+
+    host.stop();
     owner.stop().await;
 }

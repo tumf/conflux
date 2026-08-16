@@ -82,6 +82,34 @@ The stable client envelope MUST add optional top-level `instance_id`, `execution
 - **THEN** the tool returns a bounded validation error
 - **AND** it starts no owner, contacts no fallback owner, and performs no repository mutation
 
+#### Scenario: MCP stdout remains protocol-only
+
+- **GIVEN** an MCP host communicates over stdio
+- **WHEN** a tool succeeds, fails validation, or cannot reach the owner
+- **THEN** stdout contains only valid MCP JSON-RPC frames
+- **AND** diagnostics are isolated from the protocol stream
+
+#### Scenario: Raw workflow commands are not exposed
+
+- **GIVEN** the owner supports revisioned `/api/v2` commands
+- **WHEN** an initialized MCP client lists available tools
+- **THEN** it sees only the closed intent-shaped client tools
+- **AND** it cannot submit arbitrary command types, expected revisions, idempotency keys, execution marks, queue intent, shell source, or workflow state mutations
+
+#### Scenario: Tool calls require initialization
+
+- **GIVEN** an MCP peer has not completed initialization
+- **WHEN** it requests `tools/list` or `tools/call`
+- **THEN** the adapter returns a machine-readable protocol error
+- **AND** no owner request or workflow mutation occurs
+
+#### Scenario: Non-JSON-RPC request is rejected
+
+- **GIVEN** a newline-delimited JSON object omits `jsonrpc: "2.0"` or supplies another version
+- **WHEN** the MCP adapter receives it
+- **THEN** the adapter returns a JSON-RPC invalid-request error
+- **AND** no tool is dispatched
+
 <!-- Expected canonical result after archive: the client MCP namespace routes all six tools by one immutable call-scoped project or socket selector while keeping namespace and current-directory defaults compatible. -->
 
 ## MODIFIED Requirements
@@ -92,13 +120,14 @@ The CLI MUST expose `cflx client notify set`, `get`, and `clear` as direct shell
 
 The `cflx client` namespace MUST accept `--project-dir <ABSOLUTE_PATH>` as its normal explicit route and `--unix-socket <PATH>` as its low-level route. Clap-level parsing MUST reject both explicit selectors together before owner contact. The selected project MUST provide both the owner socket and repository evidence root to every client subcommand. `set` MUST accept a required non-empty callback argv after `--`, preserve each argument boundary exactly, and MAY opt into blocked-event delivery. It MUST NOT parse shell source, perform expansion, or implicitly invoke a shell. Set and clear MUST preserve the existing Unix-socket-only mutation transport rule after project resolution. Get MUST preserve transport-dependent callback redaction. These commands MUST manage callback observability only and MUST NOT mutate workflow state or become an owner.
 
-The repository's embedded Conflux operation skill and `AGENTS.md` MUST document project-directory routing, the low-level socket override, selector conflict behavior, and truthful wait evidence selection. They MUST retain the MCP tool path as an alternative for MCP-only hosts and MUST preserve the same durable-callback and untrusted-event safety guidance.
+The repository's embedded Conflux operation skill and `AGENTS.md` MUST document the direct CLI commands as the default shell-facing path for registering, inspecting, and clearing completion callbacks, together with project-directory routing, the low-level socket override, selector conflict behavior, and truthful wait evidence selection. They MUST retain the MCP tool path as an alternative for MCP-only hosts and MUST preserve the same durable-callback and untrusted-event safety guidance.
 
 #### Scenario: Operator registers one callback for an explicit project
 
 - **GIVEN** a command-capable TUI owns execution `exec-1` for change `alpha` in project B
-- **WHEN** the operator runs `cflx client --project-dir /absolute/project-b notify set alpha exec-1 --instance-id <owner-instance> --json -- /absolute/callback --flag "one argument"`
+- **WHEN** the operator runs `cflx client --project-dir /absolute/project-b notify set alpha exec-1 --instance-id <owner-instance> --blocked --json -- /absolute/callback --flag "one argument"`
 - **THEN** the client resolves project B's owner and stores the exact argv vector without shell interpretation
+- **AND** blocked-event delivery is enabled
 - **AND** the owner validates the complete instance, execution, and change binding
 - **AND** stdout contains one successful `notify_set` envelope
 - **AND** no workflow command or second owner is started
@@ -109,5 +138,42 @@ The repository's embedded Conflux operation skill and `AGENTS.md` MUST document 
 - **WHEN** the operator supplies both `--project-dir` and `--unix-socket` on the `cflx client` namespace
 - **THEN** CLI parsing fails through the existing usage-error contract
 - **AND** no owner request or workspace mutation occurs
+
+#### Scenario: Empty callback command is rejected before owner access
+
+- **GIVEN** any repository state
+- **WHEN** the operator invokes `cflx client notify set alpha exec-1 --` without a callback executable
+- **THEN** CLI parsing fails with the existing human or JSON usage-error contract
+- **AND** no owner request or workspace mutation occurs
+
+#### Scenario: Operator inspects and clears one callback
+
+- **GIVEN** execution `exec-1` for change `alpha` has a registered callback
+- **WHEN** the operator runs `cflx client notify get alpha exec-1 --json` and then `cflx client notify clear alpha exec-1 --json`
+- **THEN** get reports the current subscription using the existing transport redaction rules
+- **AND** clear removes only that execution's callback
+- **AND** both responses preserve the stable notify operation and outcome names
+
+#### Scenario: Expected owner incarnation changed
+
+- **GIVEN** the caller retained the instance ID that admitted execution `exec-1`
+- **WHEN** a notify CLI command supplies that instance ID after the socket begins serving a different owner
+- **THEN** the command returns typed `owner_restarted` non-zero
+- **AND** it does not register, inspect, or clear a callback against the replacement owner
+
+#### Scenario: TCP cannot mutate callback registration
+
+- **GIVEN** an authenticated TCP connection to an owner
+- **WHEN** a caller attempts the equivalent direct notify set or clear operation
+- **THEN** the owner returns typed `transport_not_permitted`
+- **AND** no callback registration changes
+
+#### Scenario: Installed operation skill teaches the direct CLI path
+
+- **GIVEN** an agent loads the embedded `cflx-run` skill in a shell-capable environment
+- **WHEN** it delegates a long-running change to an existing TUI owner
+- **THEN** the skill instructs it to use `cflx client notify set` with the admitted execution binding
+- **AND** it documents `get` and `clear` for inspection and cancellation of the callback registration
+- **AND** MCP remains documented as an alternative rather than the only notification interface
 
 <!-- Expected canonical result after archive: direct client operations select one project route explicitly and carry its owner and evidence identity together. -->
