@@ -13,8 +13,14 @@ sink, while the return address is still known.
 
 It does not rewrite tool results, inspect unrelated tools, parse shell commands,
 or interpret the model's text. It filters one exact tool name, reads three
-fields out of a versioned envelope, reads three more out of the session
-context, and makes one bounded subprocess call.
+fields out of a versioned envelope, three more out of the session context and
+one connection argument out of the call itself, and makes one bounded
+subprocess call.
+
+Everything it reads is scoped to the call in front of it. The owner a
+registration is sent to comes from that call's own ``unix_socket`` argument, so
+one Hermes process can serve several Conflux projects without keeping — or
+being able to stale — a project-to-socket map.
 
 It calls ``cflx client notify set`` directly rather than re-entering the MCP
 tool from inside a hook: that keeps the hook independent of the model and the
@@ -34,6 +40,7 @@ import sys
 from typing import Any, Dict, Optional
 
 from .cflx_hermes_resume import (
+    CALL_SOCKET_ARGUMENT,
     CALLBACK_ENVIRONMENT_KEYS,
     DEFAULT_SEARCH_PATH,
     build_target,
@@ -42,6 +49,7 @@ from .cflx_hermes_resume import (
     is_enqueue_tool,
     require_executable,
     require_messaging_surface,
+    resolve_owner_socket,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,6 +142,9 @@ def resolve_config() -> Dict[str, str]:
     )
     return {
         "cflx": os.environ.get("CFLX_BIN", "cflx"),
+        # A *fallback* only. Which owner a registration belongs to is decided by
+        # the enqueue call that produced the execution, not by a process-global
+        # variable that can name one project at a time; see `resolve_owner_socket`.
         "unix_socket": os.environ.get("CFLX_UNIX_SOCKET", ""),
         "auth_token_env": os.environ.get("CFLX_AUTH_TOKEN_ENV", ""),
         "hermes": os.environ.get("CFLX_HERMES_BIN") or (shutil.which("hermes") or ""),
@@ -173,12 +184,13 @@ def build_registration_argv(config: Dict[str, str], binding: Dict[str, str], cal
     """The ``cflx client notify set`` invocation that attaches the callback.
 
     Connection options belong to the ``client`` namespace, so they come before
-    the verb. ``--auth-token-env`` names a variable; a token value is never
-    accepted in argv and never printed.
+    the verb. ``--unix-socket`` is never omitted: the owner is chosen by the
+    call this registration belongs to, and leaving it out would let the client
+    derive a default from a working directory that is the Hermes gateway's
+    rather than the project's. ``--auth-token-env`` names a variable; a token
+    value is never accepted in argv and never printed.
     """
-    argv = [config["cflx"], "client"]
-    if config["unix_socket"]:
-        argv += ["--unix-socket", config["unix_socket"]]
+    argv = [config["cflx"], "client", "--unix-socket", config["unix_socket"]]
     if config["auth_token_env"]:
         argv += ["--auth-token-env", config["auth_token_env"]]
     argv += [
@@ -255,7 +267,6 @@ def on_post_tool_call(
     **_: Any,
 ) -> None:
     """React to one completed tool call. Observational; it changes no result."""
-    del args
     if not is_enqueue_tool(tool_name):
         return
 
@@ -268,6 +279,12 @@ def on_post_tool_call(
     config = resolve_config()
     try:
         target = resolve_target(read_session_bindings())
+        # Which owner, from this call's own arguments. `args` is the only thing
+        # in scope that knows: the result names an execution episode, and an
+        # execution ID is process-local to the owner that admitted it, so the
+        # same ID registered against a different owner is a different episode
+        # or none at all.
+        config["unix_socket"] = resolve_owner_socket(args, config["unix_socket"])
         # The destination and the environment are proven once, here, rather than
         # at delivery time: the registered argv carries them out of this process,
         # and an operator watching a hook fail can fix a registration that a
@@ -288,11 +305,13 @@ def register(ctx) -> None:
 
 __all__ = [
     "CALLBACK_ENVIRONMENT_KEYS",
+    "CALL_SOCKET_ARGUMENT",
     "build_callback_argv",
     "build_registration_argv",
     "on_post_tool_call",
     "read_session_bindings",
     "register",
     "resolve_config",
+    "resolve_owner_socket",
     "resolve_target",
 ]

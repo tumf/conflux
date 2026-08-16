@@ -13,11 +13,12 @@ Copy it into `~/.hermes/plugins/`, read it, and change it to fit your setup.
 1. A Hermes `post_tool_call` hook watches for one tool: `cflx_enqueue` (or a
    segment-exact namespaced `<server>_cflx_enqueue`).
 2. On a supported, successful, **admitted** envelope it takes the
-   `(instance_id, execution_id, change_id)` binding out of the result and the
+   `(instance_id, execution_id, change_id)` binding out of the result, the
    messaging platform / chat / thread out of the *request-scoped* Hermes session
-   context.
-3. It runs `cflx client notify set` over the owner's Unix socket to register one
-   execution-scoped callback argv.
+   context, and the Conflux owner socket out of that call's own `unix_socket`
+   argument.
+3. It runs `cflx client notify set` over the Unix socket **that call named** to
+   register one execution-scoped callback argv.
 4. When that execution reaches a terminal classification, the Conflux owner runs
    the callback once. The callback rebuilds `HOME`, `PATH` and `HERMES_HOME`,
    and invokes `hermes send --quiet --to <platform:chat[:thread]> <message>`.
@@ -74,7 +75,7 @@ owner will execute.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CFLX_BIN` | `cflx` | The Conflux client used to register the sink. |
-| `CFLX_UNIX_SOCKET` | owner default | `--unix-socket` for `cflx client`. |
+| `CFLX_UNIX_SOCKET` | unset | Fallback `--unix-socket`, used only when the call names none. A call-scoped `unix_socket` always wins. |
 | `CFLX_AUTH_TOKEN_ENV` | unset | *Name* of the variable holding the owner token. Never the token. |
 | `CFLX_HERMES_BIN` | `which hermes` | Absolute Hermes executable the callback runs. |
 | `CFLX_HERMES_HOME` | `$HERMES_HOME`, else `~/.hermes` | `HERMES_HOME` the callback sets. |
@@ -115,6 +116,67 @@ List what your profile can actually reach:
 hermes send --list
 hermes send --list slack
 ```
+
+## Which Conflux owner it registers with
+
+A completion sink is stored by the process that will run it, and an
+`execution_id` is process-local to the owner that admitted it. The registration
+therefore has to reach the *same* owner the enqueue did — and the only thing
+that knows which owner that was is the call itself.
+
+`cflx client mcp` accepts `unix_socket` on every tool, so register the server
+once with no project in it and let each call name its own:
+
+```bash
+# The MCP server registration. Leave the connection option off: a server-level
+# socket is a silent default. A call that omits `unix_socket` still reaches it,
+# so the enqueue succeeds while the hook sees no socket in the call at all — and
+# the registration then depends on a fallback that names one project at most.
+cflx client mcp
+```
+
+```json
+{
+  "name": "mcp__cflx__cflx_enqueue",
+  "arguments": {
+    "change_id": "add-my-change",
+    "unix_socket": "/absolute/path/to/repo/.git/cflx-api.sock"
+  }
+}
+```
+
+The hook reads that exact call-scoped `unix_socket` and registers with
+`cflx client --unix-socket <that> notify set …`. Two calls in one Hermes process,
+for two repositories, reach two owners: the route is derived from each call's
+own arguments, so there is no project-to-socket map to go stale and no ordering
+between concurrent turns that can move either one.
+
+An owner's socket is `$(git rev-parse --git-common-dir)/cflx-api.sock` in its
+repository, unless it was started with `--web-unix-socket PATH`:
+
+```bash
+git -C /path/to/repo rev-parse --git-common-dir
+```
+
+### Migrating from `CFLX_UNIX_SOCKET`
+
+`CFLX_UNIX_SOCKET` still works, as a **fallback** for a host that exposes no
+call arguments to its hooks. It is process-global, so it can describe one
+project and no more; a call-scoped `unix_socket` always overrides it. Pass the
+socket per call and the variable can go.
+
+Either way, resolution fails closed:
+
+- A call that *names* a socket this plugin cannot use — not a string, empty, or
+  relative — registers **nothing**. It is not quietly sent to whatever
+  `CFLX_UNIX_SOCKET` happens to hold, because that is exactly the cross-project
+  misroute the call-scoped value exists to prevent.
+- A call that names no socket, with no usable `CFLX_UNIX_SOCKET` either,
+  registers **nothing** rather than letting the client derive a default from the
+  Hermes gateway's working directory, which is not the project's.
+
+Paths must be absolute for the same reason: the gateway's working directory has
+nothing to do with the repository the work belongs to.
 
 ## Test delivery before you trust it
 

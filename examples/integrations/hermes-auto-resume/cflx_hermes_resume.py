@@ -341,6 +341,93 @@ def delivery_environment(home: str, search_path: str, hermes_home: str) -> dict:
 
 
 # ============================================================================
+# Which owner the registration is sent to
+# ============================================================================
+
+#: The tool argument naming the Conflux owner one call was made against.
+#:
+#: ``cflx client mcp`` accepts ``unix_socket`` on every tool, so a single Hermes
+#: process can drive several projects. The enqueue that just succeeded reached
+#: exactly one owner, and its sink has to be registered with that same owner: a
+#: registration is stored by the process that will run it, and the execution ID
+#: it names is process-local to that one incarnation.
+CALL_SOCKET_ARGUMENT = "unix_socket"
+
+
+def call_arguments(args: object):
+    """The qualifying call's arguments as a mapping, or ``None``.
+
+    A host that hands the hook a shape this code cannot read as a mapping has
+    not said which owner the call was for — the same position a host that
+    passes no arguments at all is in — so it is reported the same way, as
+    absent, and the compatibility fallback decides. It is never guessed at.
+    """
+    payload = args
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            payload = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (ValueError, TypeError):
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def require_socket_path(value: object, label: str = "the owner Unix socket") -> str:
+    """An absolute path to a Conflux owner's ``/api/v2`` Unix socket.
+
+    Absolute because this runs inside the Hermes gateway, whose working
+    directory has nothing to do with the repository the work belongs to: a
+    relative path would resolve against wherever the gateway happened to be
+    started, which is the misroute this check exists to stop. Existence is
+    deliberately *not* checked — an owner may be mid-restart, and ``cflx
+    client`` answers an unreachable socket with its own typed outcome rather
+    than with a guess.
+    """
+    if not isinstance(value, str):
+        raise ValueError("%s is not a string" % (label,))
+    return require_absolute_path(value, label)
+
+
+def resolve_owner_socket(args: object, fallback: object = "") -> str:
+    """The owner socket this registration belongs to, or refuse to have one.
+
+    Precedence, and the reason for each step:
+
+    * A call-scoped ``unix_socket`` is authoritative. It names the owner the
+      enqueue actually reached, and it is the only value that stays right when
+      one Hermes process serves more than one project.
+    * ``CFLX_UNIX_SOCKET`` is a backward-compatible fallback, read only when the
+      host exposes no call-scoped argument at all. It is process-global, so it
+      can describe one project and no more.
+    * A call that *names* a socket this code cannot use is refused outright
+      rather than fallen back on. Falling back there would send project B's
+      registration to project A's owner — the exact cross-project misroute the
+      call-scoped value exists to prevent.
+
+    Nothing is remembered between calls: the route is derived from this call's
+    own arguments every time, so there is no project-to-socket map to go stale
+    and no ordering between two concurrent turns that can change either one.
+    """
+    arguments = call_arguments(args)
+    if arguments is not None:
+        supplied = arguments.get(CALL_SOCKET_ARGUMENT)
+        # `None` is how a JSON-schema-optional argument spells "not supplied",
+        # so it means the fallback, while any other unusable value means refuse.
+        if supplied is not None:
+            return require_socket_path(supplied, "the call's %s" % (CALL_SOCKET_ARGUMENT,))
+    if isinstance(fallback, str) and fallback.strip():
+        return require_socket_path(fallback, "CFLX_UNIX_SOCKET")
+    raise ValueError(
+        "the enqueue call named no %s and CFLX_UNIX_SOCKET is unset, "
+        "so there is no owner to register with" % (CALL_SOCKET_ARGUMENT,)
+    )
+
+
+# ============================================================================
 # The message
 # ============================================================================
 
