@@ -3,57 +3,81 @@ change_type: implementation
 priority: high
 dependencies: []
 references:
+  - src/client
   - examples/integrations/hermes-auto-resume/__init__.py
+  - examples/integrations/hermes-auto-resume/README.md
   - tests/hermes_auto_resume_example.rs
   - openspec/specs/external-lifecycle-integrations/spec.md
 verifications:
-  - id: hermes-project-socket-routing
-    requirement: Each Hermes enqueue callback is registered with the owner socket selected by that tool call
+  - id: project-scoped-client-routing
+    requirement: MCP and Hermes callback registration resolve the correct owner from each call's project directory
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: Cargo.toml
-    evidence: Heavy integration tests exercise two project sockets and fallback behavior without changing global environment between calls
-    rerun: cargo test --features heavy-tests --test hermes_auto_resume_example
+    evidence: Client and heavy integration tests exercise two independent repositories, Git worktrees, conflicting inputs, and legacy low-level socket routing
+    rerun: cargo test --features heavy-tests --test hermes_auto_resume_example && cargo test client
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
 ---
 
-# Route Hermes callback registration by tool socket
+# Route Conflux MCP and Hermes callbacks by project directory
 
 Change Type: implementation
 
 ## Problem / Context
 
-The Hermes MCP server can accept `unix_socket` on each Conflux tool call, but the reference auto-resume plugin currently discards post-tool `args` and registers the completion sink using only process-global `CFLX_UNIX_SOCKET`.
+Conflux's stdio MCP server is currently started with one working directory or a fixed `--unix-socket`. Each tool may override `unix_socket`, but that exposes a transport implementation detail to the model and still requires callers to discover `.git/cflx-api.sock` correctly. A globally configured Hermes MCP server therefore covers only one project unless every call manually supplies a socket path.
 
-A Hermes agent configured with that environment variable or a fixed MCP `--unix-socket` is therefore bound to one Conflux project. Concurrent or sequential calls for other project owners can enqueue successfully but register their callback against the wrong owner.
+The Hermes auto-resume plugin has the same coupling. Its post-tool hook currently discards tool arguments and registers the completion sink through process-global `CFLX_UNIX_SOCKET`, so an enqueue sent to another owner can register its callback against the wrong project.
+
+The stable user-facing identity is the project directory, not the ephemeral owner socket. Conflux already derives the default socket from the repository's Git common directory when run inside that repository; the MCP boundary must expose that repository-aware resolution per call.
 
 ## Proposed Solution
 
-Read the exact `unix_socket` value from the qualifying `cflx_enqueue` tool arguments and use it for that execution's `cflx client notify set` call. Keep `CFLX_UNIX_SOCKET` only as a backward-compatible fallback when the host does not expose a call-scoped socket argument.
+Add an optional `project_dir` connection selector to every Conflux client MCP tool and to the shared client connection boundary. For each call, Conflux resolves the supplied directory as a Git worktree/repository, obtains its absolute Git common directory, and connects to `<git-common-dir>/cflx-api.sock`.
 
-The plugin will fail closed when no socket can be resolved. The example documentation will register the MCP server without a project-fixed socket and show callers passing `unix_socket` per tool call.
+Retain `unix_socket` as an explicit low-level override for diagnostics, tests, and non-repository transports. `project_dir` and `unix_socket` are mutually exclusive in one request; supplying both returns a typed validation refusal before any owner is contacted. If neither is supplied, existing current-working-directory resolution remains unchanged.
+
+The Hermes post-tool hook will preserve the qualifying enqueue call's connection selector. It will register `notify set` with the same call-scoped `project_dir`, or with the same call-scoped `unix_socket` when the low-level override was used. Process-global `CFLX_UNIX_SOCKET` remains only a compatibility fallback for hosts that do not expose post-tool arguments. Call-scoped routing always takes precedence over environment fallback.
+
+The Hermes setup documentation will register one global MCP server without a fixed project socket. Agent calls identify the target using `project_dir`.
 
 ## Acceptance Criteria
 
-- One Hermes process can enqueue work for two independent Conflux owner sockets and register each callback with the matching owner.
-- A tool-call `unix_socket` overrides `CFLX_UNIX_SOCKET` for that callback registration.
-- Existing hosts that omit tool arguments may continue using `CFLX_UNIX_SOCKET` as a fallback.
-- Missing, malformed, or non-string socket arguments do not cause cross-project registration or alter the original tool result.
-- Documentation no longer recommends fixing one project socket in the global Hermes MCP server registration.
+- One MCP server process can operate two independent Conflux projects by passing a different `project_dir` on each call.
+- A linked Git worktree resolves through its Git common directory and reaches the same owner socket as the main worktree.
+- `project_dir` is available consistently on status, enqueue, wait, notify-set, notify-get, and notify-clear tools.
+- `project_dir` and `unix_socket` together produce a typed validation refusal before network or socket I/O.
+- `unix_socket` remains usable by itself as a low-level override.
+- Omitting both selectors preserves current-working-directory behavior.
+- The Hermes hook registers the completion sink using the exact selector from the admitted enqueue call and does not retain mutable cross-call routing state.
+- A malformed or unavailable project route does not replace the MCP tool result, fail the Hermes turn, or register against an environment-selected different owner.
+- Documentation no longer recommends fixing a project socket in global Hermes MCP configuration.
 
 ## Explicit Completion Conditions
 
-- `on_post_tool_call` no longer discards `args`; it resolves call-scoped connection options before registration.
-- Heavy integration tests prove routing across two distinct owner sockets and fallback behavior.
-- README setup and troubleshooting describe per-call project routing.
-- `cargo test --features heavy-tests --test hermes_auto_resume_example`, formatting, Clippy, and archive-gate validation pass.
+- The shared client route resolver accepts mutually exclusive `project_dir` and `unix_socket` selectors and is used by all six MCP tools.
+- Project resolution handles ordinary repositories and linked worktrees using the absolute Git common directory.
+- MCP schemas and tool descriptions present `project_dir` as the normal selector and `unix_socket` as the low-level override.
+- The Hermes post-tool hook no longer discards `args`; callback registration preserves the enqueue call's selector.
+- Tests prove two-project routing, worktree routing, conflict refusal with no contact, low-level socket routing, default-CWD compatibility, and plugin callback affinity.
+- README examples show one socket-unbound Hermes MCP registration and per-call `project_dir` usage.
+- Targeted tests, formatting, Clippy, strict/evidence validation, and archive-gate validation pass.
+
+## Safety and Compatibility
+
+- Project resolution performs no repository mutation and starts no owner.
+- Resolution must reject a path that is not a usable Git repository/worktree rather than guessing a socket.
+- Error envelopes and diagnostics may identify the rejected path but must not include credentials or environment values.
+- Existing clients using only `unix_socket`, or relying on MCP server current working directory, remain supported.
+- No project-to-socket registry or other out-of-worktree durable routing state is introduced.
 
 ## Out of Scope
 
-- Reintroducing a multi-project Conflux server.
-- Discovering repositories or owner sockets from `change_id`.
-- Persisting project-to-socket mappings outside the tool call.
-- Changing Conflux workflow routing or terminal classification.
+- Reintroducing a multi-project Conflux server or project registry.
+- Discovering a project from `change_id`.
+- Starting a Conflux owner when no owner socket exists.
+- Remote/TCP owner discovery.
+- Changing workflow routing, acceptance, archive, merge, or terminal classification.
