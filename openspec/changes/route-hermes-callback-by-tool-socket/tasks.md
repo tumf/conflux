@@ -43,7 +43,7 @@ worktree-built binary rather than the installed release:
 - `cargo test` (default suite): 0 failed across every target.
 - `git merge-tree --write-tree main HEAD` reports no conflict.
 
-### Promotion-preservation check (MODIFIED deltas vs canonical)
+Promotion-preservation check (MODIFIED deltas vs canonical):
 
 `merge_spec_delta` replaces the whole canonical `### Requirement` block with the
 delta block, so every canonical scenario that must survive archive has to appear
