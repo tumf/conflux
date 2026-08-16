@@ -4,7 +4,9 @@
 
 The reference Hermes auto-resume integration MUST extract the enqueue envelope from Hermes host tool-result representation, including its `structuredContent` and textual `result` wrapper fields. It MUST register an execution-scoped completion sink only from a supported versioned enqueue envelope with a successful admitted outcome and non-empty string `change_id`, `execution_id`, and `instance_id`. It MUST bind that execution to the originating messaging platform, chat ID, optional thread ID, and the Conflux owner route selected by the qualifying tool call.
 
-The normal public route selector MUST be a project directory. The post-tool hook MUST preserve a non-empty string `project_dir` from the qualifying enqueue tool arguments and use it for callback registration. A non-empty string `unix_socket` MAY be preserved as a low-level alternative when that was the call's only route selector. The two selectors MUST NOT be accepted together. A process-global `CFLX_UNIX_SOCKET` MAY be used only as a backward-compatible fallback when the host exposes neither call-scoped selector. Any call-scoped selector MUST take precedence over environment fallback.
+The normal public route selector MUST be a project directory. The post-tool hook MUST preserve a non-empty string `project_dir` from the qualifying enqueue tool arguments and use it for callback registration. A non-empty string `unix_socket` MAY be preserved as a low-level alternative when that was the call's only route selector. The two selectors MUST NOT be accepted together. A process-global `CFLX_UNIX_SOCKET` MAY be used only as a backward-compatible fallback when the host does not expose post-tool arguments at all. If the host exposes the arguments object but the qualifying enqueue used the MCP server's current-directory or namespace default route, the hook MUST NOT guess from the environment; it MUST fail closed unless an admitted result provides an authoritative resolved route. Any call-scoped selector MUST take precedence over environment fallback.
+
+Every registration MUST include the admitted envelope's `instance_id`, `execution_id`, and `change_id`. A fallback or stale route naming another owner MUST therefore receive the existing typed `owner_restarted` or execution-binding refusal rather than silently registering against the wrong owner.
 
 The integration MUST NOT infer a project from `change_id`, retain a mutable project-to-socket map, require the Hermes MCP server registration to be fixed to one project, or start an owner. A malformed, conflicting, or unresolved call-scoped route MUST fail closed rather than silently register against an environment-selected different owner.
 
@@ -60,63 +62,9 @@ The post-tool hook MUST be observational: refusal, malformed output, missing rou
 #### Scenario: Legacy host may use environment fallback
 
 - **GIVEN** a qualifying admitted enqueue result
-- **AND** the host supplies neither call-scoped selector
+- **AND** the legacy host does not expose a post-tool arguments object
 - **AND** `CFLX_UNIX_SOCKET` contains a non-empty socket path
 - **WHEN** the post-tool hook runs
 - **THEN** it MAY register through that fallback socket
 
 <!-- Expected canonical result after archive: Hermes callback registration follows each enqueue call's project directory or explicit low-level socket, while process environment remains only a compatibility fallback. -->
-
-## ADDED Requirements
-
-### Requirement: Client MCP routes each call by project directory
-
-Every Conflux client MCP tool MUST accept an optional non-empty string `project_dir` as the normal public route selector. For each call, Conflux MUST resolve that path as a usable Git repository or linked worktree, obtain the absolute Git common directory using repository-aware Git semantics, and target `<git-common-dir>/cflx-api.sock`.
-
-Every tool MAY also accept `unix_socket` as a low-level route override. `project_dir` and `unix_socket` MUST be mutually exclusive. When both are supplied, the tool MUST return a typed validation refusal before attempting owner contact. When neither is supplied, the existing MCP server current-working-directory route MUST remain in effect.
-
-The same route resolution MUST apply to `cflx_status`, `cflx_enqueue`, `cflx_wait`, `cflx_notify_set`, `cflx_notify_get`, and `cflx_notify_clear`. Route resolution MUST NOT mutate the repository, start an owner, infer a repository from a change ID, or persist a project registry outside the workspace.
-
-#### Scenario: Two projects share one MCP server process
-
-- **GIVEN** projects A and B have independent live Conflux owners
-- **AND** one stdio MCP server was started without a fixed project socket
-- **WHEN** a client calls a tool with project directory A and then calls a tool with project directory B
-- **THEN** each call contacts only the owner derived from its own project directory
-- **AND** no process-global route is changed
-
-#### Scenario: Linked worktree resolves the common owner socket
-
-- **GIVEN** a linked Git worktree belongs to a repository whose Conflux owner socket is under the Git common directory
-- **WHEN** a tool receives that worktree as `project_dir`
-- **THEN** it resolves the absolute Git common directory
-- **AND** contacts the owner socket under that common directory
-
-#### Scenario: Conflicting selectors are rejected before contact
-
-- **GIVEN** a tool call supplies both `project_dir` and `unix_socket`
-- **WHEN** route validation runs
-- **THEN** the tool returns a typed validation refusal
-- **AND** no owner socket is contacted
-
-#### Scenario: Explicit socket remains a low-level override
-
-- **GIVEN** a tool call supplies `unix_socket` and omits `project_dir`
-- **WHEN** the operation runs
-- **THEN** it uses the explicit socket with existing authentication and envelope behavior
-
-#### Scenario: Omitted selector preserves current-directory behavior
-
-- **GIVEN** an MCP server starts inside a usable Git repository
-- **AND** a tool call supplies neither selector
-- **WHEN** the operation runs
-- **THEN** it derives the owner socket from the server process's current repository as before
-
-#### Scenario: Invalid project directory fails without mutation
-
-- **GIVEN** `project_dir` is missing, not a directory, or not a usable Git repository/worktree
-- **WHEN** route resolution runs
-- **THEN** the tool returns a bounded typed refusal
-- **AND** it starts no owner and performs no repository mutation
-
-<!-- Expected canonical result after archive: all six client MCP tools use repository-aware project-directory routing per call, with explicit socket and CWD compatibility retained. -->

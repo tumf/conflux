@@ -6,7 +6,10 @@ references:
   - src/client
   - examples/integrations/hermes-auto-resume/__init__.py
   - examples/integrations/hermes-auto-resume/README.md
+  - tests/client_mcp_integration.rs
   - tests/hermes_auto_resume_example.rs
+  - AGENTS.md
+  - openspec/specs/cli/spec.md
   - openspec/specs/external-lifecycle-integrations/spec.md
 verifications:
   - id: project-scoped-client-routing
@@ -16,7 +19,7 @@ verifications:
     trigger: pull-request-validation
     automation: Cargo.toml
     evidence: Client and heavy integration tests exercise two independent repositories, Git worktrees, conflicting inputs, and legacy low-level socket routing
-    rerun: cargo test --features heavy-tests --test hermes_auto_resume_example && cargo test client
+    rerun: cargo test --features heavy-tests --test hermes_auto_resume_example && cargo test --features heavy-tests --test client_mcp_integration && cargo test --lib client
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -25,6 +28,8 @@ verifications:
 # Route Conflux MCP and Hermes callbacks by project directory
 
 Change Type: implementation
+
+> The change slug retains the initial socket-routing name for history continuity; the reviewed public design is project-directory routing.
 
 ## Problem / Context
 
@@ -36,11 +41,11 @@ The stable user-facing identity is the project directory, not the ephemeral owne
 
 ## Proposed Solution
 
-Add an optional `project_dir` connection selector to every Conflux client MCP tool and to the shared client connection boundary. For each call, Conflux resolves the supplied directory as a Git worktree/repository, obtains its absolute Git common directory, and connects to `<git-common-dir>/cflx-api.sock`.
+Add an optional absolute `project_dir` connection selector to every Conflux client MCP tool, the `cflx client` CLI namespace, and the shared client connection boundary. For each call, Conflux resolves the supplied directory as a usable non-bare Git working tree, obtains both its canonical repository root and absolute Git common directory, and connects to `<git-common-dir>/cflx-api.sock`. Repository-evidence operations such as `wait` use that same selected repository root rather than the server process's current repository.
 
-Retain `unix_socket` as an explicit low-level override for diagnostics, tests, and non-repository transports. `project_dir` and `unix_socket` are mutually exclusive in one request; supplying both returns a typed validation refusal before any owner is contacted. If neither is supplied, existing current-working-directory resolution remains unchanged.
+Retain `unix_socket` as an explicit low-level override for diagnostics, tests, and non-repository transports. `project_dir` and `unix_socket` are mutually exclusive only when both appear in one call; that conflict uses the existing MCP validation-error or CLI usage-error channel before owner contact and does not add a stable-envelope outcome. Either call-scoped selector overrides a namespace-level default route. If the call supplies neither, the existing namespace-level default and then current-working-directory resolution remain unchanged.
 
-The Hermes post-tool hook will preserve the qualifying enqueue call's connection selector. It will register `notify set` with the same call-scoped `project_dir`, or with the same call-scoped `unix_socket` when the low-level override was used. Process-global `CFLX_UNIX_SOCKET` remains only a compatibility fallback for hosts that do not expose post-tool arguments. Call-scoped routing always takes precedence over environment fallback.
+The Hermes post-tool hook will preserve the qualifying enqueue call's connection selector. It will execute `cflx client --project-dir <absolute-path> notify set ...` for a project route, or use `--unix-socket` when the low-level override was used, always passing the complete admitted owner/execution/change binding. Process-global `CFLX_UNIX_SOCKET` remains only a compatibility fallback for hosts that expose no post-tool arguments object. If arguments are available but contain no selector, the hook fails closed rather than guessing an environment route.
 
 The Hermes setup documentation will register one global MCP server without a fixed project socket. Agent calls identify the target using `project_dir`.
 
@@ -49,21 +54,23 @@ The Hermes setup documentation will register one global MCP server without a fix
 - One MCP server process can operate two independent Conflux projects by passing a different `project_dir` on each call.
 - A linked Git worktree resolves through its Git common directory and reaches the same owner socket as the main worktree.
 - `project_dir` is available consistently on status, enqueue, wait, notify-set, notify-get, and notify-clear tools.
-- `project_dir` and `unix_socket` together produce a typed validation refusal before network or socket I/O.
-- `unix_socket` remains usable by itself as a low-level override.
-- Omitting both selectors preserves current-working-directory behavior.
-- The Hermes hook registers the completion sink using the exact selector from the admitted enqueue call and does not retain mutable cross-call routing state.
-- A malformed or unavailable project route does not replace the MCP tool result, fail the Hermes turn, or register against an environment-selected different owner.
+- Two call-scoped selectors together produce the existing MCP validation error or CLI usage error before network or socket I/O; no new envelope outcome is added.
+- Either call-scoped selector overrides a namespace-level default route; `unix_socket` remains usable by itself as a low-level override.
+- Omitting both selectors preserves namespace-level default and current-working-directory behavior.
+- `cflx_wait` derives its completion-evidence repository from the same selected project as the owner socket, even when the MCP server CWD contains a colliding change ID.
+- The Hermes hook registers the completion sink using the exact selector and complete binding from the admitted enqueue call and does not retain mutable cross-call routing state.
+- In the Hermes hook, a malformed or unavailable project route does not replace the original MCP tool result, fail the Hermes turn, or register against an environment-selected different owner.
 - Documentation no longer recommends fixing a project socket in global Hermes MCP configuration.
 
 ## Explicit Completion Conditions
 
-- The shared client route resolver accepts mutually exclusive `project_dir` and `unix_socket` selectors and is used by all six MCP tools.
-- Project resolution handles ordinary repositories and linked worktrees using the absolute Git common directory.
-- MCP schemas and tool descriptions present `project_dir` as the normal selector and `unix_socket` as the low-level override.
-- The Hermes post-tool hook no longer discards `args`; callback registration preserves the enqueue call's selector.
-- Tests prove two-project routing, worktree routing, conflict refusal with no contact, low-level socket routing, default-CWD compatibility, and plugin callback affinity.
-- README examples show one socket-unbound Hermes MCP registration and per-call `project_dir` usage.
+- The shared client route resolver accepts one call-scoped absolute `project_dir` or `unix_socket`, lets that call override namespace defaults, and is used by the CLI plus all six MCP tools.
+- Project resolution handles ordinary repositories, linked worktrees, submodules, canonicalized symlinks, and directories below the worktree while rejecting relative paths, bare repositories, and non-repositories.
+- The selected project supplies both the owner socket and repository-evidence root; `wait` never mixes them with server-CWD evidence.
+- CLI/MCP schemas and tool descriptions present `project_dir` as the normal selector and `unix_socket` as the low-level override without adding an envelope outcome.
+- The Hermes post-tool hook no longer discards `args`; callback registration invokes the CLI's explicit selector and preserves `instance_id`, `execution_id`, and `change_id`.
+- Tests prove two-project routing, worktree routing, wait evidence isolation for colliding change IDs, call-versus-default precedence, conflict refusal with no contact, low-level socket routing, default-CWD compatibility, and plugin callback affinity.
+- README, embedded skill, and `AGENTS.md` examples show one socket-unbound Hermes MCP registration and per-call `project_dir` usage.
 - Targeted tests, formatting, Clippy, strict/evidence validation, and archive-gate validation pass.
 
 ## Safety and Compatibility
