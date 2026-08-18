@@ -504,7 +504,7 @@ The generated OpenAPI document produced from the source declarations MUST be the
 
 ### Requirement: Event mark changes share the authoritative state revision
 
-When an existing typed failure, rejection, rejected or parallel-ineligible refresh, dequeue, target-scoped stop, or first `on_merged` hook-recovery event revokes an execution mark, `/api/v2` MUST publish the reconciled `execution_marked` value in the same authoritative state revision as that event's reducer/frontend transition. The first effective `ChangeArchived` transition MUST additionally revoke its target mark in that archive revision. The projection MUST read the shared `ExecutionMarkStore` after pre/post event reconciliation and MUST NOT wait for an unrelated refresh or create a second mark-only revision.
+When an existing typed failure, rejection, rejected or parallel-ineligible refresh, dequeue, target-scoped stop, or first `on_merged` hook-recovery event revokes an execution mark, `/api/v2` MUST publish the reconciled `execution_marked` value in the same authoritative state revision as that event's reducer/frontend transition. A `ChangeArchived` transition MUST preserve its target mark in that archive revision. The projection MUST read the shared `ExecutionMarkStore` after pre/post event reconciliation and MUST NOT wait for an unrelated refresh or create a second mark-only revision.
 
 Duplicate or late delivery that changes neither reducer state nor execution marks MUST NOT advance another state revision. Event reconciliation MUST preserve unrelated marks in the same snapshot. A duplicate failure delivered after an explicit re-mark MUST preserve that fresh mark when it creates no new reducer transition. Process-level Stopped transitions MUST retain marked resume targets.
 
@@ -523,13 +523,13 @@ Duplicate or late delivery that changes neither reducer state nor execution mark
 - **THEN** that refresh revision reports `alpha.execution_marked` as false
 - **AND** `beta.execution_marked` remains true
 
-#### Scenario: archive transition clears only its target
+#### Scenario: archive transition preserves target and unrelated marks
 
 - **GIVEN** `alpha` and `beta` are marked
 - **WHEN** the first effective `ChangeArchived(alpha)` transition is projected
-- **THEN** that archive revision reports `alpha.execution_marked` as false
+- **THEN** that archive revision reports `alpha.execution_marked` as true
 - **AND** `beta.execution_marked` remains true
-- **AND** later merged or pushed projection does not recreate the mark
+- **AND** later merged or pushed projection continues to retain both marks
 
 #### Scenario: on_merged recovery and cleared mark are coherent
 
@@ -558,7 +558,7 @@ Duplicate or late delivery that changes neither reducer state nor execution mark
 - **THEN** the stopped revision retains those `execution_marked` values
 - **AND** queue intent and reducer stop reconciliation remain separate from mark ownership
 
-<!-- Expected canonical result after archive: `remote-control-api` will expose lifecycle-independent pure marks, deterministic terminal no-ops, precise final admission, and ChangeArchived as an additional coherent revocation edge. -->
+<!-- Expected canonical result after archive: `remote-control-api` will publish archive, merge, and push transitions without revoking lifecycle-independent execution marks. -->
 
 ### Requirement: Persistent-scheduler idle is explicit in the operator snapshot
 
