@@ -159,6 +159,46 @@ fn client_subscribe_help_and_usage_documents_an_argv_callback_and_proposal_scope
     );
 }
 
+/// The first place an operator reads about the namespace is the top-level
+/// synopsis, so it advertises the verbs that exist rather than the retired one.
+/// `cflx client --help` being correct proves nothing about this text: it is a
+/// hand-written `long_about` clap never regenerates from the subcommand set.
+#[test]
+fn top_level_help_synopsis_names_current_client_verbs_and_retires_enqueue() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let top_level = run_cli(tmp.path(), &["--help"], &[]);
+    assert!(top_level.status.success(), "{}", stderr_of(&top_level));
+    let help = stdout_of(&top_level);
+
+    let synopsis = help
+        .lines()
+        .find(|line| line.trim_start().starts_with("client "))
+        .unwrap_or_else(|| {
+            panic!("the top-level help must describe the client namespace:\n{help}")
+        });
+    for verb in [
+        "status",
+        "mark",
+        "start",
+        "stop",
+        "wait",
+        "subscribe",
+        "mcp",
+    ] {
+        assert!(
+            synopsis.contains(verb),
+            "the top-level synopsis must name {verb}:\n{synopsis}"
+        );
+    }
+
+    for retired in ["enqueue", "notify"] {
+        assert!(
+            !help.contains(retired),
+            "{retired} is retired and must not appear in the top-level help:\n{help}"
+        );
+    }
+}
+
 /// The control verbs are documented as the operator's own, and the namespace
 /// must no longer offer an admission-shaped one.
 #[test]

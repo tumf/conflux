@@ -40,7 +40,7 @@ Automates the OpenSpec change workflow:
 SUBCOMMANDS:
   run      Execute orchestration loop (non-interactive)
   tui      Launch interactive TUI dashboard (default)
-  client   Operate an existing owner (status/enqueue/wait/mcp) without becoming one
+  client   Operate an existing owner (status/mark/start/stop/wait/subscribe/mcp) without becoming one
   init     Generate configuration template
   openapi  Print the generated /api/v2 OpenAPI 3.1 schema to stdout
 
