@@ -42,8 +42,6 @@ pub struct MarkEvidence {
     pub dequeued: bool,
     /// The change is waiting for a merge that needs operator recovery.
     pub merge_wait: bool,
-    /// The change completed archive and left the pending set.
-    pub archived: bool,
 }
 
 impl MarkEvidence {
@@ -52,21 +50,14 @@ impl MarkEvidence {
     /// An untracked change reports the default (nothing observed), which is what
     /// makes a first-sighting event unable to look like a transition.
     pub fn observe(state: &OrchestratorState, change_id: &str) -> Self {
-        // Archive membership is a run-level aggregate rather than per-change
-        // runtime, so it is read even for a change with no runtime entry.
-        let archived = state.is_archived(change_id);
         let Some(runtime) = state.change_runtime(change_id) else {
-            return Self {
-                archived,
-                ..Self::default()
-            };
+            return Self::default();
         };
         Self {
             error: matches!(runtime.terminal, TerminalState::Error(_)),
             rejected: matches!(runtime.terminal, TerminalState::Rejected(_)),
             dequeued: runtime.dequeued,
             merge_wait: matches!(runtime.wait_state, WaitState::MergeWait),
-            archived,
         }
     }
 }
@@ -87,12 +78,6 @@ pub enum RevokingEdge {
     Dequeue,
     /// The first `on_merged` hook failure that enters merge-wait recovery.
     MergedHookRecovery,
-    /// The first effective archive completion.
-    ///
-    /// This is the terminal edge where next-run intent stops having meaning: an
-    /// archived row is no longer a run candidate, and the later `merged` and
-    /// `pushed` transitions must not be able to bring the mark back.
-    Archive,
 }
 
 impl RevokingEdge {
@@ -107,7 +92,6 @@ impl RevokingEdge {
             Self::Rejection => post.rejected && !pre.rejected,
             Self::Dequeue => post.dequeued && !pre.dequeued,
             Self::MergedHookRecovery => post.merge_wait && !pre.merge_wait,
-            Self::Archive => post.archived && !pre.archived,
         }
     }
 }
@@ -116,10 +100,11 @@ impl RevokingEdge {
 ///
 /// `None` for every event that carries no revoking edge, including process-level
 /// `Stopped`, global fatal `Error`, `ChangeSkipped`, dependency and stalled
-/// holds, ordinary merge/resolve waits, and every non-archive success
-/// transition — `MergeCompleted` and a push completion included, because the
-/// archive edge already cleared the mark and a second clear would only give the
-/// same fact two authorities.
+/// holds, ordinary merge/resolve waits, and every success transition —
+/// `ChangeArchived`, `MergeCompleted`, and a push completion included. A mark is
+/// a lifecycle-independent operator annotation, not next-run intent that a
+/// successful lifecycle milestone invalidates, so reaching one of those
+/// milestones is not something a mark has to be revoked for.
 pub fn revoking_edge_target(event: &ExecutionEvent) -> Option<(&str, RevokingEdge)> {
     use ExecutionEvent as E;
     match event {
@@ -132,7 +117,6 @@ pub fn revoking_edge_target(event: &ExecutionEvent) -> Option<(&str, RevokingEdg
             Some((change_id, RevokingEdge::ChangeLevelFailure))
         }
         E::ChangeRejected { change_id, .. } => Some((change_id, RevokingEdge::Rejection)),
-        E::ChangeArchived(change_id) => Some((change_id, RevokingEdge::Archive)),
         E::ChangeDequeued { change_id } | E::ChangeStopped { change_id } => {
             Some((change_id, RevokingEdge::Dequeue))
         }
