@@ -191,6 +191,13 @@ impl AnalysisInputProbe for FakeAnalysisInputProbe {
 /// The analyzer callback's return type, as required by the scheduler loop.
 type AnalysisFuture<'a> = Pin<Box<dyn Future<Output = AnalysisOutcome> + Send + 'a>>;
 
+/// The in-flight holder that keeps an inert dispatch from reading as the
+/// idle-scheduler anomaly which deliberately forgets a completed input.
+const DISPATCH_HOLDER: &str = "dispatch-holder";
+
+/// A dependency no reducer, repository, or analysis result can ever resolve.
+const UNRESOLVABLE_DEPENDENCY: &str = "never-resolvable-dependency";
+
 /// Mutable script for the analyzer test double.
 ///
 /// Every knob mirrors something the real analyzer can do: how long it takes, whether its result
@@ -202,6 +209,11 @@ struct AnalyzerScript {
     duration: StdMutex<Duration>,
     provenance: StdMutex<AnalysisProvenance>,
     dependencies: StdMutex<HashMap<String, Vec<String>>>,
+    /// A dependency reported for *every* ordered change, on top of `dependencies`.
+    ///
+    /// The lever a harness uses to keep dispatch selection empty without taking
+    /// away the capacity the analyzer itself now needs.
+    blanket_dependency: StdMutex<Option<String>>,
     empty_order: StdMutex<bool>,
     during_analysis: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// In-flight ID lists exactly as the analyzer received them, one entry per invocation.
@@ -215,6 +227,7 @@ impl AnalyzerScript {
             duration: StdMutex::new(Duration::from_secs(1)),
             provenance: StdMutex::new(AnalysisProvenance::HealthyLlm),
             dependencies: StdMutex::new(HashMap::new()),
+            blanket_dependency: StdMutex::new(None),
             empty_order: StdMutex::new(false),
             during_analysis: StdMutex::new(None),
             observed_in_flight: StdMutex::new(Vec::new()),
@@ -248,6 +261,14 @@ impl AnalyzerScript {
         *self.empty_order.lock().expect("empty order lock") = empty_order;
     }
 
+    /// Report `dependency` for every ordered change, or nothing when `None`.
+    fn set_blanket_dependency(&self, dependency: Option<&str>) {
+        *self
+            .blanket_dependency
+            .lock()
+            .expect("blanket dependency lock") = dependency.map(str::to_string);
+    }
+
     fn run_during_analysis(&self, effect: impl Fn() + Send + Sync + 'static) {
         *self.during_analysis.lock().expect("during analysis lock") = Some(Box::new(effect));
     }
@@ -269,11 +290,24 @@ fn scripted_analyzer(
         } else {
             changes.iter().map(|change| change.id.clone()).collect()
         };
-        let dependencies = script
+        let mut dependencies = script
             .dependencies
             .lock()
             .expect("dependencies lock")
             .clone();
+        if let Some(blanket) = script
+            .blanket_dependency
+            .lock()
+            .expect("blanket dependency lock")
+            .clone()
+        {
+            for change_id in &order {
+                dependencies
+                    .entry(change_id.clone())
+                    .or_default()
+                    .push(blanket.clone());
+            }
+        }
         let provenance = *script.provenance.lock().expect("provenance lock");
         let duration = *script.duration.lock().expect("duration lock");
         if let Some(effect) = script
@@ -360,11 +394,47 @@ impl SuppressionHarness {
         *last_change = Some(std::time::Instant::now() - Duration::from_secs(600));
     }
 
-    /// Occupy all dispatch capacity, as the live run's in-flight changes did.
-    fn occupy_all_capacity(&mut self) -> Arc<AtomicUsize> {
-        let counter = Arc::new(AtomicUsize::new(self.max_parallelism));
-        self.executor.set_manual_resolve_counter(counter.clone());
-        counter
+    /// Hold ordinary dispatch inert while leaving the analyzer a slot to run in.
+    ///
+    /// This harness used to occupy *every* dispatch slot, which was a cheap way
+    /// to stop each pass before it created real worktrees and spawned real agent
+    /// commands. The analyzer is capacity-gated now, so occupying every slot
+    /// would suppress the very analysis these tests are about. Instead:
+    ///
+    /// - exactly one slot stays free, so analysis runs on every eligible wake;
+    /// - every analyzed candidate is reported as depending on a change no
+    ///   reducer, repository, or analysis result can resolve, so dispatch
+    ///   selection starts nothing; and
+    /// - one holder stays in flight, because an empty selection over an *idle*
+    ///   scheduler is the separate anomaly that deliberately forgets a completed
+    ///   input.
+    fn keep_dispatch_inert(&mut self) {
+        self.script
+            .set_blanket_dependency(Some(UNRESOLVABLE_DEPENDENCY));
+        self.in_flight.insert(DISPATCH_HOLDER.to_string());
+        self.grant_one_dispatch_slot();
+    }
+
+    /// Let ordinary dispatch start again, as a resolved dependency would.
+    fn allow_dispatch(&mut self) {
+        self.script.set_blanket_dependency(None);
+    }
+
+    /// Size capacity so exactly one dispatch slot is free.
+    fn grant_one_dispatch_slot(&mut self) {
+        self.max_parallelism = self.in_flight.len() + 1;
+    }
+
+    /// Add an in-flight change, keeping exactly one dispatch slot free.
+    fn add_in_flight(&mut self, change_id: &str) {
+        self.in_flight.insert(change_id.to_string());
+        self.grant_one_dispatch_slot();
+    }
+
+    /// Replace the in-flight set, keeping exactly one dispatch slot free.
+    fn set_in_flight(&mut self, change_ids: &[&str]) {
+        self.in_flight = change_ids.iter().map(|id| id.to_string()).collect();
+        self.grant_one_dispatch_slot();
     }
 
     /// One scheduler loop iteration's queued re-analysis/dispatch evaluation, including the
@@ -464,8 +534,8 @@ impl SuppressionHarness {
 /// [`stable_multi_change_queue_is_analyzed_once`].
 const TIMER_WAKES: usize = 24;
 
-/// The live no-progress loop: stale debounce, stable queued work, no capacity, only 500 ms
-/// timer wakes.
+/// The live no-progress loop: stale debounce, stable queued work, inert dispatch,
+/// only 500 ms timer wakes.
 async fn assert_unchanged_timer_wakes_analyze_once(analysis_duration: Duration) {
     let temp_dir = TempDir::new().unwrap();
     let mut harness =
@@ -473,7 +543,7 @@ async fn assert_unchanged_timer_wakes_analyze_once(analysis_duration: Duration) 
     harness.script.set_duration(analysis_duration);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    let occupancy = harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     // The first ordinary timer evaluation analyzes the input once.
     harness.run_loop_iteration(&analyzer).await;
@@ -488,11 +558,6 @@ async fn assert_unchanged_timer_wakes_analyze_once(analysis_duration: Duration) 
     harness.timer_wakes(&analyzer, TIMER_WAKES).await;
 
     assert_eq!(
-        occupancy.load(Ordering::SeqCst),
-        1,
-        "the scenario must hold dispatch capacity at zero throughout"
-    );
-    assert_eq!(
         harness.analyses(),
         1,
         "unchanged timer wakes must not invoke the analyzer again; saw {} analyses",
@@ -501,7 +566,7 @@ async fn assert_unchanged_timer_wakes_analyze_once(analysis_duration: Duration) 
     assert_eq!(
         harness.queued.len(),
         1,
-        "queued work must be retained while capacity is zero"
+        "queued work must be retained while nothing dispatches it"
     );
     let (analysis_started, apply_started) = harness.drain_attempt_counts();
     assert_eq!(
@@ -537,7 +602,7 @@ async fn stable_multi_change_queue_is_analyzed_once() {
     let mut harness = SuppressionHarness::new(temp_dir.path().to_path_buf(), queued);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     harness.timer_wakes(&analyzer, 6).await;
@@ -561,7 +626,7 @@ async fn suppressed_wakes_do_not_probe_before_the_bounded_deadline() {
         SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(harness.analyses(), 1);
@@ -626,7 +691,7 @@ async fn queue_addition_bypasses_a_matching_signature_once() {
         SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     harness.timer_wakes(&analyzer, 4).await;
@@ -668,7 +733,7 @@ async fn each_explicit_edge_bypasses_a_matching_signature_once() {
             SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
         let analyzer = scripted_analyzer(harness.script.clone());
         harness.make_queue_debounce_stale().await;
-        harness.occupy_all_capacity();
+        harness.keep_dispatch_inert();
 
         harness.run_loop_iteration(&analyzer).await;
         harness.timer_wakes(&analyzer, 4).await;
@@ -701,7 +766,7 @@ async fn each_explicit_edge_bypasses_a_matching_signature_once() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn capacity_recovery_rearms_analysis_without_a_slot_recovery_reason() {
+async fn changed_capacity_rearms_analysis_without_a_slot_recovery_reason() {
     let repo_dir = TempDir::new().unwrap();
     let workspace_base = TempDir::new().unwrap();
     init_minimal_git_repo(repo_dir.path());
@@ -718,26 +783,27 @@ async fn capacity_recovery_rearms_analysis_without_a_slot_recovery_reason() {
     );
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    let occupancy = harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     harness.timer_wakes(&analyzer, 4).await;
-    assert_eq!(harness.analyses(), 1, "zero-capacity input analyzed once");
+    assert_eq!(harness.analyses(), 1, "the stable input is analyzed once");
     assert!(
-        harness.in_flight.is_empty(),
-        "dispatch stays suppressed while capacity is zero"
+        harness.queued.iter().any(|change| change.id == "queued-a"),
+        "the undispatched change stays queued"
     );
 
-    // Capacity recovers, but no slot-recovery reason is delivered: the timer fallback alone must
+    // Capacity changes, and no slot-recovery reason is delivered: available slots
+    // are part of the analysis-input signature, so the timer fallback alone must
     // notice the changed input.
-    occupancy.store(0, Ordering::SeqCst);
+    harness.max_parallelism += 1;
     harness.pass_probe_deadline().await;
     let (should_break, _iteration) = harness
         .run_loop_iteration(&analyzer)
         .await
         .expect("queued work must be evaluated");
 
-    assert!(!should_break, "capacity recovery must resume the scheduler");
+    assert!(!should_break, "changed capacity must resume the scheduler");
     assert_eq!(
         harness.reanalysis_reason,
         ReanalysisReason::Initial,
@@ -748,15 +814,20 @@ async fn capacity_recovery_rearms_analysis_without_a_slot_recovery_reason() {
         2,
         "changed capacity must re-arm dependency analysis"
     );
+
+    // And with the dependency block lifted, capacity really does dispatch the
+    // queued change rather than only re-analyzing it. Capacity moves again too:
+    // lifting a dependency is invisible to the input signature, so without it
+    // this evaluation would be suppressed as unchanged.
+    harness.allow_dispatch();
+    harness.max_parallelism += 1;
+    harness.pass_probe_deadline().await;
+    harness.run_loop_iteration(&analyzer).await;
     assert!(
-        harness.queued.is_empty(),
-        "eligible queued work must reach dispatch evaluation after capacity recovery"
+        harness.in_flight.contains("queued-a"),
+        "eligible queued work must reach dispatch once nothing blocks it"
     );
-    assert_eq!(
-        harness.in_flight.len(),
-        1,
-        "the recovered slot must be used by the queued change"
-    );
+    assert!(harness.queued.is_empty());
 
     harness.join_set.abort_all();
     while harness.join_set.join_next().await.is_some() {}
@@ -769,7 +840,7 @@ async fn same_id_queued_proposal_change_rearms_analysis() {
         SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     harness.timer_wakes(&analyzer, 4).await;
@@ -798,8 +869,8 @@ async fn same_id_in_flight_proposal_change_rearms_analysis() {
     );
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
-    harness.in_flight.insert("inflight-a".to_string());
+    harness.keep_dispatch_inert();
+    harness.add_in_flight("inflight-a");
 
     harness.run_loop_iteration(&analyzer).await;
     harness.timer_wakes(&analyzer, 4).await;
@@ -825,7 +896,7 @@ async fn effective_base_revision_change_rearms_analysis() {
         SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     harness.timer_wakes(&analyzer, 4).await;
@@ -856,7 +927,7 @@ async fn input_change_during_analysis_is_visible_at_the_next_probe() {
     });
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(harness.analyses(), 1);
@@ -880,7 +951,7 @@ async fn fresh_executor_starts_without_a_prior_analysis_signature() {
     let mut first = SuppressionHarness::new(temp_dir.path().to_path_buf(), queued.clone());
     let first_analyzer = scripted_analyzer(first.script.clone());
     first.make_queue_debounce_stale().await;
-    first.occupy_all_capacity();
+    first.keep_dispatch_inert();
     first.run_loop_iteration(&first_analyzer).await;
     first.timer_wakes(&first_analyzer, 4).await;
     assert_eq!(first.analyses(), 1);
@@ -890,7 +961,7 @@ async fn fresh_executor_starts_without_a_prior_analysis_signature() {
     let mut restarted = SuppressionHarness::new(temp_dir.path().to_path_buf(), queued);
     let restarted_analyzer = scripted_analyzer(restarted.script.clone());
     restarted.make_queue_debounce_stale().await;
-    restarted.occupy_all_capacity();
+    restarted.keep_dispatch_inert();
     restarted.run_loop_iteration(&restarted_analyzer).await;
 
     assert_eq!(
@@ -910,7 +981,7 @@ async fn degraded_fallback_suppresses_rapid_retries_and_permits_one_retry_after_
         .set_provenance(AnalysisProvenance::RecoverableFailureFallback);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(
@@ -958,7 +1029,7 @@ async fn healthy_result_after_a_degraded_record_becomes_non_expiring() {
         .set_provenance(AnalysisProvenance::RecoverableFailureFallback);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(harness.analyses(), 1);
@@ -994,7 +1065,7 @@ async fn intentional_metadata_only_result_is_not_treated_as_degraded() {
         .set_provenance(AnalysisProvenance::IntentionalMetadataOnly);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(harness.analyses(), 1);
@@ -1019,7 +1090,7 @@ async fn unusable_empty_result_establishes_no_completed_signature() {
     harness.script.set_empty_order(true);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(harness.analyses(), 1);
@@ -1081,7 +1152,7 @@ async fn revision_probe_failure_fails_open_without_recording_suppression() {
         SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
     harness.probe.fail_revision("revision resolution failed");
 
     // Every eligible evaluation must reach the analyzer, because a signature that cannot be built
@@ -1124,7 +1195,7 @@ async fn effective_base_ref_change_rearms_analysis() {
         SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
     harness.probe.set_effective_base("main", "commit-1");
 
     harness.run_loop_iteration(&analyzer).await;
@@ -1173,7 +1244,7 @@ async fn persistent_signature_failure_is_rate_limited_across_timer_wakes() {
         SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
     harness.probe.fail_revision("revision resolution failed");
 
     // The first eligible evaluation fails open: it analyzes despite having no signature.
@@ -1246,7 +1317,7 @@ async fn explicit_edge_bypasses_the_signature_failure_retry_deadline_once() {
             SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
         let analyzer = scripted_analyzer(harness.script.clone());
         harness.make_queue_debounce_stale().await;
-        harness.occupy_all_capacity();
+        harness.keep_dispatch_inert();
         harness.probe.fail_revision("revision resolution failed");
 
         harness.run_loop_iteration(&analyzer).await;
@@ -1285,7 +1356,7 @@ async fn signature_probe_recovery_reestablishes_suppression_without_a_queue_chan
         SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
     harness.probe.fail_revision("revision resolution failed");
 
     harness.run_loop_iteration(&analyzer).await;
@@ -1332,7 +1403,7 @@ async fn unusable_empty_result_retries_at_the_bounded_cadence() {
     harness.script.set_empty_order(true);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(harness.analyses(), 1);
@@ -1369,7 +1440,7 @@ async fn degraded_expiry_is_not_delayed_by_the_repository_probe_cadence() {
     harness.script.set_duration(Duration::ZERO);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(harness.analyses(), 1);
@@ -1405,9 +1476,9 @@ async fn in_flight_order_permutations_produce_one_deterministic_analyzer_input()
     );
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
     for id in ["inflight-c", "inflight-a", "inflight-b"] {
-        harness.in_flight.insert(id.to_string());
+        harness.add_in_flight(id);
     }
 
     harness.run_loop_iteration(&analyzer).await;
@@ -1416,10 +1487,7 @@ async fn in_flight_order_permutations_produce_one_deterministic_analyzer_input()
     // Rebuild the same in-flight set through a different insertion order. `HashSet` iteration is
     // not a repository-visible change, so it must neither invalidate the signature nor reorder
     // the analyzer prompt.
-    harness.in_flight.clear();
-    for id in ["inflight-b", "inflight-c", "inflight-a"] {
-        harness.in_flight.insert(id.to_string());
-    }
+    harness.set_in_flight(&[DISPATCH_HOLDER, "inflight-b", "inflight-c", "inflight-a"]);
     harness.pass_probe_deadline().await;
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(
@@ -1429,7 +1497,7 @@ async fn in_flight_order_permutations_produce_one_deterministic_analyzer_input()
     );
 
     // A real membership change still re-arms analysis.
-    harness.in_flight.insert("inflight-d".to_string());
+    harness.add_in_flight("inflight-d");
     harness.pass_probe_deadline().await;
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(
@@ -1455,7 +1523,7 @@ async fn proposal_read_failure_fails_open_without_recording_suppression() {
         SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
     let analyzer = scripted_analyzer(harness.script.clone());
     harness.make_queue_debounce_stale().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
     harness
         .probe
         .fail_proposal_digest("proposal.md could not be read");

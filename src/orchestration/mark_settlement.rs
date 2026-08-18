@@ -7,12 +7,13 @@
 //!
 //! This module is that bridge, and it is deliberately only a *policy* bridge —
 //! it merges no projection and owns no queue state. One accepted standalone
-//! operator mark write arms a single 10-second stability deadline. Every later
-//! accepted operator write replaces the pending snapshot and restarts that one
-//! deadline. When the deadline finally expires, settlement reads the marks that
-//! exist *then*, classifies them against one coherent reducer/operator view, and
-//! adds the eligible ordinary `not queued` rows through the same queue command
-//! path a frontend would have used.
+//! operator mark write arms a single 10-second stability deadline and records
+//! the targets whose marks that write actually changed. Every later accepted
+//! operator write merges its own changed targets into the same batch and
+//! restarts that one deadline. When the deadline finally expires, settlement
+//! re-reads *only the batch's targets* against one coherent reducer/operator
+//! view and reconciles each of them in both directions through the same queue
+//! command path a frontend would have used.
 //!
 //! Three properties are structural rather than rules to re-check:
 //!
@@ -21,9 +22,18 @@
 //! mutation guard — including from a bulk write — so re-entering the reducer or
 //! that guard here would deadlock the very command that armed it.
 //!
-//! *Settlement is additive-only.* The plan can only add. Unmarking changes mark
-//! intent and nothing else, so no mark control can dequeue, cancel, stop, retry,
-//! or resolve admitted work.
+//! *Settlement is delta-scoped.* A batch names exactly the targets whose marks
+//! actually changed, and reconciliation touches only those. A global mark/queue
+//! convergence would destroy explicit queue intent nobody expressed a mark for:
+//! an unmarked row can be explicitly queued, and a marked row can be explicitly
+//! removed from the queue. Neither may move because an unrelated mark settled.
+//!
+//! *Settlement is bidirectional but never a lifecycle control.* A newly marked
+//! ordinary `not queued` row gains queue intent; a newly unmarked ordinary
+//! pending row loses it. Removing queue intent is not dequeueing: no mark
+//! control can cancel, stop, alter a phase, retry, or resolve admitted work,
+//! because every row that is active, waiting, or terminal is excluded before a
+//! mutation is ever planned.
 //!
 //! *Nothing here is durable.* The deadline and the pending snapshot live in
 //! memory for one process lifetime. Under `openspec/CONSTITUTION.md` a restart
@@ -49,7 +59,7 @@ pub const MARK_STABILITY_WINDOW: Duration = Duration::from_secs(10);
 // Classification
 // ============================================================================
 
-/// Why one marked row produced no queue addition at settlement.
+/// Why one named row produced no queue mutation at settlement.
 ///
 /// Every reason is a *reasoned skip*, never a refusal: settlement is a
 /// background policy pass, so an ineligible row simply keeps its mark and gains
@@ -67,8 +77,10 @@ pub enum MarkSettlementExclusion {
     Active,
     /// The change is waiting — merge, resolve, reject, dependency, or stall.
     Waiting,
-    /// The change already carries reducer queue intent.
+    /// The change already carries reducer queue intent, and is marked.
     AlreadyQueued,
+    /// The change already carries no reducer queue intent, and is unmarked.
+    AlreadyNotQueued,
     /// Worktree execution refuses the change.
     Unavailable,
 }
@@ -82,30 +94,55 @@ impl MarkSettlementExclusion {
             Self::Active => "active",
             Self::Waiting => "waiting",
             Self::AlreadyQueued => "already_queued",
+            Self::AlreadyNotQueued => "already_not_queued",
             Self::Unavailable => "unavailable",
         }
     }
 }
 
-/// One marked change as a single settlement observation saw it.
+/// The queue mutation one reconciled row asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkSettlementAction {
+    /// The row is marked and idle-ordinary-`not queued`: publish queue intent.
+    Add,
+    /// The row is unmarked and idle-ordinary-`queued`: withdraw queue intent.
+    Remove,
+}
+
+/// One named change as a single settlement observation saw it.
 #[derive(Debug, Clone, Copy)]
 pub struct MarkSettlementRow<'a> {
     /// Target change.
     pub change_id: &'a str,
     /// Reducer-derived display status at the observation instant.
+    ///
+    /// One word carries the whole lifecycle: `"queued"` is reachable only when
+    /// the reducer intent is `Queued` *and* the activity is idle *and* no wait
+    /// or terminal state applies, and `"not queued"` is its `NotQueued` mirror.
+    /// That is exactly the "idle ordinary pending" the reconciliation rule
+    /// names, derived from one snapshot instead of three separate reads that
+    /// could disagree.
     pub display_status: &'a str,
     /// Whether the reducer tracks the change at all.
     pub tracked: bool,
     /// Whether worktree execution admits the change.
     pub parallel_eligible: bool,
+    /// Whether the change carries an execution mark *now*, at expiry.
+    ///
+    /// Read at the settlement observation rather than taken from the batch: a
+    /// target can be marked and unmarked again inside one stability window, and
+    /// what the operator left behind is what reconciliation must honour.
+    pub marked: bool,
 }
 
-/// The additive plan one settlement pass derived.
+/// The bidirectional plan one settlement pass derived.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MarkSettlementPlan {
-    /// Changes to add through the shared queue command path, in observation order.
+    /// Changes to queue through the shared queue command path, in observation order.
     pub additions: Vec<String>,
-    /// Marked rows that gained no queue effect, each with its reason.
+    /// Changes to unqueue through the shared queue command path, in observation order.
+    pub removals: Vec<String>,
+    /// Named rows that gained no queue effect, each with its reason.
     pub excluded: Vec<(String, MarkSettlementExclusion)>,
 }
 
@@ -113,54 +150,61 @@ impl MarkSettlementPlan {
     /// True when the plan would mutate nothing.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
-        self.additions.is_empty()
+        self.additions.is_empty() && self.removals.is_empty()
     }
 }
 
-/// Classify one marked row; `None` means it is an ordinary admission candidate.
+/// Classify one named row into the mutation it asks for, or why it asks for none.
 ///
 /// The order is precedence, not convenience: a terminal row that also happens to
 /// be ineligible must report `Terminal`, because that is the reason its mark can
-/// never become queue intent again.
+/// never become queue intent again. Every lifecycle exclusion is evaluated
+/// before the mark is consulted at all, which is what makes "unmarking cannot
+/// disturb active, waiting, or terminal work" structural rather than a rule the
+/// removal branch has to re-check.
 pub fn classify_mark_settlement_row(
     row: &MarkSettlementRow<'_>,
-) -> Option<MarkSettlementExclusion> {
+) -> std::result::Result<MarkSettlementAction, MarkSettlementExclusion> {
     if !row.tracked {
-        return Some(MarkSettlementExclusion::NotLoadable);
+        return Err(MarkSettlementExclusion::NotLoadable);
     }
     if is_final_status(row.display_status) || matches!(row.display_status, "error" | "stopped") {
-        return Some(MarkSettlementExclusion::Terminal);
+        return Err(MarkSettlementExclusion::Terminal);
     }
     if is_active_status(row.display_status) {
-        return Some(MarkSettlementExclusion::Active);
+        return Err(MarkSettlementExclusion::Active);
     }
     if matches!(
         row.display_status,
         "merge wait" | "resolve pending" | "reject pending" | "blocked" | "stalled"
     ) {
-        return Some(MarkSettlementExclusion::Waiting);
+        return Err(MarkSettlementExclusion::Waiting);
     }
-    if row.display_status == "queued" {
-        return Some(MarkSettlementExclusion::AlreadyQueued);
-    }
-    if row.display_status != "not queued" {
+    match row.display_status {
+        "queued" if row.marked => Err(MarkSettlementExclusion::AlreadyQueued),
+        "queued" => Ok(MarkSettlementAction::Remove),
+        "not queued" if !row.marked => Err(MarkSettlementExclusion::AlreadyNotQueued),
+        "not queued" if !row.parallel_eligible => Err(MarkSettlementExclusion::Unavailable),
+        "not queued" => Ok(MarkSettlementAction::Add),
         // An unrecognised word is not evidence of admissibility. Fail closed so a
-        // future display status cannot silently become a queue addition.
-        return Some(MarkSettlementExclusion::Waiting);
+        // future display status cannot silently become a queue mutation.
+        _ => Err(MarkSettlementExclusion::Waiting),
     }
-    if !row.parallel_eligible {
-        return Some(MarkSettlementExclusion::Unavailable);
-    }
-    None
 }
 
-/// Derive the whole additive plan from one coherent observation.
+/// Derive the whole bidirectional plan from one coherent observation.
+///
+/// `rows` are the batch's targets and nothing else. A row the batch never named
+/// is not in this input, which is what keeps an explicitly queued unmarked
+/// change — and a marked change explicitly removed from the queue — untouched by
+/// somebody else's mark settling.
 pub fn plan_mark_settlement(rows: &[MarkSettlementRow<'_>]) -> MarkSettlementPlan {
     let mut plan = MarkSettlementPlan::default();
     for row in rows {
         match classify_mark_settlement_row(row) {
-            Some(reason) => plan.excluded.push((row.change_id.to_string(), reason)),
-            None => plan.additions.push(row.change_id.to_string()),
+            Ok(MarkSettlementAction::Add) => plan.additions.push(row.change_id.to_string()),
+            Ok(MarkSettlementAction::Remove) => plan.removals.push(row.change_id.to_string()),
+            Err(reason) => plan.excluded.push((row.change_id.to_string(), reason)),
         }
     }
     plan
@@ -184,14 +228,19 @@ pub trait MarkSettlementRuntime: Send + Sync {
     /// reports `Select` while parked and is still perfectly able to admit work.
     fn admits_dynamic_queue(&self) -> bool;
 
-    /// Read the current marks, classify them, and apply the additive plan.
-    async fn settle_marks(&self) -> MarkSettlementPlan;
+    /// Re-read exactly `targets`, classify them, and apply the plan.
+    ///
+    /// `targets` is the settled batch: every change whose mark an accepted
+    /// operator write actually flipped since the last pass, in the order those
+    /// writes were accepted. It is a *scope*, not a set of marks — the current
+    /// mark of each target is read here, at expiry.
+    async fn settle_marks(&self, targets: Vec<String>) -> MarkSettlementPlan;
 
-    /// Report that a pending snapshot was abandoned because the scheduler ended.
+    /// Report that a pending batch was abandoned because the scheduler ended.
     ///
     /// Informational only. A finite run gets no new termination barrier, so the
-    /// operator learns that the marks they made will not be admitted rather than
-    /// discovering it from a run that silently did nothing.
+    /// operator learns that the marks they made will not be reconciled rather
+    /// than discovering it from a run that silently did nothing.
     async fn report_abandoned_settlement(&self, pending: Vec<String>);
 }
 
@@ -227,9 +276,14 @@ struct CoordinatorInner {
     runtime: Option<Weak<dyn MarkSettlementRuntime>>,
     /// Monotonic arming identity. A task whose generation is stale exits.
     generation: u64,
-    /// The mark set observed when the current deadline was armed.
+    /// The settlement batch: every target whose mark an accepted operator write
+    /// changed since the last completed pass, in acceptance order.
     ///
-    /// Evidence only — settlement deliberately re-reads the marks that exist at
+    /// It accumulates rather than replaces. Restarting the deadline must not
+    /// drop the earlier writes it is waiting on, or a two-keystroke unmark
+    /// followed by a mark elsewhere would reconcile only the second target.
+    ///
+    /// Scope only — settlement deliberately re-reads the *marks* that exist at
     /// expiry, so a lifecycle-driven revocation lands in the final plan without
     /// extending the deadline.
     pending: Option<Vec<String>>,
@@ -300,7 +354,11 @@ impl MarkSettlementCoordinator {
         self.window
     }
 
-    /// Arm or restart the single stability deadline for `snapshot`.
+    /// Merge `changed` into the settlement batch and restart the one deadline.
+    ///
+    /// `changed` names the targets whose marks this accepted write actually
+    /// flipped — one for a single-row write, many for a bulk one, none for a
+    /// no-op, which never reaches here at all.
     ///
     /// Returns true when a deadline is now pending. False means the process has
     /// no live scheduler capable of dynamic queue admission, so the mark write
@@ -309,7 +367,7 @@ impl MarkSettlementCoordinator {
     /// Lock discipline matters here. This is called with the operator mutation
     /// guard held, so it must never take the reducer, take that guard again, or
     /// await anything; it records timer state and spawns the settlement task.
-    pub fn notify(self: &Arc<Self>, snapshot: Vec<String>) -> bool {
+    pub fn notify(self: &Arc<Self>, changed: Vec<String>) -> bool {
         let Some(runtime) = self.runtime() else {
             return false;
         };
@@ -325,7 +383,16 @@ impl MarkSettlementCoordinator {
         let generation = {
             let mut guard = self.lock();
             guard.generation += 1;
-            guard.pending = Some(snapshot);
+            let batch = guard.pending.get_or_insert_with(Vec::new);
+            for change_id in changed {
+                // Acceptance order, deduplicated: a target marked, unmarked, and
+                // marked again inside one window is still one target to
+                // reconcile, and re-reading it twice could only produce the same
+                // classification twice.
+                if !batch.iter().any(|existing| existing == &change_id) {
+                    batch.push(change_id);
+                }
+            }
             guard.generation
         };
 
@@ -338,7 +405,7 @@ impl MarkSettlementCoordinator {
         true
     }
 
-    /// The marks observed when the current deadline was armed, if one is pending.
+    /// The batch the current deadline is waiting on, if one is pending.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn pending_snapshot(&self) -> Option<Vec<String>> {
         self.lock().pending.clone()
@@ -387,11 +454,12 @@ impl MarkSettlementCoordinator {
 
     /// Run one expired deadline, or exit because it was superseded.
     async fn settle(self: Arc<Self>, generation: u64) {
-        let snapshot = {
+        let batch = {
             let mut guard = self.lock();
             if guard.generation != generation {
-                // A later accepted operator write already replaced this snapshot.
-                // Exactly one deadline is live, so this task simply retires.
+                // A later accepted operator write already merged into this batch
+                // and restarted the deadline. Exactly one deadline is live, so
+                // this task simply retires and the batch stays pending.
                 return;
             }
             guard.pending.take()
@@ -406,13 +474,13 @@ impl MarkSettlementCoordinator {
         if !runtime.admits_dynamic_queue() {
             self.lock().abandoned += 1;
             runtime
-                .report_abandoned_settlement(snapshot.unwrap_or_default())
+                .report_abandoned_settlement(batch.unwrap_or_default())
                 .await;
             self.record_pass();
             return;
         }
 
-        let plan = runtime.settle_marks().await;
+        let plan = runtime.settle_marks(batch.unwrap_or_default()).await;
         {
             let mut guard = self.lock();
             guard.settled += 1;

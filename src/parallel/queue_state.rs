@@ -222,6 +222,12 @@ impl ReanalysisFlowDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReanalysisExecutionDecision {
     effective_reason: ReanalysisReason,
+    /// Dispatch capacity recomputed for *this* evaluation.
+    ///
+    /// The analyzer gate and the trigger-lifetime rule both read this one value
+    /// rather than recomputing it separately, so they can never disagree about
+    /// whether the same pass had capacity.
+    available_slots: usize,
 }
 
 enum DependencyAnalysisAttempt {
@@ -3195,6 +3201,46 @@ impl ParallelExecutor {
         .await;
     }
 
+    /// Suppress the analyzer for one zero-capacity evaluation.
+    ///
+    /// Records nothing. A signature says "this exact input was analysed", and a
+    /// suppression record says "this exact input was analysed and produced
+    /// nothing new" — neither is true of an input the analyzer never saw. Writing
+    /// either here is what would swallow the queue, completion, repair, or
+    /// slot-recovery edge that is still waiting to be evaluated, so the flag it
+    /// sets instead tells the loop step to leave that edge unconsumed.
+    async fn suppress_analysis_for_zero_capacity(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+    ) {
+        self.analyzer_capacity_suppressed = true;
+        info!(
+            max_parallelism,
+            in_flight = in_flight.len(),
+            queued = queued.len(),
+            manual_resolve_active = self.manual_resolve_active(),
+            auto_resolve_active = self.auto_resolve_count.load(Ordering::Relaxed),
+            "Skipping dependency analysis because no execution slots are available"
+        );
+        self.emit_no_analysis_diagnostic(
+            queued,
+            in_flight,
+            max_parallelism,
+            "analysis_capacity_zero",
+        )
+        .await;
+    }
+
+    /// Whether this pass suppressed the analyzer purely for lack of capacity.
+    ///
+    /// Read once by the loop step that owns trigger lifetime, immediately after
+    /// the pass it describes.
+    pub(super) fn analyzer_capacity_suppressed(&self) -> bool {
+        self.analyzer_capacity_suppressed
+    }
+
     async fn prepare_dispatch_candidates(
         &mut self,
         queued: &[crate::openspec::Change],
@@ -3297,7 +3343,10 @@ impl ParallelExecutor {
                 reanalysis_reason
             };
 
-        ReanalysisExecutionDecision { effective_reason }
+        ReanalysisExecutionDecision {
+            effective_reason,
+            available_slots,
+        }
     }
 
     /// Probe the repository-visible material a signature needs.
@@ -4012,12 +4061,30 @@ impl ParallelExecutor {
             ));
         }
 
+        // Capacity is recomputed inside this call, and `last_available_slots` is
+        // recorded there — which is what lets the *next* pass recognise zero to
+        // positive recovery and promote its queue trigger. So the gate below has
+        // to run after it, never instead of it.
         let analysis_decision = self.compute_effective_reanalysis_reason(
             queued,
             in_flight,
             max_parallelism,
             reanalysis_reason,
         );
+
+        // Classification, reducer-intent reconciliation, and operator diagnostics
+        // have all run by now; only the expensive analyzer and ordinary dispatch
+        // are gated on capacity. Nothing below this point may execute at zero
+        // slots, because everything below it either invokes the analyzer or
+        // records suppression state derived from having invoked it.
+        if analysis_decision.available_slots == 0 {
+            self.suppress_analysis_for_zero_capacity(queued, in_flight, max_parallelism)
+                .await;
+            return Ok(DependencyAnalysisPass::terminal(
+                ReanalysisFlowDecision::done(false, iteration),
+            ));
+        }
+
         if let Some((should_break, iteration)) = self
             .should_run_analysis_now(
                 queued,
@@ -4096,6 +4163,10 @@ impl ParallelExecutor {
             cleanup_guard,
             work_snapshot,
         } = ctx;
+
+        // Per-pass, and cleared before anything can set it: a stale flag from an
+        // earlier evaluation would preserve an edge this pass really did consume.
+        self.analyzer_capacity_suppressed = false;
 
         if self.is_cancelled() {
             info!(

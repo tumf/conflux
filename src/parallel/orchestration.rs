@@ -79,10 +79,16 @@
 //!   analysis-input signature, so the bounded timer evaluation re-analyzes even when a
 //!   slot-recovery notification is lost.
 //!
+//! An evaluation that found zero slots is the one case where an edge survives its
+//! pass: the expensive analyzer never ran, so nothing the trigger was asking for was
+//! evaluated, and consuming it would leave capacity recovery with no immediate signal
+//! at all. See `ParallelExecutor::analyzer_capacity_suppressed`.
+//!
 //! Coverage lives in `src/parallel/tests/reanalysis_trigger_lifetime.rs` (edge lifetime,
-//! merge-outcome capacity release), `src/parallel/tests/conflict.rs` (auto-resolve guard
-//! release on success / failure / early return), and
-//! `src/parallel/tests/auto_resolve.rs` (deferred retry convergence).
+//! merge-outcome capacity release), `src/parallel/tests/capacity_gated_reanalysis.rs`
+//! (the zero-capacity analyzer gate and slot recovery through it),
+//! `src/parallel/tests/conflict.rs` (auto-resolve guard release on success / failure /
+//! early return), and `src/parallel/tests/auto_resolve.rs` (deferred retry convergence).
 
 use crate::error::Result;
 use crate::events::LogEntry;
@@ -1187,7 +1193,16 @@ impl ParallelExecutor {
         let evaluated_reason = ctx.reanalysis_reason;
         let result = self.perform_reanalysis_and_dispatch(ctx).await?;
 
-        if *reanalysis_reason == evaluated_reason && evaluated_reason.is_one_shot_edge_trigger() {
+        // A pass that skipped the analyzer purely for lack of capacity evaluated
+        // nothing this trigger was asking for. Consuming the edge there would
+        // discard the one immediate liveness signal that survives a full
+        // scheduler — the recovery wake would then have to rediscover the work
+        // through the ordinary debounced timer, or not at all.
+        let evaluated = !self.analyzer_capacity_suppressed();
+        if evaluated
+            && *reanalysis_reason == evaluated_reason
+            && evaluated_reason.is_one_shot_edge_trigger()
+        {
             *reanalysis_reason = ReanalysisReason::Initial;
         }
 

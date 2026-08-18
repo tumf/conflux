@@ -54,7 +54,9 @@ use crate::events::{
     OperatorCommandEffect, OutcomeRevisions,
 };
 use crate::orchestration::apply_commit_evidence::ApplyCommitEvidencePort;
-use crate::orchestration::mark_settlement::{MarkSettlementPlan, MarkSettlementRuntime};
+use crate::orchestration::mark_settlement::{
+    MarkSettlementAction, MarkSettlementPlan, MarkSettlementRuntime,
+};
 use crate::orchestration::operator_command::{OperatorMode, OperatorOutcome, PendingTermination};
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
@@ -949,19 +951,62 @@ impl MarkSettlementRuntime for OperatorApplication {
         self.run_control.scheduler().is_running()
     }
 
-    async fn settle_marks(&self) -> MarkSettlementPlan {
+    async fn settle_marks(&self, targets: Vec<String>) -> MarkSettlementPlan {
         // Classification happens outside the application gate; only the derived
         // plan is applied under it. Settlement therefore never holds the gate
         // across a reducer read, and never waits on a base-mutating lane.
-        let plan = self.run_control.operator().plan_mark_settlement().await;
-        for change_id in &plan.additions {
-            self.apply(OperatorIntent::SetQueueIntent {
-                change_id: change_id.clone(),
-                queued: true,
-            })
+        let plan = self
+            .run_control
+            .operator()
+            .plan_mark_settlement(&targets)
             .await;
+
+        let mutations = plan
+            .additions
+            .iter()
+            .map(|change_id| (change_id, MarkSettlementAction::Add))
+            .chain(
+                plan.removals
+                    .iter()
+                    .map(|change_id| (change_id, MarkSettlementAction::Remove)),
+            );
+
+        let mut applied_membership_change = false;
+        for (change_id, action) in mutations {
+            let application = {
+                // One target, one gate acquisition. Holding the gate across the
+                // whole batch would let a settled mark starve every operator
+                // command behind it, and the per-target guard is what makes each
+                // mutation correct on its own anyway.
+                let _guard = self.gate.clone().lock_owned().await;
+                self.run_control
+                    .operator()
+                    .apply_settlement_queue_intent(change_id, action)
+                    .await
+            };
+            if application.applied() {
+                applied_membership_change = true;
+            }
+            // Publish the same queue delta an explicit frontend command
+            // publishes, so the TUI and `/api/v2` project `queued` and
+            // `not queued` from authoritative reducer intent rather than from
+            // the mark set.
+            self.publish_operator_outcome(OperatorOutcome::Queue(application.outcome))
+                .await;
         }
-        // Observability only, and deliberately not operator-facing: a marked row
+
+        // Exactly one wake for the whole settled batch, and only when membership
+        // really moved. A no-op batch changes no analysis input, so waking the
+        // scheduler for it would manufacture an analysis attempt with no operator
+        // action behind it.
+        if applied_membership_change {
+            self.run_control
+                .operator()
+                .notify_scheduler_after_settlement()
+                .await;
+        }
+
+        // Observability only, and deliberately not operator-facing: a named row
         // that settlement skipped is otherwise indistinguishable from a deadline
         // that never expired, which is the one question this policy is hard to
         // answer from the outside.
@@ -972,7 +1017,7 @@ impl MarkSettlementRuntime for OperatorApplication {
                 .map(|(change_id, reason)| format!("{change_id}={}", reason.as_str()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            tracing::debug!("Mark settlement added no queue intent for: {skipped}");
+            tracing::debug!("Mark settlement changed no queue intent for: {skipped}");
         }
         plan
     }

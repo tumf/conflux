@@ -84,17 +84,37 @@ fn init_minimal_git_repo(repo_root: &std::path::Path) {
 /// The analyzer callback's return type, as required by the scheduler loop.
 type AnalysisFuture<'a> = Pin<Box<dyn Future<Output = AnalysisOutcome> + Send + 'a>>;
 
+/// A dependency no reducer, repository, or analysis result can ever resolve.
+///
+/// The lever that keeps ordinary dispatch inert without taking away the capacity
+/// the analyzer itself needs; see [`SchedulerLoopHarness::keep_dispatch_inert`].
+const UNRESOLVABLE_DEPENDENCY: &str = "never-resolvable-dependency";
+
+/// The in-flight holder that keeps an inert dispatch from reading as the
+/// idle-scheduler anomaly which deliberately forgets a completed input.
+const DISPATCH_HOLDER: &str = "dispatch-holder";
+
 /// Analyzer test double that counts how many dependency analyses were actually started.
+///
+/// `blocked` reports [`UNRESOLVABLE_DEPENDENCY`] for every ordered change while it
+/// is set, so dispatch selection starts nothing.
 fn counting_analyzer(
     invocations: Arc<AtomicUsize>,
+    blocked: Arc<std::sync::atomic::AtomicBool>,
 ) -> impl for<'a> Fn(&'a [Change], &'a [String], u32) -> AnalysisFuture<'a> + Send + Sync {
     move |changes: &[Change], _in_flight: &[String], _iteration: u32| -> AnalysisFuture<'_> {
         invocations.fetch_add(1, Ordering::SeqCst);
         let order: Vec<String> = changes.iter().map(|change| change.id.clone()).collect();
+        let mut dependencies = HashMap::new();
+        if blocked.load(Ordering::SeqCst) {
+            for change_id in &order {
+                dependencies.insert(change_id.clone(), vec![UNRESOLVABLE_DEPENDENCY.to_string()]);
+            }
+        }
         Box::pin(async move {
             AnalysisResult {
                 order,
-                dependencies: HashMap::new(),
+                dependencies,
                 groups: None,
             }
             .into()
@@ -115,6 +135,8 @@ struct SchedulerLoopHarness {
     iteration: u32,
     max_parallelism: usize,
     analysis_invocations: Arc<AtomicUsize>,
+    /// Whether the analyzer double reports an unresolvable dependency.
+    dispatch_blocked: Arc<std::sync::atomic::AtomicBool>,
     events: mpsc::Receiver<ExecutionEvent>,
 }
 
@@ -143,8 +165,19 @@ impl SchedulerLoopHarness {
             iteration: 2,
             max_parallelism: 1,
             analysis_invocations: Arc::new(AtomicUsize::new(0)),
+            dispatch_blocked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             events,
         }
+    }
+
+    /// The analyzer double this harness's scripting knobs drive.
+    fn analyzer(
+        &self,
+    ) -> impl for<'a> Fn(&'a [Change], &'a [String], u32) -> AnalysisFuture<'a> + Send + Sync {
+        counting_analyzer(
+            self.analysis_invocations.clone(),
+            self.dispatch_blocked.clone(),
+        )
     }
 
     /// Arm the queue debounce window so non-bypass reasons are actually debounceable.
@@ -154,7 +187,32 @@ impl SchedulerLoopHarness {
         *last_change = Some(std::time::Instant::now());
     }
 
-    /// Occupy all dispatch capacity, as an active manual resolve does.
+    /// Hold ordinary dispatch inert while leaving the analyzer a slot to run in.
+    ///
+    /// These tests used to occupy every dispatch slot, which was a cheap way to
+    /// stop each pass before it created real worktrees. The analyzer is
+    /// capacity-gated now, so that would suppress the analysis whose trigger
+    /// lifetime is under test. Instead exactly one slot stays free, every
+    /// analyzed candidate is reported as depending on a change that can never
+    /// resolve, and one holder stays in flight — an empty dispatch selection
+    /// over an *idle* scheduler is the separate anomaly that deliberately
+    /// forgets a completed input.
+    fn keep_dispatch_inert(&mut self) {
+        self.dispatch_blocked.store(true, Ordering::SeqCst);
+        self.in_flight.insert(DISPATCH_HOLDER.to_string());
+        self.max_parallelism = self.in_flight.len() + 1;
+    }
+
+    /// Let ordinary dispatch start again, as a resolved dependency would.
+    #[allow(dead_code)]
+    fn allow_dispatch(&mut self) {
+        self.dispatch_blocked.store(false, Ordering::SeqCst);
+    }
+
+    /// Occupy every dispatch slot, as an active manual resolve does.
+    ///
+    /// Genuine zero capacity, which now gates the analyzer too — use it only
+    /// where that gate is the subject, not as a way to keep dispatch quiet.
     fn occupy_all_capacity(&mut self) -> Arc<AtomicUsize> {
         let counter = Arc::new(AtomicUsize::new(self.max_parallelism));
         self.executor.set_manual_resolve_counter(counter.clone());
@@ -250,9 +308,9 @@ async fn completion_edge_analyzes_once_and_timer_wakes_do_not_replay_it() {
     let temp_dir = TempDir::new().unwrap();
     let mut harness =
         SchedulerLoopHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-b")]);
-    let analyzer = counting_analyzer(harness.analysis_invocations.clone());
+    let analyzer = harness.analyzer();
     harness.arm_queue_debounce().await;
-    let resolve_counter = harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     // A real resolve/workspace/merge completion edge, as delivered by
     // `wait_for_scheduler_event`.
@@ -270,18 +328,13 @@ async fn completion_edge_analyzes_once_and_timer_wakes_do_not_replay_it() {
         "an evaluated edge trigger must be consumed back to the non-bypass state"
     );
 
-    // Nothing changes: capacity stays at zero, the queued set stays identical, and only
-    // the ordinary 500 ms timer fires.
+    // Nothing changes: the queued set stays identical, dispatch stays blocked, and
+    // only the ordinary 500 ms timer fires.
     for _ in 0..5 {
         harness.timer_wake().await;
         harness.run_loop_iteration(&analyzer).await;
     }
 
-    assert_eq!(
-        resolve_counter.load(Ordering::SeqCst),
-        1,
-        "test must hold dispatch capacity at zero for the whole scenario"
-    );
     assert_eq!(
         harness.analyses(),
         1,
@@ -291,20 +344,20 @@ async fn completion_edge_analyzes_once_and_timer_wakes_do_not_replay_it() {
     assert_eq!(
         harness.queued.len(),
         1,
-        "queued work must be retained while capacity is zero"
+        "queued work must be retained while nothing dispatches it"
     );
     assert!(
-        harness.in_flight.is_empty(),
-        "zero capacity must suppress ordinary apply dispatch"
+        !harness.in_flight.contains("queued-b"),
+        "a candidate whose dependency cannot resolve must not be dispatched"
     );
     assert!(
         harness.join_set.is_empty(),
-        "no workspace task should be spawned at zero capacity"
+        "no workspace task should be spawned for a blocked candidate"
     );
     assert_eq!(
         harness.drain_apply_started(),
         0,
-        "no apply should start while capacity is zero"
+        "no apply should start for a blocked candidate"
     );
 }
 
@@ -315,9 +368,9 @@ async fn repair_candidate_edge_bypasses_debounce_once_only() {
         temp_dir.path().to_path_buf(),
         vec![test_change("repair-candidate")],
     );
-    let analyzer = counting_analyzer(harness.analysis_invocations.clone());
+    let analyzer = harness.analyzer();
     harness.arm_queue_debounce().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.deliver_edge(ReanalysisReason::RepairCandidate);
     harness.run_loop_iteration(&analyzer).await;
@@ -347,9 +400,9 @@ async fn slot_recovery_edge_bypasses_debounce_once_only() {
         temp_dir.path().to_path_buf(),
         vec![test_change("slot-recovery-candidate")],
     );
-    let analyzer = counting_analyzer(harness.analysis_invocations.clone());
+    let analyzer = harness.analyzer();
     harness.arm_queue_debounce().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.deliver_edge(ReanalysisReason::SlotRecovery);
     harness.run_loop_iteration(&analyzer).await;
@@ -376,9 +429,9 @@ async fn slot_recovery_edge_bypasses_debounce_once_only() {
 async fn queued_empty_loop_does_not_consume_an_unevaluated_edge() {
     let temp_dir = TempDir::new().unwrap();
     let mut harness = SchedulerLoopHarness::new(temp_dir.path().to_path_buf(), Vec::new());
-    let analyzer = counting_analyzer(harness.analysis_invocations.clone());
+    let analyzer = harness.analyzer();
     harness.arm_queue_debounce().await;
-    harness.occupy_all_capacity();
+    harness.keep_dispatch_inert();
 
     harness.deliver_edge(ReanalysisReason::ResolveCompletion);
     let outcome = harness.run_loop_iteration(&analyzer).await;
@@ -441,7 +494,7 @@ async fn second_completion_edge_rearms_analysis_and_capacity_recovery_dispatches
         vec![test_change("queued-b")],
         config,
     );
-    let analyzer = counting_analyzer(harness.analysis_invocations.clone());
+    let analyzer = harness.analyzer();
     harness.arm_queue_debounce().await;
     let resolve_counter = harness.occupy_all_capacity();
 
@@ -453,8 +506,13 @@ async fn second_completion_edge_rearms_analysis_and_capacity_recovery_dispatches
     }
     assert_eq!(
         harness.analyses(),
-        1,
-        "the first edge must be consumed exactly once"
+        0,
+        "zero capacity gates the analyzer, so the first edge is evaluated by nothing"
+    );
+    assert_eq!(
+        harness.reanalysis_reason,
+        ReanalysisReason::ResolveCompletion,
+        "an edge that reached no analyzer stays unconsumed"
     );
     assert!(
         harness.in_flight.is_empty(),
@@ -473,8 +531,8 @@ async fn second_completion_edge_rearms_analysis_and_capacity_recovery_dispatches
     assert!(!should_break, "capacity recovery must resume the scheduler");
     assert_eq!(
         harness.analyses(),
-        2,
-        "a second real edge must re-arm immediate analysis"
+        1,
+        "a real edge with capacity behind it re-arms immediate analysis"
     );
     assert_eq!(
         iteration, 3,
@@ -492,7 +550,7 @@ async fn second_completion_edge_rearms_analysis_and_capacity_recovery_dispatches
     assert_eq!(
         harness.reanalysis_reason,
         ReanalysisReason::Initial,
-        "the second edge is consumed too"
+        "the edge is consumed by the evaluation that actually used it"
     );
 
     harness.join_set.abort_all();

@@ -1062,6 +1062,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
         last_available_slots: None,
+        analyzer_capacity_suppressed: false,
         dynamic_queue: None,
         ai_runner,
         run_command_scope,
@@ -1222,6 +1223,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
         last_available_slots: None,
+        analyzer_capacity_suppressed: false,
         dynamic_queue: None,
         ai_runner,
         run_command_scope,
@@ -1398,6 +1400,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
         last_available_slots: None,
+        analyzer_capacity_suppressed: false,
         dynamic_queue: None,
         ai_runner,
         run_command_scope,
@@ -1629,6 +1632,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
         last_available_slots: None,
+        analyzer_capacity_suppressed: false,
         dynamic_queue: None,
         ai_runner,
         run_command_scope,
@@ -1852,6 +1856,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
         last_available_slots: None,
+        analyzer_capacity_suppressed: false,
         dynamic_queue: None,
         ai_runner,
         run_command_scope,
@@ -2081,6 +2086,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         cancel_token: None,
         last_queue_change_at: Arc::new(Mutex::new(None)),
         last_available_slots: None,
+        analyzer_capacity_suppressed: false,
         dynamic_queue: None,
         ai_runner,
         run_command_scope,
@@ -14024,16 +14030,32 @@ fn recording_analyzer(
             .lock()
             .expect("analyzer input lock")
             .push(order.clone());
+        // Every ordered change is reported as depending on something that can
+        // never resolve, so dispatch selection starts nothing. Its callers are
+        // analysis-boundary tests: they need the analyzer to run — which now
+        // requires a free slot — while no worktree is ever created.
+        let dependencies = order
+            .iter()
+            .map(|change_id| {
+                (
+                    change_id.clone(),
+                    vec![UNDISPATCHABLE_DEPENDENCY.to_string()],
+                )
+            })
+            .collect();
         Box::pin(async move {
             crate::analyzer::AnalysisResult {
                 order,
-                dependencies: HashMap::new(),
+                dependencies,
                 groups: None,
             }
             .into()
         })
     }
 }
+
+/// A dependency no reducer, repository, or analysis result can ever resolve.
+const UNDISPATCHABLE_DEPENDENCY: &str = "never-resolvable-dependency";
 
 /// The observed failure, in production order: one selected change, an
 /// all-change refresh, reconciliation, and analysis. The unselected
@@ -14133,9 +14155,9 @@ async fn unselected_archived_dirty_worktree_never_reaches_analysis_execution_or_
         "only the selected change may survive reconciliation"
     );
 
-    // Dependency analysis runs on exactly what reconciliation produced. Zero
-    // parallelism keeps this test at the analysis boundary: capacity, not
-    // eligibility, is what stops dispatch here.
+    // Dependency analysis runs on exactly what reconciliation produced. An
+    // unresolvable analyzer dependency keeps this test at the analysis boundary:
+    // eligibility, not capacity, is what this asserts.
     let analyzer_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
     let analyzer = recording_analyzer(analyzer_inputs.clone());
     let mut join_set = JoinSet::new();
@@ -14147,7 +14169,10 @@ async fn unselected_archived_dirty_worktree_never_reaches_analysis_execution_or_
         .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
             queued: &mut queued,
             in_flight: &mut in_flight,
-            max_parallelism: 0,
+            // One free slot: the capacity-gated analyzer needs it, and the
+            // recording analyzer's unresolvable dependency is what keeps
+            // dispatch from consuming it.
+            max_parallelism: 1,
             iteration: 1,
             reanalysis_reason: ReanalysisReason::Initial,
             analyzer: &analyzer,
@@ -14523,7 +14548,10 @@ async fn revoked_queue_intent_stops_an_already_added_candidate_before_analysis_a
             in_flight: &mut in_flight_for_dispatch,
             // Zero capacity keeps this at the analysis boundary: eligibility,
             // not slots, is what must exclude the revoked candidate.
-            max_parallelism: 0,
+            // One free slot: the capacity-gated analyzer needs it, and the
+            // recording analyzer's unresolvable dependency is what keeps
+            // dispatch from consuming it.
+            max_parallelism: 1,
             iteration: 1,
             reanalysis_reason: ReanalysisReason::Initial,
             analyzer: &analyzer,
@@ -14690,9 +14718,10 @@ async fn reducer_unknown_dynamic_hint_never_enters_analysis_or_dispatch() {
         .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
             queued: &mut queued,
             in_flight: &mut in_flight,
-            // Zero capacity keeps this at the analysis boundary: eligibility,
-            // not slots, is what must exclude the hint.
-            max_parallelism: 0,
+            // One free slot: the capacity-gated analyzer needs it, and the
+            // recording analyzer's unresolvable dependency is what keeps
+            // dispatch from consuming it.
+            max_parallelism: 1,
             iteration: 1,
             reanalysis_reason: ReanalysisReason::Initial,
             analyzer: &analyzer,

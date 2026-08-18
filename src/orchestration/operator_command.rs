@@ -34,7 +34,8 @@ use tokio_util::sync::CancellationToken;
 use crate::orchestration::apply_commit_evidence::ApplyCommitEvidence;
 use crate::orchestration::execution_facts::{project_phase, ExecutionFactsStore, ExecutionPhase};
 use crate::orchestration::mark_settlement::{
-    plan_mark_settlement, MarkSettlementCoordinator, MarkSettlementPlan, MarkSettlementRow,
+    classify_mark_settlement_row, plan_mark_settlement, MarkSettlementAction,
+    MarkSettlementCoordinator, MarkSettlementExclusion, MarkSettlementPlan, MarkSettlementRow,
 };
 use crate::orchestration::state::{OrchestratorState, ReduceOutcome, ReducerCommand};
 
@@ -834,6 +835,35 @@ pub struct QueueOutcome {
     pub display_status: String,
 }
 
+/// One settlement-derived queue mutation as the reducer write boundary saw it.
+///
+/// `skipped` is what separates "the guard refused this" from "the reducer had
+/// nothing to change": a refused mutation touched nothing at all, while an
+/// accepted one with `reducer_changed == false` simply found the intent already
+/// where it belongs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementApplication {
+    /// The per-target queue outcome, in the shape a frontend command produces.
+    pub outcome: QueueOutcome,
+    /// Why the application-time guard turned this into a reasoned no-op.
+    pub skipped: Option<MarkSettlementExclusion>,
+}
+
+impl SettlementApplication {
+    /// True when queue membership actually moved for this target.
+    pub fn applied(&self) -> bool {
+        self.outcome.reducer_changed || self.outcome.dynamic_queue_mutated
+    }
+}
+
+/// The queue-command direction one settlement action reports as.
+fn queue_mutation_for(action: MarkSettlementAction) -> QueueMutation {
+    match action {
+        MarkSettlementAction::Add => QueueMutation::Added,
+        MarkSettlementAction::Remove => QueueMutation::Removed,
+    }
+}
+
 /// Explanatory evidence fixed at a successful stop-and-dequeue settlement.
 ///
 /// Every field is a *non-authoritative observation*. It explains what the
@@ -1100,18 +1130,22 @@ impl ExecutionMarkStore {
         self.settlement.clone()
     }
 
-    /// Arm mark settlement for the current mark set.
+    /// Record `changed` in the settlement batch and arm mark settlement.
     ///
     /// Called only after an *accepted standalone operator* write actually
-    /// changed the store. A system revocation, a refused or unchanged command,
-    /// and the mark writes Start admission performs deliberately do not reach
-    /// here, so none of them can restart the stability deadline or create a
-    /// delayed queue effect.
+    /// changed the store, with exactly the targets that write flipped. A system
+    /// revocation, a refused or unchanged command, and the mark writes Start
+    /// admission performs deliberately do not reach here, so none of them can
+    /// restart the stability deadline or create a delayed queue effect.
+    ///
+    /// The batch is the whole scope of the eventual reconciliation, which is why
+    /// the changed targets are passed rather than the current mark set: a mark
+    /// set would name every marked row, and reconciling those would move queue
+    /// intent nobody touched in this batch.
     ///
     /// Returns true when a deadline is now pending.
-    pub fn arm_settlement(&self) -> bool {
-        let snapshot = self.marked_ids();
-        self.settlement.clone().notify(snapshot)
+    pub fn arm_settlement(&self, changed: Vec<String>) -> bool {
+        self.settlement.clone().notify(changed)
     }
 
     /// True when the change currently carries an execution mark.
@@ -1504,7 +1538,7 @@ impl OperatorCommandService {
         let _mutation = self.parallel.lock_mutations().await;
         let changed = self.marks.set(change_id, marked);
         if changed {
-            self.marks.arm_settlement();
+            self.marks.arm_settlement(vec![change_id.to_string()]);
         }
         changed
     }
@@ -1564,7 +1598,7 @@ impl OperatorCommandService {
             }
         }
         if self.marks.set(change_id, marked) {
-            self.marks.arm_settlement();
+            self.marks.arm_settlement(vec![change_id.to_string()]);
             Ok(OperatorOutcome::MarkSet {
                 change_id: change_id.to_string(),
                 marked,
@@ -1647,9 +1681,11 @@ impl OperatorCommandService {
         }
 
         // One notification for the whole bulk mutation, not one per row: the
-        // deadline describes a mark *set*, and restarting it per row would make
-        // a wide `x` take longer to settle than a narrow one.
-        self.marks.arm_settlement();
+        // deadline describes one batch, and restarting it per row would make a
+        // wide `x` take longer to settle than a narrow one. The batch carries
+        // exactly the rows this bulk write flipped — never the excluded ones,
+        // and never the eligible rows that already held the target state.
+        self.marks.arm_settlement(changed.clone());
 
         Ok(OperatorOutcome::BulkMarks {
             marked: plan.target_state,
@@ -1658,31 +1694,37 @@ impl OperatorCommandService {
         })
     }
 
-    /// Classify the current mark set into one additive settlement plan.
+    /// Classify one settlement batch into a bidirectional plan.
     ///
-    /// Read-only by construction. It derives *what* a settled mark set would
-    /// add and nothing more, so the caller can apply the plan through the
-    /// ordinary queue command path instead of this service growing a second one.
+    /// Read-only by construction. It derives *what* the settled batch would add
+    /// and remove and nothing more, so the caller can apply the plan through the
+    /// guarded queue path instead of this service growing a second one.
+    ///
+    /// `targets` is the batch's scope: every target whose mark an accepted
+    /// operator write flipped, and nothing else. Rows outside it are never read
+    /// and never planned, which is exactly what keeps an explicitly queued
+    /// unmarked change — and a marked change explicitly removed from the queue —
+    /// unaffected by somebody else's mark settling.
     ///
     /// The whole observation is taken under the shared mutation guard and one
     /// reducer read, which is what makes the marks, the statuses, and the
     /// worktree eligibility one coherent view rather than three instants.
     /// Deliberately re-reads the marks that exist *now*: an event that revoked a
     /// mark while the deadline was pending must land in this plan, not be
-    /// overridden by the snapshot the deadline was armed with.
-    pub async fn plan_mark_settlement(&self) -> MarkSettlementPlan {
-        let observed: Vec<(String, String, bool, bool)> = {
+    /// overridden by the intent the batch was recorded with.
+    pub async fn plan_mark_settlement(&self, targets: &[String]) -> MarkSettlementPlan {
+        let observed: Vec<(String, String, bool, bool, bool)> = {
             let _mutation = self.parallel.lock_mutations().await;
-            let marked = self.marks.marked_ids();
             let guard = self.state.read().await;
             let tracked: HashSet<String> = guard.tracked_change_ids().into_iter().collect();
-            marked
-                .into_iter()
+            targets
+                .iter()
                 .map(|change_id| {
-                    let display_status = guard.display_status(&change_id).to_string();
-                    let tracked = tracked.contains(&change_id);
-                    let eligible = self.parallel.is_eligible(&change_id);
-                    (change_id, display_status, tracked, eligible)
+                    let display_status = guard.display_status(change_id).to_string();
+                    let tracked = tracked.contains(change_id);
+                    let eligible = self.parallel.is_eligible(change_id);
+                    let marked = self.marks.is_marked(change_id);
+                    (change_id.clone(), display_status, tracked, eligible, marked)
                 })
                 .collect()
         };
@@ -1690,15 +1732,136 @@ impl OperatorCommandService {
         let rows: Vec<MarkSettlementRow<'_>> = observed
             .iter()
             .map(
-                |(change_id, display_status, tracked, parallel_eligible)| MarkSettlementRow {
-                    change_id,
-                    display_status,
-                    tracked: *tracked,
-                    parallel_eligible: *parallel_eligible,
+                |(change_id, display_status, tracked, parallel_eligible, marked)| {
+                    MarkSettlementRow {
+                        change_id,
+                        display_status,
+                        tracked: *tracked,
+                        parallel_eligible: *parallel_eligible,
+                        marked: *marked,
+                    }
                 },
             )
             .collect();
         plan_mark_settlement(&rows)
+    }
+
+    /// Apply one settlement-derived queue mutation under the reducer write boundary.
+    ///
+    /// Classification and application are two instants, and a dispatch or a
+    /// terminal transition can land between them. This is the guard that makes
+    /// that race a reasoned no-op instead of a wrong mutation: the target is
+    /// re-classified from the *same* write guard that applies the reducer
+    /// command, so there is no window at all between deciding and mutating.
+    ///
+    /// It deliberately does not reuse [`Self::add_to_queue`]. That path's
+    /// terminal-error branch is an explicit *retry* — it applies `RetryError`,
+    /// releases the failed classification, and publishes an explicit-retry edge —
+    /// and no mark ever expressed that intent. Here a terminal-error target is
+    /// simply excluded, so a settled addition can never alias a retry.
+    ///
+    /// The scheduler is deliberately *not* notified here. One settled batch owns
+    /// exactly one notification, and only the caller knows when the batch is
+    /// done; see [`Self::notify_scheduler_after_settlement`].
+    pub async fn apply_settlement_queue_intent(
+        &self,
+        change_id: &str,
+        action: MarkSettlementAction,
+    ) -> SettlementApplication {
+        let queued = matches!(action, MarkSettlementAction::Add);
+        let guard_outcome = {
+            let mut guard = self.state.write().await;
+            let tracked = guard.change_runtime(change_id).is_some();
+            let display_status = guard.display_status(change_id);
+            let row = MarkSettlementRow {
+                change_id,
+                display_status,
+                tracked,
+                // Worktree eligibility was proven when the plan was derived and
+                // is not a reducer-boundary fact. What this guard re-reads is
+                // the lifecycle, which is the only thing the reducer can have
+                // moved since.
+                parallel_eligible: true,
+                marked: queued,
+            };
+            match classify_mark_settlement_row(&row) {
+                Ok(current) if current == action => {
+                    let command = if queued {
+                        ReducerCommand::AddToQueue(change_id.to_string())
+                    } else {
+                        ReducerCommand::RemoveFromQueue(change_id.to_string())
+                    };
+                    Ok(matches!(
+                        guard.apply_command(command),
+                        ReduceOutcome::Changed(_)
+                    ))
+                }
+                // A row whose reconciliation flipped direction under the guard
+                // is already where the operator's current mark wants it.
+                Ok(_) => Err(if queued {
+                    MarkSettlementExclusion::AlreadyQueued
+                } else {
+                    MarkSettlementExclusion::AlreadyNotQueued
+                }),
+                Err(reason) => Err(reason),
+            }
+        };
+
+        let reducer_changed = match guard_outcome {
+            Ok(changed) => changed,
+            Err(reason) => {
+                // Nothing was touched: no reducer command, no dynamic queue
+                // mutation, no hook, no explicit-retry edge, and no active
+                // lifecycle evidence cleared.
+                return SettlementApplication {
+                    outcome: QueueOutcome {
+                        change_id: change_id.to_string(),
+                        mutation: queue_mutation_for(action),
+                        reducer_changed: false,
+                        dynamic_queue_mutated: false,
+                        display_status: self.display_status(change_id).await,
+                    },
+                    skipped: Some(reason),
+                };
+            }
+        };
+
+        // Effect before commit, and only for a mutation the reducer accepted:
+        // hooks describe real runtime mutations only, exactly once each.
+        let dynamic_queue_mutated = if !reducer_changed {
+            false
+        } else if queued {
+            let added = self.queue.add(change_id).await;
+            if added {
+                self.hooks.on_queue_add(change_id).await;
+            }
+            added
+        } else {
+            let removed = self.queue.remove(change_id).await;
+            self.hooks.on_queue_remove(change_id).await;
+            removed
+        };
+
+        SettlementApplication {
+            outcome: QueueOutcome {
+                change_id: change_id.to_string(),
+                mutation: queue_mutation_for(action),
+                reducer_changed,
+                dynamic_queue_mutated,
+                display_status: self.display_status(change_id).await,
+            },
+            skipped: None,
+        }
+    }
+
+    /// Wake the scheduler once for a settled batch that changed queue membership.
+    ///
+    /// Coalesced on purpose. One settled batch is one analysis input change, so
+    /// notifying per target would produce N duplicate analysis attempts for a
+    /// single operator action — and a removal-only batch still changes what the
+    /// scheduler should consider, so it notifies too.
+    pub async fn notify_scheduler_after_settlement(&self) {
+        self.queue.notify_scheduler().await;
     }
 
     /// Add a change to the dynamic queue.

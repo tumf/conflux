@@ -708,6 +708,12 @@ async fn failed_dependency_restart_discards_ephemeral_failure_tracking() {
 struct ObservedEvents {
     skips: AtomicUsize,
     blocked: AtomicUsize,
+    /// Distinct operator-visible "no analysis: zero capacity" diagnostics.
+    ///
+    /// This is the loop's observable acknowledgement that it evaluated queued
+    /// work and found no slot. With every slot occupied the analyzer never runs,
+    /// so it is the synchronisation point an analysis count used to be.
+    capacity_gated: AtomicUsize,
 }
 
 /// Everything a loop driver may touch while the real scheduler is running.
@@ -743,6 +749,15 @@ impl LoopHandles {
 
     async fn await_analyses(&self, target: usize) {
         await_counter(&self.analyses, target, "analyzer invocations").await;
+    }
+
+    async fn await_capacity_gated(&self, target: usize) {
+        await_counter(
+            &self.observed.capacity_gated,
+            target,
+            "zero-capacity no-analysis diagnostics",
+        )
+        .await;
     }
 }
 
@@ -818,6 +833,11 @@ where
                 }
                 ParallelEvent::DependencyBlocked { .. } => {
                     forwarder_observed.blocked.fetch_add(1, Ordering::SeqCst);
+                }
+                ParallelEvent::Log(entry) if entry.message.contains("analysis_capacity_zero") => {
+                    forwarder_observed
+                        .capacity_gated
+                        .fetch_add(1, Ordering::SeqCst);
                 }
                 _ => {}
             }
@@ -975,8 +995,10 @@ async fn failed_dependency_lifetime_admits_genuine_dynamic_additions() {
             }
             handles.queue.push("c".to_string()).await;
 
-            // The addition must reach analysis before the run is cancelled.
-            handles.await_analyses(1).await;
+            // The addition must reach an evaluation before the run is cancelled.
+            // Every slot is occupied here, so that evaluation reports the
+            // capacity gate rather than invoking the analyzer.
+            handles.await_capacity_gated(1).await;
             handles.cancel.cancel();
         },
     )
@@ -984,8 +1006,8 @@ async fn failed_dependency_lifetime_admits_genuine_dynamic_additions() {
 
     assert!(run.stopped);
     assert_eq!(
-        run.analyses, 1,
-        "a genuine queue addition must still receive its one immediate analysis"
+        run.analyses, 0,
+        "a genuine queue addition is still capacity-gated; the analyzer waits for a slot"
     );
     assert_eq!(
         run.change_skipped,

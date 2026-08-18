@@ -650,7 +650,10 @@ impl crate::orchestration::mark_settlement::MarkSettlementRuntime for AdmittingS
         true
     }
 
-    async fn settle_marks(&self) -> crate::orchestration::mark_settlement::MarkSettlementPlan {
+    async fn settle_marks(
+        &self,
+        _targets: Vec<String>,
+    ) -> crate::orchestration::mark_settlement::MarkSettlementPlan {
         crate::orchestration::mark_settlement::MarkSettlementPlan::default()
     }
 
