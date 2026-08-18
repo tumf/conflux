@@ -69,13 +69,19 @@ The surface is also fragmented: status, enqueue, wait, and three notify tools ex
 
 Expose three MCP tools:
 
+- `cflx_status`
+- `cflx_control`
+- `cflx_subscribe`
+
+`cflx_wait` is removed only from MCP. `cflx client wait` remains the bounded CLI completion oracle. MCP hosts that need asynchronous completion explicitly register a callback with `cflx_subscribe`; an MCP host that cannot execute callback argv has no MCP completion oracle, by design.
+
 ### `cflx_status`
 
 Retain coherent read-only owner, proposal, mark, queue, mode, and execution observation.
 
 ### `cflx_control`
 
-Accept one action and an optional bounded proposal-ID set:
+Accept one action and an optional bounded set of one through 64 distinct change IDs (called proposals in user-facing text):
 
 - `mark`: set the named proposals' execution marks to true;
 - `unmark`: set the named proposals' execution marks to false;
@@ -89,15 +95,15 @@ Accept one action and an optional bounded proposal-ID set:
 
 ### `cflx_subscribe`
 
-Accept one subscription action over a bounded non-empty set of proposal IDs:
+Accept one subscription action over one through 64 distinct change IDs:
 
 - `set`: atomically register or replace one proposal-scoped subscription for every named proposal;
 - `get`: inspect subscriptions for the named proposals;
 - `clear`: atomically clear subscriptions for the named proposals.
 
-A subscription is process-local observability state, not workflow state. It can be registered before admission. When a subscribed proposal enters a new execution episode, the owner binds that episode to the proposal subscription and delivers terminal `completed`, `failed`, or `stopped` once; optional `blocked` remains edge-triggered. The callback event contains the actual `instance_id`, `execution_id`, and `proposal_id`.
+A subscription is process-local observability state, not workflow state. It can be registered before admission. When a subscribed proposal enters a new execution episode, the owner binds that episode to the proposal subscription and delivers terminal `completed`, `failed`, or `stopped` once; optional `blocked` remains edge-triggered. The callback event contains the actual `instance_id`, `execution_id`, and wire-compatible `change_id`; `CFLX_CHANGE_ID` remains the environment name.
 
-A proposal subscription applies to future execution episodes until cleared or the owner exits. Each episode has independent delivery dedupe. Re-admission of the same proposal with a new execution ID produces a distinct notification. Registration after the latest episode is already terminal immediately attempts that terminal delivery once. Owner restart invalidates all process-local subscriptions and does not promise delivery from the lost process.
+A proposal subscription applies to the current live episode and future execution episodes until cleared or the owner exits. Each episode has independent delivery dedupe. Re-admission with a new execution ID produces a distinct notification. Replace changes callback configuration for undelivered current/future events; clear cancels pending delivery but does not terminate an already-started callback. Set, replace, clear, then set MUST NOT redeliver a terminal event already delivered for the same episode. Registration after the latest episode is terminal immediately attempts delivery only when that terminal edge has not already been delivered by this owner. Owner restart invalidates subscriptions and retained episode history.
 
 `set` takes bounded argv executed directly without shell interpretation and is Unix-socket-only. Existing completion-sink safety rules for command length, environment scrubbing, artifact ownership, bounded execution, failure isolation, and secret-free diagnostics remain mandatory.
 
@@ -113,24 +119,26 @@ The CLI counterpart uses the same shared implementations. It MAY preserve separa
 ## Acceptance Criteria
 
 1. MCP lists exactly `cflx_status`, `cflx_control`, and `cflx_subscribe`.
-2. `cflx_control mark/unmark` accepts multiple proposal IDs, uses target-scoped `SetExecutionMark`, preserves unrelated marks, and returns without observing admission.
+2. `cflx_control mark/unmark` accepts 1–64 distinct change IDs, uses target-scoped `SetExecutionMark`, preserves unrelated marks, and returns without observing admission.
 3. No MCP/client control path constructs `SetQueueIntent`, invokes DynamicQueue, implements analysis, polls admission, or synthesizes an execution ID from a mark.
 4. `cflx_control start/stop/force_stop` invokes the same shared operator intents and mode matrix as TUI F5/stop controls.
-5. `cflx_subscribe set/get/clear` accepts multiple proposal IDs and operates atomically for the requested set.
+5. `cflx_subscribe set/get/clear` accepts 1–64 distinct change IDs; set/clear are atomic and get is bounded and named-target only.
 6. A subscription can precede admission, follows each new execution episode of that proposal until cleared, and emits the actual execution binding in each event.
 7. Callback registration and delivery do not create workflow command records, advance state revision, change marks/queue/mode, or alter workflow outcome.
 8. OpenCode/Hermes auto-resume hooks and examples are removed. No tool result triggers automatic sink registration or agent/session resume.
 9. Existing callback sandboxing, boundedness, dedupe, late-terminal delivery, owner-incarnation, and failure-isolation guarantees remain.
 10. Canonical MODIFIED requirements retain all unrelated existing scenarios; removed auto-resume requirements are explicit REMOVED deltas.
+11. `cflx_wait` and its completion oracle remain available through CLI but are absent from MCP.
+12. Existing MCP route resolution, JSON-RPC initialization/error behavior, protocol-only stdout, and bounded frame guarantees remain unchanged.
 
 ## Explicit Completion Conditions
 
-- `src/client/enqueue.rs` and admission-oriented `Operation::Enqueue` are removed or no longer reachable from CLI/MCP.
+- `src/client/enqueue.rs`, admission-oriented `Operation::Enqueue`, and all `cflx_enqueue` MCP/CLI dispatch code are deleted; unreachable dead-code retention does not satisfy completion.
 - Client-side source contains no construction of `SetQueueIntent`, `Start` as a consequence of mark fall-through, or `RetryChange` as a consequence of mark input.
 - `cflx_control start` constructs Start only for explicit action `start`; mark/unmark never falls through to lifecycle control.
 - `cflx_subscribe` has bounded multi-proposal validation and all-or-nothing set/clear behavior.
 - Proposal subscriptions bind at owner admission and deliver independent events for successive execution IDs.
-- `examples/integrations/opencode-auto-resume/` and `examples/integrations/hermes-auto-resume/` plus their tests and auto-resume docs are removed.
+- `examples/integrations/opencode-auto-resume/`, `examples/integrations/hermes-auto-resume/`, `tests/opencode_auto_resume_example.rs`, and `tests/hermes_auto_resume_example.rs` are removed. Stale links/assertions are removed from `README.md`, `AGENTS.md`, `tests/client_cli_tests.rs`, `skills/cflx-run/SKILL.md`, and `skills/cflx-run/references/cflx-run.md`; embedded skill output contains no auto-resume or enqueue guidance.
 - OpenAPI/MCP schemas, help, README, bundled skill docs, AGENTS guidance, and canonical specs describe explicit control and subscription only.
 - `client-tui-control-parity` and `proposal-subscription-tests` pass.
 - `cflx openspec validate align-client-mcp-with-tui-control --archive-gate` passes.
