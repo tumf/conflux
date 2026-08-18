@@ -278,24 +278,29 @@ pub enum Commands {
     /// exactly what separates it from `cflx run`: `run` *is* an owner of a
     /// finite explicit-target run, while `client` only speaks to one.
     ///
-    /// Intent, not protocol: the CLI reads authoritative eligibility itself and
-    /// chooses the commands, so no caller constructs a revision, an idempotency
-    /// key, an execution mark, or a queue intent.
+    /// Control, not protocol: the verbs are the operator's own. `mark` and
+    /// `unmark` write one proposal's execution mark and preserve every unrelated
+    /// one; `start` is the F5 equivalent that consumes the owner's authoritative
+    /// mark set. No caller constructs a revision, an idempotency key, a command
+    /// type, or a queue intent, and no client command decides admission — the
+    /// owner's own settlement does.
     ///
-    /// `notify` manages the one-shot completion callback the owner runs when an
-    /// admitted execution finishes. That is execution completion, not process
-    /// completion: a resident TUI stays alive after the work is done, so its
-    /// exit was never the signal. The callback is an argv after `--`, never
-    /// shell source.
+    /// `subscribe` manages completion callbacks for named proposals. Because it
+    /// is keyed by the proposal rather than by an execution episode, it can be
+    /// registered before anything is admitted, and each new episode of a
+    /// subscribed proposal delivers once. Delivery notifies; it never resumes an
+    /// agent. The callback is an argv after `--`, never shell source.
     ///
     /// EXAMPLES:
     ///   cflx client status --json               # Read the owner without mutating it
-    ///   cflx client enqueue alpha --json        # Ask the owner to admit one change
+    ///   cflx client mark alpha beta --json      # Select proposals; admission stays the owner's
+    ///   cflx client start --json                # F5 equivalent over the authoritative marks
+    ///   cflx client stop --json                 # Graceful stop; force-stop for the immediate one
     ///   cflx client wait alpha --timeout 30m    # Observe until verified completion
-    ///   cflx client notify set alpha EXEC --json -- /absolute/callback --flag value
-    ///   cflx client notify get alpha EXEC --json     # Read the registration
-    ///   cflx client notify clear alpha EXEC --json   # Detach the callback
-    ///   cflx client mcp                         # Serve the same intents over stdio MCP
+    ///   cflx client subscribe set alpha --instance-id ID --json -- /absolute/callback
+    ///   cflx client subscribe get alpha --instance-id ID --json     # Read the registration
+    ///   cflx client subscribe clear alpha --instance-id ID --json   # Remove it
+    ///   cflx client mcp                         # Serve the same controls over stdio MCP
     Client(ClientArgs),
 
     /// Print the generated /api/v2 OpenAPI 3.1 schema to standard output
@@ -1004,11 +1009,15 @@ variable that holds the bearer token, and the token is never printed.
 
 EXAMPLES:
   cflx client status --json
-  cflx client enqueue alpha --json
+  cflx client mark alpha beta --json
+  cflx client unmark alpha --json
+  cflx client start --json
+  cflx client stop --json
+  cflx client force-stop --json
   cflx client wait alpha --timeout 45m --json
-  cflx client notify set alpha <execution-id> --json -- /absolute/callback --flag value
-  cflx client notify get alpha <execution-id> --json
-  cflx client notify clear alpha <execution-id> --json
+  cflx client subscribe set alpha beta --instance-id <owner-instance> --json -- /absolute/callback --flag value
+  cflx client subscribe get alpha --instance-id <owner-instance> --json
+  cflx client subscribe clear alpha beta --instance-id <owner-instance> --json
   cflx client mcp
   cflx client --unix-socket /tmp/cflx-api.sock status"
 )]
@@ -1064,14 +1073,49 @@ pub enum ClientCommands {
     /// rather than stitched together.
     Status(ClientStatusArgs),
 
-    /// Ask the existing owner to admit one change
+    /// Set the execution mark on one or more proposals
     ///
-    /// Expresses the intent "admit this change", then reads authoritative
-    /// eligibility and submits the smallest supported sequence of ordinary v2
-    /// commands. Refuses unknown, final, blocked, worktree-ineligible, and
-    /// active-run-limited targets without any hidden fallback, and never starts
-    /// a second owner.
-    Enqueue(ClientEnqueueArgs),
+    /// Target-scoped desired-state write, exactly like Space in the TUI. It
+    /// preserves every unrelated mark, submits only the shared
+    /// `SetExecutionMark` intent, and returns once the commands settle.
+    ///
+    /// A mark is operator selection, not admission. It does not construct queue
+    /// intent, start a run, retry anything, or create an execution episode, and
+    /// it does not wait to see whether the owner later admitted the work: the
+    /// owner's own mark settlement and analysis decide that.
+    ///
+    /// EXAMPLES:
+    ///   cflx client mark alpha
+    ///   cflx client mark alpha beta gamma --json
+    Mark(ClientMarkArgs),
+
+    /// Clear the execution mark on one or more proposals
+    ///
+    /// The mirror of `mark`, and just as narrowly scoped: unmarking `alpha`
+    /// leaves `beta` marked, and it neither stops nor dequeues work that is
+    /// already admitted or active.
+    Unmark(ClientMarkArgs),
+
+    /// Start the owner against its authoritative mark set — F5 / `!` equivalent
+    ///
+    /// Submits the shared Start intent a keypress submits. There is no target
+    /// list: Start consumes the marks the owner already holds, and a
+    /// caller-supplied replacement set is something the shared transaction does
+    /// not offer. Mark what you want first.
+    Start(ClientLifecycleArgs),
+
+    /// Request a graceful stop
+    ///
+    /// Submits the shared Stop intent. The run stops at its next boundary; this
+    /// command does not infer termination before settlement.
+    Stop(ClientLifecycleArgs),
+
+    /// Stop immediately
+    ///
+    /// Submits the shared ForceStop intent, which applies the same runtime
+    /// classification the TUI's immediate stop applies. The client does not
+    /// classify or terminate work itself.
+    ForceStop(ClientLifecycleArgs),
 
     /// Observe one change until verified completion, a typed failure, or timeout
     ///
@@ -1081,25 +1125,38 @@ pub enum ClientCommands {
     /// snapshot is never completion.
     Wait(ClientWaitArgs),
 
-    /// Manage the completion callback attached to one admitted execution
+    /// Manage explicit completion subscriptions for named proposals
     ///
-    /// Observability only: a callback registration submits no workflow command,
-    /// creates no command record, advances no revision, and cannot move a
-    /// change. The owner runs the argv once when that execution reaches a typed
-    /// terminal classification — which is execution completion, not process
-    /// completion, because a resident TUI stays alive after the work finishes
-    /// and its exit was therefore never the signal.
+    /// Observability only: a subscription submits no workflow command, creates
+    /// no command record, advances no revision, and cannot move a proposal.
     ///
-    /// Every operation names the complete (instance_id, execution_id,
-    /// change_id) binding the owner checks. The execution ID is the one
-    /// `enqueue` reported for that admitted episode: a retry opens a
-    /// *different* execution.
+    /// Keyed by the proposal rather than by an execution episode, so it can be
+    /// registered before the owner admits anything. Whenever a subscribed
+    /// proposal enters a new execution episode, the owner binds that episode and
+    /// delivers its first typed terminal classification — completed, failed, or
+    /// stopped — once. `--blocked` opts into the non-terminal attention edge.
+    /// Re-admission after a retry is a distinct episode and a distinct
+    /// notification.
+    ///
+    /// What fires is execution completion, not process completion: a resident
+    /// TUI stays alive after the work finishes, so its exit was never the
+    /// signal, and a lifecycle adapter's `idle` describes the process rather
+    /// than your proposal.
+    ///
+    /// Delivery is notification, never control: Conflux runs the registered argv
+    /// and resumes no agent. It does not start or message a session either, and
+    /// a callback's exit status cannot change any workflow outcome.
+    ///
+    /// Every operation names the owner incarnation it expects. Subscriptions are
+    /// process-local, so an owner restart invalidates all of them and a caller
+    /// naming the old incarnation is told `owner_restarted` rather than silently
+    /// registering against a process that never saw its work.
     ///
     /// The callback is an argv vector given after `--`, never shell source: no
     /// `sh -c`, no quoting, no expansion, and every argument boundary is
-    /// preserved exactly as typed. The owner replaces the callback's
-    /// environment with exactly CFLX_EVENT_PATH, CFLX_EVENT_TYPE,
-    /// CFLX_EXECUTION_ID, CFLX_CHANGE_ID, and CFLX_INSTANCE_ID.
+    /// preserved exactly as typed. The owner replaces the callback's environment
+    /// with exactly CFLX_EVENT_PATH, CFLX_EVENT_TYPE, CFLX_EXECUTION_ID,
+    /// CFLX_CHANGE_ID, and CFLX_INSTANCE_ID.
     ///
     /// Setting and clearing store or remove an argv this owner will execute, so
     /// they are accepted only over the owner's Unix socket; a TCP client is
@@ -1107,35 +1164,34 @@ pub enum ClientCommands {
     /// on a read either.
     ///
     /// EXAMPLES:
-    ///   cflx client notify set alpha EXEC -- /absolute/callback --flag value
-    ///   cflx client notify set alpha EXEC --blocked --json -- /absolute/callback
-    ///   cflx client notify get alpha EXEC --json
-    ///   cflx client notify clear alpha EXEC --json
-    Notify(ClientNotifyArgs),
+    ///   cflx client subscribe set alpha --instance-id ID -- /absolute/callback --flag value
+    ///   cflx client subscribe set alpha beta --instance-id ID --blocked --json -- /absolute/callback
+    ///   cflx client subscribe get alpha --instance-id ID --json
+    ///   cflx client subscribe clear alpha beta --instance-id ID --json
+    Subscribe(ClientSubscribeArgs),
 
     /// Serve the same client intents to an MCP host over stdio
     ///
     /// A stdio Model Context Protocol server over exactly this namespace. It
     /// stays a client — no repository lock, no listener, no orchestration run —
     /// and exposes no raw `/api/v2` command construction, so a model cannot name
-    /// a command type, an expected revision, an idempotency key, an execution
-    /// mark, or shell source.
+    /// a command type, an expected revision, an idempotency key, queue intent,
+    /// or shell source.
     ///
-    /// Six closed tools: cflx_status, cflx_enqueue, cflx_wait, cflx_notify_set,
-    /// cflx_notify_get, and cflx_notify_clear. Each one calls the same client
-    /// boundary the corresponding command does, so routing, typed outcomes, and
-    /// the completion oracle are shared rather than reimplemented.
+    /// Three closed tools: cflx_status, cflx_control, and cflx_subscribe.
+    /// cflx_control takes one action — mark, unmark, start, stop, or force_stop
+    /// — and calls the same client boundary the matching command does, so
+    /// routing and typed outcomes are shared rather than reimplemented.
     ///
-    /// cflx_enqueue returns as soon as admission settles and carries the
-    /// execution_id of that exact admitted episode; it never holds the tool call
-    /// open for the life of a change. Pass that execution_id to cflx_notify_set
-    /// for asynchronous continuation, or use cflx_wait for a bounded synchronous
-    /// observation.
+    /// cflx_wait is deliberately absent from MCP: an unbounded completion wait
+    /// is not a tool call. `cflx client wait` remains the bounded CLI oracle,
+    /// and an MCP host that wants asynchronous completion registers an explicit
+    /// callback with cflx_subscribe.
     ///
-    /// Connection defaults come from this namespace's --unix-socket and
-    /// --auth-token-env, and each tool may override them. A token value is never
-    /// accepted in argv or in a tool argument: only the name of an environment
-    /// variable holding it.
+    /// Connection defaults come from this namespace's --project-dir /
+    /// --unix-socket and --auth-token-env, and each tool may override them per
+    /// call. A token value is never accepted in argv or in a tool argument: only
+    /// the name of an environment variable holding it.
     ///
     /// stdout carries JSON-RPC frames and nothing else; diagnostics go to stderr.
     Mcp(ClientMcpArgs),
@@ -1156,13 +1212,28 @@ pub struct ClientStatusArgs {
     pub json: bool,
 }
 
-/// Arguments for `cflx client enqueue`.
+/// Arguments for `cflx client mark` and `cflx client unmark`.
+///
+/// One struct for both because they are the same write with opposite desired
+/// states, and a caller that can name targets for one names them for the other.
 #[derive(Parser, Debug)]
-pub struct ClientEnqueueArgs {
-    /// Change ID to admit
-    #[arg(value_parser = parse_change_id)]
-    pub change_id: String,
+pub struct ClientMarkArgs {
+    /// Proposals whose execution mark to set, 1 through 64 and all distinct
+    #[arg(required = true, num_args = 1.., value_parser = parse_change_id)]
+    pub change_ids: Vec<String>,
 
+    /// Emit one versioned JSON envelope on stdout
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `cflx client start`, `stop`, and `force-stop`.
+///
+/// No target list, deliberately: these submit the shared lifecycle intent
+/// against the marks the owner already holds, which is the only thing the shared
+/// transaction — and the TUI — can express.
+#[derive(Parser, Debug)]
+pub struct ClientLifecycleArgs {
     /// Emit one versioned JSON envelope on stdout
     #[arg(long)]
     pub json: bool,
@@ -1184,69 +1255,70 @@ pub struct ClientWaitArgs {
     pub json: bool,
 }
 
-/// Arguments for `cflx client notify`.
+/// Arguments for `cflx client subscribe`.
 ///
 /// A group rather than an operation: the help a caller reads lives on the
-/// [`ClientCommands::Notify`] variant, the way every other subcommand's does.
+/// [`ClientCommands::Subscribe`] variant, the way every other subcommand's does.
 #[derive(Parser, Debug)]
-pub struct ClientNotifyArgs {
+pub struct ClientSubscribeArgs {
     #[command(subcommand)]
-    pub command: ClientNotifyCommands,
+    pub command: ClientSubscribeCommands,
 }
 
-/// Subcommands for `cflx client notify`.
+/// Subcommands for `cflx client subscribe`.
 #[derive(Subcommand, Debug)]
-pub enum ClientNotifyCommands {
-    /// Attach or replace this execution's completion callback
+pub enum ClientSubscribeCommands {
+    /// Register or replace the named proposals' completion callback
     ///
-    /// The argv after `--` is executed directly, never as shell source, and
-    /// each argument boundary is preserved exactly as typed. Registering after
-    /// the execution already settled delivers that terminal event immediately,
-    /// which is what stops the enqueue/registration race from losing a
-    /// notification.
+    /// The argv after `--` is executed directly, never as shell source, and each
+    /// argument boundary is preserved exactly as typed. Registering after the
+    /// proposal's latest execution episode already settled delivers that
+    /// terminal event immediately, once — which is what stops a start/registration
+    /// race from losing a notification, without replaying anything this owner
+    /// already delivered.
     ///
     /// Registration is not delivery and delivery is not workflow state: a
     /// callback that fails, hangs, or exits non-zero cannot roll back, retry, or
-    /// re-classify anything.
+    /// re-classify anything, and it never resumes an agent.
     ///
     /// EXAMPLES:
-    ///   cflx client notify set alpha EXEC -- /absolute/callback --flag value
-    ///   cflx client notify set alpha EXEC --blocked --json -- /absolute/callback
-    Set(ClientNotifySetArgs),
+    ///   cflx client subscribe set alpha --instance-id ID -- /absolute/callback --flag value
+    ///   cflx client subscribe set alpha beta --instance-id ID --blocked --json -- /absolute/callback
+    Set(ClientSubscribeSetArgs),
 
-    /// Read the current callback registration for this execution
+    /// Read the named proposals' current subscriptions
     ///
-    /// Reports whether a subscription exists, the execution's state, and the
-    /// events already delivered. The registered argv itself comes back only
-    /// over the owner's own Unix socket.
-    Get(ClientNotifyRefArgs),
+    /// Reports whether a subscription exists, the latest bound execution
+    /// episode, its state, and the events already delivered. The registered argv
+    /// itself comes back only over the owner's own Unix socket.
+    ///
+    /// Named targets only: there is no list-all, because an unbounded read of
+    /// every registration is not something one request should answer.
+    Get(ClientSubscribeRefArgs),
 
-    /// Detach this execution's completion callback
+    /// Remove the named proposals' subscriptions
     ///
-    /// Removes only that execution's registration; no other execution and no
-    /// workflow state is touched.
-    Clear(ClientNotifyRefArgs),
+    /// Removes only those subscriptions; every other proposal is untouched.
+    /// Delivery that has not started is cancelled; a callback process already
+    /// running keeps its own bounds and finishes.
+    Clear(ClientSubscribeRefArgs),
 }
 
-/// Arguments for `cflx client notify set`.
+/// Arguments for `cflx client subscribe set`.
 #[derive(Parser, Debug)]
-pub struct ClientNotifySetArgs {
-    /// Change the execution belongs to
-    #[arg(value_parser = parse_change_id)]
-    pub change_id: String,
+pub struct ClientSubscribeSetArgs {
+    /// Proposals to subscribe, 1 through 64 and all distinct
+    #[arg(required = true, num_args = 1.., value_parser = parse_change_id)]
+    pub change_ids: Vec<String>,
 
-    /// Execution episode the callback is bound to, as `enqueue` reported it
-    #[arg(value_parser = parse_process_local_id)]
-    pub execution_id: String,
-
-    /// Owner incarnation that admitted the execution
+    /// Owner incarnation the subscription is registered against
     ///
-    /// Supply the instance ID an earlier `enqueue` reported to be told
-    /// `owner_restarted` when the socket has begun serving a different
-    /// incarnation, instead of the `execution_not_found` a new one would
-    /// otherwise answer with.
-    #[arg(long, value_name = "ID", value_parser = parse_process_local_id)]
-    pub instance_id: Option<String>,
+    /// Required, because a subscription is process-local: a request that named
+    /// no incarnation would be asking to register against whichever owner
+    /// happens to answer the socket. `cflx client status` reports the current
+    /// one.
+    #[arg(long, value_name = "ID", required = true, value_parser = parse_process_local_id)]
+    pub instance_id: String,
 
     /// Also deliver the non-terminal `blocked` attention edge
     #[arg(long)]
@@ -1264,24 +1336,20 @@ pub struct ClientNotifySetArgs {
     pub command: Vec<String>,
 }
 
-/// Arguments for `cflx client notify get` and `cflx client notify clear`.
+/// Arguments for `cflx client subscribe get` and `cflx client subscribe clear`.
 ///
-/// One struct for both because a read and a detach name the same thing: neither
-/// carries a callback, and a caller that can name an execution for one can name
-/// it for the other.
+/// One struct for both because a read and a removal name the same thing: neither
+/// carries a callback, and a caller that can name proposals for one can name them
+/// for the other.
 #[derive(Parser, Debug)]
-pub struct ClientNotifyRefArgs {
-    /// Change the execution belongs to
-    #[arg(value_parser = parse_change_id)]
-    pub change_id: String,
+pub struct ClientSubscribeRefArgs {
+    /// Proposals to address, 1 through 64 and all distinct
+    #[arg(required = true, num_args = 1.., value_parser = parse_change_id)]
+    pub change_ids: Vec<String>,
 
-    /// Execution episode to address, as `enqueue` reported it
-    #[arg(value_parser = parse_process_local_id)]
-    pub execution_id: String,
-
-    /// Owner incarnation that admitted the execution
-    #[arg(long, value_name = "ID", value_parser = parse_process_local_id)]
-    pub instance_id: Option<String>,
+    /// Owner incarnation the subscriptions belong to
+    #[arg(long, value_name = "ID", required = true, value_parser = parse_process_local_id)]
+    pub instance_id: String,
 
     /// Emit one versioned JSON envelope on stdout
     #[arg(long)]

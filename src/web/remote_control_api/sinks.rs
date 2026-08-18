@@ -266,6 +266,18 @@ fn refusal_response(refusal: SinkRefusal, execution_id: &str, correlation: &str)
         SinkRefusal::InvalidCommand(detail) => {
             ApiError::new(ErrorCode::ValidationFailed, detail, correlation).into_response()
         }
+        // Unreachable here: this resource resolves the execution first and
+        // reports a wrong incarnation as an unknown execution, because a
+        // process-local execution ID from another owner is exactly that.
+        SinkRefusal::InstanceMismatch => ApiError::new(
+            ErrorCode::ExecutionBindingMismatch,
+            format!(
+                "execution '{execution_id}' does not belong to the owner incarnation presented \
+                 with this request"
+            ),
+            correlation,
+        )
+        .into_response(),
     }
 }
 

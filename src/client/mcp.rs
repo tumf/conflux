@@ -2,21 +2,31 @@
 //!
 //! # What this is
 //!
-//! A stdio JSON-RPC frontend over exactly the intents `cflx client` already
-//! offers, plus the three notify operations. It is a *client*: it takes no
-//! repository lock, binds no listener, starts no run, and holds no orchestration
-//! state. Every tool call resolves a connection, asks the owner, and returns the
-//! same versioned envelope the CLI prints.
+//! A stdio JSON-RPC frontend over exactly the control and subscription boundary
+//! `cflx client` already offers. It is a *client*: it takes no repository lock,
+//! binds no listener, starts no run, and holds no orchestration state. Every
+//! tool call resolves a connection, asks the owner, and returns the same
+//! versioned envelope the CLI prints.
+//!
+//! # Why three tools rather than six
+//!
+//! The previous surface exposed its own implementation history — enqueue, wait,
+//! and three notify verbs — and one of those tools chose admission policy on the
+//! model's behalf. An agent needs three things: read the owner, control it the
+//! way an operator does, and ask to be told when a proposal finishes. So the
+//! tools are `cflx_status`, `cflx_control`, and `cflx_subscribe`, and the
+//! actions inside `cflx_control` are exactly the operator's: mark, unmark,
+//! start, stop, force_stop.
 //!
 //! # Why the tool set is closed
 //!
 //! The obvious design — expose `/api/v2` and let the model compose commands — is
 //! the one thing this must not do. `POST /api/v2/commands` needs an expected
-//! revision, an idempotency key, and mode-aware routing between mark/queue/start;
-//! a model that got any of those wrong would consume another operator's execution
-//! marks or double-submit under a stale revision. So the tools are intents, the
-//! routing stays in `enqueue`, and there is no way to name a raw command type,
-//! revision, idempotency key, queue mark, or shell string at all.
+//! revision, an idempotency key, and mode-aware routing; a model that got any of
+//! those wrong would consume another operator's execution marks or double-submit
+//! under a stale revision. So the tools are intents, the routing stays in
+//! `control`, and there is no way to name a raw command type, revision,
+//! idempotency key, queue intent, or shell string at all.
 //!
 //! # Why stdout is protocol-only
 //!
@@ -24,12 +34,14 @@
 //! desynchronizes the session, so nothing here writes to stdout except complete
 //! frames, and every diagnostic goes to stderr.
 //!
-//! # Bounded calls
+//! # Bounded calls, and why `cflx_wait` is not here
 //!
-//! `cflx_enqueue` returns as soon as admission settles; it never holds the call
-//! open for the life of a change. Asynchronous continuation is what the
-//! execution-scoped sinks are for, and `cflx_wait` keeps its explicit timeout for
-//! bounded synchronous observation.
+//! `cflx_control` returns as soon as its commands settle and `cflx_subscribe` as
+//! soon as the registry does; neither holds a call open for the life of a
+//! proposal. A completion wait is the opposite shape — it is open for exactly as
+//! long as the work takes — so it stays a CLI command. An MCP host that wants
+//! asynchronous completion registers an explicit callback with `cflx_subscribe`;
+//! a host that cannot execute one has no MCP completion oracle, by design.
 
 use std::path::PathBuf;
 
@@ -58,14 +70,7 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = ["2025-06-18", "2025-03-26"];
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Every tool this adapter exposes, in listing order.
-pub const TOOL_NAMES: [&str; 6] = [
-    "cflx_status",
-    "cflx_enqueue",
-    "cflx_wait",
-    "cflx_notify_set",
-    "cflx_notify_get",
-    "cflx_notify_clear",
-];
+pub const TOOL_NAMES: [&str; 3] = ["cflx_status", "cflx_control", "cflx_subscribe"];
 
 /// Connection settings every tool accepts.
 ///
@@ -94,48 +99,37 @@ struct StatusArgs {
     connection: ConnectionArgs,
 }
 
+/// `cflx_control` arguments.
+///
+/// One tool with an action rather than five tools, because the five are one
+/// decision an operator makes: which of the controls the TUI offers to use. The
+/// target list is optional at the parsing layer and *required* by the two mark
+/// actions, so a lifecycle action that carried one is refused as a usage error
+/// rather than silently ignoring it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EnqueueArgs {
-    change_id: String,
-    #[serde(flatten)]
-    connection: ConnectionArgs,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WaitArgs {
-    change_id: String,
-    /// Duration spelling accepted by `--timeout`: `500ms`, `30s`, `45m`, `2h`.
+struct ControlArgs {
+    action: String,
     #[serde(default)]
-    timeout: Option<String>,
+    change_ids: Vec<String>,
     #[serde(flatten)]
     connection: ConnectionArgs,
 }
 
+/// `cflx_subscribe` arguments.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NotifySetArgs {
-    change_id: String,
-    execution_id: String,
-    /// Owner incarnation the execution was admitted by, when the caller kept it.
+struct SubscribeArgs {
+    action: String,
+    change_ids: Vec<String>,
+    /// Owner incarnation the caller believes it is addressing, when it kept one.
     #[serde(default)]
     instance_id: Option<String>,
-    command: Vec<String>,
+    /// Callback argv. Required by `set`, refused by `get` and `clear`.
+    #[serde(default)]
+    command: Option<Vec<String>>,
     #[serde(default)]
     notify_blocked: bool,
-    #[serde(flatten)]
-    connection: ConnectionArgs,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NotifyRefArgs {
-    change_id: String,
-    execution_id: String,
-    /// Owner incarnation the execution was admitted by, when the caller kept it.
-    #[serde(default)]
-    instance_id: Option<String>,
     #[serde(flatten)]
     connection: ConnectionArgs,
 }
@@ -255,70 +249,81 @@ impl ToolHost for ClientToolHost {
                 };
                 Ok(crate::client::session::status(&connection).await)
             }
-            "cflx_enqueue" => {
-                let args: EnqueueArgs = parse_args(arguments)?;
-                let change_id = validated_change_id(&args.change_id)?;
-                let route = self.route(&args.connection)?;
-                let connection = match self.connect(&route, &args.connection, Operation::Enqueue) {
-                    Ok(connection) => connection,
-                    Err(envelope) => return Ok((*envelope).with_change(change_id)),
-                };
-                Ok(crate::client::enqueue::run(&connection, &change_id).await)
-            }
-            "cflx_wait" => {
-                let args: WaitArgs = parse_args(arguments)?;
-                let change_id = validated_change_id(&args.change_id)?;
-                let timeout = match args.timeout.as_deref() {
-                    Some(value) => {
-                        crate::cli::parse_client_timeout(value).map_err(ToolError::new)?
-                    }
-                    None => DEFAULT_WAIT_TIMEOUT,
-                };
-                let route = self.route(&args.connection)?;
-                let connection = match self.connect(&route, &args.connection, Operation::Wait) {
-                    Ok(connection) => connection,
-                    Err(envelope) => return Ok((*envelope).with_change(change_id)),
-                };
-                Ok(crate::client::wait::run(&connection, &change_id, timeout).await)
-            }
-            "cflx_notify_set" => {
-                let args: NotifySetArgs = parse_args(arguments)?;
-                let change_id = validated_change_id(&args.change_id)?;
-                let route = self.route(&args.connection)?;
-                let connection = match self.connect(&route, &args.connection, Operation::NotifySet)
+            "cflx_control" => {
+                let args: ControlArgs = parse_args(arguments)?;
+                let action =
+                    crate::client::control::Action::parse(&args.action).ok_or_else(|| {
+                        ToolError::new(format!(
+                            "'{}' is not a control action; use one of mark, unmark, start, stop, \
+                             or force_stop",
+                            args.action
+                        ))
+                    })?;
+                let change_ids = validated_change_ids(&args.change_ids)?;
+                let operation = action.operation();
+                // Shape refusals are answered as the stable `usage_error`
+                // envelope rather than as a protocol error, because they are
+                // facts about the request a model has to read and correct — and
+                // they happen here, before any route is even resolved.
+                if let Err(message) = crate::client::control::validate_request(action, &change_ids)
                 {
-                    Ok(connection) => connection,
-                    Err(envelope) => return Ok((*envelope).with_change(change_id)),
-                };
-                Ok(crate::client::notify::run(
-                    &connection,
-                    &change_id,
-                    &args.execution_id,
-                    args.instance_id.as_deref(),
-                    crate::client::notify::Intent::Set {
-                        command: args.command,
-                        notify_blocked: args.notify_blocked,
-                    },
-                )
-                .await)
-            }
-            "cflx_notify_get" | "cflx_notify_clear" => {
-                let args: NotifyRefArgs = parse_args(arguments)?;
-                let change_id = validated_change_id(&args.change_id)?;
-                let (operation, intent) = if name == "cflx_notify_get" {
-                    (Operation::NotifyGet, crate::client::notify::Intent::Get)
-                } else {
-                    (Operation::NotifyClear, crate::client::notify::Intent::Clear)
-                };
+                    return Ok(usage_error(operation, message));
+                }
                 let route = self.route(&args.connection)?;
                 let connection = match self.connect(&route, &args.connection, operation) {
                     Ok(connection) => connection,
-                    Err(envelope) => return Ok((*envelope).with_change(change_id)),
+                    Err(envelope) => return Ok(*envelope),
                 };
-                Ok(crate::client::notify::run(
+                Ok(crate::client::control::run(&connection, action, &change_ids).await)
+            }
+            "cflx_subscribe" => {
+                let args: SubscribeArgs = parse_args(arguments)?;
+                let change_ids = validated_change_ids(&args.change_ids)?;
+                let intent = match args.action.as_str() {
+                    "set" => crate::client::subscribe::Intent::Set {
+                        // An absent argv is an empty one on purpose: the shared
+                        // validator already refuses that with the reason a
+                        // caller needs, and a second spelling of the same
+                        // refusal would be a second thing to keep in step.
+                        command: args.command.clone().unwrap_or_default(),
+                        notify_blocked: args.notify_blocked,
+                    },
+                    "get" => crate::client::subscribe::Intent::Get,
+                    "clear" => crate::client::subscribe::Intent::Clear,
+                    other => {
+                        return Err(ToolError::new(format!(
+                            "'{other}' is not a subscription action; use one of set, get, or clear"
+                        )))
+                    }
+                };
+                let operation = intent.operation();
+                // A callback on a read or a removal is a caller that believes it
+                // is registering something. Ignoring it would let that belief
+                // survive the call.
+                if args.command.is_some()
+                    && !matches!(intent, crate::client::subscribe::Intent::Set { .. })
+                {
+                    return Ok(usage_error(
+                        operation,
+                        format!(
+                            "the '{}' action runs no callback, so it accepts no command argv",
+                            args.action
+                        ),
+                    ));
+                }
+                if let Err(message) =
+                    crate::client::subscribe::validate_request(&change_ids, &intent)
+                {
+                    return Ok(usage_error(operation, message));
+                }
+                let route = self.route(&args.connection)?;
+                let connection = match self.connect(&route, &args.connection, operation) {
+                    Ok(connection) => connection,
+                    Err(envelope) => return Ok(*envelope),
+                };
+                Ok(crate::client::subscribe::run(
                     &connection,
-                    &change_id,
-                    &args.execution_id,
+                    &change_ids,
                     args.instance_id.as_deref(),
                     intent,
                 )
@@ -331,8 +336,10 @@ impl ToolHost for ClientToolHost {
     }
 }
 
-/// Default `cflx_wait` budget, matching the CLI's own `--timeout` default.
-const DEFAULT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// The stable usage-failure envelope for a request this server refused itself.
+fn usage_error(operation: Operation, message: impl Into<String>) -> ResultEnvelope {
+    ResultEnvelope::new(operation, Outcome::UsageError).with_message(message)
+}
 
 /// Parse one tool's arguments, failing closed on anything unexpected.
 fn parse_args<T: serde::de::DeserializeOwned>(
@@ -357,6 +364,18 @@ fn parse_args<T: serde::de::DeserializeOwned>(
 /// would send `../` if nothing stopped it.
 fn validated_change_id(value: &str) -> Result<String, ToolError> {
     crate::cli::parse_change_id(value).map_err(ToolError::new)
+}
+
+/// Apply that rule to every element of a target list.
+///
+/// Shape only. Count and distinctness belong to the shared request validators,
+/// so the two surfaces cannot drift: a list the CLI would refuse must not be one
+/// a tool accepts.
+fn validated_change_ids(values: &[String]) -> Result<Vec<String>, ToolError> {
+    values
+        .iter()
+        .map(|value| validated_change_id(value))
+        .collect()
 }
 
 /// The published `tools/list` payload.
@@ -392,7 +411,7 @@ pub fn tool_descriptors() -> serde_json::Value {
             {
                 "name": "cflx_status",
                 "title": "Read the existing Conflux owner",
-                "description": "Read one coherent snapshot of the Conflux process that owns this repository. Mutates nothing and submits no command.",
+                "description": "Read one coherent snapshot of the Conflux process that owns this repository: owner incarnation, application mode, scheduler and activity state, per-proposal status, execution marks, queue intent, and execution episodes. Mutates nothing and submits no command.",
                 "inputSchema": {
                     "type": "object",
                     "properties": with_connection(serde_json::json!({})),
@@ -400,86 +419,63 @@ pub fn tool_descriptors() -> serde_json::Value {
                 }
             },
             {
-                "name": "cflx_enqueue",
-                "title": "Ask the owner to admit one change",
-                "description": "Ask the existing owner to admit one change. Returns as soon as admission settles — it is not a completion signal. The returned execution_id names the exact admitted episode; pass it to cflx_notify_set to be told when that episode finishes.",
+                "name": "cflx_control",
+                "title": "Control the owner exactly as an operator does",
+                "description": "Do one of the five things a Conflux operator does at the TUI. 'mark' and 'unmark' set or clear the named proposals' execution marks: target-scoped desired-state writes that preserve every unrelated mark, submit no queue intent, start nothing, and return without waiting for admission — the owner's own settlement decides whether stable marked work later runs. 'start', 'stop', and 'force_stop' submit the shared lifecycle intents F5/'!' and the stop controls submit; 'start' consumes the marks the owner already holds and takes no target list. Branch on the envelope's `outcome`: marked, unmarked, unchanged, and accepted are the successes.",
                 "inputSchema": {
                     "type": "object",
                     "properties": with_connection(serde_json::json!({
-                        "change_id": {"type": "string", "description": "Change to admit."}
-                    })),
-                    "required": ["change_id"],
-                    "additionalProperties": false
-                }
-            },
-            {
-                "name": "cflx_wait",
-                "title": "Observe one change until verified completion",
-                "description": "Observe one change until current repository evidence proves the owner's terminal mode, a typed failure settles, or the bounded timeout passes. Submits no command. A change disappearing from the owner's snapshot is never completion. The evidence is read from the selected project's repository, never from this server's own working directory.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": with_connection(serde_json::json!({
-                        "change_id": {"type": "string", "description": "Change to observe."},
-                        "timeout": {
+                        "action": {
                             "type": "string",
-                            "description": "Bounded budget: a whole number optionally suffixed with ms, s, m, or h (for example 500ms, 30s, 45m, 2h). Defaults to 60m."
+                            "enum": ["mark", "unmark", "start", "stop", "force_stop"],
+                            "description": "Which operator control to use."
+                        },
+                        "change_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 64,
+                            "description": "Proposals to mark or unmark: 1 through 64, all distinct. Required by mark and unmark; refused by start, stop, and force_stop, which consume the owner's authoritative mark set."
                         }
                     })),
-                    "required": ["change_id"],
+                    "required": ["action"],
                     "additionalProperties": false
                 }
             },
             {
-                "name": "cflx_notify_set",
-                "title": "Attach a completion callback to one execution",
-                "description": "Attach one bounded argv the owner runs once when this exact execution reaches a typed terminal classification. argv is data, never shell source. Accepted only over the owner's Unix socket. Registering after the execution already settled delivers that terminal event immediately.",
+                "name": "cflx_subscribe",
+                "title": "Ask to be told when named proposals finish",
+                "description": "Register, read, or remove completion callbacks for named proposals. A subscription is keyed by the proposal, so it can be registered before the owner admits anything; whenever a subscribed proposal enters a new execution episode the owner binds it and delivers that episode's first terminal classification — completed, failed, or stopped — once. Re-admission after a retry is a distinct episode and a distinct notification. Registering after the latest episode already settled delivers that event immediately, and never again. Delivery is notification only: Conflux runs the registered argv and does not start, resume, or message an agent, and the callback's exit status changes no workflow outcome. Registering mutates no workflow state, creates no command record, and advances no revision. Subscriptions are process-local: an owner restart invalidates all of them.",
                 "inputSchema": {
                     "type": "object",
                     "properties": with_connection(serde_json::json!({
-                        "change_id": {"type": "string", "description": "Change the execution belongs to."},
-                        "execution_id": {"type": "string", "description": "Execution episode returned by cflx_enqueue."},
-                        "instance_id": {"type": "string", "description": "Owner incarnation cflx_enqueue reported. Supplying it turns an owner restart into a typed owner_restarted refusal instead of a lost execution."},
+                        "action": {
+                            "type": "string",
+                            "enum": ["set", "get", "clear"],
+                            "description": "Register or replace, inspect, or remove."
+                        },
+                        "change_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 64,
+                            "description": "Proposals to address: 1 through 64, all distinct. There is no list-all."
+                        },
+                        "instance_id": {
+                            "type": "string",
+                            "description": "Owner incarnation cflx_status reported. Supplying it turns an owner restart into a typed owner_restarted refusal instead of a silent registration against a process that never saw your work."
+                        },
                         "command": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Callback argv. Element 0 is the program; no shell interpretation is applied."
+                            "description": "Callback argv, required by 'set' and refused by 'get' and 'clear'. Element 0 is the program; no shell interpretation is applied. Accepted only over the owner's Unix socket."
                         },
                         "notify_blocked": {
                             "type": "boolean",
                             "description": "Also deliver the non-terminal blocked attention edge. Terminal events are always delivered and cannot be disabled."
                         }
                     })),
-                    "required": ["change_id", "execution_id", "command"],
-                    "additionalProperties": false
-                }
-            },
-            {
-                "name": "cflx_notify_get",
-                "title": "Read one execution's completion callback",
-                "description": "Read the callback currently attached to one execution, along with which events have already been delivered.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": with_connection(serde_json::json!({
-                        "change_id": {"type": "string", "description": "Change the execution belongs to."},
-                        "execution_id": {"type": "string", "description": "Execution episode to read."},
-                        "instance_id": {"type": "string", "description": "Owner incarnation cflx_enqueue reported. Supplying it turns an owner restart into a typed owner_restarted refusal instead of a lost execution."}
-                    })),
-                    "required": ["change_id", "execution_id"],
-                    "additionalProperties": false
-                }
-            },
-            {
-                "name": "cflx_notify_clear",
-                "title": "Detach one execution's completion callback",
-                "description": "Detach the callback attached to one execution. Accepted only over the owner's Unix socket.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": with_connection(serde_json::json!({
-                        "change_id": {"type": "string", "description": "Change the execution belongs to."},
-                        "execution_id": {"type": "string", "description": "Execution episode to clear."},
-                        "instance_id": {"type": "string", "description": "Owner incarnation cflx_enqueue reported. Supplying it turns an owner restart into a typed owner_restarted refusal instead of a lost execution."}
-                    })),
-                    "required": ["change_id", "execution_id"],
+                    "required": ["action", "change_ids"],
                     "additionalProperties": false
                 }
             }
@@ -656,12 +652,16 @@ impl<H: ToolHost> Session<H> {
                 "name": "cflx-client",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "instructions": "Intent-shaped client of the Conflux process that already owns this \
-                             repository. cflx_enqueue admits one change and returns immediately \
-                             with an execution_id; admission is not completion. Use \
-                             cflx_notify_set with that execution_id for asynchronous \
-                             continuation, or cflx_wait for a bounded synchronous observation. \
-                             Branch on the envelope's `outcome` field, never on prose.",
+            "instructions": "Control client of the Conflux process that already owns this \
+                             repository, with the operator's own verbs. cflx_control mark selects \
+                             proposals — it preserves unrelated marks and claims no admission — \
+                             and cflx_control start is the F5 equivalent that consumes the \
+                             owner's authoritative mark set. Neither is completion. For \
+                             asynchronous completion, register a callback explicitly with \
+                             cflx_subscribe set; nothing is registered for you, and delivery \
+                             notifies rather than resumes. There is no wait tool: use \
+                             `cflx client wait` when a bounded synchronous observation is what \
+                             you need. Branch on the envelope's `outcome` field, never on prose.",
         })
     }
 
@@ -1176,8 +1176,15 @@ mod tests {
             "expected_revision",
             "idempotency_key",
             "set_execution_mark",
+            "set_queue_intent",
             "command_type",
             "/api/v2/commands",
+            // The retired admission surface, in every spelling it ever had: an
+            // agent that could still name one would still be able to ask for the
+            // analyze bypass this change removed.
+            "cflx_enqueue",
+            "cflx_wait",
+            "cflx_notify",
         ] {
             assert!(
                 !rendered.contains(forbidden),
@@ -1205,41 +1212,46 @@ mod tests {
 
     #[tokio::test]
     async fn a_successful_call_returns_the_envelope_as_text_and_structured_content() {
-        let envelope = ResultEnvelope::new(Operation::Enqueue, Outcome::Admitted)
+        let envelope = ResultEnvelope::new(Operation::ControlMark, Outcome::Marked)
             .with_change("alpha")
-            .with_instance(Some("i-1".to_string()))
-            .with_execution(Some("e-1".to_string()));
+            .with_instance(Some("i-1".to_string()));
         let mut session = initialized(FakeHost::answering(envelope)).await;
         let response = respond(
             &mut session,
             serde_json::json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "cflx_enqueue", "arguments": {"change_id": "alpha"}}
+                "params": {
+                    "name": "cflx_control",
+                    "arguments": {"action": "mark", "change_ids": ["alpha"]}
+                }
             }),
         )
         .await;
         let result = &response["result"];
         assert_eq!(result["isError"], false);
-        assert_eq!(result["structuredContent"]["outcome"], "admitted");
-        assert_eq!(result["structuredContent"]["execution_id"], "e-1");
+        assert_eq!(result["structuredContent"]["outcome"], "marked");
+        assert_eq!(result["structuredContent"]["operation"], "control_mark");
         let text = result["content"][0]["text"].as_str().unwrap();
         let reparsed: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(reparsed["outcome"], "admitted");
+        assert_eq!(reparsed["outcome"], "marked");
     }
 
     /// An unsuccessful *owner* outcome is a tool error the model can read, not a
     /// protocol error that would hide the reason from it.
     #[tokio::test]
     async fn an_unsuccessful_outcome_is_an_error_tool_result_carrying_its_reason() {
-        let envelope = ResultEnvelope::new(Operation::Enqueue, Outcome::TargetIneligible)
+        let envelope = ResultEnvelope::new(Operation::ControlMark, Outcome::TargetIneligible)
             .with_change("alpha")
-            .with_message("'alpha' has reached the final status 'merged'");
+            .with_message("this owner refuses execution-mark mutation right now");
         let mut session = initialized(FakeHost::answering(envelope)).await;
         let response = respond(
             &mut session,
             serde_json::json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "cflx_enqueue", "arguments": {"change_id": "alpha"}}
+                "params": {
+                    "name": "cflx_control",
+                    "arguments": {"action": "mark", "change_ids": ["alpha"]}
+                }
             }),
         )
         .await;
@@ -1249,6 +1261,35 @@ mod tests {
             response["result"]["structuredContent"]["outcome"],
             "target_ineligible"
         );
+    }
+
+    /// The three retired tools are gone from the dispatcher, not merely from the
+    /// listing: a host that remembered a name from an older server must reach no
+    /// owner with it.
+    #[tokio::test]
+    async fn the_retired_tools_are_unreachable_by_name() {
+        for retired in [
+            "cflx_enqueue",
+            "cflx_wait",
+            "cflx_notify_set",
+            "cflx_notify_get",
+            "cflx_notify_clear",
+        ] {
+            let mut session = initialized(FakeHost::refusing("unreachable")).await;
+            let response = respond(
+                &mut session,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": retired, "arguments": {"change_id": "alpha"}}
+                }),
+            )
+            .await;
+            assert_eq!(response["result"]["isError"], true, "{retired}");
+            assert!(
+                session.host.calls.lock().unwrap().is_empty(),
+                "{retired} must reach no owner"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1384,17 +1425,40 @@ mod tests {
     /// silently-ignored instruction.
     #[test]
     fn tool_arguments_reject_unknown_fields() {
-        let ok: Result<EnqueueArgs, _> = parse_args(&serde_json::json!({"change_id": "alpha"}));
+        let ok: Result<ControlArgs, _> =
+            parse_args(&serde_json::json!({"action": "mark", "change_ids": ["alpha"]}));
         assert!(ok.is_ok());
-        let extra: Result<EnqueueArgs, _> =
-            parse_args(&serde_json::json!({"change_id": "alpha", "force": true}));
+        let extra: Result<ControlArgs, _> = parse_args(
+            &serde_json::json!({"action": "mark", "change_ids": ["alpha"], "force": true}),
+        );
         assert!(extra.is_err());
-        let missing: Result<EnqueueArgs, _> = parse_args(&serde_json::json!({}));
+        let missing: Result<ControlArgs, _> = parse_args(&serde_json::json!({}));
         assert!(missing.is_err());
+        // A lifecycle action names no targets, and the field defaults to empty
+        // rather than being required, so `start` parses on its own.
+        let lifecycle: Result<ControlArgs, _> = parse_args(&serde_json::json!({"action": "start"}));
+        assert!(lifecycle.is_ok());
+        // Subscription targets are always explicit: there is no list-all.
+        let no_targets: Result<SubscribeArgs, _> =
+            parse_args(&serde_json::json!({"action": "get"}));
+        assert!(no_targets.is_err());
         // Absent arguments are an empty object, not a parse failure, for the one
         // tool that needs none.
         let none: Result<StatusArgs, _> = parse_args(&serde_json::Value::Null);
         assert!(none.is_ok());
+    }
+
+    /// The action vocabulary is the security boundary of `cflx_control`, so a
+    /// name outside it must not resolve to anything at all.
+    #[test]
+    fn control_actions_are_a_closed_set() {
+        use crate::client::control::Action;
+        for name in ["mark", "unmark", "start", "stop", "force_stop"] {
+            assert!(Action::parse(name).is_some(), "{name}");
+        }
+        for name in ["enqueue", "queue", "retry", "resolve", "archive", "merge"] {
+            assert!(Action::parse(name).is_none(), "{name} must not be callable");
+        }
     }
 
     #[test]

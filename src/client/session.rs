@@ -227,6 +227,88 @@ pub struct Observation {
     pub contract: ExecutionContractResponse,
 }
 
+/// Build one observation from a change list, for classification-only tests.
+///
+/// The classification a control request performs reads exactly two things: the
+/// projected changes and the command-execution capability. Everything else in an
+/// [`Observation`] describes how the reads were reconciled, which a test about
+/// *what was decided* has no business depending on. Assembling one here keeps
+/// those tests unit-scoped — no socket, no repository, no owner — which is the
+/// same boundary the contract draws around a pre-submission refusal.
+#[cfg(test)]
+pub(crate) fn observation_for_test(changes: Vec<ChangeResource>) -> Observation {
+    use crate::web::remote_control_api::dto::{
+        CapabilityLimits, CommandExecutionCapability, InstanceSnapshot, ProcessExecutionStatus,
+    };
+
+    let instance_id = "i-test".to_string();
+    Observation {
+        instance_id: instance_id.clone(),
+        state_revision: 1,
+        event_sequence: 1,
+        capabilities: CapabilitiesResponse {
+            api_version: API_VERSION.to_string(),
+            instance_id: instance_id.clone(),
+            commands: Vec::new(),
+            transports: Vec::new(),
+            error_codes: Vec::new(),
+            limits: CapabilityLimits {
+                max_events: 0,
+                max_logs: 0,
+                max_commands: 0,
+                max_idempotency_records: 0,
+                command_record_ttl_secs: 0,
+                max_correlation_id_len: 0,
+            },
+            authentication_required: false,
+            command_execution: CommandExecutionCapability { available: true },
+            execution_sinks: Default::default(),
+            proposal_subscriptions: crate::web::completion_sink::proposal_capability(),
+            worktrees: Default::default(),
+            parallel: crate::web::remote_control_api::dto::ParallelCapabilities {
+                max_concurrent: 1,
+                vcs_backend: "git".to_string(),
+                blocked_reasons: Vec::new(),
+            },
+        },
+        instance: InstanceResponse {
+            instance_id: instance_id.clone(),
+            started_at: String::new(),
+            pid: 0,
+            version: String::new(),
+            api_version: API_VERSION.to_string(),
+        },
+        state: StateResponse {
+            instance_id: instance_id.clone(),
+            state_revision: 1,
+            event_sequence: 1,
+            snapshot: InstanceSnapshot {
+                changes,
+                ..InstanceSnapshot::empty()
+            },
+        },
+        execution: ExecutionStatusResponse {
+            instance_id: instance_id.clone(),
+            state_revision: 1,
+            event_sequence: 1,
+            observed_at: String::new(),
+            process: ProcessExecutionStatus {
+                app_mode: "select".to_string(),
+                scheduler_running: false,
+                has_active_work: false,
+                active_activities: Vec::new(),
+                latest_log: None,
+            },
+            changes: Vec::new(),
+        },
+        contract: ExecutionContractResponse {
+            instance_id,
+            state_revision: 1,
+            contract: None,
+        },
+    }
+}
+
 impl Observation {
     /// One projected change, when the owner tracks it.
     pub fn change(&self, change_id: &str) -> Option<&ChangeResource> {
@@ -242,23 +324,15 @@ impl Observation {
         self.capabilities.command_execution.available
     }
 
-    /// The process-local execution episode the owner publishes for one change.
-    ///
-    /// `None` on an owner that predates execution identity, and on a change
-    /// this incarnation never admitted. Both are honest absences rather than
-    /// something to synthesize: an episode ID this client invented would name
-    /// no subscription the owner could ever deliver.
-    pub fn execution_id(&self, change_id: &str) -> Option<String> {
-        self.execution
-            .changes
-            .iter()
-            .find(|status| status.id == change_id)
-            .and_then(|status| status.execution_id.clone())
-    }
-
     /// Whether this owner serves execution-scoped completion sinks.
+    #[allow(dead_code)] // The owner still serves the resource; no client verb uses it.
     pub fn execution_sinks_available(&self) -> bool {
         self.capabilities.execution_sinks.available
+    }
+
+    /// Whether this owner serves proposal-scoped subscriptions.
+    pub fn proposal_subscriptions_available(&self) -> bool {
+        self.capabilities.proposal_subscriptions.available
     }
 }
 

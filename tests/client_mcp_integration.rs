@@ -129,6 +129,12 @@ struct ReducerExecutor {
     facts: Arc<ExecutionFactsStore>,
     dispatch: Mutex<u64>,
     submitted: Mutex<Vec<CommandSpec>>,
+    /// The process-local execution marks a keypress would write.
+    ///
+    /// Held here rather than derived, because the whole separation under test is
+    /// that a mark is *selection* and Start is what consumes it: an executor
+    /// that admitted work on a mark would make the two indistinguishable.
+    marks: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl ReducerExecutor {
@@ -138,6 +144,7 @@ impl ReducerExecutor {
             facts,
             dispatch: Mutex::new(1_000),
             submitted: Mutex::new(Vec::new()),
+            marks: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -181,6 +188,33 @@ impl RemoteControlExecutor for ReducerExecutor {
                     reducer.retry_terminal_error(change_id);
                 }
                 self.publish(change_id, true);
+            }
+            // Selection only. Nothing is admitted here, which is exactly what
+            // makes the Start below the thing that admits.
+            CommandSpec::SetExecutionMark { change_id, marked } => {
+                let mut marks = self.marks.lock().unwrap();
+                let changed = match marked {
+                    true => marks.insert(change_id.clone()),
+                    false => marks.remove(change_id),
+                };
+                if !changed {
+                    return Ok(ExecutionSummary::no_op(
+                        "execution mark already had the requested value",
+                    ));
+                }
+            }
+            // The shared Start consumes the authoritative mark set — every mark,
+            // not a caller-supplied subset — which is the property the client
+            // must not be able to work around.
+            CommandSpec::Start => {
+                let targets: Vec<String> = self.marks.lock().unwrap().iter().cloned().collect();
+                for change_id in &targets {
+                    {
+                        let mut reducer = self.reducer.lock().unwrap();
+                        reducer.apply_command(ReducerCommand::AddToQueue(change_id.clone()));
+                    }
+                    self.publish(change_id, true);
+                }
             }
             _ => {}
         }
@@ -289,6 +323,27 @@ impl Owner {
             .to_string()
     }
 
+    /// Mark one proposal and start, the way an operator does, and return the
+    /// execution episode the owner opened.
+    ///
+    /// Two explicit steps rather than one admission call: the separation is the
+    /// change, so a helper that hid it would stop the tests from covering it.
+    fn admit_through(&self, host: &mut McpHost, change_id: &str) -> String {
+        let marked = host.call(
+            "cflx_control",
+            serde_json::json!({"action": "mark", "change_ids": [change_id]}),
+        );
+        assert_eq!(marked["outcome"], "marked", "{marked}");
+        assert!(
+            marked.as_object().unwrap().get("execution_id").is_none(),
+            "a mark creates no episode: {marked}"
+        );
+        let started = host.call("cflx_control", serde_json::json!({"action": "start"}));
+        assert_eq!(started["outcome"], "accepted", "{started}");
+        self.execution_id(change_id)
+            .expect("Start admits the marked set, which opens an episode")
+    }
+
     /// Publish the owner's authoritative snapshot with real action eligibility.
     fn publish(&self, change_ids: &[&str], app_mode: &str) {
         let changes: Vec<ChangeResource> = change_ids
@@ -313,7 +368,7 @@ impl Owner {
                     progress_percent: 0.0,
                     dependencies: Vec::new(),
                     iteration_number: None,
-                    execution_marked: false,
+                    execution_marked: self.executor.marks.lock().unwrap().contains(*id),
                     queue_intent: if queued {
                         QueueIntent::Queued
                     } else {
@@ -598,14 +653,289 @@ fn count(path: &Path, needle: &str) -> usize {
 // Tests
 // ============================================================================
 
-/// The whole point of the change: an agent admits work into a resident TUI over
-/// MCP and is told exactly once when that execution finishes — while the TUI is
-/// still running, and only because the repository proves it.
+// ----------------------------------------------------------------------------
+// Surface and validation
+//
+// These need no owner at all, which is the point: every refusal below has to be
+// provable *before* a route is even resolved, so a rejected request cannot have
+// contacted anybody. They run in the default suite because "what this server
+// exposes and what it refuses" is the security boundary the rest of the file
+// assumes.
+// ----------------------------------------------------------------------------
+
+/// One server with nowhere to route to, for assertions about the surface and
+/// about refusals that never reach an owner.
+fn unrouted_host() -> (tempfile::TempDir, McpHost) {
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let host = McpHost::start_unrouted(elsewhere.path());
+    (elsewhere, host)
+}
+
+/// The tool set *is* the boundary, so it is asserted exactly rather than
+/// sampled, and every retired name is asserted absent rather than assumed gone.
+#[test]
+fn mcp_tools_list_exposes_exactly_the_three_closed_tools() {
+    let (_dir, mut host) = unrouted_host();
+    let listed = host.request("tools/list", serde_json::json!({}));
+    let tools = listed["result"]["tools"].as_array().expect("a tool list");
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["cflx_status", "cflx_control", "cflx_subscribe"]);
+
+    let rendered = listed.to_string();
+    for forbidden in [
+        "cflx_enqueue",
+        "cflx_wait",
+        "cflx_notify",
+        "expected_revision",
+        "idempotency_key",
+        "set_execution_mark",
+        "set_queue_intent",
+        "/api/v2/commands",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "the closed tool surface must not mention {forbidden}"
+        );
+    }
+
+    // The action vocabularies are published as closed enums, so a host can see
+    // what is callable without guessing.
+    let control = tools
+        .iter()
+        .find(|tool| tool["name"] == "cflx_control")
+        .unwrap();
+    assert_eq!(
+        control["inputSchema"]["properties"]["action"]["enum"],
+        serde_json::json!(["mark", "unmark", "start", "stop", "force_stop"])
+    );
+    let subscribe = tools
+        .iter()
+        .find(|tool| tool["name"] == "cflx_subscribe")
+        .unwrap();
+    assert_eq!(
+        subscribe["inputSchema"]["properties"]["action"]["enum"],
+        serde_json::json!(["set", "get", "clear"])
+    );
+
+    for tool in tools {
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false, "{}", tool["name"]);
+        // A token is always a variable *name*.
+        assert!(schema["properties"]["auth_token_env"].is_object());
+        assert!(schema["properties"].get("auth_token").is_none());
+        // Both route selectors are on every tool.
+        assert!(schema["properties"]["project_dir"].is_object());
+        assert!(schema["properties"]["unix_socket"].is_object());
+    }
+    host.stop();
+}
+
+/// Every shape refusal `cflx_control` can produce happens before a route is
+/// resolved, and it comes back as the stable `usage_error` envelope rather than
+/// as a protocol error the model could not read.
+#[test]
+fn mcp_control_refuses_a_malformed_request_before_contacting_an_owner() {
+    let (_dir, mut host) = unrouted_host();
+
+    for (arguments, what) in [
+        (
+            serde_json::json!({"action": "mark", "change_ids": ["alpha", "alpha"]}),
+            "a duplicated target",
+        ),
+        (
+            serde_json::json!({"action": "mark", "change_ids": []}),
+            "an empty target list",
+        ),
+        (
+            serde_json::json!({
+                "action": "mark",
+                "change_ids": (0..65).map(|n| format!("change-{n}")).collect::<Vec<_>>()
+            }),
+            "more than 64 targets",
+        ),
+        (
+            serde_json::json!({"action": "start", "change_ids": ["alpha"]}),
+            "a lifecycle action carrying targets",
+        ),
+        (
+            serde_json::json!({"action": "stop", "change_ids": ["alpha"]}),
+            "stop carrying targets",
+        ),
+        (
+            serde_json::json!({"action": "force_stop", "change_ids": ["alpha"]}),
+            "force_stop carrying targets",
+        ),
+    ] {
+        let envelope = host.call("cflx_control", arguments);
+        assert_eq!(envelope["outcome"], "usage_error", "{what}: {envelope}");
+        assert_eq!(envelope["ok"], false, "{what}");
+        assert!(
+            envelope.as_object().unwrap().get("instance_id").is_none(),
+            "{what}: nothing was contacted, so no owner may be named: {envelope}"
+        );
+    }
+
+    // An action outside the closed set is a tool error rather than an envelope:
+    // there is no operation for it to report on.
+    for action in ["enqueue", "queue", "retry", "archive"] {
+        let refused = host.call_raw(
+            "cflx_control",
+            serde_json::json!({"action": action, "change_ids": ["alpha"]}),
+        );
+        assert_eq!(refused["isError"], true, "{action}");
+        assert!(
+            refused.get("structuredContent").is_none(),
+            "{action} reached nobody"
+        );
+    }
+
+    // A change ID that could escape a URL or a Git ref never gets that far.
+    let escaping = host.call_raw(
+        "cflx_control",
+        serde_json::json!({"action": "mark", "change_ids": ["../escape"]}),
+    );
+    assert_eq!(escaping["isError"], true, "{escaping}");
+    host.stop();
+}
+
+/// The same, for `cflx_subscribe`: the callback argv is required by `set` and
+/// refused by the two operations that never run one.
+#[test]
+fn mcp_subscribe_refuses_a_malformed_request_before_contacting_an_owner() {
+    let (_dir, mut host) = unrouted_host();
+
+    for (arguments, what) in [
+        (
+            serde_json::json!({"action": "set", "change_ids": ["alpha"]}),
+            "a registration with no callback at all",
+        ),
+        (
+            serde_json::json!({"action": "set", "change_ids": ["alpha"], "command": []}),
+            "an empty callback argv",
+        ),
+        (
+            serde_json::json!({
+                "action": "set",
+                "change_ids": ["alpha"],
+                "command": ["/bin/echo", "one\ntwo"]
+            }),
+            "a control byte inside the argv",
+        ),
+        (
+            serde_json::json!({"action": "get", "change_ids": ["alpha"], "command": ["/bin/true"]}),
+            "a callback on a read",
+        ),
+        (
+            serde_json::json!({
+                "action": "clear",
+                "change_ids": ["alpha"],
+                "command": ["/bin/true"]
+            }),
+            "a callback on a removal",
+        ),
+        (
+            serde_json::json!({"action": "get", "change_ids": ["alpha", "alpha"]}),
+            "a duplicated target",
+        ),
+        (
+            serde_json::json!({"action": "get", "change_ids": []}),
+            "an empty target list",
+        ),
+        (
+            serde_json::json!({
+                "action": "get",
+                "change_ids": (0..65).map(|n| format!("change-{n}")).collect::<Vec<_>>()
+            }),
+            "more than 64 targets",
+        ),
+    ] {
+        let envelope = host.call("cflx_subscribe", arguments);
+        assert_eq!(envelope["outcome"], "usage_error", "{what}: {envelope}");
+        assert_eq!(envelope["ok"], false, "{what}");
+    }
+
+    // There is no list-all: a request that named nothing does not parse.
+    let unbounded = host.call_raw("cflx_subscribe", serde_json::json!({"action": "get"}));
+    assert_eq!(unbounded["isError"], true, "{unbounded}");
+
+    for action in ["subscribe", "watch", "notify"] {
+        let refused = host.call_raw(
+            "cflx_subscribe",
+            serde_json::json!({"action": action, "change_ids": ["alpha"]}),
+        );
+        assert_eq!(refused["isError"], true, "{action}");
+    }
+    host.stop();
+}
+
+/// The initialization text is what an agent reads before it does anything, so it
+/// has to point at the control verbs and say plainly that nothing subscribes for
+/// it.
+#[test]
+fn mcp_initialization_text_teaches_explicit_control_and_subscription() {
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .args(["client", "mcp"])
+        .current_dir(elsewhere.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the compiled cflx binary must be runnable");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}}
+        })
+    )
+    .expect("write the handshake");
+    stdin.flush().expect("flush");
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read the response");
+    let response: serde_json::Value = serde_json::from_str(line.trim()).expect("one frame");
+    let instructions = response["result"]["instructions"]
+        .as_str()
+        .expect("the handshake carries instructions");
+
+    for expected in ["cflx_control", "cflx_subscribe", "F5", "cflx client wait"] {
+        assert!(
+            instructions.contains(expected),
+            "the instructions must mention {expected}: {instructions}"
+        );
+    }
+    for retired in ["cflx_enqueue", "cflx_notify_set"] {
+        assert!(
+            !instructions.contains(retired),
+            "{retired} is retired: {instructions}"
+        );
+    }
+    assert!(
+        instructions.contains("nothing is registered for you")
+            || instructions.contains("nothing is registered")
+            || instructions.contains("explicitly"),
+        "the instructions must say registration is explicit: {instructions}"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// The whole point of the change: an agent *selects* work in a resident TUI over
+/// MCP, explicitly starts it, and — because it separately asked to be told — is
+/// notified exactly once when that execution finishes, while the TUI is still
+/// running and only because the repository proves it.
 // Multi-threaded on purpose: the MCP host is driven with blocking stdio
 // reads, and the owner it is talking to is a task in this same runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(not(feature = "heavy-tests"), ignore)]
-async fn mcp_admits_into_a_live_owner_and_notifies_once_on_verified_completion() {
+async fn mcp_control_marks_and_starts_a_live_owner_and_subscribe_notifies_once() {
     let repo = Repo::new();
     repo.stage_active("alpha");
     let socket = repo.path().join("cflx-api.sock");
@@ -615,57 +945,41 @@ async fn mcp_admits_into_a_live_owner_and_notifies_once_on_verified_completion()
 
     let mut host = McpHost::start(repo.path(), &socket);
 
-    // The tool surface is closed: no raw command construction is reachable.
-    let listed = host.request("tools/list", serde_json::json!({}));
-    let names: Vec<String> = listed["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|tool| tool["name"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            "cflx_status",
-            "cflx_enqueue",
-            "cflx_wait",
-            "cflx_notify_set",
-            "cflx_notify_get",
-            "cflx_notify_clear"
-        ]
-    );
-
     let status = host.call("cflx_status", serde_json::json!({}));
     assert_eq!(status["outcome"], "observed");
     assert_eq!(status["instance_id"], owner.instance_id());
 
-    let admitted = host.call("cflx_enqueue", serde_json::json!({"change_id": "alpha"}));
-    assert_eq!(admitted["outcome"], "admitted");
-    let execution_id = admitted["execution_id"]
-        .as_str()
-        .expect("an admitted execution carries its episode identity")
-        .to_string();
-    assert_eq!(admitted["instance_id"], owner.instance_id());
-    assert_eq!(
-        owner.executor.submitted(),
-        vec![CommandSpec::SetQueueIntent {
-            change_id: "alpha".to_string(),
-            queued: true
-        }],
-        "a live owner is queued, never started a second time"
-    );
-
+    // Registered *before* anything is admitted, which is the gap a
+    // proposal-scoped subscription exists to cover.
     let subscribed = host.call(
-        "cflx_notify_set",
+        "cflx_subscribe",
         serde_json::json!({
-            "change_id": "alpha",
-            "execution_id": execution_id,
+            "action": "set",
+            "change_ids": ["alpha"],
             "instance_id": owner.instance_id(),
             "command": command,
         }),
     );
     assert_eq!(subscribed["outcome"], "subscribed");
-    assert_eq!(subscribed["detail"]["terminal_dispatched"], false);
+    assert_eq!(subscribed["detail"]["subscriptions"][0]["subscribed"], true);
+    assert_eq!(
+        subscribed["detail"]["subscriptions"][0]["terminal_dispatched"],
+        false
+    );
+
+    let execution_id = owner.admit_through(&mut host, "alpha");
+    assert_eq!(
+        owner.executor.submitted(),
+        vec![
+            CommandSpec::SetExecutionMark {
+                change_id: "alpha".to_string(),
+                marked: true
+            },
+            CommandSpec::Start,
+        ],
+        "the only commands a control client may submit are marks and shared \
+         lifecycle intents — never queue intent"
+    );
 
     // The work finishes: the repository carries the archive entry, and the
     // owner reaches its typed terminal success.
@@ -691,39 +1005,46 @@ async fn mcp_admits_into_a_live_owner_and_notifies_once_on_verified_completion()
     );
 
     let read = host.call(
-        "cflx_notify_get",
+        "cflx_subscribe",
         serde_json::json!({
-            "change_id": "alpha",
-            "execution_id": execution_id,
+            "action": "get",
+            "change_ids": ["alpha"],
             "instance_id": owner.instance_id(),
         }),
     );
     assert_eq!(read["outcome"], "subscribed");
-    assert_eq!(read["detail"]["terminal_dispatched"], true);
-    assert_eq!(read["detail"]["delivered_events"][0], "completed");
+    assert_eq!(read["execution_id"], execution_id.as_str());
+    assert_eq!(
+        read["detail"]["subscriptions"][0]["terminal_dispatched"],
+        true
+    );
+    assert_eq!(
+        read["detail"]["subscriptions"][0]["delivered_events"][0],
+        "completed"
+    );
 
     host.stop();
     owner.stop().await;
 }
 
-/// The race an agent is genuinely in: the execution settles between the enqueue
-/// returning and the notify landing. Losing that notification would make the
-/// whole contract unusable.
+/// The race an agent is genuinely in: the execution settles before the
+/// subscription lands. Losing that notification would make the whole contract
+/// unusable, and replaying it afterwards would make it untrustworthy.
 // Multi-threaded on purpose: the MCP host is driven with blocking stdio
 // reads, and the owner it is talking to is a task in this same runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(not(feature = "heavy-tests"), ignore)]
-async fn mcp_delivers_a_terminal_that_settled_before_registration() {
+async fn mcp_subscribe_delivers_a_terminal_that_settled_before_registration() {
     let repo = Repo::new();
     repo.stage_active("alpha");
     let socket = repo.path().join("cflx-api.sock");
     let owner = Owner::start(&repo, socket.clone(), &["alpha"]).await;
     let callbacks = tempfile::tempdir().expect("temp dir");
     let command = recorder(callbacks.path(), "late");
+    let replacement = recorder(callbacks.path(), "replacement");
 
     let mut host = McpHost::start(repo.path(), &socket);
-    let admitted = host.call("cflx_enqueue", serde_json::json!({"change_id": "alpha"}));
-    let execution_id = admitted["execution_id"].as_str().unwrap().to_string();
+    let execution_id = owner.admit_through(&mut host, "alpha");
 
     // Settle first, with nothing registered.
     repo.archive("alpha");
@@ -735,10 +1056,10 @@ async fn mcp_delivers_a_terminal_that_settled_before_registration() {
     assert!(!log_of(&command).exists());
 
     let subscribed = host.call(
-        "cflx_notify_set",
+        "cflx_subscribe",
         serde_json::json!({
-            "change_id": "alpha",
-            "execution_id": execution_id,
+            "action": "set",
+            "change_ids": ["alpha"],
             "command": command,
         }),
     );
@@ -747,6 +1068,24 @@ async fn mcp_delivers_a_terminal_that_settled_before_registration() {
     let record = await_event(&log_of(&command), "event=completed").await;
     assert!(record.contains(&execution_id));
     settle().await;
+    assert_eq!(count(&log_of(&command), "event="), 1);
+
+    // Dedupe is keyed by the episode, not by the subscription generation:
+    // replacing the callback must not replay a terminal already delivered.
+    let replaced = host.call(
+        "cflx_subscribe",
+        serde_json::json!({
+            "action": "set",
+            "change_ids": ["alpha"],
+            "command": replacement,
+        }),
+    );
+    assert_eq!(replaced["outcome"], "subscribed");
+    settle().await;
+    assert!(
+        !log_of(&replacement).exists(),
+        "a replacement must not replay a delivered terminal"
+    );
     assert_eq!(count(&log_of(&command), "event="), 1);
 
     host.stop();
@@ -759,7 +1098,7 @@ async fn mcp_delivers_a_terminal_that_settled_before_registration() {
 // reads, and the owner it is talking to is a task in this same runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(not(feature = "heavy-tests"), ignore)]
-async fn mcp_blocked_attention_repeats_only_after_recovery() {
+async fn mcp_subscribe_blocked_attention_repeats_only_after_recovery() {
     let repo = Repo::new();
     repo.stage_active("alpha");
     let socket = repo.path().join("cflx-api.sock");
@@ -768,17 +1107,16 @@ async fn mcp_blocked_attention_repeats_only_after_recovery() {
     let command = recorder(callbacks.path(), "attention");
 
     let mut host = McpHost::start(repo.path(), &socket);
-    let admitted = host.call("cflx_enqueue", serde_json::json!({"change_id": "alpha"}));
-    let execution_id = admitted["execution_id"].as_str().unwrap().to_string();
     host.call(
-        "cflx_notify_set",
+        "cflx_subscribe",
         serde_json::json!({
-            "change_id": "alpha",
-            "execution_id": execution_id,
+            "action": "set",
+            "change_ids": ["alpha"],
             "command": command,
             "notify_blocked": true,
         }),
     );
+    owner.admit_through(&mut host, "alpha");
 
     // Manual deferral: the reducer parks the row idle in an explicit merge
     // wait, which is the typed blocked condition a sink reports on.
@@ -844,16 +1182,15 @@ async fn mcp_graceful_owner_shutdown_reports_owner_stopping_not_completion() {
     let command = recorder(callbacks.path(), "stopping");
 
     let mut host = McpHost::start(repo.path(), &socket);
-    let admitted = host.call("cflx_enqueue", serde_json::json!({"change_id": "alpha"}));
-    let execution_id = admitted["execution_id"].as_str().unwrap().to_string();
     host.call(
-        "cflx_notify_set",
+        "cflx_subscribe",
         serde_json::json!({
-            "change_id": "alpha",
-            "execution_id": execution_id,
+            "action": "set",
+            "change_ids": ["alpha"],
             "command": command,
         }),
     );
+    owner.admit_through(&mut host, "alpha");
 
     owner.stop().await;
 
@@ -886,28 +1223,27 @@ async fn mcp_reports_owner_restarted_after_a_crash_rather_than_completion() {
     let command = recorder(callbacks.path(), "lost");
 
     let mut host = McpHost::start(repo.path(), &socket);
-    let admitted = host.call("cflx_enqueue", serde_json::json!({"change_id": "alpha"}));
-    let execution_id = admitted["execution_id"].as_str().unwrap().to_string();
     let first_instance = owner.instance_id();
     host.call(
-        "cflx_notify_set",
+        "cflx_subscribe",
         serde_json::json!({
-            "change_id": "alpha",
-            "execution_id": execution_id,
+            "action": "set",
+            "change_ids": ["alpha"],
             "instance_id": first_instance,
             "command": command,
         }),
     );
+    owner.admit_through(&mut host, "alpha");
 
     owner.crash();
     let replacement = Owner::start(&repo, socket.clone(), &["alpha"]).await;
     assert_ne!(replacement.instance_id(), first_instance);
 
     let read = host.call(
-        "cflx_notify_get",
+        "cflx_subscribe",
         serde_json::json!({
-            "change_id": "alpha",
-            "execution_id": execution_id,
+            "action": "get",
+            "change_ids": ["alpha"],
             "instance_id": first_instance,
         }),
     );
@@ -922,38 +1258,39 @@ async fn mcp_reports_owner_restarted_after_a_crash_rather_than_completion() {
     replacement.stop().await;
 }
 
-/// A retry is a distinct execution episode, so a sink bound to the first one is
-/// never consulted for the second. Two runs of one proposal are two answers.
+/// A retry is a distinct execution episode. The proposal subscription survives
+/// it and delivers again, and the first episode's delivery is never replayed:
+/// two runs of one proposal are two answers.
 // Multi-threaded on purpose: the MCP host is driven with blocking stdio
 // reads, and the owner it is talking to is a task in this same runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(not(feature = "heavy-tests"), ignore)]
-async fn mcp_retry_is_a_distinct_execution_identity() {
+async fn mcp_subscribe_follows_a_retry_into_a_distinct_execution_identity() {
     let repo = Repo::new();
     repo.stage_active("alpha");
     let socket = repo.path().join("cflx-api.sock");
     let owner = Owner::start(&repo, socket.clone(), &["alpha"]).await;
     let callbacks = tempfile::tempdir().expect("temp dir");
-    let first_command = recorder(callbacks.path(), "first");
+    let command = recorder(callbacks.path(), "episodes");
 
     let mut host = McpHost::start(repo.path(), &socket);
-    let admitted = host.call("cflx_enqueue", serde_json::json!({"change_id": "alpha"}));
-    let first_execution = admitted["execution_id"].as_str().unwrap().to_string();
     host.call(
-        "cflx_notify_set",
+        "cflx_subscribe",
         serde_json::json!({
-            "change_id": "alpha",
-            "execution_id": first_execution,
-            "command": first_command,
+            "action": "set",
+            "change_ids": ["alpha"],
+            "command": command,
         }),
     );
+    let first_execution = owner.admit_through(&mut host, "alpha");
 
     // The first episode fails.
     owner.dispatch(ExecutionEvent::ApplyFailed {
         change_id: "alpha".to_string(),
         error: "boom".to_string(),
     });
-    await_event(&log_of(&first_command), "event=failed").await;
+    let failed = await_event(&log_of(&command), "event=failed").await;
+    assert!(failed.contains(&first_execution), "{failed}");
 
     // A retry opens a new episode with its own identity.
     {
@@ -971,41 +1308,43 @@ async fn mcp_retry_is_a_distinct_execution_identity() {
         .expect("the retry opens an episode");
     assert_ne!(second_execution, first_execution);
 
-    // The first sink is not consulted for the second episode.
+    // The standing subscription binds it, and the first episode's dedupe does
+    // not suppress the second.
     repo.archive("alpha");
     owner.dispatch(ExecutionEvent::MergeCompleted {
         change_id: "alpha".to_string(),
         revision: "r1".to_string(),
     });
+    let completed = await_event(&log_of(&command), "event=completed").await;
+    assert!(
+        completed.contains(&second_execution),
+        "the second episode is the one delivered: {completed}"
+    );
     settle().await;
     assert_eq!(
-        count(&log_of(&first_command), "event="),
-        1,
-        "one terminal per execution, and the retry is a different execution"
+        count(&log_of(&command), "event="),
+        2,
+        "one terminal per episode, and the retry is a different episode"
     );
-    assert_eq!(count(&log_of(&first_command), "event=completed"), 0);
+    assert_eq!(count(&log_of(&command), "event=failed"), 1);
+    assert_eq!(count(&log_of(&command), "event=completed"), 1);
 
-    // And the second episode has no sink of its own until one is registered.
     let read = host.call(
-        "cflx_notify_get",
-        serde_json::json!({
-            "change_id": "alpha",
-            "execution_id": second_execution,
-        }),
+        "cflx_subscribe",
+        serde_json::json!({"action": "get", "change_ids": ["alpha"]}),
     );
-    assert_eq!(read["outcome"], "subscribed");
-    assert!(read["detail"]["sink"].is_null());
+    assert_eq!(read["execution_id"], second_execution.as_str());
 
     host.stop();
     owner.stop().await;
 }
 
-/// An owner with no execution-sink surface is an *owner-compatibility* fact, not
-/// a lost execution and not a protocol error. A client that confused the three
-/// would either retry forever or fail the whole MCP session.
+/// An owner with no subscription surface is an *owner-capability* fact, not a
+/// refusal and not a protocol error. A client that confused the three would
+/// either retry forever or fail the whole MCP session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(not(feature = "heavy-tests"), ignore)]
-async fn mcp_reports_an_owner_without_execution_sinks_as_incompatible() {
+async fn mcp_subscribe_reports_an_owner_without_the_surface_as_unsupported() {
     let repo = Repo::new();
     repo.stage_active("alpha");
     let socket = repo.path().join("cflx-api.sock");
@@ -1013,23 +1352,23 @@ async fn mcp_reports_an_owner_without_execution_sinks_as_incompatible() {
 
     let mut host = McpHost::start(repo.path(), &socket);
     let envelope = host.call(
-        "cflx_notify_set",
+        "cflx_subscribe",
         serde_json::json!({
-            "change_id": "alpha",
-            "execution_id": "0123456789abcdef0123456789abcdef",
+            "action": "set",
+            "change_ids": ["alpha"],
             "command": ["/bin/true"],
         }),
     );
-    assert_eq!(envelope["outcome"], "incompatible_owner");
+    assert_eq!(envelope["outcome"], "unsupported_owner");
     assert_eq!(envelope["ok"], false);
     // It is a tool result the model can read, not a JSON-RPC failure that would
     // hide the reason from it.
     assert!(envelope["message"]
         .as_str()
         .unwrap()
-        .contains("completion sinks"));
+        .contains("proposal-scoped subscriptions"));
 
-    // Status still works against the same owner: only the sink surface is absent.
+    // Status still works against the same owner: only that surface is absent.
     let status = host.call("cflx_status", serde_json::json!({}));
     assert_eq!(status["outcome"], "observed");
 
@@ -1133,7 +1472,7 @@ async fn mcp_refuses_tool_traffic_before_initialization_and_off_protocol_frames(
     for method in ["tools/list", "tools/call"] {
         let response = exchange(serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": method,
-            "params": {"name": "cflx_enqueue", "arguments": {"change_id": "alpha"}}
+            "params": {"name": "cflx_control", "arguments": {"action": "mark", "change_ids": ["alpha"]}}
         }));
         assert_eq!(
             response["error"]["code"], -32002,
@@ -1168,7 +1507,7 @@ async fn mcp_refuses_tool_traffic_before_initialization_and_off_protocol_frames(
     let response = exchange(serde_json::json!({
         "jsonrpc": "2.0", "id": 7, "method": "tools/list"
     }));
-    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 3);
 
     assert!(
         owner.executor.submitted().is_empty(),
@@ -1214,40 +1553,42 @@ async fn mcp_routes_two_projects_by_their_own_project_directories() {
         assert_eq!(status["instance_id"], expected.instance_id(), "{status}");
     }
 
-    // And an intent, not just a read: each admission lands in its own reducer.
-    let admitted_a = host.call(
-        "cflx_enqueue",
+    // And a mutation, not just a read: each mark lands in its own owner.
+    let marked_a = host.call(
+        "cflx_control",
         serde_json::json!({
-            "change_id": "alpha",
+            "action": "mark",
+            "change_ids": ["alpha"],
             "project_dir": project_a.path().to_str().unwrap(),
         }),
     );
-    assert_eq!(admitted_a["outcome"], "admitted", "{admitted_a}");
-    assert_eq!(admitted_a["instance_id"], owner_a.instance_id());
+    assert_eq!(marked_a["outcome"], "marked", "{marked_a}");
+    assert_eq!(marked_a["instance_id"], owner_a.instance_id());
 
-    let admitted_b = host.call(
-        "cflx_enqueue",
+    let marked_b = host.call(
+        "cflx_control",
         serde_json::json!({
-            "change_id": "beta",
+            "action": "mark",
+            "change_ids": ["beta"],
             "project_dir": project_b.path().to_str().unwrap(),
         }),
     );
-    assert_eq!(admitted_b["outcome"], "admitted", "{admitted_b}");
-    assert_eq!(admitted_b["instance_id"], owner_b.instance_id());
+    assert_eq!(marked_b["outcome"], "marked", "{marked_b}");
+    assert_eq!(marked_b["instance_id"], owner_b.instance_id());
 
     assert_eq!(
         owner_a.executor.submitted(),
-        vec![CommandSpec::SetQueueIntent {
+        vec![CommandSpec::SetExecutionMark {
             change_id: "alpha".to_string(),
-            queued: true
+            marked: true
         }],
-        "project A saw only its own admission"
+        "project A saw only its own mark"
     );
     assert_eq!(
         owner_b.executor.submitted(),
-        vec![CommandSpec::SetQueueIntent {
+        vec![CommandSpec::SetExecutionMark {
             change_id: "beta".to_string(),
-            queued: true
+            marked: true
         }],
         "project B saw only its own admission"
     );
@@ -1320,9 +1661,10 @@ async fn mcp_refuses_two_call_selectors_before_contacting_any_owner() {
     let mut host = McpHost::start_unrouted(elsewhere.path());
 
     let refused = host.call_raw(
-        "cflx_enqueue",
+        "cflx_control",
         serde_json::json!({
-            "change_id": "alpha",
+            "action": "mark",
+            "change_ids": ["alpha"],
             "project_dir": project_b.path().to_str().unwrap(),
             "unix_socket": project_socket(&project_a).to_str().unwrap(),
         }),
@@ -1433,14 +1775,18 @@ async fn mcp_lets_a_call_selector_override_the_namespace_default_without_moving_
     owner_b.stop().await;
 }
 
-/// The truthfulness half of the route. Completion is proven from a repository,
-/// so a call that selected project B must read project B's repository — even
-/// when the server is standing in project A and both projects contain the same
-/// change ID. Reading the server's own repository here would certify one
-/// project's archive as another project's success.
+/// The truthfulness half of the route, now that the completion oracle lives
+/// only in the CLI. Completion is proven from a repository, so a call that
+/// selected project B must read project B's repository — even when the caller is
+/// standing in project A and both projects contain the same change ID. Reading
+/// the caller's own repository here would certify one project's archive as
+/// another project's success.
+///
+/// The same test asserts the other half: MCP exposes no wait tool at all, so a
+/// host cannot reach the oracle through an unbounded tool call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(not(feature = "heavy-tests"), ignore)]
-async fn mcp_wait_certifies_evidence_from_the_selected_project_only() {
+async fn wait_certifies_evidence_from_the_selected_project_and_is_absent_from_mcp() {
     // Project A: 'alpha' is still active — its repository proves nothing.
     let project_a = Repo::new();
     project_a.stage_active("alpha");
@@ -1454,40 +1800,86 @@ async fn mcp_wait_certifies_evidence_from_the_selected_project_only() {
     let owner_a = Owner::start(&project_a, project_socket(&project_a), &[]).await;
     let owner_b = Owner::start(&project_b, project_socket(&project_b), &[]).await;
 
-    // The server stands inside project A, which is also its default route.
+    // The tool a host would reach for is simply not there.
     let mut host = McpHost::start_unrouted(project_a.path());
-
-    let completed = host.call(
-        "cflx_wait",
-        serde_json::json!({
-            "change_id": "alpha",
-            "project_dir": project_b.path().to_str().unwrap(),
-            "timeout": "30s",
-        }),
+    let listed = host.request("tools/list", serde_json::json!({}));
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["cflx_status", "cflx_control", "cflx_subscribe"]);
+    let refused = host.call_raw("cflx_wait", serde_json::json!({"change_id": "alpha"}));
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        refused.get("structuredContent").is_none(),
+        "an unknown tool contacted nobody: {refused}"
     );
-    assert_eq!(
-        completed["outcome"], "completed",
-        "project B's archive is the only evidence that could have settled this: {completed}"
-    );
-    assert_eq!(completed["instance_id"], owner_b.instance_id());
-
-    // The mirror image, with the same server and the same change ID: project A
-    // has no archive entry, so it cannot be completed and must time out rather
-    // than borrow project B's proof.
-    let unproven = host.call(
-        "cflx_wait",
-        serde_json::json!({
-            "change_id": "alpha",
-            "project_dir": project_a.path().to_str().unwrap(),
-            "timeout": "2s",
-        }),
-    );
-    assert_eq!(
-        unproven["outcome"], "timeout",
-        "an unarchived change is never completion: {unproven}"
-    );
-
     host.stop();
+
+    // The CLI oracle remains, and it certifies from the *selected* project.
+    let a_path = project_a.path().to_path_buf();
+    let b_path = project_b.path().to_path_buf();
+    let cwd = a_path.clone();
+    let completed = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_cflx"))
+            .args([
+                "client",
+                "--project-dir",
+                b_path.to_str().unwrap(),
+                "wait",
+                "alpha",
+                "--timeout",
+                "30s",
+                "--json",
+            ])
+            .current_dir(&cwd)
+            .output()
+            .expect("the compiled cflx binary must be runnable")
+    })
+    .await
+    .unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&completed.stdout).trim())
+            .expect("one envelope on stdout");
+    assert_eq!(
+        parsed["outcome"], "completed",
+        "project B's archive is the only evidence that could have settled this: {parsed}"
+    );
+    assert_eq!(parsed["instance_id"], owner_b.instance_id());
+
+    // The mirror image, from the same working directory and with the same
+    // change ID: project A has no archive entry, so it cannot be completed and
+    // must time out rather than borrow project B's proof.
+    let cwd = a_path.clone();
+    let unproven = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_cflx"))
+            .args([
+                "client",
+                "--project-dir",
+                a_path.to_str().unwrap(),
+                "wait",
+                "alpha",
+                "--timeout",
+                "2s",
+                "--json",
+            ])
+            .current_dir(&cwd)
+            .output()
+            .expect("the compiled cflx binary must be runnable")
+    })
+    .await
+    .unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&unproven.stdout).trim())
+            .expect("one envelope on stdout");
+    assert_eq!(
+        parsed["outcome"], "timeout",
+        "an unarchived change is never completion: {parsed}"
+    );
+    assert_eq!(parsed["instance_id"], owner_a.instance_id());
+
     owner_a.stop().await;
     owner_b.stop().await;
 }

@@ -597,6 +597,13 @@ pub struct CapabilitiesResponse {
     /// writes it.
     #[serde(default)]
     pub execution_sinks: ExecutionSinkCapability,
+    /// Whether this process serves proposal-scoped subscriptions.
+    ///
+    /// `#[serde(default)]` for the same reason as `execution_sinks`: a client
+    /// built against this contract must be able to read an older owner, and the
+    /// absent field means "unavailable", which is exactly what such an owner is.
+    #[serde(default)]
+    pub proposal_subscriptions: ProposalSubscriptionCapability,
     /// The complete worktree surface, including its conflict-recovery boundary.
     pub worktrees: super::worktrees::WorktreeCapabilities,
     /// The parallel execution surface, including its blocked-reason vocabulary.
@@ -1512,6 +1519,96 @@ pub struct ExecutionSinkResponse {
     /// Typed rather than free strings: a client deciding whether it still owes
     /// a resume should branch on the vocabulary, not on spelling.
     pub delivered_events: Vec<ExecutionEventType>,
+}
+
+// ============================================================================
+// Proposal-scoped subscriptions
+// ============================================================================
+//
+// The wire identifier stays `change_id`; user-facing text calls the addressed
+// change a *proposal*. Renaming the field would have broken every existing
+// reader for a word, and the callback environment keeps `CFLX_CHANGE_ID` for
+// the same reason.
+//
+// Why this is a different resource from the execution-scoped sink: an execution
+// ID does not exist until the owner admits work, so an agent that wants to be
+// told when its proposal finishes had no way to say so *before* admission. A
+// proposal subscription is registered against the thing the operator actually
+// names, and the owner binds each new execution episode of that proposal to it.
+
+/// `PUT /api/v2/proposals/{change_id}/subscription` request body.
+///
+/// The instance binding is mandatory and checked rather than trusted: a
+/// subscription that attached itself to whatever process currently answers the
+/// socket would silently follow an owner the caller never observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalSubscriptionRequest {
+    /// Owner incarnation the caller believes it is talking to.
+    pub instance_id: String,
+    /// Callback argv, executed directly and never as shell source.
+    pub command: Vec<String>,
+    /// Opt in to the non-terminal blocked attention edge.
+    #[serde(default)]
+    pub notify_blocked: bool,
+}
+
+/// Binding a `GET` or `DELETE` proposal-subscription request asserts.
+///
+/// Optional only at the parsing layer, so an omission is reported as the typed
+/// validation refusal it is rather than as a malformed query string.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProposalSubscriptionParams {
+    /// Owner incarnation the caller believes it is talking to.
+    pub instance_id: Option<String>,
+}
+
+/// `GET`/`PUT`/`DELETE /api/v2/proposals/{change_id}/subscription` body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ProposalSubscriptionResponse {
+    /// Owner incarnation that answered.
+    pub instance_id: String,
+    /// Proposal the subscription is keyed by. The wire name stays `change_id`.
+    pub change_id: String,
+    /// Currently registered callback, argv included.
+    ///
+    /// `null` when none is registered — *and* when the request did not arrive
+    /// on the owner's Unix socket. Read [`ProposalSubscriptionResponse::subscribed`]
+    /// to tell "no subscription" apart from "not disclosed here".
+    pub sink: Option<ExecutionSinkSpec>,
+    /// Whether a subscription is registered at all.
+    ///
+    /// Answered on either transport, because presence is not the secret — the
+    /// argv is.
+    #[serde(default)]
+    pub subscribed: bool,
+    /// Latest execution episode this owner bound to the proposal, when one exists.
+    ///
+    /// Absent before the first admission. A subscription is legal there: that
+    /// absence is exactly the gap an execution-scoped registration could not
+    /// cover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    /// The proposal's current closed execution state.
+    pub execution_state: ChangeExecutionState,
+    /// True once a terminal event was dispatched for the latest episode.
+    pub terminal_dispatched: bool,
+    /// Event types already delivered for the latest episode, in delivery order.
+    pub delivered_events: Vec<ExecutionEventType>,
+}
+
+/// Whether proposal-scoped subscriptions can be registered at all.
+///
+/// Published as its own typed fact so a client discovers the surface instead of
+/// inferring it from a 404: an owner that predates it has no
+/// `/api/v2/proposals/...` route, and "the route is missing" and "this owner
+/// refuses subscriptions" would otherwise be indistinguishable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct ProposalSubscriptionCapability {
+    /// True when this build serves the proposal-subscription resources.
+    pub available: bool,
+    /// Most proposals one atomic request may address.
+    pub max_targets: usize,
 }
 
 /// The versioned payload written to `CFLX_EVENT_PATH` for one delivery.

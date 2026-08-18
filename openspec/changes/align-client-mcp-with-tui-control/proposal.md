@@ -147,6 +147,40 @@ The CLI counterpart uses the same shared implementations. It MAY preserve separa
 
 Mark/control parity, MCP contraction, proposal-scoped subscriptions, and auto-resume removal must land together. Keeping admission-oriented enqueue or implicit hooks during a staged migration would retain the analyze bypass or silently register callbacks from a mark-only result.
 
+## Retired Scenarios
+
+Scenarios this change deliberately retires from a MODIFIED requirement, rather
+than losing by accident. Declared here because the promotion-safety regression
+treats every other disappearance as a coverage regression, and because a
+declaration inside a delta block would be copied verbatim into a canonical spec
+that should describe the system rather than the history of one change.
+
+- remote-control-api: Client observation does not alter API semantics / Enqueue uses ordinary typed commands
+  — replaced by `Client controls use ordinary typed commands`, which asserts
+  strictly more: every mutation is still an ordinary v2 command record taking the
+  same shared operator intent as the equivalent TUI control, *and* mark/unmark
+  never submits queue intent or a lifecycle command.
+- cli: Existing-owner client MCP namespace / MCP enqueues into the existing TUI
+  — the tool it describes no longer exists. `MCP lists only the compact tools`
+  asserts the surface, and `Raw workflow commands are not exposed` keeps the
+  "does not become a second owner" half.
+- cli: MCP tool calls remain bounded / Long-lived TUI does not hold enqueue open
+  — replaced by `Long-lived TUI does not hold a control call open`, which states
+  the same bound for the tool that replaced it.
+- cli: Direct client completion notification management / Operator registers one callback for an explicit project
+  — replaced by `Operator registers callbacks for explicit proposals`, which
+  covers the same routing and argv rules over one *or more* proposals.
+- cli: Direct client completion notification management / Operator inspects and clears one callback
+  — replaced by `Operator inspects and clears named subscriptions`, which adds
+  that clearing removes only the named targets.
+- cli: Direct client completion notification management / Installed operation skill teaches the direct CLI path
+  — replaced by `Installed operation skill teaches explicit subscription`, which
+  additionally requires the skill to state that notification resumes no agent.
+
+`Wait certifies evidence from the selected project` is *not* retired: it moves
+from the MCP requirement, whose wait tool is withdrawn, to the CLI namespace
+requirement that still owns the completion oracle.
+
 ## Out of Scope
 
 - Merging execution marks with queue intent.

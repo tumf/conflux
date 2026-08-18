@@ -26,16 +26,24 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub enum Operation {
     /// `cflx client status`
     Status,
-    /// `cflx client enqueue`
-    Enqueue,
     /// `cflx client wait`
     Wait,
-    /// `cflx_notify_set` through `cflx client mcp`
-    NotifySet,
-    /// `cflx_notify_get` through `cflx client mcp`
-    NotifyGet,
-    /// `cflx_notify_clear` through `cflx client mcp`
-    NotifyClear,
+    /// `cflx client mark`, and `cflx_control` with action `mark`
+    ControlMark,
+    /// `cflx client unmark`, and `cflx_control` with action `unmark`
+    ControlUnmark,
+    /// `cflx client start`, and `cflx_control` with action `start`
+    ControlStart,
+    /// `cflx client stop`, and `cflx_control` with action `stop`
+    ControlStop,
+    /// `cflx client force-stop`, and `cflx_control` with action `force_stop`
+    ControlForceStop,
+    /// `cflx client subscribe set`, and `cflx_subscribe` with action `set`
+    SubscribeSet,
+    /// `cflx client subscribe get`, and `cflx_subscribe` with action `get`
+    SubscribeGet,
+    /// `cflx client subscribe clear`, and `cflx_subscribe` with action `clear`
+    SubscribeClear,
 }
 
 impl Operation {
@@ -43,24 +51,32 @@ impl Operation {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Status => "status",
-            Self::Enqueue => "enqueue",
             Self::Wait => "wait",
-            Self::NotifySet => "notify_set",
-            Self::NotifyGet => "notify_get",
-            Self::NotifyClear => "notify_clear",
+            Self::ControlMark => "control_mark",
+            Self::ControlUnmark => "control_unmark",
+            Self::ControlStart => "control_start",
+            Self::ControlStop => "control_stop",
+            Self::ControlForceStop => "control_force_stop",
+            Self::SubscribeSet => "subscribe_set",
+            Self::SubscribeGet => "subscribe_get",
+            Self::SubscribeClear => "subscribe_clear",
         }
     }
 }
 
 /// Every operation, in the order the contract advertises them.
 #[allow(dead_code)] // Read by the operation-contract assertions, not by the binary.
-pub const ALL_OPERATIONS: [Operation; 6] = [
+pub const ALL_OPERATIONS: [Operation; 10] = [
     Operation::Status,
-    Operation::Enqueue,
     Operation::Wait,
-    Operation::NotifySet,
-    Operation::NotifyGet,
-    Operation::NotifyClear,
+    Operation::ControlMark,
+    Operation::ControlUnmark,
+    Operation::ControlStart,
+    Operation::ControlStop,
+    Operation::ControlForceStop,
+    Operation::SubscribeSet,
+    Operation::SubscribeGet,
+    Operation::SubscribeClear,
 ];
 
 /// Every stable outcome token this CLI can report.
@@ -74,18 +90,35 @@ pub enum Outcome {
     // ── Successful ────────────────────────────────────────────────────────
     /// `status` read one coherent snapshot of a compatible owner.
     Observed,
-    /// `enqueue` admitted the requested change.
-    Admitted,
-    /// `enqueue` found the change already admitted; nothing was submitted.
-    AlreadyAdmitted,
     /// `wait` verified the change's successful terminal outcome.
     Completed,
-    /// A notification sink was attached, replaced, read, or cleared.
+    /// A proposal subscription was registered, replaced, or read.
     ///
-    /// One token for all three notify operations because `operation` already
-    /// says which one ran, and a caller branching on success must not have to
-    /// learn three spellings of "it worked".
+    /// One token for `set` and `get` because `operation` already says which one
+    /// ran, and a caller branching on success must not have to learn two
+    /// spellings of "it worked". `clear` reports [`Self::Cleared`] instead,
+    /// because "there is a subscription" and "there is not" are the two answers
+    /// a caller acts on differently.
     Subscribed,
+    /// A subscription was removed for every named proposal.
+    Cleared,
+    /// At least one named proposal's execution mark became set.
+    Marked,
+    /// At least one named proposal's execution mark became clear.
+    Unmarked,
+    /// Every named target already held the requested state, so nothing moved.
+    ///
+    /// A success, not a refusal: the desired state is the one the operator
+    /// asked for, and a client that reported "nothing to do" as a failure would
+    /// make a second `mark` of the same proposal look like a problem.
+    Unchanged,
+    /// The owner accepted a lifecycle intent.
+    ///
+    /// Deliberately not "started" or "stopped": the client submits the shared
+    /// Start, Stop, or ForceStop intent and reports that it settled. What the
+    /// run then does is the owner's, and claiming otherwise would be a
+    /// completion claim no command record can support.
+    Accepted,
 
     // ── Unsuccessful ──────────────────────────────────────────────────────
     /// No Git repository, so no default socket identity exists.
@@ -102,10 +135,8 @@ pub enum Outcome {
     OwnerRestarted,
     /// The owner does not track the requested change.
     ChangeNotFound,
-    /// The change cannot accept the requested admission right now.
+    /// The named target cannot accept the requested control right now.
     TargetIneligible,
-    /// Acting would have consumed or discarded another operator's intent.
-    OperatorIntentConflict,
     /// Bounded stale-revision recomputation was exhausted.
     RevisionConflict,
     /// Bounded rereads could not produce one coherent observation.
@@ -135,17 +166,16 @@ pub enum Outcome {
     TransportError,
     /// The invocation itself was not usable.
     UsageError,
-    /// The addressed execution episode is not one this owner incarnation has.
-    ///
-    /// Distinct from [`Self::ChangeNotFound`]: the change may be perfectly well
-    /// known while the episode it names belongs to a run that already ended or
-    /// to a different owner, and a caller that confused the two would rebind a
-    /// callback onto work it never admitted.
-    ExecutionNotFound,
-    /// The presented instance/execution/change binding does not agree.
-    ExecutionBindingMismatch,
     /// The owner refused an executable registration on this transport.
     TransportNotPermitted,
+    /// The owner is reachable and compatible but does not serve this surface.
+    ///
+    /// Distinct from [`Self::IncompatibleOwner`]: that one says the owner and
+    /// this build disagree about the API itself, while this says they agree
+    /// perfectly and the owner published that it does not offer proposal
+    /// subscriptions. A caller told the first would stop talking to the owner
+    /// at all; a caller told the second keeps using every other operation.
+    UnsupportedOwner,
 }
 
 impl Outcome {
@@ -153,10 +183,13 @@ impl Outcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Observed => "observed",
-            Self::Admitted => "admitted",
-            Self::AlreadyAdmitted => "already_admitted",
             Self::Completed => "completed",
             Self::Subscribed => "subscribed",
+            Self::Cleared => "cleared",
+            Self::Marked => "marked",
+            Self::Unmarked => "unmarked",
+            Self::Unchanged => "unchanged",
+            Self::Accepted => "accepted",
             Self::NotInRepository => "not_in_repository",
             Self::OwnerNotRunning => "owner_not_running",
             Self::AuthenticationFailed => "authentication_failed",
@@ -165,7 +198,6 @@ impl Outcome {
             Self::OwnerRestarted => "owner_restarted",
             Self::ChangeNotFound => "change_not_found",
             Self::TargetIneligible => "target_ineligible",
-            Self::OperatorIntentConflict => "operator_intent_conflict",
             Self::RevisionConflict => "revision_conflict",
             Self::ObservationConflict => "observation_conflict",
             Self::CommandFailed => "command_failed",
@@ -178,9 +210,8 @@ impl Outcome {
             Self::FeatureUnavailable => "feature_unavailable",
             Self::TransportError => "transport_error",
             Self::UsageError => "usage_error",
-            Self::ExecutionNotFound => "execution_not_found",
-            Self::ExecutionBindingMismatch => "execution_binding_mismatch",
             Self::TransportNotPermitted => "transport_not_permitted",
+            Self::UnsupportedOwner => "unsupported_owner",
         }
     }
 
@@ -193,10 +224,13 @@ impl Outcome {
         matches!(
             self,
             Self::Observed
-                | Self::Admitted
-                | Self::AlreadyAdmitted
                 | Self::Completed
                 | Self::Subscribed
+                | Self::Cleared
+                | Self::Marked
+                | Self::Unmarked
+                | Self::Unchanged
+                | Self::Accepted
         )
     }
 
@@ -209,10 +243,13 @@ impl Outcome {
     pub fn exit_code(self) -> i32 {
         match self {
             Self::Observed
-            | Self::Admitted
-            | Self::AlreadyAdmitted
             | Self::Completed
-            | Self::Subscribed => 0,
+            | Self::Subscribed
+            | Self::Cleared
+            | Self::Marked
+            | Self::Unmarked
+            | Self::Unchanged
+            | Self::Accepted => 0,
             Self::UsageError => 2,
             Self::NotInRepository => 3,
             Self::OwnerNotRunning => 4,
@@ -222,7 +259,6 @@ impl Outcome {
             Self::OwnerRestarted => 8,
             Self::ChangeNotFound => 9,
             Self::TargetIneligible => 10,
-            Self::OperatorIntentConflict => 11,
             Self::RevisionConflict => 12,
             Self::ObservationConflict => 13,
             Self::CommandFailed => 14,
@@ -234,9 +270,8 @@ impl Outcome {
             Self::Timeout => 19,
             Self::FeatureUnavailable => 20,
             Self::TransportError => 21,
-            Self::ExecutionNotFound => 23,
-            Self::ExecutionBindingMismatch => 24,
             Self::TransportNotPermitted => 25,
+            Self::UnsupportedOwner => 26,
         }
     }
 }
@@ -246,12 +281,15 @@ impl Outcome {
 /// Read by the CLI's own contract assertions, which is what stops an added
 /// variant from silently reusing an exit status.
 #[allow(dead_code)] // Read by the outcome-contract assertions, not by the binary.
-pub const ALL_OUTCOMES: [Outcome; 29] = [
+pub const ALL_OUTCOMES: [Outcome; 30] = [
     Outcome::Observed,
-    Outcome::Admitted,
-    Outcome::AlreadyAdmitted,
     Outcome::Completed,
     Outcome::Subscribed,
+    Outcome::Cleared,
+    Outcome::Marked,
+    Outcome::Unmarked,
+    Outcome::Unchanged,
+    Outcome::Accepted,
     Outcome::NotInRepository,
     Outcome::OwnerNotRunning,
     Outcome::AuthenticationFailed,
@@ -260,7 +298,6 @@ pub const ALL_OUTCOMES: [Outcome; 29] = [
     Outcome::OwnerRestarted,
     Outcome::ChangeNotFound,
     Outcome::TargetIneligible,
-    Outcome::OperatorIntentConflict,
     Outcome::RevisionConflict,
     Outcome::ObservationConflict,
     Outcome::CommandFailed,
@@ -273,9 +310,8 @@ pub const ALL_OUTCOMES: [Outcome; 29] = [
     Outcome::FeatureUnavailable,
     Outcome::TransportError,
     Outcome::UsageError,
-    Outcome::ExecutionNotFound,
-    Outcome::ExecutionBindingMismatch,
     Outcome::TransportNotPermitted,
+    Outcome::UnsupportedOwner,
 ];
 
 /// The single object a `--json` invocation writes to stdout.
@@ -422,7 +458,11 @@ mod tests {
                 outcome.exit_code()
             );
         }
-        assert_eq!(codes.len(), ALL_OUTCOMES.len() - 5);
+        let successes = ALL_OUTCOMES
+            .iter()
+            .filter(|outcome| outcome.is_success())
+            .count();
+        assert_eq!(codes.len(), ALL_OUTCOMES.len() - successes);
     }
 
     #[test]
@@ -454,17 +494,20 @@ mod tests {
             successes,
             vec![
                 "observed",
-                "admitted",
-                "already_admitted",
                 "completed",
-                "subscribed"
+                "subscribed",
+                "cleared",
+                "marked",
+                "unmarked",
+                "unchanged",
+                "accepted",
             ]
         );
     }
 
     #[test]
     fn a_json_envelope_is_one_object_with_a_stable_shape() {
-        let envelope = ResultEnvelope::new(Operation::Enqueue, Outcome::Admitted)
+        let envelope = ResultEnvelope::new(Operation::ControlMark, Outcome::Marked)
             .with_instance(Some("abc".to_string()))
             .with_change("alpha");
         let line = envelope.to_json_line();
@@ -472,8 +515,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("parses");
         assert_eq!(parsed["schema_version"], SCHEMA_VERSION);
         assert_eq!(parsed["ok"], true);
-        assert_eq!(parsed["operation"], "enqueue");
-        assert_eq!(parsed["outcome"], "admitted");
+        assert_eq!(parsed["operation"], "control_mark");
+        assert_eq!(parsed["outcome"], "marked");
         assert_eq!(parsed["instance_id"], "abc");
         assert_eq!(parsed["change_id"], "alpha");
         // Additive and omitted rather than nulled when the owner published none.
@@ -496,9 +539,13 @@ mod tests {
 
     /// Execution identity is additive: present when the owner published one,
     /// absent otherwise, and never a change to what an existing caller reads.
+    ///
+    /// A mark result never carries one, and that is the point: a mark is
+    /// operator selection, and an episode ID on it would name work the write
+    /// did not create.
     #[test]
     fn execution_identity_is_an_additive_optional_field() {
-        let envelope = ResultEnvelope::new(Operation::Enqueue, Outcome::Admitted)
+        let envelope = ResultEnvelope::new(Operation::SubscribeGet, Outcome::Subscribed)
             .with_instance(Some("i-1".to_string()))
             .with_change("alpha")
             .with_execution(Some("e-1".to_string()));
@@ -506,45 +553,53 @@ mod tests {
         assert_eq!(parsed["execution_id"], "e-1");
         // The fields an existing caller already branches on keep their meaning.
         assert_eq!(parsed["ok"], true);
-        assert_eq!(parsed["outcome"], "admitted");
+        assert_eq!(parsed["outcome"], "subscribed");
         assert_eq!(envelope.exit_code(), 0);
 
-        let without = ResultEnvelope::new(Operation::Enqueue, Outcome::Admitted)
+        let without = ResultEnvelope::new(Operation::ControlMark, Outcome::Marked)
             .with_change("alpha")
             .with_execution(None);
         let parsed: serde_json::Value = serde_json::from_str(&without.to_json_line()).unwrap();
         assert!(!parsed.as_object().unwrap().contains_key("execution_id"));
     }
 
-    /// Notify operations report success with one token, because `operation`
-    /// already says which of the three ran.
+    /// Registration and inspection share one success token, because `operation`
+    /// already says which one ran; clearing gets its own, because "there is a
+    /// subscription" and "there is not" are acted on differently.
     #[test]
-    fn notify_operations_share_one_success_token_and_their_own_names() {
-        for operation in [
-            Operation::NotifySet,
-            Operation::NotifyGet,
-            Operation::NotifyClear,
-        ] {
+    fn subscribe_operations_report_their_own_names_and_success_tokens() {
+        for operation in [Operation::SubscribeSet, Operation::SubscribeGet] {
             let envelope = ResultEnvelope::new(operation, Outcome::Subscribed);
             assert!(envelope.ok);
             assert_eq!(envelope.exit_code(), 0);
             assert_eq!(envelope.outcome.as_str(), "subscribed");
         }
-        assert_eq!(Operation::NotifySet.as_str(), "notify_set");
-        assert_eq!(Operation::NotifyGet.as_str(), "notify_get");
-        assert_eq!(Operation::NotifyClear.as_str(), "notify_clear");
+        let cleared = ResultEnvelope::new(Operation::SubscribeClear, Outcome::Cleared);
+        assert!(cleared.ok);
+        assert_eq!(cleared.outcome.as_str(), "cleared");
+
         let names: Vec<&str> = ALL_OPERATIONS.iter().map(|op| op.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "status",
-                "enqueue",
                 "wait",
-                "notify_set",
-                "notify_get",
-                "notify_clear"
+                "control_mark",
+                "control_unmark",
+                "control_start",
+                "control_stop",
+                "control_force_stop",
+                "subscribe_set",
+                "subscribe_get",
+                "subscribe_clear",
             ]
         );
+        // The retired admission vocabulary must not reappear under a new name:
+        // an agent that could still spell `enqueue` would still be able to ask
+        // for the analyze bypass this change removed.
+        for retired in ["enqueue", "notify_set", "notify_get", "notify_clear"] {
+            assert!(!names.contains(&retired), "{retired} is retired");
+        }
     }
 
     #[test]

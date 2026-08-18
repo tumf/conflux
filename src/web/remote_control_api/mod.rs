@@ -24,6 +24,7 @@ pub mod commands;
 pub mod dto;
 pub mod executor;
 pub mod projection;
+pub mod proposal_subscriptions;
 pub mod reads;
 pub mod registry;
 pub mod sinks;
@@ -590,6 +591,12 @@ pub fn router(state: RemoteControlState) -> Router {
             get(sinks::get_sink)
                 .put(sinks::put_sink)
                 .delete(sinks::delete_sink),
+        )
+        .route(
+            "/api/v2/proposals/{change_id}/subscription",
+            get(proposal_subscriptions::get_subscription)
+                .put(proposal_subscriptions::put_subscription)
+                .delete(proposal_subscriptions::delete_subscription),
         )
         .route("/api/v2/changes", get(reads::list_changes))
         .route("/api/v2/changes/{change_id}", get(reads::get_change))

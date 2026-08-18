@@ -200,10 +200,14 @@ fn test_embedded_install_without_skills_dir() {
     let run_skill = fs::read_to_string(skills_base.join("cflx-run/SKILL.md")).unwrap();
     for required in [
         "Hermes processes may be killed after 30 minutes",
-        // The default shell-facing path, and the MCP tools it does not require.
-        "`cflx client notify set|get|clear`",
-        "cflx client notify set <change-id> <execution-id>",
-        "`cflx_notify_set`",
+        // The default shell-facing path, and the MCP tool it does not require.
+        "`cflx client subscribe set|get|clear`",
+        "cflx client subscribe set <change-id> --instance-id <instance-id>",
+        "`cflx_subscribe`",
+        // Registration is explicit: nothing is inferred from a control result.
+        "Nothing subscribes you to completion automatically",
+        // Delivery notifies rather than resumes.
+        "Delivery notifies; it never resumes",
         // Execution completion is not process completion.
         "not process completion",
         // The callback is argv, never shell source.

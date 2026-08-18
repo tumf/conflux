@@ -1,12 +1,17 @@
-//! Execution-scoped completion sinks: one bounded callback per admitted run.
+//! Completion subscriptions: one bounded callback per admitted execution.
+//!
+//! Two ways in, one delivery machine. An *execution-scoped* sink names one
+//! admitted episode. A *proposal-scoped* subscription names the proposal an
+//! operator names, so it can be registered before any admission exists and binds
+//! each new episode of that proposal as the owner opens it.
 //!
 //! # Why this exists
 //!
-//! `cflx client enqueue` proves an owner accepted an intent; it does not prove
-//! anything finished. A caller that wants autonomous continuation therefore had
-//! two bad options: hold `cflx client wait` open for the whole change, or poll.
-//! Neither survives the client restarting, and process exit is not a signal
-//! either — a TUI stays alive after the work it admitted is done.
+//! A settled control command proves an owner accepted an intent; it does not
+//! prove anything finished. A caller that wants to know when work completes
+//! therefore had two bad options: hold `cflx client wait` open for the whole
+//! change, or poll. Neither survives the client restarting, and process exit is
+//! not a signal either — a TUI stays alive after the work it admitted is done.
 //!
 //! So the *owner* holds the subscription. It knows the typed transitions
 //! (admission, stop, failure, blocked) that no external observer can see, and it
@@ -20,6 +25,8 @@
 //!
 //! * a registration cannot make a change eligible, ineligible, retried, or archived;
 //! * a delivery failure cannot roll back, retry, or re-classify anything;
+//! * a delivered event starts, resumes, and messages nobody: Conflux runs the
+//!   registered argv and draws no conclusion from what it does;
 //! * deleting the whole registry changes no next action for the same workspace.
 //!
 //! # Truthfulness
@@ -47,7 +54,7 @@ use crate::orchestration::execution_facts::{
 };
 use crate::web::remote_control_api::dto::{
     ChangeExecutionState, ExecutionEventFile, ExecutionEventType, ExecutionSinkCapability,
-    ExecutionSinkSpec, EXECUTION_EVENT_SCHEMA_VERSION,
+    ExecutionSinkSpec, ProposalSubscriptionCapability, EXECUTION_EVENT_SCHEMA_VERSION,
 };
 use crate::web::remote_control_api::ExecutionContractHandle;
 
@@ -98,6 +105,14 @@ const VERIFY_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 /// Ceiling on one repository verification subprocess round.
 const VERIFY_ROUND_BUDGET: Duration = Duration::from_secs(20);
 
+/// Most proposals one atomic subscription request may address.
+///
+/// Bounded because `set` and `clear` are all-or-nothing over the whole list: an
+/// unbounded request would be an unbounded critical section holding the registry
+/// lock, and an agent that genuinely needs more than this is describing a whole
+/// repository rather than the work it is waiting on.
+pub const MAX_PROPOSAL_TARGETS: usize = 64;
+
 /// What this build advertises through `/api/v2/capabilities`.
 pub fn capability() -> ExecutionSinkCapability {
     ExecutionSinkCapability {
@@ -106,6 +121,14 @@ pub fn capability() -> ExecutionSinkCapability {
         max_command_arg_len: MAX_COMMAND_ARG_LEN,
         callback_timeout_ms: CALLBACK_TIMEOUT.as_millis() as u64,
         max_callback_output_bytes: MAX_CALLBACK_OUTPUT_BYTES,
+    }
+}
+
+/// What this build advertises for proposal-scoped subscriptions.
+pub fn proposal_capability() -> ProposalSubscriptionCapability {
+    ProposalSubscriptionCapability {
+        available: true,
+        max_targets: MAX_PROPOSAL_TARGETS,
     }
 }
 
@@ -119,8 +142,51 @@ pub enum SinkRefusal {
         /// The change the execution actually belongs to.
         actual_change_id: String,
     },
+    /// The presented owner incarnation is not this one.
+    ///
+    /// Its own variant rather than a [`Self::BindingMismatch`] because a
+    /// proposal subscription has no execution to be mismatched *against*: the
+    /// only thing that can disagree is which owner the caller thinks it is
+    /// talking to, and a caller told "wrong change" there would look for a
+    /// change that was never the problem.
+    InstanceMismatch,
     /// The argv itself is not acceptable.
     InvalidCommand(String),
+}
+
+/// One proposal's subscription and the episode it is currently bound to.
+#[derive(Debug, Clone, Default)]
+struct ProposalEntry {
+    /// The registered callback, when one is.
+    sink: Option<ExecutionSinkSpec>,
+    /// Latest execution episode this owner observed for the proposal.
+    ///
+    /// Tracked whether or not a subscription exists, because a subscription
+    /// registered *after* an episode settled owes exactly one late delivery,
+    /// and it can only name the episode if the owner remembered it.
+    latest: Option<String>,
+}
+
+impl ProposalEntry {
+    /// Whether this entry still carries anything worth remembering.
+    fn is_empty(&self) -> bool {
+        self.sink.is_none() && self.latest.is_none()
+    }
+}
+
+/// A read of one proposal's subscription state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalSubscriptionView {
+    /// Proposal the subscription is keyed by.
+    pub change_id: String,
+    /// The registered callback, when one is.
+    pub sink: Option<ExecutionSinkSpec>,
+    /// Latest bound execution episode, when the proposal has ever been admitted.
+    pub execution_id: Option<String>,
+    /// Whether a terminal event was delivered for that latest episode.
+    pub terminal_dispatched: bool,
+    /// Event types delivered for that latest episode, in delivery order.
+    pub delivered_events: Vec<ExecutionEventType>,
 }
 
 /// One execution's process-local subscription state.
@@ -128,6 +194,14 @@ pub enum SinkRefusal {
 struct Entry {
     change_id: String,
     sink: Option<ExecutionSinkSpec>,
+    /// True when this episode's sink was bound from a proposal subscription
+    /// rather than registered directly against the execution.
+    ///
+    /// The distinction is what keeps the two surfaces independent: clearing a
+    /// proposal subscription must not detach a callback somebody registered
+    /// against this exact execution, and pruning a superseded episode must not
+    /// throw away a direct registration.
+    proposal_bound: bool,
     /// Typed terminal classification, once the reducer produced one.
     terminal: Option<EpisodeTerminal>,
     /// True once terminal handling started, which is what caps delivery at one
@@ -148,6 +222,7 @@ impl Entry {
         Self {
             change_id,
             sink: None,
+            proposal_bound: false,
             terminal: None,
             terminal_attempted: false,
             terminal_dispatched: false,
@@ -207,6 +282,14 @@ impl Default for Limits {
 pub struct CompletionSinkRegistry {
     instance_id: String,
     entries: Mutex<HashMap<String, Entry>>,
+    /// Proposal-scoped subscriptions, keyed by `change_id`.
+    ///
+    /// A second map rather than a field on [`Entry`] because a subscription
+    /// outlives every episode it binds: it is registered against the thing an
+    /// operator names, and an execution ID does not exist yet when the agent
+    /// asks to be told. Lock order is always `proposals` before `entries`; no
+    /// path takes them the other way round.
+    proposals: Mutex<HashMap<String, ProposalEntry>>,
     facts: Arc<ExecutionFactsStore>,
     contract: Arc<ExecutionContractHandle>,
     repo_root: Mutex<Option<PathBuf>>,
@@ -315,6 +398,7 @@ impl CompletionSinkRegistry {
             registry: Arc::new(Self {
                 instance_id,
                 entries: Mutex::new(HashMap::new()),
+                proposals: Mutex::new(HashMap::new()),
                 facts,
                 contract,
                 repo_root: Mutex::new(None),
@@ -370,6 +454,12 @@ impl CompletionSinkRegistry {
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
         self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_proposals(&self) -> MutexGuard<'_, HashMap<String, ProposalEntry>> {
+        self.proposals
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -451,6 +541,10 @@ impl CompletionSinkRegistry {
                 .get_mut(execution_id)
                 .ok_or(SinkRefusal::UnknownExecution)?;
             entry.sink = Some(spec);
+            // A direct registration names this exact execution, so it outranks
+            // — and is never confused with — a sink the owner bound from a
+            // proposal subscription.
+            entry.proposal_bound = false;
             SinkView {
                 change_id: entry.change_id.clone(),
                 sink: entry.sink.clone(),
@@ -481,12 +575,217 @@ impl CompletionSinkRegistry {
             .get_mut(execution_id)
             .ok_or(SinkRefusal::UnknownExecution)?;
         entry.sink = None;
+        entry.proposal_bound = false;
         Ok(SinkView {
             change_id: entry.change_id.clone(),
             sink: None,
             terminal_dispatched: entry.terminal_dispatched,
             delivered_events: entry.delivered.clone(),
         })
+    }
+
+    // ── Proposal-scoped subscriptions ───────────────────────────────────────
+    //
+    // Registered against the proposal an operator names rather than against an
+    // execution ID that does not exist yet. The owner binds each new episode of
+    // that proposal to the current subscription, so re-admission after a retry
+    // is a *new* delivery rather than a lost one, and dedupe stays keyed by
+    // episode so replacing or clearing a subscription can never replay a
+    // terminal event this owner already delivered.
+
+    /// Register or replace one proposal's subscription.
+    ///
+    /// Binding the live episode happens here rather than at delivery time so a
+    /// subscription set while work is already running is honored: the episode's
+    /// own entry is what the dispatcher reads, and an entry with no sink is
+    /// indistinguishable from one nobody asked about.
+    ///
+    /// The one episode it will not bind is a live one already carrying a sink
+    /// registered directly against that execution. The two surfaces are separate
+    /// by contract, and a standing rule about a proposal silently replacing a
+    /// registration that named one exact episode — which a later `clear` would
+    /// then detach — is the interference that separation exists to prevent.
+    ///
+    /// Registering after the latest episode already settled owes exactly one
+    /// late delivery. It is requested unconditionally and *filtered* by
+    /// [`Self::handle_terminal`]'s `terminal_attempted` flag, which is what makes
+    /// "clear then set does not replay" hold: the flag lives on the episode, so
+    /// no subscription generation can reset it.
+    pub fn set_proposal_subscription(
+        &self,
+        change_id: &str,
+        instance_id: &str,
+        spec: ExecutionSinkSpec,
+    ) -> Result<ProposalSubscriptionView, SinkRefusal> {
+        validate_command(&spec.command)?;
+        if instance_id != self.instance_id {
+            return Err(SinkRefusal::InstanceMismatch);
+        }
+        let (view, bound) = {
+            let mut proposals = self.lock_proposals();
+            let proposal = proposals.entry(change_id.to_string()).or_default();
+            proposal.sink = Some(spec.clone());
+            let latest = proposal.latest.clone();
+
+            let mut entries = self.lock();
+            let bound = latest.as_ref().filter(|execution_id| {
+                match entries.get_mut(execution_id.as_str()) {
+                    // A terminal event already handed to a callback closes this
+                    // episode for good; the replacement applies to the next one.
+                    Some(entry) if entry.terminal_dispatched => false,
+                    // A sink registered *directly* against this execution named
+                    // this exact episode, and the two surfaces are separate: a
+                    // standing proposal rule must not silently replace a
+                    // specific registration, and clearing the proposal must not
+                    // detach one it never made. The subscription still governs
+                    // every future episode of the proposal.
+                    Some(entry) if entry.sink.is_some() && !entry.proposal_bound => false,
+                    Some(entry) => {
+                        entry.sink = Some(spec.clone());
+                        entry.proposal_bound = true;
+                        true
+                    }
+                    None => false,
+                }
+            });
+            let bound = bound.cloned();
+            (
+                Self::project_proposal(change_id, proposals.get(change_id), &entries),
+                bound,
+            )
+        };
+        // Admission stops at shutdown: the registration is recorded and readable,
+        // but it opens no new delivery work in a process that is leaving.
+        if let Some(execution_id) = bound {
+            if !self.stopping.load(Ordering::SeqCst) {
+                let _ = self.tasks.send(Task::Registered { execution_id });
+            }
+        }
+        Ok(view)
+    }
+
+    /// Read one proposal's subscription, validating the owner binding.
+    pub fn view_proposal_subscription(
+        &self,
+        change_id: &str,
+        instance_id: &str,
+    ) -> Result<ProposalSubscriptionView, SinkRefusal> {
+        if instance_id != self.instance_id {
+            return Err(SinkRefusal::InstanceMismatch);
+        }
+        let proposals = self.lock_proposals();
+        let entries = self.lock();
+        Ok(Self::project_proposal(
+            change_id,
+            proposals.get(change_id),
+            &entries,
+        ))
+    }
+
+    /// Clear one proposal's subscription.
+    ///
+    /// Cancels delivery that has not started, and nothing else: a callback
+    /// process already running keeps its own bounds and finishes, because
+    /// killing it would make "clear" a control action over something the owner
+    /// already handed to another program.
+    ///
+    /// A sink registered directly against the episode is left alone. Clearing
+    /// the proposal is not authority over an execution-scoped registration
+    /// somebody else made.
+    pub fn clear_proposal_subscription(
+        &self,
+        change_id: &str,
+        instance_id: &str,
+    ) -> Result<ProposalSubscriptionView, SinkRefusal> {
+        if instance_id != self.instance_id {
+            return Err(SinkRefusal::InstanceMismatch);
+        }
+        let mut proposals = self.lock_proposals();
+        let mut entries = self.lock();
+        if let Some(proposal) = proposals.get_mut(change_id) {
+            proposal.sink = None;
+            if let Some(entry) = proposal
+                .latest
+                .as_ref()
+                .and_then(|execution_id| entries.get_mut(execution_id.as_str()))
+            {
+                if entry.proposal_bound {
+                    entry.sink = None;
+                    entry.proposal_bound = false;
+                }
+            }
+        }
+        let view = Self::project_proposal(change_id, proposals.get(change_id), &entries);
+        // The delivery history of the latest episode is what a caller reads back
+        // to decide whether it still owes follow-up, so the entry is kept while
+        // it has one. An entry that never bound an episode and now holds no
+        // subscription is nothing at all.
+        if proposals
+            .get(change_id)
+            .is_some_and(ProposalEntry::is_empty)
+        {
+            proposals.remove(change_id);
+        }
+        Ok(view)
+    }
+
+    /// Project one proposal's registry state into its read model.
+    fn project_proposal(
+        change_id: &str,
+        proposal: Option<&ProposalEntry>,
+        entries: &HashMap<String, Entry>,
+    ) -> ProposalSubscriptionView {
+        let sink = proposal.and_then(|proposal| proposal.sink.clone());
+        let execution_id = proposal.and_then(|proposal| proposal.latest.clone());
+        let episode = execution_id
+            .as_ref()
+            .and_then(|execution_id| entries.get(execution_id.as_str()));
+        ProposalSubscriptionView {
+            change_id: change_id.to_string(),
+            sink,
+            execution_id,
+            terminal_dispatched: episode.is_some_and(|entry| entry.terminal_dispatched),
+            delivered_events: episode
+                .map(|entry| entry.delivered.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Bind a newly started episode to its proposal's subscription, if any.
+    ///
+    /// Also the point where a superseded episode is discarded. The contract
+    /// retains at most the latest episode per proposal, and an entry the owner
+    /// only created because a subscription bound it has nobody left to answer
+    /// for once a newer episode exists. An entry carrying a *direct*
+    /// registration is never discarded here: that registration named this exact
+    /// execution, and a retry is not permission to forget it.
+    fn bind_episode(&self, change_id: &str, execution_id: &str) {
+        let mut proposals = self.lock_proposals();
+        let mut entries = self.lock();
+        let entry = entries
+            .entry(execution_id.to_string())
+            .or_insert_with(|| Entry::new(change_id.to_string()));
+        let proposal = proposals.entry(change_id.to_string()).or_default();
+        // Same precedence as `set_proposal_subscription`: a direct registration
+        // for this exact execution is more specific than a standing rule about
+        // the proposal, so it is not displaced.
+        if entry.sink.is_none() || entry.proposal_bound {
+            if let Some(spec) = proposal.sink.clone() {
+                entry.sink = Some(spec);
+                entry.proposal_bound = true;
+            }
+        }
+        let superseded = proposal.latest.replace(execution_id.to_string());
+        if let Some(superseded) = superseded {
+            if superseded != execution_id {
+                let disposable = entries
+                    .get(&superseded)
+                    .is_some_and(|entry| entry.proposal_bound || entry.sink.is_none());
+                if disposable {
+                    entries.remove(&superseded);
+                }
+            }
+        }
     }
 
     /// Attempt `owner_stopping` for every live registration, then return.
@@ -672,9 +971,11 @@ impl CompletionSinkRegistry {
     async fn handle_episode(&self, transition: EpisodeTransition) {
         match transition.kind {
             EpisodeTransitionKind::Started => {
-                self.lock()
-                    .entry(transition.execution_id.clone())
-                    .or_insert_with(|| Entry::new(transition.change_id.clone()));
+                // One call rather than two: creating the episode entry and
+                // binding it to the proposal's current subscription have to be
+                // the same step, or a terminal transition arriving in between
+                // would find an unsubscribed episode and deliver nothing.
+                self.bind_episode(&transition.change_id, &transition.execution_id);
             }
             EpisodeTransitionKind::BlockedEntered => {
                 let should_deliver = {
@@ -708,27 +1009,34 @@ impl CompletionSinkRegistry {
         }
     }
 
+    /// Take the single terminal-delivery attempt one episode is allowed.
+    ///
+    /// `None` means there is nothing to deliver *or* somebody already took it.
+    /// Both are the same answer to the caller, and collapsing them here is what
+    /// makes the rule one place rather than a condition every caller repeats.
+    ///
+    /// Claiming inside the lock is what makes "one terminal delivery per
+    /// episode" hold against a registration racing the reducer's own transition,
+    /// and keying the flag on the *episode* rather than on the subscription is
+    /// what makes replacing, clearing, or clearing-then-setting unable to replay
+    /// a terminal event this owner already delivered.
+    fn claim_terminal(&self, execution_id: &str) -> Option<(EpisodeTerminal, String)> {
+        let mut entries = self.lock();
+        let entry = entries.get_mut(execution_id)?;
+        let terminal = entry.terminal?;
+        if entry.terminal_attempted || entry.sink.is_none() {
+            return None;
+        }
+        entry.terminal_attempted = true;
+        Some((terminal, entry.change_id.clone()))
+    }
+
     /// Deliver the terminal event for one execution, at most once, if it can be
     /// told truthfully.
     async fn handle_terminal(&self, execution_id: &str) {
-        let claimed = {
-            let mut entries = self.lock();
-            let Some(entry) = entries.get_mut(execution_id) else {
-                return;
-            };
-            let Some(terminal) = entry.terminal else {
-                return;
-            };
-            if entry.terminal_attempted || entry.sink.is_none() {
-                return;
-            }
-            // Claiming the attempt inside the lock is what makes "one terminal
-            // delivery per execution" hold against a registration racing the
-            // reducer's own transition.
-            entry.terminal_attempted = true;
-            (terminal, entry.change_id.clone())
+        let Some((terminal, change_id)) = self.claim_terminal(execution_id) else {
+            return;
         };
-        let (terminal, change_id) = claimed;
 
         let (event_type, evidence) = match terminal {
             EpisodeTerminal::Failed => (ExecutionEventType::Failed, None),
@@ -1384,6 +1692,369 @@ mod tests {
         assert_eq!(drained.total, produced.len());
         assert!(!drained.truncated());
         assert_eq!(drained.text(), "one bounded line\n");
+    }
+
+    // ── Proposal-scoped subscriptions ───────────────────────────────────────
+    //
+    // Unit-scoped by construction: every assertion below is about the registry's
+    // own decisions — which episode a subscription binds, and who is allowed to
+    // take an episode's single terminal-delivery attempt. None of it writes an
+    // event file, spawns a callback, or waits on a clock, because none of those
+    // is what the contract is about.
+
+    /// A registry with no dispatcher running, so queued delivery work stays
+    /// observable as queued work rather than becoming a subprocess.
+    fn proposal_registry() -> (Arc<CompletionSinkRegistry>, mpsc::UnboundedReceiver<Task>) {
+        let Wiring { registry, tasks } = CompletionSinkRegistry::build(
+            "i-1".to_string(),
+            Arc::new(ExecutionFactsStore::new()),
+            Arc::new(crate::web::remote_control_api::ExecutionContractHandle::default()),
+        );
+        (registry, tasks)
+    }
+
+    fn spec(program: &str) -> ExecutionSinkSpec {
+        ExecutionSinkSpec {
+            command: vec![program.to_string()],
+            notify_blocked: false,
+        }
+    }
+
+    /// Announce one episode the way the reducer's own transition does.
+    fn start_episode(registry: &CompletionSinkRegistry, change_id: &str, execution_id: &str) {
+        registry.bind_episode(change_id, execution_id);
+    }
+
+    /// Record the typed terminal classification for one episode.
+    fn settle(registry: &CompletionSinkRegistry, execution_id: &str, terminal: EpisodeTerminal) {
+        let mut entries = registry.lock();
+        let entry = entries
+            .get_mut(execution_id)
+            .expect("the episode must exist before it settles");
+        entry.terminal = Some(terminal);
+    }
+
+    /// How many delivery attempts are queued for one episode.
+    fn queued_registrations(
+        tasks: &mut mpsc::UnboundedReceiver<Task>,
+        execution_id: &str,
+    ) -> usize {
+        let mut count = 0;
+        while let Ok(task) = tasks.try_recv() {
+            if matches!(&task, Task::Registered { execution_id: queued } if queued == execution_id)
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn a_subscription_binds_the_owner_incarnation_it_names() {
+        let (registry, _tasks) = proposal_registry();
+        assert!(matches!(
+            registry.set_proposal_subscription("alpha", "i-2", spec("/bin/true")),
+            Err(SinkRefusal::InstanceMismatch)
+        ));
+        assert!(matches!(
+            registry.view_proposal_subscription("alpha", "i-2"),
+            Err(SinkRefusal::InstanceMismatch)
+        ));
+        assert!(matches!(
+            registry.clear_proposal_subscription("alpha", "i-2"),
+            Err(SinkRefusal::InstanceMismatch)
+        ));
+        // Nothing was recorded by any of the three refusals.
+        let view = registry
+            .view_proposal_subscription("alpha", "i-1")
+            .expect("this incarnation");
+        assert!(view.sink.is_none());
+    }
+
+    #[test]
+    fn an_unacceptable_argv_is_refused_before_anything_is_recorded() {
+        let (registry, _tasks) = proposal_registry();
+        let refusal = registry.set_proposal_subscription(
+            "alpha",
+            "i-1",
+            ExecutionSinkSpec {
+                command: Vec::new(),
+                notify_blocked: false,
+            },
+        );
+        assert!(matches!(refusal, Err(SinkRefusal::InvalidCommand(_))));
+        assert!(registry
+            .view_proposal_subscription("alpha", "i-1")
+            .unwrap()
+            .sink
+            .is_none());
+    }
+
+    /// The case the whole resource exists for: an agent asks to be told about a
+    /// proposal that has never been admitted, and the next episode binds to it.
+    #[test]
+    fn a_subscription_registered_before_admission_binds_the_next_episode() {
+        let (registry, mut tasks) = proposal_registry();
+        let view = registry
+            .set_proposal_subscription("alpha", "i-1", spec("/bin/true"))
+            .expect("a pre-admission subscription is legal");
+        assert!(view.sink.is_some());
+        assert_eq!(view.execution_id, None, "no episode is synthesized");
+        assert_eq!(queued_registrations(&mut tasks, "e-1"), 0);
+
+        start_episode(&registry, "alpha", "e-1");
+        let view = registry.view_proposal_subscription("alpha", "i-1").unwrap();
+        assert_eq!(view.execution_id.as_deref(), Some("e-1"));
+
+        settle(&registry, "e-1", EpisodeTerminal::Completed);
+        assert!(
+            registry.claim_terminal("e-1").is_some(),
+            "the bound episode owes exactly one delivery attempt"
+        );
+    }
+
+    /// Registering after the latest episode already settled owes one late
+    /// delivery, which is what closes the start/registration race.
+    #[test]
+    fn a_late_subscription_claims_the_retained_terminal_episode_once() {
+        let (registry, mut tasks) = proposal_registry();
+        start_episode(&registry, "alpha", "e-1");
+        settle(&registry, "e-1", EpisodeTerminal::Failed);
+        // No subscription yet, so there is nothing to deliver to.
+        assert!(registry.claim_terminal("e-1").is_none());
+
+        registry
+            .set_proposal_subscription("alpha", "i-1", spec("/bin/true"))
+            .expect("a late subscription");
+        assert_eq!(
+            queued_registrations(&mut tasks, "e-1"),
+            1,
+            "the late registration asks the dispatcher to look at the settled episode"
+        );
+        assert!(registry.claim_terminal("e-1").is_some());
+        assert!(
+            registry.claim_terminal("e-1").is_none(),
+            "and only once, however many times it is asked"
+        );
+    }
+
+    /// Dedupe is keyed by the episode, not by the subscription generation. This
+    /// is the property that stops a replacement — or a clear-then-set — from
+    /// replaying a terminal event this owner already delivered.
+    #[test]
+    fn replacing_or_clearing_a_subscription_never_replays_a_delivered_terminal() {
+        for replay in ["replace", "clear then set"] {
+            let (registry, mut tasks) = proposal_registry();
+            registry
+                .set_proposal_subscription("alpha", "i-1", spec("/bin/true"))
+                .unwrap();
+            start_episode(&registry, "alpha", "e-1");
+            settle(&registry, "e-1", EpisodeTerminal::Stopped);
+            assert!(registry.claim_terminal("e-1").is_some(), "{replay}");
+
+            if replay == "clear then set" {
+                registry
+                    .clear_proposal_subscription("alpha", "i-1")
+                    .unwrap();
+            }
+            registry
+                .set_proposal_subscription("alpha", "i-1", spec("/bin/false"))
+                .unwrap();
+            // The dispatcher is asked to look, and finds the attempt already taken.
+            assert_eq!(queued_registrations(&mut tasks, "e-1"), 1, "{replay}");
+            assert!(
+                registry.claim_terminal("e-1").is_none(),
+                "{replay} must not replay e-1"
+            );
+
+            // A *new* episode is independently deliverable under the replacement.
+            start_episode(&registry, "alpha", "e-2");
+            settle(&registry, "e-2", EpisodeTerminal::Stopped);
+            assert!(registry.claim_terminal("e-2").is_some(), "{replay}");
+        }
+    }
+
+    /// Re-admission after a retry is a distinct episode carrying the replacement
+    /// argv, and the proposal subscription survives it.
+    #[test]
+    fn re_admission_creates_a_distinct_episode_under_the_same_subscription() {
+        let (registry, _tasks) = proposal_registry();
+        registry
+            .set_proposal_subscription("alpha", "i-1", spec("/bin/true"))
+            .unwrap();
+        start_episode(&registry, "alpha", "e-1");
+        settle(&registry, "e-1", EpisodeTerminal::Failed);
+        assert!(registry.claim_terminal("e-1").is_some());
+
+        start_episode(&registry, "alpha", "e-2");
+        let view = registry.view_proposal_subscription("alpha", "i-1").unwrap();
+        assert_eq!(view.execution_id.as_deref(), Some("e-2"));
+        assert!(view.sink.is_some(), "the subscription outlives the episode");
+        // At most the latest episode is retained per proposal.
+        assert!(
+            !registry.lock().contains_key("e-1"),
+            "a superseded proposal-bound episode is discarded"
+        );
+        settle(&registry, "e-2", EpisodeTerminal::Failed);
+        assert!(
+            registry.claim_terminal("e-2").is_some(),
+            "e-1's dedupe must not suppress e-2"
+        );
+    }
+
+    #[test]
+    fn clearing_removes_only_the_named_proposal() {
+        let (registry, _tasks) = proposal_registry();
+        for change_id in ["alpha", "beta", "gamma"] {
+            registry
+                .set_proposal_subscription(change_id, "i-1", spec("/bin/true"))
+                .unwrap();
+        }
+        registry
+            .clear_proposal_subscription("alpha", "i-1")
+            .unwrap();
+        registry
+            .clear_proposal_subscription("gamma", "i-1")
+            .unwrap();
+
+        for cleared in ["alpha", "gamma"] {
+            let view = registry.view_proposal_subscription(cleared, "i-1").unwrap();
+            assert!(view.sink.is_none(), "{cleared}");
+        }
+        assert!(registry
+            .view_proposal_subscription("beta", "i-1")
+            .unwrap()
+            .sink
+            .is_some());
+    }
+
+    /// Clearing cancels delivery that has not started. It does so by detaching
+    /// the *episode's* binding, which is the same state a not-yet-started
+    /// delivery reads.
+    #[test]
+    fn clearing_cancels_an_unstarted_delivery_for_the_live_episode() {
+        let (registry, _tasks) = proposal_registry();
+        registry
+            .set_proposal_subscription("alpha", "i-1", spec("/bin/true"))
+            .unwrap();
+        start_episode(&registry, "alpha", "e-1");
+        settle(&registry, "e-1", EpisodeTerminal::Completed);
+
+        registry
+            .clear_proposal_subscription("alpha", "i-1")
+            .unwrap();
+        assert!(
+            registry.claim_terminal("e-1").is_none(),
+            "a cleared subscription has nobody to deliver to"
+        );
+        // The delivery history of the latest episode is still readable, because
+        // that is what a caller reads to decide whether it still owes follow-up.
+        let view = registry.view_proposal_subscription("alpha", "i-1").unwrap();
+        assert_eq!(view.execution_id.as_deref(), Some("e-1"));
+    }
+
+    /// The two surfaces are independent. A proposal clear is not authority over
+    /// a callback somebody registered against this exact execution, and a
+    /// superseded episode carrying one is not discarded.
+    #[test]
+    fn a_proposal_subscription_never_disturbs_an_execution_scoped_registration() {
+        let (registry, _tasks) = proposal_registry();
+        start_episode(&registry, "alpha", "e-1");
+        registry
+            .set_sink("e-1", "i-1", "alpha", spec("/bin/direct"))
+            .expect("a direct registration");
+
+        registry
+            .set_proposal_subscription("alpha", "i-1", spec("/bin/proposal"))
+            .unwrap();
+        let view = registry.view("e-1", "i-1", "alpha").expect("still there");
+        assert_eq!(
+            view.sink.expect("the direct registration stands").command,
+            vec!["/bin/direct".to_string()],
+            "a standing proposal rule must not replace a registration that named this episode"
+        );
+
+        registry
+            .clear_proposal_subscription("alpha", "i-1")
+            .unwrap();
+        let view = registry.view("e-1", "i-1", "alpha").expect("still there");
+        assert_eq!(
+            view.sink.expect("the direct registration survives").command,
+            vec!["/bin/direct".to_string()],
+            "clearing a proposal must not detach an execution-scoped sink"
+        );
+
+        // The subscription still governs every *future* episode, and the episode
+        // holding a direct registration is not thrown away by a retry.
+        registry
+            .set_proposal_subscription("alpha", "i-1", spec("/bin/proposal"))
+            .unwrap();
+        start_episode(&registry, "alpha", "e-2");
+        assert!(
+            registry.lock().contains_key("e-1"),
+            "an episode carrying a direct registration is not pruned by a retry"
+        );
+        assert_eq!(
+            registry
+                .lock()
+                .get("e-2")
+                .unwrap()
+                .sink
+                .as_ref()
+                .unwrap()
+                .command,
+            vec!["/bin/proposal".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_subscription_replaced_after_delivery_applies_to_the_next_episode_only() {
+        let (registry, _tasks) = proposal_registry();
+        registry
+            .set_proposal_subscription("alpha", "i-1", spec("/bin/first"))
+            .unwrap();
+        start_episode(&registry, "alpha", "e-1");
+        settle(&registry, "e-1", EpisodeTerminal::Completed);
+        assert!(registry.claim_terminal("e-1").is_some());
+        // Mark the episode delivered, which is what `deliver` records.
+        registry.lock().get_mut("e-1").unwrap().terminal_dispatched = true;
+
+        registry
+            .set_proposal_subscription("alpha", "i-1", spec("/bin/second"))
+            .unwrap();
+        assert_eq!(
+            registry
+                .lock()
+                .get("e-1")
+                .unwrap()
+                .sink
+                .as_ref()
+                .unwrap()
+                .command,
+            vec!["/bin/first".to_string()],
+            "a closed episode keeps the argv it was delivered with"
+        );
+
+        start_episode(&registry, "alpha", "e-2");
+        assert_eq!(
+            registry
+                .lock()
+                .get("e-2")
+                .unwrap()
+                .sink
+                .as_ref()
+                .unwrap()
+                .command,
+            vec!["/bin/second".to_string()],
+            "the replacement applies to the next episode"
+        );
+    }
+
+    #[test]
+    fn the_published_proposal_capability_matches_the_enforced_bound() {
+        let capability = proposal_capability();
+        assert!(capability.available);
+        assert_eq!(capability.max_targets, MAX_PROPOSAL_TARGETS);
     }
 
     #[test]

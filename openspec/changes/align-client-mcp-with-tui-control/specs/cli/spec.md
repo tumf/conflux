@@ -20,6 +20,15 @@ The namespace MUST derive the default Unix socket from the canonical Git common 
 - **THEN** the command exits non-zero with an actionable error
 - **AND** it creates no repository lock, API socket, log, or workspace mutation
 
+#### Scenario: Wait certifies evidence from the selected project
+
+- **GIVEN** the client working directory is inside project A
+- **AND** project A and project B contain the same change ID but different completion evidence
+- **AND** a `cflx client wait` invocation supplies absolute project directory B
+- **WHEN** project B's owner claims terminal success
+- **THEN** completion is certified only from project B's repository evidence
+- **AND** project A's repository is never consulted
+
 ### Requirement: Existing-owner client MCP namespace
 
 The CLI MUST provide `cflx client mcp` as a stdio Model Context Protocol server over the existing client-only control boundary. It MUST expose exactly `cflx_status`, `cflx_control`, and `cflx_subscribe`. It MUST NOT expose raw `/api/v2` command construction or become a second owner. `cflx_wait` is withdrawn only from MCP; `cflx client wait` remains the bounded CLI completion oracle.
