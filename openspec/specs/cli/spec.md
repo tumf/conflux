@@ -2400,14 +2400,14 @@ The CLI MUST provide `cflx openapi` as a read-only command that emits the build'
 
 ### Requirement: Existing-owner client namespace
 
-The CLI MUST provide `cflx client` as a client-only namespace for operating one existing repository owner. It MUST provide `status`, `enqueue`, `wait`, `notify`, and `mcp`. The nested `notify` namespace MUST provide execution-scoped `set`, `get`, and `clear` intents over the existing completion-sink client implementation. Invoking a client command MUST NOT acquire the orchestration repository lock, bind an owner listener, initialize an orchestration run, launch lifecycle adapters or AI subprocesses, or otherwise become an owner. `cflx run` MUST retain its existing explicit-target owner semantics.
+The CLI MUST provide `cflx client` as a client-only namespace for operating one existing repository owner. It MUST provide `status`, `mark`, `unmark`, `start`, `stop`, `force-stop`, `wait`, `subscribe`, and `mcp`. The nested `subscribe` namespace MUST provide proposal-scoped `set`, `get`, and `clear` intents over the proposal-subscription client implementation. CLI controls MUST use the same shared operator intents and subscription services as the TUI and MCP. Invoking a client command MUST NOT acquire the orchestration repository lock, bind an owner listener, initialize an orchestration run, launch lifecycle adapters or AI subprocesses, or otherwise become an owner. `cflx run` MUST retain its existing explicit-target owner semantics.
 
 The namespace MUST derive the default Unix socket from the canonical Git common directory and MAY accept an explicit socket override. Authentication secrets MUST be read from a named environment variable rather than a literal argv value. Builds without the required local API support MUST reject the namespace before side effects.
 
 #### Scenario: Client does not compete with the owner
 
 - **GIVEN** a TUI process owns the repository and serves its default Unix socket
-- **WHEN** another process runs `cflx client status --json`, `cflx client notify get alpha <execution-id> --json`, or `cflx client mcp`
+- **WHEN** another process runs a client status, mark, lifecycle-control, wait, subscription, or MCP command
 - **THEN** it connects as a client to the existing owner
 - **AND** it does not acquire the repository lock or start another orchestration process
 
@@ -2417,6 +2417,15 @@ The namespace MUST derive the default Unix socket from the canonical Git common 
 - **WHEN** an operator invokes any `cflx client` command
 - **THEN** the command exits non-zero with an actionable error
 - **AND** it creates no repository lock, API socket, log, or workspace mutation
+
+#### Scenario: Wait certifies evidence from the selected project
+
+- **GIVEN** the client working directory is inside project A
+- **AND** project A and project B contain the same change ID but different completion evidence
+- **AND** a `cflx client wait` invocation supplies absolute project directory B
+- **WHEN** project B's owner claims terminal success
+- **THEN** completion is certified only from project B's repository evidence
+- **AND** project A's repository is never consulted
 
 ### Requirement: Stable client output contract
 
@@ -2452,87 +2461,6 @@ Client commands MUST support concise human output and a machine-readable JSON mo
 **When**: Clap rejects the invocation
 **Then**: normal human-facing Clap diagnostics and exit behavior remain in effect
 **And**: no JSON envelope is emitted merely because another argument value contains the substring `--json`
-
-### Requirement: Intent-based enqueue
-
-`cflx client enqueue <change-id>` MUST express the high-level intent to admit one change to the existing command-capable owner. The CLI MUST determine the route from authoritative capabilities, instance, state, execution status, and action eligibility. It MUST shield callers from raw command types, `expected_revision`, execution marks, queue intent, and idempotency keys.
-
-The CLI MUST submit the smallest supported sequence through the existing shared operator-command service, wait for each command record to settle, and return success only when the target is already admitted or the intended admission is accepted. It MUST recompute intent after bounded stale-revision conflicts, use a fresh idempotency identity when the typed command identity changes, and fail if the owner instance changes. It MUST fail closed for unknown, final, blocked, worktree-ineligible, active-run-limited, unsupported, or command-incapable targets without starting another owner or claiming admission. An idle-owner Start MUST NOT consume unrelated execution marks: the client MUST preserve them and return a typed operator-intent conflict if it cannot isolate the requested target through existing semantics. If the requested mark settles but Start does not, the client MUST return non-zero `partial_intent`, identify the remaining mark, warn that a later operator Start can consume it, and MUST NOT claim rollback. Every `partial_intent` result MUST list every command actually submitted by that invocation, regardless of whether that command settles successfully, and MUST omit commands that were skipped or rejected before submission. Stale-revision recomputation MUST preserve that exact per-invocation audit sequence without duplicates or omissions.
-
-#### Scenario: Idle owner admits one change
-
-**Given**: a command-capable idle owner exposes eligible unmarked change `alpha`
-**When**: an agent runs `cflx client enqueue alpha --json`
-**Then**: the client marks only `alpha`, rereads authoritative state, and submits Start through the existing command service
-**And**: it reports success only after the command records settle successfully
-
-#### Scenario: Live owner admits additional eligible work
-
-**Given**: a command-capable owner has a live scheduler and `alpha` is eligible for dynamic admission
-**When**: an agent runs `cflx client enqueue alpha --json`
-**Then**: the client uses the existing live-owner admission semantics
-**And**: it does not start a second scheduler or owner
-
-#### Scenario: Idle enqueue preserves unrelated marks
-
-**Given**: an idle owner has unrelated ordinary change `beta` execution-marked
-**When**: an agent runs `cflx client enqueue alpha --json`
-**Then**: the client does not submit Start for the combined marked set
-**And**: it does not clear or otherwise mutate `beta`'s mark
-**And**: it returns `operator_intent_conflict` with a non-zero exit status
-
-#### Scenario: Settled mark without Start is partial intent
-
-**Given**: idle admission settles the requested execution mark
-**When**: Start is rejected or a conflicting mark appears before Start
-**Then**: enqueue exits non-zero with outcome `partial_intent`
-**And**: it identifies the remaining requested mark and warns that a later operator Start can consume it
-**And**: it does not claim rollback
-
-#### Scenario: Stale revision is recomputed safely
-
-**Given**: owner state advances between the client's read and mutation
-**When**: the v2 command rejects the observed revision as stale
-**Then**: the client rereads instance and authoritative state and recomputes the complete intent
-**And**: retries are bounded
-**And**: no settled side effect is submitted twice
-
-#### Scenario: Headless run is not command capable
-
-**Given**: the socket belongs to `cflx run`, whose remote command executor is unbound
-**When**: an agent runs `cflx client enqueue alpha --json`
-**Then**: the client returns `owner_not_command_capable` non-zero
-**And**: it does not start or replace an owner
-
-#### Scenario: Unsafe target is mutation free
-
-**Given**: `alpha` is unknown, final, blocked, worktree-ineligible, or blocked by active-run iteration-limit evidence
-**When**: an agent runs `cflx client enqueue alpha --json`
-**Then**: the client returns a typed unsuccessful outcome
-**And**: it submits no hidden fallback, manual archive, merge, repair, or second-owner action
-
-#### Scenario: Pre-existing mark is not reported as submitted
-
-**Given**: `alpha` was already execution-marked before the client invocation
-**When**: the client skips mark submission, submits Start, and Start fails
-**Then**: `partial_intent.detail.commands_submitted` contains `start`
-**And**: it does not contain `set_execution_mark`
-**And**: the remaining mark and its later-consumption warning are still reported truthfully
-
-#### Scenario: Failed submitted Start remains in the audit list
-
-**Given**: the client submits `Start` and the owner settles it unsuccessfully
-**When**: enqueue returns `partial_intent`
-**Then**: `detail.commands_submitted` contains `start`
-**And**: its order matches the command records actually submitted by this invocation
-
-#### Scenario: Stale revision retry preserves exact command audit
-
-**Given**: one enqueue invocation has a mutation attempt rejected with `StaleRevision` before a command record is created
-**When**: the client rereads authoritative state, recomputes intent, and submits the next supported command sequence
-**Then**: `detail.commands_submitted` equals the ordered command records actually created by that invocation
-**And**: the rejected pre-record attempt is not listed
-**And**: no retried command is duplicated or omitted
 
 ### Requirement: Observation-only completion wait
 
@@ -2608,27 +2536,25 @@ Wait MUST submit no mutation command. Change disappearance alone MUST NOT count 
 
 ### Requirement: Existing-owner client MCP namespace
 
-The CLI MUST provide `cflx client mcp` as a stdio Model Context Protocol server over the existing client-only intent boundary. It MUST expose closed tools for coherent status, enqueue, truthful wait, and completion-sink set/get/clear. It MUST NOT expose raw `/api/v2` command construction or become a second owner.
+The CLI MUST provide `cflx client mcp` as a stdio Model Context Protocol server over the existing client-only control boundary. It MUST expose exactly `cflx_status`, `cflx_control`, and `cflx_subscribe`. It MUST NOT expose raw `/api/v2` command construction or become a second owner. `cflx_wait` is withdrawn only from MCP; `cflx client wait` remains the bounded CLI completion oracle.
 
-The MCP adapter MUST use the same route resolution, authentication environment-variable references, intent routing, typed outcomes, and completion oracle as `cflx client status`, `enqueue`, and `wait`. Route resolution consists of a call-scoped absolute project directory, a call-scoped explicit Unix socket, a namespace-level default route, or current-working-directory repository discovery, in that precedence order. A selector supplied by one call MUST override the namespace-level default and MUST NOT mutate it. Mutual exclusion applies only when the same call supplies both `project_dir` and `unix_socket`.
+The MCP adapter MUST use the same route resolution, authentication environment-variable references, shared operator intents, typed outcomes, and subscription service as the matching client CLI operations. Route resolution consists of a call-scoped absolute project directory, a call-scoped explicit Unix socket, a namespace-level default route, or current-working-directory repository discovery, in that precedence order. A selector supplied by one call MUST override the namespace-level default and MUST NOT mutate it. Mutual exclusion applies only when the same call supplies both `project_dir` and `unix_socket`.
 
 Every closed MCP tool MUST accept optional non-empty string `project_dir` and `unix_socket` selectors. `project_dir` is the normal public selector; `unix_socket` is the low-level override. `project_dir` MUST be an absolute path. A relative path or two selectors in the same call MUST produce the normal MCP `ToolError` / `isError` validation result before owner contact; this change MUST NOT add a new stable-envelope outcome. When neither call-scoped selector is supplied, the namespace-level default remains effective, otherwise current-working-directory discovery remains effective.
 
-A project-directory route MUST resolve any directory inside a usable non-bare Git working tree, including a linked worktree, submodule, or canonicalized symlink, through the same canonical repository and Git common-directory derivation used by repository locking and default owner-socket resolution. It MUST derive both the absolute repository root used by repository-evidence operations and `<git-common-dir>/cflx-api.sock` from that selected project. `cflx_wait` completion certification MUST use only the selected project's repository root and MUST NOT consult the MCP server process's current repository when another project is selected.
-
-The same route resolution MUST apply to `cflx_status`, `cflx_enqueue`, `cflx_wait`, `cflx_notify_set`, `cflx_notify_get`, and `cflx_notify_clear`. Route resolution MUST NOT mutate a repository, start an owner, infer a repository from a change ID, or persist a project registry. A missing path, non-directory, bare repository, or non-repository path MUST fail through the bounded validation channel before owner contact.
+A project-directory route MUST resolve any directory inside a usable non-bare Git working tree, including a linked worktree, submodule, or canonicalized symlink, through the same canonical repository and Git common-directory derivation used by repository locking and default owner-socket resolution. It MUST derive both the absolute repository root and `<git-common-dir>/cflx-api.sock` from that selected project. The same immutable call-scoped route resolution MUST apply to all three tools. Route resolution MUST NOT mutate a repository, start an owner, infer a repository from a change ID, or persist a project registry. A missing path, non-directory, bare repository, or non-repository path MUST fail through the bounded validation channel before owner contact.
 
 The MCP adapter MUST implement MCP initialization, initialized notification handling, ping, `tools/list`, and `tools/call` for a documented protocol revision. Before initialization it MUST accept only `initialize` and `ping`. Tool listing and calls become enabled after the adapter successfully responds to `initialize`; `notifications/initialized` MUST be accepted idempotently. It MUST reject request envelopes that do not identify JSON-RPC 2.0. Invalid request objects MUST receive an invalid-request response using a valid request ID or `null`; invalid notifications MUST receive no response. JSON-RPC batch arrays MUST be rejected as invalid requests because batch support is not advertised. Protocol errors and tool failures MUST be machine-readable and MUST NOT mix diagnostics into JSON-RPC stdout.
 
-The stable client envelope MUST add optional top-level `instance_id`, `execution_id`, and `change_id` fields without changing existing field meanings or exit codes. Notify operations MUST use stable operation and outcome names. Owners without the execution-sink capability MUST produce a typed unsupported-owner failure rather than a protocol error.
+The stable client envelope MUST retain optional top-level `instance_id`, `execution_id`, and `change_id` fields without changing existing field meanings or exit codes. Mark responses MUST leave `execution_id` absent. Operations MUST use `control_mark`, `control_unmark`, `control_start`, `control_stop`, `control_force_stop`, `subscribe_set`, `subscribe_get`, and `subscribe_clear`. Stable success outcomes MUST distinguish `marked`, `unmarked`, `unchanged`, `accepted`, `subscribed`, `observed`, and `cleared`; retained typed refusals include `owner_not_running`, `owner_not_command_capable`, `owner_restarted`, `change_not_found`, `target_ineligible`, `revision_conflict`, `transport_not_permitted`, `unsupported_owner`, `partial_intent`, and `usage_error`. Owners without proposal-subscription capability MUST produce typed `unsupported_owner`, not a protocol error.
 
-#### Scenario: MCP enqueues into the existing TUI
+`cflx_control` MUST accept action `mark`, `unmark`, `start`, `stop`, or `force_stop`. Mark/unmark require one through 64 distinct `change_ids`; lifecycle actions MUST reject `change_ids` and consume authoritative owner state. `cflx_subscribe` MUST accept action `set`, `get`, or `clear` and one through 64 distinct `change_ids`. Set requires bounded non-empty callback argv; get and clear reject callback argv. Duplicate IDs, an empty set, or more than 64 IDs MUST fail as `usage_error` before owner contact. No tool may expose raw command construction, expected revision, idempotency keys, queue intent, shell interpretation, or hidden admission.
 
-- **GIVEN** a long-lived TUI owns the selected repository and serves its local Unix socket
-- **WHEN** an initialized MCP host calls `cflx_enqueue` for eligible change `alpha`
-- **THEN** the adapter submits the same high-level intent as `cflx client enqueue alpha`
-- **AND** it returns the admitted owner, execution, and change binding
-- **AND** it does not acquire the owner lock or start another scheduler owner
+#### Scenario: MCP lists only the compact tools
+
+- **WHEN** an initialized MCP client lists tools
+- **THEN** it sees exactly `cflx_status`, `cflx_control`, and `cflx_subscribe`
+- **AND** it cannot call historical enqueue, wait, or notify tools
 
 #### Scenario: Two projects share one MCP server process
 
@@ -2644,15 +2570,6 @@ The stable client envelope MUST add optional top-level `instance_id`, `execution
 - **WHEN** a tool receives an absolute directory inside that worktree as `project_dir`
 - **THEN** it derives the canonical repository root and absolute Git common directory from that worktree
 - **AND** contacts the owner socket under that common directory
-
-#### Scenario: Wait certifies evidence from the selected project
-
-- **GIVEN** the MCP server current directory is inside project A
-- **AND** project A and project B contain the same change ID but different completion evidence
-- **AND** a `cflx_wait` call supplies absolute project directory B
-- **WHEN** project B's owner claims terminal success
-- **THEN** completion is certified only from project B's repository evidence
-- **AND** project A's repository is never consulted
 
 #### Scenario: Call-scoped project overrides the namespace default socket
 
@@ -2679,7 +2596,7 @@ The stable client envelope MUST add optional top-level `instance_id`, `execution
 - **GIVEN** a tool call supplies neither selector
 - **WHEN** the operation runs
 - **THEN** it uses the namespace-level default when configured
-- **AND** otherwise derives the owner route and repository evidence root from the MCP server current repository as before
+- **AND** otherwise derives the owner route from the MCP server current repository
 
 #### Scenario: Invalid project directory fails without mutation
 
@@ -2699,8 +2616,8 @@ The stable client envelope MUST add optional top-level `instance_id`, `execution
 
 - **GIVEN** the owner supports revisioned `/api/v2` commands
 - **WHEN** an initialized MCP client lists available tools
-- **THEN** it sees only the closed intent-shaped client tools
-- **AND** it cannot submit arbitrary command types, expected revisions, idempotency keys, execution marks, queue intent, shell source, or workflow state mutations
+- **THEN** it sees only the three closed client tools
+- **AND** it cannot submit arbitrary command types, expected revisions, idempotency keys, queue intent, shell source, or workflow state mutations
 
 #### Scenario: Tool calls require initialization
 
@@ -2716,19 +2633,18 @@ The stable client envelope MUST add optional top-level `instance_id`, `execution
 - **THEN** the adapter returns a JSON-RPC invalid-request error
 - **AND** no tool is dispatched
 
-<!-- Expected canonical result after archive: the client MCP namespace routes all six tools by one immutable call-scoped project or socket selector while keeping namespace and current-directory defaults compatible. -->
-
 ### Requirement: MCP tool calls remain bounded
 
-The MCP adapter MUST NOT keep an enqueue tool call open for the lifetime of a change. Enqueue MUST return after admission settlement. `cflx_wait` MUST retain an explicit bounded timeout, and asynchronous continuation MUST use an execution-scoped completion sink rather than an unbounded MCP request. Newline-delimited input framing MUST enforce its memory bound while bytes are read, including when a peer never sends a newline.
+No MCP tool may remain open for the lifetime of a proposal. `cflx_control` MUST return after command settlement and `cflx_subscribe` after registry settlement. Asynchronous completion observation MUST use a proposal-scoped subscription rather than an unbounded MCP request. Newline-delimited input framing MUST enforce its memory bound while bytes are read, including when a peer never sends a newline.
+
 An oversized frame or invalid UTF-8 frame MUST terminate the stdio session without dispatching a tool or owner request; the adapter does not attempt stream resynchronization.
 
-#### Scenario: Long-lived TUI does not hold enqueue open
+#### Scenario: Long-lived TUI does not hold a control call open
 
-- **GIVEN** the TUI remains alive after admitting `alpha`
-- **WHEN** `cflx_enqueue` settles successfully
-- **THEN** the MCP call returns the execution binding immediately after admission
-- **AND** proposal completion is observed separately through wait or notification
+- **GIVEN** the TUI remains alive after Start is accepted
+- **WHEN** `cflx_control` settles
+- **THEN** the MCP call returns immediately after command settlement
+- **AND** proposal completion is observed separately through subscription
 
 #### Scenario: Newline-free oversized frame remains bounded
 
@@ -2740,64 +2656,132 @@ An oversized frame or invalid UTF-8 frame MUST terminate the stdio session witho
 
 ### Requirement: Direct client completion notification management
 
-The CLI MUST expose `cflx client notify set`, `get`, and `clear` as direct shell-facing adapters over the same execution-scoped completion-sink implementation used by `cflx client mcp`. Every operation MUST require a change ID and execution ID, MAY accept the expected owner instance ID, and MUST preserve the complete owner/execution/change coherence checks and typed outcomes. All three commands MUST support concise human output and `--json` through the stable client envelope contract.
+The CLI MUST expose `cflx client subscribe set`, `get`, and `clear` as direct shell-facing adapters over the same proposal-scoped subscription implementation used by MCP. Every operation MUST require one through 64 distinct change IDs and the expected owner instance ID, and MUST preserve complete owner/change coherence checks and typed outcomes. All three commands MUST support concise human output and `--json` through the stable client envelope contract.
 
-The `cflx client` namespace MUST accept `--project-dir <ABSOLUTE_PATH>` as its normal explicit route and `--unix-socket <PATH>` as its low-level route. Clap-level parsing MUST reject both explicit selectors together before owner contact. The selected project MUST provide both the owner socket and repository evidence root to every client subcommand. `set` MUST accept a required non-empty callback argv after `--`, preserve each argument boundary exactly, and MAY opt into blocked-event delivery. It MUST NOT parse shell source, perform expansion, or implicitly invoke a shell. Set and clear MUST preserve the existing Unix-socket-only mutation transport rule after project resolution. Get MUST preserve transport-dependent callback redaction. These commands MUST manage callback observability only and MUST NOT mutate workflow state or become an owner.
+The `cflx client` namespace MUST accept `--project-dir <ABSOLUTE_PATH>` as its normal explicit route and `--unix-socket <PATH>` as its low-level route. Clap-level parsing MUST reject both explicit selectors together before owner contact. Set MUST accept required non-empty bounded callback argv after `--`, preserve each argument boundary exactly, and MAY opt into blocked-event delivery. It MUST NOT parse shell source, perform expansion, or implicitly invoke a shell. Set and clear MUST preserve the Unix-socket-only mutation rule. Get MUST preserve transport-dependent argv redaction. These commands manage callback observability only and MUST NOT mutate workflow state or become an owner.
 
-The repository's embedded Conflux operation skill and `AGENTS.md` MUST document the direct CLI commands as the default shell-facing path for registering, inspecting, and clearing completion callbacks, together with project-directory routing, the low-level socket override, selector conflict behavior, and truthful wait evidence selection. They MUST retain the MCP tool path as an alternative for MCP-only hosts and MUST preserve the same durable-callback and untrusted-event safety guidance.
+The embedded Conflux operation skill and `AGENTS.md` MUST document explicit subscribe commands, project-directory routing, the low-level socket override, selector conflicts, owner-restart invalidation, notification-only behavior, and untrusted-event handling. They MUST NOT document automatic registration or agent/session resume.
 
-#### Scenario: Operator registers one callback for an explicit project
+#### Scenario: Operator registers callbacks for explicit proposals
 
-- **GIVEN** a command-capable TUI owns execution `exec-1` for change `alpha` in project B
-- **WHEN** the operator runs `cflx client --project-dir /absolute/project-b notify set alpha exec-1 --instance-id <owner-instance> --blocked --json -- /absolute/callback --flag "one argument"`
-- **THEN** the client resolves project B's owner and stores the exact argv vector without shell interpretation
-- **AND** blocked-event delivery is enabled
-- **AND** the owner validates the complete instance, execution, and change binding
-- **AND** stdout contains one successful `notify_set` envelope
+- **GIVEN** project B has visible proposals `alpha` and `beta`
+- **WHEN** the operator runs `cflx client --project-dir /absolute/project-b subscribe set alpha beta --instance-id <owner-instance> --blocked --json -- /absolute/callback --flag "one argument"`
+- **THEN** the client stores the exact argv vector for both proposals without shell interpretation
+- **AND** blocked-event delivery is enabled atomically for both
+- **AND** stdout contains one successful `subscribe_set` envelope
 - **AND** no workflow command or second owner is started
 
 #### Scenario: CLI selectors conflict before contact
 
 - **GIVEN** any repository state
-- **WHEN** the operator supplies both `--project-dir` and `--unix-socket` on the `cflx client` namespace
-- **THEN** CLI parsing fails through the existing usage-error contract
+- **WHEN** the operator supplies both `--project-dir` and `--unix-socket`
+- **THEN** CLI parsing fails through the usage-error contract
 - **AND** no owner request or workspace mutation occurs
 
 #### Scenario: Empty callback command is rejected before owner access
 
 - **GIVEN** any repository state
-- **WHEN** the operator invokes `cflx client notify set alpha exec-1 --` without a callback executable
-- **THEN** CLI parsing fails with the existing human or JSON usage-error contract
+- **WHEN** the operator invokes subscribe set without a callback executable
+- **THEN** CLI parsing fails with the human or JSON usage-error contract
 - **AND** no owner request or workspace mutation occurs
 
-#### Scenario: Operator inspects and clears one callback
+#### Scenario: Operator inspects and clears named subscriptions
 
-- **GIVEN** execution `exec-1` for change `alpha` has a registered callback
-- **WHEN** the operator runs `cflx client notify get alpha exec-1 --json` and then `cflx client notify clear alpha exec-1 --json`
-- **THEN** get reports the current subscription using the existing transport redaction rules
-- **AND** clear removes only that execution's callback
-- **AND** both responses preserve the stable notify operation and outcome names
+- **GIVEN** `alpha` and `beta` have subscriptions
+- **WHEN** the operator gets and then clears both through one request
+- **THEN** get reports both using transport redaction rules
+- **AND** clear removes only those named subscriptions
+- **AND** responses preserve stable subscribe operation and outcome names
 
 #### Scenario: Expected owner incarnation changed
 
-- **GIVEN** the caller retained the instance ID that admitted execution `exec-1`
-- **WHEN** a notify CLI command supplies that instance ID after the socket begins serving a different owner
-- **THEN** the command returns typed `owner_restarted` non-zero
-- **AND** it does not register, inspect, or clear a callback against the replacement owner
+- **GIVEN** the caller retained instance ID `owner-a`
+- **WHEN** a subscribe command supplies it after the socket serves `owner-b`
+- **THEN** the command returns typed `owner_restarted`
+- **AND** it does not register, inspect, or clear against the replacement owner
 
 #### Scenario: TCP cannot mutate callback registration
 
 - **GIVEN** an authenticated TCP connection to an owner
-- **WHEN** a caller attempts the equivalent direct notify set or clear operation
+- **WHEN** a caller attempts subscribe set or clear
 - **THEN** the owner returns typed `transport_not_permitted`
 - **AND** no callback registration changes
 
-#### Scenario: Installed operation skill teaches the direct CLI path
+#### Scenario: Installed operation skill teaches explicit subscription
 
-- **GIVEN** an agent loads the embedded `cflx-run` skill in a shell-capable environment
-- **WHEN** it delegates a long-running change to an existing TUI owner
-- **THEN** the skill instructs it to use `cflx client notify set` with the admitted execution binding
-- **AND** it documents `get` and `clear` for inspection and cancellation of the callback registration
-- **AND** MCP remains documented as an alternative rather than the only notification interface
+- **GIVEN** an agent loads the embedded `cflx-run` skill
+- **WHEN** it wants completion notification for existing or future proposal execution
+- **THEN** the skill instructs it to explicitly use proposal-scoped subscribe set/get/clear
+- **AND** it states that notification does not resume an agent automatically
 
-<!-- Expected canonical result after archive: direct client operations select one project route explicitly and carry its owner and evidence identity together. -->
+### Requirement: Target-scoped client execution-mark control
+
+The client MUST provide mark and unmark over one through 64 distinct change IDs. Each target MUST use the existing single-target `SetExecutionMark` service and mode/eligibility matrix used by TUI mark input. The client MUST preserve unrelated marks and MUST NOT construct queue intent, Start, Retry, DynamicQueue mutation, analysis, admission polling, or an execution identity. Desired state already satisfied MUST settle as a reasoned unchanged no-op.
+
+The client MUST classify every target against one coherent authoritative state before submitting any mutation and then submit one command per target in request order. Error mode or a request-level validation failure MUST refuse before any command. An ineligible target MUST use the shared service's unchanged no-op and stable reason. If a later target fails after earlier commands settled, the client MUST return `partial_intent`, list every command record actually created in order, omit unsubmitted commands, preserve already-settled effects, and MUST NOT claim rollback. Bounded stale-revision recomputation MUST reread instance and state, MUST NOT resubmit a settled command, and MUST preserve the exact audit list without duplicates or omissions.
+
+#### Scenario: Multiple proposals are marked without replacing existing marks
+
+- **GIVEN** `beta` is marked and `alpha` and `gamma` are unmarked
+- **WHEN** the client marks `alpha` and `gamma`
+- **THEN** all three are marked
+- **AND** no command mutates `beta`, queue intent, or lifecycle state
+
+#### Scenario: Mark settlement does not claim admission
+
+- **GIVEN** a mark command settles successfully
+- **WHEN** the client returns
+- **THEN** it reports only requested mark state and change/no-op results
+- **AND** `execution_id` is absent and it does not wait for queue or active state
+
+#### Scenario: Error mode refuses before submission
+
+- **GIVEN** owner mode rejects mark mutation
+- **WHEN** the client requests mark or unmark for multiple proposals
+- **THEN** the whole request is refused before any command record is created
+
+#### Scenario: Ineligible target is a reasoned unchanged no-op
+
+- **GIVEN** a named proposal is terminal or otherwise excluded by the TUI mark matrix
+- **WHEN** mark control classifies it
+- **THEN** that target reports unchanged with the shared stable reason
+- **AND** unrelated eligible targets retain their request-order semantics
+
+#### Scenario: Partial multi-target mark reports exact audit
+
+- **GIVEN** commands for `alpha` and `beta` settle before `gamma` fails
+- **WHEN** the request returns `partial_intent`
+- **THEN** it lists exactly the created command records for `alpha`, `beta`, and any submitted `gamma` command in submission order
+- **AND** it does not claim rollback or resubmit settled commands
+
+#### Scenario: Unmark is target scoped
+
+- **GIVEN** `alpha` and `beta` are marked
+- **WHEN** the client unmarks only `alpha`
+- **THEN** `alpha` is unmarked and `beta` remains marked
+- **AND** admitted or active work is not stopped or dequeued
+
+### Requirement: Client lifecycle control mirrors TUI app controls
+
+The client MUST provide Start, graceful Stop, and ForceStop. Each MUST submit only the corresponding shared operator intent used by the TUI. Start MUST consume the authoritative current mark set and MUST NOT accept a caller-supplied replacement set. The client MUST NOT reimplement mode, eligibility, retry, analysis, cancellation, scheduler, or stop-classification policy.
+
+#### Scenario: Start is F5 equivalent
+
+- **GIVEN** the owner has an authoritative mark set
+- **WHEN** the client explicitly requests Start
+- **THEN** shared Start consumes it exactly as TUI F5/`!`
+- **AND** the client does not create queue intent independently
+
+#### Scenario: Graceful stop uses shared stop
+
+- **GIVEN** current mode permits graceful stop
+- **WHEN** the client requests Stop
+- **THEN** it submits shared Stop
+- **AND** it does not infer termination before settlement
+
+#### Scenario: Force stop uses shared runtime classification
+
+- **GIVEN** the operator requests ForceStop
+- **WHEN** the client submits it
+- **THEN** shared ForceStop applies the TUI runtime classification
+- **AND** the client does not classify or terminate work independently
