@@ -609,16 +609,23 @@ mod tests {
     /// it while the test runs.
     ///
     /// It stays correct after this change is archived: an archived change is not
-    /// under `openspec/changes/`, so the scan simply finds one fewer.
+    /// under `openspec/changes/`, so the scan simply finds one fewer — and a
+    /// repository with nothing pending is the ordinary end state, not a broken
+    /// harness. What the scan must not do is go quiet because its own roots
+    /// moved, so the roots are asserted and the count is not.
     #[test]
     fn every_pending_change_promotes_without_dropping_a_scenario() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let changes = root.join("openspec/changes");
-        let Ok(entries) = std::fs::read_dir(&changes) else {
-            return;
-        };
+        let canonical_root = root.join("openspec/specs");
+        assert!(
+            changes.is_dir() && canonical_root.is_dir(),
+            "the scan cannot find its own roots ({} and {}), so it would silently check nothing",
+            changes.display(),
+            canonical_root.display()
+        );
+        let entries = std::fs::read_dir(&changes).expect("openspec/changes is readable");
 
-        let mut checked = 0usize;
         for entry in entries.flatten() {
             let change = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
@@ -635,15 +642,11 @@ mod tests {
                 let Ok(delta) = std::fs::read_to_string(&delta_path) else {
                     continue;
                 };
-                let canonical_path = root
-                    .join("openspec/specs")
-                    .join(&capability_name)
-                    .join("spec.md");
+                let canonical_path = canonical_root.join(&capability_name).join("spec.md");
                 // A brand-new capability has no canonical spec to regress.
                 let Ok(canonical) = std::fs::read_to_string(&canonical_path) else {
                     continue;
                 };
-                checked += 1;
                 let declared = std::fs::read_to_string(change.join("proposal.md"))
                     .map(|proposal| declared_retirements(&proposal))
                     .unwrap_or_default();
@@ -659,9 +662,5 @@ mod tests {
                 );
             }
         }
-        assert!(
-            checked > 0,
-            "the scan found no delta to check at all, which means it is proving nothing"
-        );
     }
 }
