@@ -34,6 +34,7 @@ pub const SUPPORTED_V2_PATHS: &[&str] = &[
     "/api/v2/execution-status",
     "/api/v2/execution-contract",
     "/api/v2/executions/{execution_id}/sink",
+    "/api/v2/proposals/{change_id}/subscription",
     "/api/v2/changes",
     "/api/v2/changes/{change_id}",
     "/api/v2/logs",
@@ -117,6 +118,17 @@ over the owner's Unix socket and are refused over TCP with
 `transport_not_permitted`, even when bearer authentication succeeds.
 `GET /api/v2/capabilities` reports whether the surface exists at all.
 
+**Proposal subscriptions.** `PUT /api/v2/proposals/{change_id}/subscription`
+registers the same bounded argv against a *proposal* rather than one execution
+episode, so it can be registered before any admission exists. The owner binds
+each new execution episode of that proposal to the current subscription and
+delivers the first typed terminal classification of each episode once; dedupe is
+keyed by episode, so replacing or clearing a subscription never replays a
+terminal event this owner already delivered. It creates no command record and
+advances no revision, `PUT` and `DELETE` are accepted only over the owner's Unix
+socket, and the registered argv is disclosed only there. Subscriptions are
+process-local: an owner restart invalidates every one of them.
+
 The callback itself is not an HTTP surface and has no schema here. It receives
 exactly `CFLX_EVENT_PATH`, `CFLX_EVENT_TYPE`, `CFLX_EXECUTION_ID`,
 `CFLX_CHANGE_ID`, and `CFLX_INSTANCE_ID` — the environment is replaced, not
@@ -150,6 +162,9 @@ worktree lands or what it is cut from.";
         crate::web::remote_control_api::sinks::get_sink,
         crate::web::remote_control_api::sinks::put_sink,
         crate::web::remote_control_api::sinks::delete_sink,
+        crate::web::remote_control_api::proposal_subscriptions::get_subscription,
+        crate::web::remote_control_api::proposal_subscriptions::put_subscription,
+        crate::web::remote_control_api::proposal_subscriptions::delete_subscription,
         crate::web::remote_control_api::reads::list_changes,
         crate::web::remote_control_api::reads::get_change,
         crate::web::remote_control_api::reads::logs,
@@ -192,6 +207,12 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::dto::ExecutionSinkRequest,
             crate::web::remote_control_api::dto::ExecutionSinkResponse,
             crate::web::remote_control_api::dto::ExecutionSinkSpec,
+            // Proposal-scoped subscriptions: the same delivery contract, keyed
+            // by the proposal an operator names rather than by an execution ID
+            // that does not exist until the owner admits work.
+            crate::web::remote_control_api::dto::ProposalSubscriptionCapability,
+            crate::web::remote_control_api::dto::ProposalSubscriptionRequest,
+            crate::web::remote_control_api::dto::ProposalSubscriptionResponse,
             crate::web::remote_control_api::dto::OwnerExecutionContract,
             crate::web::remote_control_api::dto::TerminalMode,
             crate::web::remote_control_api::dto::LatestLogProjection,

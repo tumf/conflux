@@ -71,31 +71,31 @@ fn feature_disabled_or_enabled_client_never_takes_the_repository_lock() {
 }
 
 // ============================================================================
-// client_notify_help_and_usage
+// client_help_and_usage
 // ============================================================================
 //
 // Help text and argv parsing are the same in both builds — neither needs a
-// local API — so these run wherever the binary does. A caller wiring a callback
-// up hits this surface before it ever reaches an owner, and everything asserted
-// here is refused *before* any request is sent.
+// local API — so these run wherever the binary does. A caller reaches this
+// surface before it ever reaches an owner, and everything asserted here is
+// refused *before* any request is sent.
 
-/// The group has to teach the three things an operator gets wrong: that the
-/// callback is argv rather than shell source, that the identity it names is an
-/// admitted execution rather than a change, and that "the TUI is still running"
-/// was never a statement about completion.
+/// The `subscribe` group is documented as an explicit, proposal-scoped callback
+/// registration whose argv is data. The two things a reader must not come away
+/// believing are that the callback is shell source, and that "the TUI is still
+/// running" was ever a statement about a proposal.
 #[test]
-fn client_notify_help_and_usage_documents_an_argv_callback_and_execution_scope() {
+fn client_subscribe_help_and_usage_documents_an_argv_callback_and_proposal_scope() {
     let tmp = tempfile::tempdir().expect("temp dir");
 
     let namespace = run_cli(tmp.path(), &["client", "--help"], &[]);
     assert!(namespace.status.success(), "{}", stderr_of(&namespace));
+    let namespace_help = stdout_of(&namespace);
     assert!(
-        stdout_of(&namespace).contains("notify"),
-        "the namespace must offer the group:\n{}",
-        stdout_of(&namespace)
+        namespace_help.contains("subscribe"),
+        "the namespace must offer the group:\n{namespace_help}"
     );
 
-    let output = run_cli(tmp.path(), &["client", "notify", "--help"], &[]);
+    let output = run_cli(tmp.path(), &["client", "subscribe", "--help"], &[]);
     assert!(output.status.success(), "{}", stderr_of(&output));
     let help = stdout_of(&output);
     for expected in [
@@ -111,9 +111,14 @@ fn client_notify_help_and_usage_documents_an_argv_callback_and_execution_scope()
     ] {
         assert!(
             help.contains(expected),
-            "notify help must mention {expected}:\n{help}"
+            "subscribe help must mention {expected}:\n{help}"
         );
     }
+    // Delivery is observability. A reader must not be told it resumes anything.
+    assert!(
+        help.contains("never resumes") || help.contains("resumes no agent"),
+        "subscribe help must say delivery does not resume an agent:\n{help}"
+    );
     // The protocol stays out of the public surface here too: a callback
     // registration is not a command, and nothing about it is constructible.
     for forbidden in [
@@ -126,18 +131,18 @@ fn client_notify_help_and_usage_documents_an_argv_callback_and_execution_scope()
     ] {
         assert!(
             !help.contains(forbidden),
-            "notify help must not expose {forbidden}:\n{help}"
+            "subscribe help must not expose {forbidden}:\n{help}"
         );
     }
 
-    let set = run_cli(tmp.path(), &["client", "notify", "set", "--help"], &[]);
+    let set = run_cli(tmp.path(), &["client", "subscribe", "set", "--help"], &[]);
     assert!(set.status.success(), "{}", stderr_of(&set));
     let set_help = stdout_of(&set);
     assert!(
         set_help.contains("-- <COMMAND>..."),
         "the separator must be part of the documented usage:\n{set_help}"
     );
-    for expected in ["--blocked", "--instance-id", "--json", "<EXECUTION_ID>"] {
+    for expected in ["--blocked", "--instance-id", "--json", "<CHANGE_IDS>"] {
         assert!(
             set_help.contains(expected),
             "set help must mention {expected}:\n{set_help}"
@@ -154,74 +159,205 @@ fn client_notify_help_and_usage_documents_an_argv_callback_and_execution_scope()
     );
 }
 
+/// The first place an operator reads about the namespace is the top-level
+/// synopsis, so it advertises the verbs that exist rather than the retired one.
+/// `cflx client --help` being correct proves nothing about this text: it is a
+/// hand-written `long_about` clap never regenerates from the subcommand set.
+#[test]
+fn top_level_help_synopsis_names_current_client_verbs_and_retires_enqueue() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let top_level = run_cli(tmp.path(), &["--help"], &[]);
+    assert!(top_level.status.success(), "{}", stderr_of(&top_level));
+    let help = stdout_of(&top_level);
+
+    let synopsis = help
+        .lines()
+        .find(|line| line.trim_start().starts_with("client "))
+        .unwrap_or_else(|| {
+            panic!("the top-level help must describe the client namespace:\n{help}")
+        });
+    for verb in [
+        "status",
+        "mark",
+        "start",
+        "stop",
+        "wait",
+        "subscribe",
+        "mcp",
+    ] {
+        assert!(
+            synopsis.contains(verb),
+            "the top-level synopsis must name {verb}:\n{synopsis}"
+        );
+    }
+
+    for retired in ["enqueue", "notify"] {
+        assert!(
+            !help.contains(retired),
+            "{retired} is retired and must not appear in the top-level help:\n{help}"
+        );
+    }
+}
+
+/// The control verbs are documented as the operator's own, and the namespace
+/// must no longer offer an admission-shaped one.
+#[test]
+fn client_control_help_documents_operator_verbs_and_retires_enqueue() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let namespace = run_cli(tmp.path(), &["client", "--help"], &[]);
+    assert!(namespace.status.success(), "{}", stderr_of(&namespace));
+    let help = stdout_of(&namespace);
+    for verb in [
+        "status",
+        "mark",
+        "unmark",
+        "start",
+        "stop",
+        "force-stop",
+        "wait",
+        "subscribe",
+        "mcp",
+    ] {
+        assert!(
+            help.contains(verb),
+            "the namespace must offer {verb}:\n{help}"
+        );
+    }
+    for retired in ["enqueue", "notify"] {
+        assert!(
+            !help.contains(retired),
+            "{retired} is retired and must not be offered:\n{help}"
+        );
+    }
+
+    let mark = run_cli(tmp.path(), &["client", "mark", "--help"], &[]);
+    assert!(mark.status.success(), "{}", stderr_of(&mark));
+    let mark_help = stdout_of(&mark);
+    assert!(
+        mark_help.contains("preserves every unrelated mark"),
+        "mark help must state the target scope:\n{mark_help}"
+    );
+    assert!(
+        mark_help.contains("does not construct queue intent"),
+        "mark help must state that admission is not claimed:\n{mark_help}"
+    );
+
+    let start = run_cli(tmp.path(), &["client", "start", "--help"], &[]);
+    assert!(start.status.success(), "{}", stderr_of(&start));
+    let start_help = stdout_of(&start);
+    assert!(
+        start_help.contains("F5"),
+        "start help must name its TUI equivalent:\n{start_help}"
+    );
+    assert!(
+        start_help.contains("no target list"),
+        "start help must say it takes no targets:\n{start_help}"
+    );
+}
+
 /// Every argv the CLI itself rejects is rejected before an owner is contacted,
 /// and a `--json` caller still gets its one envelope naming the operation it
 /// attempted.
 #[test]
-fn client_notify_help_and_usage_rejects_a_malformed_invocation_before_any_request() {
+fn client_subscribe_help_and_usage_rejects_a_malformed_invocation_before_any_request() {
     let tmp = tempfile::tempdir().expect("temp dir");
-    let execution = "a".repeat(32);
-    let oversized_execution = "a".repeat(129);
+    let instance = "a".repeat(32);
+    let oversized_instance = "a".repeat(129);
     let cases: Vec<(Vec<&str>, &str, &str)> = vec![
         (
-            vec!["notify", "set", "alpha", &execution, "--json", "--"],
-            "notify_set",
+            vec![
+                "subscribe",
+                "set",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+                "--",
+            ],
+            "subscribe_set",
             "a callback with no program at all",
         ),
         (
-            vec!["notify", "set", "alpha", &execution, "--json", "/bin/true"],
-            "notify_set",
+            vec![
+                "subscribe",
+                "set",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+                "/bin/true",
+            ],
+            "subscribe_set",
             "a callback that skipped the separator",
         ),
         (
+            vec!["subscribe", "set", "alpha", "--json", "--", "/bin/true"],
+            "subscribe_set",
+            "a registration that named no owner incarnation",
+        ),
+        (
             vec![
-                "notify",
+                "subscribe",
                 "set",
                 "../escape",
-                &execution,
+                "--instance-id",
+                &instance,
                 "--json",
                 "--",
                 "/bin/true",
             ],
-            "notify_set",
+            "subscribe_set",
             "an escaping change ID",
         ),
         (
-            vec!["notify", "get", "alpha", "", "--json"],
-            "notify_get",
-            "an empty execution ID",
-        ),
-        (
-            vec!["notify", "clear", "alpha", "has space", "--json"],
-            "notify_clear",
-            "an execution ID with a separator in it",
-        ),
-        (
-            vec!["notify", "get", "alpha", ".reserved", "--json"],
-            "notify_get",
-            "an execution ID starting with a reserved character",
-        ),
-        (
-            vec!["notify", "get", "alpha", &oversized_execution, "--json"],
-            "notify_get",
-            "an oversized execution ID",
-        ),
-        (
-            vec![
-                "notify",
-                "get",
-                "alpha",
-                &execution,
-                "--instance-id",
-                "",
-                "--json",
-            ],
-            "notify_get",
+            vec!["subscribe", "get", "alpha", "--instance-id", "", "--json"],
+            "subscribe_get",
             "an empty instance ID",
         ),
         (
-            vec!["notify", "--json"],
-            "notify_get",
+            vec![
+                "subscribe",
+                "clear",
+                "alpha",
+                "--instance-id",
+                "has space",
+                "--json",
+            ],
+            "subscribe_clear",
+            "an instance ID with a separator in it",
+        ),
+        (
+            vec![
+                "subscribe",
+                "get",
+                "alpha",
+                "--instance-id",
+                ".reserved",
+                "--json",
+            ],
+            "subscribe_get",
+            "an instance ID starting with a reserved character",
+        ),
+        (
+            vec![
+                "subscribe",
+                "get",
+                "alpha",
+                "--instance-id",
+                &oversized_instance,
+                "--json",
+            ],
+            "subscribe_get",
+            "an oversized instance ID",
+        ),
+        (
+            vec!["subscribe", "get", "--instance-id", &instance, "--json"],
+            "subscribe_get",
+            "a request that named no proposal",
+        ),
+        (
+            vec!["subscribe", "--json"],
+            "subscribe_get",
             "a group with no operation",
         ),
     ];
@@ -256,11 +392,11 @@ fn client_notify_help_and_usage_rejects_a_malformed_invocation_before_any_reques
 /// answered, which is the same inference the whole-argument `--json` rule
 /// already forbids.
 #[test]
-fn client_notify_help_and_usage_keeps_a_callback_flag_out_of_the_output_mode() {
+fn client_subscribe_help_and_usage_keeps_a_callback_flag_out_of_the_output_mode() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let absent = tmp.path().join("absent.sock");
     let socket = absent.display().to_string();
-    let execution = "a".repeat(32);
+    let instance = "a".repeat(32);
 
     // `--json` is only ever the callback's, so the answer is the human line.
     let human = run_cli(
@@ -269,10 +405,11 @@ fn client_notify_help_and_usage_keeps_a_callback_flag_out_of_the_output_mode() {
             "client",
             "--unix-socket",
             &socket,
-            "notify",
+            "subscribe",
             "set",
             "alpha",
-            &execution,
+            "--instance-id",
+            &instance,
             "--",
             "/bin/true",
             "--json",
@@ -285,7 +422,7 @@ fn client_notify_help_and_usage_keeps_a_callback_flag_out_of_the_output_mode() {
         "a callback argument must not select machine output:\n{stdout}"
     );
     assert!(
-        stdout.starts_with("notify_set: "),
+        stdout.starts_with("subscribe_set: "),
         "the human line still names the operation:\n{stdout}"
     );
 
@@ -296,10 +433,11 @@ fn client_notify_help_and_usage_keeps_a_callback_flag_out_of_the_output_mode() {
             "client",
             "--unix-socket",
             &socket,
-            "notify",
+            "subscribe",
             "set",
             "alpha",
-            &execution,
+            "--instance-id",
+            &instance,
             "--json",
             "--",
             "/bin/true",
@@ -310,7 +448,7 @@ fn client_notify_help_and_usage_keeps_a_callback_flag_out_of_the_output_mode() {
     let stdout = stdout_of(&machine);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("stdout must be one envelope, got {stdout:?}: {e}"));
-    assert_eq!(parsed["operation"], "notify_set");
+    assert_eq!(parsed["operation"], "subscribe_set");
     assert!(!parsed["ok"].as_bool().expect("ok is a boolean"));
 }
 
@@ -348,20 +486,41 @@ mod feature_disabled {
         let tmp = tempfile::tempdir().expect("temp dir");
         for action in [
             vec!["client", "status", "--json"],
-            vec!["client", "enqueue", "alpha", "--json"],
+            vec!["client", "mark", "alpha", "--json"],
+            vec!["client", "unmark", "alpha", "--json"],
+            vec!["client", "start", "--json"],
+            vec!["client", "stop", "--json"],
+            vec!["client", "force-stop", "--json"],
             vec!["client", "wait", "alpha", "--json"],
             vec![
                 "client",
-                "notify",
+                "subscribe",
                 "set",
                 "alpha",
-                "execution",
+                "--instance-id",
+                "owner",
                 "--json",
                 "--",
                 "/bin/true",
             ],
-            vec!["client", "notify", "get", "alpha", "execution", "--json"],
-            vec!["client", "notify", "clear", "alpha", "execution", "--json"],
+            vec![
+                "client",
+                "subscribe",
+                "get",
+                "alpha",
+                "--instance-id",
+                "owner",
+                "--json",
+            ],
+            vec![
+                "client",
+                "subscribe",
+                "clear",
+                "alpha",
+                "--instance-id",
+                "owner",
+                "--json",
+            ],
         ] {
             let output = run_cli(tmp.path(), &action, &[]);
             let stdout = stdout_of(&output);
@@ -599,7 +758,7 @@ mod enabled {
     // Owner fixture
     // ────────────────────────────────────────────────────────────────────────
 
-    /// Owner surfaces only the notify group needs.
+    /// Owner surfaces only the subscribe group needs.
     ///
     /// Off by default so every pre-existing test keeps describing the owner it
     /// always described: an owner with no execution-sink registry is a real
@@ -942,17 +1101,22 @@ mod enabled {
     // ========================================================================
 
     #[test]
-    fn cli_surface_exposes_only_status_enqueue_wait_notify_and_mcp() {
+    fn cli_surface_exposes_only_the_operator_verbs_wait_subscribe_and_mcp() {
         let tmp = neutral_cwd();
         let output = run_cli(tmp.path(), &["client", "--help"], &[]);
         assert!(output.status.success(), "{}", stderr_of(&output));
         let help = stdout_of(&output);
         for expected in [
             "status",
-            "enqueue",
+            "mark",
+            "unmark",
+            "start",
+            "stop",
+            "force-stop",
             "wait",
-            "notify",
+            "subscribe",
             "mcp",
+            "--project-dir",
             "--unix-socket",
             "--auth-token-env",
         ] {
@@ -976,7 +1140,11 @@ mod enabled {
                 "help must not expose {forbidden}:\n{help}"
             );
         }
-        for absent in ["stop", "retry", "resolve", "worktree"] {
+        // Retired: an admission-shaped verb is exactly what this namespace no
+        // longer offers, and the remaining ones are not orchestration.
+        for absent in [
+            "enqueue", "notify", "retry", "resolve", "worktree", "archive",
+        ] {
             assert!(
                 !help.contains(&format!("  {absent} ")),
                 "client must not offer a {absent} subcommand:\n{help}"
@@ -984,9 +1152,9 @@ mod enabled {
         }
     }
 
-    /// The MCP server's own help has to state the two things a caller gets
-    /// wrong: that it is still a client, and that enqueue settles rather than
-    /// completes.
+    /// The MCP server's own help has to state the things a caller gets wrong:
+    /// that it is still a client, that the tool set is the compact three, and
+    /// that there is no wait tool to reach for.
     #[test]
     fn cli_surface_documents_the_mcp_server_as_a_bounded_client() {
         let tmp = neutral_cwd();
@@ -994,23 +1162,18 @@ mod enabled {
         assert!(output.status.success(), "{}", stderr_of(&output));
         let help = stdout_of(&output);
 
-        for tool in [
-            "cflx_status",
-            "cflx_enqueue",
-            "cflx_wait",
-            "cflx_notify_set",
-            "cflx_notify_get",
-            "cflx_notify_clear",
-        ] {
+        for tool in ["cflx_status", "cflx_control", "cflx_subscribe"] {
             assert!(help.contains(tool), "help must name {tool}:\n{help}");
         }
+        for retired in ["cflx_enqueue", "cflx_notify"] {
+            assert!(
+                !help.contains(retired),
+                "{retired} is retired and must not be named:\n{help}"
+            );
+        }
         assert!(
-            help.contains("execution_id"),
-            "help must explain the execution binding:\n{help}"
-        );
-        assert!(
-            help.contains("never holds the tool call open"),
-            "help must say enqueue is bounded:\n{help}"
+            help.contains("cflx_wait is deliberately absent"),
+            "help must explain why there is no wait tool:\n{help}"
         );
         assert!(
             help.contains("token value is never accepted"),
@@ -1030,7 +1193,7 @@ mod enabled {
     fn cli_surface_rejects_a_malformed_change_id_as_usage() {
         let tmp = neutral_cwd();
         for bad in ["../escape", ".hidden", "-leading", "has space", ""] {
-            let output = run_cli(tmp.path(), &["client", "enqueue", bad, "--json"], &[]);
+            let output = run_cli(tmp.path(), &["client", "mark", bad, "--json"], &[]);
             assert_eq!(
                 output.status.code(),
                 Some(2),
@@ -1042,7 +1205,7 @@ mod enabled {
             // machine contract.
             let parsed = envelope(&output);
             assert_eq!(parsed["outcome"], "usage_error");
-            assert_eq!(parsed["operation"], "enqueue");
+            assert_eq!(parsed["operation"], "control_mark");
         }
     }
 
@@ -1135,13 +1298,13 @@ mod enabled {
         let tmp = neutral_cwd();
         for (args, operation, what) in [
             (
-                vec!["client", "enqueue", "../escape", "--json"],
-                "enqueue",
+                vec!["client", "mark", "../escape", "--json"],
+                "control_mark",
                 "an invalid change ID",
             ),
             (
-                vec!["client", "enqueue", "", "--json"],
-                "enqueue",
+                vec!["client", "unmark", "", "--json"],
+                "control_unmark",
                 "an empty change ID",
             ),
             (
@@ -1155,8 +1318,8 @@ mod enabled {
                 "a zero timeout",
             ),
             (
-                vec!["client", "enqueue", "--json"],
-                "enqueue",
+                vec!["client", "mark", "--json"],
+                "control_mark",
                 "a missing required argument",
             ),
             (
@@ -1201,7 +1364,7 @@ mod enabled {
         let tmp = neutral_cwd();
         // Human mode: Clap's own diagnostics, and no envelope on stdout.
         for args in [
-            vec!["client", "enqueue", "../escape"],
+            vec!["client", "mark", "../escape"],
             vec!["client", "wait", "alpha", "--timeout", "abc"],
             vec!["client", "status", "--not-an-option"],
         ] {
@@ -1240,7 +1403,7 @@ mod enabled {
                 "client",
                 "--unix-socket",
                 "/tmp/holds--json-in-its-name.sock",
-                "enqueue",
+                "mark",
                 "../escape",
             ],
             &[],
@@ -1659,7 +1822,7 @@ mod enabled {
                         "client",
                         "--unix-socket",
                         &socket,
-                        "enqueue",
+                        "mark",
                         "ghost",
                         "--json",
                     ],
@@ -1717,13 +1880,13 @@ mod enabled {
         let cases: Vec<(bool, Vec<String>, &str, i32)> = vec![
             (
                 false,
-                vec!["enqueue".into(), "alpha".into()],
+                vec!["mark".into(), "alpha".into()],
                 "owner_not_command_capable",
                 7,
             ),
             (
                 true,
-                vec!["enqueue".into(), "ghost".into()],
+                vec!["mark".into(), "ghost".into()],
                 "change_not_found",
                 9,
             ),
@@ -1901,7 +2064,7 @@ mod enabled {
             false
         );
 
-        let enqueue = tokio::task::spawn_blocking({
+        let marked = tokio::task::spawn_blocking({
             let cwd = tmp.path().to_path_buf();
             move || {
                 run_cli(
@@ -1910,7 +2073,7 @@ mod enabled {
                         "client",
                         "--unix-socket",
                         &socket,
-                        "enqueue",
+                        "mark",
                         "alpha",
                         "--json",
                     ],
@@ -1920,8 +2083,8 @@ mod enabled {
         })
         .await
         .unwrap();
-        assert_eq!(envelope(&enqueue)["outcome"], "owner_not_command_capable");
-        assert_eq!(enqueue.status.code(), Some(7));
+        assert_eq!(envelope(&marked)["outcome"], "owner_not_command_capable");
+        assert_eq!(marked.status.code(), Some(7));
         unbound.stop().await;
     }
 
@@ -2079,8 +2242,16 @@ mod enabled {
     }
 
     // ========================================================================
-    // enqueue
+    // control
     // ========================================================================
+    //
+    // The client's control verbs are the operator's own, and the properties
+    // that matter are all about what the *owner* was asked to do. So every test
+    // here drives the compiled binary against a real `/api/v2` endpoint backed
+    // by a spy executor, and asserts the exact command sequence the endpoint
+    // saw. An in-process call could not distinguish "the client submitted only
+    // `SetExecutionMark`" from "the client submitted whatever it liked and the
+    // envelope said otherwise", which is the whole thing this group exists for.
 
     /// One endpoint that starts serving a different owner after the first POST.
     ///
@@ -2139,498 +2310,452 @@ mod enabled {
         cancel
     }
 
-    /// Run `cflx client enqueue` against an owner, off the async runtime thread.
-    async fn enqueue(owner: &Owner, change_id: &str) -> Output {
-        let socket = owner.socket();
-        let change_id = change_id.to_string();
-        let cwd = neutral_cwd();
-        let path = cwd.path().to_path_buf();
-        let output = tokio::task::spawn_blocking(move || {
-            run_cli(
-                &path,
-                &[
-                    "client",
-                    "--unix-socket",
-                    &socket,
-                    "enqueue",
-                    &change_id,
-                    "--json",
-                ],
-                &[],
-            )
+    /// Run one `cflx client` invocation against this owner's socket.
+    ///
+    /// Blocking work off the runtime thread, the way every other group here
+    /// drives the binary.
+    async fn run_client(socket: &str, cwd: &Path, tail: &[&str]) -> Output {
+        let socket = socket.to_string();
+        let cwd = cwd.to_path_buf();
+        let tail: Vec<String> = tail.iter().map(|value| (*value).to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            let mut args = vec!["client".to_string(), "--unix-socket".to_string(), socket];
+            args.extend(tail);
+            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_cli(&cwd, &borrowed, &[])
         })
         .await
-        .unwrap();
+        .expect("the client invocation must not panic")
+    }
+
+    /// Run one control verb with `--json` against this owner.
+    async fn control(owner: &Owner, tail: &[&str]) -> Output {
+        let cwd = neutral_cwd();
+        let mut args = tail.to_vec();
+        args.push("--json");
+        let output = run_client(&owner.socket(), cwd.path(), &args).await;
         drop(cwd);
         output
     }
 
-    #[tokio::test]
-    async fn enqueue_admits_an_idle_owner_with_an_isolated_mark_and_start() {
-        let spy = SpyExecutor::new();
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        owner.publish(snapshot(
-            "select",
-            vec![change("alpha", "select", "not queued")],
-        ));
-
-        let output = enqueue(&owner, "alpha").await;
-        let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "admitted");
-        assert_eq!(output.status.code(), Some(0));
-        assert_eq!(parsed["detail"]["route"], "mark_and_start");
-
-        // Exactly the two commands the idle route needs, in order, and nothing
-        // else: no bulk mark, no queue intent, no retry.
-        let calls = spy.calls();
-        assert_eq!(calls.len(), 2, "{calls:?}");
-        assert_eq!(
-            calls[0],
-            CommandSpec::SetExecutionMark {
-                change_id: "alpha".to_string(),
-                marked: true
-            }
-        );
-        assert_eq!(calls[1], CommandSpec::Start);
-        owner.stop().await;
+    /// A change with its execution mark already set.
+    fn marked(id: &str, app_mode: &str, display_status: &str) -> ChangeResource {
+        let mut change = change(id, app_mode, display_status);
+        change.execution_marked = true;
+        change
     }
 
-    #[tokio::test]
-    async fn enqueue_adds_live_owner_work_through_queue_intent() {
-        let spy = SpyExecutor::new();
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        owner.publish(snapshot(
-            "running",
-            vec![change("alpha", "running", "not queued")],
-        ));
-        owner.boundary.set_running(true);
-
-        let output = enqueue(&owner, "alpha").await;
-        let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "admitted");
-        assert_eq!(parsed["detail"]["route"], "set_queue_intent");
-        assert_eq!(
-            spy.calls(),
-            vec![CommandSpec::SetQueueIntent {
-                change_id: "alpha".to_string(),
-                queued: true
-            }],
-            "a live owner must not be started a second time"
-        );
-        owner.stop().await;
-    }
-
-    #[tokio::test]
-    async fn enqueue_routes_retryable_evidence_through_retry() {
-        let spy = SpyExecutor::new();
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        owner.publish(snapshot(
-            "running",
-            vec![change("alpha", "running", "error")],
-        ));
-        owner.boundary.set_running(true);
-
-        let output = enqueue(&owner, "alpha").await;
-        assert_eq!(envelope(&output)["outcome"], "admitted");
-        assert_eq!(
-            spy.calls(),
-            vec![CommandSpec::RetryChange {
-                change_id: "alpha".to_string()
-            }]
-        );
-        owner.stop().await;
-    }
-
-    #[tokio::test]
-    async fn enqueue_is_an_idempotent_no_op_for_already_admitted_work() {
-        let spy = SpyExecutor::new();
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        let mut queued = change("alpha", "running", "not queued");
-        queued.queue_intent = QueueIntent::Queued;
-        owner.publish(snapshot("running", vec![queued]));
-
-        let output = enqueue(&owner, "alpha").await;
-        let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "already_admitted");
-        assert_eq!(output.status.code(), Some(0));
-        assert_eq!(parsed["detail"]["commands_submitted"], 0);
-        assert_eq!(spy.call_count(), 0);
-        owner.stop().await;
-    }
-
-    #[tokio::test]
-    async fn enqueue_refuses_rather_than_consuming_an_unrelated_mark() {
-        let spy = SpyExecutor::new();
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        let mut beta = change("beta", "select", "not queued");
-        beta.execution_marked = true;
-        owner.publish(snapshot(
-            "select",
-            vec![change("alpha", "select", "not queued"), beta],
-        ));
-
-        let output = enqueue(&owner, "alpha").await;
-        let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "operator_intent_conflict");
-        assert_eq!(output.status.code(), Some(11));
-        assert_eq!(parsed["detail"]["unrelated_marks"][0], "beta");
-        // The whole point: `beta`'s mark is another operator's intent, and it is
-        // neither consumed by a Start nor cleared to manufacture isolation.
-        assert_eq!(spy.call_count(), 0, "no command may touch beta's mark");
-        owner.stop().await;
-    }
-
-    #[tokio::test]
-    async fn enqueue_refuses_unsafe_targets_without_any_hidden_mutation() {
-        for (app_mode, status, expected) in [
-            ("select", "archived", "target_ineligible"),
-            ("select", "merged", "target_ineligible"),
-            ("select", "rejected", "target_ineligible"),
-            ("select", "blocked", "target_ineligible"),
-        ] {
-            let spy = SpyExecutor::new();
-            let owner = Owner::start(Some(spy.clone()), None).await;
-            owner.publish(snapshot(app_mode, vec![change("alpha", app_mode, status)]));
-
-            let output = enqueue(&owner, "alpha").await;
-            assert_eq!(envelope(&output)["outcome"], expected, "status={status}");
-            assert_eq!(output.status.code(), Some(10));
-            assert_eq!(spy.call_count(), 0, "status={status} must submit nothing");
-            owner.stop().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn enqueue_refuses_a_worktree_ineligible_target() {
-        let spy = SpyExecutor::new();
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        let mut alpha = change("alpha", "select", "not queued");
-        alpha.parallel = ParallelEligibility {
-            eligible: false,
-            blocked_reason: Some(
-                conflux::web::remote_control_api::dto::ParallelBlockedReason::NotCommitted,
-            ),
-        };
-        owner.publish(snapshot("select", vec![alpha]));
-
-        let output = enqueue(&owner, "alpha").await;
-        assert_eq!(envelope(&output)["outcome"], "target_ineligible");
-        assert_eq!(spy.call_count(), 0);
-        owner.stop().await;
-    }
-
-    #[tokio::test]
-    async fn enqueue_refuses_a_target_held_by_an_active_apply_iteration_limit() {
-        let spy = SpyExecutor::new();
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        let mut limited = change("alpha", "running", "error");
-        // The active run owns this target's exhausted ceiling. It is retryable
-        // in principle, which is exactly why a router reading only
-        // `retry_change.allowed` would wrongly submit a retry here.
-        limited.actions =
-            conflux::web::remote_control_api::projection::limited_change_actions_for_test(
-                "running", "error", true,
-            );
-        assert!(!limited.actions.retry_change.allowed);
-        owner.publish(snapshot("running", vec![limited]));
-        owner.boundary.set_running(true);
-
-        let output = enqueue(&owner, "alpha").await;
-        let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "target_ineligible");
-        assert_eq!(output.status.code(), Some(10));
-        assert!(parsed["message"]
-            .as_str()
-            .unwrap()
-            .contains("Apply-dispatch ceiling"));
-        assert_eq!(spy.call_count(), 0);
-        owner.stop().await;
-    }
-
-    #[tokio::test]
-    async fn enqueue_reports_partial_intent_when_a_mark_races_in_before_start() {
-        // The mark settles, and an unrelated mark appears in the window before
-        // Start. Starting would consume it; clearing either mark to restore
-        // isolation would be mutating an operator's intent to tidy up our own.
-        let spy = SpyExecutor::new();
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        owner.publish(snapshot(
-            "select",
-            vec![change("alpha", "select", "not queued")],
-        ));
-
-        struct RacingMark {
-            inner: Arc<SpyExecutor>,
-            projection: Arc<Projection>,
-        }
-        #[async_trait]
-        impl RemoteControlExecutor for RacingMark {
-            async fn execute(
-                &self,
-                command: &CommandSpec,
-            ) -> Result<ExecutionSummary, CommandFailure> {
-                let result = self.inner.execute(command).await;
-                if matches!(command, CommandSpec::SetExecutionMark { .. }) {
-                    let mut alpha = change("alpha", "select", "not queued");
-                    alpha.execution_marked = true;
-                    let mut beta = change("beta", "select", "not queued");
-                    beta.execution_marked = true;
-                    self.projection.apply_state(
-                        "test_snapshot",
-                        None,
-                        serde_json::json!({}),
-                        snapshot("select", vec![alpha, beta]),
-                    );
-                }
-                result
-            }
-        }
-        owner
-            .runtime
-            .bind(Arc::new(RacingMark {
-                inner: spy.clone(),
-                projection: owner.projection.clone(),
-            }))
-            .await;
-
-        let output = enqueue(&owner, "alpha").await;
-        let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "partial_intent");
-        assert_eq!(output.status.code(), Some(15));
-        assert_eq!(parsed["detail"]["remaining_mark"], "alpha");
-        assert_eq!(parsed["detail"]["rolled_back"], false);
-        assert!(parsed["message"].as_str().unwrap().contains("beta"));
-        // The mark, and only the mark: no Start, and no attempt to clear either
-        // mark afterwards.
-        assert_eq!(spy.call_count(), 1, "{:?}", spy.calls());
-        assert!(matches!(
-            spy.calls()[0],
-            CommandSpec::SetExecutionMark { .. }
-        ));
-        owner.stop().await;
-    }
-
-    #[tokio::test]
-    async fn enqueue_aborts_when_the_socket_starts_serving_a_different_incarnation() {
-        // Two real owners behind one endpoint. The client marks against the
-        // first, and the reread before Start reaches the second — which cannot
-        // prove whether the first one's command settled.
-        let first_spy = SpyExecutor::new();
-        let second_spy = SpyExecutor::new();
-        let first = Owner::start(Some(first_spy.clone()), None).await;
-        let second = Owner::start(Some(second_spy.clone()), None).await;
-        first.publish(snapshot(
-            "select",
-            vec![change("alpha", "select", "not queued")],
-        ));
-        second.publish(snapshot(
-            "select",
-            vec![change("alpha", "select", "not queued")],
-        ));
-
-        let front_dir = tempfile::tempdir().expect("temp dir");
-        let front = front_dir.path().join("cflx-api.sock");
-        let switch =
-            switch_after_first_post(front.clone(), first.socket.clone(), second.socket.clone())
-                .await;
-
-        let workspace = neutral_cwd();
-        let socket = front.display().to_string();
-        let output = tokio::task::spawn_blocking({
-            let cwd = workspace.path().to_path_buf();
-            move || {
-                run_cli(
-                    &cwd,
-                    &[
-                        "client",
-                        "--unix-socket",
-                        &socket,
-                        "enqueue",
-                        "alpha",
-                        "--json",
-                    ],
-                    &[],
-                )
-            }
-        })
-        .await
-        .unwrap();
-
-        let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "owner_restarted");
-        assert_eq!(output.status.code(), Some(8));
-        assert_eq!(
-            first_spy.call_count(),
-            1,
-            "only the mark reached the first incarnation: {:?}",
-            first_spy.calls()
-        );
-        assert_eq!(
-            second_spy.call_count(),
-            0,
-            "nothing may be resubmitted to a process that never saw the first command"
-        );
-
-        switch.cancel();
-        first.stop().await;
-        second.stop().await;
-    }
-
-    #[tokio::test]
-    async fn enqueue_reports_partial_intent_when_start_is_refused_after_the_mark_settles() {
-        let spy = SpyExecutor::new();
-        // The mark succeeds; Start is refused. The mark is real and cannot be
-        // honestly rolled back, so the client must say so rather than claim
-        // either success or a clean refusal.
-        spy.script(vec![
-            Ok(ExecutionSummary::changed("marked")),
-            Err(CommandFailure::new(
-                ErrorCode::LifecycleConflict,
-                "the run cannot start right now",
-            )),
-        ]);
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        owner.publish(snapshot(
-            "select",
-            vec![change("alpha", "select", "not queued")],
-        ));
-
-        let output = enqueue(&owner, "alpha").await;
-        let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "partial_intent");
-        assert_eq!(output.status.code(), Some(15));
-        assert_eq!(parsed["detail"]["remaining_mark"], "alpha");
-        assert_eq!(parsed["detail"]["rolled_back"], false);
-        let message = parsed["message"].as_str().unwrap();
-        assert!(message.contains("later operator Start"), "{message}");
-        // Two commands, and crucially no third: the client must not try to undo
-        // the mark it already settled.
-        assert_eq!(spy.call_count(), 2, "{:?}", spy.calls());
-        owner.stop().await;
-    }
-
-    // ------------------------------------------------------------------------
-    // partial_intent_command_audit
-    // ------------------------------------------------------------------------
-    //
-    // `commands_submitted` is an audit list, not a description of the situation.
-    // A mark the client *found* and a mark the client *set* leave the repository
-    // in the same shape but say different things about who to ask next, and only
-    // one of them is this invocation's doing. The mirror error is just as bad: a
-    // Start that was submitted and then failed is still an external effect the
-    // owner recorded, so the list must carry it. In every case the list has to
-    // equal what the executor behind the real endpoint actually saw.
-
-    /// The audit spelling of each command the spy observed, in order.
+    /// The command types the endpoint actually executed, in order.
     fn submitted_names(spy: &SpyExecutor) -> Vec<&'static str> {
         spy.calls()
             .iter()
             .map(|command| match command {
                 CommandSpec::SetExecutionMark { .. } => "set_execution_mark",
+                CommandSpec::SetAllExecutionMarks {} => "set_all_execution_marks",
                 CommandSpec::Start => "start",
+                CommandSpec::Stop => "stop",
+                CommandSpec::ForceStop => "force_stop",
                 CommandSpec::SetQueueIntent { .. } => "set_queue_intent",
                 CommandSpec::RetryChange { .. } => "retry_change",
+                CommandSpec::RetryErrors { .. } => "retry_errors",
                 _ => "other",
             })
             .collect()
     }
 
+    /// The core of the change: marking is target-scoped, so an operator's
+    /// unrelated next-run intent survives an agent's request. The old client
+    /// could only answer this situation by refusing outright.
     #[tokio::test]
-    async fn partial_intent_command_audit_lists_the_mark_this_invocation_submitted() {
+    async fn control_mark_preserves_unrelated_marks_and_submits_only_mark_commands() {
         let spy = SpyExecutor::new();
-        spy.script(vec![
-            Ok(ExecutionSummary::changed("marked")),
-            Err(CommandFailure::new(
-                ErrorCode::LifecycleConflict,
-                "the run cannot start right now",
-            )),
-        ]);
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![
+                change("alpha", "select", "not queued"),
+                marked("beta", "select", "not queued"),
+                change("gamma", "select", "not queued"),
+            ],
+        ));
+
+        let output = control(&owner, &["mark", "alpha", "gamma"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "marked", "{}", stderr_of(&output));
+        assert_eq!(output.status.code(), Some(0));
+
+        assert_eq!(
+            submitted_names(&spy),
+            vec!["set_execution_mark", "set_execution_mark"],
+            "only the two named targets are written, and only as marks"
+        );
+        assert_eq!(
+            spy.calls(),
+            vec![
+                CommandSpec::SetExecutionMark {
+                    change_id: "alpha".to_string(),
+                    marked: true
+                },
+                CommandSpec::SetExecutionMark {
+                    change_id: "gamma".to_string(),
+                    marked: true
+                },
+            ],
+            "nothing addressed beta, and nothing addressed lifecycle or queue state"
+        );
+
+        // The per-target audit is in request order and names every target.
+        let targets = parsed["detail"]["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0]["change_id"], "alpha");
+        assert_eq!(targets[0]["changed"], true);
+        assert_eq!(targets[1]["change_id"], "gamma");
+        owner.stop().await;
+    }
+
+    /// A mark reports mark state and nothing else. No episode is named, because
+    /// the write created none, and no admission is claimed.
+    #[tokio::test]
+    async fn control_mark_settlement_claims_no_admission() {
+        let spy = SpyExecutor::new();
         let owner = Owner::start(Some(spy.clone()), None).await;
         owner.publish(snapshot(
             "select",
             vec![change("alpha", "select", "not queued")],
         ));
 
-        let output = enqueue(&owner, "alpha").await;
+        let output = control(&owner, &["mark", "alpha"]).await;
         let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "partial_intent");
-        assert_eq!(output.status.code(), Some(15));
-        assert_eq!(
-            parsed["detail"]["commands_submitted"],
-            serde_json::json!(["set_execution_mark", "start"]),
-            "a Start that was submitted and then failed is still an effect the \
-             owner recorded"
+        assert_eq!(parsed["outcome"], "marked", "{}", stderr_of(&output));
+        assert_eq!(parsed["operation"], "control_mark");
+        assert_eq!(parsed["change_id"], "alpha");
+        assert!(
+            parsed.as_object().unwrap().get("execution_id").is_none(),
+            "a mark write creates no execution episode to name: {parsed}"
         );
-        assert_eq!(parsed["detail"]["remaining_mark"], "alpha");
-        assert_eq!(parsed["detail"]["rolled_back"], false);
-
-        // The audit list and the executor agree on exactly which commands ran.
-        assert_eq!(
-            parsed["detail"]["commands_submitted"],
-            serde_json::json!(submitted_names(&spy)),
-            "the envelope audit must equal the executor's submission sequence"
-        );
+        let rendered = parsed.to_string();
+        for forbidden in ["queue_intent", "admitted", "already_admitted"] {
+            assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");
+        }
+        assert_eq!(submitted_names(&spy), vec!["set_execution_mark"]);
         owner.stop().await;
     }
 
+    /// Desired state that already holds is a success with no command at all: the
+    /// owner is already in the state the operator asked for.
     #[tokio::test]
-    async fn partial_intent_command_audit_omits_a_mark_it_only_found() {
+    async fn control_mark_of_an_already_marked_target_settles_unchanged_without_a_command() {
         let spy = SpyExecutor::new();
-        // Only Start is ever submitted: the target carries an operator's mark
-        // already, so the client has no mark command to send.
-        spy.script(vec![Err(CommandFailure::new(
-            ErrorCode::LifecycleConflict,
-            "the run cannot start right now",
-        ))]);
         let owner = Owner::start(Some(spy.clone()), None).await;
-        let mut premarked = change("alpha", "select", "not queued");
-        premarked.execution_marked = true;
-        owner.publish(snapshot("select", vec![premarked]));
+        owner.publish(snapshot(
+            "select",
+            vec![marked("alpha", "select", "not queued")],
+        ));
 
-        let output = enqueue(&owner, "alpha").await;
+        let output = control(&owner, &["mark", "alpha"]).await;
         let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "partial_intent");
-        assert_eq!(output.status.code(), Some(15));
-        assert_eq!(
-            parsed["detail"]["commands_submitted"],
-            serde_json::json!(["start"]),
-            "a pre-existing mark is state, not a command this invocation sent, \
-             but the Start that failed was still submitted"
-        );
-
-        // The truthful parts of the report survive: the mark is still there and
-        // a later operator Start can still consume it.
-        assert_eq!(parsed["detail"]["remaining_mark"], "alpha");
-        assert_eq!(parsed["detail"]["rolled_back"], false);
-        let message = parsed["message"].as_str().unwrap();
-        assert!(message.contains("later operator Start"), "{message}");
+        assert_eq!(parsed["outcome"], "unchanged", "{}", stderr_of(&output));
+        assert_eq!(output.status.code(), Some(0), "unchanged is a success");
+        assert_eq!(parsed["detail"]["targets"][0]["changed"], false);
         assert!(
-            message.contains("already execution-marked"),
-            "the message must not claim a mark settled: {message}"
-        );
-
-        // Exactly one command reached the executor, and it was not a mark.
-        assert_eq!(spy.call_count(), 1, "{:?}", spy.calls());
-        assert!(
-            matches!(spy.calls().as_slice(), [CommandSpec::Start]),
-            "{:?}",
+            spy.calls().is_empty(),
+            "a settled desired state needs no command: {:?}",
             spy.calls()
         );
+        owner.stop().await;
+    }
+
+    /// A terminal row is a fact about the target, and the *shared service* owns
+    /// the reason. The client submits and reports what came back rather than
+    /// reimplementing the mark matrix.
+    #[tokio::test]
+    async fn control_mark_of_a_terminal_target_is_a_reasoned_unchanged_no_op() {
+        let spy = SpyExecutor::new();
+        spy.script(vec![Ok(ExecutionSummary::no_op(
+            "'alpha' is terminal and carries no next-run intent",
+        ))]);
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "merged")],
+        ));
+
+        let output = control(&owner, &["mark", "alpha"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "unchanged", "{}", stderr_of(&output));
         assert_eq!(
-            parsed["detail"]["commands_submitted"],
-            serde_json::json!(submitted_names(&spy)),
-            "the envelope audit must equal the executor's submission sequence"
+            submitted_names(&spy),
+            vec!["set_execution_mark"],
+            "the shared service decides, so the command still goes out"
+        );
+        let reason = parsed["detail"]["targets"][0]["reason"].as_str().unwrap();
+        assert!(reason.contains("next-run intent"), "{reason}");
+        owner.stop().await;
+    }
+
+    #[tokio::test]
+    async fn control_unmark_is_target_scoped_and_stops_nothing() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![
+                marked("alpha", "select", "not queued"),
+                marked("beta", "select", "not queued"),
+            ],
+        ));
+
+        let output = control(&owner, &["unmark", "alpha"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "unmarked", "{}", stderr_of(&output));
+        assert_eq!(parsed["operation"], "control_unmark");
+        assert_eq!(
+            spy.calls(),
+            vec![CommandSpec::SetExecutionMark {
+                change_id: "alpha".to_string(),
+                marked: false
+            }],
+            "beta's mark is untouched, and nothing stopped or dequeued anything"
+        );
+        owner.stop().await;
+    }
+
+    /// An unknown target is a request-level refusal: no command record exists
+    /// for any named proposal, including the ones that were perfectly valid.
+    #[tokio::test]
+    async fn control_refuses_an_unknown_proposal_before_any_command() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+
+        let output = control(&owner, &["mark", "alpha", "missing"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "change_not_found");
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(parsed["change_id"], "missing");
+        assert!(
+            spy.calls().is_empty(),
+            "classification happens before submission: {:?}",
+            spy.calls()
+        );
+        owner.stop().await;
+    }
+
+    /// Shape refusals never reach an owner at all.
+    #[tokio::test]
+    async fn control_refuses_a_malformed_target_list_before_contact() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+
+        let duplicated = control(&owner, &["mark", "alpha", "alpha"]).await;
+        let parsed = envelope(&duplicated);
+        assert_eq!(parsed["outcome"], "usage_error");
+        assert_eq!(duplicated.status.code(), Some(2));
+        assert!(
+            parsed["message"]
+                .as_str()
+                .unwrap()
+                .contains("more than once"),
+            "{parsed}"
+        );
+
+        let many: Vec<String> = (0..65).map(|n| format!("change-{n}")).collect();
+        let mut args = vec!["mark".to_string()];
+        args.extend(many);
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let oversized = control(&owner, &borrowed).await;
+        assert_eq!(envelope(&oversized)["outcome"], "usage_error");
+
+        assert!(spy.calls().is_empty());
+        owner.stop().await;
+    }
+
+    /// Start is F5: it submits the shared intent and consumes whatever marks the
+    /// owner holds. It never writes a mark of its own, and it never invents a
+    /// target set.
+    #[tokio::test]
+    async fn control_start_submits_only_the_shared_start_intent() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![
+                marked("alpha", "select", "not queued"),
+                marked("beta", "select", "not queued"),
+            ],
+        ));
+
+        let output = control(&owner, &["start"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "accepted", "{}", stderr_of(&output));
+        assert_eq!(parsed["operation"], "control_start");
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            spy.calls(),
+            vec![CommandSpec::Start],
+            "exactly the shared intent, with no mark rewriting on the way"
         );
         owner.stop().await;
     }
 
     #[tokio::test]
-    async fn partial_intent_command_audit_omits_a_start_it_never_submitted() {
-        // An unrelated mark appearing between our settled mark and Start makes
-        // Start unsafe, so it is never POSTed. The audit must stop at the mark:
-        // "we intended two commands" is not the same claim as "we sent two".
+    async fn control_stop_and_force_stop_submit_their_own_shared_intents() {
+        for (verb, operation, expected) in [
+            ("stop", "control_stop", CommandSpec::Stop),
+            ("force-stop", "control_force_stop", CommandSpec::ForceStop),
+        ] {
+            let spy = SpyExecutor::new();
+            let owner = Owner::start(Some(spy.clone()), None).await;
+            owner.publish(snapshot(
+                "running",
+                vec![change("alpha", "running", "applying")],
+            ));
+
+            let output = control(&owner, &[verb]).await;
+            let parsed = envelope(&output);
+            assert_eq!(
+                parsed["outcome"],
+                "accepted",
+                "{verb}: {}",
+                stderr_of(&output)
+            );
+            assert_eq!(parsed["operation"], operation);
+            assert_eq!(spy.calls(), vec![expected], "{verb}");
+            owner.stop().await;
+        }
+    }
+
+    /// "Start only these" is not something the shared transaction can express,
+    /// so it is refused from the arguments rather than approximated.
+    #[tokio::test]
+    async fn control_lifecycle_refuses_a_target_list_before_contact() {
         let spy = SpyExecutor::new();
         let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+
+        for verb in ["start", "stop", "force-stop"] {
+            let output = control(&owner, &[verb, "alpha"]).await;
+            // Clap owns the arity, so this is the namespace's usage contract.
+            assert_eq!(envelope(&output)["outcome"], "usage_error", "{verb}");
+            assert_eq!(output.status.code(), Some(2), "{verb}");
+        }
+        assert!(spy.calls().is_empty());
+        owner.stop().await;
+    }
+
+    /// The guarantee the whole change exists for, asserted against the endpoint
+    /// rather than against the client's own prose: no control path reaches the
+    /// scheduler's admitted set directly.
+    #[tokio::test]
+    async fn control_never_constructs_queue_intent_retry_or_a_bulk_mark() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "running",
+            vec![
+                change("alpha", "running", "not queued"),
+                change("beta", "running", "error"),
+            ],
+        ));
+
+        // A live owner offering queue intent, and a row carrying retryable
+        // evidence: the two routes the previous client would have taken.
+        let alpha = control(&owner, &["mark", "alpha"]).await;
+        assert_eq!(
+            envelope(&alpha)["outcome"],
+            "marked",
+            "{}",
+            stderr_of(&alpha)
+        );
+        let beta = control(&owner, &["mark", "beta"]).await;
+        assert_eq!(envelope(&beta)["outcome"], "marked", "{}", stderr_of(&beta));
+        let started = control(&owner, &["start"]).await;
+        assert_eq!(envelope(&started)["outcome"], "accepted");
+
+        let names = submitted_names(&spy);
+        assert_eq!(
+            names,
+            vec!["set_execution_mark", "set_execution_mark", "start"],
+            "the only commands a client may submit are marks and shared lifecycle intents"
+        );
+        for forbidden in [
+            "set_queue_intent",
+            "retry_change",
+            "retry_errors",
+            "set_all_execution_marks",
+        ] {
+            assert!(
+                !names.contains(&forbidden),
+                "{forbidden} must be unreachable"
+            );
+        }
+        owner.stop().await;
+    }
+
+    /// A later target failing after earlier ones settled is partial intent: the
+    /// settled marks are real, the audit lists exactly the records created, and
+    /// nothing claims a rollback.
+    #[tokio::test]
+    async fn control_reports_partial_intent_with_an_exact_audit_and_no_rollback() {
+        let spy = SpyExecutor::new();
+        spy.script(vec![
+            Ok(ExecutionSummary::changed("marked alpha")),
+            Ok(ExecutionSummary::changed("marked beta")),
+            Err(CommandFailure::new(
+                ErrorCode::TargetIneligible,
+                "gamma cannot be marked right now",
+            )),
+        ]);
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![
+                change("alpha", "select", "not queued"),
+                change("beta", "select", "not queued"),
+                change("gamma", "select", "not queued"),
+            ],
+        ));
+
+        let output = control(&owner, &["mark", "alpha", "beta", "gamma"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "partial_intent");
+        assert_eq!(output.status.code(), Some(15));
+        assert_eq!(parsed["detail"]["rolled_back"], false);
+
+        // Exactly the three records the endpoint made, in submission order.
+        let commands = parsed["detail"]["commands_submitted"].as_array().unwrap();
+        assert_eq!(commands.len(), 3, "{parsed}");
+        for (index, change_id) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            assert_eq!(commands[index]["command"], "set_execution_mark");
+            assert_eq!(commands[index]["change_id"], *change_id);
+        }
+        // Two targets settled; the third produced a record and no result.
+        let targets = parsed["detail"]["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(parsed["message"].as_str().unwrap().contains("rolled back"));
+        // And crucially no fourth command: the client must not try to undo the
+        // marks it already settled.
+        assert_eq!(spy.call_count(), 3, "{:?}", spy.calls());
+        owner.stop().await;
+    }
+
+    /// A recomputation must not resubmit a command that already settled, and it
+    /// must not lose one either. The audit list is what proves both.
+    #[tokio::test]
+    async fn control_recomputes_after_a_stale_revision_without_repeating_a_settled_effect() {
+        let spy = SpyExecutor::new();
+        let api = ApiSpy::new();
+        let owner = Owner::start_intercepted(Some(spy.clone()), None, api.clone()).await;
         owner.publish(snapshot(
             "select",
             vec![
@@ -2639,337 +2764,217 @@ mod enabled {
             ],
         ));
 
-        // The racing mark lands from inside the mark command's own execution, so
-        // the client's pre-Start reread is guaranteed to observe it.
-        struct Racing {
-            inner: Arc<SpyExecutor>,
-            projection: Arc<Projection>,
-        }
-        #[async_trait]
-        impl RemoteControlExecutor for Racing {
-            async fn execute(
-                &self,
-                command: &CommandSpec,
-            ) -> Result<ExecutionSummary, CommandFailure> {
-                let result = self.inner.execute(command).await;
-                let mut alpha = change("alpha", "select", "not queued");
-                alpha.execution_marked = true;
-                let mut beta = change("beta", "select", "not queued");
-                beta.execution_marked = true;
-                self.projection.apply_state(
-                    "test_snapshot",
-                    None,
-                    serde_json::json!({}),
-                    snapshot("select", vec![alpha, beta]),
-                );
-                result
-            }
-        }
-        owner
-            .runtime
-            .bind(Arc::new(Racing {
-                inner: spy.clone(),
-                projection: owner.projection.clone(),
-            }))
-            .await;
-
-        let output = enqueue(&owner, "alpha").await;
-        let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "partial_intent");
-        assert_eq!(output.status.code(), Some(15));
-        assert_eq!(
-            parsed["detail"]["commands_submitted"],
-            serde_json::json!(["set_execution_mark"]),
-            "a Start that was never POSTed must not appear in the audit"
-        );
-        assert_eq!(
-            parsed["detail"]["commands_submitted"],
-            serde_json::json!(submitted_names(&spy)),
-            "the envelope audit must equal the executor's submission sequence"
-        );
-        assert!(
-            matches!(
-                spy.calls().as_slice(),
-                [CommandSpec::SetExecutionMark { .. }]
-            ),
-            "{:?}",
-            spy.calls()
-        );
-        assert_eq!(parsed["detail"]["remaining_mark"], "alpha");
-        assert_eq!(parsed["detail"]["rolled_back"], false);
-        owner.stop().await;
-    }
-
-    // ------------------------------------------------------------------------
-    // stale_revision_command_audit
-    // ------------------------------------------------------------------------
-    //
-    // The audit spans a whole invocation, and a recomputation is the only place
-    // where that span covers more than one attempt. Two opposite lies are
-    // available there: a submission the owner refused as stale created no
-    // command record and must not be counted, while the recomputed submission
-    // that *did* produce one must be counted exactly once. Both are invisible to
-    // every other test in this file, because no other test makes the endpoint
-    // reject a submission and then watches what the next one does to the list.
-
-    #[tokio::test]
-    async fn stale_revision_command_audit_matches_the_records_across_a_recomputation() {
-        let spy = SpyExecutor::new();
-        let api = ApiSpy::new();
-        let owner = Owner::start_intercepted(Some(spy.clone()), None, api.clone()).await;
-        owner.publish(snapshot(
-            "select",
-            vec![change("alpha", "select", "not queued")],
-        ));
-
         // One advance, injected in the only window that can produce a stale
         // submission: after the client took its observation, before the real
-        // endpoint compares `expected_revision`. It is deliberately routing-
-        // irrelevant progress — the owner moved on with its own work, so the
-        // recomputed attempt must reach the same conclusion at a newer revision.
+        // endpoint compares `expected_revision`. Deliberately routing-irrelevant
+        // progress — a third change appears, which the request never names — so
+        // the recomputed attempt must reach the same conclusion at a newer
+        // revision rather than a different one.
         let projection = owner.projection.clone();
         api.inject_before_commands(vec![Box::new(move || {
-            let mut advanced = change("alpha", "select", "not queued");
-            advanced.completed_tasks = 1;
-            advanced.progress_percent = 50.0;
             projection.apply_state(
                 "test_snapshot",
                 None,
                 serde_json::json!({}),
-                snapshot("select", vec![advanced]),
+                snapshot(
+                    "select",
+                    vec![
+                        change("alpha", "select", "not queued"),
+                        change("beta", "select", "not queued"),
+                        change("gamma", "select", "not queued"),
+                    ],
+                ),
             );
         })]);
 
-        let output = enqueue(&owner, "alpha").await;
+        let output = control(&owner, &["mark", "alpha", "beta"]).await;
         let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "admitted", "{}", stderr_of(&output));
-        assert_eq!(output.status.code(), Some(0));
-        assert_eq!(parsed["detail"]["route"], "mark_and_start");
+        assert_eq!(parsed["outcome"], "marked", "{}", stderr_of(&output));
 
-        // The injection fired and the *real* endpoint refused the first mutation
-        // this invocation attempted, before any command record existed.
+        // The refused submission created no record and is absent; the
+        // recomputed one is present exactly once, and so is beta's.
+        let commands = parsed["detail"]["commands_submitted"].as_array().unwrap();
+        assert_eq!(
+            commands.len(),
+            spy.call_count(),
+            "the audit equals the records the endpoint actually made: {parsed}"
+        );
+        assert_eq!(
+            submitted_names(&spy),
+            vec!["set_execution_mark", "set_execution_mark"],
+            "a stale submission produced no record, and nothing was submitted twice"
+        );
+
+        // The interceptor saw the whole conversation, so the audit can be
+        // checked against the endpoint's own answers rather than against the
+        // client's account of them: exactly the POSTs that came back with a
+        // command record are the ones listed, and the refused one is not.
         let exchanges = api.exchanges();
         assert_eq!(
             exchanges.len(),
             3,
-            "one refused mark, one recomputed mark, one start: {exchanges:#?}"
+            "one refused submission, its recomputation, and beta's: {exchanges:#?}"
         );
-        assert_eq!(exchanges[0].command_type, "set_execution_mark");
-        assert_eq!(exchanges[0].status, 409);
+        assert_eq!(exchanges[0].status, 409, "{exchanges:#?}");
         assert_eq!(exchanges[0].error_code.as_deref(), Some("stale_revision"));
         assert!(
             exchanges[0].record_id.is_none(),
-            "a stale submission is refused before admission, so no record can exist: {:#?}",
-            exchanges[0]
+            "a refused submission creates no record to audit"
         );
-
-        // The reread and recomputation happened inside this one invocation: a
-        // fresh authoritative read landed between the refusal and the next
-        // submission, and that submission carried a revision the first attempt
-        // never observed.
-        let trace = api.requests();
-        let first_post = trace
+        let recorded: Vec<&str> = exchanges
             .iter()
-            .position(|request| request == "POST /api/v2/commands")
-            .expect("the client must submit a command");
-        let second_post = first_post
-            + 1
-            + trace[first_post + 1..]
-                .iter()
-                .position(|request| request == "POST /api/v2/commands")
-                .expect("the client must recompute and submit again");
+            .filter_map(|exchange| exchange.record_id.as_deref())
+            .collect();
+        let audited: Vec<&str> = commands
+            .iter()
+            .map(|entry| entry["command_id"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            trace[first_post + 1..second_post]
-                .iter()
-                .filter(|request| *request == "GET /api/v2/state")
-                .count(),
-            1,
-            "the client must reread authoritative state between the stale refusal and its \
-             recomputed submission: {trace:#?}"
+            audited, recorded,
+            "the audit is exactly the records the owner made, in order"
         );
-        assert!(
-            exchanges[1].expected_revision > exchanges[0].expected_revision,
-            "the recomputed submission must carry the advanced revision: {exchanges:#?}"
-        );
-        assert_eq!(exchanges[1].command_type, "set_execution_mark");
-        assert_eq!(exchanges[2].command_type, "start");
-        let mut keys: Vec<&str> = exchanges
+        for exchange in &exchanges {
+            assert_eq!(exchange.command_type, "set_execution_mark");
+        }
+        // Every submission carries its own idempotency key, because the key is
+        // bound to the expected revision: reusing one across a recomputation
+        // would be refused as a mismatch rather than replayed.
+        let keys: std::collections::BTreeSet<&str> = exchanges
             .iter()
             .map(|exchange| exchange.idempotency_key.as_str())
             .collect();
-        keys.sort_unstable();
-        keys.dedup();
-        assert_eq!(
-            keys.len(),
-            3,
-            "a recomputed submission must mint its own key, or the owner would replay the \
-             refused identity: {exchanges:#?}"
+        assert_eq!(keys.len(), exchanges.len(), "{exchanges:#?}");
+        assert!(
+            exchanges[1].expected_revision > exchanges[0].expected_revision,
+            "the recomputation submits against the revision it just reread: {exchanges:#?}"
         );
-
-        // The audit equals, in order, exactly the submissions the owner answered
-        // with a command record. The refused attempt is absent because no record
-        // was created for it, and the mark appears once rather than twice.
-        let recorded: Vec<&str> = exchanges
-            .iter()
-            .filter(|exchange| exchange.record_id.is_some())
-            .map(|exchange| exchange.command_type.as_str())
-            .collect();
-        assert_eq!(
-            recorded,
-            vec!["set_execution_mark", "start"],
-            "{exchanges:#?}"
-        );
-        assert_eq!(
-            parsed["detail"]["commands_submitted"],
-            serde_json::json!(recorded),
-            "the envelope audit must equal the owner's own command records"
-        );
-        assert_eq!(
-            parsed["detail"]["commands_submitted"],
-            serde_json::json!(submitted_names(&spy)),
-            "the envelope audit must equal the executor's submission sequence"
-        );
-        assert_eq!(
-            spy.call_count(),
-            2,
-            "the refused attempt must not have reached the executor: {:?}",
-            spy.calls()
+        assert!(
+            api.requests()
+                .iter()
+                .any(|request| request == "GET /api/v2/state"),
+            "a recomputation rereads the owner's state rather than guessing"
         );
         owner.stop().await;
     }
 
+    /// A new incarnation cannot prove whether a command submitted to the
+    /// previous one settled, so the request *stops* — it does not report the
+    /// settled marks as standing (they belonged to a process that is gone) and
+    /// it does not walk the rest of the target list into an owner that never saw
+    /// the first command.
+    ///
+    /// Two real owners behind one relay that switches after the first POST, so
+    /// the client sees genuine v2 responses from two genuine incarnations.
     #[tokio::test]
-    async fn enqueue_recomputes_after_a_stale_revision_without_repeating_a_settled_effect() {
-        let spy = SpyExecutor::new();
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        owner.publish(snapshot(
-            "running",
-            vec![change("alpha", "running", "not queued")],
-        ));
-        owner.boundary.set_running(true);
-
-        // Advance the revision exactly once, from inside the executor, so the
-        // client's *next* submission is admitted against a revision it did not
-        // observe. The endpoint rejects it as stale and the client recomputes.
-        let projection = owner.projection.clone();
-        let bumped = Arc::new(AtomicUsize::new(0));
-        struct Bumping {
-            inner: Arc<SpyExecutor>,
-            projection: Arc<Projection>,
-            bumped: Arc<AtomicUsize>,
+    async fn control_aborts_when_the_socket_starts_serving_a_different_incarnation() {
+        let first_spy = SpyExecutor::new();
+        let second_spy = SpyExecutor::new();
+        let first = Owner::start(Some(first_spy.clone()), None).await;
+        let second = Owner::start(Some(second_spy.clone()), None).await;
+        for owner in [&first, &second] {
+            owner.publish(snapshot(
+                "select",
+                vec![
+                    change("alpha", "select", "not queued"),
+                    change("beta", "select", "not queued"),
+                    change("gamma", "select", "not queued"),
+                ],
+            ));
         }
-        #[async_trait]
-        impl RemoteControlExecutor for Bumping {
-            async fn execute(
-                &self,
-                command: &CommandSpec,
-            ) -> Result<ExecutionSummary, CommandFailure> {
-                let result = self.inner.execute(command).await;
-                if self.bumped.fetch_add(1, Ordering::SeqCst) == 0 {
-                    // A second, unrelated advance lands after this command, which
-                    // is what makes a retry of the same revision stale.
-                    self.projection.apply_state(
-                        "test_snapshot",
-                        None,
-                        serde_json::json!({}),
-                        snapshot("running", vec![change("alpha", "running", "not queued")]),
-                    );
-                }
-                result
-            }
-        }
-        owner
-            .runtime
-            .bind(Arc::new(Bumping {
-                inner: spy.clone(),
-                projection: projection.clone(),
-                bumped: bumped.clone(),
-            }))
-            .await;
 
-        let first = enqueue(&owner, "alpha").await;
-        assert_eq!(envelope(&first)["outcome"], "admitted");
-        let after_first = spy.call_count();
+        let relay_dir = tempfile::tempdir().expect("temp dir");
+        let relay = relay_dir.path().join("relay.sock");
+        let cancel = switch_after_first_post(
+            relay.clone(),
+            PathBuf::from(first.socket()),
+            PathBuf::from(second.socket()),
+        )
+        .await;
 
-        // A second enqueue against the already-advanced owner still settles once.
-        let second = enqueue(&owner, "alpha").await;
-        assert_eq!(envelope(&second)["outcome"], "admitted");
+        let cwd = neutral_cwd();
+        let output = run_client(
+            relay.to_str().unwrap(),
+            cwd.path(),
+            &["mark", "alpha", "beta", "gamma", "--json"],
+        )
+        .await;
+        let parsed = envelope(&output);
         assert_eq!(
-            spy.call_count(),
-            after_first + 1,
-            "each intent submits exactly one queue command: {:?}",
-            spy.calls()
+            parsed["outcome"],
+            "owner_restarted",
+            "{}",
+            stderr_of(&output)
         );
-        owner.stop().await;
+        assert_eq!(output.status.code(), Some(8));
+        assert_ne!(
+            parsed["detail"]["expected_instance_id"],
+            parsed["detail"]["observed_instance_id"]
+        );
+        assert_eq!(
+            parsed["detail"]["stopped_at"], "beta",
+            "the request stops at the target whose record revealed the switch"
+        );
+
+        assert_eq!(
+            first_spy.call_count(),
+            1,
+            "only the first mark reached the incarnation the client observed: {:?}",
+            first_spy.calls()
+        );
+        assert_eq!(
+            second_spy.call_count(),
+            1,
+            "exactly the in-flight command reached the replacement, and gamma was never \
+             submitted at all: {:?}",
+            second_spy.calls()
+        );
+
+        cancel.cancel();
+        first.stop().await;
+        second.stop().await;
     }
 
+    /// A headless owner serves reads and binds no executor. Discovering that
+    /// from a refusal would mean submitting a command already known to be
+    /// unrunnable, so capability is read first.
     #[tokio::test]
-    async fn enqueue_reports_a_command_failure_rather_than_claiming_admission() {
-        let spy = SpyExecutor::new();
-        spy.script(vec![Err(CommandFailure::new(
-            ErrorCode::TargetIneligible,
-            "the target is not admissible",
-        ))]);
-        let owner = Owner::start(Some(spy.clone()), None).await;
-        owner.publish(snapshot(
-            "running",
-            vec![change("alpha", "running", "not queued")],
-        ));
-        owner.boundary.set_running(true);
-
-        let output = enqueue(&owner, "alpha").await;
-        assert_eq!(envelope(&output)["outcome"], "target_ineligible");
-        assert_eq!(output.status.code(), Some(10));
-        assert_eq!(spy.call_count(), 1);
-        owner.stop().await;
-    }
-
-    #[tokio::test]
-    async fn enqueue_starts_no_second_owner_and_writes_nothing_when_it_refuses() {
-        let workspace = tempfile::tempdir().unwrap();
+    async fn control_reports_owner_not_command_capable_without_touching_the_workspace() {
         let owner = Owner::start(None, None).await;
         owner.publish(snapshot(
             "select",
             vec![change("alpha", "select", "not queued")],
         ));
-        let socket = owner.socket();
-
+        let workspace = neutral_cwd();
         let before: Vec<_> = std::fs::read_dir(workspace.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        let output = tokio::task::spawn_blocking({
-            let cwd = workspace.path().to_path_buf();
-            move || {
-                run_cli(
-                    &cwd,
-                    &[
-                        "client",
-                        "--unix-socket",
-                        &socket,
-                        "enqueue",
-                        "alpha",
-                        "--json",
-                    ],
-                    &[],
-                )
-            }
-        })
-        .await
-        .unwrap();
+
+        for tail in [vec!["mark", "alpha"], vec!["start"]] {
+            let output = run_client(
+                &owner.socket(),
+                workspace.path(),
+                &[tail.clone(), vec!["--json"]].concat(),
+            )
+            .await;
+            assert_eq!(
+                envelope(&output)["outcome"],
+                "owner_not_command_capable",
+                "{tail:?}"
+            );
+            assert_eq!(output.status.code(), Some(7), "{tail:?}");
+        }
+
         let after: Vec<_> = std::fs::read_dir(workspace.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-
-        assert_eq!(envelope(&output)["outcome"], "owner_not_command_capable");
         assert_eq!(
             before, after,
-            "a refused enqueue must not touch the workspace"
+            "a refused control command must not touch the workspace"
         );
         owner.stop().await;
     }
-
     // ========================================================================
     // wait
     // ========================================================================
@@ -3759,56 +3764,45 @@ mod enabled {
     }
 
     // ========================================================================
-    // client_notify
+    // client_subscribe
     // ========================================================================
     //
-    // `cflx client notify` is the shell-facing adapter over the same
-    // execution-scoped completion sink `cflx client mcp` exposes as three tools.
-    // Everything here therefore drives the compiled binary against a real
-    // registry behind the real `/api/v2` endpoints: the properties that matter —
-    // argv boundaries survive the shell, mutation is socket-only, an owner
-    // restart is typed rather than mistaken for a lost execution — are all
-    // invisible from an in-process call.
+    // `cflx client subscribe` is the shell-facing adapter over the same
+    // proposal-scoped subscription registry `cflx client mcp` exposes as
+    // `cflx_subscribe`. Everything here therefore drives the compiled binary
+    // against a real registry behind the real `/api/v2` endpoints: the
+    // properties that matter — argv boundaries survive the shell, mutation is
+    // socket-only, a subscription may precede admission, an owner restart is
+    // typed — are all invisible from an in-process call.
 
-    /// Run one `cflx client` invocation against this owner's socket.
+    /// A subscription-capable owner that has admitted nothing.
     ///
-    /// Blocking work off the runtime thread, the way every other group here
-    /// drives the binary.
-    async fn run_client(socket: &str, cwd: &Path, tail: &[&str]) -> Output {
-        let socket = socket.to_string();
-        let cwd = cwd.to_path_buf();
-        let tail: Vec<String> = tail.iter().map(|value| (*value).to_string()).collect();
-        tokio::task::spawn_blocking(move || {
-            let mut args = vec!["client".to_string(), "--unix-socket".to_string(), socket];
-            args.extend(tail);
-            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-            run_cli(&cwd, &borrowed, &[])
-        })
-        .await
-        .expect("the client invocation must not panic")
-    }
-
-    /// A sink-capable owner with one admitted execution for `alpha`.
-    async fn sink_owner(spy: Arc<SpyExecutor>) -> (Owner, String) {
+    /// Deliberately without an execution: the whole point of keying a
+    /// subscription by the proposal is that it works before there is an episode
+    /// to name.
+    async fn subscribe_owner(spy: Arc<SpyExecutor>) -> Owner {
         let owner = Owner::start_with(Some(spy), None, OwnerExtras::sink_capable()).await;
         owner.publish(snapshot(
             "select",
-            vec![change("alpha", "select", "applying")],
+            vec![
+                change("alpha", "select", "not queued"),
+                change("beta", "select", "not queued"),
+            ],
         ));
         owner.contract(merged_contract("main"));
-        let execution_id = owner.admit_registered("alpha").await;
-        (owner, execution_id)
+        owner
     }
 
-    /// The whole round trip through the owner that already exists: attach, read
-    /// back, detach. The registration must reach the *same* module the MCP tool
-    /// calls, and it must not become a workflow command on the way — a sink
-    /// creates no command record and cannot move a change, so the spy behind the
-    /// real command endpoint must never see anything.
+    /// The whole round trip through the owner that already exists: register,
+    /// read back, remove. It must reach the *same* module the MCP tool calls,
+    /// and it must not become a workflow command on the way — a subscription
+    /// creates no command record and cannot move a proposal, so the spy behind
+    /// the real command endpoint must never see anything.
     #[tokio::test]
-    async fn client_notify_routes_through_existing_owner() {
+    async fn client_subscribe_routes_through_existing_owner() {
         let spy = SpyExecutor::new();
-        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        let owner = subscribe_owner(spy.clone()).await;
+        let instance = owner.instance_id();
         let tmp = neutral_cwd();
         let socket = owner.socket();
 
@@ -3816,10 +3810,11 @@ mod enabled {
             &socket,
             tmp.path(),
             &[
-                "notify",
+                "subscribe",
                 "set",
                 "alpha",
-                &execution_id,
+                "--instance-id",
+                &instance,
                 "--json",
                 "--",
                 "/bin/true",
@@ -3827,56 +3822,241 @@ mod enabled {
         )
         .await;
         let parsed = envelope(&set);
-        assert_eq!(parsed["operation"], "notify_set");
+        assert_eq!(parsed["operation"], "subscribe_set");
         assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&set));
         assert_eq!(parsed["ok"], true);
         assert_eq!(set.status.code(), Some(0));
         assert_eq!(parsed["change_id"], "alpha");
-        assert_eq!(parsed["execution_id"], execution_id.as_str());
-        assert_eq!(parsed["instance_id"], owner.instance_id().as_str());
-        assert_eq!(parsed["detail"]["sink"]["command"][0], "/bin/true");
-        assert_eq!(parsed["detail"]["sink"]["notify_blocked"], false);
+        assert_eq!(parsed["instance_id"], instance.as_str());
+        assert_eq!(
+            parsed["detail"]["subscriptions"][0]["sink"]["command"][0],
+            "/bin/true"
+        );
+        assert_eq!(
+            parsed["detail"]["subscriptions"][0]["sink"]["notify_blocked"],
+            false
+        );
+        // Registering before admission is the case this resource exists for, so
+        // no episode is named and none is synthesized.
+        assert!(
+            parsed["detail"]["subscriptions"][0]
+                .as_object()
+                .unwrap()
+                .get("execution_id")
+                .is_none(),
+            "{parsed}"
+        );
 
         let read = run_client(
             &socket,
             tmp.path(),
-            &["notify", "get", "alpha", &execution_id, "--json"],
+            &[
+                "subscribe",
+                "get",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+            ],
         )
         .await;
         let parsed = envelope(&read);
-        assert_eq!(parsed["operation"], "notify_get");
+        assert_eq!(parsed["operation"], "subscribe_get");
         assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&read));
-        assert_eq!(parsed["detail"]["sink_registered"], true);
-        assert_eq!(parsed["detail"]["sink"]["command"][0], "/bin/true");
+        assert_eq!(parsed["detail"]["subscriptions"][0]["subscribed"], true);
+        assert_eq!(
+            parsed["detail"]["subscriptions"][0]["sink"]["command"][0],
+            "/bin/true"
+        );
 
         let cleared = run_client(
             &socket,
             tmp.path(),
-            &["notify", "clear", "alpha", &execution_id, "--json"],
+            &[
+                "subscribe",
+                "clear",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+            ],
         )
         .await;
         let parsed = envelope(&cleared);
-        assert_eq!(parsed["operation"], "notify_clear");
-        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&cleared));
+        assert_eq!(parsed["operation"], "subscribe_clear");
+        assert_eq!(parsed["outcome"], "cleared", "{}", stderr_of(&cleared));
         assert_eq!(cleared.status.code(), Some(0));
 
-        // Detachment removed exactly that execution's callback, and left the
-        // execution itself addressable.
         let after = run_client(
             &socket,
             tmp.path(),
-            &["notify", "get", "alpha", &execution_id, "--json"],
+            &[
+                "subscribe",
+                "get",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+            ],
         )
         .await;
         let parsed = envelope(&after);
-        assert_eq!(parsed["detail"]["sink_registered"], false);
-        assert!(parsed["detail"]["sink"].is_null());
+        assert_eq!(parsed["detail"]["subscriptions"][0]["subscribed"], false);
+        assert!(parsed["detail"]["subscriptions"][0]["sink"].is_null());
 
         assert_eq!(
             spy.call_count(),
             0,
-            "a completion sink is observability, not a workflow command"
+            "a subscription is observability, not a workflow command"
         );
+        owner.stop().await;
+    }
+
+    /// One request addresses several proposals, and clearing removes only the
+    /// ones it names.
+    #[tokio::test]
+    async fn client_subscribe_addresses_several_proposals_and_clears_only_those() {
+        let spy = SpyExecutor::new();
+        let owner = subscribe_owner(spy.clone()).await;
+        let instance = owner.instance_id();
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+
+        let set = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "subscribe",
+                "set",
+                "alpha",
+                "beta",
+                "--instance-id",
+                &instance,
+                "--json",
+                "--",
+                "/bin/true",
+            ],
+        )
+        .await;
+        let parsed = envelope(&set);
+        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&set));
+        let subscriptions = parsed["detail"]["subscriptions"].as_array().unwrap();
+        assert_eq!(subscriptions.len(), 2);
+        for (index, change_id) in ["alpha", "beta"].iter().enumerate() {
+            assert_eq!(subscriptions[index]["change_id"], *change_id);
+            assert_eq!(subscriptions[index]["subscribed"], true);
+        }
+        // A multi-target request names no single change: `change_id` is a
+        // scalar, and naming the first would misdescribe the request.
+        assert!(parsed.as_object().unwrap().get("change_id").is_none());
+
+        let cleared = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "subscribe",
+                "clear",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(envelope(&cleared)["outcome"], "cleared");
+
+        let read = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "subscribe",
+                "get",
+                "beta",
+                "--instance-id",
+                &instance,
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(
+            envelope(&read)["detail"]["subscriptions"][0]["subscribed"],
+            true,
+            "clearing alpha must leave beta alone"
+        );
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// A subscription registered before admission binds the episode the owner
+    /// later opens, and a read reports that binding. This is the gap an
+    /// execution-scoped registration could not cover: at registration time there
+    /// was no execution ID to name.
+    #[tokio::test]
+    async fn client_subscribe_binds_the_episode_the_owner_later_opens() {
+        let spy = SpyExecutor::new();
+        let owner = subscribe_owner(spy.clone()).await;
+        let instance = owner.instance_id();
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+
+        let set = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "subscribe",
+                "set",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+                "--",
+                "/bin/true",
+            ],
+        )
+        .await;
+        let parsed = envelope(&set);
+        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&set));
+        assert!(
+            parsed.as_object().unwrap().get("execution_id").is_none(),
+            "no episode exists yet, and none may be synthesized: {parsed}"
+        );
+
+        // The owner admits the work through the same path every admission
+        // source takes, which opens the episode the subscription binds.
+        let execution_id = owner.admit_registered("alpha").await;
+
+        let read = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "subscribe",
+                "get",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+            ],
+        )
+        .await;
+        let parsed = envelope(&read);
+        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&read));
+        assert_eq!(
+            parsed["execution_id"],
+            execution_id.as_str(),
+            "the read names the episode the owner bound: {parsed}"
+        );
+        assert_eq!(
+            parsed["detail"]["subscriptions"][0]["execution_id"],
+            execution_id.as_str()
+        );
+        assert_eq!(parsed["detail"]["subscriptions"][0]["subscribed"], true);
+        assert_eq!(
+            parsed["detail"]["subscriptions"][0]["terminal_dispatched"], false,
+            "the episode is live, not finished"
+        );
+
+        // And none of it was a workflow command.
+        assert_eq!(spy.call_count(), 0);
         owner.stop().await;
     }
 
@@ -3885,9 +4065,10 @@ mod enabled {
     /// leading hyphen, a glob, a variable reference, and a command separator.
     /// The owner stores them verbatim because it never sees a shell at all.
     #[tokio::test]
-    async fn client_notify_preserves_every_argv_boundary_without_a_shell() {
+    async fn client_subscribe_preserves_every_argv_boundary_without_a_shell() {
         let spy = SpyExecutor::new();
-        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        let owner = subscribe_owner(spy.clone()).await;
+        let instance = owner.instance_id();
         let tmp = neutral_cwd();
         let socket = owner.socket();
 
@@ -3900,13 +4081,21 @@ mod enabled {
             "; rm -rf /",
             "--json",
         ];
-        let mut args = vec!["notify", "set", "alpha", &execution_id, "--json", "--"];
+        let mut args = vec![
+            "subscribe",
+            "set",
+            "alpha",
+            "--instance-id",
+            &instance,
+            "--json",
+            "--",
+        ];
         args.extend_from_slice(&argv);
         let output = run_client(&socket, tmp.path(), &args).await;
 
         let parsed = envelope(&output);
         assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&output));
-        let stored = parsed["detail"]["sink"]["command"]
+        let stored = parsed["detail"]["subscriptions"][0]["sink"]["command"]
             .as_array()
             .expect("the socket that registered the argv is told it back")
             .iter()
@@ -3926,9 +4115,10 @@ mod enabled {
     /// `blocked` is a non-terminal attention edge, so it is delivered only when
     /// the caller asked for it.
     #[tokio::test]
-    async fn client_notify_blocked_delivery_is_an_explicit_opt_in() {
+    async fn client_subscribe_blocked_delivery_is_an_explicit_opt_in() {
         let spy = SpyExecutor::new();
-        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        let owner = subscribe_owner(spy.clone()).await;
+        let instance = owner.instance_id();
         let tmp = neutral_cwd();
         let socket = owner.socket();
 
@@ -3936,10 +4126,11 @@ mod enabled {
             &socket,
             tmp.path(),
             &[
-                "notify",
+                "subscribe",
                 "set",
                 "alpha",
-                &execution_id,
+                "--instance-id",
+                &instance,
                 "--json",
                 "--",
                 "/bin/true",
@@ -3947,7 +4138,7 @@ mod enabled {
         )
         .await;
         assert_eq!(
-            envelope(&without)["detail"]["sink"]["notify_blocked"],
+            envelope(&without)["detail"]["subscriptions"][0]["sink"]["notify_blocked"],
             false
         );
 
@@ -3955,10 +4146,11 @@ mod enabled {
             &socket,
             tmp.path(),
             &[
-                "notify",
+                "subscribe",
                 "set",
                 "alpha",
-                &execution_id,
+                "--instance-id",
+                &instance,
                 "--blocked",
                 "--json",
                 "--",
@@ -3966,41 +4158,52 @@ mod enabled {
             ],
         )
         .await;
-        assert_eq!(envelope(&with)["detail"]["sink"]["notify_blocked"], true);
+        assert_eq!(
+            envelope(&with)["detail"]["subscriptions"][0]["sink"]["notify_blocked"],
+            true
+        );
         owner.stop().await;
     }
 
     /// Human mode is one concise line on stdout, with nothing of the machine
     /// contract leaking into it.
     #[tokio::test]
-    async fn client_notify_human_output_is_one_concise_line() {
+    async fn client_subscribe_human_output_is_one_concise_line() {
         let spy = SpyExecutor::new();
-        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        let owner = subscribe_owner(spy.clone()).await;
+        let instance = owner.instance_id();
         let tmp = neutral_cwd();
-        let socket = owner.socket();
 
         let output = run_client(
-            &socket,
+            &owner.socket(),
             tmp.path(),
-            &["notify", "set", "alpha", &execution_id, "--", "/bin/true"],
+            &[
+                "subscribe",
+                "set",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--",
+                "/bin/true",
+            ],
         )
         .await;
         let stdout = stdout_of(&output);
         assert_eq!(stdout.lines().count(), 1, "human output must be one line");
-        assert!(stdout.starts_with("notify_set: subscribed"), "{stdout}");
+        assert!(stdout.starts_with("subscribe_set: subscribed"), "{stdout}");
         assert!(!stdout.contains("schema_version"), "{stdout}");
         assert_eq!(output.status.code(), Some(0));
         owner.stop().await;
     }
 
-    /// The caller kept the incarnation an earlier enqueue reported, and the
-    /// socket is now serving a different one. That is `owner_restarted` — not
-    /// the `execution_not_found` a new incarnation would otherwise answer with,
-    /// and emphatically not a registration against the replacement.
+    /// Subscriptions are process-local, so a caller holding one from a previous
+    /// owner is holding nothing. That is `owner_restarted` — and emphatically
+    /// not a silent registration against the replacement.
     #[tokio::test]
-    async fn client_notify_reports_a_replaced_owner_incarnation() {
+    async fn client_subscribe_reports_a_replaced_owner_incarnation() {
         let spy = SpyExecutor::new();
-        let (owner, execution_id) = sink_owner(spy.clone()).await;
+        let owner = subscribe_owner(spy.clone()).await;
+        let instance = owner.instance_id();
         let tmp = neutral_cwd();
         let socket = owner.socket();
         // Well-formed, and provably not this owner: instance IDs are 32 hex
@@ -4009,10 +4212,9 @@ mod enabled {
 
         for action in ["set", "get", "clear"] {
             let mut args = vec![
-                "notify",
+                "subscribe",
                 action,
                 "alpha",
-                &execution_id,
                 "--instance-id",
                 &stale_instance,
                 "--json",
@@ -4025,106 +4227,66 @@ mod enabled {
             assert_eq!(parsed["outcome"], "owner_restarted", "{action}");
             assert_eq!(output.status.code(), Some(8), "{action}");
             assert_eq!(parsed["detail"]["expected_instance_id"], stale_instance);
-            assert_eq!(
-                parsed["detail"]["observed_instance_id"],
-                owner.instance_id().as_str()
-            );
+            assert_eq!(parsed["detail"]["observed_instance_id"], instance.as_str());
         }
 
         // Nothing was registered against the owner that is actually there.
         let read = run_client(
             &socket,
             tmp.path(),
-            &["notify", "get", "alpha", &execution_id, "--json"],
-        )
-        .await;
-        assert_eq!(envelope(&read)["detail"]["sink_registered"], false);
-        assert_eq!(spy.call_count(), 0);
-        owner.stop().await;
-    }
-
-    /// An execution this incarnation never admitted, and an execution that
-    /// belongs to another change, are different refusals: the first says the
-    /// episode is gone, the second says the caller and the owner mean different
-    /// things by the same ID.
-    #[tokio::test]
-    async fn client_notify_separates_a_lost_execution_from_a_stale_binding() {
-        let spy = SpyExecutor::new();
-        let (owner, execution_id) = sink_owner(spy.clone()).await;
-        owner.publish(snapshot(
-            "select",
-            vec![
-                change("alpha", "select", "applying"),
-                change("beta", "select", "applying"),
-            ],
-        ));
-        owner.admit_registered("beta").await;
-        let tmp = neutral_cwd();
-        let socket = owner.socket();
-
-        let ghost = "f".repeat(32);
-        let missing = run_client(
-            &socket,
-            tmp.path(),
-            &["notify", "get", "alpha", &ghost, "--json"],
-        )
-        .await;
-        let parsed = envelope(&missing);
-        assert_eq!(parsed["outcome"], "execution_not_found");
-        assert_eq!(missing.status.code(), Some(23));
-        assert_eq!(parsed["execution_id"], ghost.as_str());
-
-        // The execution exists, but it is alpha's, not beta's.
-        let mismatched = run_client(
-            &socket,
-            tmp.path(),
             &[
-                "notify",
-                "set",
-                "beta",
-                &execution_id,
+                "subscribe",
+                "get",
+                "alpha",
+                "--instance-id",
+                &instance,
                 "--json",
-                "--",
-                "/bin/true",
             ],
         )
         .await;
-        let parsed = envelope(&mismatched);
-        assert_eq!(parsed["outcome"], "execution_binding_mismatch");
-        assert_eq!(mismatched.status.code(), Some(24));
-
+        assert_eq!(
+            envelope(&read)["detail"]["subscriptions"][0]["subscribed"],
+            false
+        );
         assert_eq!(spy.call_count(), 0);
         owner.stop().await;
     }
 
-    /// An owner that binds no sink registry has no such route. That is an
-    /// owner-compatibility fact, published as a capability, and the client reads
-    /// it before submitting anything — otherwise a 404 would be
-    /// indistinguishable from "that execution is gone".
+    /// An owner that binds no registry has no such route. That is an
+    /// owner-capability fact, published as a capability, and the client reads it
+    /// before submitting anything — otherwise a 404 would be indistinguishable
+    /// from an ordinary refusal.
     #[tokio::test]
-    async fn client_notify_reports_an_owner_without_sinks_as_incompatible() {
+    async fn client_subscribe_reports_an_owner_without_the_surface_as_unsupported() {
         let spy = SpyExecutor::new();
         let owner = Owner::start(Some(spy.clone()), None).await;
         owner.publish(snapshot(
             "select",
-            vec![change("alpha", "select", "applying")],
+            vec![change("alpha", "select", "not queued")],
         ));
         owner.contract(merged_contract("main"));
+        let instance = owner.instance_id();
         let tmp = neutral_cwd();
         let socket = owner.socket();
-        let execution_id = "a".repeat(32);
 
         for action in ["set", "get", "clear"] {
-            let mut args = vec!["notify", action, "alpha", &execution_id, "--json"];
+            let mut args = vec![
+                "subscribe",
+                action,
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+            ];
             if action == "set" {
                 args.extend_from_slice(&["--", "/bin/true"]);
             }
             let output = run_client(&socket, tmp.path(), &args).await;
             let parsed = envelope(&output);
-            assert_eq!(parsed["outcome"], "incompatible_owner", "{action}");
-            assert_eq!(output.status.code(), Some(6), "{action}");
+            assert_eq!(parsed["outcome"], "unsupported_owner", "{action}");
+            assert_eq!(output.status.code(), Some(26), "{action}");
             assert!(
-                stderr_of(&output).contains("incompatible_owner"),
+                stderr_of(&output).contains("unsupported_owner"),
                 "the diagnostic belongs on stderr"
             );
         }
@@ -4132,16 +4294,17 @@ mod enabled {
         owner.stop().await;
     }
 
-    /// A sink stores an argv the owner will execute, so only the owner's own
-    /// Unix socket may register or remove one. Reading is allowed anywhere, but
-    /// a channel that may not register a command is not told one back either.
+    /// A subscription stores an argv the owner will execute, so only the
+    /// owner's own Unix socket may register or remove one. Reading is allowed
+    /// anywhere, but a channel that may not register a command is not told one
+    /// back either.
     ///
     /// The fixture labels its router as the exposed transport, which is exactly
     /// what production attaches per listener — so the refusal under test is the
     /// endpoint's own rule, and the outcome under test is the client's mapping
     /// of it.
     #[tokio::test]
-    async fn client_notify_mutation_is_refused_off_the_owner_socket() {
+    async fn client_subscribe_mutation_is_refused_off_the_owner_socket() {
         let spy = SpyExecutor::new();
         let owner = Owner::start_with(
             Some(spy.clone()),
@@ -4154,15 +4317,22 @@ mod enabled {
         .await;
         owner.publish(snapshot(
             "select",
-            vec![change("alpha", "select", "applying")],
+            vec![change("alpha", "select", "not queued")],
         ));
         owner.contract(merged_contract("main"));
-        let execution_id = owner.admit_registered("alpha").await;
+        let instance = owner.instance_id();
         let tmp = neutral_cwd();
         let socket = owner.socket();
 
         for action in ["set", "clear"] {
-            let mut args = vec!["notify", action, "alpha", &execution_id, "--json"];
+            let mut args = vec![
+                "subscribe",
+                action,
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+            ];
             if action == "set" {
                 args.extend_from_slice(&["--", "/bin/true"]);
             }
@@ -4177,18 +4347,24 @@ mod enabled {
         let read = run_client(
             &socket,
             tmp.path(),
-            &["notify", "get", "alpha", &execution_id, "--json"],
+            &[
+                "subscribe",
+                "get",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+            ],
         )
         .await;
         let parsed = envelope(&read);
         assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&read));
-        assert_eq!(parsed["detail"]["sink_registered"], false);
-        assert!(parsed["detail"]["sink"].is_null());
+        assert_eq!(parsed["detail"]["subscriptions"][0]["subscribed"], false);
+        assert!(parsed["detail"]["subscriptions"][0]["sink"].is_null());
 
         assert_eq!(spy.call_count(), 0);
         owner.stop().await;
     }
-
     // ========================================================================
     // production_owner_smoke
     // ========================================================================
@@ -4375,7 +4551,7 @@ mod enabled {
                         "client",
                         "--unix-socket",
                         &socket,
-                        "enqueue",
+                        "mark",
                         "alpha",
                         "--json",
                     ],
@@ -4385,22 +4561,47 @@ mod enabled {
         })
         .await
         .unwrap();
-
         let parsed = envelope(&output);
-        assert_eq!(
-            parsed["outcome"],
-            "admitted",
-            "stderr={}",
-            stderr_of(&output)
-        );
+        assert_eq!(parsed["outcome"], "marked", "stderr={}", stderr_of(&output));
         assert_eq!(output.status.code(), Some(0));
 
-        // The proof this test exists for: the shared coordinator really admitted
-        // the change. The mark is in the process-local store a keypress writes,
-        // and the scheduler saw a launch naming exactly this target.
+        // A mark claims no admission, so the scheduler must not have moved.
         assert!(
             marks.is_marked("alpha"),
-            "the shared execution-mark store must hold the admitted change"
+            "the shared execution-mark store must hold the operator's selection"
+        );
+        assert!(
+            scheduler.launches().is_empty(),
+            "marking is selection: nothing may be launched by it"
+        );
+
+        // The explicit Start is what consumes that authoritative mark set.
+        let socket = socket_path.display().to_string();
+        let started = tokio::task::spawn_blocking({
+            let cwd = workspace.path().to_path_buf();
+            move || {
+                run_cli(
+                    &cwd,
+                    &["client", "--unix-socket", &socket, "start", "--json"],
+                    &[],
+                )
+            }
+        })
+        .await
+        .unwrap();
+        let parsed = envelope(&started);
+        assert_eq!(
+            parsed["outcome"],
+            "accepted",
+            "stderr={}",
+            stderr_of(&started)
+        );
+
+        // The proof this test exists for: the shared coordinator really ran the
+        // same transaction a keypress reaches.
+        assert!(
+            marks.is_marked("alpha"),
+            "the shared execution-mark store must hold the started change"
         );
         assert_eq!(
             scheduler.launches(),
@@ -4427,10 +4628,19 @@ mod enabled {
         );
         for example in [
             "cflx client status",
-            "cflx client enqueue",
+            "cflx client mark",
+            "cflx client start",
             "cflx client wait",
+            "cflx client subscribe set",
         ] {
             assert!(agents.contains(example), "AGENTS.md must show `{example}`");
+        }
+        // The retired admission verb must not survive as guidance anywhere.
+        for retired in ["cflx client enqueue", "cflx client notify", "cflx_enqueue"] {
+            assert!(
+                !agents.contains(retired),
+                "AGENTS.md must not recommend the retired `{retired}`"
+            );
         }
         assert!(
             agents.contains("/api/v2"),
@@ -4454,29 +4664,76 @@ mod enabled {
         }
     }
 
-    /// The four-command namespace, the client-only MCP server, and the
-    /// completion-sink semantics an operator gets wrong if nobody writes them
-    /// down.
+    /// The three ideas a reader must not conflate — selection, lifecycle
+    /// control, and owner-side admission — stated in the documents an operator
+    /// and an agent actually read.
     #[test]
-    fn documentation_states_the_mcp_and_completion_sink_contract() {
+    fn documentation_separates_marking_from_starting_from_admission() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let agents = std::fs::read_to_string(repo_root.join("AGENTS.md")).expect("AGENTS.md");
         let readme = std::fs::read_to_string(repo_root.join("README.md")).expect("README.md");
-        let example = std::fs::read_to_string(
-            repo_root.join("examples/integrations/opencode-auto-resume/README.md"),
-        )
-        .expect("the example README");
+
+        for (document, name) in [(&agents, "AGENTS.md"), (&readme, "README.md")] {
+            assert!(
+                document.contains("preserve") || document.contains("preserves"),
+                "{name} must say a mark preserves unrelated marks"
+            );
+            assert!(
+                document.contains("unrelated mark"),
+                "{name} must name what a mark leaves alone"
+            );
+            assert!(
+                document.contains("F5"),
+                "{name} must describe Start through its TUI equivalent"
+            );
+            assert!(
+                document.contains("authoritative mark set"),
+                "{name} must say Start consumes the owner's own marks"
+            );
+            assert!(
+                document.contains("settlement"),
+                "{name} must attribute admission to owner-side settlement"
+            );
+            // And it must not imply queue intent is a client-side result.
+            assert!(
+                !document.contains("cflx client enqueue"),
+                "{name} must not recommend the retired admission verb"
+            );
+        }
+    }
+
+    /// The compact namespace, the client-only MCP server, and the subscription
+    /// semantics an operator gets wrong if nobody writes them down.
+    #[test]
+    fn documentation_states_the_mcp_and_subscription_contract() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let agents = std::fs::read_to_string(repo_root.join("AGENTS.md")).expect("AGENTS.md");
+        let readme = std::fs::read_to_string(repo_root.join("README.md")).expect("README.md");
 
         for document in [&agents, &readme] {
             assert!(
                 document.contains("cflx client mcp"),
                 "every document must show the MCP server"
             );
+            for tool in ["cflx_status", "cflx_control", "cflx_subscribe"] {
+                assert!(document.contains(tool), "{tool} must be documented");
+            }
+            for retired in ["cflx_enqueue", "cflx_notify_set"] {
+                assert!(
+                    !document.contains(retired),
+                    "the retired tool {retired} must not be documented"
+                );
+            }
+            // `cflx_wait` may be *named*, but only to say it is not there: an
+            // MCP host that went looking for it needs to be told where the
+            // bounded oracle lives instead.
             assert!(
-                document.contains("cflx_notify_set"),
-                "and the notify tool that makes it useful"
+                document.contains("cflx_wait is deliberately absent")
+                    || document.contains("cflx_wait` is deliberately absent")
+                    || document.contains("deliberately absent from MCP"),
+                "the documents must explain that MCP has no wait tool"
             );
-            // UDS-only sink mutation.
+            // UDS-only subscription mutation.
             assert!(
                 document.contains("transport_not_permitted"),
                 "the transport refusal is the rule an operator hits first"
@@ -4496,15 +4753,29 @@ mod enabled {
                 document.contains("process exit was never"),
                 "a resident TUI's liveness must be distinguished from completion"
             );
+            // Delivery notifies; it never resumes.
+            assert!(
+                document.contains("resumes no agent")
+                    || document.contains("does not resume")
+                    || document.contains("resumes nothing")
+                    || document.contains("it does not resume"),
+                "every document must say delivery does not resume an agent"
+            );
             // A token is a variable name, never a value.
             assert!(
                 document.contains("--auth-token-env"),
                 "the credential rule must be stated"
             );
-            // The argv is disclosed only over the socket that may register one.
+            // A subscription may precede admission — the reason it is keyed by
+            // the proposal at all.
             assert!(
-                document.contains("sink_registered"),
-                "a reader that is not told the argv needs the field that answers presence"
+                document.contains("before"),
+                "the pre-admission registration must be documented"
+            );
+            // Dedupe is per episode, so a replacement cannot replay.
+            assert!(
+                document.contains("episode"),
+                "the delivery episode is the unit a reader has to understand"
             );
             // The event artifact is read-only by default and never read back.
             assert!(
@@ -4531,16 +4802,6 @@ mod enabled {
             );
         }
 
-        // The namespace, stated as a closed set.
-        assert!(
-            agents.contains("Four verbs, and only four"),
-            "AGENTS.md must state the namespace is closed"
-        );
-        assert!(
-            agents.contains("cflx client mcp"),
-            "and name the protocol alternative"
-        );
-
         // The direct shell-facing path, in both documents and in the embedded
         // skill: an agent that has a shell must not be told MCP is the only
         // way to register a callback.
@@ -4552,17 +4813,24 @@ mod enabled {
             (&skill, "the cflx-run skill"),
         ] {
             assert!(
-                document.contains("cflx client notify set"),
+                document.contains("cflx client subscribe set"),
                 "{name} must show the direct callback command"
             );
             assert!(
-                document.contains("cflx client notify clear"),
+                document.contains("cflx client subscribe clear"),
                 "{name} must show how a registration is withdrawn"
             );
             assert!(
-                document.contains("cflx_notify_set"),
+                document.contains("cflx_subscribe"),
                 "{name} must keep MCP as the alternative for a host with no shell"
             );
+            // Nothing may claim a registration happens by itself.
+            for retired in ["auto-resume", "cflx_enqueue", "cflx client enqueue"] {
+                assert!(
+                    !document.contains(retired),
+                    "{name} must not carry retired guidance: {retired}"
+                );
+            }
         }
         assert!(
             skill.contains("no `sh -c`"),
@@ -4572,36 +4840,22 @@ mod enabled {
             skill.contains("not process completion"),
             "and that a resident TUI's exit is not the signal"
         );
+        assert!(
+            skill.contains("Nothing subscribes you to completion automatically"),
+            "the skill must state that registration is explicit"
+        );
 
         // Why a one-shot event file is separate from the lifecycle adapter's
         // long-lived stdin stream.
         assert!(
             agents.contains("lifecycle adapter") && agents.contains("one-shot"),
-            "AGENTS.md must explain why sinks are not the lifecycle adapter"
+            "AGENTS.md must explain why subscriptions are not the lifecycle adapter"
         );
 
         // Crash limitations and the external fallback.
         assert!(
             agents.contains("owner_restarted"),
             "AGENTS.md must name the typed answer for a lost owner"
-        );
-
-        // The example's own contract: ordinary role=user messages, untrusted events.
-        assert!(
-            example.contains("role=user"),
-            "the example must say what OpenCode actually stores"
-        );
-        assert!(
-            example.contains("[AUTOMATION EVENT — not user-authored]"),
-            "and show the mandatory marker"
-        );
-        assert!(
-            example.contains("untrusted"),
-            "and say event files are data, not instructions"
-        );
-        assert!(
-            example.contains("lifecycle adapter"),
-            "and explain why this is not the lifecycle adapter"
         );
     }
 }

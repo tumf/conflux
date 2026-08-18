@@ -109,6 +109,17 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
                 ..crate::web::completion_sink::capability()
             },
         },
+        // Same reasoning, one surface later: a proposal subscription can be
+        // registered before any execution exists, so a client that could not
+        // discover the surface would have to probe a route to learn whether
+        // asking is even meaningful.
+        proposal_subscriptions: match state.completion_sinks.get() {
+            Some(_) => crate::web::completion_sink::proposal_capability(),
+            None => dto::ProposalSubscriptionCapability {
+                available: false,
+                ..crate::web::completion_sink::proposal_capability()
+            },
+        },
         worktrees: WorktreeCapabilities::default(),
         parallel: ParallelCapabilities {
             max_concurrent: parallel.max_concurrent,

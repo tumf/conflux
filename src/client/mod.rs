@@ -10,14 +10,23 @@
 //! mark/queue/start routing, and truthful completion. The second option makes
 //! every caller break whenever the orchestration state model moves.
 //!
-//! So this is a thin, intent-shaped client: `status`, `enqueue`, `wait`, the
-//! nested `notify` group, and `mcp` — stable JSON, stable exit statuses, and no
-//! protocol details in the public surface at all. `notify` manages the one-shot
-//! completion callback for one *admitted execution*, which is observability
-//! rather than workflow: it submits no command and cannot move a change. `mcp`
-//! is the same boundary spoken as Model Context Protocol, so an agent gets the
-//! identical routing and the identical typed outcomes whether it types a command
-//! or calls a tool.
+//! So this is a thin, control-shaped client whose verbs are the operator's own:
+//! `status`, `mark`, `unmark`, `start`, `stop`, `force-stop`, `wait`, the nested
+//! `subscribe` group, and `mcp` — stable JSON, stable exit statuses, and no
+//! protocol details in the public surface at all.
+//!
+//! The shape is deliberately the TUI's rather than an "admit this change"
+//! abstraction over it. Marking is operator selection; Start is the explicit
+//! lifecycle control that consumes the authoritative mark set; admission is the
+//! owner's own conclusion. A client that decided admission policy itself — as
+//! this one used to, by writing queue intent directly — could move work into the
+//! scheduler's admitted set along a path no keypress can take.
+//!
+//! `subscribe` manages the completion callback for a *proposal*, which is
+//! observability rather than workflow: it submits no command and cannot move
+//! anything. `mcp` is the same boundary spoken as Model Context Protocol, so an
+//! agent gets the identical routing and the identical typed outcomes whether it
+//! types a command or calls a tool.
 //!
 //! # What it must never do
 //!
@@ -29,9 +38,10 @@
 //!
 //! # Truthfulness
 //!
-//! Admission is not completion. A settled command record proves the owner
-//! accepted an intent, not that a change was implemented, accepted, archived, or
-//! integrated. `wait` therefore certifies success from current repository
+//! A settled command record proves the owner accepted an intent, not that a
+//! change was implemented, accepted, archived, or integrated — and a settled
+//! mark proves less still, because a mark is next-run intent that the owner may
+//! never admit. `wait` therefore certifies success from current repository
 //! evidence for the owner's declared terminal mode, and treats owner
 //! disappearance, owner restart, rejection, process failure, and timeout as
 //! distinct unsuccessful outcomes rather than as completion.
@@ -46,15 +56,15 @@ use clap::CommandFactory;
 #[cfg(feature = "web-monitoring")]
 pub mod completion;
 #[cfg(feature = "web-monitoring")]
-mod enqueue;
+pub mod control;
 #[cfg(feature = "web-monitoring")]
 pub mod mcp;
-#[cfg(feature = "web-monitoring")]
-mod notify;
 #[cfg(feature = "web-monitoring")]
 pub mod repo;
 #[cfg(feature = "web-monitoring")]
 mod session;
+#[cfg(feature = "web-monitoring")]
+pub mod subscribe;
 #[cfg(feature = "web-monitoring")]
 mod transport;
 #[cfg(feature = "web-monitoring")]
@@ -62,7 +72,7 @@ mod wait;
 
 use envelope::{Operation, Outcome, ResultEnvelope};
 
-use crate::cli::{ClientArgs, ClientCommands, ClientNotifyCommands};
+use crate::cli::{ClientArgs, ClientCommands, ClientSubscribeCommands};
 
 // ============================================================================
 // Which owner one operation talks to
@@ -309,7 +319,7 @@ const JSON_FLAG: &str = "--json";
 /// The end-of-options separator.
 ///
 /// Everything after it is a value by definition, so the argv scan for
-/// [`JSON_FLAG`] stops there: `cflx client notify set alpha e-1 -- /cb --json`
+/// [`JSON_FLAG`] stops there: `cflx client subscribe set alpha -- /cb --json`
 /// asks the owner to run a callback whose second argument happens to be spelled
 /// `--json`, and reading that as a request for machine output would let a
 /// *value* select the output contract — the exact inference the whole-argument
@@ -318,12 +328,16 @@ const END_OF_OPTIONS: &str = "--";
 
 /// Map a client subcommand name onto the operation an envelope reports.
 ///
-/// `notify` is a group rather than an operation, so it is resolved by
-/// [`notify_operation_of`] against the nested subcommand instead.
+/// `subscribe` is a group rather than an operation, so it is resolved by
+/// [`subscribe_operation_of`] against the nested subcommand instead.
 fn operation_of(subcommand: &str) -> Option<Operation> {
     match subcommand {
         "status" => Some(Operation::Status),
-        "enqueue" => Some(Operation::Enqueue),
+        "mark" => Some(Operation::ControlMark),
+        "unmark" => Some(Operation::ControlUnmark),
+        "start" => Some(Operation::ControlStart),
+        "stop" => Some(Operation::ControlStop),
+        "force-stop" => Some(Operation::ControlForceStop),
         "wait" => Some(Operation::Wait),
         // `mcp` is a server, not an operation: a usage failure there has no
         // envelope to belong to, so it keeps Clap's human behavior.
@@ -331,17 +345,17 @@ fn operation_of(subcommand: &str) -> Option<Operation> {
     }
 }
 
-/// Map a `notify` subcommand name onto the operation an envelope reports.
+/// Map a `subscribe` subcommand name onto the operation an envelope reports.
 ///
-/// A `notify` invocation that named no operation — `cflx client notify --json` —
-/// reports [`Operation::NotifyGet`]: of the three it is the only one that
-/// neither attaches nor detaches anything, so a caller branching on `operation`
-/// cannot read a refused invocation as an attempted registration.
-fn notify_operation_of(subcommand: Option<&str>) -> Operation {
+/// A `subscribe` invocation that named no operation — `cflx client subscribe
+/// --json` — reports [`Operation::SubscribeGet`]: of the three it is the only
+/// one that neither registers nor removes anything, so a caller branching on
+/// `operation` cannot read a refused invocation as an attempted registration.
+fn subscribe_operation_of(subcommand: Option<&str>) -> Operation {
     match subcommand {
-        Some("set") => Operation::NotifySet,
-        Some("clear") => Operation::NotifyClear,
-        _ => Operation::NotifyGet,
+        Some("set") => Operation::SubscribeSet,
+        Some("clear") => Operation::SubscribeClear,
+        _ => Operation::SubscribeGet,
     }
 }
 
@@ -350,15 +364,15 @@ fn notify_operation_of(subcommand: Option<&str>) -> Operation {
 /// Clap's own parse decides the namespace, so an option *value* that happens to
 /// read `client` cannot fake one. The `--json` flag is looked for in argv rather
 /// than in the parsed matches on purpose: parsing stops at the first rejected
-/// argument, so `cflx client enqueue ../escape --json` never records the flag
+/// argument, so `cflx client mark ../escape --json` never records the flag
 /// even though the caller plainly asked for machine output.
 ///
 /// When the namespace is selected but no operation is named — `cflx client
 /// --json` — the envelope still has to exist, and it reports [`Operation::Status`]:
 /// it is the only operation that neither mutates nor waits, so a caller
 /// branching on `operation` cannot read a refused invocation as an attempted
-/// admission. The nested `notify` group answers the same way through
-/// [`notify_operation_of`]. `outcome` is `usage_error` either way, and `message`
+/// admission. The nested `subscribe` group answers the same way through
+/// [`subscribe_operation_of`]. `outcome` is `usage_error` either way, and `message`
 /// carries Clap's own statement of what was wrong.
 pub fn json_usage_operation(argv: &[OsString]) -> Option<Operation> {
     let selects_json = argv
@@ -374,8 +388,8 @@ pub fn json_usage_operation(argv: &[OsString]) -> Option<Operation> {
         .try_get_matches_from(argv)
         .ok()?;
     let client = matches.subcommand_matches("client")?;
-    if let Some(notify) = client.subcommand_matches("notify") {
-        return Some(notify_operation_of(notify.subcommand_name()));
+    if let Some(subscribe) = client.subcommand_matches("subscribe") {
+        return Some(subscribe_operation_of(subscribe.subcommand_name()));
     }
     Some(
         client
@@ -458,31 +472,54 @@ pub async fn run(args: ClientArgs) -> i32 {
             OutputMode::from_json_flag(status.json),
             None,
         ),
-        ClientCommands::Enqueue(enqueue) => (
-            Operation::Enqueue,
-            OutputMode::from_json_flag(enqueue.json),
-            Some(enqueue.change_id.clone()),
+        // A single-target request names its target the way every other
+        // operation does; a multi-target one cannot, and the per-target list in
+        // `detail` is the answer instead.
+        ClientCommands::Mark(mark) => (
+            Operation::ControlMark,
+            OutputMode::from_json_flag(mark.json),
+            single(&mark.change_ids),
+        ),
+        ClientCommands::Unmark(unmark) => (
+            Operation::ControlUnmark,
+            OutputMode::from_json_flag(unmark.json),
+            single(&unmark.change_ids),
+        ),
+        ClientCommands::Start(start) => (
+            Operation::ControlStart,
+            OutputMode::from_json_flag(start.json),
+            None,
+        ),
+        ClientCommands::Stop(stop) => (
+            Operation::ControlStop,
+            OutputMode::from_json_flag(stop.json),
+            None,
+        ),
+        ClientCommands::ForceStop(force) => (
+            Operation::ControlForceStop,
+            OutputMode::from_json_flag(force.json),
+            None,
         ),
         ClientCommands::Wait(wait) => (
             Operation::Wait,
             OutputMode::from_json_flag(wait.json),
             Some(wait.change_id.clone()),
         ),
-        ClientCommands::Notify(notify) => match &notify.command {
-            ClientNotifyCommands::Set(set) => (
-                Operation::NotifySet,
+        ClientCommands::Subscribe(subscribe) => match &subscribe.command {
+            ClientSubscribeCommands::Set(set) => (
+                Operation::SubscribeSet,
                 OutputMode::from_json_flag(set.json),
-                Some(set.change_id.clone()),
+                single(&set.change_ids),
             ),
-            ClientNotifyCommands::Get(get) => (
-                Operation::NotifyGet,
+            ClientSubscribeCommands::Get(get) => (
+                Operation::SubscribeGet,
                 OutputMode::from_json_flag(get.json),
-                Some(get.change_id.clone()),
+                single(&get.change_ids),
             ),
-            ClientNotifyCommands::Clear(clear) => (
-                Operation::NotifyClear,
+            ClientSubscribeCommands::Clear(clear) => (
+                Operation::SubscribeClear,
                 OutputMode::from_json_flag(clear.json),
-                Some(clear.change_id.clone()),
+                single(&clear.change_ids),
             ),
         },
         // Answered above; reaching here would mean the guard was removed.
@@ -565,47 +602,67 @@ async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
 
     match args.command {
         ClientCommands::Status(_) => session::status(&connection).await,
-        ClientCommands::Enqueue(enqueue) => enqueue::run(&connection, &enqueue.change_id).await,
-        ClientCommands::Wait(wait) => wait::run(&connection, &wait.change_id, wait.timeout).await,
-        // The same module `cflx client mcp` calls, with the same arguments: a
+        // The same modules `cflx client mcp` calls, with the same arguments: a
         // command and a tool that disagreed about routing, transport, or typed
         // outcomes would be two contracts wearing one name.
-        ClientCommands::Notify(args) => match args.command {
-            ClientNotifyCommands::Set(set) => {
-                notify::run(
+        ClientCommands::Mark(mark) => {
+            control::run(&connection, control::Action::Mark, &mark.change_ids).await
+        }
+        ClientCommands::Unmark(unmark) => {
+            control::run(&connection, control::Action::Unmark, &unmark.change_ids).await
+        }
+        ClientCommands::Start(_) => control::run(&connection, control::Action::Start, &[]).await,
+        ClientCommands::Stop(_) => control::run(&connection, control::Action::Stop, &[]).await,
+        ClientCommands::ForceStop(_) => {
+            control::run(&connection, control::Action::ForceStop, &[]).await
+        }
+        ClientCommands::Wait(wait) => wait::run(&connection, &wait.change_id, wait.timeout).await,
+        ClientCommands::Subscribe(args) => match args.command {
+            ClientSubscribeCommands::Set(set) => {
+                subscribe::run(
                     &connection,
-                    &set.change_id,
-                    &set.execution_id,
-                    set.instance_id.as_deref(),
-                    notify::Intent::Set {
+                    &set.change_ids,
+                    Some(&set.instance_id),
+                    subscribe::Intent::Set {
                         command: set.command,
                         notify_blocked: set.blocked,
                     },
                 )
                 .await
             }
-            ClientNotifyCommands::Get(get) => {
-                notify::run(
+            ClientSubscribeCommands::Get(get) => {
+                subscribe::run(
                     &connection,
-                    &get.change_id,
-                    &get.execution_id,
-                    get.instance_id.as_deref(),
-                    notify::Intent::Get,
+                    &get.change_ids,
+                    Some(&get.instance_id),
+                    subscribe::Intent::Get,
                 )
                 .await
             }
-            ClientNotifyCommands::Clear(clear) => {
-                notify::run(
+            ClientSubscribeCommands::Clear(clear) => {
+                subscribe::run(
                     &connection,
-                    &clear.change_id,
-                    &clear.execution_id,
-                    clear.instance_id.as_deref(),
-                    notify::Intent::Clear,
+                    &clear.change_ids,
+                    Some(&clear.instance_id),
+                    subscribe::Intent::Clear,
                 )
                 .await
             }
         },
         ClientCommands::Mcp(_) => unreachable!("the MCP session is served before this point"),
+    }
+}
+
+/// The one change an envelope may name, when a request addressed exactly one.
+///
+/// A multi-target request deliberately names none: `change_id` is a scalar, and
+/// picking the first of several would tell a caller its request was about one
+/// proposal when it was about five.
+#[cfg(feature = "web-monitoring")]
+fn single(change_ids: &[String]) -> Option<String> {
+    match change_ids {
+        [only] => Some(only.clone()),
+        _ => None,
     }
 }
 
@@ -629,9 +686,26 @@ mod tests {
         // The rejected value stops Clap's parse before `--json`, which is
         // exactly the case the argv scan exists for.
         assert_eq!(
-            json_usage_operation(&argv(&["client", "enqueue", "../escape", "--json"])),
-            Some(Operation::Enqueue)
+            json_usage_operation(&argv(&["client", "mark", "../escape", "--json"])),
+            Some(Operation::ControlMark)
         );
+        assert_eq!(
+            json_usage_operation(&argv(&["client", "unmark", "../escape", "--json"])),
+            Some(Operation::ControlUnmark)
+        );
+        // A lifecycle verb has no argument to reject, so an unknown flag is the
+        // failure that still has to name its operation.
+        for (verb, operation) in [
+            ("start", Operation::ControlStart),
+            ("stop", Operation::ControlStop),
+            ("force-stop", Operation::ControlForceStop),
+        ] {
+            assert_eq!(
+                json_usage_operation(&argv(&["client", verb, "--nope", "--json"])),
+                Some(operation),
+                "{verb}"
+            );
+        }
         assert_eq!(
             json_usage_operation(&argv(&[
                 "client",
@@ -645,8 +719,22 @@ mod tests {
         );
         // A missing required argument still names its operation.
         assert_eq!(
-            json_usage_operation(&argv(&["client", "enqueue", "--json"])),
-            Some(Operation::Enqueue)
+            json_usage_operation(&argv(&["client", "mark", "--json"])),
+            Some(Operation::ControlMark)
+        );
+        // The nested group answers with the operation it named, and a group
+        // that named none reports the one that neither registers nor removes.
+        assert_eq!(
+            json_usage_operation(&argv(&["client", "subscribe", "set", "--json"])),
+            Some(Operation::SubscribeSet)
+        );
+        assert_eq!(
+            json_usage_operation(&argv(&["client", "subscribe", "clear", "--json"])),
+            Some(Operation::SubscribeClear)
+        );
+        assert_eq!(
+            json_usage_operation(&argv(&["client", "subscribe", "--json"])),
+            Some(Operation::SubscribeGet)
         );
         // The namespace with no operation still owes the caller an envelope.
         assert_eq!(
@@ -660,7 +748,7 @@ mod tests {
         // No `--json` at all.
         assert_eq!(json_usage_operation(&argv(&["client", "status"])), None);
         assert_eq!(
-            json_usage_operation(&argv(&["client", "enqueue", "../escape"])),
+            json_usage_operation(&argv(&["client", "mark", "../escape"])),
             None
         );
         // JSON, but not this namespace.
@@ -678,7 +766,7 @@ mod tests {
         // contract forbids.
         for value in ["--jsonish", "not--json", "x--json", "--json=true"] {
             assert_eq!(
-                json_usage_operation(&argv(&["client", "enqueue", value])),
+                json_usage_operation(&argv(&["client", "mark", value])),
                 None,
                 "{value} must not select JSON mode"
             );
@@ -708,12 +796,12 @@ mod tests {
     fn a_usage_envelope_is_one_line_and_carries_only_the_problem() {
         let error = <crate::cli::Cli as clap::Parser>::try_parse_from(argv(&[
             "client",
-            "enqueue",
+            "mark",
             "../escape",
             "--json",
         ]))
         .expect_err("an escaping change ID must be rejected");
-        let envelope = usage_error_envelope(&error, Operation::Enqueue);
+        let envelope = usage_error_envelope(&error, Operation::ControlMark);
         assert_eq!(envelope.outcome, Outcome::UsageError);
         assert!(!envelope.ok);
         assert_eq!(envelope.exit_code(), 2);

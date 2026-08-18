@@ -103,77 +103,112 @@ would contend for the lock with the process you meant to talk to.
 
 ```bash
 cflx client status --json                 # read the owner; mutates nothing
-EXEC=$(cflx client enqueue add-my-change --json | jq -r '.execution_id')
+cflx client mark add-my-change --json     # select it; unrelated marks are preserved
+cflx client start --json                  # F5 equivalent over the authoritative marks
 cflx client wait add-my-change --timeout 45m --json
-cflx client notify set add-my-change "$EXEC" --json -- /absolute/callback
-cflx client mcp                           # serve the same intents over stdio MCP
+cflx client mcp                           # serve the same controls over stdio MCP
 ```
 
-Four verbs, and only four: `status`, `enqueue`, `wait`, and the `notify` group,
-plus `mcp` for hosts that speak the protocol instead of a shell. `--unix-socket
-PATH` overrides the default `${GIT_COMMON_DIR}/cflx-api.sock`, and
+The verbs are the operator's own: `status`, `mark`, `unmark`, `start`, `stop`,
+`force-stop`, `wait`, and the `subscribe` group, plus `mcp` for hosts that speak
+the protocol instead of a shell. `--project-dir ABSOLUTE_PATH` names any
+directory inside the project's Git working tree and is the normal explicit route;
+`--unix-socket PATH` is the low-level override of the default
+`${GIT_COMMON_DIR}/cflx-api.sock`. The two conflict at parse time, and
 `--auth-token-env NAME` names an environment variable holding the bearer token —
 a token value is never accepted in argv and never printed.
 
-**Admission is not completion.** A successful `enqueue` proves only that the
-owner accepted the intent. `wait` is the observation-only counterpart, and it
-returns `completed` only when current Git/OpenSpec evidence proves the owner's
-declared terminal mode. Read the envelope's `outcome`, never prose.
+**A mark is selection, not admission.** `mark` and `unmark` are target-scoped
+desired-state writes: they set exactly the named proposals' execution marks,
+leave every unrelated mark alone, submit no queue intent, start nothing, and
+return once the commands settle. Whether marked work then runs is the owner's own
+settlement and analysis, exactly as it is for a mark typed at the TUI. `start`,
+`stop`, and `force-stop` submit the same shared lifecycle intents F5/`!` and the
+stop controls submit — `start` consumes the owner's authoritative mark set and
+takes no target list, because "start only these" is not something the shared
+transaction can express.
+
+**Read `outcome`, not prose.** `--json` prints exactly one versioned envelope on
+stdout; diagnostics go to stderr, and each outcome has its own stable exit
+status. The successes are narrow: `observed`, `marked`, `unmarked`, `unchanged`,
+`accepted`, `subscribed`, `cleared`, and `completed`. Everything else —
+`owner_not_running`, `owner_not_command_capable`, `owner_restarted`,
+`change_not_found`, `target_ineligible`, `revision_conflict`,
+`transport_not_permitted`, `unsupported_owner`, `partial_intent`,
+`observation_conflict`, `evidence_error`, `change_rejected`, `process_failed`,
+`timeout`, `usage_error` — is a non-zero refusal.
+
+**Accepted is not completion.** A settled control command proves the owner took
+the intent, nothing more, and a settled mark proves less still. `wait` is the
+observation-only counterpart: it submits no command and returns `completed` only
+when current Git/OpenSpec evidence proves the owner's declared terminal mode.
 
 ### `cflx client mcp`
 
 `cflx client mcp` is a stdio Model Context Protocol server over exactly that
-boundary, with six closed tools: `cflx_status`, `cflx_enqueue`, `cflx_wait`, and
-`cflx_notify_set` / `_get` / `_clear`. It is the alternative for a host that
-speaks the protocol rather than a shell, and each tool calls the same module its
-command does. It exposes no raw `/api/v2` command construction, so a model cannot name a command type, an expected revision, an
-idempotency key, an execution mark, or shell source. stdout carries JSON-RPC
-frames and nothing else.
+boundary, with three closed tools: `cflx_status`, `cflx_control`, and
+`cflx_subscribe`. `cflx_control` takes one action — `mark`, `unmark`, `start`,
+`stop`, or `force_stop` — and each tool calls the same module its command does.
+It exposes no raw `/api/v2` command construction, so a model cannot name a
+command type, an expected revision, an idempotency key, queue intent, or shell
+source. stdout carries JSON-RPC frames and nothing else.
 
-`cflx_enqueue` returns as soon as admission settles and carries an
-`execution_id` naming that exact admitted episode — a retry of the same proposal
-is a *different* execution. It never holds the tool call open for the life of a
-change.
+Every tool accepts an optional absolute `project_dir` and an optional low-level
+`unix_socket`, so one server process registered globally can drive any number of
+projects by naming one per call. Nothing is remembered between calls.
+
+`cflx_wait` is deliberately absent from MCP: a completion wait is open for as
+long as the work takes, which is not a tool call. `cflx client wait` remains the
+bounded CLI oracle, and an MCP host that wants asynchronous completion registers
+an explicit callback with `cflx_subscribe`. A host that cannot execute a callback
+has no MCP completion oracle, by design.
 
 ### Completion notifications
 
-A shell reaches this directly through `cflx client notify`; an MCP host reaches
-the same implementation through `cflx_notify_set` / `_get` / `_clear`. Neither
-requires the other.
+Nothing is registered for you. An agent that wants to be told when a proposal
+finishes asks, explicitly — a shell through `cflx client subscribe`, an MCP host
+through `cflx_subscribe`. Neither requires the other.
 
 ```bash
-EXEC=$(cflx client enqueue add-my-change --json | jq -r .execution_id)
-cflx client notify set add-my-change "$EXEC" --json -- /absolute/callback --flag v
-cflx client notify get add-my-change "$EXEC" --json
-cflx client notify clear add-my-change "$EXEC" --json
+I=$(cflx client status --json | jq -r .instance_id)
+cflx client subscribe set add-my-change --instance-id "$I" --json -- /absolute/callback --flag v
+cflx client subscribe get add-my-change --instance-id "$I" --json
+cflx client subscribe clear add-my-change --instance-id "$I" --json
 ```
 
-Every operation names an *admitted execution episode* rather than a change: pass
-the `execution_id` the enqueue reported, and pass `--instance-id` as well when
-you kept it, so a replaced owner comes back as typed `owner_restarted` instead
-of the `execution_not_found` a new incarnation would otherwise answer with.
-Everything after `--` is the callback argv, one element per argument exactly as
-typed; the CLI never parses shell source. `--blocked` opts into the non-terminal
-attention edge.
+A subscription is keyed by the *proposal*, not by an execution episode, so it can
+be registered before anything is admitted — which is the gap that used to be
+closed by inferring a registration from an admission result. One request names 1
+through 64 distinct proposals. Everything after `--` is the callback argv, one
+element per argument exactly as typed; the CLI never parses shell source.
+`--blocked` opts into the non-terminal attention edge.
 
-The registration attaches one bounded argv the owner runs **once** when that
-execution reaches a typed terminal classification (`completed`, `failed`,
-`stopped`), with `blocked` available as an opt-in attention edge and
-`owner_stopping` on graceful shutdown. This exists because the TUI stays alive
-after the work finishes, so process exit was never a completion signal.
+Whenever a subscribed proposal enters a new execution episode, the owner binds
+that episode and runs the argv **once** when it reaches a typed terminal
+classification (`completed`, `failed`, `stopped`), with `owner_stopping` on
+graceful shutdown. Re-admission after a retry is a distinct episode and a
+distinct notification. This exists because the TUI stays alive after the work
+finishes, so process exit was never a completion signal.
 
+- **Delivery notifies; it does not resume.** Conflux runs the registered argv and
+  draws no conclusion from it. It starts no agent, resumes no session, and a
+  callback's exit status changes no workflow outcome. Whatever happens next is
+  external and explicit.
 - `completed` uses the same repository oracle `cflx client wait` certifies with.
   A change disappearing from the owner's snapshot is never completion.
+- Delivery dedupe is keyed by the execution episode, so replacing a subscription,
+  clearing it, or clearing and setting it again never replays a terminal event
+  this owner already delivered. Registering *after* the latest episode settled
+  delivers that event immediately, once.
 - The callback is argv, not shell source — no `sh -c`, no quoting, no expansion —
   and its environment is *replaced* with exactly `CFLX_EVENT_PATH`,
   `CFLX_EVENT_TYPE`, `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and
   `CFLX_INSTANCE_ID`. No owner token or configuration reaches it.
 - Registration is accepted **only over the owner's Unix socket**. An
   authenticated TCP client is refused with `transport_not_permitted`, and it is
-  not told the registered argv on a read either — it sees `sink_registered`,
-  execution state, and delivery history instead. Every sink request, inspection
-  included, carries the complete `(instance_id, execution_id, change_id)`
-  binding.
+  not told the registered argv on a read either — it sees presence, execution
+  state, and delivery history instead. Every request, inspection included,
+  carries the complete `(instance_id, change_id)` binding.
 - The event payload is created `0400` inside a `0700` owner-private directory, so
   a callback cannot open `CFLX_EVENT_PATH` for writing by default. That is
   default mutation refusal, not an integrity guarantee against a same-UID
@@ -187,12 +222,9 @@ after the work finishes, so process exit was never a completion signal.
 - Delivery stays serialized, including through graceful shutdown: one finite
   deadline covers every queued or running callback, nothing new starts after it,
   and no event artifact is removed until its callback has been reaped.
-- Registrations are process-local and die with the owner: nothing here is
-  durable workflow state, and delivery failure cannot change any outcome.
-
-`examples/integrations/opencode-auto-resume/` is an optional reference
-integration that wires this into OpenCode. It is repository-distributed and not
-part of the published crate.
+- Subscriptions are process-local and die with the owner: nothing here is durable
+  workflow state, an owner restart invalidates every registration, and delivery
+  failure cannot change any outcome.
 
 ## Configuration
 
@@ -240,7 +272,6 @@ cargo install cflx
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | Development guide |
 | [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | Release guide |
-| [examples/integrations/opencode-auto-resume/README.md](examples/integrations/opencode-auto-resume/README.md) | Optional OpenCode auto-resume reference integration |
 | `cflx openapi` / `GET /api/v2/openapi.yaml` | Canonical `/api/v2` contract (generated at runtime; not tracked in the repository) |
 
 ## License
