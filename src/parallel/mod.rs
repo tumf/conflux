@@ -220,6 +220,14 @@ pub struct ParallelExecutor {
     /// Used to bypass queue-edit debounce when capacity recovers from zero to positive,
     /// so queued changes dispatch immediately after a running task or manual resolve frees a slot.
     last_available_slots: Option<usize>,
+    /// Whether the most recent reanalysis pass skipped the analyzer for lack of
+    /// capacity alone.
+    ///
+    /// Per-pass and process-local. It exists so the loop step that owns
+    /// one-shot trigger lifetime can tell "this edge was evaluated" from "this
+    /// edge never got an evaluation", without every direct caller of the pass
+    /// having to thread a richer return value through.
+    analyzer_capacity_suppressed: bool,
     /// Dynamic queue for runtime change additions (TUI mode)
     dynamic_queue: Option<Arc<crate::tui::queue::DynamicQueue>>,
     /// Shared AI command runner for stagger coordination

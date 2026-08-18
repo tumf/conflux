@@ -135,6 +135,7 @@ impl ParallelExecutor {
             cancel_token: None,
             last_queue_change_at,
             last_available_slots: None,
+            analyzer_capacity_suppressed: false,
             dynamic_queue: None,
             ai_runner,
             run_command_scope,

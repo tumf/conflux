@@ -264,8 +264,14 @@ fn analysis_result<'a>(
     })
 }
 
+/// Zero capacity gates the analyzer as well as dispatch.
+///
+/// An analysis order nothing can consume is wasted work, and recording that the
+/// input was analysed is what would suppress the evaluation capacity recovery
+/// depends on. Queue classification, reducer reconciliation, and diagnostics all
+/// still run — they are just above this gate.
 #[tokio::test]
-async fn test_manual_resolve_zero_capacity_runs_analysis_but_suppresses_apply_dispatch() {
+async fn test_manual_resolve_zero_capacity_gates_analysis_and_apply_dispatch() {
     let temp_dir = TempDir::new().unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let mut executor = ParallelExecutor::new(
@@ -320,38 +326,27 @@ async fn test_manual_resolve_zero_capacity_runs_analysis_but_suppresses_apply_di
 
     let mut saw_analysis_started = false;
     let mut saw_apply_started = false;
-    let mut saw_capacity_diagnostic = false;
     while let Ok(event) = rx.try_recv() {
         match event {
             ExecutionEvent::AnalysisStarted { .. } => saw_analysis_started = true,
             ExecutionEvent::ApplyStarted { .. } => saw_apply_started = true,
-            ExecutionEvent::Log(entry)
-                if entry
-                    .message
-                    .contains("dispatch_capacity_zero_after_analysis") =>
-            {
-                saw_capacity_diagnostic = true;
-            }
             _ => {}
         }
     }
 
     assert!(
-        saw_analysis_started,
-        "queued work should enter analysis during active manual resolve"
+        !saw_analysis_started,
+        "the expensive analyzer must not start while a manual resolve holds every slot"
     );
     assert!(
         !saw_apply_started,
         "ordinary apply must remain capacity-gated during active manual resolve"
     );
-    assert!(
-        saw_capacity_diagnostic,
-        "capacity-gated dispatch should emit an operator-visible diagnostic"
-    );
 }
 
+/// Repeated zero-capacity wakes stay inert rather than relaunching the analyzer.
 #[tokio::test]
-async fn repeated_capacity_zero_does_not_spam_dispatch_diagnostic() {
+async fn repeated_capacity_zero_never_starts_analysis() {
     let temp_dir = TempDir::new().unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
     let mut executor = ParallelExecutor::new(
@@ -408,34 +403,21 @@ async fn repeated_capacity_zero_does_not_spam_dispatch_diagnostic() {
 
     let mut analysis_started_count = 0;
     let mut apply_started_count = 0;
-    let mut capacity_diagnostics = Vec::new();
     while let Ok(event) = rx.try_recv() {
         match event {
             ExecutionEvent::AnalysisStarted { .. } => analysis_started_count += 1,
             ExecutionEvent::ApplyStarted { .. } => apply_started_count += 1,
-            ExecutionEvent::Log(entry)
-                if entry
-                    .message
-                    .contains("dispatch_capacity_zero_after_analysis") =>
-            {
-                capacity_diagnostics.push(entry.message);
-            }
             _ => {}
         }
     }
 
-    assert!(
-        analysis_started_count >= 2,
-        "expected at least two re-analysis iterations; saw {analysis_started_count}"
+    assert_eq!(
+        analysis_started_count, 0,
+        "a suppressed evaluation is not a distinct analysis attempt; saw {analysis_started_count}"
     );
     assert_eq!(
         apply_started_count, 0,
         "ordinary apply must remain capacity-gated"
-    );
-    assert_eq!(
-        capacity_diagnostics.len(),
-        1,
-        "identical zero-capacity signatures should emit one operator-visible diagnostic; saw {capacity_diagnostics:?}"
     );
 }
 
@@ -483,7 +465,7 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
     let mut log_messages = Vec::new();
 
     tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        while !(saw_dynamic_ingest && saw_analysis_started && saw_capacity_diagnostic) {
+        while !(saw_dynamic_ingest && saw_capacity_diagnostic) {
             match rx.recv().await {
                 Some(ExecutionEvent::Log(entry))
                     if entry.message.contains(&format!(
@@ -493,9 +475,7 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
                     saw_dynamic_ingest = true;
                 }
                 Some(ExecutionEvent::Log(entry))
-                    if entry
-                        .message
-                        .contains("dispatch_capacity_zero_after_analysis") =>
+                    if entry.message.contains("analysis_capacity_zero") =>
                 {
                     saw_capacity_diagnostic = true;
                     log_messages.push(entry.message);
@@ -513,7 +493,7 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
 
     assert!(
         gated_resolve_counter.load(Ordering::SeqCst) > 0,
-        "controllable resolve gate must still be held when analysis and capacity diagnostics fire"
+        "controllable resolve gate must still be held when the capacity diagnostic fires"
     );
 
     gated_resolve_counter.store(0, Ordering::SeqCst);
@@ -527,7 +507,10 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
         saw_dynamic_ingest,
         "expected dynamic ingest log for {synthetic_change_id}; saw logs: {log_messages:?}"
     );
-    assert!(saw_analysis_started);
+    assert!(
+        !saw_analysis_started,
+        "zero recalculated capacity must suppress the expensive analyzer too"
+    );
     assert!(saw_capacity_diagnostic);
     assert!(
         !saw_apply_started,

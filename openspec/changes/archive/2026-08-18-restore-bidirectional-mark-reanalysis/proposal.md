@@ -55,6 +55,21 @@ Analyze also currently runs with zero worker capacity under the canonical schedu
 - Positive slot recovery re-evaluates remaining eligible queued work.
 - Empty eligible queue and no-op settlement start no Analyze.
 
+## Retired Scenarios
+
+Scenarios this change deliberately retires from a MODIFIED requirement, rather
+than losing by accident. Declared here because the promotion-safety regression
+treats every other disappearance as a coverage regression, and because a
+declaration inside a delta block would be copied verbatim into a canonical spec
+that should describe the system rather than the history of one change.
+
+- parallel-execution: Reanalysis dispatch guards are factored by responsibility / Zero-capacity behavior remains unchanged after extraction
+
+Replaced in the same requirement by `Zero-capacity behavior gates analyzer after
+extraction`. The old scenario asserted that dependency analysis still runs with
+zero slots, which is the behavior this change reverses; keeping both would leave
+the capability contradicting itself.
+
 ## Impact
 
 - Specs: `operator-command-execution`, `parallel-execution`

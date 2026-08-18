@@ -284,8 +284,9 @@ fn analysis_result<'a>(
     })
 }
 
+/// The automatic-resolve mirror of the manual-resolve capacity gate.
 #[tokio::test]
-async fn test_auto_resolve_zero_capacity_runs_analysis_but_suppresses_apply_dispatch() {
+async fn test_auto_resolve_zero_capacity_gates_analysis_and_apply_dispatch() {
     let temp_dir = TempDir::new().unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let mut executor = ParallelExecutor::new(
@@ -350,8 +351,8 @@ async fn test_auto_resolve_zero_capacity_runs_analysis_but_suppresses_apply_disp
     }
 
     assert!(
-        saw_analysis_started,
-        "queued work should enter analysis during active automatic resolve"
+        !saw_analysis_started,
+        "the expensive analyzer must not start while an automatic resolve holds every slot"
     );
     assert!(
         !saw_apply_started,

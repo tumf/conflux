@@ -1,19 +1,25 @@
-//! Scheduler-side behaviour after a settled mark reaches the queue service.
+//! Scheduler behaviour when dispatch capacity is exhausted.
 //!
-//! Mark stability is a *pre-admission* policy: by the time the scheduler sees
-//! anything, all that has happened is an ordinary explicit queue addition. These
-//! tests assert exactly that — a settled addition reaches the scheduler as a real
-//! `DynamicQueue` candidate and takes the existing queue-addition reanalysis
-//! edge, so the ten-second stability interval never stacks with the scheduler's
-//! own queue debounce, analysis still runs while a resolve occupies the
-//! base-mutating lane as long as a slot is left, and both analysis and dispatch
-//! wait for capacity rather than for another operator action.
+//! The expensive dependency analyzer is a *dispatch* input. Running it with zero
+//! free slots produces an order nothing can consume, and — worse — records that
+//! the input was analysed, which is what previously let a full scheduler swallow
+//! the queue, completion, repair, and slot-recovery edges that were still
+//! waiting for capacity to come back.
+//!
+//! So the gate is: classification, reducer-visible queued-intent reconciliation,
+//! and operator diagnostics stay available at zero slots; the analyzer and
+//! ordinary dispatch do not. A gated evaluation records no signature and
+//! consumes no edge, so the recovery wake still has something to act on.
 //!
 //! Everything runs through the production loop step
 //! (`evaluate_queued_reanalysis_and_dispatch`) over a real `DynamicQueue` and a
-//! real reducer, so the ingestion admission rules are the ones under test rather
-//! than a test-only copy. Paused Tokio time throughout: no assertion depends on
-//! a wall-clock threshold.
+//! real reducer. Paused Tokio time throughout: no assertion depends on a
+//! wall-clock threshold.
+//!
+//! Evidence class: integration. The harness initialises a real Git repository
+//! and a real workspace directory because queue classification reads them, so
+//! these tests exercise real filesystem and process boundaries rather than
+//! in-memory doubles.
 
 use crate::analyzer::{AnalysisOutcome, AnalysisResult};
 use crate::config::OrchestratorConfig;
@@ -74,10 +80,6 @@ fn git(repo_root: &std::path::Path, args: &[&str]) {
 }
 
 /// A minimal repository whose OpenSpec catalog really contains `change_ids`.
-///
-/// Ingestion loads the candidate from the catalog, so a change that exists only
-/// in the reducer would be refused as `candidate_not_found` — which would make
-/// every assertion below pass for the wrong reason.
 fn repo_with_changes(repo_root: &std::path::Path, change_ids: &[&str]) {
     git(repo_root, &["init", "-b", "main"]);
     git(repo_root, &["config", "user.email", "test@example.com"]);
@@ -112,7 +114,6 @@ fn counting_analyzer(
     }
 }
 
-/// The scheduler-loop state a settled queue addition actually lands in.
 struct Harness {
     executor: ParallelExecutor,
     queue: Arc<DynamicQueue>,
@@ -129,7 +130,6 @@ struct Harness {
     events: mpsc::Receiver<ExecutionEvent>,
     /// Slots held by an active resolve, as the base-mutating lane holds them.
     resolve_slots: Arc<AtomicUsize>,
-    /// Kept alive so the temp directories outlive the executor.
     _repo_dir: TempDir,
     _workspace_base: TempDir,
 }
@@ -193,18 +193,15 @@ impl Harness {
         self.resolve_slots.store(count, Ordering::SeqCst);
     }
 
-    /// Apply the exact effect stable mark settlement produces.
-    ///
-    /// Reducer intent first, then the runtime hint — the same order the shared
-    /// queue command path uses, and the order ingestion validates against.
-    async fn settle_mark_addition(&self, change_id: &str) {
+    /// Publish reducer queue intent and the matching runtime hint.
+    async fn queue_change(&self, change_id: &str) {
         self.state
             .write()
             .await
             .apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
         assert!(
             self.queue.push(change_id.to_string()).await,
-            "settlement must produce a real DynamicQueue addition"
+            "the queue addition must be real"
         );
     }
 
@@ -257,17 +254,24 @@ impl Harness {
         self.analyses.load(Ordering::SeqCst)
     }
 
-    /// Drain the event channel, counting the two events under test.
-    fn drain_events(&mut self) -> (usize, usize) {
-        let (mut analysis_started, mut apply_started) = (0, 0);
+    /// Drain the event channel, returning analysis starts and diagnostic logs.
+    fn drain_events(&mut self) -> (usize, Vec<String>) {
+        let (mut analysis_started, mut logs) = (0, Vec::new());
         while let Ok(event) = self.events.try_recv() {
             match event {
                 ExecutionEvent::AnalysisStarted { .. } => analysis_started += 1,
-                ExecutionEvent::ApplyStarted { .. } => apply_started += 1,
+                ExecutionEvent::Log(entry) => logs.push(entry.message),
                 _ => {}
             }
         }
-        (analysis_started, apply_started)
+        (analysis_started, logs)
+    }
+
+    /// The signature/suppression state a gated evaluation must leave untouched.
+    fn records_no_suppression(&self) -> bool {
+        self.executor.last_completed_analysis_input.is_none()
+            && self.executor.next_analysis_signature_probe_at.is_none()
+            && self.executor.analysis_retry_throttle.is_none()
     }
 
     async fn shutdown(mut self) {
@@ -277,71 +281,31 @@ impl Harness {
 }
 
 #[tokio::test(start_paused = true)]
-async fn running_mark_reanalysis_settled_addition_analyzes_during_active_resolve() {
-    // One slot held by an active resolve, one left for ordinary dispatch.
-    let mut harness = Harness::new(&["beta"], 2);
-    let analyzer = counting_analyzer(harness.analyses.clone());
-    harness.arm_queue_debounce().await;
-    harness.hold_resolve_slots(1);
-
-    harness.settle_mark_addition("beta").await;
-    harness.run_loop_iteration(&analyzer).await;
-
-    let (analysis_started, apply_started) = harness.drain_events();
-    assert_eq!(
-        harness.analyses(),
-        1,
-        "a settled queue addition must start analysis without another debounce period"
-    );
-    assert_eq!(
-        analysis_started, 1,
-        "the addition takes the existing queue-addition reanalysis edge"
-    );
-    assert_eq!(
-        harness.resolve_slots.load(Ordering::SeqCst),
-        1,
-        "the resolve must still be active when analysis started"
-    );
-    assert_eq!(
-        apply_started, 0,
-        "an apply event is published by the spawned task, not by the dispatch decision"
-    );
-    // Dispatch is asserted from the loop's own synchronous state rather than
-    // from an event a spawned task will publish later: admission is what this
-    // test is about, and a race on the event channel would make it flaky.
-    assert_eq!(
-        harness.in_flight.len(),
-        1,
-        "recomputed capacity of one admits ordinary dispatch alongside the resolve"
-    );
-    assert!(harness.queued.is_empty());
-
-    harness.shutdown().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn running_mark_reanalysis_settled_addition_waits_for_capacity() {
-    // Every slot held by resolve/manual work. A settled addition is an ordinary
-    // queue addition, so it is subject to the scheduler's own capacity gate: the
-    // expensive analyzer and dispatch both wait, and the candidate is retained.
+async fn reanalysis_zero_capacity_gates_analyzer() {
+    // Every slot held by the base-mutating lane: classification and diagnostics
+    // must still run, the analyzer and dispatch must not.
     let mut harness = Harness::new(&["beta"], 1);
     let analyzer = counting_analyzer(harness.analyses.clone());
     harness.arm_queue_debounce().await;
     harness.hold_resolve_slots(1);
 
-    harness.settle_mark_addition("beta").await;
+    harness.queue_change("beta").await;
     harness.run_loop_iteration(&analyzer).await;
 
-    let (analysis_started, apply_started) = harness.drain_events();
+    let (analysis_started, logs) = harness.drain_events();
+    assert_eq!(
+        harness.analyses(),
+        0,
+        "zero capacity must not start the expensive dependency analyzer"
+    );
     assert_eq!(
         analysis_started, 0,
-        "zero capacity must suppress the expensive dependency analyzer"
+        "a suppressed evaluation is not a distinct analysis attempt"
     );
-    assert_eq!(
-        apply_started, 0,
+    assert!(
+        harness.in_flight.is_empty(),
         "zero capacity must suppress ordinary apply dispatch"
     );
-    assert!(harness.in_flight.is_empty());
     assert!(
         harness.join_set.is_empty(),
         "no workspace task may be spawned at zero capacity"
@@ -351,79 +315,182 @@ async fn running_mark_reanalysis_settled_addition_waits_for_capacity() {
         1,
         "the queued candidate is retained until capacity recovers"
     );
+    assert!(
+        logs.iter()
+            .any(|message| message.contains("analysis_capacity_zero")),
+        "the reason must be operator-visible: {logs:?}"
+    );
 
     harness.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn running_mark_reanalysis_capacity_recovery_dispatches_without_another_operator_action() {
+async fn reanalysis_zero_capacity_preserves_edge_and_signature() {
     let mut harness = Harness::new(&["beta"], 1);
     let analyzer = counting_analyzer(harness.analyses.clone());
     harness.arm_queue_debounce().await;
     harness.hold_resolve_slots(1);
 
-    harness.settle_mark_addition("beta").await;
+    // Ingest first, so the queue hint is already drained and the one-shot edge
+    // below is the only trigger the gated evaluation is carrying.
+    harness.queue_change("beta").await;
     harness.run_loop_iteration(&analyzer).await;
+    assert!(harness.queue.pop().await.is_none());
+
+    // An explicit one-shot state-transition edge, arriving with no capacity.
+    harness.reanalysis_reason = ReanalysisReason::ResolveCompletion;
+    harness.run_loop_iteration(&analyzer).await;
+
+    assert_eq!(harness.analyses(), 0);
+    assert_eq!(
+        harness.reanalysis_reason,
+        ReanalysisReason::ResolveCompletion,
+        "an edge that never reached the analyzer must stay unconsumed"
+    );
+    assert!(
+        harness.records_no_suppression(),
+        "an input the analyzer never saw must leave no completed or suppression record"
+    );
+
+    // Repeated gated wakes must stay just as inert: no analysis, no record, and
+    // the edge still intact.
     for _ in 0..3 {
         harness.timer_wake().await;
         harness.run_loop_iteration(&analyzer).await;
     }
-    let (_, apply_started) = harness.drain_events();
+    assert_eq!(harness.analyses(), 0);
     assert_eq!(
-        apply_started, 0,
-        "dispatch stays suppressed while capacity is zero"
+        harness.reanalysis_reason,
+        ReanalysisReason::ResolveCompletion
     );
-    assert!(harness.in_flight.is_empty());
+    assert!(harness.records_no_suppression());
 
-    // The resolve completes and the scheduler wakes itself with its own edge. No
-    // second mark, no second settlement, and no Start action is involved.
-    harness.hold_resolve_slots(0);
+    let (analysis_started, logs) = harness.drain_events();
+    assert_eq!(analysis_started, 0);
+    let capacity_diagnostics: Vec<_> = logs
+        .iter()
+        .filter(|message| message.contains("analysis_capacity_zero"))
+        .collect();
+    assert_eq!(
+        capacity_diagnostics.len(),
+        1,
+        "identical gated wakes report one deduplicated operator-visible reason: {capacity_diagnostics:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn reanalysis_slot_recovery_after_capacity_gate_resumes_from_the_preserved_edge() {
+    let mut harness = Harness::new(&["beta"], 1);
+    let analyzer = counting_analyzer(harness.analyses.clone());
+    harness.arm_queue_debounce().await;
+    harness.hold_resolve_slots(1);
+
+    harness.queue_change("beta").await;
+    harness.run_loop_iteration(&analyzer).await;
     harness.reanalysis_reason = ReanalysisReason::ResolveCompletion;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(harness.analyses(), 0);
+
+    // The resolve finishes. No new queue mutation and no second operator action:
+    // the edge preserved by the gate is the whole liveness signal.
+    harness.hold_resolve_slots(0);
     let outcome = harness
         .run_loop_iteration(&analyzer)
         .await
         .expect("queued work must be evaluated after capacity recovery");
 
     assert!(!outcome.0, "capacity recovery must resume the scheduler");
+    assert_eq!(harness.analyses(), 1);
     assert_eq!(
         harness.in_flight.len(),
         1,
-        "the recovered slot must dispatch the settled candidate"
+        "the recovered slot dispatches the queued candidate"
     );
-    assert!(
-        harness.queued.is_empty(),
-        "the settled candidate leaves the queued set once dispatched"
-    );
-    assert!(
-        harness.queue.pop().await.is_none(),
-        "the DynamicQueue addition was consumed exactly once"
+    assert!(harness.queued.is_empty());
+    assert_eq!(
+        harness.reanalysis_reason,
+        ReanalysisReason::Initial,
+        "the edge is consumed by the evaluation that actually used it"
     );
 
     harness.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn running_mark_reanalysis_unsettled_mark_creates_no_analysis_edge() {
-    // The negative half of the contract: without a real queue addition there is
-    // nothing for the scheduler to see, so a pending mark must not make it poll.
+async fn reanalysis_slot_recovery_after_capacity_gate_follows_in_flight_completion() {
+    // Capacity recovered by a finished apply rather than by a resolve, and with
+    // no explicit edge left over: the queue trigger promoted to `SlotRecovery`
+    // is what re-evaluates the remaining work.
     let mut harness = Harness::new(&["beta"], 1);
     let analyzer = counting_analyzer(harness.analyses.clone());
     harness.arm_queue_debounce().await;
+    harness.in_flight.insert("alpha".to_string());
 
-    // Marked but unsettled: no reducer intent, no DynamicQueue entry.
+    harness.queue_change("beta").await;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(harness.analyses(), 0, "the pass ran with no free slot");
+    assert!(harness.records_no_suppression());
+
+    // The in-flight apply completes.
+    harness.in_flight.remove("alpha");
+    harness.reanalysis_reason = ReanalysisReason::QueueNotification;
+    harness.run_loop_iteration(&analyzer).await;
+
+    assert_eq!(
+        harness.analyses(),
+        1,
+        "recovered capacity re-evaluates work"
+    );
+    assert_eq!(harness.in_flight.len(), 1);
+    assert!(harness.queued.is_empty());
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn reanalysis_empty_or_noop_suppressed() {
+    // An empty eligible queue never starts Analyze, however the loop was woken.
+    let mut harness = Harness::new(&["beta"], 2);
+    let analyzer = counting_analyzer(harness.analyses.clone());
+    harness.arm_queue_debounce().await;
+
+    for reason in [
+        ReanalysisReason::Initial,
+        ReanalysisReason::QueueNotification,
+        ReanalysisReason::ResolveCompletion,
+        ReanalysisReason::SlotRecovery,
+    ] {
+        harness.reanalysis_reason = reason;
+        assert!(
+            harness.run_loop_iteration(&analyzer).await.is_none(),
+            "an empty eligible queue must produce no evaluation for {reason}"
+        );
+    }
+
+    let (analysis_started, _) = harness.drain_events();
+    assert_eq!(harness.analyses(), 0);
+    assert_eq!(analysis_started, 0);
+    assert!(harness.join_set.is_empty());
+
+    // A settled batch that applied nothing notifies no scheduler, so the loop
+    // sees only its ordinary timer inside a fresh debounce window. That must not
+    // manufacture an analysis attempt either.
+    harness.reanalysis_reason = ReanalysisReason::Initial;
     harness.queued.push(test_change("beta"));
     for _ in 0..4 {
         harness.timer_wake().await;
         harness.run_loop_iteration(&analyzer).await;
     }
 
-    let (analysis_started, apply_started) = harness.drain_events();
+    let (analysis_started, _) = harness.drain_events();
     assert_eq!(
-        analysis_started, 0,
-        "a fresh debounce window still defers timer-driven reanalysis"
+        harness.analyses(),
+        0,
+        "a no-op batch adds no queue edge, so the fresh debounce window still defers"
     );
-    assert_eq!(apply_started, 0);
-    assert_eq!(harness.analyses(), 0);
+    assert_eq!(analysis_started, 0);
 
     harness.shutdown().await;
 }
