@@ -1,11 +1,14 @@
-//! `/api/v2` coherence between a revoking event and the mark it revokes.
+//! `/api/v2` coherence between a typed event and the marks it does or does not
+//! revoke.
 //!
 //! The property under test is a *revision* property, not a value property: a
 //! client that reads the snapshot named by a failure event's envelope must never
-//! see the failure alongside the stale `execution_marked: true`. That can only
-//! hold if mark reconciliation runs inside the authoritative dispatch, before
-//! this sink builds its candidate snapshot — so every test here drives the real
-//! `dispatch_event_with_marks` boundary rather than poking the projection.
+//! see the failure alongside the stale `execution_marked: true`, and one that
+//! reads the snapshot an archive envelope names must still see the marks the
+//! archive preserved. That can only hold if mark reconciliation runs inside the
+//! authoritative dispatch, before this sink builds its candidate snapshot — so
+//! every test here drives the real `dispatch_event_with_marks` boundary rather
+//! than poking the projection.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -290,20 +293,21 @@ async fn on_merged_recovery_and_cleared_mark_are_coherent() {
     );
 }
 
-/// The archive edge publishes the cleared mark in the revision its own envelope
-/// names, and no post-archive transition can bring the mark back.
+/// The archive transition publishes the *preserved* marks in the revision its
+/// own envelope names, and no post-archive transition disturbs them.
 ///
-/// Archive is the terminal revocation edge, and it is the one edge classified
-/// from a run-level aggregate (`is_archived`) rather than per-change runtime, so
-/// the ordering claim is asserted here at the real dispatch boundary instead of
-/// being inferred from the reducer-level edge tests.
+/// Archive is a lifecycle milestone, not an invalidation of operator intent, and
+/// it is the one transition classified from a run-level aggregate
+/// (`is_archived`) rather than per-change runtime — so the preservation claim is
+/// asserted here at the real dispatch boundary instead of being inferred from
+/// the reducer-level edge tests.
 #[tokio::test]
-async fn run_mark_intent_archive_revision_publishes_the_cleared_mark() {
+async fn run_mark_intent_archive_revision_preserves_target_and_unrelated_marks() {
     let wired = Wired::new(&["alpha", "beta"]).await;
     wired.marks.set("alpha", true);
     wired.marks.set("beta", true);
 
-    // Establish a baseline revision that still reports both marks.
+    // Establish a baseline revision that already reports both marks.
     wired
         .dispatch(ExecutionEvent::ApplyStarted {
             change_id: "alpha".to_string(),
@@ -325,11 +329,11 @@ async fn run_mark_intent_archive_revision_publishes_the_cleared_mark() {
     assert_eq!(
         wired.envelope_revision("change_archived"),
         after_revision,
-        "the archive event must name the revision that already reports the cleared mark"
+        "the archive event must name the revision that reports the preserved marks"
     );
     assert!(
-        !marked(&after, "alpha"),
-        "the archive revision still exposes the mark it revoked"
+        marked(&after, "alpha"),
+        "the archive revision revoked the mark on its own target"
     );
     assert!(
         marked(&after, "beta"),
@@ -346,8 +350,8 @@ async fn run_mark_intent_archive_revision_publishes_the_cleared_mark() {
         "the same revision must carry the reducer transition"
     );
 
-    // Post-archive success transitions carry no revoking edge of their own, and
-    // must not resurrect the mark in any later published revision either.
+    // The later merged and pushed transitions carry no mark edge of their own,
+    // so they must leave the preserved marks exactly as the archive left them.
     for event in [
         ExecutionEvent::MergeCompleted {
             change_id: "alpha".to_string(),
@@ -362,15 +366,18 @@ async fn run_mark_intent_archive_revision_publishes_the_cleared_mark() {
         wired.dispatch(event.clone()).await;
         let (snapshot, _) = wired.published();
         assert!(
-            !marked(&snapshot, "alpha"),
-            "{event:?} recreated the mark the archive edge revoked"
+            marked(&snapshot, "alpha"),
+            "{event:?} revoked the mark the archive preserved"
         );
         assert!(
             marked(&snapshot, "beta"),
             "{event:?} disturbed an unrelated mark"
         );
     }
-    assert_eq!(wired.marks.marked_ids(), vec!["beta".to_string()]);
+    assert_eq!(
+        wired.marks.marked_ids(),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
 }
 
 /// Process-level `Stopped` publishes a revision that still names every resume
