@@ -1286,7 +1286,7 @@ re-analysis ループは dispatch の完了待ちでブロックされてはな�
 
 re-analysis の起動トリガは、キュー通知・デバウンスタイマー・in-flight 完了・reducer-visible queued intent reconciliation のいずれでもよい（MUST）。
 
-利用可能スロットが 0 の場合でも、queued に ordinary dispatchable candidate が存在するなら、システムは queue classification、reducer-visible queued intent reconciliation、dependency analysis、operator-visible diagnostics を実行できなければならない（MUST）。ただし ordinary apply dispatch は、dispatch 直前に再計算した利用可能スロットが 1 以上になるまで開始してはならない（MUST NOT）。
+利用可能スロットが 0 の場合でも、queued に ordinary candidate が存在するなら、システムは queue classification、reducer-visible queued intent reconciliation、operator-visible diagnostics を実行できなければならない（MUST）。高価な dependency analyzer と ordinary apply dispatch は、各起動直前に再計算した利用可能スロットが 1 以上の場合に限り開始しなければならない（MUST）。
 
 Reducer-dependent scheduler work detection は dynamic queue hint admission、reducer-visible queued intent reconciliation、lane wait synchronization、drain/idle decision、ordinary queue eligibility、terminal error、active/resolving membership、および Acceptance/external hold を同一の coherent reducer snapshot または disposition 前に完了する等価な awaited acquisition から評価しなければならない（MUST）。一時的な reducer lock contention は current dispatch attempt を fail-closed に保たなければならないが（MUST）、popped queue hint の最終拒否、empty reconciliation、stable candidate-unavailable、blocked-only、drained、finite scheduler termination、または indefinite persistent-idle state として確定してはならない（MUST NOT）。snapshot が利用可能になった時点で、追加の queue mutation または外部 wake notification を要求せず同じ scheduler evaluation を継続しなければならない（MUST）。不完全な reducer evidence の間は dependency analyzer、workspace preparation、ordinary dispatch を開始してはならない（MUST NOT）。reducer read guard は repository/VCS probe、dependency analysis、agent execution、dispatch の前に解放されなければならない（MUST）。
 
@@ -1300,7 +1300,7 @@ signature は同一 change ID の proposal dependency、prompt-relevant metadata
 
 signature 構築に必要な proposal read または effective-base revision resolution が失敗した場合、scheduler は fail-open で dependency analysis を許可し、signature を記録せず、loop を終了してはならない（MUST）。ただし ordinary timer による再試行は既存の 10 秒 queue debounce cadence より頻繁に実行してはならず（MUST NOT）、失敗が継続する間の 500 ms timer wake ごとに proposal/VCS probe または dependency analyzer を起動してはならない（MUST NOT）。新しい明示的 edge trigger はこの失敗再試行 deadline を event ごとに一度 bypass してよい（MAY）。
 
-queue addition、completion、repair candidate、および slot recovery の明示的 edge trigger は、matching signature が存在しても event ごとに一度の即時 analysis を許可しなければならない（MUST）。scheduler は analyzer result provenance を runtime 内で識別しなければならない（MUST）。healthy LLM result または意図的な metadata-only result は non-expiring completed signature を記録してよい。recoverable LLM failure による metadata fallback は degraded signature として記録し、記録から5分後の最初の eligible timer wake で unchanged input に対する一度の retry を許可しなければならない（MUST）。直前の repository probe deadline はこの degraded expiry を越えて retry を遅延させてはならない（MUST NOT）。
+queue addition、completion、repair candidate、および slot recovery の明示的 edge trigger は、利用可能スロットが 1 以上なら matching signature が存在しても event ごとに一度の即時 analysis を許可しなければならない（MUST）。利用可能スロットが 0 のため analyzer を抑止した evaluation は completed signature または suppression を記録してはならず（MUST NOT）、未評価の edge trigger を消費または破棄してはならない（MUST NOT）。scheduler は analyzer result provenance を runtime 内で識別しなければならない（MUST）。healthy LLM result または意図的な metadata-only result は non-expiring completed signature を記録してよい。recoverable LLM failure による metadata fallback は degraded signature として記録し、記録から5分後の最初の eligible timer wake で unchanged input に対する一度の retry を許可しなければならない（MUST）。直前の repository probe deadline はこの degraded expiry を越えて retry を遅延させてはならない（MUST NOT）。
 
 usable result を生成しない analyzer path は completed signature を記録してはならない（MUST NOT）。reducer-visible queued work が残る場合、その unusable result だけを理由に scheduler loop を終了してはならず（MUST NOT）、次の debounce-eligible timer evaluation または明示的 edge による retry を許可しなければならない（MUST）。
 
@@ -3056,14 +3056,15 @@ The scheduler's reanalysis-and-dispatch path SHALL be decomposed into single-res
 - **THEN** analysis starts immediately without waiting for the debounce window
 - **AND** an `AnalysisStarted` event is emitted
 
-#### Scenario: Zero-capacity behavior remains unchanged after extraction
+#### Scenario: Zero-capacity behavior gates analyzer after extraction
 
-- **GIVEN** queued dispatchable work exists
+- **GIVEN** queued ordinary work exists
 - **AND** `in_flight.len() == max_parallelism`
-- **WHEN** the refactored reanalysis path runs dependency analysis
-- **THEN** dependency analysis still runs
-- **AND** ordinary apply dispatch is suppressed
-- **AND** the capacity-zero diagnostic is emitted through the diagnostic deduplication store
+- **WHEN** the refactored reanalysis path evaluates queued work
+- **THEN** queue classification, queued-intent reconciliation, and operator diagnostics still run
+- **AND** dependency analysis and ordinary apply dispatch are suppressed
+- **AND** no completed or suppression signature is recorded and no unconsumed edge is discarded
+- **AND** slot recovery or a debounce-eligible changed signature can evaluate the work later
 
 #### Scenario: Blocked-only work skips analyzer after extraction
 
