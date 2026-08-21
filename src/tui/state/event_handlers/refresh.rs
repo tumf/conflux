@@ -231,6 +231,14 @@ mod tests {
         }
     }
 
+    fn create_test_change_with_progress(id: &str, completed: u32, total: u32) -> Change {
+        Change {
+            completed_tasks: completed,
+            total_tasks: total,
+            ..create_test_change(id)
+        }
+    }
+
     fn count_blocked_logs(app: &AppState, change_id: &str) -> usize {
         let message = format!("Change '{}' blocked by dependencies", change_id);
         app.logs
@@ -376,6 +384,180 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A proposal can be missing from a single filesystem snapshot while its
+    /// worktree is refreshed or merged into the base branch. The row is dropped,
+    /// but the proposal never stopped existing — so once discovery observes it
+    /// again the row has to come back, rebuilt from *that* snapshot's data.
+    ///
+    /// The same pass proves the opposite half of the rule: a row deliberately
+    /// retained through the absence (here, one with a recorded start) is updated
+    /// in place when it is observed again, not duplicated, re-badged, or
+    /// re-logged. Nothing in the sequence may move the cursor, select a row, or
+    /// otherwise touch workflow intent.
+    #[test]
+    fn changes_refreshed_restores_change_after_transient_absence() {
+        fn refresh(app: &mut AppState, active: Vec<Change>, rejected: Vec<Change>) {
+            let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+            app.handle_changes_refreshed(
+                active,
+                rejected,
+                committed,
+                uncommitted,
+                worktrees,
+                paths,
+                not_ahead,
+                HashSet::new(),
+            );
+        }
+
+        fn detection_logs(app: &AppState, change_id: &str) -> usize {
+            let message = format!("Detected new change: {}", change_id);
+            app.logs
+                .iter()
+                .filter(|entry| entry.message == message)
+                .count()
+        }
+
+        fn row<'a>(app: &'a AppState, change_id: &str) -> &'a crate::tui::state::ChangeState {
+            app.changes
+                .iter()
+                .find(|c| c.id == change_id)
+                .unwrap_or_else(|| panic!("row for '{}' is missing", change_id))
+        }
+
+        fn rows_with_id(app: &AppState, change_id: &str) -> usize {
+            app.changes.iter().filter(|c| c.id == change_id).count()
+        }
+
+        let mut app = AppState::new(vec![
+            create_test_change("change-anchor"),
+            create_test_change("change-retained"),
+        ]);
+        // A recorded start is one of the reasons the projection deliberately
+        // keeps a row that the current snapshot does not observe.
+        app.changes[1].started_at = Some(std::time::Instant::now());
+        app.cursor_index = 1;
+        app.list_state.select(Some(1));
+
+        // Snapshot 1: everything is observable. Two proposals are detected for
+        // the first time, both as ordinary active rows.
+        refresh(
+            &mut app,
+            vec![
+                create_test_change("change-anchor"),
+                create_test_change_with_progress("change-retained", 2, 5),
+                create_test_change_with_progress("change-vanishing", 1, 4),
+                create_test_change("change-rejecting"),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(rows_with_id(&app, "change-vanishing"), 1);
+        assert!(row(&app, "change-vanishing").is_new);
+        assert_eq!(detection_logs(&app, "change-vanishing"), 1);
+        assert_eq!(
+            row(&app, "change-rejecting").display_status_cache,
+            "not queued"
+        );
+        assert_eq!(detection_logs(&app, "change-rejecting"), 1);
+        assert_eq!(app.new_change_count, 2);
+
+        // Snapshot 2: the transient absence. Discovery observes neither the
+        // active proposal nor the rejected one, and the retained row survives on
+        // its recorded start alone.
+        refresh(
+            &mut app,
+            vec![create_test_change("change-anchor")],
+            Vec::new(),
+        );
+
+        assert_eq!(rows_with_id(&app, "change-vanishing"), 0);
+        assert_eq!(rows_with_id(&app, "change-rejecting"), 0);
+        assert!(
+            !app.known_change_ids.contains("change-vanishing"),
+            "an identity entry must not outlive the row it belongs to"
+        );
+        assert!(
+            !app.known_change_ids.contains("change-rejecting"),
+            "an identity entry must not outlive the row it belongs to"
+        );
+        assert!(
+            app.known_change_ids.contains("change-retained"),
+            "a row kept through the absence must stay known"
+        );
+        assert_eq!(rows_with_id(&app, "change-retained"), 1);
+        assert_eq!(
+            app.new_change_count, 0,
+            "the NEW badge must not count a row this pass dropped"
+        );
+
+        // Snapshot 3: both proposals are observable again, with progress that
+        // differs from what the removed rows last held.
+        refresh(
+            &mut app,
+            vec![
+                create_test_change("change-anchor"),
+                create_test_change_with_progress("change-retained", 3, 5),
+                create_test_change_with_progress("change-vanishing", 2, 4),
+            ],
+            vec![create_test_change("change-rejecting")],
+        );
+
+        let restored = row(&app, "change-vanishing");
+        assert_eq!(rows_with_id(&app, "change-vanishing"), 1);
+        assert_eq!(
+            (restored.completed_tasks, restored.total_tasks),
+            (2, 4),
+            "the restored row must be rebuilt from the current refresh data"
+        );
+        assert_eq!(restored.display_status_cache, "not queued");
+        assert!(
+            restored.is_new,
+            "a reappearing active proposal is newly detected again"
+        );
+        assert_eq!(
+            detection_logs(&app, "change-vanishing"),
+            2,
+            "exactly one additional detection log for the reappearance"
+        );
+
+        // The retained row was never removed, so re-observing it is an in-place
+        // update: no duplicate, no NEW badge, no detection log.
+        let retained = row(&app, "change-retained");
+        assert_eq!(rows_with_id(&app, "change-retained"), 1);
+        assert_eq!((retained.completed_tasks, retained.total_tasks), (3, 5));
+        assert!(!retained.is_new);
+        assert_eq!(detection_logs(&app, "change-retained"), 0);
+
+        // A proposal whose row was dropped and which comes back rejected is
+        // rebuilt read-only: no active NEW badge, no active detection log.
+        let rejected = row(&app, "change-rejecting");
+        assert_eq!(rows_with_id(&app, "change-rejecting"), 1);
+        assert_eq!(rejected.display_status_cache, "rejected");
+        assert!(!rejected.is_new);
+        assert!(!rejected.selected);
+        assert_eq!(
+            detection_logs(&app, "change-rejecting"),
+            1,
+            "the rejected reappearance adds no active detection log"
+        );
+        assert_eq!(
+            app.new_change_count, 1,
+            "only the reappearing active proposal counts toward the NEW badge"
+        );
+
+        // Reappearance is observability only: no cursor movement, no mark, and
+        // the identity set still equals exactly the rows that are present.
+        assert_eq!(app.cursor_index, 1, "reappearance must not move the cursor");
+        assert_eq!(app.list_state.selected(), Some(1));
+        assert!(
+            app.changes.iter().all(|c| !c.selected),
+            "refresh must never mark a change for execution"
+        );
+        let projected_ids: HashSet<String> = app.changes.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(app.known_change_ids, projected_ids);
     }
 
     #[test]
