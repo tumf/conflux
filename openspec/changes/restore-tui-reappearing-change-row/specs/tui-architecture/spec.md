@@ -2,7 +2,7 @@
 
 ### Requirement: Refresh projection convergence
 
-The local TUI change projection MUST converge to the current successful active and rejected change observations. If a change is temporarily absent from one refresh and is observed again later, stale identity bookkeeping MUST NOT suppress reconstruction of its row.
+The local TUI MUST display a row for every change present in the current successful active and rejected observations, and its change identity bookkeeping MUST converge to the row projection that survives each successful refresh: an identity entry MUST NOT outlive its row, and an entry whose row is deliberately retained through a snapshot absence (recorded start, or terminal/wait display status) MUST stay known. If a change's row was removed during a transient absence and the change is observed again later, stale identity bookkeeping MUST NOT suppress reconstruction of its row; if the row was retained through the absence, re-observation MUST update it in place without creating a duplicate row.
 
 Reappearance state and logs are observability-only. They MUST NOT become inputs to queue membership, scheduler dispatch, resume routing, acceptance, archive routing, or other next-action decisions.
 
@@ -25,9 +25,17 @@ Reappearance state and logs are observability-only. They MUST NOT become inputs 
 - **AND** the proposal is not automatically selected, marked, queued, dispatched, resumed, accepted, or archived
 - **AND** reducer and repository state remain authoritative for workflow behavior
 
+#### Scenario: Retained row is re-observed without duplication
+
+- **GIVEN** a change row is retained through a snapshot absence because it has a recorded start or a terminal/wait display status
+- **WHEN** a subsequent successful refresh observes that change again
+- **THEN** the existing row is updated in place from the current refresh data
+- **AND** no duplicate row is added for the same change ID
+- **AND** the row does not receive the newly-detected badge and no detection log is emitted for it
+
 #### Scenario: Rejected proposal remains read-only
 
-- **GIVEN** a rejected proposal is absent from one refresh and observed again later
+- **GIVEN** a proposal's row was removed during a transient absence and a later successful refresh observes the proposal as rejected
 - **WHEN** the TUI reconstructs its row
 - **THEN** the row is displayed as rejected and read-only
 - **AND** it does not receive an active NEW badge or increment the active new-change counter
