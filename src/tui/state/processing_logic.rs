@@ -152,7 +152,6 @@ pub(super) fn update_changes_with_rejected(
     }
 
     state.known_change_ids.extend(new_ids);
-    state.new_change_count = state.changes.iter().filter(|c| c.is_new).count();
     state.last_refresh = Instant::now();
 
     if let Some(shared_state) = &state.shared_orchestrator_state {
@@ -189,6 +188,30 @@ pub(super) fn update_changes_with_rejected(
                     | "error"
             )
     });
+
+    // Identity bookkeeping converges to the row projection that just survived.
+    //
+    // An ID must not outlive its row. A change can be absent from a single
+    // filesystem snapshot while its worktree is refreshed or merged; the retain
+    // above drops the row, and a known-ID entry left behind would classify the
+    // change as already seen when it is observed again, so the row could never
+    // be reconstructed. Conversely an ID whose row was deliberately retained
+    // through the absence (recorded start, or a terminal/wait display status)
+    // stays known, so re-observing it updates that row in place instead of
+    // pushing a duplicate NEW row.
+    //
+    // This is observability bookkeeping only: it decides whether a row is
+    // painted as newly detected and logged, never queue membership, dispatch,
+    // resume routing, acceptance, or archive routing.
+    let retained_row_ids: HashSet<&str> = state.changes.iter().map(|c| c.id.as_str()).collect();
+    state
+        .known_change_ids
+        .retain(|id| retained_row_ids.contains(id.as_str()));
+
+    // Counted from the settled projection rather than from the pre-retain row
+    // list, so the NEW badge can never advertise a row that this same pass
+    // dropped.
+    state.new_change_count = state.changes.iter().filter(|c| c.is_new).count();
 
     // Rows this pass created or re-created start with no archive-completion cache,
     // so the retained reducer snapshot is reapplied before anything renders. Doing
