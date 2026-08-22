@@ -31,7 +31,8 @@ cflx client mark add-my-change --json     # select it; unrelated marks are prese
 cflx client unmark add-my-change --json
 cflx client start --json                  # F5 equivalent over the authoritative marks
 cflx client stop --json                   # graceful; force-stop for the immediate one
-cflx client wait add-my-change --timeout 45m --json
+cflx client wait add-my-change --json     # waits for as long as the work takes
+cflx client wait add-my-change --timeout 45m --json   # or give up at an explicit deadline
 I=$(cflx client status --json | jq -r .instance_id)
 cflx client subscribe set add-my-change --instance-id "$I" --json -- /absolute/callback --flag v
 cflx client subscribe get add-my-change --instance-id "$I" --json
@@ -109,6 +110,18 @@ current Git/OpenSpec evidence proves the owner's declared terminal mode
 (`merged`, `base_published`, or `branch_pushed`) was reached. A change
 disappearing from the snapshot is never completion.
 
+**`wait` has no deadline unless you ask for one.** `--timeout` defaults to `0`,
+and `0` in any unit — `0`, `0s`, `0ms`, `0m`, `0h` — means "wait for as long as
+the work takes": the wait ends at verified completion, a typed failure, owner
+replacement, or your own cancellation, and never because a clock ran out. Pass a
+positive `--timeout D` when you want the opposite, and its expiry is the typed
+`timeout` outcome. A positive value below `100ms` or above `7d` is still a usage
+error. Either way the bound on the *operation* is not a bound on its
+subprocesses: each owner request keeps the transport's own per-request valve, and
+each Git child an unbounded wait spawns keeps a finite per-invocation deadline
+whose expiry terminates and reaps that child and retries the check — it is never
+reported as the operation-level `timeout`.
+
 If a later target fails after earlier commands settled, the request returns
 `partial_intent` listing exactly the command records it created, in order. It
 never claims a rollback: undoing a settled mark would be a mark mutation racing
@@ -152,9 +165,9 @@ JSON-RPC frames and nothing else; diagnostics go to stderr.
 
 `cflx_wait` is deliberately absent from MCP. A completion wait stays open for
 as long as the work takes, which is not the shape of a tool call. `cflx client
-wait` remains the bounded CLI completion oracle, and an MCP host that wants
-asynchronous completion registers an explicit callback with `cflx_subscribe`. A
-host that cannot execute callback argv has no MCP completion oracle, by design.
+wait` remains the CLI completion oracle, and an MCP host that wants asynchronous
+completion registers an explicit callback with `cflx_subscribe`. A host that
+cannot execute callback argv has no MCP completion oracle, by design.
 
 ### Completion notifications
 

@@ -1212,16 +1212,9 @@ mod enabled {
     #[test]
     fn cli_surface_rejects_a_malformed_timeout_as_usage() {
         let tmp = neutral_cwd();
-        for bad in [
-            "0s",
-            "0ms",
-            "50ms",
-            "abc",
-            "5x",
-            "-1",
-            "99999999999999h",
-            "",
-        ] {
+        // Zero is deliberately absent: it is the unbounded sentinel, not a
+        // below-minimum duration. `50ms` still is one.
+        for bad in ["50ms", "99ms", "abc", "5x", "-1", "99999999999999h", ""] {
             let output = run_cli(
                 tmp.path(),
                 &["client", "wait", "alpha", "--timeout", bad, "--json"],
@@ -1237,6 +1230,67 @@ mod enabled {
             assert_eq!(parsed["outcome"], "usage_error");
             assert_eq!(parsed["operation"], "wait");
         }
+    }
+
+    #[test]
+    fn cli_surface_accepts_every_zero_spelling_as_the_unbounded_sentinel() {
+        // A caller who wrote a zero meant the same thing whichever unit they
+        // reached for, so no spelling may survive as a below-minimum duration
+        // and none may become an instant timeout. `owner_not_running` proves the
+        // value parsed and the command ran rather than being rejected.
+        let tmp = neutral_cwd();
+        let socket = tmp.path().join("absent.sock");
+        for zero in ["0", "0s", "0ms", "0m", "0h"] {
+            let output = run_cli(
+                tmp.path(),
+                &[
+                    "client",
+                    "--unix-socket",
+                    &socket.display().to_string(),
+                    "wait",
+                    "alpha",
+                    "--timeout",
+                    zero,
+                    "--json",
+                ],
+                &[],
+            );
+            let parsed = envelope(&output);
+            assert_eq!(
+                parsed["outcome"],
+                "owner_not_running",
+                "'{zero}' must select the unbounded sentinel, stderr={}",
+                stderr_of(&output)
+            );
+        }
+    }
+
+    #[test]
+    fn cli_surface_defaults_the_timeout_to_the_unbounded_sentinel() {
+        // The default is the same value `--timeout 0` selects, so an omitted
+        // timeout cannot quietly reintroduce a synthesized deadline.
+        let tmp = neutral_cwd();
+        let socket = tmp.path().join("absent.sock");
+        let path = socket.display().to_string();
+        let omitted = run_cli(
+            tmp.path(),
+            &["client", "--unix-socket", &path, "wait", "alpha", "--json"],
+            &[],
+        );
+        assert_eq!(envelope(&omitted)["outcome"], "owner_not_running");
+
+        // And the help says so, because "how long does this wait" is exactly
+        // what a caller reads it for.
+        let help = run_cli(tmp.path(), &["client", "wait", "--help"], &[]);
+        let text = stdout_of(&help);
+        assert!(
+            text.contains("waits indefinitely"),
+            "the default must be documented as unbounded: {text}"
+        );
+        assert!(
+            text.contains("[default: 0]"),
+            "the default value must be visible: {text}"
+        );
     }
 
     #[test]
@@ -1313,9 +1367,9 @@ mod enabled {
                 "an unparseable timeout",
             ),
             (
-                vec!["client", "wait", "alpha", "--timeout", "0s", "--json"],
+                vec!["client", "wait", "alpha", "--timeout", "50ms", "--json"],
                 "wait",
-                "a zero timeout",
+                "a below-minimum timeout",
             ),
             (
                 vec!["client", "mark", "--json"],
@@ -3090,6 +3144,39 @@ mod enabled {
         .unwrap()
     }
 
+    /// Spawn `cflx client wait`, with the timeout arguments exactly as given.
+    ///
+    /// `timeout: None` reproduces what a caller who never typed `--timeout`
+    /// runs, which is the whole point of the unbounded default: it cannot be
+    /// tested through a helper that always supplies one.
+    fn spawn_wait(
+        owner: &Owner,
+        repo: &Path,
+        change_id: &str,
+        timeout: Option<&str>,
+    ) -> tokio::task::JoinHandle<Output> {
+        let socket = owner.socket();
+        let repo = repo.to_path_buf();
+        let change_id = change_id.to_string();
+        let timeout = timeout.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let mut args = vec![
+                "client".to_string(),
+                "--unix-socket".to_string(),
+                socket,
+                "wait".to_string(),
+                change_id,
+            ];
+            if let Some(timeout) = timeout {
+                args.push("--timeout".to_string());
+                args.push(timeout);
+            }
+            args.push("--json".to_string());
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_cli(&repo, &argv, &[])
+        })
+    }
+
     #[tokio::test]
     async fn wait_proves_local_integration_from_repository_evidence() {
         let repo = Fixture::new();
@@ -3351,6 +3438,245 @@ mod enabled {
         );
         owner.stop().await;
     }
+
+    // ------------------------------------------------------------------------
+    // wait_unbounded
+    // ------------------------------------------------------------------------
+    //
+    // The default is now "no operation deadline", so the property under test is
+    // an absence: nothing may synthesize a deadline, and no `timeout` outcome may
+    // appear. Wall-clock cannot prove an absence, so each test here settles the
+    // wait from evidence that arrives *after* it started observing — an
+    // implementation that invented a deadline, or read zero as an immediate
+    // expiry, reports `timeout` and never reaches the assertion.
+
+    #[tokio::test]
+    async fn wait_without_a_timeout_keeps_observing_until_repository_evidence_arrives() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "applying")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let waiting = spawn_wait(&owner, repo.path(), "alpha", None);
+
+        // Many poll cycles with nothing terminal to find. A wait that had a
+        // deadline of its own would be free to end here; this one has none, so
+        // it is still observing when the evidence finally lands.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !waiting.is_finished(),
+            "an omitted timeout must not end the wait on its own"
+        );
+
+        repo.archive("alpha");
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "merged")],
+        ));
+
+        let output = waiting.await.unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "completed",
+            "an unbounded wait must still settle from repository evidence, stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(spy.call_count(), 0, "wait must submit no command");
+        owner.stop().await;
+    }
+
+    #[tokio::test]
+    async fn wait_with_an_explicit_zero_timeout_behaves_exactly_like_omission() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "applying")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let waiting = spawn_wait(&owner, repo.path(), "alpha", Some("0"));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !waiting.is_finished(),
+            "`--timeout 0` must not be an immediate timeout"
+        );
+
+        repo.archive("alpha");
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "merged")],
+        ));
+
+        let output = waiting.await.unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "completed",
+            "zero must select the same unbounded wait omission does, stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    #[tokio::test]
+    async fn wait_without_a_timeout_still_returns_its_typed_non_success_outcomes() {
+        // Unbounded is about the clock, not about giving up: every terminal
+        // classification a bounded wait reports is still reachable, so an
+        // omitted timeout cannot strand a caller on rejected work.
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        let mut rejected = change("alpha", "select", "rejected");
+        rejected.error_detail = Some("the proposal was rejected in review".to_string());
+        owner.publish(snapshot("select", vec![rejected]));
+        owner.contract(merged_contract("main"));
+
+        let output = spawn_wait(&owner, repo.path(), "alpha", None)
+            .await
+            .unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "change_rejected");
+        assert_eq!(output.status.code(), Some(17));
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// A stalled `git://` endpoint has to outlive the per-subprocess budget, and
+    /// that budget is deliberately generous — it mirrors the transport's own 30s
+    /// valve, because being *shorter* than a slow-but-healthy `ls-remote` is the
+    /// only way it could hurt. So this one is heavy by construction.
+    #[tokio::test]
+    #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+    async fn wait_unbounded_terminates_a_stalled_remote_lookup_without_reporting_timeout() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+        repo.archive("alpha");
+        let head_before = repo.git(&["rev-parse", "HEAD"]);
+
+        // Accepts and then says nothing, so `git ls-remote` blocks on the ref
+        // advertisement. With no operation deadline above it, the only thing
+        // that can end this child is the per-invocation budget the unbounded
+        // wait puts on it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds a loopback port");
+        let port = listener.local_addr().unwrap().port();
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let stop = shutdown.clone();
+            async move {
+                let mut connected_tx = Some(connected_tx);
+                let mut held = Vec::new();
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        incoming = listener.accept() => {
+                            let Ok((stream, _)) = incoming else { break };
+                            if let Some(tx) = connected_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            held.push(stream);
+                        }
+                    }
+                }
+                held
+            }
+        });
+
+        repo.git(&[
+            "remote",
+            "add",
+            "upstream",
+            &format!("git://127.0.0.1:{port}/stalled.git"),
+        ]);
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "merged")],
+        ));
+        // Base publication, so local integration is not enough and the remote
+        // lookup genuinely decides the outcome.
+        owner.contract(OwnerExecutionContract::resolve(
+            "main",
+            None,
+            Some("upstream"),
+        ));
+
+        let waiting = spawn_wait(&owner, repo.path(), "alpha", None);
+
+        tokio::time::timeout(UNBOUNDED_SUBPROCESS_GUARD, connected_rx)
+            .await
+            .expect("git must have reached the stalled remote")
+            .expect("the fixture must report the connection");
+
+        // The child hit its own budget and was reaped: its socket reaches EOF. A
+        // `git` still running would hold the connection open and this read would
+        // never return.
+        shutdown.cancel();
+        let mut held = task.await.unwrap();
+        let mut stream = held.pop().expect("one accepted connection");
+        tokio::time::timeout(UNBOUNDED_SUBPROCESS_GUARD, async {
+            let mut sink = [0u8; 64];
+            loop {
+                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut sink)
+                    .await
+                    .expect("reading the fixture connection");
+                if read == 0 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the stalled git child must be terminated and reaped at its own budget");
+
+        // The remote is gone with the fixture, so the next lookup fails fast and
+        // the wait settles on evidence rather than on a clock. Whatever it says,
+        // it must not be the operation-level timeout: no deadline was ever asked
+        // for, so none could expire.
+        let output = waiting.await.unwrap();
+        let parsed = envelope(&output);
+        assert_ne!(
+            parsed["outcome"],
+            "timeout",
+            "a per-subprocess expiry must never become the operation's timeout, stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(spy.call_count(), 0, "wait must submit no command");
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+        assert_eq!(
+            repo.git(&["status", "--porcelain"]),
+            "",
+            "wait must leave the worktree clean"
+        );
+        owner.stop().await;
+    }
+
+    /// Longest the per-subprocess budget may take to fire before the test gives
+    /// up. Comfortably above the 30s budget so it can only trip on a genuine
+    /// loss of bounding.
+    const UNBOUNDED_SUBPROCESS_GUARD: Duration = Duration::from_secs(120);
 
     // ------------------------------------------------------------------------
     // wait_deadline

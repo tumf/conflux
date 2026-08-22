@@ -616,7 +616,9 @@ async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
         ClientCommands::ForceStop(_) => {
             control::run(&connection, control::Action::ForceStop, &[]).await
         }
-        ClientCommands::Wait(wait) => wait::run(&connection, &wait.change_id, wait.timeout).await,
+        ClientCommands::Wait(wait) => {
+            wait::run(&connection, &wait.change_id, wait.timeout.deadline()).await
+        }
         ClientCommands::Subscribe(args) => match args.command {
             ClientSubscribeCommands::Set(set) => {
                 subscribe::run(

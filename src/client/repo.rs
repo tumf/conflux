@@ -13,9 +13,7 @@
 
 use std::path::Path;
 
-use tokio::time::Instant;
-
-use crate::bounded_git::{run_git, GitOutcome};
+use crate::bounded_git::{run_git, GitDeadline, GitOutcome};
 use crate::execution::state::{classify_base_completion_within, BaseCompletionEvidence};
 use crate::web::remote_control_api::dto::{OwnerExecutionContract, TerminalMode};
 
@@ -38,19 +36,25 @@ pub enum Verdict {
     /// Separate from every other verdict on purpose: a verification that ran out
     /// of time proves nothing about the repository, so it must not be reported
     /// as missing evidence, broken evidence, or "keep waiting".
+    ///
+    /// Only a [`GitDeadline::Operation`] caller can see this. A per-child expiry
+    /// is one attempt giving up, not the operation, so it comes back as
+    /// [`Verdict::NotCompleted`] and the caller keeps observing.
     DeadlineExpired,
 }
 
 /// Verify one change against the owner's declared terminal mode.
 ///
-/// `deadline` is the caller's whole-operation deadline, not a per-command
-/// budget: it is handed to every Git child so an expiry terminates the child
-/// that is still running rather than leaving it behind.
+/// `deadline` reaches every Git child rather than wrapping the future that
+/// spawned it, so an expiry terminates and reaps the child that is still running
+/// instead of leaving it behind. Which *kind* of bound it carries decides what
+/// an expiry means: a caller's whole-operation deadline answers the operation,
+/// while a per-child budget only ends this attempt.
 pub async fn verify(
     change_id: &str,
     repo_root: &Path,
     contract: &OwnerExecutionContract,
-    deadline: Instant,
+    deadline: GitDeadline,
 ) -> Verdict {
     match contract.terminal_mode {
         TerminalMode::Merged => {
@@ -81,7 +85,9 @@ pub async fn verify(
                             ),
                         },
                         Err(RemoteError::Broken(detail)) => Verdict::Broken { detail },
-                        Err(RemoteError::DeadlineExpired) => Verdict::DeadlineExpired,
+                        Err(RemoteError::DeadlineExpired) => {
+                            expired(deadline, &format!("git ls-remote {remote}"))
+                        }
                     }
                 }
                 other => other,
@@ -116,11 +122,34 @@ pub async fn verify(
                             ),
                         },
                         Err(RemoteError::Broken(detail)) => Verdict::Broken { detail },
-                        Err(RemoteError::DeadlineExpired) => Verdict::DeadlineExpired,
+                        Err(RemoteError::DeadlineExpired) => {
+                            expired(deadline, &format!("git ls-remote {remote}"))
+                        }
                     }
                 }
                 other => other,
             }
+        }
+    }
+}
+
+/// Turn a Git child expiry into the verdict its caller's bound implies.
+///
+/// Under a shared operation deadline the expiry *is* the operation's answer, and
+/// [`Verdict::DeadlineExpired`] carries it to the `timeout` outcome. Under a
+/// per-child budget only this attempt ended: the child was terminated and
+/// reaped, nothing was proven either way, and an unbounded wait must keep
+/// observing rather than borrow an outcome reserved for callers who asked for a
+/// deadline.
+fn expired(deadline: GitDeadline, what: &str) -> Verdict {
+    if deadline.is_operation_deadline() {
+        Verdict::DeadlineExpired
+    } else {
+        Verdict::NotCompleted {
+            detail: format!(
+                "{what} did not finish within its subprocess budget; the child was terminated and \
+                 the check will be retried"
+            ),
         }
     }
 }
@@ -134,12 +163,12 @@ async fn verify_base(
     change_id: &str,
     repo_root: &Path,
     branch: &str,
-    deadline: Instant,
+    deadline: GitDeadline,
 ) -> Verdict {
     let Some(evidence) =
-        classify_base_completion_within(change_id, repo_root, branch, Some(deadline)).await
+        classify_base_completion_within(change_id, repo_root, branch, deadline).await
     else {
-        return Verdict::DeadlineExpired;
+        return expired(deadline, "local base-completion classification");
     };
     match evidence {
         BaseCompletionEvidence::Completed => Verdict::Completed {
@@ -172,12 +201,14 @@ enum RemoteError {
 ///
 /// This is the one Git command here that talks to the network, so it is also the
 /// one that can hang indefinitely: the caller's deadline reaches the child
-/// itself, not a wrapper around a future that would abandon it.
+/// itself, not a wrapper around a future that would abandon it. That is why an
+/// unbounded caller still supplies a per-child budget — there is no operation
+/// deadline left to stop this one.
 async fn remote_matches_local(
     repo_root: &Path,
     remote: &str,
     branch: &str,
-    deadline: Instant,
+    deadline: GitDeadline,
 ) -> Result<Option<String>, RemoteError> {
     let local = rev_parse(repo_root, branch, deadline)
         .await?
@@ -188,7 +219,7 @@ async fn remote_matches_local(
     let output = match run_git(
         repo_root,
         &["ls-remote", "--exit-code", "--heads", remote, branch],
-        Some(deadline),
+        deadline,
     )
     .await
     {
@@ -243,12 +274,12 @@ pub fn parse_ls_remote_line(line: &str, branch: &str) -> Option<String> {
 async fn rev_parse(
     repo_root: &Path,
     revision: &str,
-    deadline: Instant,
+    deadline: GitDeadline,
 ) -> Result<Option<String>, RemoteError> {
     let output = match run_git(
         repo_root,
         &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
-        Some(deadline),
+        deadline,
     )
     .await
     {
@@ -271,6 +302,7 @@ async fn rev_parse(
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tokio::time::Instant;
 
     #[test]
     fn an_ls_remote_line_matches_only_the_exact_branch_ref() {
@@ -315,7 +347,7 @@ mod tests {
                     "alpha",
                     Path::new("/nonexistent"),
                     &contract,
-                    Instant::now() + Duration::from_secs(30),
+                    GitDeadline::Operation(Instant::now() + Duration::from_secs(30)),
                 )
                 .await
             });
@@ -342,7 +374,7 @@ mod tests {
                     "alpha",
                     Path::new("/nonexistent"),
                     &contract,
-                    Instant::now() + Duration::from_secs(30),
+                    GitDeadline::Operation(Instant::now() + Duration::from_secs(30)),
                 )
                 .await
             });
@@ -350,5 +382,40 @@ mod tests {
             matches!(verdict, Verdict::Unsupported { .. }),
             "{verdict:?}"
         );
+    }
+
+    #[test]
+    fn only_an_operation_deadline_turns_a_git_expiry_into_the_operations_answer() {
+        assert_eq!(
+            expired(
+                GitDeadline::Operation(Instant::now() + Duration::from_secs(30)),
+                "git ls-remote origin"
+            ),
+            Verdict::DeadlineExpired
+        );
+    }
+
+    #[test]
+    fn a_per_child_expiry_is_a_retryable_absence_of_evidence_not_a_timeout() {
+        // The distinction the unbounded wait depends on: killing one `git` says
+        // nothing about how long the caller has been waiting, so it must never
+        // reach the `timeout` outcome an explicit `--timeout` owns.
+        let verdict = expired(
+            GitDeadline::PerChild(Duration::from_secs(30)),
+            "git ls-remote origin",
+        );
+        let Verdict::NotCompleted { detail } = verdict else {
+            panic!("a per-child expiry must keep the caller observing: {verdict:?}");
+        };
+        assert!(detail.contains("terminated"), "{detail}");
+        assert!(detail.contains("retried"), "{detail}");
+    }
+
+    #[test]
+    fn an_unbounded_git_deadline_never_claims_the_operation_expired() {
+        assert!(!matches!(
+            expired(GitDeadline::Unbounded, "git rev-parse"),
+            Verdict::DeadlineExpired
+        ));
     }
 }

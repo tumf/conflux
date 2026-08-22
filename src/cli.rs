@@ -296,7 +296,8 @@ pub enum Commands {
     ///   cflx client mark alpha beta --json      # Select proposals; admission stays the owner's
     ///   cflx client start --json                # F5 equivalent over the authoritative marks
     ///   cflx client stop --json                 # Graceful stop; force-stop for the immediate one
-    ///   cflx client wait alpha --timeout 30m    # Observe until verified completion
+    ///   cflx client wait alpha                  # Observe until verified completion; no deadline
+    ///   cflx client wait alpha --timeout 30m    # Give up after an explicit deadline instead
     ///   cflx client subscribe set alpha --instance-id ID --json -- /absolute/callback
     ///   cflx client subscribe get alpha --instance-id ID --json     # Read the registration
     ///   cflx client subscribe clear alpha --instance-id ID --json   # Remove it
@@ -865,11 +866,13 @@ pub fn install_skills_legacy_error(src: &str) -> String {
 // Existing-owner client namespace
 // ============================================================================
 
-/// Smallest accepted `--timeout`, so a "0s" typo cannot turn a wait into a probe.
+/// Smallest accepted *positive* `--timeout`, so a `50ms` typo cannot turn a wait
+/// into a probe.
 ///
 /// Sub-second values are accepted because the deadline is a safety valve, not a
 /// latency budget: a scripted caller that wants "check once and give up" should
-/// be able to say so without inventing a second flag.
+/// be able to say so without inventing a second flag. Zero is not a small
+/// deadline but the absence of one, so it is handled before this bound applies.
 const MIN_CLIENT_TIMEOUT_MILLIS: u64 = 100;
 
 /// Largest accepted `--timeout`: 7 days.
@@ -882,13 +885,41 @@ const MAX_CLIENT_TIMEOUT_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// Longest accepted change ID.
 const MAX_CHANGE_ID_LEN: usize = 128;
 
-/// Parse a `--timeout` value as a strict duration.
+/// How long a `cflx client wait` may run before it gives up.
+///
+/// A newtype rather than a bare `Duration` because the interesting value is the
+/// one a `Duration` cannot hold: "no operation deadline at all". Representing
+/// that as `Duration::ZERO` and comparing everywhere is how an unbounded wait
+/// turns into an instant timeout the first time someone forgets the special
+/// case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitTimeout(Option<std::time::Duration>);
+
+impl WaitTimeout {
+    /// Wait until the question is answered, however long that takes.
+    pub const UNBOUNDED: Self = Self(None);
+
+    /// The explicitly requested operation deadline, if there is one.
+    ///
+    /// `None` is the unbounded default, and the only form that never produces
+    /// the `timeout` outcome.
+    pub fn deadline(self) -> Option<std::time::Duration> {
+        self.0
+    }
+}
+
+/// Parse a `--timeout` value as a strict duration, or as the unbounded sentinel.
 ///
 /// Accepted spellings are `<n>`, `<n>ms`, `<n>s`, `<n>m`, and `<n>h`; a bare
 /// number is seconds. Deliberately strict: a silently-ignored suffix would turn
 /// `30m` into thirty seconds and make a wait report `timeout` on work that was
 /// fine. `ms` is matched before `m` for the same reason.
-pub fn parse_client_timeout(value: &str) -> std::result::Result<std::time::Duration, String> {
+///
+/// Every spelling whose magnitude is exactly zero — `0`, `0s`, `0ms`, `0m`, `0h`
+/// — means "no operation deadline", uniformly, because a caller who wrote a zero
+/// in any unit asked the same question. It is a sentinel and not a bound, so the
+/// minimum below applies only to positive values.
+pub fn parse_client_timeout(value: &str) -> std::result::Result<WaitTimeout, String> {
     let trimmed = value.trim();
     let (digits, multiplier) = if let Some(digits) = trimmed.strip_suffix("ms") {
         (digits, 1)
@@ -912,12 +943,17 @@ pub fn parse_client_timeout(value: &str) -> std::result::Result<std::time::Durat
     let millis = magnitude
         .checked_mul(multiplier)
         .ok_or_else(|| format!("'{value}' is out of range: the maximum timeout is 7d"))?;
+    // Checked before the range, because zero is not a duration this command is
+    // being asked to honour — it is the caller declining to name one.
+    if millis == 0 {
+        return Ok(WaitTimeout::UNBOUNDED);
+    }
     if !(MIN_CLIENT_TIMEOUT_MILLIS..=MAX_CLIENT_TIMEOUT_MILLIS).contains(&millis) {
         return Err(format!(
-            "'{value}' is out of range: the timeout must be between {MIN_CLIENT_TIMEOUT_MILLIS}ms and 7d"
+            "'{value}' is out of range: the timeout must be 0 (wait indefinitely) or between {MIN_CLIENT_TIMEOUT_MILLIS}ms and 7d"
         ));
     }
-    Ok(std::time::Duration::from_millis(millis))
+    Ok(WaitTimeout(Some(std::time::Duration::from_millis(millis))))
 }
 
 /// Parse a change ID as an ordinary managed identifier.
@@ -1014,7 +1050,8 @@ EXAMPLES:
   cflx client start --json
   cflx client stop --json
   cflx client force-stop --json
-  cflx client wait alpha --timeout 45m --json
+  cflx client wait alpha --json                    # Wait indefinitely (the default)
+  cflx client wait alpha --timeout 45m --json      # Give up after an explicit deadline
   cflx client subscribe set alpha beta --instance-id <owner-instance> --json -- /absolute/callback --flag value
   cflx client subscribe get alpha --instance-id <owner-instance> --json
   cflx client subscribe clear alpha beta --instance-id <owner-instance> --json
@@ -1117,12 +1154,18 @@ pub enum ClientCommands {
     /// classify or terminate work itself.
     ForceStop(ClientLifecycleArgs),
 
-    /// Observe one change until verified completion, a typed failure, or timeout
+    /// Observe one change until verified completion or a typed failure
     ///
     /// Observation only: it submits no start, retry, queue, resolve, archive,
     /// merge, or cleanup command. Success requires current repository evidence
     /// for the owner's terminal mode; a change merely disappearing from the
     /// snapshot is never completion.
+    ///
+    /// There is no deadline unless one is asked for: `--timeout` defaults to 0,
+    /// which waits for as long as the work takes. `--timeout D` adds one
+    /// operation deadline whose expiry is the typed `timeout` outcome. Either
+    /// way each owner request and each Git subprocess keeps its own bound, so an
+    /// unbounded wait never becomes an unbounded child process.
     Wait(ClientWaitArgs),
 
     /// Manage explicit completion subscriptions for named proposals
@@ -1183,10 +1226,12 @@ pub enum ClientCommands {
     /// — and calls the same client boundary the matching command does, so
     /// routing and typed outcomes are shared rather than reimplemented.
     ///
-    /// cflx_wait is deliberately absent from MCP: an unbounded completion wait
-    /// is not a tool call. `cflx client wait` remains the bounded CLI oracle,
-    /// and an MCP host that wants asynchronous completion registers an explicit
-    /// callback with cflx_subscribe.
+    /// cflx_wait is deliberately absent from MCP: a completion wait stays open
+    /// for as long as the work takes, which is not the shape of a tool call.
+    /// `cflx client wait` remains the CLI completion oracle — unbounded by
+    /// default, with `--timeout D` available when a caller does want a deadline
+    /// — and an MCP host that wants asynchronous completion registers an
+    /// explicit callback with cflx_subscribe.
     ///
     /// Connection defaults come from this namespace's --project-dir /
     /// --unix-socket and --auth-token-env, and each tool may override them per
@@ -1246,9 +1291,16 @@ pub struct ClientWaitArgs {
     #[arg(value_parser = parse_change_id)]
     pub change_id: String,
 
-    /// How long to observe before giving up (for example 500ms, 30s, 45m, 2h)
-    #[arg(long, value_name = "DURATION", default_value = "60m", value_parser = parse_client_timeout)]
-    pub timeout: std::time::Duration,
+    /// How long to observe before giving up; 0 (the default) waits indefinitely
+    ///
+    /// A positive duration — 500ms, 30s, 45m, 2h — creates one operation
+    /// deadline whose expiry is the typed `timeout` outcome. Zero, in any unit,
+    /// creates none: the wait ends at verified completion, a typed failure,
+    /// owner replacement, or cancellation, and never because a clock ran out.
+    /// Per-request transport limits and per-subprocess Git limits stay in force
+    /// either way.
+    #[arg(long, value_name = "DURATION", default_value = "0", value_parser = parse_client_timeout)]
+    pub timeout: WaitTimeout,
 
     /// Emit one versioned JSON envelope on stdout
     #[arg(long)]

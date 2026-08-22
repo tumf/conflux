@@ -1124,7 +1124,11 @@ impl CompletionSinkRegistry {
                 );
                 return None;
             }
-            let deadline = tokio::time::Instant::now() + VERIFY_ROUND_BUDGET;
+            // One shared instant for the round, so expiry ends this attempt the
+            // way it always has rather than becoming a per-child retry.
+            let deadline = crate::bounded_git::GitDeadline::Operation(
+                tokio::time::Instant::now() + VERIFY_ROUND_BUDGET,
+            );
             match crate::client::completion::certify(change_id, &repo_root, &contract, deadline)
                 .await
             {
