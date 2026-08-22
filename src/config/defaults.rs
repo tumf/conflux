@@ -135,6 +135,21 @@ pub const DEFAULT_COMMAND_INACTIVITY_TIMEOUT_MAX_RETRIES: u32 = 3;
 /// agent that keeps printing is still bounded. `0` disables it.
 pub const DEFAULT_COMMAND_MAX_RUNTIME_SECS: u64 = 10800;
 
+/// Default absolute runtime limit for one Acceptance invocation (seconds).
+///
+/// Thirty minutes: Acceptance reviews an existing implementation rather than
+/// producing one, so it needs a far smaller budget than Apply. Measured from
+/// successful child spawn and never extended by output. Unlike
+/// [`DEFAULT_COMMAND_MAX_RUNTIME_SECS`] this guard cannot be disabled: `0` is
+/// rejected at configuration load.
+pub const DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS: u64 = 1800;
+
+/// Smallest configurable Acceptance absolute runtime limit (seconds).
+pub const MIN_ACCEPTANCE_MAX_RUNTIME_SECS: u64 = 60;
+
+/// Largest configurable Acceptance absolute runtime limit (seconds).
+pub const MAX_ACCEPTANCE_MAX_RUNTIME_SECS: u64 = 10800;
+
 /// Default enablement for stream-json output textification
 pub const DEFAULT_STREAM_JSON_TEXTIFY: bool = true;
 

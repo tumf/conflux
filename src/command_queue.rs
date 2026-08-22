@@ -134,6 +134,21 @@ impl CommandQueue {
         }
     }
 
+    /// A queue that shares this one's stagger state but bounds its commands with
+    /// a different absolute runtime limit.
+    ///
+    /// Only `max_runtime_secs` moves: retry, inactivity, and cleanup settings
+    /// stay exactly as configured, so a per-command-class deadline cannot become
+    /// an accidental fork of the whole command policy.
+    pub fn with_max_runtime_secs(&self, max_runtime_secs: u64) -> Self {
+        let mut config = self.config.clone();
+        config.max_runtime_secs = max_runtime_secs;
+        Self {
+            config,
+            last_execution: self.last_execution.clone(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn shared_stagger_state(&self) -> Arc<Mutex<Option<Instant>>> {
         self.last_execution.clone()

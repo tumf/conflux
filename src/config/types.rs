@@ -386,6 +386,17 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub command_max_runtime_secs: Option<u64>,
 
+    /// Absolute runtime limit for one Acceptance invocation (seconds).
+    ///
+    /// Acceptance is a reviewer, not an implementation worker, so it carries its
+    /// own shorter deadline instead of Apply's. Measured from successful child
+    /// spawn and never extended by output. Accepts 60 through 10800; unlike
+    /// [`Self::command_max_runtime_secs`], `0` is rejected — Acceptance cannot
+    /// run unbounded.
+    /// Default: 1800 (30 minutes)
+    #[serde(default)]
+    pub acceptance_max_runtime_secs: Option<u64>,
+
     /// Enable stream-json output textification.
     /// When true (default), stdout lines that are Claude Code stream-json (NDJSON) events
     /// are converted to human-readable text before being emitted to logs.
@@ -611,6 +622,7 @@ impl OrchestratorConfig {
             command_inactivity_kill_grace_secs,
             command_inactivity_timeout_max_retries,
             command_max_runtime_secs,
+            acceptance_max_runtime_secs,
             stream_json_textify,
             command_strict_process_cleanup,
             lifecycle_integration,
@@ -712,6 +724,10 @@ impl OrchestratorConfig {
             command_inactivity_timeout_max_retries,
         );
         overwrite_if_some(&mut self.command_max_runtime_secs, command_max_runtime_secs);
+        overwrite_if_some(
+            &mut self.acceptance_max_runtime_secs,
+            acceptance_max_runtime_secs,
+        );
         overwrite_if_some(&mut self.stream_json_textify, stream_json_textify);
         overwrite_if_some(
             &mut self.command_strict_process_cleanup,
@@ -998,6 +1014,51 @@ impl OrchestratorConfig {
             .unwrap_or(defaults::DEFAULT_COMMAND_MAX_RUNTIME_SECS)
     }
 
+    /// Get the configured Acceptance absolute runtime limit (seconds).
+    ///
+    /// Default: 1800 (30 minutes). Never 0: the value is range-validated at
+    /// configuration load, so Acceptance always has a wall-clock guard. This is
+    /// the *dedicated* limit; [`Self::get_acceptance_runtime_limit_secs`] is the
+    /// effective bound once the common safety limit is taken into account.
+    pub fn get_acceptance_max_runtime_secs(&self) -> u64 {
+        self.acceptance_max_runtime_secs
+            .unwrap_or(defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS)
+    }
+
+    /// The absolute runtime bound one Acceptance invocation actually runs under.
+    ///
+    /// A positive common limit is a safety budget every command class shares, so
+    /// Acceptance takes the shorter of the two. A disabled (`0`) common limit
+    /// disables nothing here: the dedicated limit still applies.
+    pub fn get_acceptance_runtime_limit_secs(&self) -> u64 {
+        crate::orchestration::acceptance::acceptance_runtime_limit_secs(
+            self.get_acceptance_max_runtime_secs(),
+            self.get_command_max_runtime_secs(),
+        )
+    }
+
+    /// Validate the Acceptance absolute runtime limit with an actionable range
+    /// diagnostic.
+    ///
+    /// `0` is deliberately not a disable token here: an Acceptance invocation
+    /// that can run forever is the failure this guard exists to prevent, so it
+    /// is reported with the same range message as any other invalid value.
+    pub fn validate_acceptance_max_runtime_secs(&self) -> Result<()> {
+        let Some(configured) = self.acceptance_max_runtime_secs else {
+            return Ok(());
+        };
+        let min = defaults::MIN_ACCEPTANCE_MAX_RUNTIME_SECS;
+        let max = defaults::MAX_ACCEPTANCE_MAX_RUNTIME_SECS;
+        if (min..=max).contains(&configured) {
+            return Ok(());
+        }
+        Err(OrchestratorError::ConfigLoad(format!(
+            "Configuration error: `acceptance_max_runtime_secs` must be between {min} and {max} \
+             seconds (got {configured}). Acceptance cannot disable its absolute runtime limit, so \
+             `0` is not accepted; use `command_max_runtime_secs` for the common command budget."
+        )))
+    }
+
     /// Get whether stream-json output textification is enabled.
     /// Default: true (convert stream-json events to human-readable text)
     pub fn get_stream_json_textify(&self) -> bool {
@@ -1060,6 +1121,7 @@ impl OrchestratorConfig {
         self.get_stall_detection().validate()?;
         self.validate_operation_skills()?;
         self.validate_lifecycle_integration()?;
+        self.validate_acceptance_max_runtime_secs()?;
 
         let mut missing = Vec::new();
 

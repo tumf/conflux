@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 async fn wait_for_streaming_child_with_cancel(
-    mut child: crate::process_manager::StreamingChildHandle,
+    child: &mut crate::process_manager::StreamingChildHandle,
     cancel_token: Option<&CancellationToken>,
     operation: &str,
     change_id: &str,
@@ -416,7 +416,7 @@ async fn run_cleanup_review_attempt(
     }
 
     let status = wait_for_streaming_child_with_cancel(
-        child,
+        &mut child,
         cancel_token,
         "cleanup-review",
         change_id,
@@ -1192,7 +1192,7 @@ pub async fn execute_archive_in_workspace(
         // Wait for process to complete. Keep this cancellation-aware because
         // output pipes may close before the child process status is available.
         let status = wait_for_streaming_child_with_cancel(
-            child,
+            &mut child,
             cancel_token,
             "archive",
             change_id,
@@ -1832,8 +1832,15 @@ pub async fn execute_acceptance_in_workspace(
     // Capture start time for history recording
     let start_time = std::time::Instant::now();
 
+    // Acceptance reviews an implementation rather than producing one, so it runs
+    // under its own dedicated absolute deadline instead of Apply's much larger
+    // `command_max_runtime_secs`. A positive common limit still caps it; a
+    // disabled (`0`) common limit does not unbound it.
+    let acceptance_runtime_limit_secs = config.get_acceptance_runtime_limit_secs();
+    let acceptance_runner = ai_runner.with_max_runtime_secs(acceptance_runtime_limit_secs);
+
     // Execute command via AiCommandRunner (with stagger and retry)
-    let (mut child, mut output_rx) = ai_runner
+    let (mut child, mut output_rx) = acceptance_runner
         .execute_streaming_with_retry(
             &command,
             Some(workspace_path),
@@ -1983,7 +1990,7 @@ pub async fn execute_acceptance_in_workspace(
     // status waiting cancellation-aware because output pipes can close before
     // the child process is reaped.
     let status = match wait_for_streaming_child_with_cancel(
-        child,
+        &mut child,
         cancel_token,
         "acceptance",
         change_id,
@@ -2004,6 +2011,56 @@ pub async fn execute_acceptance_in_workspace(
         }
         Err(err) => return Err(err),
     };
+
+    // Absolute Acceptance runtime limit. This gate runs before the exit-status
+    // and verdict branches below because a SIGKILLed agent reports the same
+    // non-zero status a crash does: the reason is read from the runner's typed
+    // termination, never inferred. Expiry closes retry admission for this
+    // invocation, and the process-group cleanup evidence travels with it so an
+    // unproven group is reported rather than silently acknowledged.
+    {
+        let termination = child.termination().await;
+        if termination.is_runtime_limit() {
+            let cleanup = child.process_group_cleanup().await;
+            let limit = crate::orchestration::acceptance::classify_acceptance_runtime_limit(
+                termination,
+                acceptance_runtime_limit_secs,
+                &cleanup,
+            )
+            .expect("runtime-limit termination always classifies as a runtime limit");
+            warn!(
+                change_id = %change_id,
+                workspace = %workspace_path.display(),
+                iteration = acceptance_iteration,
+                limit_secs = limit.limit_secs,
+                cleanup_confirmed = limit.cleanup_confirmed,
+                "Acceptance exceeded its absolute runtime limit: {}",
+                limit.cleanup_diagnostics
+            );
+            // No canonical attempt was produced, so nothing is recorded in
+            // acceptance history and no attempt number is consumed: a terminated
+            // invocation is not a verdict and must never be replayed as one.
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::error(limit.summary(change_id))
+                            .with_change_id(change_id)
+                            .with_operation("acceptance")
+                            .with_iteration(acceptance_iteration),
+                    ))
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
+                    .await;
+            }
+            return Ok((
+                crate::orchestration::AcceptanceResult::RuntimeLimit { limit },
+                0,
+            ));
+        }
+    }
 
     // When the runtime terminated the child after a canonical verdict, the
     // terminated exit code is not a real failure — the acceptance result is
