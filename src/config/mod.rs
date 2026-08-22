@@ -1431,6 +1431,226 @@ mod tests {
         }
     }
 
+    // === Acceptance absolute runtime limit ===
+
+    /// A fully-populated config, so `validate_required_commands` reaches the
+    /// range check instead of stopping at a missing command.
+    fn config_with_required_commands(
+        acceptance_max_runtime_secs: Option<u64>,
+    ) -> OrchestratorConfig {
+        OrchestratorConfig {
+            apply_command: Some("apply".to_string()),
+            archive_command: Some("archive".to_string()),
+            analyze_command: Some("analyze".to_string()),
+            acceptance_command: Some("accept".to_string()),
+            resolve_command: Some("resolve".to_string()),
+            acceptance_max_runtime_secs,
+            ..OrchestratorConfig::default()
+        }
+    }
+
+    #[test]
+    fn acceptance_max_runtime_defaults_to_thirty_minutes() {
+        let config = OrchestratorConfig::default();
+        assert!(config.acceptance_max_runtime_secs.is_none());
+        assert_eq!(
+            config.get_acceptance_max_runtime_secs(),
+            1800,
+            "Acceptance defaults to a 30-minute absolute runtime limit"
+        );
+        assert_eq!(
+            config.get_acceptance_max_runtime_secs(),
+            defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS
+        );
+    }
+
+    /// The dedicated limit follows the same precedence every other command
+    /// setting does: a higher-priority `Some` wins, `None` preserves.
+    #[test]
+    fn acceptance_max_runtime_follows_normal_config_precedence() {
+        let mut base = OrchestratorConfig {
+            acceptance_max_runtime_secs: Some(600),
+            ..OrchestratorConfig::default()
+        };
+        base.merge(OrchestratorConfig::default());
+        assert_eq!(
+            base.get_acceptance_max_runtime_secs(),
+            600,
+            "an unset higher-priority layer must not erase the configured value"
+        );
+
+        // global -> project -> custom, each layer merged over the previous one.
+        let mut merged = OrchestratorConfig {
+            acceptance_max_runtime_secs: Some(3600),
+            ..OrchestratorConfig::default()
+        };
+        merged.merge(OrchestratorConfig {
+            acceptance_max_runtime_secs: Some(1200),
+            ..OrchestratorConfig::default()
+        });
+        merged.merge(OrchestratorConfig {
+            acceptance_max_runtime_secs: Some(900),
+            ..OrchestratorConfig::default()
+        });
+        assert_eq!(
+            merged.get_acceptance_max_runtime_secs(),
+            900,
+            "custom overrides project, which overrides global"
+        );
+
+        let parsed = OrchestratorConfig::parse_jsonc(
+            r#"{
+            "acceptance_max_runtime_secs": 2400
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.acceptance_max_runtime_secs, Some(2400));
+        assert_eq!(parsed.get_acceptance_max_runtime_secs(), 2400);
+    }
+
+    /// `0` disables the *common* budget; here it is simply out of range, because
+    /// Acceptance may not run without a wall-clock guard at all.
+    #[test]
+    fn acceptance_max_runtime_rejects_zero_with_an_actionable_diagnostic() {
+        let config = config_with_required_commands(Some(0));
+        let error = config
+            .validate_acceptance_max_runtime_secs()
+            .expect_err("zero must not load");
+        let message = error.to_string();
+        assert!(
+            message.contains("acceptance_max_runtime_secs"),
+            "the diagnostic must name the field: {message}"
+        );
+        assert!(
+            message.contains("between 60 and 10800"),
+            "the diagnostic must state the accepted range: {message}"
+        );
+        assert!(
+            message.contains("`0` is not accepted"),
+            "the diagnostic must say why zero is refused: {message}"
+        );
+
+        assert!(
+            config.validate_required_commands().is_err(),
+            "the range check is reached on the configuration load path"
+        );
+    }
+
+    #[test]
+    fn acceptance_max_runtime_enforces_its_range_bounds() {
+        for rejected in [1_u64, 59, 10_801, 86_400] {
+            assert!(
+                config_with_required_commands(Some(rejected))
+                    .validate_acceptance_max_runtime_secs()
+                    .is_err(),
+                "{rejected}s is outside 60..=10800 and must be refused"
+            );
+        }
+
+        for accepted in [
+            defaults::MIN_ACCEPTANCE_MAX_RUNTIME_SECS,
+            1800,
+            defaults::MAX_ACCEPTANCE_MAX_RUNTIME_SECS,
+        ] {
+            let config = config_with_required_commands(Some(accepted));
+            assert!(
+                config.validate_acceptance_max_runtime_secs().is_ok(),
+                "{accepted}s is inside the accepted range"
+            );
+            assert!(
+                config.validate_required_commands().is_ok(),
+                "{accepted}s must also load"
+            );
+        }
+
+        assert!(
+            config_with_required_commands(None)
+                .validate_acceptance_max_runtime_secs()
+                .is_ok(),
+            "an unconfigured field falls back to the in-range default"
+        );
+    }
+
+    /// The two knobs are independent: the Acceptance guard survives a disabled
+    /// common budget, and a shorter common budget still caps Acceptance.
+    #[test]
+    fn acceptance_runtime_limit_composes_with_the_common_limit() {
+        let disabled_common = OrchestratorConfig::parse_jsonc(
+            r#"{
+            "command_max_runtime_secs": 0
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(disabled_common.get_command_max_runtime_secs(), 0);
+        assert_eq!(
+            disabled_common.get_acceptance_runtime_limit_secs(),
+            1800,
+            "disabling the common command budget must not unbound Acceptance"
+        );
+
+        let shorter_common = OrchestratorConfig::parse_jsonc(
+            r#"{
+            "command_max_runtime_secs": 300,
+            "acceptance_max_runtime_secs": 1800
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            shorter_common.get_acceptance_runtime_limit_secs(),
+            300,
+            "a shorter common safety limit still applies to Acceptance"
+        );
+        assert_eq!(
+            shorter_common.get_command_max_runtime_secs(),
+            300,
+            "other command classes are untouched by the Acceptance knob"
+        );
+
+        let acceptance_only = OrchestratorConfig::parse_jsonc(
+            r#"{
+            "acceptance_max_runtime_secs": 600
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(acceptance_only.get_acceptance_runtime_limit_secs(), 600);
+        assert_eq!(
+            acceptance_only.get_command_max_runtime_secs(),
+            10800,
+            "configuring the Acceptance limit must never move the common one"
+        );
+    }
+
+    /// Every generated configuration example is a distributed contract: an
+    /// operator who copies one must read the same default, the same range, and
+    /// the same "no disable" rule the code enforces.
+    #[test]
+    fn generated_config_examples_document_the_acceptance_runtime_limit() {
+        for template in [
+            crate::cli::Template::Claude,
+            crate::cli::Template::Opencode,
+            crate::cli::Template::Codex,
+        ] {
+            let example = crate::templates::get_template_content(template);
+            assert!(
+                example.contains("\"acceptance_max_runtime_secs\": 1800"),
+                "{template:?} example must show the {}-second default",
+                defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS
+            );
+            assert!(
+                example.contains("Default: 1800 (30 minutes)"),
+                "{template:?} example must name the default explicitly"
+            );
+            assert!(
+                example.contains("Accepts 60 through 10800"),
+                "{template:?} example must state the accepted range"
+            );
+            assert!(
+                example.contains("0 is rejected"),
+                "{template:?} example must keep the no-disable rule"
+            );
+        }
+    }
+
     // === Tests for XDG config path precedence ===
 
     #[test]

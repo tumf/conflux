@@ -9,6 +9,9 @@ mod model;
 mod promotion;
 mod rendering;
 pub(crate) mod validation;
+mod verify;
+
+pub use verify::cmd_verify;
 
 use crate::archive_layout;
 use archive::ArchiveEngine;

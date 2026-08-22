@@ -731,6 +731,20 @@ impl AiCommandRunner {
         self.command_queue.config()
     }
 
+    /// A runner identical to this one except for its absolute runtime limit.
+    ///
+    /// Used by command classes that carry their own deadline (Acceptance) so the
+    /// dedicated limit is applied at the call site without changing the limit
+    /// every other class runs under. The stagger state, run scope, envs, and
+    /// cleanup settings are shared, so the bounded runner stays part of the same
+    /// invocation's ownership.
+    pub fn with_max_runtime_secs(&self, max_runtime_secs: u64) -> Self {
+        Self {
+            command_queue: self.command_queue.with_max_runtime_secs(max_runtime_secs),
+            ..self.clone()
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn shared_stagger_state(&self) -> SharedStaggerState {
         self.command_queue.shared_stagger_state()
