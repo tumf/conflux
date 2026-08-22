@@ -1433,6 +1433,90 @@ pub fn build_acceptance_tail_findings(
     }
 }
 
+/// The absolute runtime bound one Acceptance invocation runs under.
+///
+/// `command_max_runtime_secs` is the safety budget every command class shares,
+/// so a positive value still caps Acceptance. `0` disables that common budget
+/// only: the dedicated Acceptance limit is not disableable, so it remains the
+/// bound. Pure over both inputs so the precedence rule is verifiable without a
+/// configuration file or a process.
+pub fn acceptance_runtime_limit_secs(acceptance_limit_secs: u64, common_limit_secs: u64) -> u64 {
+    if common_limit_secs == 0 {
+        acceptance_limit_secs
+    } else {
+        acceptance_limit_secs.min(common_limit_secs)
+    }
+}
+
+/// Typed evidence for an Acceptance invocation stopped by its runtime limit.
+///
+/// Carries the configured limit that expired and the owned process group's
+/// cleanup evidence, because "we stopped it" and "it is actually gone" are
+/// separate facts and an unproven group must never be reported as quiescent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceRuntimeLimit {
+    /// The effective absolute limit, in seconds, that this invocation exceeded.
+    pub limit_secs: u64,
+    /// Whether the owned process group was proven quiescent after termination.
+    pub cleanup_confirmed: bool,
+    /// One-line process-group cleanup diagnostics from the runner's own report.
+    pub cleanup_diagnostics: String,
+}
+
+impl AcceptanceRuntimeLimit {
+    /// Another attempt at the same invocation is never admissible.
+    ///
+    /// The limit is a boundary decision, not transient evidence: re-running it
+    /// would re-run exactly the work the limit just stopped. Operator-triggered
+    /// recovery stays explicit and repository-derived.
+    pub fn permits_retry(&self) -> bool {
+        false
+    }
+
+    /// Actionable operator-facing summary used as the workspace error text.
+    pub fn summary(&self, change_id: &str) -> String {
+        let cleanup = if self.cleanup_confirmed {
+            "owned process group confirmed quiescent".to_string()
+        } else {
+            format!(
+                "owned process group NOT confirmed quiescent — {}",
+                self.cleanup_diagnostics
+            )
+        };
+        format!(
+            "Acceptance for '{}' was terminated by its absolute runtime limit of {}s \
+             (`acceptance_max_runtime_secs`); {}. This invocation is not retried automatically: \
+             it is not a PASS, not an external block, not an inactivity timeout, and not a \
+             missing-verdict continuation. Reduce the proposal's Acceptance scope or raise \
+             `acceptance_max_runtime_secs`, then retry explicitly.",
+            change_id, self.limit_secs, cleanup
+        )
+    }
+}
+
+/// Classify one Acceptance invocation's typed termination.
+///
+/// Returns `Some` only for absolute-runtime-limit expiry. Every other reason —
+/// an ordinary exit, an inactivity timeout, cancellation, or an invocation that
+/// never started — keeps its existing routing, so this can never turn a verdict
+/// or an operator stop into a runtime-limit failure. The reason is read from the
+/// runner's typed termination rather than inferred from the exit status, because
+/// a SIGKILLed agent reports the same status a crash does.
+pub fn classify_acceptance_runtime_limit(
+    termination: crate::process_manager::CommandTermination,
+    limit_secs: u64,
+    cleanup: &crate::process_manager::ProcessGroupCleanupReport,
+) -> Option<AcceptanceRuntimeLimit> {
+    if !termination.is_runtime_limit() {
+        return None;
+    }
+    Some(AcceptanceRuntimeLimit {
+        limit_secs,
+        cleanup_confirmed: cleanup.is_confirmed(),
+        cleanup_diagnostics: cleanup.diagnostics(),
+    })
+}
+
 /// Result of an acceptance operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptanceResult {
@@ -1482,6 +1566,15 @@ pub enum AcceptanceResult {
     /// canonical `Continue`; it must never consume the explicit-CONTINUE
     /// retry path.
     MissingVerdict { findings: Vec<String> },
+    /// Acceptance exceeded its own absolute runtime limit and was terminated.
+    ///
+    /// Terminal for this invocation and deliberately distinct from every other
+    /// variant: it is not a verdict, so it never reaches verdict routing; it is
+    /// not `CommandFailed`, so it never consumes command-recovery retry; it is
+    /// not `MissingVerdict`, so it never enters no-verdict protocol
+    /// continuation; and it is not `Cancelled`, so an operator stop and a
+    /// runaway Acceptance stay distinguishable in reporting.
+    RuntimeLimit { limit: AcceptanceRuntimeLimit },
     /// Acceptance was cancelled (e.g., by user or timeout).
     Cancelled,
 }
@@ -1507,6 +1600,25 @@ impl AcceptanceResult {
                 | AcceptanceResult::Continue
                 | AcceptanceResult::Stalled { .. }
                 | AcceptanceResult::PermissionStalled { .. }
+        )
+    }
+
+    /// Returns true when this invocation was stopped by its absolute runtime
+    /// limit.
+    pub fn is_runtime_limit(&self) -> bool {
+        matches!(self, AcceptanceResult::RuntimeLimit { .. })
+    }
+
+    /// Whether another Acceptance invocation for the same work is admissible in
+    /// the active run.
+    ///
+    /// Deliberate terminations — the absolute runtime limit and cancellation —
+    /// are decisions rather than transient evidence, so neither is re-dispatched
+    /// automatically. Every other result keeps its own existing routing.
+    pub fn permits_acceptance_retry(&self) -> bool {
+        !matches!(
+            self,
+            AcceptanceResult::RuntimeLimit { .. } | AcceptanceResult::Cancelled
         )
     }
 }
@@ -1894,6 +2006,10 @@ where
             evidence.extend(findings.iter().cloned());
             Some(crate::acceptance::legacy_findings(evidence))
         }
+        // Unreachable by construction: verdict parsing never produces a runtime
+        // limit, which is classified from the runner's typed termination before
+        // any output is parsed. A terminated invocation carries no findings.
+        AcceptanceResult::RuntimeLimit { .. } => None,
         AcceptanceResult::CommandFailed { .. }
         | AcceptanceResult::PermissionStalled { .. }
         | AcceptanceResult::Cancelled => {
@@ -1927,6 +2043,308 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // === Acceptance absolute runtime limit ===
+
+    /// Acceptance is a reviewer, not an implementation worker, so it carries a
+    /// dedicated non-disableable deadline. Every claim here is about a decision,
+    /// so nothing in this module spawns a process or reads a configuration file;
+    /// the real-process enforcement of that decision lives in
+    /// `tests/process_cleanup_test.rs`.
+    mod runtime_limit {
+        use super::super::*;
+        use crate::process_manager::{
+            CommandTermination, ProcessGroupCleanupReport, ProcessGroupQuiescence,
+        };
+
+        const ACCEPTANCE_DEFAULT: u64 = 1_800;
+        const COMMON_DEFAULT: u64 = 10_800;
+
+        fn confirmed_cleanup() -> ProcessGroupCleanupReport {
+            ProcessGroupCleanupReport::for_test(
+                ProcessGroupQuiescence::Confirmed,
+                Some(4242),
+                "group empty after SIGTERM",
+            )
+        }
+
+        fn unprovable_cleanup() -> ProcessGroupCleanupReport {
+            ProcessGroupCleanupReport::for_test(
+                ProcessGroupQuiescence::Unverifiable,
+                Some(4242),
+                "a SIGTERM-immune descendant outlived the verification budget",
+            )
+        }
+
+        /// The dedicated limit is shorter than the shared command budget, so the
+        /// default Acceptance invocation is bounded by 30 minutes rather than by
+        /// Apply's three hours.
+        #[test]
+        fn acceptance_uses_the_shorter_default() {
+            assert_eq!(
+                acceptance_runtime_limit_secs(ACCEPTANCE_DEFAULT, COMMON_DEFAULT),
+                ACCEPTANCE_DEFAULT,
+                "the dedicated Acceptance limit is the binding one at the defaults"
+            );
+        }
+
+        /// `0` disables the *common* budget only. Acceptance has no disable
+        /// token at all, so its own limit still bounds the invocation.
+        #[test]
+        fn a_disabled_common_limit_does_not_unbound_acceptance() {
+            assert_eq!(
+                acceptance_runtime_limit_secs(ACCEPTANCE_DEFAULT, 0),
+                ACCEPTANCE_DEFAULT,
+                "disabling the shared command budget must never unbound Acceptance"
+            );
+        }
+
+        /// The common budget is a safety limit every class shares, so a shorter
+        /// positive value still wins.
+        #[test]
+        fn a_shorter_common_safety_limit_still_applies() {
+            assert_eq!(
+                acceptance_runtime_limit_secs(ACCEPTANCE_DEFAULT, 300),
+                300,
+                "Acceptance takes the minimum of the dedicated and common limits"
+            );
+            assert_eq!(
+                acceptance_runtime_limit_secs(600, 10_800),
+                600,
+                "a configured Acceptance limit below the common one is honored"
+            );
+        }
+
+        /// Acceptance is routed through a runner carrying the dedicated limit,
+        /// and building it leaves the runner every other command class uses
+        /// exactly as configured.
+        #[test]
+        fn routing_bounds_acceptance_without_moving_other_command_classes() {
+            use crate::ai_command_runner::AiCommandRunner;
+            use crate::config::OrchestratorConfig;
+            use std::sync::Arc;
+            use tokio::sync::Mutex;
+
+            let config = OrchestratorConfig {
+                command_max_runtime_secs: Some(COMMON_DEFAULT),
+                acceptance_max_runtime_secs: Some(ACCEPTANCE_DEFAULT),
+                command_inactivity_timeout_secs: Some(900),
+                ..OrchestratorConfig::default()
+            };
+            let runner =
+                AiCommandRunner::from_orchestrator_config(&config, Arc::new(Mutex::new(None)));
+            let acceptance =
+                runner.with_max_runtime_secs(config.get_acceptance_runtime_limit_secs());
+
+            assert_eq!(
+                acceptance.queue_config().max_runtime_secs,
+                ACCEPTANCE_DEFAULT,
+                "the Acceptance invocation runs under the dedicated limit"
+            );
+            assert_eq!(
+                runner.queue_config().max_runtime_secs,
+                COMMON_DEFAULT,
+                "Apply, Archive, analysis, and resolution keep `command_max_runtime_secs`"
+            );
+            assert_eq!(
+                acceptance.queue_config().inactivity_timeout_secs,
+                runner.queue_config().inactivity_timeout_secs,
+                "only the absolute deadline moves; the rest of the command policy is shared"
+            );
+            assert_eq!(
+                acceptance.queue_config().max_retries,
+                runner.queue_config().max_retries
+            );
+        }
+
+        /// The effective bound composes the two configured knobs the same way at
+        /// the configuration boundary as the pure rule does.
+        #[test]
+        fn the_configured_effective_limit_matches_the_rule() {
+            use crate::config::OrchestratorConfig;
+
+            let defaults = OrchestratorConfig::default();
+            assert_eq!(
+                defaults.get_acceptance_runtime_limit_secs(),
+                ACCEPTANCE_DEFAULT,
+                "an unconfigured project still bounds Acceptance at 30 minutes"
+            );
+
+            let disabled_common = OrchestratorConfig {
+                command_max_runtime_secs: Some(0),
+                ..OrchestratorConfig::default()
+            };
+            assert_eq!(
+                disabled_common.get_acceptance_runtime_limit_secs(),
+                ACCEPTANCE_DEFAULT
+            );
+
+            let shorter_common = OrchestratorConfig {
+                command_max_runtime_secs: Some(300),
+                ..OrchestratorConfig::default()
+            };
+            assert_eq!(shorter_common.get_acceptance_runtime_limit_secs(), 300);
+        }
+
+        /// Only the runtime limit classifies as one. A SIGKILLed agent, an agent
+        /// that crashed, and an agent an operator stopped all report a non-zero
+        /// status, so the reason has to come from the typed termination.
+        #[test]
+        fn only_runtime_limit_termination_classifies_as_one() {
+            for termination in [
+                CommandTermination::Exited,
+                CommandTermination::InactivityTimeout,
+                CommandTermination::Cancelled,
+                CommandTermination::NotStarted,
+            ] {
+                assert!(
+                    classify_acceptance_runtime_limit(
+                        termination,
+                        ACCEPTANCE_DEFAULT,
+                        &confirmed_cleanup(),
+                    )
+                    .is_none(),
+                    "{} must keep its own routing",
+                    termination.as_str()
+                );
+            }
+
+            let limit = classify_acceptance_runtime_limit(
+                CommandTermination::RuntimeLimit,
+                ACCEPTANCE_DEFAULT,
+                &confirmed_cleanup(),
+            )
+            .expect("runtime-limit termination classifies as a runtime limit");
+            assert_eq!(limit.limit_secs, ACCEPTANCE_DEFAULT);
+            assert!(limit.cleanup_confirmed);
+        }
+
+        /// Expiry is a boundary decision, so the same invocation is never
+        /// re-dispatched, and the operator-facing text has to name both the knob
+        /// and that decision.
+        #[test]
+        fn expiry_is_terminal_for_the_invocation_and_says_so() {
+            let limit = classify_acceptance_runtime_limit(
+                CommandTermination::RuntimeLimit,
+                ACCEPTANCE_DEFAULT,
+                &confirmed_cleanup(),
+            )
+            .expect("classified");
+
+            assert!(
+                !limit.permits_retry(),
+                "a timed-out Acceptance invocation is never retried automatically"
+            );
+
+            let summary = limit.summary("change-a");
+            assert!(summary.contains("1800s"), "the configured limit: {summary}");
+            assert!(
+                summary.contains("acceptance_max_runtime_secs"),
+                "the knob an operator has to change: {summary}"
+            );
+            assert!(
+                summary.contains("not retried automatically"),
+                "the retry decision must be visible: {summary}"
+            );
+            assert!(
+                summary.contains("change-a"),
+                "the affected proposal: {summary}"
+            );
+        }
+
+        /// Terminating is not the same fact as proving the group is gone. An
+        /// unprovable sweep is reported, never acknowledged as quiescence.
+        #[test]
+        fn cleanup_failure_is_not_hidden() {
+            let limit = classify_acceptance_runtime_limit(
+                CommandTermination::RuntimeLimit,
+                ACCEPTANCE_DEFAULT,
+                &unprovable_cleanup(),
+            )
+            .expect("classified");
+
+            assert!(
+                !limit.cleanup_confirmed,
+                "an unswept owned group must never count as quiescent"
+            );
+            assert!(
+                limit.cleanup_diagnostics.contains("SIGTERM-immune"),
+                "the runner's own evidence must survive: {}",
+                limit.cleanup_diagnostics
+            );
+
+            let summary = limit.summary("change-a");
+            assert!(
+                summary.contains("NOT confirmed quiescent"),
+                "unproven cleanup must be stated, not implied: {summary}"
+            );
+            assert!(
+                summary.contains("SIGTERM-immune"),
+                "the actionable cleanup diagnostics must reach the operator: {summary}"
+            );
+            assert!(
+                !limit.permits_retry(),
+                "unprovable cleanup never converts the limit into a retry"
+            );
+        }
+
+        /// The result must not be mistakable for a verdict, for cancellation, or
+        /// for any of the bounded retry protocols keyed off the other variants.
+        #[test]
+        fn runtime_limit_is_its_own_terminal_result() {
+            let limit = classify_acceptance_runtime_limit(
+                CommandTermination::RuntimeLimit,
+                ACCEPTANCE_DEFAULT,
+                &confirmed_cleanup(),
+            )
+            .expect("classified");
+            let result = AcceptanceResult::RuntimeLimit { limit };
+
+            assert!(result.is_runtime_limit());
+            assert!(
+                !result.is_pass(),
+                "a terminated invocation can never be a PASS"
+            );
+            assert!(
+                !result.is_canonical_verdict(),
+                "no verdict was emitted, so no verdict protocol may consume it"
+            );
+            assert!(
+                !result.permits_acceptance_retry(),
+                "the invocation that the limit stopped is not re-dispatched"
+            );
+            assert!(
+                !matches!(
+                    result,
+                    AcceptanceResult::MissingVerdict { .. }
+                        | AcceptanceResult::CommandFailed { .. }
+                        | AcceptanceResult::Stalled { .. }
+                        | AcceptanceResult::BareBlocker { .. }
+                        | AcceptanceResult::PermissionStalled { .. }
+                        | AcceptanceResult::Cancelled
+                ),
+                "runtime-limit expiry is not a missing verdict, a command failure, \
+                 an external block, or a cancellation"
+            );
+        }
+
+        /// Cancellation is the one other deliberate termination, and it keeps its
+        /// own reporting: an operator stop and a runaway Acceptance must stay
+        /// distinguishable even though neither is retried.
+        #[test]
+        fn cancellation_and_runtime_limit_stay_distinct() {
+            assert!(!AcceptanceResult::Cancelled.is_runtime_limit());
+            assert!(!AcceptanceResult::Cancelled.permits_acceptance_retry());
+            assert!(
+                AcceptanceResult::Pass.permits_acceptance_retry(),
+                "only deliberate terminations close acceptance re-dispatch"
+            );
+            assert!(AcceptanceResult::MissingVerdict {
+                findings: Vec::new()
+            }
+            .permits_acceptance_retry());
+        }
+    }
 
     // === Acceptance command-failure recovery ===
 
