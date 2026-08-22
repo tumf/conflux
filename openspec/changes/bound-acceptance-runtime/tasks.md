@@ -1,9 +1,9 @@
 ## Implementation Tasks
 
-- [ ] Add validated `acceptance_max_runtime_secs` configuration with a 1800-second default, 60..=10800 range, zero rejection, and normal precedence (verification: unit - `cargo test orchestration::acceptance --lib`; verification-id: acceptance-runtime-tests)
+- [ ] Add validated `acceptance_max_runtime_secs` configuration with a 1800-second default, 60..=10800 range, zero rejection, and normal precedence (verification: unit - `cargo test config:: --lib`; verification-id: acceptance-runtime-config-tests)
 - [ ] Route Acceptance command construction through the Acceptance-specific limit without changing other command classes (verification: unit - `cargo test orchestration::acceptance --lib`; verification-id: acceptance-runtime-tests)
 - [ ] Convert Acceptance runtime expiry into a typed non-retryable failure after bounded owned-process-group cleanup, with actionable limit and cleanup diagnostics (verification: unit - `cargo test orchestration::acceptance --lib`; verification-id: acceptance-runtime-tests)
-- [ ] Add regression coverage and update generated config/operator documentation for the new guard (verification: unit - `cargo test orchestration::acceptance --lib`; verification-id: acceptance-runtime-tests)
+- [ ] Add regression coverage for common-limit interaction and retry classification, and update generated config/operator documentation for the new guard (verification: unit - `cargo test orchestration::acceptance --lib` and `cargo test config:: --lib`; verification-id: acceptance-runtime-tests; verification-id: acceptance-runtime-config-tests)
 
 ## Future Work
 

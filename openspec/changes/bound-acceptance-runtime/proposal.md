@@ -20,6 +20,17 @@ verifications:
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
+  - id: acceptance-runtime-config-tests
+    requirement: Acceptance runtime configuration defaults, precedence, range, and zero rejection are validated
+    phase: pre-integration
+    owner: conflux-acceptance
+    trigger: pull-request-validation
+    automation: src/config/mod.rs
+    evidence: "cargo test config:: --lib"
+    rerun: "cargo test config:: --lib"
+    prerequisites: []
+    execution_class: repository-local
+    completion_role: change-blocking
 ---
 
 # Bound Acceptance runtime
@@ -38,24 +49,24 @@ Add `acceptance_max_runtime_secs` as an Acceptance-specific absolute deadline:
 - Valid range: 60 through 10800 seconds.
 - Zero is rejected; Acceptance cannot disable its wall-clock guard.
 - Configuration follows existing global, project, custom, and CLI construction precedence.
-- Acceptance uses this value when constructing its command runner; Apply, Archive, analysis, resolution, and other command types retain `command_max_runtime_secs`.
+- Acceptance uses the shorter of its dedicated limit and any enabled positive `command_max_runtime_secs`; when the common limit is disabled with zero, the dedicated Acceptance limit still applies. Apply, Archive, analysis, resolution, and other command types retain `command_max_runtime_secs`.
 - Expiry closes retry admission for that Acceptance invocation, terminates and reaps the owned process group through the existing cleanup path, and produces a typed actionable Acceptance failure containing the configured limit.
 - A timed-out Acceptance invocation is not automatically retried. Operator-triggered recovery remains explicit and repository-derived.
 
 ## Acceptance Criteria
 
 - Acceptance defaults to a 30-minute absolute runtime limit even when the common command limit is three hours or disabled.
-- A configured valid Acceptance limit is honored without altering other command classes.
+- A configured valid Acceptance limit is honored, subject to any shorter enabled common safety limit, without altering other command classes.
 - Continuous output does not extend the Acceptance deadline.
 - Expiry proves process-group quiescence before the workflow proceeds or reports cleanup failure.
-- Timeout is visible as a typed Acceptance failure and cannot be mistaken for PASS, external block, or inactivity timeout.
+- Timeout is visible as a typed Acceptance failure and cannot be mistaken for PASS, external block, inactivity timeout, no-verdict protocol continuation, or corrective command-recovery retry.
 - Existing Acceptance success and verdict parsing remain unchanged below the limit.
 
 ## Explicit Completion Conditions
 
 - Config tests cover default, precedence, lower/upper bounds, and zero rejection.
 - Acceptance runner tests cover success, continuous-output expiry, no same-invocation retry, and cleanup failure diagnostics.
-- `cargo test orchestration::acceptance --lib` passes.
+- `cargo test orchestration::acceptance --lib` and `cargo test config:: --lib` pass.
 
 ## Out of Scope
 
