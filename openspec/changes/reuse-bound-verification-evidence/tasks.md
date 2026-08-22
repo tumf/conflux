@@ -1,9 +1,9 @@
 ## Implementation Tasks
 
-- [ ] Define and parse the versioned repository-relative evidence envelope with exact identity and digest fields, rejecting malformed or partial records (verification: unit - `cargo test orchestration::acceptance --lib`; verification-id: bound-evidence-tests)
-- [ ] Capture successful Apply verification evidence only after the command exits, artifacts are digested, and index/worktree cleanliness is proven (verification: unit - `cargo test orchestration::acceptance --lib`; verification-id: bound-evidence-tests)
+- [ ] Define and parse the versioned Git-excluded repository-relative evidence sidecar with exact identity and digest fields, rejecting malformed, partial, or agent-authored records (verification: unit - `cargo test orchestration::acceptance --lib`; verification-id: bound-evidence-tests)
+- [ ] Implement the Conflux-runtime-owned verification executor with injected Git/process adapters for tests; capture evidence only after directly supervised success, artifact hashing, unchanged pre/post bindings, and evidence-path-excluded cleanliness (verification: integration - `cargo test orchestration::acceptance --lib`; verification-id: bound-evidence-tests)
 - [ ] Validate every binding against current Git and proposal state and reuse only exact successful matches; otherwise rerun with an actionable reason (verification: unit - `cargo test orchestration::acceptance --lib`; verification-id: bound-evidence-tests)
-- [ ] Add cheap-command rerun policy, per-verification observability, adversarial mismatch tests, and operator documentation (verification: unit - `cargo test orchestration::acceptance --lib`; verification-id: bound-evidence-tests)
+- [ ] Add a repository-tracked minimum-duration rerun policy, per-verification observability, adversarial mismatch and self-reference tests, and operator documentation (verification: unit - `cargo test orchestration::acceptance --lib`; verification-id: bound-evidence-tests)
 
 ## Future Work
 

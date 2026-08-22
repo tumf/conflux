@@ -31,20 +31,20 @@ Apply may already run the exact repository-local command declared for Acceptance
 
 ## Proposed Solution
 
-Define an optional tracked verification evidence envelope under the change worktree and allow Acceptance to reuse it only after fail-closed validation.
+Define an optional repository-local verification evidence sidecar under the change worktree. A Conflux-runtime-owned executor, not the Apply agent, creates it from a process the runtime directly supervises. Acceptance may reuse it only after fail-closed validation.
 
 Each record binds:
 
 - verification ID;
-- full 40-hex Apply commit/tree identity used for the run;
+- full-length Apply commit object ID and tree ID used for the run;
 - exact argv array and normalized working directory relative to repository root;
 - tracked automation-file blob ID;
 - tool executable identity, preferring immutable digest and otherwise an exact version plus executable file digest;
 - start/end timestamps and exit code;
 - evidence artifact path plus content digest;
-- clean index and worktree state at capture.
+- clean index and worktree state at capture, excluding only the designated runtime evidence directory.
 
-Acceptance may reuse a record only when all bindings match the current worktree, proposal declaration, automation blob, executable identity, and successful exit code. Any missing, malformed, stale, dirty, mismatched, or unverifiable field means rerun; it never means PASS. Cheap checks remain rerunnable by policy. Reuse decisions are derived entirely from tracked workspace content and current Git state.
+Acceptance may reuse a record only when it was created by the runtime executor and all bindings match the current worktree, proposal declaration, automation blob, executable identity, and successful exit code. The current tree may differ from the bound commit only inside the designated evidence directory. Any agent-authored, missing, malformed, stale, dirty, mismatched, or unverifiable field means rerun; it never means PASS. Cheap checks remain rerunnable by a repository-tracked duration policy. Reuse decisions are derived entirely from repository-local evidence and current Git state.
 
 ## Acceptance Criteria
 
@@ -52,12 +52,13 @@ Acceptance may reuse a record only when all bindings match the current worktree,
 - Commit/tree, argv, cwd, automation blob, tool identity, artifact digest, exit code, and clean-state mismatches force rerun.
 - Missing or malformed evidence forces rerun and produces an actionable reason.
 - Evidence from another branch, worktree, verification ID, or executable cannot satisfy Acceptance.
-- Reused evidence remains repository-verifiable and survives restart without external state.
+- Reused evidence remains repository-verifiable and survives restart without external state or Git history pollution.
 - A policy threshold keeps cheap commands on the existing rerun path.
 
 ## Explicit Completion Conditions
 
-- A versioned evidence schema and repository-relative location are documented and parsed fail-closed.
+- A versioned evidence schema, Git-excluded repository-relative location, and evidence-path-excluded clean-state rule are documented and parsed fail-closed.
+- A runtime-owned executor directly supervises eligible verification commands and rejects agent-authored envelopes.
 - Tests cover exact reuse and each mismatch class, including dirty worktree and short-SHA rejection.
 - Acceptance output states `reused` or `rerun` per verification ID and the reason without treating malformed evidence as failure of the implementation itself.
 - `cargo test orchestration::acceptance --lib` passes.
