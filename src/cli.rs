@@ -1433,6 +1433,39 @@ pub enum OpenspecCommands {
 
     /// Archive a deployed change and promote spec deltas
     Archive(OpenspecArchiveArgs),
+
+    /// Run a change's repository-local verifications under runtime supervision
+    ///
+    /// The Conflux runtime — not the calling agent — starts the declared argv,
+    /// waits for it, and records a sidecar bound to the current commit, tree,
+    /// automation blob, and executable. Acceptance may reuse that record only
+    /// while every one of those bindings still matches, so a command whose
+    /// evidence is stale, dirty, or absent is simply run again.
+    ///
+    /// EXAMPLES:
+    ///   cflx openspec verify my-change              # Run what cannot be reused
+    ///   cflx openspec verify my-change --plan       # Show reuse decisions only
+    ///   cflx openspec verify my-change --verification-id local-tests --json
+    Verify(OpenspecVerifyArgs),
+}
+
+/// Arguments for `cflx openspec verify`
+#[derive(Parser, Debug)]
+pub struct OpenspecVerifyArgs {
+    /// Change ID whose declared verifications to run
+    pub change_id: String,
+
+    /// Run only this declared verification ID
+    #[arg(long)]
+    pub verification_id: Option<String>,
+
+    /// Report reuse decisions without executing anything
+    #[arg(long)]
+    pub plan: bool,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `cflx openspec list`

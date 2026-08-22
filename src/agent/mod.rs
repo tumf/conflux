@@ -20,8 +20,9 @@ pub use prompt::{
     build_archive_prompt, build_archive_prompt_with_skill, build_cleanup_review_correction_context,
     build_cleanup_review_prompt, build_cleanup_review_prompt_with_skill,
     build_last_acceptance_output_context, build_missing_verdict_continuation_context,
-    build_task_format_repair_context, count_cleanup_review_markers, parse_cleanup_review_output,
-    CleanupMarkerScanner, CleanupReviewDiagnostic, CleanupReviewFailureKind,
+    build_task_format_repair_context, build_verification_reuse_context,
+    count_cleanup_review_markers, parse_cleanup_review_output, CleanupMarkerScanner,
+    CleanupReviewDiagnostic, CleanupReviewFailureKind,
 };
 pub use runner::AgentRunner;
 
