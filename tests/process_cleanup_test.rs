@@ -399,6 +399,19 @@ mod absolute_runtime_limit {
     /// A run-owned runner with the absolute limit set and every other lifecycle
     /// limit disabled, so a terminated command is unambiguous evidence.
     fn runner_with_limit(scope: &RunCommandScope, max_runtime_secs: u64) -> AiCommandRunner {
+        runner_with_limits(scope, max_runtime_secs, None)
+    }
+
+    /// The same runner, with the dedicated Acceptance limit injected too.
+    ///
+    /// `acceptance_max_runtime_secs` is deliberately set below its configured
+    /// floor here: the floor is a *configuration load* rule, and this test needs
+    /// an injected short limit rather than a real 300-second wait.
+    fn runner_with_limits(
+        scope: &RunCommandScope,
+        max_runtime_secs: u64,
+        acceptance_max_runtime_secs: Option<u64>,
+    ) -> AiCommandRunner {
         let config = OrchestratorConfig {
             command_queue_stagger_delay_ms: Some(0),
             command_queue_max_retries: Some(1),
@@ -407,6 +420,7 @@ mod absolute_runtime_limit {
             command_inactivity_timeout_secs: Some(0),
             command_inactivity_timeout_max_retries: Some(0),
             command_max_runtime_secs: Some(max_runtime_secs),
+            acceptance_max_runtime_secs,
             ..OrchestratorConfig::default()
         };
         AiCommandRunner::for_run(&config, Arc::new(Mutex::new(None)), scope.clone())
@@ -493,30 +507,37 @@ mod absolute_runtime_limit {
     ///
     /// The common budget is disabled here, so nothing but the dedicated
     /// Acceptance limit can end this command — which is exactly the case a
-    /// legacy or malformed proposal produces. The bound comes from the same
-    /// precedence rule the Acceptance call site uses, not from a hand-picked
-    /// number.
+    /// legacy or malformed proposal produces. No forked runner selects that
+    /// bound: the *common* runner does, from the `"acceptance"` operation type
+    /// this call already declares.
     #[tokio::test]
     async fn acceptance_stays_bounded_when_the_common_limit_is_disabled() {
-        use conflux::orchestration::acceptance::acceptance_runtime_limit_secs;
+        // The operation type is the selector, spelled here exactly as a real
+        // Acceptance call site spells it.
+        const ACCEPTANCE_OPERATION_TYPE: &str = "acceptance";
 
         let scope = RunCommandScope::new();
         // `0` = the shared command budget is disabled for every class.
-        let runner = runner_with_limit(&scope, 0);
+        let runner = runner_with_limits(&scope, 0, Some(1));
         assert_eq!(runner.queue_config().max_runtime_secs, 0);
-
-        let effective = acceptance_runtime_limit_secs(1, 0);
         assert_eq!(
-            effective, 1,
+            runner.queue_config().effective_max_runtime_secs(None),
+            0,
+            "every other class is genuinely unbounded here"
+        );
+        assert_eq!(
+            runner
+                .queue_config()
+                .effective_max_runtime_secs(Some(ACCEPTANCE_OPERATION_TYPE)),
+            1,
             "a disabled common limit leaves the dedicated Acceptance limit binding"
         );
-        let acceptance = runner.with_max_runtime_secs(effective);
 
-        let (mut handle, mut rx) = acceptance
+        let (mut handle, mut rx) = runner
             .execute_streaming_with_retry(
                 CHATTY_FOREVER,
                 None,
-                Some("acceptance"),
+                Some(ACCEPTANCE_OPERATION_TYPE),
                 Some("change-a"),
             )
             .await

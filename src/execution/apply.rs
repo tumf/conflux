@@ -5064,6 +5064,8 @@ mod tests {
 
     pub(super) fn make_test_ai_runner() -> crate::ai_command_runner::AiCommandRunner {
         let queue_config = crate::command_queue::CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 0,
             retry_delay_ms: 0,
@@ -9105,6 +9107,8 @@ mod apply_budget_recovery {
         // Two transport retries inside one dispatch: the command queue owns them,
         // so the outer per-change count must still observe exactly one dispatch.
         let queue_config = crate::command_queue::CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 2,
             retry_delay_ms: 0,

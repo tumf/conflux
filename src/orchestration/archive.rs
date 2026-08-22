@@ -800,6 +800,8 @@ exit 0
             use std::sync::Arc;
             use tokio::sync::Mutex;
             let queue_config = CommandQueueConfig {
+                acceptance_max_runtime_secs:
+                    crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
                 stagger_delay_ms: config
                     .command_queue_stagger_delay_ms
                     .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
@@ -917,6 +919,8 @@ mv "$base_dir/openspec/changes/$1" "$base_dir/openspec/changes/archive/$1"
         use std::sync::Arc;
         use tokio::sync::Mutex;
         let queue_config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: config
                 .command_queue_stagger_delay_ms
                 .unwrap_or(DEFAULT_STAGGER_DELAY_MS),

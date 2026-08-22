@@ -390,9 +390,11 @@ pub struct OrchestratorConfig {
     ///
     /// Acceptance is a reviewer, not an implementation worker, so it carries its
     /// own shorter deadline instead of Apply's. Measured from successful child
-    /// spawn and never extended by output. Accepts 60 through 10800; unlike
+    /// spawn and never extended by output. Accepts 300 through 10800; unlike
     /// [`Self::command_max_runtime_secs`], `0` is rejected — Acceptance cannot
-    /// run unbounded.
+    /// run unbounded. The floor constrains this key only: a shorter positive
+    /// [`Self::command_max_runtime_secs`] is an independent safety limit and may
+    /// still produce an effective Acceptance bound below 300 seconds.
     /// Default: 1800 (30 minutes)
     #[serde(default)]
     pub acceptance_max_runtime_secs: Option<u64>,
@@ -1018,23 +1020,13 @@ impl OrchestratorConfig {
     ///
     /// Default: 1800 (30 minutes). Never 0: the value is range-validated at
     /// configuration load, so Acceptance always has a wall-clock guard. This is
-    /// the *dedicated* limit; [`Self::get_acceptance_runtime_limit_secs`] is the
-    /// effective bound once the common safety limit is taken into account.
+    /// the *dedicated* limit; the effective bound, once the common safety limit
+    /// is taken into account, is resolved in exactly one place —
+    /// [`crate::command_queue::CommandQueueConfig::effective_max_runtime_secs`],
+    /// which the common runner calls with the invocation's operation type.
     pub fn get_acceptance_max_runtime_secs(&self) -> u64 {
         self.acceptance_max_runtime_secs
             .unwrap_or(defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS)
-    }
-
-    /// The absolute runtime bound one Acceptance invocation actually runs under.
-    ///
-    /// A positive common limit is a safety budget every command class shares, so
-    /// Acceptance takes the shorter of the two. A disabled (`0`) common limit
-    /// disables nothing here: the dedicated limit still applies.
-    pub fn get_acceptance_runtime_limit_secs(&self) -> u64 {
-        crate::orchestration::acceptance::acceptance_runtime_limit_secs(
-            self.get_acceptance_max_runtime_secs(),
-            self.get_command_max_runtime_secs(),
-        )
     }
 
     /// Validate the Acceptance absolute runtime limit with an actionable range
