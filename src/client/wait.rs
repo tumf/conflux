@@ -34,12 +34,26 @@
 //! bound only the parts that were already fast. Expiry is an *operation*
 //! outcome: whatever the inner step would have reported afterwards, the answer
 //! is `timeout`, and nothing was submitted.
+//!
+//! # No deadline is the default
+//!
+//! Omitting `--timeout`, or spelling it `0`, means the caller wants the answer
+//! rather than a report about the clock, so there is no operation deadline at
+//! all and no `timeout` outcome to reach. That is a promise about the
+//! *operation*, not about the processes it spawns: the transport keeps its
+//! per-request valve, and every Git child gets a fresh finite budget of its own
+//! ([`GIT_INVOCATION_BUDGET`]) — otherwise a single `git ls-remote` against an
+//! unreachable remote would turn "wait as long as it takes" into "hang forever
+//! on the first hop". A child that hits that budget is killed, reaped, and
+//! retried on the next poll; it never borrows the `timeout` outcome that belongs
+//! to callers who asked for a deadline.
 
 use std::future::Future;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::bounded_git::GitDeadline;
 use crate::client::completion::{certify, claims_terminal_success, Verdict};
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
 use crate::client::session::{observe, Connection, Observation};
@@ -56,20 +70,61 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Delay before retrying after a transient failure to observe.
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Run one step under the operation deadline.
+/// Longest one Git child may run when there is no operation deadline above it.
+///
+/// Deliberately the same 30 seconds as the transport's per-request valve: both
+/// answer "this single hop is not coming back", and an unbounded wait needs the
+/// two to agree so a stalled remote and a stalled owner cost the same nothing.
+/// Generous on purpose — expiry costs a respawn on the next poll, so the only
+/// way this can hurt is by being *shorter* than a slow-but-healthy `ls-remote`.
+const GIT_INVOCATION_BUDGET: Duration = Duration::from_secs(30);
+
+/// Run one step under the operation deadline, if there is one.
 ///
 /// `None` means the deadline passed. The inner future is dropped at that point,
 /// which is safe precisely because everything reachable from here is read-only:
 /// `wait` submits no command, so a cancelled step can never have half-applied
 /// one. Git children are the exception that needs more than dropping, and they
 /// carry the deadline down to the spawn site themselves.
-async fn within<F: Future>(deadline: Instant, future: F) -> Option<F::Output> {
-    tokio::time::timeout_at(deadline, future).await.ok()
+///
+/// Without a deadline the step simply runs: an unbounded wait has nothing to
+/// compare against, and inventing a bound here would be the synthesized deadline
+/// this default exists to remove.
+async fn within<F: Future>(deadline: Option<Instant>, future: F) -> Option<F::Output> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await.ok(),
+        None => Some(future.await),
+    }
+}
+
+/// Whether an operation deadline exists and has already passed.
+fn reached(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+/// How the Git children of one verification round are bounded.
+///
+/// A positive `--timeout` hands its own deadline down, so expiry is the
+/// operation's answer. Without one, each child gets a fresh finite budget whose
+/// expiry is only that child giving up.
+fn git_deadline(deadline: Option<Instant>) -> GitDeadline {
+    match deadline {
+        Some(deadline) => GitDeadline::Operation(deadline),
+        None => GitDeadline::PerChild(GIT_INVOCATION_BUDGET),
+    }
 }
 
 /// Observe one change until verified completion, a typed failure, or timeout.
-pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) -> ResultEnvelope {
-    let deadline = Instant::now() + timeout;
+///
+/// `timeout` is `None` for the unbounded default that omission and `--timeout 0`
+/// both select; `Some(d)` is an explicitly requested positive operation
+/// deadline, and the only form that can end in `timeout`.
+pub async fn run(
+    connection: &Connection,
+    change_id: &str,
+    timeout: Option<Duration>,
+) -> ResultEnvelope {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
 
     // Bounded from the very first read: a socket that accepts a connection and
     // then stops talking must cost the caller its own timeout, not the
@@ -119,7 +174,7 @@ pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) ->
                 return timeout_envelope(change_id, &instance_id, timeout, detail)
             }
             Step::KeepObserving { detail } => {
-                if Instant::now() >= deadline {
+                if reached(deadline) {
                     return timeout_envelope(change_id, &instance_id, timeout, detail);
                 }
             }
@@ -128,11 +183,16 @@ pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) ->
         // Wake on published activity, and fall back to the poll cadence. The
         // budget never outlives the caller's deadline, so a quiet owner cannot
         // stretch the wait past what was asked for.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return timeout_envelope(change_id, &instance_id, timeout, None);
-        }
-        let budget = POLL_INTERVAL.min(remaining);
+        let budget = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return timeout_envelope(change_id, &instance_id, timeout, None);
+                }
+                POLL_INTERVAL.min(remaining)
+            }
+            None => POLL_INTERVAL,
+        };
         let wake = connection
             .client()
             .wake_on_activity(observation.event_sequence, &instance_id, budget)
@@ -149,7 +209,7 @@ pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) ->
             match result {
                 Ok(next) => break next,
                 Err(error) if error.is_transient() => {
-                    if Instant::now() >= deadline {
+                    if reached(deadline) {
                         return timeout_envelope(
                             change_id,
                             &instance_id,
@@ -157,15 +217,18 @@ pub async fn run(connection: &Connection, change_id: &str, timeout: Duration) ->
                             Some(error.message().to_string()),
                         );
                     }
-                    tokio::time::sleep(
-                        RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
-                    )
-                    .await;
+                    let backoff = match deadline {
+                        Some(deadline) => {
+                            RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))
+                        }
+                        None => RETRY_INTERVAL,
+                    };
+                    tokio::time::sleep(backoff).await;
                 }
                 // A socket that stopped answering mid-wait is an owner that is
                 // gone. It is never completion: the repository has to say so.
                 Err(error) => {
-                    match certify(change_id, &repo_root, &contract, deadline).await {
+                    match certify(change_id, &repo_root, &contract, git_deadline(deadline)).await {
                         Verdict::Completed { evidence } => {
                             return completed_envelope(change_id, &instance_id, &contract, evidence)
                         }
@@ -207,12 +270,12 @@ async fn evaluate(
     change_id: &str,
     repo_root: &std::path::Path,
     contract: &OwnerExecutionContract,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Step {
     // Owner replacement first: everything below would otherwise be read from a
     // process that never saw the work this wait is about.
     if observation.instance_id != instance_id {
-        let verdict = certify(change_id, repo_root, contract, deadline).await;
+        let verdict = certify(change_id, repo_root, contract, git_deadline(deadline)).await;
         return match verdict {
             // Repository evidence alone is enough, and it is the *only* thing
             // that is: the new incarnation cannot vouch for the old one's
@@ -282,7 +345,7 @@ async fn evaluate(
         };
     }
 
-    match certify(change_id, repo_root, contract, deadline).await {
+    match certify(change_id, repo_root, contract, git_deadline(deadline)).await {
         Verdict::Completed { evidence } => Step::settled(completed_envelope(
             change_id,
             instance_id,
@@ -342,16 +405,28 @@ fn contract_detail(contract: &OwnerExecutionContract) -> serde_json::Value {
     })
 }
 
+/// How the expired budget reads in a message.
+///
+/// `None` is unreachable from a timeout: without an operation deadline there is
+/// nothing to expire. It stays representable rather than panicking, because the
+/// wrong answer to "which budget ran out" is a worse failure than a vague one.
+fn budget_phrase(timeout: Option<Duration>) -> String {
+    match timeout {
+        Some(timeout) => format!(" within {}ms", timeout.as_millis()),
+        None => String::new(),
+    }
+}
+
 /// The timeout that happened before any owner incarnation was observed.
 ///
 /// It carries no `instance_id` because none was ever reconciled — reporting one
 /// would claim an observation the operation never made.
-fn unobserved_timeout_envelope(change_id: &str, timeout: Duration) -> ResultEnvelope {
+fn unobserved_timeout_envelope(change_id: &str, timeout: Option<Duration>) -> ResultEnvelope {
     ResultEnvelope::new(Operation::Wait, Outcome::Timeout)
         .with_change(change_id)
         .with_message(format!(
-            "the owner did not answer the first observation within {}ms",
-            timeout.as_millis()
+            "the owner did not answer the first observation{}",
+            budget_phrase(timeout)
         ))
         .with_detail(serde_json::json!({ "commands_submitted": 0 }))
 }
@@ -359,12 +434,12 @@ fn unobserved_timeout_envelope(change_id: &str, timeout: Duration) -> ResultEnve
 fn timeout_envelope(
     change_id: &str,
     instance_id: &str,
-    timeout: Duration,
+    timeout: Option<Duration>,
     detail: Option<String>,
 ) -> ResultEnvelope {
     let mut message = format!(
-        "no verified terminal outcome for '{change_id}' within {}ms",
-        timeout.as_millis()
+        "no verified terminal outcome for '{change_id}'{}",
+        budget_phrase(timeout)
     );
     if let Some(detail) = detail {
         message.push_str(&format!("; {detail}"));
@@ -405,7 +480,7 @@ mod tests {
         let envelope = timeout_envelope(
             "alpha",
             "i-1",
-            Duration::from_secs(90),
+            Some(Duration::from_secs(90)),
             Some("no archive entry".to_string()),
         );
         assert_eq!(envelope.outcome, Outcome::Timeout);
@@ -414,5 +489,43 @@ mod tests {
         assert!(message.contains("within 90000ms"), "{message}");
         assert!(message.contains("no archive entry"), "{message}");
         assert_eq!(envelope.detail["commands_submitted"], 0);
+    }
+
+    #[test]
+    fn an_unbounded_wait_never_reaches_an_operation_deadline() {
+        assert!(!reached(None));
+        // Even an instant that is already in the past is only reachable when the
+        // caller asked for one.
+        assert!(reached(Some(Instant::now() - Duration::from_secs(1))));
+        assert!(!reached(Some(Instant::now() + Duration::from_secs(60))));
+    }
+
+    #[test]
+    fn git_children_are_bounded_per_child_exactly_when_the_operation_is_not() {
+        // The invariant the unbounded default rests on: no operation deadline
+        // still means no unbounded `git`.
+        assert!(matches!(
+            git_deadline(None),
+            GitDeadline::PerChild(GIT_INVOCATION_BUDGET)
+        ));
+        assert!(git_deadline(Some(Instant::now())).is_operation_deadline());
+    }
+
+    #[tokio::test]
+    async fn a_step_without_a_deadline_is_run_rather_than_bounded() {
+        // `within` must not synthesize a bound: an unbounded wait that quietly
+        // wrapped each step in one would be the 60-minute default under a new
+        // name.
+        assert_eq!(within(None, async { 7 }).await, Some(7));
+        // A step that would block is where the difference shows: with a deadline
+        // already behind it, the same future is abandoned.
+        assert_eq!(
+            within(
+                Some(Instant::now() - Duration::from_secs(1)),
+                std::future::pending::<i32>()
+            )
+            .await,
+            None
+        );
     }
 }

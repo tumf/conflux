@@ -105,7 +105,7 @@ would contend for the lock with the process you meant to talk to.
 cflx client status --json                 # read the owner; mutates nothing
 cflx client mark add-my-change --json     # select it; unrelated marks are preserved
 cflx client start --json                  # F5 equivalent over the authoritative marks
-cflx client wait add-my-change --timeout 45m --json
+cflx client wait add-my-change --json     # waits for as long as the work takes
 cflx client mcp                           # serve the same controls over stdio MCP
 ```
 
@@ -127,6 +127,15 @@ settlement and analysis, exactly as it is for a mark typed at the TUI. `start`,
 stop controls submit — `start` consumes the owner's authoritative mark set and
 takes no target list, because "start only these" is not something the shared
 transaction can express.
+
+**`wait` has no deadline unless you ask for one.** `--timeout` defaults to `0`,
+and zero in any unit means "wait for as long as the work takes": the wait ends at
+verified completion, a typed failure, owner replacement, or your own
+cancellation. A positive `--timeout D` opts back into one operation deadline
+whose expiry is the typed `timeout` outcome. Neither form makes a subprocess
+unbounded — each owner request keeps the transport's per-request valve, and every
+Git child an unbounded wait spawns is terminated and reaped at a finite
+per-invocation deadline of its own rather than reported as `timeout`.
 
 **Read `outcome`, not prose.** `--json` prints exactly one versioned envelope on
 stdout; diagnostics go to stderr, and each outcome has its own stable exit
@@ -159,8 +168,8 @@ projects by naming one per call. Nothing is remembered between calls.
 
 `cflx_wait` is deliberately absent from MCP: a completion wait is open for as
 long as the work takes, which is not a tool call. `cflx client wait` remains the
-bounded CLI oracle, and an MCP host that wants asynchronous completion registers
-an explicit callback with `cflx_subscribe`. A host that cannot execute a callback
+CLI oracle, and an MCP host that wants asynchronous completion registers an
+explicit callback with `cflx_subscribe`. A host that cannot execute a callback
 has no MCP completion oracle, by design.
 
 ### Completion notifications

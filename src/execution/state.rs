@@ -33,10 +33,9 @@
 
 use std::path::Path;
 use tokio::process::Command;
-use tokio::time::Instant;
 use tracing::debug;
 
-use crate::bounded_git::{run_git, GitOutcome};
+use crate::bounded_git::{run_git, GitDeadline, GitOutcome};
 
 use crate::error::{OrchestratorError, Result};
 use crate::execution::archive::is_archive_commit_complete;
@@ -136,17 +135,20 @@ pub async fn classify_base_completion(
     base_branch: &str,
 ) -> BaseCompletionEvidence {
     // No deadline, so expiry is unreachable and the fallback is unobservable.
-    classify_base_completion_within(change_id, repo_root, base_branch, None)
+    classify_base_completion_within(change_id, repo_root, base_branch, GitDeadline::Unbounded)
         .await
         .unwrap_or(BaseCompletionEvidence::NotCompleted)
 }
 
-/// [`classify_base_completion`], bounded by a caller's operation deadline.
+/// [`classify_base_completion`], bounded by a caller's [`GitDeadline`].
 ///
-/// `None` means the deadline passed before the evidence was established. It is
-/// deliberately not an [`BaseCompletionEvidence::EvidenceError`]: a classification
-/// that ran out of time says nothing about the repository, and reporting broken
-/// evidence would send an operator to look at a repository that is fine.
+/// `None` means a Git child hit that bound before the evidence was established.
+/// It is deliberately not an [`BaseCompletionEvidence::EvidenceError`]: a
+/// classification that ran out of time says nothing about the repository, and
+/// reporting broken evidence would send an operator to look at a repository that
+/// is fine. What the expiry *means* is the caller's to decide — the whole
+/// operation ran out under [`GitDeadline::Operation`], one attempt gave up under
+/// [`GitDeadline::PerChild`].
 ///
 /// Every Git child is spawned through [`run_git`], so an expiry terminates and
 /// reaps the classification's own subprocess instead of orphaning it.
@@ -154,7 +156,7 @@ pub async fn classify_base_completion_within(
     change_id: &str,
     repo_root: &Path,
     base_branch: &str,
-    deadline: Option<Instant>,
+    deadline: GitDeadline,
 ) -> Option<BaseCompletionEvidence> {
     let failed = |detail: String| {
         Some(BaseCompletionEvidence::EvidenceError {
