@@ -488,6 +488,93 @@ mod absolute_runtime_limit {
         assert!(!survived, "process group {pgid} survived its runtime limit");
     }
 
+    /// Acceptance carries its own deadline, and continuous output cannot
+    /// postpone that one either.
+    ///
+    /// The common budget is disabled here, so nothing but the dedicated
+    /// Acceptance limit can end this command — which is exactly the case a
+    /// legacy or malformed proposal produces. The bound comes from the same
+    /// precedence rule the Acceptance call site uses, not from a hand-picked
+    /// number.
+    #[tokio::test]
+    async fn acceptance_stays_bounded_when_the_common_limit_is_disabled() {
+        use conflux::orchestration::acceptance::acceptance_runtime_limit_secs;
+
+        let scope = RunCommandScope::new();
+        // `0` = the shared command budget is disabled for every class.
+        let runner = runner_with_limit(&scope, 0);
+        assert_eq!(runner.queue_config().max_runtime_secs, 0);
+
+        let effective = acceptance_runtime_limit_secs(1, 0);
+        assert_eq!(
+            effective, 1,
+            "a disabled common limit leaves the dedicated Acceptance limit binding"
+        );
+        let acceptance = runner.with_max_runtime_secs(effective);
+
+        let (mut handle, mut rx) = acceptance
+            .execute_streaming_with_retry(
+                CHATTY_FOREVER,
+                None,
+                Some("acceptance"),
+                Some("change-a"),
+            )
+            .await
+            .expect("an open scope admits the command");
+        let pgid = wait_for_pgid(&handle).await;
+
+        let mut lines = 0usize;
+        let drain = tokio::spawn(async move {
+            while let Some(line) = rx.recv().await {
+                if matches!(line, OutputLine::Stdout(_)) {
+                    lines += 1;
+                }
+            }
+            lines
+        });
+
+        let status = tokio::time::timeout(SAFETY, handle.wait())
+            .await
+            .expect("the dedicated Acceptance limit must end a command that never stops emitting")
+            .expect("the runner publishes a final status");
+        let termination = handle.termination().await;
+        let cleanup = handle.process_group_cleanup().await;
+        let emitted = drain.await.expect("the drain task joins");
+
+        let survived = reap_and_report_survival(pgid);
+        assert!(
+            emitted > 0,
+            "arrangement failed: the command must have been emitting output"
+        );
+        assert!(!status.success());
+        assert_eq!(
+            termination,
+            CommandTermination::RuntimeLimit,
+            "Acceptance ends on its own absolute limit, not on an ordinary exit"
+        );
+        assert!(
+            !termination.permits_retry(),
+            "retry admission closes for a timed-out Acceptance invocation"
+        );
+        assert!(
+            cleanup.is_confirmed(),
+            "the owned group must be proven quiescent: {}",
+            cleanup.diagnostics()
+        );
+        assert!(
+            !survived,
+            "process group {pgid} survived the Acceptance runtime limit"
+        );
+
+        // The runner every other command class uses is untouched: building the
+        // Acceptance-bounded runner must not move Apply's budget.
+        assert_eq!(
+            runner.queue_config().max_runtime_secs,
+            0,
+            "the dedicated Acceptance limit is applied at the Acceptance call site only"
+        );
+    }
+
     /// `0` is an explicit disable: total elapsed runtime alone never ends the
     /// command, and cancellation stays independently effective.
     #[tokio::test]

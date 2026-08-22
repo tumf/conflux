@@ -2918,10 +2918,11 @@ impl ParallelExecutor {
                             // never completes, so it neither resets nor consumes
                             // this budget.
                             Ok((result, acceptance_iteration)) => {
-                                if !matches!(
-                                    result,
-                                    crate::orchestration::AcceptanceResult::Cancelled
-                                ) {
+                                // Cancellation and absolute-runtime-limit expiry
+                                // never completed an invocation, so neither
+                                // resets nor consumes the command-recovery
+                                // budget.
+                                if result.permits_acceptance_retry() {
                                     crate::orchestration::acceptance::observe_completed_acceptance_invocation(
                                         &mut acceptance_command_recovery,
                                         &mut agent,
@@ -3598,6 +3599,43 @@ impl ParallelExecutor {
                                 "decide_acceptance_blocker owns every blocker-bearing result"
                             ),
                         }
+                    }
+                    Ok((
+                        crate::orchestration::AcceptanceResult::RuntimeLimit { limit },
+                        acceptance_iteration,
+                    )) => {
+                        // Terminal for this invocation. It is deliberately not
+                        // routed through missing-verdict continuation, the
+                        // command-recovery retry, or the FAIL-to-Apply repair
+                        // cycle: the limit stopped the work, so re-dispatching
+                        // it inside this run would re-run exactly what was
+                        // stopped. Operator-triggered recovery stays explicit.
+                        let error = limit.summary(&change_id);
+                        error!(
+                            "Acceptance runtime limit for {} (cycle {}): {}",
+                            change_id, cycle_count, error
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::error(format!(
+                                        "Acceptance runtime limit (cycle {}): {}",
+                                        cycle_count, error
+                                    ))
+                                    .with_change_id(&change_id)
+                                    .with_operation("acceptance")
+                                    .with_iteration(acceptance_iteration),
+                                ))
+                                .await;
+                        }
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: Some(error),
+                            rejected: None,
+                        };
                     }
                     Ok((
                         crate::orchestration::AcceptanceResult::Cancelled,
