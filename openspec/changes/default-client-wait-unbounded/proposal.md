@@ -14,8 +14,8 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: tests/client_cli_tests.rs
-    evidence: cargo test --test client_cli_tests wait_
-    rerun: cargo test --test client_cli_tests wait_
+    evidence: cargo test --test client_cli_tests
+    rerun: cargo test --test client_cli_tests
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -36,25 +36,27 @@ The CLI currently rejects zero and represents every wait with a mandatory `Durat
 Make the default timeout `0`, with `0` meaning no overall operation deadline:
 
 - `cflx client wait <change-id>` waits until verified completion, a typed terminal failure, owner replacement, cancellation by the calling process, or another non-timeout terminal observation.
-- `cflx client wait <change-id> --timeout 0` has the same unbounded behavior.
+- `cflx client wait <change-id> --timeout 0` has the same unbounded behavior, and so does every accepted spelling whose value is exactly zero (`0s`, `0ms`, `0m`, `0h`).
 - An explicit positive timeout keeps the existing monotonic operation-deadline behavior and typed `timeout` outcome.
-- Internal transport and Git subprocess safety bounds remain in force. Unbounded operation duration must not create unbounded child processes or disable process cleanup.
+- Per-request transport limits remain in force. Git subprocesses are today bounded only by the operation deadline, so an unbounded wait introduces a finite per-invocation deadline for every Git child it spawns; inner expiry terminates and reaps the child and is a recoverable or typed evidence condition, never the operation-level `timeout` outcome. Unbounded operation duration must not create unbounded child processes or disable process cleanup.
 - Help and operator documentation state that the default is `0` and that zero means unbounded.
 
 ## Acceptance Criteria
 
-- Omitting `--timeout` and passing `--timeout 0` both select unbounded operation duration.
+- Omitting `--timeout` and passing any exactly-zero timeout spelling both select unbounded operation duration.
 - An unbounded wait does not synthesize a deadline or return `timeout` merely because 60 minutes elapsed.
+- An unbounded wait bounds every Git subprocess with a finite per-invocation deadline; a stalled remote lookup is terminated and reaped without producing the operation-level `timeout` outcome.
 - Explicit positive durations retain their current parsing, upper bound, deadline enforcement, child termination, and typed timeout result.
-- Invalid timeout syntax and values above the existing maximum remain usage errors.
+- Invalid timeout syntax and positive values below the existing minimum or above the existing maximum remain usage errors.
 - Wait remains observation-only and uses the same repository completion oracle.
 
 ## Explicit Completion Conditions
 
-- CLI parsing tests prove that omitted timeout and `--timeout 0` select the same unbounded representation.
+- CLI parsing tests prove that omitted timeout and every exactly-zero spelling select the same unbounded representation, and the existing `--timeout 0s` usage-rejection expectation is updated accordingly.
 - Runtime tests prove an unbounded wait survives beyond a short test interval and can still settle from owner/repository evidence.
+- A test proves an unbounded wait terminates and reaps a stalled Git child at its finite per-invocation deadline without returning the operation-level `timeout` outcome.
 - Existing explicit-timeout tests continue proving deadline expiry and cleanup.
-- `cargo test --test client_cli_tests wait_` passes.
+- `cargo test --test client_cli_tests` passes.
 
 ## Out of Scope
 
