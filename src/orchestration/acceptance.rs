@@ -4,6 +4,10 @@
 
 #![allow(dead_code)]
 
+/// Whether a declared repository-local verification still has evidence that
+/// belongs to this exact tree, or has to be run again.
+pub mod verification_evidence;
+
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{AcceptanceAttempt, OutputCollector};

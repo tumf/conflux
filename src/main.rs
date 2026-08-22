@@ -1360,6 +1360,23 @@ async fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                 }
+                OpenspecCommands::Verify(verify_args) => {
+                    match crate::openspec_cmd::cmd_verify(
+                        &verify_args.change_id,
+                        verify_args.verification_id.as_deref(),
+                        verify_args.plan,
+                        verify_args.json,
+                    )
+                    .await
+                    {
+                        Ok(0) => {}
+                        Ok(code) => std::process::exit(code),
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
             }
         }
 
