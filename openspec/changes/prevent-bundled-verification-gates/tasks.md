@@ -1,9 +1,9 @@
 ## Implementation Tasks
 
-- [ ] Extend active-task parsing to retain each checkbox's verification ownership marker, concrete command, referenced verification ID, and line number without deriving semantics from free text (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-validation-tests)
-- [ ] Add deterministic cohesion validation for reused change-blocking IDs and reject mismatched ownership markers or commands; diagnostics MUST name the verification ID and every affected task line (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-validation-tests)
-- [ ] Add the minimal structural heavyweight-command policy across `evidence`, `rerun`, task concrete commands, and structured argv when present; reject matches as change-blocking while preserving focused shared commands (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-validation-tests)
-- [ ] Update bundled proposal guidance and installation assertions with bounded-proof and operational-observation examples (verification: unit - `cargo test embedded_skills --lib`; verification-id: proposal-guidance-embedding-tests)
+- [x] Extend active-task parsing to retain each checkbox's verification ownership marker, concrete command, referenced verification ID, and line number without deriving semantics from free text (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-validation-tests)
+- [x] Add deterministic cohesion validation for reused change-blocking IDs and reject mismatched ownership markers or commands; diagnostics MUST name the verification ID and every affected task line (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-validation-tests)
+- [x] Add the minimal structural heavyweight-command policy across `evidence`, `rerun`, task concrete commands, and structured argv when present; reject matches as change-blocking while preserving focused shared commands (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-validation-tests)
+- [x] Update bundled proposal guidance and installation assertions with bounded-proof and operational-observation examples (verification: unit - `cargo test embedded_skills --lib`; verification-id: proposal-guidance-embedding-tests)
 
 ## Future Work
 
