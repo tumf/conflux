@@ -564,63 +564,83 @@ the implementation task. The heavy suite keeps its own separate non-blocking
 ownership. This is the preferred shape: requirement-specific bounded proof
 blocks the change, and the broad suite guards the integration. The bounded path
 is an exception for the *requirement*, never for the *command form*: a bounded
-repository-local declaration whose command still matches the denied forms below
-is rejected by native validation, and no wording makes it valid.
+repository-local declaration whose `evidence` or `rerun` still names one of the
+warned forms below is flagged by native validation, and no wording removes the
+finding.
 
 **Never hide a non-local outcome in task prose.** If the outcome needs
 credentials, a deployment, hardware, or an approval, it does not become
 Apply-blocking by being phrased as "verify that ...". Move it to its structured
 verification owner or to narrative Future Work.
 
-## One Change-Blocking Gate Proves One Cohesive Claim
+## Structured Frontmatter Is the Only Command Authority
 
-Native strict validation enforces two structural rules on every
-`completion_role: change-blocking` verification. Both read declared syntax only;
-neither infers meaning from task prose.
+Native strict validation reads commands from exactly two places:
+`verifications[].evidence` and `verifications[].rerun`. Nothing else is a
+command-authority source.
 
-**A shared change-blocking ID needs one ownership marker and one command.**
-Several checkboxes may reference the same `verification-id:` only when every one
-of them names the same ownership marker and the same concrete command. The
-marker is the single closed-set token immediately after `verification:` and
-before the first ` - ` — `unit`, `integration`, `e2e`, `manual`, `benchmark`, or
-`not-testable`. Markdown backticks, spacing, and letter case are normalized away
-before comparison, so only a real difference is a difference.
+**Task prose is never parsed for commands.** A task note links a checkbox to its
+gate with `verification-id: <id>`; it does not duplicate, override, or weaken the
+declared command. Validation derives no cohesion rule from task-note ownership
+markers, and it produces no heaviness finding from a word or a command that
+appears only in task text. Several checkboxes may share one change-blocking
+`verification-id:` — that is the normal shape for coupled implementation and
+regression work:
 
 ```markdown
-<!-- Valid: coupled implementation and regression tests, one focused proof. -->
-- [ ] Add the cohesion rule (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-tests)
+- [ ] Add the token matcher (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-tests)
 - [ ] Add its regression tests (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-tests)
-
-<!-- Invalid: one gate bundling unrelated evidence. Split the declarations. -->
-- [ ] Add the cohesion rule (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-tests)
-- [ ] Wire the TUI panel (verification: integration - `cargo test tui::panel --lib`; verification-id: proposal-gate-tests)
 ```
 
-The second shape fails validation with the verification ID and every affected
-task line. Give each distinct marker-and-command pair its own `verifications:`
-entry and its own ID.
+**Validation constrains what you declare, not what a session runs.** The
+validator never executes `evidence` or `rerun`, and it cannot stop an AI session
+from independently choosing a heavy command. It removes the *declared
+authorization* for one; keeping the actual execution bounded stays the job of
+this guidance and of the Apply skill's bounded-verification discipline.
 
-**Structurally heavyweight command forms cannot be change-blocking.** The
-denylist applies to *every* declared command form — the `evidence` field, the
-`rerun` field, and the concrete command in a task's `(verification: ...)` note —
-so a heavy `evidence` is still rejected behind a focused `rerun`. Denied forms:
+## Heavyweight Command Forms on a Change-Blocking Gate
 
-| Denied form | Examples |
+**During migration these are warnings.** A match is reported by strict
+validation with the verification ID and the matched form, and it does **not**
+fail `cflx openspec validate <id> --archive-gate`. A later reviewed proposal may
+promote proven classes to errors once migration evidence exists — so treat a
+warning as work to do now, not as a finding to ignore.
+
+The check applies to both declared command forms, `evidence` and `rerun`, so a
+heavy `evidence` is still reported behind a focused `rerun`. Warned forms:
+
+| Warned form | Examples |
 | --- | --- |
-| Container orchestration | `docker`, `docker compose`, `podman`, `nerdctl`, `kubectl`, `helm` |
-| Cross-architecture emulation | `qemu-*`, `binfmt`, `cross`, `--platform linux/...` |
-| Benchmark | `cargo bench`, `--bench ...`, `hyperfine`, `criterion` |
-| Fuzzing | `cargo fuzz`, `afl-fuzz`, `--fuzz...` |
-| Full / exhaustive / heavy suite | `--workspace`, `--all`, `--all-features`, `--features heavy`, `--ignored`, `--include-ignored` |
-| Repeated stability execution | `--repeat N`, `-count=3`, `for i in ...`, `while true` |
+| Container orchestration | `docker compose`, `docker-compose`, `docker run`, `docker swarm`, `podman`, `kubectl` |
+| Architecture emulation | `qemu-system-*`, `cross` |
+| Benchmark | `cargo bench` |
+| Broad selector | `--workspace`, `--all-features`, `--ignored`, `--include-ignored`, `--features heavy`, `--exhaustive` |
+| Structural repetition | `seq`, `xargs` |
 
-Rewrite the gate as bounded proof plus separately owned broad verification:
+**Matching is exact, by whole token.** Tokens are compared case-insensitively
+after Markdown backticks are removed and whitespace is folded; multi-token forms
+such as `docker compose` and `--features heavy` require adjacent tokens, and
+`qemu-system-*` is the one executable-prefix form. Substring containment is never
+a match, so these stay valid:
+
+- `docker build .` — a bounded image build is explicitly permitted and is not
+  container orchestration.
+- `cargo test full_pipeline_smoke --lib`, `cargo test benchmark_parser_units
+  --lib`, `cargo test exhaustive_token_matching --lib` — `full`, `heavy`,
+  `benchmark`, and `exhaustive` inside a longer token are not selectors.
+
+Structural repetition is detected from `seq` and `xargs` in the declared command,
+including inside shell syntax such as `for i in $(seq 3); do cargo test; done`.
+Prose like "run it three times" is not parsed at all — but do not write that task
+either; see the bounded-execution rule above.
+
+Rewrite a warned gate as bounded proof plus separately owned broad verification:
 
 ```yaml
 verifications:
   # Bounded requirement-specific proof: this one blocks the change.
   - id: parser-gate-tests
-    requirement: The parser rejects bundled change-blocking declarations
+    requirement: The parser warns about declared heavyweight change-blocking commands
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
@@ -644,8 +664,7 @@ verifications:
     completion_role: operational-observation
 ```
 
-`-count=1` and similar cache-busting forms stay bounded and remain valid; only a
-repetition count of two or more is treated as a stability loop.
+Cache-busting forms such as `-count=1` are bounded and are not matched at all.
 
 ## Task Classification
 
