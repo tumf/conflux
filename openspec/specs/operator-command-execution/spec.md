@@ -148,7 +148,7 @@ Settlement-derived queue mutations MUST use an application-time guard under the 
 
 A settled batch with one or more applied queue-membership mutations MUST notify the scheduler exactly once after all mutations; a batch with no applied membership mutation MUST NOT notify it. `on_queue_add` and `on_queue_remove` remain governed by their successful per-target mutation rules. Frontends and settlement MUST NOT start Analyze directly; the scheduler alone applies the capacity, candidate, edge, and runtime-signature rules in `parallel-execution`.
 
-Bulk execution-mark classification MUST exclude a reducer-recorded archive-complete row and an active-run-limited terminal-error row before mutation, with stable reasons, choose one target state from the remaining eligible rows only, and update their marks atomically before the accepted mark deltas enter the common settlement batch. A terminal-error queue addition that would route through `RetryError` MUST consult the same active typed Apply iteration-limit eligibility before changing reducer state, marks, queue state, hooks, or explicit-retry edges; while limited it MUST be rejected with the same stable reason as explicit retry.
+Bulk execution-mark classification MUST exclude a reducer-recorded archive-complete row before mutation, with stable reasons, choose one target state from the remaining eligible rows only, and update their marks atomically before the accepted mark deltas enter the common settlement batch. Retained Apply iteration-limit evidence on a settled terminal-error row MUST NOT add an exclusion of its own: the row MUST classify exactly as an ordinary terminal-error row does in the same request. An explicit per-target terminal-error queue addition that would route through `RetryError` remains explicit retry intent and MUST apply the same explicit-retry classification as individual retry, publishing the same target-specific explicit-retry edge when accepted.
 
 #### Scenario: Eligibility refresh cleans invalid intent
 
@@ -172,25 +172,21 @@ Bulk execution-mark classification MUST exclude a reducer-recorded archive-compl
 **Then**: The target is excluded with a stable archive-complete reason
 **And**: Its execution mark, queue intent, retry/resolve state, hooks, and scheduler state remain unchanged
 
-#### Scenario: Bulk mark excludes active limited queue aliases before mutation
+#### Scenario: Settled limited row follows ordinary bulk classification
 
-**Given**: An active-run-limited terminal-error row and unrelated eligible rows exist in one Running-mode bulk request
+**Given**: A settled terminal-error row retaining typed Apply iteration-limit evidence and unrelated eligible rows exist in one bulk request
 **When**: The service classifies and applies bulk execution marks
-**Then**: It excludes the limited row with `apply_iteration_limit_active`
-**And**: The limited row's mark and queue intent remain unchanged
-**And**: It atomically applies one coherent target state and queue intent to the remaining eligible rows
-**And**: The terminal-error alias guard cannot abort a partially applied bulk operation
+**Then**: The retained evidence adds no exclusion of its own
+**And**: The row is classified exactly as an ordinary terminal-error row in the same mode
+**And**: The remaining eligible rows still receive one coherent target state atomically
 
-#### Scenario: Queue intent cannot alias an active limited retry
+#### Scenario: Queue-intent alias retries a settled limited error explicitly
 
-**Given**: A terminal-error change carries typed Apply iteration-limit evidence owned by the active run
-**When**: A caller requests queue addition or `set_queue_intent=true`
-**Then**: The service rejects the request with `apply_iteration_limit_active`
-**And**: It does not apply `RetryError` or clear the retained error
-**And**: It does not change marks, dynamic queue, explicit-retry edges, hooks, or scheduler state
-
-<!-- Expected canonical result after archive: `operator-command-execution` will preserve wait-state mark intent only until reducer-recorded archive completion and will exclude post-archive rows before atomic single or bulk mutation. -->
-
+**Given**: A settled terminal-error change retains typed Apply iteration-limit evidence
+**When**: A caller requests explicit per-target queue addition or `set_queue_intent=true` for that change
+**Then**: The service applies the same explicit-retry classification as individual retry
+**And**: An accepted alias applies `RetryError` exactly once and publishes one target-specific explicit-retry edge
+**And**: The retained diagnostic remains observable and is consumed only by that explicit intent
 
 #### Scenario: Mark settlement is scoped to changed targets
 
@@ -219,6 +215,8 @@ Bulk execution-mark classification MUST exclude a reducer-recorded archive-compl
 **When**: All target mutations finish
 **Then**: The scheduler receives exactly one notification for the batch
 **And**: A batch with zero applied membership changes emits none
+
+<!-- Expected canonical result after archive: settled Apply-limit diagnostics remain observable but no longer prevent a later explicit retry from creating a fresh execution boundary, and mark/queue classification treats a settled limited row exactly as an ordinary terminal-error row. -->
 
 ### Requirement: Cancellation precedes active dequeue
 
@@ -287,9 +285,9 @@ The service MUST run `on_queue_add` and `on_queue_remove` exactly once after suc
 
 ### Requirement: Retry routing preserves reconciled evidence
 
-Terminal error retry MUST use `ReducerCommand::RetryError`. Acceptance-stalled retry MUST reconcile the existing runtime hold and resume through the existing explicit acceptance retry path without rerunning apply. Before either route mutates state, the shared service MUST reject a target carrying typed Apply iteration-limit evidence owned by the active run. Unsupported, non-resumable, identity-mismatched, or active-run-limited targets MUST retain their evidence. Bulk retry and Start-selected retry MUST exclude such targets, dispatch other accepted targets once, and produce no scheduler effect when none remain.
+Terminal error retry MUST use `ReducerCommand::RetryError`. Acceptance-stalled retry MUST reconcile the existing runtime hold and resume through the existing explicit acceptance retry path without rerunning apply. Unsupported, non-resumable, or identity-mismatched targets MUST retain their evidence. A settled terminal error carrying retained Apply iteration-limit evidence MUST be eligible for a later explicit individual, bulk, or Start-selected retry even while the persistent scheduler remains live. Bulk retry and Start-selected retry MUST dispatch accepted targets once and produce no scheduler effect when none remain.
 
-An accepted terminal-error retry selected by Start MUST publish the same target-ID-bearing explicit-retry edge as an individual or bulk retry. Ordinary `AddToQueue`, generic scheduler notification, execution marks, and delayed mark settlement MUST NOT substitute for that edge or clear terminal error evidence.
+An accepted terminal-error retry selected by Start MUST publish the same target-ID-bearing explicit-retry edge as an individual or bulk retry. Ordinary `AddToQueue`, generic scheduler notification, execution marks, and delayed mark settlement MUST NOT substitute for that edge or clear terminal error evidence. Retained Apply iteration-limit evidence MUST remain observational and MUST NOT block a new explicit retry boundary.
 
 #### Scenario: Valid acceptance hold resumes acceptance
 
@@ -299,37 +297,30 @@ An accepted terminal-error retry selected by Start MUST publish the same target-
 **And**: Workspace preparation occurs
 **And**: Processing resumes at acceptance rather than apply
 
-#### Scenario: Individual active-limit retry is mutation-free
+#### Scenario: Individual retry starts a fresh boundary after Apply limit
 
-**Given**: A terminal-error change carries typed Apply iteration-limit evidence owned by the active run
+**Given**: A terminal-error change retains typed Apply iteration-limit evidence from its settled invocation
+**And**: The persistent scheduler remains live
 **When**: An operator requests individual retry
-**Then**: The service rejects it with `apply_iteration_limit_active`
-**And**: Reducer status, error detail, failed classification, execution mark, queue contents, and explicit-retry publications remain unchanged
-**And**: No queue hook, scheduler notification, or scheduler start occurs
+**Then**: The service applies the ordinary terminal-error retry route exactly once
+**And**: The retained error is consumed only by that explicit intent
+**And**: The later invocation receives fresh Apply budget
 
-#### Scenario: Bulk retry skips only active limited targets
+#### Scenario: Bulk retry includes a settled Apply-limit target
 
-**Given**: One requested change is limited by its active run
+**Given**: One requested terminal-error change retains settled Apply iteration-limit evidence
 **And**: Other requested changes carry ordinary retryable terminal-error or resumable acceptance evidence
 **When**: The operator requests bulk retry
-**Then**: The limited change retains all state and is not reported as accepted
-**And**: Its `apply_iteration_limit_active` reason remains readable in the authoritative snapshot at the result revision
-**And**: The other retryable changes are mutated and dispatched exactly once
+**Then**: Every supported target is mutated and dispatched exactly once
+**And**: The settled Apply-limit target enters a fresh execution boundary
+**And**: Unrelated targets retain their independent retry routes
 
-#### Scenario: All-limited bulk retry is a no-op
+#### Scenario: No explicit retry produces no redispatch
 
-**Given**: Every candidate in a bulk retry carries active-run Apply iteration-limit evidence
-**When**: The operator requests bulk retry
-**Then**: The service returns a no-op with no retryable target
-**And**: No reducer, mark, queue, hook, explicit-retry, notification, or scheduler-start effect occurs
-
-#### Scenario: Later boundary uses ordinary retry routing
-
-**Given**: The boundary that owned typed iteration-limit evidence has closed and retired its gate
-**And**: Workspace evidence still classifies the change as retryable
-**When**: An operator requests retry
-**Then**: The service applies the ordinary reconciled retry route
-**And**: A new scheduler boundary may start with fresh active-run state
+**Given**: A terminal-error change retains typed Apply iteration-limit evidence from its settled invocation
+**When**: Only queue reconciliation, generic scheduler notification, ordinary queue addition, or delayed mark settlement occurs
+**Then**: The failed change is not retried
+**And**: Its terminal error and diagnostic evidence remain intact
 
 #### Scenario: Start-selected terminal error publishes one explicit-retry edge
 
@@ -343,7 +334,7 @@ An accepted terminal-error retry selected by Start MUST publish the same target-
 
 #### Scenario: Start-selected unsupported retry preserves evidence
 
-**Given**: a marked target is non-resumable, identity-mismatched, unsupported, or active-run-limited
+**Given**: a marked target is non-resumable, identity-mismatched, or otherwise unsupported
 **When**: Start evaluates retry routing
 **Then**: the target is refused or excluded with current evidence intact
 **And**: no reducer, mark, queue, hook, retry-edge, notification, or scheduler-start effect occurs for that target
@@ -355,8 +346,6 @@ An accepted terminal-error retry selected by Start MUST publish the same target-
 **Then**: the scheduler MUST NOT redispatch the failed target from queue reconciliation or ordinary notification
 **When**: a later Start request accepts the marked retry route
 **Then**: the normal terminal-error retry transition and explicit-retry edge MAY release the target for analysis
-
-<!-- Expected canonical result after archive: Start-selected retries consume the same reconciled evidence and target-specific edge as explicit retry commands, including mutation-free active-limit and unsupported-evidence handling. -->
 
 ### Requirement: Event-driven execution mark reconciliation
 

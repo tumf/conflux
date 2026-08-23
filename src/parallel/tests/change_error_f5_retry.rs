@@ -168,15 +168,12 @@ impl Harness {
         let marks = Arc::new(ExecutionMarkStore::new());
         let scheduler = Arc::new(RecordingScheduler::new());
         scheduler.set_running(true);
-        let operator = Arc::new(
-            OperatorCommandService::new(
-                state.clone(),
-                queue.clone(),
-                Arc::new(NoopQueueHooks),
-                marks.clone(),
-            )
-            .with_run_boundary(scheduler.clone()),
-        );
+        let operator = Arc::new(OperatorCommandService::new(
+            state.clone(),
+            queue.clone(),
+            Arc::new(NoopQueueHooks),
+            marks.clone(),
+        ));
         let run_control = RunControlService::new(
             state.clone(),
             operator,
@@ -535,6 +532,220 @@ async fn change_error_f5_retry_marking_alone_publishes_no_edge() {
     );
     harness.depends_on(&[("alpha-dep", ALPHA)]);
     assert!(harness.is_gated_by_failure("alpha-dep"));
+    let (_, apply_started) = harness.drain_events();
+    assert_eq!(apply_started, 0);
+
+    harness.shutdown().await;
+}
+
+// ============================================================================
+// Settled Apply iteration limit: fresh budget for the explicit retry
+// ============================================================================
+//
+// The runtime-limit case above proves the *edge* is what releases a failed
+// change. The iteration-limit case adds the second half the operator actually
+// hit: the Apply-dispatch budget is owned by this scheduler boundary, not by the
+// invocation that spent it, so a persistent scheduler that outlives the
+// exhausted invocation would refuse the very first dispatch of the retry the
+// operator just authorized. The explicit edge is what releases that budget, and
+// nothing else produces one.
+
+impl Harness {
+    /// Reproduce an Apply invocation terminated at its iteration ceiling.
+    ///
+    /// Spends the budget through the real `ApplyBudget`, records the typed
+    /// reducer diagnostic the finish path reads, and settles the change into
+    /// terminal Error with the scheduler-local failed classification — which is
+    /// exactly what `handle_workspace_completion` leaves behind.
+    async fn fail_with_iteration_limit(&mut self, change_id: &str, max: u32) {
+        for _ in 0..max {
+            self.executor.apply_budget.reserve(change_id, max);
+        }
+        {
+            let mut guard = self.state.write().await;
+            guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+            guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+                id: change_id.to_string(),
+                error: format!("reached maximum iterations ({max}/{max}) without completion"),
+            });
+            guard.record_apply_iteration_limit(change_id, max, max);
+        }
+        self.executor.failed_tracker.mark_failed(change_id);
+    }
+
+    /// Whether the next Apply dispatch for `change_id` would be refused.
+    fn apply_budget_exhausted(&self, change_id: &str, max: u32) -> bool {
+        self.executor
+            .apply_budget
+            .exhaustion(change_id, max)
+            .is_some()
+    }
+}
+
+/// The whole regression, in the order it happens to an operator: an exhausted
+/// ceiling is not redispatched by the live scheduler, and the later explicit
+/// retry receives a fresh budget rather than reaching the same ceiling at once.
+#[tokio::test(start_paused = true)]
+async fn change_error_f5_retry_iteration_limit_receives_fresh_budget_on_explicit_retry() {
+    const MAX: u32 = 3;
+
+    let mut harness = Harness::new(&[ALPHA, BETA], 2);
+    let analyzer = counting_analyzer(harness.analyses.clone());
+    harness.arm_queue_debounce().await;
+
+    harness.fail_with_iteration_limit(ALPHA, MAX).await;
+    harness.fail_with_iteration_limit(BETA, MAX).await;
+    assert_eq!(harness.status(ALPHA).await, "error");
+    assert!(
+        harness.apply_budget_exhausted(ALPHA, MAX),
+        "the invocation really spent its ceiling"
+    );
+
+    // ── No automatic retry ────────────────────────────────────────────────
+    // The scheduler stays alive and keeps reconciling. Neither the retained
+    // diagnostic nor the spent budget may be released without explicit intent.
+    for _ in 0..3 {
+        harness.timer_wake().await;
+        harness.run_loop_iteration(&analyzer).await;
+    }
+    let (_, apply_started) = harness.drain_events();
+    assert_eq!(
+        apply_started, 0,
+        "an iteration-limit failure must not be redispatched without explicit intent"
+    );
+    assert!(
+        harness.apply_budget_exhausted(ALPHA, MAX),
+        "and reconciliation grants no budget"
+    );
+    assert!(
+        harness
+            .state
+            .read()
+            .await
+            .apply_iteration_limit(ALPHA)
+            .is_some(),
+        "the diagnostic survives every automatic cycle"
+    );
+
+    // ── The operator marks the row and presses F5 ─────────────────────────
+    harness.marks.set(ALPHA, true);
+    let outcome = harness
+        .run_control
+        .start(OperatorMode::Running)
+        .await
+        .expect("a settled iteration-limit error is startable while the run is live");
+
+    assert_eq!(
+        outcome,
+        RunControlOutcome::RunDispatched {
+            change_ids: vec![ALPHA.to_string()],
+            explicit_retry: true,
+            scheduler: SchedulerEffect::Notified,
+            excluded: Vec::new(),
+        },
+        "the live scheduler is woken rather than joined by a second boundary"
+    );
+    assert_eq!(
+        harness.status(ALPHA).await,
+        "queued",
+        "the terminal error was cleared through retry intent"
+    );
+    assert!(
+        harness
+            .state
+            .read()
+            .await
+            .apply_iteration_limit(ALPHA)
+            .is_none(),
+        "the diagnostic is consumed by the same explicit intent"
+    );
+    assert!(
+        harness
+            .state
+            .read()
+            .await
+            .apply_iteration_limit(BETA)
+            .is_some(),
+        "and an unretried failure keeps its own diagnostic"
+    );
+
+    // ── The scheduler consumes the edge and releases the budget ───────────
+    assert!(
+        harness.consume_retry_edges().await,
+        "the accepted retry published an edge for this scheduler to consume"
+    );
+    assert!(
+        !harness.apply_budget_exhausted(ALPHA, MAX),
+        "the retried change enters its new invocation with a fresh Apply budget"
+    );
+    assert!(
+        harness.apply_budget_exhausted(BETA, MAX),
+        "release is target-specific: another exhausted change keeps its ceiling"
+    );
+
+    // ── And the released change really reaches dispatch again ─────────────
+    // This scheduler boundary admits work by starting the change's next
+    // analysis; the Apply the fresh budget pays for happens downstream of that
+    // dispatch, so the evidence here is the admission plus the unspent ceiling.
+    harness.run_loop_iteration(&analyzer).await;
+    let (analysis_started, _) = harness.drain_events();
+    assert!(
+        harness.in_flight.contains(ALPHA),
+        "the released change is dispatched once dependency and capacity guards allow it"
+    );
+    assert_eq!(
+        analysis_started, 1,
+        "exactly one reevaluation follows the accepted retry"
+    );
+    assert!(
+        !harness.in_flight.contains(BETA),
+        "and the unretried failure is still not admitted"
+    );
+    assert!(
+        matches!(
+            harness.executor.apply_budget.reserve(ALPHA, MAX),
+            crate::execution::apply::ApplyBudgetReservation::Reserved { attempt: 1, .. }
+        ),
+        "the new invocation's first dispatch is admitted as attempt 1 rather than refused"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The negative half for the budget: a generic notification releases nothing.
+#[tokio::test(start_paused = true)]
+async fn change_error_f5_retry_iteration_limit_budget_survives_ordinary_notification() {
+    const MAX: u32 = 3;
+
+    let mut harness = Harness::new(&[ALPHA], 1);
+    let analyzer = counting_analyzer(harness.analyses.clone());
+    harness.arm_queue_debounce().await;
+
+    harness.fail_with_iteration_limit(ALPHA, MAX).await;
+
+    // A generic wake, exactly as an unrelated queue mutation would produce, plus
+    // an ordinary mark: neither is explicit retry intent.
+    harness.queue.notify_scheduler();
+    harness
+        .run_control
+        .operator()
+        .set_execution_mark(ALPHA, true)
+        .await
+        .expect("a settled limited row still accepts next-run intent");
+    for _ in 0..3 {
+        harness.timer_wake().await;
+        harness.run_loop_iteration(&analyzer).await;
+    }
+
+    assert!(
+        !harness.consume_retry_edges().await,
+        "no automatic path publishes an explicit-retry edge"
+    );
+    assert!(
+        harness.apply_budget_exhausted(ALPHA, MAX),
+        "so the exhausted budget is never released"
+    );
+    assert_eq!(harness.status(ALPHA).await, "error");
     let (_, apply_started) = harness.drain_events();
     assert_eq!(apply_started, 0);
 

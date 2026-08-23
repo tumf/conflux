@@ -55,6 +55,33 @@ Retire the gate from every canonical requirement that mandates it: `operator-com
 - API projection and TUI tests no longer expose `apply_iteration_limit_active` as a block for a settled terminal error.
 - `cargo test operator_command --lib` passes and selects the new regression tests.
 
+## Retired Scenarios
+
+Each of these canonical scenarios exists only to mandate the gate this change
+retires, so each is replaced by a renamed scenario asserting the opposite inside
+the same requirement. No coverage is dropped: the retained iteration-limit
+record, the headless projection, the bulk-retry partition, the TUI error header,
+and the footer guidance are all still pinned — by the scenario that names the new
+behavior rather than the retired one.
+
+- remote-control-api: Authoritative operator snapshot / Active iteration limit is projected as typed eligibility
+- remote-control-api: Authoritative operator snapshot / Scheduler-task exit removes the active action block
+- remote-control-api: Authoritative operator snapshot / Headless read-only projection does not retain an actionable block
+- remote-control-api: Shared lifecycle scheduling semantics / V2 individual retry reports active limit refusal
+- remote-control-api: Shared lifecycle scheduling semantics / V2 bulk retry remains partial
+- cli: Error State Display / Active iteration limit replaces retry guidance
+- cli: Error Retry with F5 Key / F5 cannot target an active limited run
+- cli: Error Retry with F5 Key / F5 becomes available after boundary closure
+- cli: Error Retry with F5 Key / Active iteration limit remains mutation-free
+- cli: Footer Dynamic Guidance Display / Limited error rows do not produce retry promises
+- cli: Footer Dynamic Guidance Display / Bulk mark selection excludes a limited error row
+- operator-command-execution: Retry routing preserves reconciled evidence / Individual active-limit retry is mutation-free
+- operator-command-execution: Retry routing preserves reconciled evidence / Bulk retry skips only active limited targets
+- operator-command-execution: Retry routing preserves reconciled evidence / All-limited bulk retry is a no-op
+- operator-command-execution: Retry routing preserves reconciled evidence / Later boundary uses ordinary retry routing
+- operator-command-execution: Mode-aware mark and queue behavior / Bulk mark excludes active limited queue aliases before mutation
+- operator-command-execution: Mode-aware mark and queue behavior / Queue intent cannot alias an active limited retry
+
 ## Out of Scope
 
 - Increasing the Apply iteration limit.

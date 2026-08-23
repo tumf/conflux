@@ -69,7 +69,6 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
-            apply_iteration_limit_active: false,
             archive_complete_cache: false,
         };
 
@@ -92,7 +91,6 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
-            apply_iteration_limit_active: false,
             archive_complete_cache: false,
         };
 
@@ -120,7 +118,6 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
-            apply_iteration_limit_active: false,
             archive_complete_cache: false,
         };
 

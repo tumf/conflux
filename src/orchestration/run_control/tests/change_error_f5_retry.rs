@@ -395,33 +395,50 @@ async fn change_error_f5_retry_worktree_ineligible_retry_mark_refuses_before_cla
     }
 }
 
-/// Acceptance criterion 5: active-run Apply iteration-limit evidence is
-/// mutation-free in every mode a Start can arrive in.
+/// Acceptance criterion 5: a settled Apply iteration-limit failure is an
+/// ordinary retry-class Start target in every mode a Start can arrive in.
+///
+/// The retained ceiling record explains the invocation that stopped. A live
+/// scheduler task decides only *how* the accepted retry reaches a boundary, so
+/// class selection sees the same terminal-error evidence a bare failure carries.
 #[tokio::test]
-async fn change_error_f5_retry_active_iteration_limit_refuses_in_every_mode() {
+async fn change_error_f5_retry_settled_iteration_limit_retries_in_every_mode() {
     for mode in NON_STOPPING_MODES {
         let harness = Harness::new(&[ALPHA]);
         harness.to_iteration_limit(ALPHA, 50, 50).await;
         harness.mark(&[ALPHA]);
-        // The live boundary is what owns the gate; every mode is evaluated
-        // against the same owning task.
+        // The boundary that spent the ceiling is still live; that is the exact
+        // state which used to make the row permanently unroutable.
         harness.scheduler.set_running(true);
 
-        let error =
-            assert_refusal_is_mutation_free(&harness, mode, &format!("{mode:?} active limit"))
-                .await;
+        let outcome =
+            harness.service.start(mode).await.unwrap_or_else(|error| {
+                panic!("{mode:?}: the settled row is retryable: {error:?}")
+            });
 
-        let RunControlError::NoEligibleTarget { detail, .. } = error else {
-            panic!("{mode:?}: an all-limited request is refused at admission: {error:?}");
-        };
-        assert!(
-            detail.contains(ALPHA),
-            "{mode:?}: the refused target must be named: {detail}"
+        assert_eq!(
+            outcome,
+            RunControlOutcome::RunDispatched {
+                change_ids: vec![ALPHA.to_string()],
+                explicit_retry: true,
+                scheduler: SchedulerEffect::Notified,
+                excluded: Vec::new(),
+            },
+            "{mode:?}: the live boundary is woken rather than refused"
         );
         assert_eq!(
-            harness.status(ALPHA).await,
-            "error",
-            "{mode:?}: the typed evidence survives the refusal"
+            harness.effects().await.explicit_retries,
+            vec![ALPHA.to_string()],
+            "{mode:?}: exactly one target-specific explicit-retry edge is published"
+        );
+        assert!(
+            harness
+                .state
+                .read()
+                .await
+                .apply_iteration_limit(ALPHA)
+                .is_none(),
+            "{mode:?}: the diagnostic is consumed by the same explicit intent"
         );
     }
 }

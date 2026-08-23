@@ -2490,6 +2490,14 @@ impl ParallelExecutor {
     /// epoch — never more: whether the dependency is actually resolved is still
     /// decided by ordinary repository and dependency evidence, so a dependent
     /// stays blocked while its blocker is queued, in flight, or unmerged.
+    ///
+    /// It is also where the retried change's Apply budget is released. The
+    /// budget owner is scoped to this scheduler boundary rather than to one
+    /// invocation, so a persistent scheduler that outlives the invocation which
+    /// spent the ceiling would otherwise refuse the very first dispatch of the
+    /// retry the operator just authorized. Release is keyed to the explicit edge
+    /// alone: reconciliation, notification, ordinary queue additions, and mark
+    /// settlement produce no edge and therefore grant no budget.
     pub(super) async fn consume_explicit_retry_edges(&mut self) -> bool {
         let Some(queue) = self.dynamic_queue.clone() else {
             return false;
@@ -2505,9 +2513,12 @@ impl ParallelExecutor {
             // later blocked observation for it is a new transition rather than a
             // suppressed duplicate.
             self.dependency_blocker_fingerprints.remove(change_id);
+            let released_attempts = self.apply_budget.attempts(change_id);
+            self.apply_budget.reset(change_id);
             info!(
                 change_id = %change_id,
                 cleared_failed_marker = cleared,
+                released_apply_attempts = released_attempts,
                 "Consumed explicit-retry edge before queue reconciliation"
             );
         }

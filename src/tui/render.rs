@@ -20,17 +20,6 @@ use super::state::{
 use super::types::{AppExecutionMode, ModalState};
 use super::utils::{get_version_string, truncate_to_display_width_with_suffix};
 
-/// Key hint for a row whose active run owns its Apply ceiling.
-///
-/// It deliberately names no key. Marking the row is allowed — a mark is only
-/// next-run intent — but the start key would still refuse the dispatch, so this
-/// explains the condition instead of promising a control.
-const APPLY_LIMIT_KEY_HINT: &str = "Apply limit reached (retry after the run closes)";
-
-/// Footer/status condition for rows blocked by an active-run Apply ceiling.
-const APPLY_LIMIT_CONDITION: &str =
-    "Apply iteration limit reached: retry becomes available after the active run closes";
-
 /// Parsed parts of a remote change ID.
 ///
 /// Remote server mode encodes the change ID as `<project_id>::<project_name>/<change_id>`.
@@ -291,12 +280,6 @@ fn push_change_row_hints(keys: &mut Vec<String>, app: &AppState, item: &ChangeSt
         } else {
             "Space: mark".to_string()
         });
-        // Explains why the start key will still refuse this row. It sits next to
-        // the mark hint rather than replacing it: marking is genuinely allowed,
-        // and only the dispatch it asks for is gated.
-        if item.apply_iteration_limit_active {
-            keys.push(APPLY_LIMIT_KEY_HINT.to_string());
-        }
     }
 }
 
@@ -1509,15 +1492,6 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
             format!(" Status ({start_key_label}: continue, Esc: force stop, Ctrl+C: quit) ")
         }
         AppExecutionMode::Stopped => format!(" Status ({start_key_label}: resume, Ctrl+C: quit) "),
-        // The retry affordance survives every other Error-mode condition, but not
-        // one where the only failed rows are held by the active run's own Apply
-        // ceiling: the start key would be refused without mutating anything, so
-        // the header states the condition instead of naming a key.
-        AppExecutionMode::Error
-            if app.has_active_apply_iteration_limit() && !app.has_admissible_retry_target() =>
-        {
-            format!(" Status ({APPLY_LIMIT_CONDITION}, Ctrl+C: quit) ")
-        }
         AppExecutionMode::Error => format!(" Status ({start_key_label}: retry, Ctrl+C: quit) "),
     };
 
@@ -1771,24 +1745,15 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ));
     } else if selected == 0 {
-        // Changes exist but none selected. Guidance names a key only for rows the
-        // shared service would actually admit: a row at the active run's Apply
-        // ceiling must not make the footer promise Space or the start key.
-        let retryable_error_rows = app.changes.iter().any(|change| {
-            change.display_status_cache == "error" && !change.apply_iteration_limit_active
-        });
-        // Whether a *start* has anything to admit — not whether a mark has
-        // anything to write. The two diverged when marks stopped consulting
-        // lifecycle state: a limited row is markable, so the bulk-mark predicate
-        // would report a target here and hide the condition the footer exists to
-        // state.
-        let startable_rows = app.changes.iter().any(|change| {
-            is_markable_status(&change.display_status_cache, change.archive_complete_cache)
-                && !change.apply_iteration_limit_active
-        });
-        let message = if app.has_active_apply_iteration_limit() && !startable_rows {
-            APPLY_LIMIT_CONDITION
-        } else if retryable_error_rows {
+        // Changes exist but none selected. A settled terminal-error row — with or
+        // without a retained Apply iteration-limit diagnostic — is an ordinary
+        // retryable row here, because that is exactly how the shared service
+        // classifies it.
+        let retryable_error_rows = app
+            .changes
+            .iter()
+            .any(|change| change.display_status_cache == "error");
+        let message = if retryable_error_rows {
             "Select changes with Space to process (error rows need retry mark)"
         } else {
             "Select changes with Space to process"
@@ -4455,34 +4420,40 @@ mod tests {
     }
 
     // ========================================================================
-    // Active-run Apply iteration limit: TUI guidance (integration — rendering)
+    // Settled Apply iteration limit: TUI guidance (integration — rendering)
     // ========================================================================
     //
     // These render the real widget tree over an in-memory buffer. No terminal,
-    // process, or repository is involved.
+    // process, or repository is involved. The retained diagnostic is evidence,
+    // not an action gate, so every one of them asserts that a settled limited
+    // row is presented exactly as an ordinary terminal-error row.
 
-    /// One error row already gated by the active run's Apply ceiling.
+    /// One settled terminal-error row whose Apply ceiling refused the invocation.
+    ///
+    /// The retained diagnostic reaches the TUI as the row's error detail, which
+    /// is the only place it lives now: there is no per-row limit cache to set.
     fn app_with_limited_error_row() -> AppState {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        app.changes[0].set_error_message_cache("max iterations reached".to_string());
-        app.changes[0].apply_iteration_limit_active = true;
+        app.changes[0].set_error_message_cache(
+            "reached maximum iterations (13/13) without completion".to_string(),
+        );
         app
     }
 
     #[test]
-    fn active_iteration_limit_tui_row_hint_promises_no_space_retry() {
+    fn settled_iteration_limit_tui_row_hint_offers_the_ordinary_mark() {
         let mut app = app_with_limited_error_row();
         app.cursor_index = 0;
 
         let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
 
         assert!(
-            !content.contains("Space: retry mark") && !content.contains("Space: clear retry"),
-            "a limited row must not advertise a mark the service refuses:\n{content}"
+            content.contains("Space: mark"),
+            "a settled limited row is markable like any other error row:\n{content}"
         );
         assert!(
-            content.contains("Apply limit reached"),
-            "the row states the stable condition instead:\n{content}"
+            !content.contains("Apply limit reached"),
+            "and no retired active-limit condition replaces that guidance:\n{content}"
         );
         assert!(
             content.contains("Enter: details"),
@@ -4491,64 +4462,44 @@ mod tests {
     }
 
     #[test]
-    fn active_iteration_limit_tui_row_hint_returns_after_the_gate_retires() {
-        let mut app = app_with_limited_error_row();
-        app.cursor_index = 0;
-        app.sync_active_apply_iteration_limits(&std::collections::HashSet::new());
-
-        let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
-        assert!(
-            content.contains("Space: mark"),
-            "the mark hint stands alone once the owning boundary closes:\n{content}"
-        );
-        assert!(
-            !content.contains("Apply limit reached"),
-            "and the condition it sat beside is no longer stated:\n{content}"
-        );
-    }
-
-    #[test]
-    fn active_iteration_limit_tui_select_footer_states_the_condition() {
+    fn settled_iteration_limit_tui_select_footer_gives_ordinary_retry_guidance() {
         let mut app = app_with_limited_error_row();
 
         let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
         assert!(
-            content.contains("Apply iteration limit reached"),
-            "the footer reports the stable active-limit condition:\n{content}"
+            content.contains("Select changes with Space to process"),
+            "the footer offers the same Space guidance as any error row:\n{content}"
         );
         assert!(
-            !content.contains("Select changes with Space to process"),
-            "and never instructs the operator to mark a row the service refuses:\n{content}"
+            content.contains("error rows need retry mark"),
+            "including the ordinary error-row retry hint:\n{content}"
         );
         assert!(
-            !content.contains("Press F5/! to start processing"),
-            "nor promises the start key for it:\n{content}"
+            !content.contains("Apply iteration limit reached"),
+            "and no stable active-limit condition replaces it:\n{content}"
         );
     }
 
-    /// A limited row must not suppress guidance for unrelated eligible rows.
+    /// A settled limited row must not suppress guidance for unrelated rows.
     #[test]
-    fn active_iteration_limit_tui_select_footer_keeps_guidance_for_eligible_rows() {
+    fn settled_iteration_limit_tui_select_footer_keeps_guidance_for_eligible_rows() {
         let mut app = create_test_app(vec![
             create_test_change("limited"),
             create_test_change("eligible"),
         ]);
-        app.changes[0].set_error_message_cache("max iterations reached".to_string());
-        app.changes[0].apply_iteration_limit_active = true;
+        app.changes[0].set_error_message_cache(
+            "reached maximum iterations (13/13) without completion".to_string(),
+        );
 
         let content = buffer_to_string(&render_buffer(&mut app, 120, 24));
         assert!(
             content.contains("Select changes with Space to process"),
             "an eligible row keeps its ordinary guidance:\n{content}"
         );
-        assert!(
-            !content.contains("error rows need retry mark"),
-            "but the error-row retry promise is not made for a limited row:\n{content}"
-        );
     }
 
     #[test]
-    fn active_iteration_limit_tui_error_header_offers_no_retry_key() {
+    fn settled_iteration_limit_tui_error_header_offers_the_retry_key() {
         let mut app = app_with_limited_error_row();
         app.execution_mode = AppExecutionMode::Error;
         app.error_change_id = Some("change-a".to_string());
@@ -4560,20 +4511,29 @@ mod tests {
         // Status panel is not laid out at all.
         let content = buffer_to_string(&render_buffer(&mut app, 120, 40));
         assert!(
-            !content.contains(&format!("{}: retry", app.start_key_label())),
-            "the header must not promise a retry key the service refuses:\n{content}"
+            content.contains(&format!("{}: retry", app.start_key_label())),
+            "the header offers the retry the shared service now admits:\n{content}"
         );
         assert!(
-            content.contains("Apply iteration limit reached"),
-            "it states the condition instead:\n{content}"
+            !content.contains("Apply iteration limit reached"),
+            "and states no retired active-limit condition:\n{content}"
         );
+    }
 
-        // An unrelated retryable row restores the ordinary control.
-        app.changes[0].apply_iteration_limit_active = false;
+    /// The retained diagnostic is what makes the failure inspectable, so it must
+    /// still reach the operator through the row's error detail.
+    #[test]
+    fn settled_iteration_limit_tui_keeps_the_attempts_and_ceiling_visible() {
+        let mut app = app_with_limited_error_row();
+        app.cursor_index = 0;
+        app.execution_mode = AppExecutionMode::Error;
+        app.error_change_id = Some("change-a".to_string());
+        app.add_log(LogEntry::error("apply failed"));
+
         let content = buffer_to_string(&render_buffer(&mut app, 120, 40));
         assert!(
-            content.contains(&format!("{}: retry", app.start_key_label())),
-            "the retry control returns once a target is admissible:\n{content}"
+            content.contains("13/13"),
+            "the exact attempts/max evidence stays observable:\n{content}"
         );
     }
 
@@ -6546,7 +6506,6 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
-            apply_iteration_limit_active: false,
             archive_complete_cache: false,
         }
     }

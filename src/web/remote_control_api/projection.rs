@@ -569,7 +569,6 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
                     &display_status,
                     change.blocker.as_ref(),
                     change.parallel.eligible,
-                    change.apply_iteration_limit_active,
                 ),
                 display_status,
                 progress_status: change.status.clone(),
@@ -621,35 +620,28 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
 /// change, but advertising "resolve" on a change that is not waiting on a merge
 /// describes an operation nobody asked for.
 ///
-/// `set_execution_mark` is deliberately *not* gated by mode, activity, worktree
-/// eligibility, or the Apply-iteration limit: a mark is pure next-run target
-/// intent, and whether that run may actually start is decided at final start /
-/// retry admission. Only a terminal row — archived, merged, pushed, rejected —
-/// is reported as non-markable, because it is no longer a run candidate.
+/// `set_execution_mark` is deliberately *not* gated by mode, activity, or
+/// worktree eligibility: a mark is pure next-run target intent, and whether that
+/// run may actually start is decided at final start / retry admission. Only a
+/// terminal row — archived, merged, pushed, rejected — is reported as
+/// non-markable, because it is no longer a run candidate.
 ///
 /// `parallel_eligible` still gates the explicit queue command, which really does
 /// mutate current-run membership.
 ///
-/// `apply_iteration_limit_active` is the process-local admission gate: the
-/// snapshot builder sets it only when typed iteration-limit evidence exists and
-/// the owning command-capable scheduler task is still live. It blocks retry and
-/// the explicit queue command for a terminal-error row, because that request
-/// routes through the same `RetryError` edge.
+/// A retained Apply iteration-limit record is deliberately absent from this
+/// signature. It is diagnostic evidence about the invocation that stopped, and a
+/// classifier that cannot see it cannot let it refuse a retry the shared command
+/// service would accept — which is the whole point of projecting the same
+/// classifier admission uses.
 fn classify_actions(
     mode: OperatorMode,
     display_status: &str,
     blocker: Option<&ChangeBlocker>,
     parallel_eligible: bool,
-    apply_iteration_limit_active: bool,
 ) -> ChangeActions {
     let final_status = is_final_status(display_status);
     let route = classify_queue_intent_route(mode, display_status);
-
-    // Only a terminal-error row can route through `RetryError`, so only that row
-    // carries the gate. Anything else with a retained record is describing a
-    // ceiling that no current action would touch.
-    let limit_blocked = apply_iteration_limit_active && display_status == "error";
-    let limit_reason = ActionBlockedReason::ApplyIterationLimitActive;
 
     let immutable_reason = if final_status {
         ActionBlockedReason::FinalStatus
@@ -675,7 +667,6 @@ fn classify_actions(
     };
 
     let set_queue_intent = match route {
-        _ if limit_blocked => ActionEligibility::blocked(limit_reason),
         _ if parallel_blocked => ActionEligibility::blocked(parallel_reason),
         QueueIntentRoute::Mutable => ActionEligibility::allowed(),
         // Select and Stopped have no runtime queue to mutate; a base-lane wait in
@@ -694,11 +685,7 @@ fn classify_actions(
         QueueIntentRoute::Immutable => ActionEligibility::blocked(immutable_reason),
     };
 
-    let retry_change = if limit_blocked {
-        ActionEligibility::blocked(limit_reason)
-    } else {
-        classify_retry_action(display_status, blocker, final_status)
-    };
+    let retry_change = classify_retry_action(display_status, blocker, final_status);
 
     // `DequeueChange` is refused only for a final outcome; `error` and `stopped`
     // are terminal for accounting but still dequeuable.
@@ -746,30 +733,6 @@ pub fn change_actions_for_test(
         display_status,
         blocker,
         true,
-        false,
-    )
-}
-
-/// Action eligibility with an explicit active Apply-iteration-limit gate.
-///
-/// Reachable outside `cfg(test)` for the same reason as
-/// [`change_actions_for_test`]: the active-ceiling refusal is produced by a live
-/// scheduler boundary plus typed limit evidence, which a client fixture cannot
-/// assemble, and a hand-written `ChangeActions` there could publish a reason the
-/// server never would.
-#[doc(hidden)]
-#[allow(dead_code)] // Used by unit tests and by `tests/client_cli_tests.rs`.
-pub fn limited_change_actions_for_test(
-    app_mode: &str,
-    display_status: &str,
-    apply_iteration_limit_active: bool,
-) -> ChangeActions {
-    classify_actions(
-        OperatorMode::from_app_mode(app_mode),
-        display_status,
-        None,
-        true,
-        apply_iteration_limit_active,
     )
 }
 
@@ -786,7 +749,6 @@ pub fn parallel_change_actions_for_test(
         display_status,
         None,
         parallel_eligible,
-        false,
     )
 }
 

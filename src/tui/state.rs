@@ -43,8 +43,6 @@ mod workspace_dirty_observability_tests;
 mod worktree_action_logic;
 mod worktree_logic;
 
-pub(crate) use selection_logic::ACTIVE_APPLY_LIMIT_EXPLANATION;
-
 // ============================================================================
 // Constants
 // ============================================================================
@@ -178,16 +176,6 @@ pub struct ChangeState {
     /// Purely rendering state. `display_status_cache` stays `"applying"` for the
     /// whole finalization sequence, and nothing routes on this field.
     pub apply_operation_cache: String,
-    /// Whether the active run still owns this change's exhausted Apply ceiling.
-    ///
-    /// Synchronized from the one shared query
-    /// ([`crate::orchestration::operator_command::active_apply_iteration_limit`])
-    /// rather than derived from the diagnostic text or the iteration number. The
-    /// cache exists because row `Space` flips a mark optimistically *before* the
-    /// command reaches the service; without it the UI would briefly claim intent
-    /// the service is about to refuse. It is presentation state only — the
-    /// service guard stands on its own with no TUI attached.
-    pub apply_iteration_limit_active: bool,
     /// Whether the reducer has recorded archive completion for this change.
     ///
     /// Synchronized from
@@ -421,7 +409,6 @@ impl ChangeState {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
-            apply_iteration_limit_active: false,
             archive_complete_cache: false,
         }
     }
@@ -845,44 +832,20 @@ impl AppState {
         );
     }
 
-    /// Adopt the shared active Apply-iteration-limit eligibility set.
-    ///
-    /// Returns true when the projection actually changed. The run loop uses that
-    /// as the scheduler-liveness transition signal: on the frame where the owning
-    /// task exits, `limited` arrives empty, the rows are refreshed, and exactly
-    /// one authoritative `/api/v2` revision is published — without waiting for
-    /// unrelated repository activity to move the snapshot.
-    pub fn sync_active_apply_iteration_limits(&mut self, limited: &HashSet<String>) -> bool {
-        let mut changed = false;
-        for change in &mut self.changes {
-            let active = limited.contains(&change.id);
-            if change.apply_iteration_limit_active != active {
-                change.apply_iteration_limit_active = active;
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// True when any visible row is gated by an active-run Apply ceiling.
-    pub fn has_active_apply_iteration_limit(&self) -> bool {
-        self.changes
-            .iter()
-            .any(|change| change.apply_iteration_limit_active)
-    }
-
     /// True when at least one row carries retryable evidence the service admits.
     ///
     /// Route classification is the shared one, so guidance offers the retry key
-    /// only when some target really exists for it.
+    /// only when some target really exists for it. A retained Apply
+    /// iteration-limit diagnostic is deliberately not consulted: the shared
+    /// service admits an explicit retry on the row's terminal-error evidence, so
+    /// consulting it here would reintroduce a frontend-only refusal.
     pub fn has_admissible_retry_target(&self) -> bool {
         self.changes.iter().any(|change| {
-            !change.apply_iteration_limit_active
-                && crate::orchestration::operator_command::classify_retry_route(
-                    &change.display_status_cache,
-                    change.blocker_kind_cache,
-                )
-                .is_some()
+            crate::orchestration::operator_command::classify_retry_route(
+                &change.display_status_cache,
+                change.blocker_kind_cache,
+            )
+            .is_some()
         })
     }
 
@@ -3144,7 +3107,6 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
-            apply_iteration_limit_active: false,
             archive_complete_cache: false,
         };
 
@@ -4332,7 +4294,6 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
-            apply_iteration_limit_active: false,
             archive_complete_cache: false,
         };
 
@@ -4364,7 +4325,6 @@ mod tests {
             elapsed_time: None,
             iteration_number: Some(3),
             apply_operation_cache: "apply".to_string(),
-            apply_iteration_limit_active: false,
             archive_complete_cache: false,
         };
 
@@ -4400,7 +4360,6 @@ mod tests {
             elapsed_time: None,
             iteration_number: Some(2),
             apply_operation_cache: "apply".to_string(),
-            apply_iteration_limit_active: false,
             archive_complete_cache: false,
         };
 

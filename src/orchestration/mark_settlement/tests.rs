@@ -291,8 +291,7 @@ impl Harness {
         let sink = Arc::new(RecordingSink::default());
         let operator = Arc::new(
             OperatorCommandService::new(state.clone(), queue.clone(), hooks.clone(), marks.clone())
-                .with_parallel(parallel.clone())
-                .with_run_boundary(scheduler.clone()),
+                .with_parallel(parallel.clone()),
         );
         let run_control = Arc::new(RunControlService::new(
             state.clone(),

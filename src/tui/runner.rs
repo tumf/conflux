@@ -663,10 +663,6 @@ async fn run_tui_loop(
                 app.execution_marks(),
             )
             .with_parallel(app.parallel_runtime())
-            // The supervisor's own task handle is the active-limit gate's
-            // lifetime. Binding it here — the same handle run control dispatches
-            // through — is what makes admission and eligibility one decision.
-            .with_run_boundary(supervisor.clone())
             // Read-only, and only at stop settlement: the phase a settled
             // command reports comes from the same store the status resource
             // publishes.
@@ -774,10 +770,6 @@ async fn run_tui_loop(
         // admission from "atomic for the record" into "serialized through
         // settlement", so two new commands cannot consume one revision.
         runtime.bind_gate(application.gate()).await;
-        // Same handle, same decision: the snapshot cannot advertise a retry the
-        // services would refuse, and cannot keep advertising the block once the
-        // owning scheduler task exits.
-        ws.set_run_boundary(supervisor.clone()).await;
         // The same liveness authority the execution-status resource reports as
         // `scheduler_running`, kept distinct from `has_active_work` so a parked
         // persistent scheduler is never mistaken for admitted work.
@@ -1148,25 +1140,6 @@ async fn run_tui_loop(
         // The eligibility set is a TUI observation, so it is republished once
         // per frame instead of at every place the TUI can change it.
         app.publish_parallel_runtime();
-
-        // Active Apply-ceiling eligibility, from the one shared query. The gate
-        // is retired by scheduler-task exit rather than by clearing the record,
-        // so this frame is where the TUI observes that liveness transition. Only
-        // a real change publishes, which makes it exactly one authoritative
-        // `/api/v2` revision instead of one per frame.
-        {
-            let limited =
-                crate::orchestration::operator_command::active_apply_iteration_limited_ids(
-                    &*shared_state.read().await,
-                    Some(supervisor.as_ref()),
-                );
-            if app.sync_active_apply_iteration_limits(&limited) {
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ref ws) = web_state {
-                    ws.sync_remote_control_projection().await;
-                }
-            }
-        }
 
         publish_lifecycle_state(&app);
 
