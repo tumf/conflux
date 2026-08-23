@@ -2921,14 +2921,14 @@ impl ParallelExecutor {
                                 // Cancellation and absolute-runtime-limit expiry
                                 // never completed an invocation, so neither
                                 // resets nor consumes the command-recovery
-                                // budget.
-                                if result.permits_acceptance_retry() {
-                                    crate::orchestration::acceptance::observe_completed_acceptance_invocation(
-                                        &mut acceptance_command_recovery,
-                                        &mut agent,
-                                        &change_id,
-                                    );
-                                }
+                                // budget. The shared observer owns that test so
+                                // this call site cannot drift from it.
+                                crate::orchestration::acceptance::observe_acceptance_invocation_result(
+                                    &mut acceptance_command_recovery,
+                                    &mut agent,
+                                    &change_id,
+                                    &result,
+                                );
                                 break Ok((result, acceptance_iteration));
                             }
                             Err(e) => break Err(e),

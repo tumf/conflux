@@ -731,20 +731,6 @@ impl AiCommandRunner {
         self.command_queue.config()
     }
 
-    /// A runner identical to this one except for its absolute runtime limit.
-    ///
-    /// Used by command classes that carry their own deadline (Acceptance) so the
-    /// dedicated limit is applied at the call site without changing the limit
-    /// every other class runs under. The stagger state, run scope, envs, and
-    /// cleanup settings are shared, so the bounded runner stays part of the same
-    /// invocation's ownership.
-    pub fn with_max_runtime_secs(&self, max_runtime_secs: u64) -> Self {
-        Self {
-            command_queue: self.command_queue.with_max_runtime_secs(max_runtime_secs),
-            ..self.clone()
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn shared_stagger_state(&self) -> SharedStaggerState {
         self.command_queue.shared_stagger_state()
@@ -855,9 +841,15 @@ impl AiCommandRunner {
             let kill_grace_secs = command_queue.config().inactivity_kill_grace_secs;
             let inactivity_timeout_max_retries =
                 command_queue.config().inactivity_timeout_max_retries;
-            // Absolute invocation deadline. `0` disables it; output never
-            // extends it, which is what bounds a continuously-printing agent.
-            let max_runtime_secs = command_queue.config().max_runtime_secs;
+            // Absolute invocation deadline, selected here from the operation
+            // type this invocation already declared: Acceptance carries its own
+            // shorter deadline, every other class keeps `command_max_runtime_secs`
+            // and its `0`-disable semantics. Resolving it inside the common
+            // runner rather than at the call site is what keeps a bounded class
+            // from being an optional per-caller decision.
+            let max_runtime_secs = command_queue
+                .config()
+                .effective_max_runtime_secs(operation_type_owned.as_deref());
 
             // cancel_rx is wrapped in Option so we can neutralise it after first use.
             let mut cancel_rx_opt = Some(cancel_rx);
@@ -2184,6 +2176,8 @@ mod tests {
         let shared_state = Arc::new(Mutex::new(None));
 
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 100,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -2221,6 +2215,8 @@ mod tests {
     async fn test_streaming_with_retry_applies_configured_envs_without_logging_values() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 0,
             retry_delay_ms: 0,
@@ -2261,6 +2257,8 @@ mod tests {
     async fn test_streaming_with_retry_real_pid() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -2305,6 +2303,8 @@ mod tests {
     async fn test_streaming_retry_no_leaked_processes() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 2,
             retry_delay_ms: 300,
@@ -2431,6 +2431,8 @@ mod tests {
             // window a check taken *before* the delay would miss.
             let stagger: SharedStaggerState = Arc::new(Mutex::new(Some(Instant::now())));
             let config = CommandQueueConfig {
+                acceptance_max_runtime_secs:
+                    crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
                 stagger_delay_ms: 250,
                 max_retries: 3,
                 retry_delay_ms: 0,
@@ -2490,6 +2492,8 @@ mod tests {
             let _ = std::fs::remove_file(&attempts);
 
             let config = CommandQueueConfig {
+                acceptance_max_runtime_secs:
+                    crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
                 stagger_delay_ms: 0,
                 max_retries: 5,
                 retry_delay_ms: 300,
@@ -2662,6 +2666,8 @@ mod tests {
         #[tokio::test]
         async fn run_command_scope_treats_handle_loss_as_cancellation() {
             let config = CommandQueueConfig {
+                acceptance_max_runtime_secs:
+                    crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
                 stagger_delay_ms: 0,
                 max_retries: 1,
                 retry_delay_ms: 0,
@@ -2773,6 +2779,8 @@ mod tests {
         #[tokio::test]
         async fn a_command_that_cannot_start_reports_its_cause_on_the_output_channel() {
             let config = CommandQueueConfig {
+                acceptance_max_runtime_secs:
+                    crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
                 stagger_delay_ms: 0,
                 max_retries: 0,
                 retry_delay_ms: 0,
@@ -2828,6 +2836,8 @@ mod tests {
     async fn test_streaming_with_retry_terminates_pipeline() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -2874,6 +2884,8 @@ mod tests {
     async fn test_inactivity_timeout_streaming_pipeline() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -2933,6 +2945,8 @@ mod tests {
     async fn test_inactivity_timeout_retry() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 100,
@@ -2997,6 +3011,8 @@ mod tests {
     async fn test_post_completion_cleanup_on_success() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -3063,6 +3079,8 @@ mod tests {
     async fn test_post_completion_cleanup_on_failure() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1, // One attempt only — no retry on failure
             retry_delay_ms: 50,
@@ -3126,6 +3144,8 @@ mod tests {
     async fn apply_completion_publishes_confirmed_cleanup_for_clean_exit() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -3163,6 +3183,8 @@ mod tests {
     async fn apply_completion_grace_termination_reports_unconfirmed_cleanup() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -3224,6 +3246,8 @@ mod tests {
     async fn apply_completion_grace_termination_confirms_quiescent_group() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -3275,6 +3299,8 @@ mod tests {
     async fn test_post_completion_cleanup_on_cancellation() {
         let shared_state = Arc::new(Mutex::new(None));
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,

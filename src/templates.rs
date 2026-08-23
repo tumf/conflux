@@ -71,7 +71,7 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Absolute runtime limit for one acceptance invocation (seconds).
   // Default: 1800 (30 minutes). Acceptance reviews an implementation rather than
   // producing one, so it carries its own shorter deadline. Measured from child
-  // spawn and never extended by output. Accepts 60 through 10800; 0 is rejected
+  // spawn and never extended by output. Accepts 300 through 10800; 0 is rejected
   // because acceptance cannot disable its wall-clock guard. When
   // command_max_runtime_secs is a positive value the shorter of the two applies.
   // "acceptance_max_runtime_secs": 1800,
@@ -180,7 +180,7 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Absolute runtime limit for one acceptance invocation (seconds).
   // Default: 1800 (30 minutes). Acceptance reviews an implementation rather than
   // producing one, so it carries its own shorter deadline. Measured from child
-  // spawn and never extended by output. Accepts 60 through 10800; 0 is rejected
+  // spawn and never extended by output. Accepts 300 through 10800; 0 is rejected
   // because acceptance cannot disable its wall-clock guard. When
   // command_max_runtime_secs is a positive value the shorter of the two applies.
   // "acceptance_max_runtime_secs": 1800,
@@ -289,7 +289,7 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // Absolute runtime limit for one acceptance invocation (seconds).
   // Default: 1800 (30 minutes). Acceptance reviews an implementation rather than
   // producing one, so it carries its own shorter deadline. Measured from child
-  // spawn and never extended by output. Accepts 60 through 10800; 0 is rejected
+  // spawn and never extended by output. Accepts 300 through 10800; 0 is rejected
   // because acceptance cannot disable its wall-clock guard. When
   // command_max_runtime_secs is a positive value the shorter of the two applies.
   // "acceptance_max_runtime_secs": 1800,

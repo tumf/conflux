@@ -145,7 +145,13 @@ pub const DEFAULT_COMMAND_MAX_RUNTIME_SECS: u64 = 10800;
 pub const DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS: u64 = 1800;
 
 /// Smallest configurable Acceptance absolute runtime limit (seconds).
-pub const MIN_ACCEPTANCE_MAX_RUNTIME_SECS: u64 = 60;
+///
+/// Five minutes. A minute-scale floor reads as a generally safe production
+/// value while being closer to skill-loading overhead than to a review, so the
+/// dedicated key refuses it. This bounds the *dedicated* key only: a shorter
+/// positive [`DEFAULT_COMMAND_MAX_RUNTIME_SECS`] override is an independent
+/// safety limit and may still produce an effective Acceptance bound below this.
+pub const MIN_ACCEPTANCE_MAX_RUNTIME_SECS: u64 = 300;
 
 /// Largest configurable Acceptance absolute runtime limit (seconds).
 pub const MAX_ACCEPTANCE_MAX_RUNTIME_SECS: u64 = 10800;

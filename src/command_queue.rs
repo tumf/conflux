@@ -68,6 +68,65 @@ pub struct CommandQueueConfig {
     #[allow(dead_code)]
     // Used by execute_streaming_with_retry for absolute-runtime enforcement.
     pub max_runtime_secs: u64,
+
+    /// Absolute runtime limit for one Acceptance invocation (seconds).
+    ///
+    /// Acceptance reviews an implementation rather than producing one, so it
+    /// carries its own shorter deadline instead of Apply's. It lives here rather
+    /// than in a forked runner because the limit is command-class policy: the
+    /// common runner selects between this and [`Self::max_runtime_secs`] from the
+    /// operation type it was already given, so no call site can hand a different
+    /// class the Acceptance deadline by construction.
+    ///
+    /// Never `0`: the value is range-validated at configuration load, so
+    /// Acceptance always has a wall-clock guard.
+    #[allow(dead_code)]
+    // Read by `effective_max_runtime_secs` for Acceptance invocations.
+    pub acceptance_max_runtime_secs: u64,
+}
+
+/// The operation type whose invocations run under the dedicated Acceptance
+/// runtime limit.
+///
+/// Exactly one string selects it. Cleanup-review runs the *same configured
+/// agent command* under `cleanup-review`, and a shared command is not a shared
+/// deadline, so it keeps the common limit like every other class.
+pub const ACCEPTANCE_OPERATION_TYPE: &str = "acceptance";
+
+/// The absolute runtime bound one Acceptance invocation runs under.
+///
+/// `command_max_runtime_secs` is the safety budget every command class shares,
+/// so a positive value still caps Acceptance — including values below the
+/// dedicated key's own configuration floor, which constrains what may be
+/// configured rather than clamping the effective bound. `0` disables that common
+/// budget only: the dedicated Acceptance limit is not disableable, so it remains
+/// the bound. Pure over both inputs so the precedence rule is verifiable without
+/// a configuration file, a process, or a clock.
+pub fn acceptance_runtime_limit_secs(acceptance_limit_secs: u64, common_limit_secs: u64) -> u64 {
+    if common_limit_secs == 0 {
+        acceptance_limit_secs
+    } else {
+        acceptance_limit_secs.min(common_limit_secs)
+    }
+}
+
+impl CommandQueueConfig {
+    /// The absolute runtime bound one invocation of `operation_type` runs under.
+    ///
+    /// This is the single selection point: the common runner calls it with the
+    /// operation type it already receives, so the dedicated Acceptance deadline
+    /// is applied without a forked runner and without changing the runner's
+    /// signature. Every operation type other than [`ACCEPTANCE_OPERATION_TYPE`]
+    /// — including `cleanup-review`, `apply`, `archive`, `analyze`, `resolve`,
+    /// and an unlabelled invocation — keeps `command_max_runtime_secs` exactly as
+    /// configured, `0`-disable semantics included.
+    pub fn effective_max_runtime_secs(&self, operation_type: Option<&str>) -> u64 {
+        if operation_type == Some(ACCEPTANCE_OPERATION_TYPE) {
+            acceptance_runtime_limit_secs(self.acceptance_max_runtime_secs, self.max_runtime_secs)
+        } else {
+            self.max_runtime_secs
+        }
+    }
 }
 
 impl From<&OrchestratorConfig> for CommandQueueConfig {
@@ -94,6 +153,7 @@ impl From<&OrchestratorConfig> for CommandQueueConfig {
             inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
             strict_process_cleanup: config.get_command_strict_process_cleanup(),
             max_runtime_secs: config.get_command_max_runtime_secs(),
+            acceptance_max_runtime_secs: config.get_acceptance_max_runtime_secs(),
         }
     }
 }
@@ -131,21 +191,6 @@ impl CommandQueue {
         Self {
             config,
             last_execution: shared_state,
-        }
-    }
-
-    /// A queue that shares this one's stagger state but bounds its commands with
-    /// a different absolute runtime limit.
-    ///
-    /// Only `max_runtime_secs` moves: retry, inactivity, and cleanup settings
-    /// stay exactly as configured, so a per-command-class deadline cannot become
-    /// an accidental fork of the whole command policy.
-    pub fn with_max_runtime_secs(&self, max_runtime_secs: u64) -> Self {
-        let mut config = self.config.clone();
-        config.max_runtime_secs = max_runtime_secs;
-        Self {
-            config,
-            last_execution: self.last_execution.clone(),
         }
     }
 
@@ -755,6 +800,7 @@ mod tests {
             command_inactivity_timeout_max_retries: Some(17),
             command_strict_process_cleanup: Some(false),
             command_max_runtime_secs: Some(18),
+            acceptance_max_runtime_secs: Some(19),
             ..OrchestratorConfig::default()
         };
 
@@ -769,6 +815,7 @@ mod tests {
         assert_eq!(queue.inactivity_timeout_max_retries, 17);
         assert!(!queue.strict_process_cleanup);
         assert_eq!(queue.max_runtime_secs, 18);
+        assert_eq!(queue.acceptance_max_runtime_secs, 19);
 
         let defaults = CommandQueueConfig::from(&OrchestratorConfig::default());
         assert_eq!(defaults.stagger_delay_ms, DEFAULT_STAGGER_DELAY_MS);
@@ -796,6 +843,10 @@ mod tests {
             DEFAULT_COMMAND_STRICT_PROCESS_CLEANUP
         );
         assert_eq!(defaults.max_runtime_secs, DEFAULT_COMMAND_MAX_RUNTIME_SECS);
+        assert_eq!(
+            defaults.acceptance_max_runtime_secs,
+            DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS
+        );
 
         // `0` is a configured value, not "unset": it must survive the
         // conversion as the explicit disable it is.
@@ -804,10 +855,73 @@ mod tests {
             ..OrchestratorConfig::default()
         });
         assert_eq!(disabled.max_runtime_secs, 0);
+        assert_eq!(
+            disabled.acceptance_max_runtime_secs, DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
+            "disabling the common budget never disables the Acceptance one"
+        );
+    }
+
+    /// The precedence rule between the two limits, over nothing but numbers.
+    ///
+    /// It is deliberately pure: the common budget is a shared safety limit, the
+    /// dedicated one has no disable token, and `min` versus "dedicated wins" has
+    /// to be decidable without a configuration file, a process, or a clock.
+    #[test]
+    fn acceptance_runtime_limit_precedence_is_pure() {
+        // The defaults: 30 minutes binds, not Apply's three hours.
+        assert_eq!(acceptance_runtime_limit_secs(1_800, 10_800), 1_800);
+        // `0` disables the *common* budget only.
+        assert_eq!(acceptance_runtime_limit_secs(1_800, 0), 1_800);
+        // A shorter positive common limit is an overriding safety bound, even
+        // below the dedicated key's own configuration floor.
+        assert_eq!(acceptance_runtime_limit_secs(1_800, 300), 300);
+        assert_eq!(acceptance_runtime_limit_secs(1_800, 30), 30);
+        assert_eq!(acceptance_runtime_limit_secs(1_800, 1), 1);
+        // A configured dedicated limit below the common one is honored.
+        assert_eq!(acceptance_runtime_limit_secs(600, 10_800), 600);
+        // Equal limits are neither doubled nor disabled.
+        assert_eq!(acceptance_runtime_limit_secs(1_800, 1_800), 1_800);
+    }
+
+    /// Selection is by operation type and nothing else: the value stored for the
+    /// common classes is never rewritten, so one runner serves both.
+    #[test]
+    fn effective_limit_is_selected_by_operation_type() {
+        let config = CommandQueueConfig::from(&OrchestratorConfig {
+            command_max_runtime_secs: Some(10_800),
+            acceptance_max_runtime_secs: Some(1_800),
+            ..OrchestratorConfig::default()
+        });
+
+        assert_eq!(
+            config.effective_max_runtime_secs(Some(ACCEPTANCE_OPERATION_TYPE)),
+            1_800
+        );
+        for other in [
+            Some("apply"),
+            Some("archive"),
+            Some("analyze"),
+            Some("resolve"),
+            Some("cleanup-review"),
+            Some("rejecting"),
+            None,
+        ] {
+            assert_eq!(
+                config.effective_max_runtime_secs(other),
+                10_800,
+                "{other:?} must keep the common limit"
+            );
+        }
+        assert_eq!(
+            config.max_runtime_secs, 10_800,
+            "resolving a class deadline must not mutate the shared configuration"
+        );
     }
 
     fn test_config() -> CommandQueueConfig {
         CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 100,
             max_retries: 2,
             retry_delay_ms: 50,
@@ -995,6 +1109,8 @@ mod tests {
     async fn test_execute_with_retry_streaming_failure_no_retry() {
         // Test with max_retries = 0 to ensure no retries happen
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 100,
             max_retries: 1, // Only 1 attempt allowed (no retries)
             retry_delay_ms: 50,
@@ -1034,6 +1150,8 @@ mod tests {
 
         // Configure with short inactivity timeout (1 second)
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 100,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -1085,6 +1203,8 @@ mod tests {
 
         // Configure with inactivity timeout (1 second)
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 100,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -1126,6 +1246,8 @@ mod tests {
 
         // Configure with timeout disabled (0)
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 100,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -1165,6 +1287,8 @@ mod tests {
         use std::process::Stdio;
 
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -1222,6 +1346,8 @@ mod tests {
 
         // Inactivity timeout of 1 second; command emits bytes every 0.2s (no newlines)
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
@@ -1267,6 +1393,8 @@ mod tests {
 
         // Inactivity timeout of 1 second; command emits to stderr every 0.2s
         let config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 1,
             retry_delay_ms: 50,
