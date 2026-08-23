@@ -352,7 +352,7 @@ The common AI command runner MUST enforce `command_max_runtime_secs` as an absol
 
 ### Requirement: Acceptance commands have a dedicated absolute runtime limit
 
-The common AI command runner MUST accept an Acceptance-specific absolute runtime limit supplied by orchestration. `acceptance_max_runtime_secs` MUST default to 1,800 seconds, accept values from 60 through 10,800 seconds, and reject zero. When `command_max_runtime_secs` is positive, Acceptance MUST use the minimum of the common and dedicated limits. When `command_max_runtime_secs` is zero, Acceptance MUST remain bounded by the dedicated limit. Acceptance output activity MUST NOT extend the deadline. Expiry MUST close retry admission for that invocation, terminate and prove quiescence for the owned process group through the existing cleanup path, and return a typed non-retryable Acceptance runtime failure. That failure MUST NOT enter no-verdict protocol continuation, corrective command-recovery retry, or inactivity-timeout classification. Other command classes MUST retain `command_max_runtime_secs` semantics.
+The common AI command runner MUST select an Acceptance-specific absolute runtime limit from the operation type the invocation already declares, without a caller-supplied limit and without changing the runner's signature. `acceptance_max_runtime_secs` MUST default to 1,800 seconds; its validated range and its rejection of zero belong to the configuration capability rather than to this one. When `command_max_runtime_secs` is positive, Acceptance MUST use the minimum of the common and dedicated limits, including common values below the dedicated key's configuration floor. When `command_max_runtime_secs` is zero, Acceptance MUST remain bounded by the dedicated limit. Acceptance output activity MUST NOT extend the deadline. Expiry MUST close retry admission for that invocation, terminate and prove quiescence for the owned process group through the existing cleanup path, and return a typed non-retryable Acceptance runtime failure. That failure MUST NOT enter no-verdict protocol continuation, corrective command-recovery retry, or inactivity-timeout classification. Every other operation type, including cleanup review, MUST retain `command_max_runtime_secs` semantics even when it runs the same configured agent command.
 
 #### Scenario: Acceptance uses the shorter default
 
@@ -383,11 +383,13 @@ The common AI command runner MUST accept an Acceptance-specific absolute runtime
 **And**: the owned process group is terminated and reaped
 **And**: the invocation returns a typed non-retryable Acceptance runtime failure
 
-#### Scenario: Acceptance deadline cannot be disabled
+#### Scenario: The operation type selects the deadline
 
-**Given**: configuration sets `acceptance_max_runtime_secs` to zero or outside 60 through 10,800 seconds
-**When**: configuration is loaded
-**Then**: loading fails with an actionable range diagnostic
+**Given**: one command runner serves every operation class
+**When**: it starts an invocation labelled `acceptance`
+**Then**: it applies the dedicated Acceptance limit
+**And**: an invocation labelled with any other operation type receives `command_max_runtime_secs`
+**And**: no call site supplies a runtime limit of its own
 
 #### Scenario: Other command limits remain unchanged
 
