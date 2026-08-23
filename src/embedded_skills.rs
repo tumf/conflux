@@ -1245,6 +1245,53 @@ mod tests {
         );
     }
 
+    /// The proposal skill is the authoring half of the verification-cohesion
+    /// contract: native validation rejects bundled gates, and the bundled
+    /// guidance has to teach the same rule with the same vocabulary.
+    #[test]
+    fn proposal_skill_documents_cohesive_bounded_change_blocking_gates() {
+        let content = embedded_skill_content("cflx-proposal");
+
+        for required in [
+            "## One Change-Blocking Gate Proves One Cohesive Claim",
+            "**A shared change-blocking ID needs one ownership marker and one command.**",
+            "the single closed-set token immediately after `verification:` and\nbefore the first ` - `",
+            "Markdown backticks, spacing, and letter case are normalized away",
+            "**Structurally heavyweight command forms cannot be change-blocking.**",
+            "so a heavy `evidence` is still rejected behind a focused `rerun`",
+            // Every denied structural class, named as the validator names it.
+            "| Container orchestration |",
+            "| Cross-architecture emulation |",
+            "| Benchmark |",
+            "| Fuzzing |",
+            "| Full / exhaustive / heavy suite |",
+            "| Repeated stability execution |",
+            // The prescribed split: bounded proof blocks, broad execution observes.
+            "Rewrite the gate as bounded proof plus separately owned broad verification",
+            "completion_role: change-blocking",
+            "completion_role: operational-observation",
+        ] {
+            assert!(
+                content.contains(required),
+                "cflx-proposal must document `{required}`"
+            );
+        }
+
+        // The bounded repository-local exception must not read as an escape
+        // hatch from the command-form denylist.
+        assert!(
+            content.contains(
+                "The bounded path\nis an exception for the *requirement*, never for the *command form*"
+            ),
+            "cflx-proposal must keep the bounded-path exception subordinate to the denylist"
+        );
+        assert!(
+            content
+                .contains("only a\nrepetition count of two or more is treated as a stability loop"),
+            "cflx-proposal must keep cache-busting repetition counts valid"
+        );
+    }
+
     /// The apply skill must separate agent staging from Conflux commit
     /// ownership, demand a clean workspace, and forbid returning with
     /// background verification still running.

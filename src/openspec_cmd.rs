@@ -9,6 +9,9 @@ mod model;
 mod promotion;
 mod rendering;
 pub(crate) mod validation;
+mod verify;
+
+pub use verify::cmd_verify;
 
 use crate::archive_layout;
 use archive::ArchiveEngine;
@@ -1561,6 +1564,327 @@ mod validation_tests {
         assert!(errors.is_empty(), "{errors:?}");
     }
 
+    // -----------------------------------------------------------------
+    // Change-blocking verification cohesion and bounded-command policy
+    // -----------------------------------------------------------------
+
+    /// Validate a `tasks.md` body against the migrated role-model proposal.
+    fn migrated_task_errors(content: &str) -> Vec<String> {
+        let (errors, _) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "error",
+            Some("implementation"),
+            Some(MIGRATED_PROPOSAL),
+        );
+        errors
+    }
+
+    /// One active checkbox whose verification note carries `note`.
+    fn single_task(note: &str) -> String {
+        format!("## Implementation Tasks\n- [ ] Prove the behavior (verification: {note})\n")
+    }
+
+    #[test]
+    fn test_shared_change_blocking_id_rejects_heterogeneous_ownership_markers() {
+        let content = concat!(
+            "## Implementation Tasks\n",
+            "- [ ] Implement the validator (verification: unit - `cargo test openspec_cmd --lib`; verification-id: local-tests)\n",
+            "- [ ] Confirm the CLI wiring (verification: integration - `cargo test openspec_cmd --lib`; verification-id: local-tests)\n",
+        );
+        let errors = migrated_task_errors(content);
+
+        let finding = errors
+            .iter()
+            .find(|error| error.contains("is shared by task lines"))
+            .unwrap_or_else(|| panic!("cohesion finding expected: {errors:?}"));
+        assert!(finding.contains("'local-tests'"), "{finding}");
+        assert!(finding.contains("task lines 2, 3"), "{finding}");
+        assert!(
+            finding.contains("split the verification declarations"),
+            "{finding}"
+        );
+    }
+
+    #[test]
+    fn test_shared_change_blocking_id_rejects_heterogeneous_commands() {
+        let content = concat!(
+            "## Implementation Tasks\n",
+            "- [ ] Implement the validator (verification: unit - `cargo test openspec_cmd --lib`; verification-id: local-tests)\n",
+            "- [ ] Cover the parser (verification: unit - `cargo test task_parser --lib`; verification-id: local-tests)\n",
+        );
+        let errors = migrated_task_errors(content);
+
+        assert!(
+            errors.iter().any(|error| error.contains("'local-tests'")
+                && error.contains("different verification ownership markers or concrete commands")
+                && error.contains("task lines 2, 3")),
+            "{errors:?}"
+        );
+    }
+
+    /// One focused command may prove tightly coupled implementation and
+    /// regression-test tasks. Backticks, spacing, and case are normalized away.
+    #[test]
+    fn test_focused_command_may_cover_coupled_tasks() {
+        let content = concat!(
+            "## Implementation Tasks\n",
+            "- [ ] Implement the cohesion rule (verification: unit - `cargo test openspec_cmd --lib`; verification-id: local-tests)\n",
+            "- [ ] Add the regression tests (verification: Unit -  cargo test   openspec_cmd    --lib ; verification-id: local-tests)\n",
+        );
+
+        let errors = migrated_task_errors(content);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn test_change_blocking_task_command_rejects_heavyweight_forms() {
+        for (command, category) in [
+            (
+                "`docker compose up -d && ./suite.sh`",
+                "container orchestration",
+            ),
+            ("`podman run ci-image make test`", "container orchestration"),
+            (
+                "`qemu-system-aarch64 -kernel target/test.img`",
+                "cross-architecture emulation",
+            ),
+            (
+                "`docker buildx build --platform linux/arm64 .`",
+                "container orchestration",
+            ),
+            ("`cargo bench --bench validation`", "benchmark"),
+            ("`cargo fuzz run proposal-parser`", "fuzzing"),
+            (
+                "`cargo test --workspace --all-features`",
+                "full/exhaustive/heavy suite",
+            ),
+            (
+                "`cargo test --features heavy openspec_cmd`",
+                "full/exhaustive/heavy suite",
+            ),
+            (
+                "`cargo test openspec_cmd --lib -- --repeat 5`",
+                "repeated stability execution",
+            ),
+            (
+                "`go test -count=3 ./internal/spec`",
+                "repeated stability execution",
+            ),
+            (
+                "`for i in 1 2 3; do cargo test openspec_cmd --lib; done`",
+                "repeated stability execution",
+            ),
+        ] {
+            let content = single_task(&format!("unit - {command}; verification-id: local-tests"));
+            let errors = migrated_task_errors(&content);
+            assert!(
+                errors.iter().any(|error| error.contains("tasks.md:2")
+                    && error.contains("change-blocking verification 'local-tests'")
+                    && error.contains("heavyweight command form")
+                    && error.contains(category)),
+                "{command} must be rejected as {category}: {errors:?}"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("bounded repository-local command")
+                        && error.contains("operational-observation")),
+                "{command} must recommend bounded proof plus separate ownership: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bounded_repository_local_commands_stay_valid() {
+        for command in [
+            "`cargo test openspec_cmd --lib`",
+            "`cargo test embedded_skills --lib`",
+            "`go test -count=1 ./internal/spec`",
+            "`npm test -- --run src/validation.test.ts`",
+            "`uv run pytest tests/test_validation.py`",
+        ] {
+            let content = single_task(&format!("unit - {command}; verification-id: local-tests"));
+            assert!(
+                migrated_task_errors(&content).is_empty(),
+                "{command} must remain a valid bounded gate"
+            );
+        }
+    }
+
+    /// The native denylist outranks generic evidence-hint recognition: a
+    /// container command must report the heavyweight diagnostic even though
+    /// `docker build` is an accepted repository-evidence hint.
+    #[test]
+    fn test_heavyweight_command_overrides_evidence_hint_recognition() {
+        for command in [
+            "`docker build -t ci . && docker run ci`",
+            "`docker compose up -d`",
+        ] {
+            let content = single_task(&format!("unit - {command}; verification-id: local-tests"));
+            let errors = migrated_task_errors(&content);
+
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("heavyweight command form")),
+                "{command}: {errors:?}"
+            );
+            assert!(
+                !errors
+                    .iter()
+                    .any(|error| error.contains("should cite repository-verifiable evidence")),
+                "{command} must not fall back to the missing-evidence diagnostic: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_change_blocking_ownership_marker_must_be_one_closed_set_token() {
+        for marker in ["unit and integration", "manual review", "smoke"] {
+            let content = single_task(&format!(
+                "{marker} - `cargo test openspec_cmd --lib`; verification-id: local-tests"
+            ));
+            let errors = migrated_task_errors(&content);
+
+            assert!(
+                errors.iter().any(|error| error.contains("tasks.md:2")
+                    && error.contains("change-blocking verification 'local-tests'")
+                    && error.contains("ownership marker must be exactly one of")
+                    && error.contains(marker)),
+                "'{marker}' must be rejected as an ownership marker: {errors:?}"
+            );
+        }
+    }
+
+    /// Free-text prose never creates or alters a workflow-control
+    /// classification, inside a task description or in narrative sections.
+    #[test]
+    fn test_prose_heaviness_outside_verification_syntax_is_ignored() {
+        let content = concat!(
+            "## Implementation Tasks\n",
+            "- [ ] Replace the full heavy docker benchmark suite with a bounded check (verification: unit - `cargo test openspec_cmd --lib`; verification-id: local-tests)\n",
+            "\n## Future Work\n",
+            "- The exhaustive qemu cross-architecture sweep stays owned by CI\n",
+            "\n## Notes\n",
+            "- `docker compose up -d` and `cargo bench --bench validation` run in repository automation\n",
+        );
+
+        assert!(migrated_task_errors(content).is_empty());
+    }
+
+    /// Legacy proposals keep migration compatibility: no cohesion or
+    /// bounded-command finding is produced until role metadata is declared.
+    #[test]
+    fn test_cohesion_policy_stays_inactive_for_legacy_proposals() {
+        let content = concat!(
+            "## Implementation Tasks\n",
+            "- [ ] Implement it (verification: unit - `docker compose up -d`; verification-id: local-tests)\n",
+            "- [ ] Cover it (verification: integration - `cargo bench --bench x`; verification-id: local-tests)\n",
+        );
+        let (errors, _) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "error",
+            Some("implementation"),
+            Some(LEGACY_PROPOSAL),
+        );
+
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("heavyweight command form")
+                    || error.contains("is shared by task lines")),
+            "{errors:?}"
+        );
+    }
+
+    /// A change-blocking declaration cannot hide a heavy command in `evidence`
+    /// behind a focused `rerun`, and vice versa.
+    #[test]
+    fn test_change_blocking_declaration_rejects_heavy_command_in_every_form() {
+        use crate::openspec::VerificationDeclaration;
+        use crate::openspec_cmd::validation::heavy_declaration_findings;
+
+        let declaration =
+            |evidence: &str, rerun: &str, completion_role: &str| VerificationDeclaration {
+                id: Some("proposal-gate".to_string()),
+                phase: Some("pre-integration".to_string()),
+                owner: Some("conflux-acceptance".to_string()),
+                evidence: Some(evidence.to_string()),
+                rerun: Some(rerun.to_string()),
+                execution_class: Some("repository-local".to_string()),
+                completion_role: Some(completion_role.to_string()),
+                ..Default::default()
+            };
+
+        let heavy_evidence = heavy_declaration_findings(
+            "test",
+            &declaration(
+                "docker compose run tests",
+                "cargo test openspec_cmd --lib",
+                "change-blocking",
+            ),
+        );
+        assert!(
+            heavy_evidence
+                .iter()
+                .any(|error| error.contains("verification 'proposal-gate'")
+                    && error.contains("change-blocking evidence")
+                    && error.contains("container orchestration")),
+            "{heavy_evidence:?}"
+        );
+
+        let heavy_rerun = heavy_declaration_findings(
+            "test",
+            &declaration(
+                "cargo test openspec_cmd --lib",
+                "cargo test --workspace",
+                "change-blocking",
+            ),
+        );
+        assert!(
+            heavy_rerun
+                .iter()
+                .any(|error| error.contains("change-blocking rerun")
+                    && error.contains("full/exhaustive/heavy suite")),
+            "{heavy_rerun:?}"
+        );
+
+        assert!(heavy_declaration_findings(
+            "test",
+            &declaration(
+                "cargo test openspec_cmd --lib",
+                "cargo test openspec_cmd --lib",
+                "change-blocking",
+            ),
+        )
+        .is_empty());
+
+        // Broad execution stays legal once it is owned as an observation.
+        assert!(heavy_declaration_findings(
+            "test",
+            &declaration(
+                "docker compose run tests",
+                "docker compose run tests",
+                "operational-observation",
+            ),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn test_normalize_command_folds_backticks_whitespace_and_case() {
+        use crate::openspec_cmd::validation::normalize_command;
+
+        assert_eq!(
+            normalize_command(" `cargo  TEST   openspec_cmd --lib` "),
+            "cargo test openspec_cmd --lib"
+        );
+    }
+
     #[test]
     fn test_validate_tasks_with_weak_verification() {
         let content = "- [ ] Add a new feature (verification: manual review)\n";
@@ -2736,6 +3060,37 @@ mod openspec_list_show_tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("is not tracked by git")));
+    }
+
+    /// Strict validation must reach the bounded-command policy from the real
+    /// entrypoint, not only from the pure decision helper.
+    #[test]
+    fn test_strict_validation_rejects_heavyweight_change_blocking_declaration() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/heavy-gate");
+        create_strict_valid_change(&change_dir, "Heavy Gate");
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nverifications:\n  - id: bounded-gate\n    requirement: validator behavior\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: pull request\n    automation: Cargo.toml\n    evidence: docker compose run --rm suite\n    rerun: cargo test openspec_cmd --lib\n    prerequisites: []\n    execution_class: repository-local\n    completion_role: change-blocking\n---\n# Heavy Gate\n\n**Change Type**: implementation\n\n## Problem\nvalidator fixture\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] 1. validator update (verification: unit - cargo test openspec_cmd --lib; verification-id: bounded-gate)\n",
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("heavy-gate"), true, "error");
+
+        assert!(!valid);
+        assert!(
+            errors.iter().any(|error| error
+                .contains("verification 'bounded-gate': change-blocking evidence")
+                && error.contains("heavyweight command form (container orchestration)")),
+            "{errors:?}"
+        );
     }
 
     #[test]

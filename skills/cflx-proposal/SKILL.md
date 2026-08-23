@@ -562,12 +562,90 @@ testcontainer-free harness that completes in one direct command, declare *that*
 as `pre-integration`, `repository-local`, and `change-blocking`, and attach it to
 the implementation task. The heavy suite keeps its own separate non-blocking
 ownership. This is the preferred shape: requirement-specific bounded proof
-blocks the change, and the broad suite guards the integration.
+blocks the change, and the broad suite guards the integration. The bounded path
+is an exception for the *requirement*, never for the *command form*: a bounded
+repository-local declaration whose command still matches the denied forms below
+is rejected by native validation, and no wording makes it valid.
 
 **Never hide a non-local outcome in task prose.** If the outcome needs
 credentials, a deployment, hardware, or an approval, it does not become
 Apply-blocking by being phrased as "verify that ...". Move it to its structured
 verification owner or to narrative Future Work.
+
+## One Change-Blocking Gate Proves One Cohesive Claim
+
+Native strict validation enforces two structural rules on every
+`completion_role: change-blocking` verification. Both read declared syntax only;
+neither infers meaning from task prose.
+
+**A shared change-blocking ID needs one ownership marker and one command.**
+Several checkboxes may reference the same `verification-id:` only when every one
+of them names the same ownership marker and the same concrete command. The
+marker is the single closed-set token immediately after `verification:` and
+before the first ` - ` — `unit`, `integration`, `e2e`, `manual`, `benchmark`, or
+`not-testable`. Markdown backticks, spacing, and letter case are normalized away
+before comparison, so only a real difference is a difference.
+
+```markdown
+<!-- Valid: coupled implementation and regression tests, one focused proof. -->
+- [ ] Add the cohesion rule (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-tests)
+- [ ] Add its regression tests (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-tests)
+
+<!-- Invalid: one gate bundling unrelated evidence. Split the declarations. -->
+- [ ] Add the cohesion rule (verification: unit - `cargo test openspec_cmd --lib`; verification-id: proposal-gate-tests)
+- [ ] Wire the TUI panel (verification: integration - `cargo test tui::panel --lib`; verification-id: proposal-gate-tests)
+```
+
+The second shape fails validation with the verification ID and every affected
+task line. Give each distinct marker-and-command pair its own `verifications:`
+entry and its own ID.
+
+**Structurally heavyweight command forms cannot be change-blocking.** The
+denylist applies to *every* declared command form — the `evidence` field, the
+`rerun` field, and the concrete command in a task's `(verification: ...)` note —
+so a heavy `evidence` is still rejected behind a focused `rerun`. Denied forms:
+
+| Denied form | Examples |
+| --- | --- |
+| Container orchestration | `docker`, `docker compose`, `podman`, `nerdctl`, `kubectl`, `helm` |
+| Cross-architecture emulation | `qemu-*`, `binfmt`, `cross`, `--platform linux/...` |
+| Benchmark | `cargo bench`, `--bench ...`, `hyperfine`, `criterion` |
+| Fuzzing | `cargo fuzz`, `afl-fuzz`, `--fuzz...` |
+| Full / exhaustive / heavy suite | `--workspace`, `--all`, `--all-features`, `--features heavy`, `--ignored`, `--include-ignored` |
+| Repeated stability execution | `--repeat N`, `-count=3`, `for i in ...`, `while true` |
+
+Rewrite the gate as bounded proof plus separately owned broad verification:
+
+```yaml
+verifications:
+  # Bounded requirement-specific proof: this one blocks the change.
+  - id: parser-gate-tests
+    requirement: The parser rejects bundled change-blocking declarations
+    phase: pre-integration
+    owner: conflux-acceptance
+    trigger: pull-request-validation
+    automation: src/openspec_cmd/validation.rs
+    evidence: cargo test openspec_cmd --lib
+    rerun: cargo test openspec_cmd --lib
+    prerequisites: []
+    execution_class: repository-local
+    completion_role: change-blocking
+  # Broad execution: observed, never blocking.
+  - id: container-integration-sweep
+    requirement: The packaged image still runs the full suite
+    phase: post-integration
+    owner: repository-automation
+    trigger: merge-to-main
+    automation: .github/workflows/integration.yml
+    evidence: docker compose run --rm suite
+    rerun: docker compose run --rm suite
+    prerequisites: []
+    execution_class: repository-automation
+    completion_role: operational-observation
+```
+
+`-count=1` and similar cache-busting forms stay bounded and remain valid; only a
+repetition count of two or more is treated as a stability loop.
 
 ## Task Classification
 

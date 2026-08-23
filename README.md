@@ -278,6 +278,7 @@ cargo install cflx
 | [Web UI Guide (English)](docs/guides/WEBUI.md) | Web UI, REST API, `/api/v2`, migrating from server mode |
 | [README.ja.md](README.ja.md) | Full documentation (Japanese) |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | Usage examples |
+| [docs/guides/VERIFICATION_EVIDENCE.md](docs/guides/VERIFICATION_EVIDENCE.md) | `cflx openspec verify`, bound evidence reuse, and why a rerun is never a verdict |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | Development guide |
 | [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | Release guide |

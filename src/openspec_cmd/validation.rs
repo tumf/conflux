@@ -548,6 +548,7 @@ fn validate_verification_declarations(
                 root_dir, change_id, label, automation,
             ));
         }
+        errors.extend(heavy_declaration_findings(change_id, verification));
         for issue in crate::openspec::evaluate_verification_role(verification) {
             let message = verification_role_issue_message(change_id, label, verification, &issue);
             if issue.is_warning() {
@@ -1016,6 +1017,532 @@ pub(super) fn has_verification_ownership_marker(verification_text: &str) -> bool
         .any(|marker| normalized.contains(marker))
 }
 
+// ---------------------------------------------------------------------------
+// Change-blocking verification cohesion and bounded-command policy
+// ---------------------------------------------------------------------------
+
+/// Structural class of a command form that must never gate change completion.
+///
+/// Every class is decided from command syntax alone. Prose is never consulted,
+/// so narrative words such as "heavy" or "full" cannot create a classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HeavyCommandCategory {
+    ContainerOrchestration,
+    CrossArchitectureEmulation,
+    Benchmark,
+    Fuzzing,
+    FullSuite,
+    RepeatedStability,
+}
+
+impl HeavyCommandCategory {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::ContainerOrchestration => "container orchestration",
+            Self::CrossArchitectureEmulation => "cross-architecture emulation",
+            Self::Benchmark => "benchmark",
+            Self::Fuzzing => "fuzzing",
+            Self::FullSuite => "full/exhaustive/heavy suite",
+            Self::RepeatedStability => "repeated stability execution",
+        }
+    }
+}
+
+/// How one denylist entry matches an already-normalized command.
+enum HeavyPattern {
+    /// Whole whitespace-delimited token equality.
+    Token(&'static str),
+    /// Token prefix, so `--bench=name` and `qemu-system-aarch64` match too.
+    TokenPrefix(&'static str),
+    /// Substring of the whitespace-folded command.
+    Phrase(&'static str),
+    /// A repetition flag whose numeric value is two or more.
+    RepeatCount,
+}
+
+/// The initial minimal denylist of structurally heavyweight execution forms.
+///
+/// Entries are deterministic syntax, not semantics: each one names a command,
+/// subcommand, or flag whose presence alone proves the execution cannot be a
+/// bounded repository-local proof. Extend it only from observed false negatives
+/// that have equally deterministic syntax.
+const HEAVY_COMMAND_RULES: &[(HeavyCommandCategory, HeavyPattern)] = &[
+    // Container orchestration.
+    (
+        HeavyCommandCategory::ContainerOrchestration,
+        HeavyPattern::Token("docker"),
+    ),
+    (
+        HeavyCommandCategory::ContainerOrchestration,
+        HeavyPattern::Token("docker-compose"),
+    ),
+    (
+        HeavyCommandCategory::ContainerOrchestration,
+        HeavyPattern::Token("podman"),
+    ),
+    (
+        HeavyCommandCategory::ContainerOrchestration,
+        HeavyPattern::Token("podman-compose"),
+    ),
+    (
+        HeavyCommandCategory::ContainerOrchestration,
+        HeavyPattern::Token("nerdctl"),
+    ),
+    (
+        HeavyCommandCategory::ContainerOrchestration,
+        HeavyPattern::Token("kubectl"),
+    ),
+    (
+        HeavyCommandCategory::ContainerOrchestration,
+        HeavyPattern::Token("helm"),
+    ),
+    (
+        HeavyCommandCategory::ContainerOrchestration,
+        HeavyPattern::Token("minikube"),
+    ),
+    (
+        HeavyCommandCategory::ContainerOrchestration,
+        HeavyPattern::Token("skaffold"),
+    ),
+    (
+        HeavyCommandCategory::ContainerOrchestration,
+        HeavyPattern::Token("testcontainers"),
+    ),
+    // Cross-architecture emulation.
+    (
+        HeavyCommandCategory::CrossArchitectureEmulation,
+        HeavyPattern::TokenPrefix("qemu"),
+    ),
+    (
+        HeavyCommandCategory::CrossArchitectureEmulation,
+        HeavyPattern::Token("binfmt"),
+    ),
+    (
+        HeavyCommandCategory::CrossArchitectureEmulation,
+        HeavyPattern::Token("cross"),
+    ),
+    (
+        HeavyCommandCategory::CrossArchitectureEmulation,
+        HeavyPattern::Token("dockcross"),
+    ),
+    (
+        HeavyCommandCategory::CrossArchitectureEmulation,
+        HeavyPattern::Phrase("--platform linux/"),
+    ),
+    (
+        HeavyCommandCategory::CrossArchitectureEmulation,
+        HeavyPattern::Phrase("--platform=linux/"),
+    ),
+    // Benchmarks.
+    (
+        HeavyCommandCategory::Benchmark,
+        HeavyPattern::Phrase("cargo bench"),
+    ),
+    (
+        HeavyCommandCategory::Benchmark,
+        HeavyPattern::TokenPrefix("--bench"),
+    ),
+    (
+        HeavyCommandCategory::Benchmark,
+        HeavyPattern::TokenPrefix("-bench"),
+    ),
+    (
+        HeavyCommandCategory::Benchmark,
+        HeavyPattern::Token("hyperfine"),
+    ),
+    (
+        HeavyCommandCategory::Benchmark,
+        HeavyPattern::Token("criterion"),
+    ),
+    (HeavyCommandCategory::Benchmark, HeavyPattern::Token("wrk")),
+    (HeavyCommandCategory::Benchmark, HeavyPattern::Token("k6")),
+    // Fuzzing.
+    (
+        HeavyCommandCategory::Fuzzing,
+        HeavyPattern::Phrase("cargo fuzz"),
+    ),
+    (
+        HeavyCommandCategory::Fuzzing,
+        HeavyPattern::Token("afl-fuzz"),
+    ),
+    (
+        HeavyCommandCategory::Fuzzing,
+        HeavyPattern::Token("honggfuzz"),
+    ),
+    (
+        HeavyCommandCategory::Fuzzing,
+        HeavyPattern::Token("libfuzzer"),
+    ),
+    (
+        HeavyCommandCategory::Fuzzing,
+        HeavyPattern::TokenPrefix("--fuzz"),
+    ),
+    // Explicit full / exhaustive / heavy suite selectors.
+    (
+        HeavyCommandCategory::FullSuite,
+        HeavyPattern::Token("--all-features"),
+    ),
+    (
+        HeavyCommandCategory::FullSuite,
+        HeavyPattern::Token("--workspace"),
+    ),
+    (
+        HeavyCommandCategory::FullSuite,
+        HeavyPattern::Token("--all"),
+    ),
+    (
+        HeavyCommandCategory::FullSuite,
+        HeavyPattern::Token("--ignored"),
+    ),
+    (
+        HeavyCommandCategory::FullSuite,
+        HeavyPattern::Token("--include-ignored"),
+    ),
+    (
+        HeavyCommandCategory::FullSuite,
+        HeavyPattern::Token("--exhaustive"),
+    ),
+    (
+        HeavyCommandCategory::FullSuite,
+        HeavyPattern::Token("--full"),
+    ),
+    (
+        HeavyCommandCategory::FullSuite,
+        HeavyPattern::Token("--heavy"),
+    ),
+    (
+        HeavyCommandCategory::FullSuite,
+        HeavyPattern::Phrase("--features heavy"),
+    ),
+    (
+        HeavyCommandCategory::FullSuite,
+        HeavyPattern::Phrase("--features=heavy"),
+    ),
+    // Repeated execution / stability loops.
+    (
+        HeavyCommandCategory::RepeatedStability,
+        HeavyPattern::Phrase("while true"),
+    ),
+    (
+        HeavyCommandCategory::RepeatedStability,
+        HeavyPattern::Phrase("for i in"),
+    ),
+    (
+        HeavyCommandCategory::RepeatedStability,
+        HeavyPattern::Phrase("for _ in"),
+    ),
+    (
+        HeavyCommandCategory::RepeatedStability,
+        HeavyPattern::TokenPrefix("--repeat"),
+    ),
+    (
+        HeavyCommandCategory::RepeatedStability,
+        HeavyPattern::RepeatCount,
+    ),
+];
+
+/// Repetition flags whose value decides whether the form is a stability loop.
+///
+/// `-count=1` is the standard "do not reuse the cached result" form and stays
+/// bounded, so only a value of two or more is rejected.
+const REPEAT_COUNT_FLAGS: &[&str] = &["-count", "--count", "--runs", "--iterations"];
+
+fn matches_repeat_count(tokens: &[&str]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        let (flag, inline_value) = match token.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (*token, None),
+        };
+        REPEAT_COUNT_FLAGS.contains(&flag)
+            && inline_value
+                .or_else(|| tokens.get(index + 1).copied())
+                .and_then(|value| value.parse::<u32>().ok())
+                .is_some_and(|value| value >= 2)
+    })
+}
+
+/// Normalize a declared command form for structural comparison.
+///
+/// Markdown backticks are removed, internal whitespace folds to one ASCII
+/// space, the result is trimmed, and comparison is case-insensitive.
+pub(super) fn normalize_command(command: &str) -> String {
+    command
+        .replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Classify a declared command form against the structural denylist.
+///
+/// Returns the first matching category, or `None` for a bounded command form.
+pub(super) fn heavy_command_category(command: &str) -> Option<HeavyCommandCategory> {
+    let normalized = normalize_command(command);
+    if normalized.is_empty() {
+        return None;
+    }
+    let tokens: Vec<&str> = normalized.split(' ').filter(|t| !t.is_empty()).collect();
+    HEAVY_COMMAND_RULES
+        .iter()
+        .find(|(_, pattern)| match pattern {
+            HeavyPattern::Token(value) => tokens.contains(value),
+            HeavyPattern::TokenPrefix(value) => tokens.iter().any(|token| token.starts_with(value)),
+            HeavyPattern::Phrase(value) => normalized.contains(value),
+            HeavyPattern::RepeatCount => matches_repeat_count(&tokens),
+        })
+        .map(|(category, _)| *category)
+}
+
+/// Ownership marker resolved from a `verification:` note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwnershipMarker {
+    /// Exactly one closed-set token was declared.
+    Resolved(&'static str),
+    /// Zero closed-set tokens, more than one, or extra tokens around it.
+    Unresolved,
+}
+
+/// Structured view of one `verification:` note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VerificationNote {
+    pub(super) marker: OwnershipMarker,
+    /// Raw marker text, reported verbatim in the diagnostic.
+    pub(super) marker_text: String,
+    /// Concrete command declared after the first ` - `, metadata segments removed.
+    pub(super) command: Option<String>,
+}
+
+/// Split a `verification:` note into its ownership marker and concrete command.
+///
+/// The marker is the single closed-set token before the first ` - `; the
+/// concrete command is everything after it, up to the first trailing
+/// `<key>: <value>` metadata segment such as `verification-id:`.
+pub(super) fn parse_verification_note(note: &str) -> VerificationNote {
+    let note = note.trim();
+    let (marker_text, rest) = match note.find(" - ") {
+        Some(index) => (&note[..index], Some(&note[index + 3..])),
+        None => (note, None),
+    };
+
+    VerificationNote {
+        marker: resolve_ownership_marker(marker_text),
+        marker_text: marker_text.trim().to_string(),
+        command: rest.and_then(extract_concrete_command),
+    }
+}
+
+fn resolve_ownership_marker(marker_text: &str) -> OwnershipMarker {
+    let tokens: Vec<&str> = marker_text
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut matches = VERIFICATION_OWNERSHIP_MARKERS
+        .iter()
+        .copied()
+        .filter(|marker| {
+            tokens
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case(marker))
+        });
+
+    match (tokens.len(), matches.next(), matches.next()) {
+        (1, Some(marker), None) => OwnershipMarker::Resolved(marker),
+        _ => OwnershipMarker::Unresolved,
+    }
+}
+
+fn extract_concrete_command(rest: &str) -> Option<String> {
+    static METADATA_SEGMENT_RE: OnceLock<Regex> = OnceLock::new();
+    let metadata_re =
+        METADATA_SEGMENT_RE.get_or_init(|| Regex::new(r"^\s*[A-Za-z][A-Za-z0-9_-]*\s*:").unwrap());
+
+    let mut segments = Vec::new();
+    for segment in rest.split(';') {
+        if metadata_re.is_match(segment) {
+            break;
+        }
+        let trimmed = segment.trim();
+        if !trimmed.is_empty() {
+            segments.push(trimmed);
+        }
+    }
+    (!segments.is_empty()).then(|| segments.join("; "))
+}
+
+/// Whether a `verification:` note declares a structurally heavyweight command.
+///
+/// The native denylist takes precedence over generic evidence-hint recognition,
+/// so a matching note reports the heavyweight-command diagnostic instead of the
+/// `missing repository evidence` hint diagnostic.
+pub(super) fn note_declares_heavy_command(note: &str) -> bool {
+    parse_verification_note(note)
+        .command
+        .as_deref()
+        .and_then(heavy_command_category)
+        .is_some()
+}
+
+const BOUNDED_PROOF_REMEDY: &str = "prove the requirement with a bounded repository-local command, and give the broad execution its own operational-observation verification or repository automation";
+
+/// One active checkbox's parseable verification reference.
+///
+/// Assembled from the checkbox line plus its immediate `verification:`
+/// continuation line, so both authoring shapes produce the same cohesion key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TaskVerificationReference {
+    pub(super) line_num: usize,
+    pub(super) verification_id: Option<String>,
+    pub(super) note: Option<String>,
+}
+
+/// Reject heterogeneous or heavyweight change-blocking verification bundles.
+///
+/// Pure decision logic over already-parsed references: no filesystem, process,
+/// or network access, and no inference from free-text prose.
+pub(super) fn evaluate_verification_cohesion(
+    change_id: &str,
+    change_blocking_ids: &HashSet<String>,
+    references: &[TaskVerificationReference],
+) -> Vec<String> {
+    struct Entry {
+        line_num: usize,
+        marker: OwnershipMarker,
+        marker_text: String,
+        command: Option<String>,
+    }
+
+    let mut errors = Vec::new();
+    // Document order, so diagnostics are stable across runs.
+    let mut grouped: Vec<(&str, Vec<Entry>)> = Vec::new();
+
+    for reference in references {
+        let Some(id) = reference
+            .verification_id
+            .as_deref()
+            .filter(|id| change_blocking_ids.contains(*id))
+        else {
+            continue;
+        };
+        let Some(note) = reference.note.as_deref() else {
+            continue;
+        };
+
+        let parsed = parse_verification_note(note);
+        if parsed.marker == OwnershipMarker::Unresolved {
+            errors.push(format!(
+                "{}: tasks.md:{}: change-blocking verification '{}': verification ownership marker must be exactly one of {} immediately after 'verification:' and before the first ' - ' (found '{}')",
+                change_id,
+                reference.line_num,
+                id,
+                VERIFICATION_OWNERSHIP_MARKERS.join(", "),
+                parsed.marker_text
+            ));
+        }
+        if let Some(category) = parsed.command.as_deref().and_then(heavy_command_category) {
+            errors.push(format!(
+                "{}: tasks.md:{}: change-blocking verification '{}' declares a heavyweight command form ({}): '{}'; {}",
+                change_id,
+                reference.line_num,
+                id,
+                category.as_str(),
+                normalize_command(parsed.command.as_deref().unwrap_or_default()),
+                BOUNDED_PROOF_REMEDY
+            ));
+        }
+
+        let entry = Entry {
+            line_num: reference.line_num,
+            marker: parsed.marker,
+            marker_text: parsed.marker_text,
+            command: parsed.command.as_deref().map(normalize_command),
+        };
+        match grouped.iter_mut().find(|(known, _)| *known == id) {
+            Some((_, entries)) => entries.push(entry),
+            None => grouped.push((id, vec![entry])),
+        }
+    }
+
+    for (id, entries) in &grouped {
+        if entries.len() < 2 {
+            continue;
+        }
+        let first = &entries[0];
+        let cohesive = entries
+            .iter()
+            .all(|entry| entry.marker == first.marker && entry.command == first.command);
+        if cohesive {
+            continue;
+        }
+        let lines = entries
+            .iter()
+            .map(|entry| entry.line_num.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let detail = entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "line {}: '{}' / '{}'",
+                    entry.line_num,
+                    entry.marker_text,
+                    entry.command.as_deref().unwrap_or("<no command>")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        errors.push(format!(
+            "{}: tasks.md: change-blocking verification '{}' is shared by task lines {} that declare different verification ownership markers or concrete commands ({}); split the verification declarations so each change-blocking gate has one ownership marker and one concrete command",
+            change_id, id, lines, detail
+        ));
+    }
+
+    errors
+}
+
+/// Reject heavyweight command forms declared on a change-blocking verification.
+///
+/// Pure decision logic over one already-parsed declaration.
+pub(super) fn heavy_declaration_findings(
+    change_id: &str,
+    verification: &VerificationDeclaration,
+) -> Vec<String> {
+    if !verification.is_change_blocking() {
+        return Vec::new();
+    }
+    let label = verification_label(verification);
+    declared_command_forms(verification)
+        .into_iter()
+        .filter_map(|(field, value)| {
+            heavy_command_category(value).map(|category| {
+                format!(
+                    "{}: verification '{}': change-blocking {} declares a heavyweight command form ({}): '{}'; {}",
+                    change_id,
+                    label,
+                    field,
+                    category.as_str(),
+                    normalize_command(value),
+                    BOUNDED_PROOF_REMEDY
+                )
+            })
+        })
+        .collect()
+}
+
+/// Every declared command form carried by one verification declaration.
+///
+/// The declaration schema carries `evidence` and `rerun` today; a structured
+/// argv field joins this list unchanged if the schema ever gains one.
+fn declared_command_forms(verification: &VerificationDeclaration) -> Vec<(&'static str, &str)> {
+    [
+        ("evidence", verification.evidence.as_deref()),
+        ("rerun", verification.rerun.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(field, value)| value.map(|value| (field, value)))
+    .collect()
+}
+
 pub(super) fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
     let needle_lower = needle.to_lowercase();
     haystack
@@ -1203,6 +1730,9 @@ pub(super) fn validate_tasks_content(
         .then(|| VerificationLinkage::from_proposal(proposal_content))
         .flatten();
     let mut pending_verification_id_line: Option<usize> = None;
+    // Cohesion keys for every active checkbox that carries a parseable
+    // verification reference. Only collected while linkage is active.
+    let mut verification_references: Vec<TaskVerificationReference> = Vec::new();
 
     for (i, line) in content.lines().enumerate() {
         let line_num = i + 1;
@@ -1268,18 +1798,32 @@ pub(super) fn validate_tasks_content(
                 }
 
                 if let Some(linkage) = linkage.as_ref() {
-                    match extract_verification_id_reference(task_text) {
+                    let inline_reference = extract_verification_id_reference(task_text);
+                    match inline_reference.as_deref() {
                         Some(reference) => {
-                            errors.extend(linkage.evaluate(change_id, line_num, &reference))
+                            errors.extend(linkage.evaluate(change_id, line_num, reference))
                         }
                         // The reference may still arrive on a continuation line.
                         None => pending_verification_id_line = Some(line_num),
                     }
+                    verification_references.push(TaskVerificationReference {
+                        line_num,
+                        verification_id: inline_reference,
+                        note: verification_text.clone(),
+                    });
                 }
+
+                // A structurally heavyweight command is reported by its own
+                // diagnostic below, which takes precedence over the generic
+                // evidence hint.
+                let heavy_command = linkage.is_some()
+                    && verification_text
+                        .as_deref()
+                        .is_some_and(note_declares_heavy_command);
 
                 if strict && evidence_mode != "off" && is_behavior_change {
                     if let Some(vtext) = verification_text {
-                        if !has_repository_evidence_hint(&vtext) {
+                        if !heavy_command && !has_repository_evidence_hint(&vtext) {
                             let msg = format!(
                                 "{}: tasks.md:{}: Verification note should cite repository-verifiable evidence such as source paths, tests, or runnable commands",
                                 change_id, line_num
@@ -1328,8 +1872,22 @@ pub(super) fn validate_tasks_content(
                             }
                         }
                     }
+                    // A continuation line completes the owning checkbox's
+                    // cohesion key; the checkbox line itself may carry neither.
+                    if let Some(reference) = verification_references
+                        .last_mut()
+                        .filter(|reference| reference.line_num == prev_line_num)
+                    {
+                        if reference.verification_id.is_none() {
+                            reference.verification_id = extract_verification_id_reference(vtext);
+                        }
+                        if reference.note.is_none() && !vtext.is_empty() {
+                            reference.note = Some(vtext.to_string());
+                        }
+                    }
+                    let heavy_command = linkage.is_some() && note_declares_heavy_command(vtext);
                     if strict && evidence_mode != "off" && !vtext.is_empty() {
-                        if !has_repository_evidence_hint(vtext) {
+                        if !heavy_command && !has_repository_evidence_hint(vtext) {
                             let msg = format!(
                                 "{}: tasks.md:{}: Verification note should cite repository-verifiable evidence such as source paths, tests, or runnable commands",
                                 change_id, prev_line_num
@@ -1381,6 +1939,14 @@ pub(super) fn validate_tasks_content(
     if let Some(unresolved) = pending_verification_id_line {
         errors.push(VerificationLinkage::missing_reference_message(
             change_id, unresolved,
+        ));
+    }
+
+    if let Some(linkage) = linkage.as_ref() {
+        errors.extend(evaluate_verification_cohesion(
+            change_id,
+            &linkage.change_blocking_ids,
+            &verification_references,
         ));
     }
 

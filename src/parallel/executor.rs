@@ -1574,6 +1574,58 @@ where
     VERDICT_GRACE_OVERRIDE_SECS.scope(secs, fut).await
 }
 
+/// Per-verification reuse plan for the acceptance invocation about to start.
+///
+/// Everything here is derived from the workspace: the proposal's own
+/// declarations, the runtime-written sidecar, and live Git state. Nothing is
+/// remembered across invocations, so a restart in the middle of a change
+/// recomputes the same plan from the same files.
+///
+/// A plan is observability plus context. It never decides whether acceptance
+/// runs, never suppresses a command, and never turns into a verdict: an empty
+/// or all-`rerun` plan leaves the acceptance invocation exactly as it was before
+/// this feature existed.
+async fn build_verification_reuse_context_for_workspace(
+    change_id: &str,
+    workspace_path: &Path,
+) -> String {
+    use crate::orchestration::acceptance::verification_evidence::{
+        plan_reuse, GitRepositoryFacts, ReusePolicy,
+    };
+
+    let proposal_path = workspace_path
+        .join("openspec/changes")
+        .join(change_id)
+        .join("proposal.md");
+    if !proposal_path.is_file() {
+        return String::new();
+    }
+    let metadata = crate::openspec::parse_proposal_metadata_from_file(&proposal_path);
+    if metadata.verifications.is_empty() {
+        return String::new();
+    }
+    let plan = plan_reuse(
+        &GitRepositoryFacts,
+        workspace_path,
+        &metadata.verifications,
+        ReusePolicy::default(),
+    )
+    .await;
+    if plan.is_empty() {
+        return String::new();
+    }
+    for decision in &plan.decisions {
+        info!(
+            change_id = change_id,
+            verification_id = decision.verification_id(),
+            outcome = decision.outcome(),
+            "Verification evidence: {}",
+            decision.summary()
+        );
+    }
+    crate::agent::build_verification_reuse_context(&plan)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_acceptance_in_workspace(
     change_id: &str,
@@ -1714,6 +1766,12 @@ pub async fn execute_acceptance_in_workspace(
         agent.acceptance_command_recovery(change_id),
     );
 
+    // Per-verification reuse decisions, derived from the worktree alone. This
+    // is observation, not control: a verification with no surviving binding is
+    // reported as `rerun` and the acceptance agent runs it exactly as before.
+    let verification_reuse_context =
+        build_verification_reuse_context_for_workspace(change_id, workspace_path).await;
+
     // Build prompt injected into `{prompt}`
     let full_prompt = crate::agent::append_optional_prompt(
         match config.get_acceptance_prompt_mode() {
@@ -1744,6 +1802,8 @@ pub async fn execute_acceptance_in_workspace(
         },
         config.get_acceptance_append_prompt(),
     );
+    let full_prompt =
+        crate::agent::append_optional_prompt(full_prompt, Some(&verification_reuse_context));
 
     // Expand change_id and prompt in command
     let template = config.get_acceptance_command()?;
