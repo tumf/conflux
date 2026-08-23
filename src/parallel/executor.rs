@@ -1835,16 +1835,20 @@ pub async fn execute_acceptance_in_workspace(
     // Acceptance reviews an implementation rather than producing one, so it runs
     // under its own dedicated absolute deadline instead of Apply's much larger
     // `command_max_runtime_secs`. A positive common limit still caps it; a
-    // disabled (`0`) common limit does not unbound it.
-    let acceptance_runtime_limit_secs = config.get_acceptance_runtime_limit_secs();
-    let acceptance_runner = ai_runner.with_max_runtime_secs(acceptance_runtime_limit_secs);
+    // disabled (`0`) common limit does not unbound it. The runner selects that
+    // bound from the `"acceptance"` operation type below, so this reads the same
+    // resolution the runner enforces rather than a second copy of the rule: the
+    // diagnostic can never name a limit other than the one that expired.
+    let acceptance_runtime_limit_secs = ai_runner
+        .queue_config()
+        .effective_max_runtime_secs(Some(crate::command_queue::ACCEPTANCE_OPERATION_TYPE));
 
     // Execute command via AiCommandRunner (with stagger and retry)
-    let (mut child, mut output_rx) = acceptance_runner
+    let (mut child, mut output_rx) = ai_runner
         .execute_streaming_with_retry(
             &command,
             Some(workspace_path),
-            Some("acceptance"),
+            Some(crate::command_queue::ACCEPTANCE_OPERATION_TYPE),
             Some(change_id),
         )
         .await?;
@@ -2857,6 +2861,8 @@ mod tests {
 
     fn test_ai_runner() -> AiCommandRunner {
         let queue_config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: 0,
             max_retries: 0,
             retry_delay_ms: 0,
@@ -2959,6 +2965,8 @@ mod tests {
 
         fn ai_runner() -> AiCommandRunner {
             let queue_config = CommandQueueConfig {
+                acceptance_max_runtime_secs:
+                    crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
                 stagger_delay_ms: 0,
                 max_retries: 0,
                 retry_delay_ms: 0,
