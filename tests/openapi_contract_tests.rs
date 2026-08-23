@@ -941,19 +941,22 @@ fn the_authoritative_snapshot_publishes_every_operator_field() {
     assert_eq!(snapshot_field_errors(&generated()), Vec::<String>::new());
 }
 
-/// The active-run Apply-limit refusal is a published token, not prose.
+/// The retired Apply-limit token stays published, and stays a token.
 ///
-/// A client branches on `apply_iteration_limit_active` to know that Retry is
-/// unavailable until the owning run closes. If the generated document did not
-/// carry the member, a generated client would either drop the variant or fail to
-/// deserialize the snapshot that contains it.
+/// No current projection or command admission produces
+/// `apply_iteration_limit_active` any more: a retained Apply ceiling is
+/// diagnostic evidence about the invocation that stopped, not an operator-action
+/// block. The member still has to appear in the generated document, because a
+/// client generated against an older contract — or one replaying a recorded
+/// snapshot that carries it — would otherwise drop the variant or fail to
+/// deserialize.
 #[test]
-fn active_iteration_limit_projection_publishes_the_blocked_reason_token() {
+fn retired_iteration_limit_blocked_reason_token_remains_published() {
     let doc = generated();
     let published = published_enum(&doc, "ActionBlockedReason");
     assert!(
         published.contains("apply_iteration_limit_active"),
-        "the active Apply-limit refusal must be published: {published:?}"
+        "the retired Apply-limit reason must stay published: {published:?}"
     );
     // The same token the server actually serializes, taken from the type rather
     // than repeated as a literal on both sides.
