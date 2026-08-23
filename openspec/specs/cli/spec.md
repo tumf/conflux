@@ -270,7 +270,7 @@ Applying/Accepting/Archiving/Resolving changes MUST continue to reject `@` state
 
 ### Requirement: Error State Display
 
-When an error occurs, TUI SHALL explicitly display the error state and the authoritative retry eligibility for the failed change. Retry guidance SHALL be shown only when the shared service currently permits retry. While typed Apply iteration-limit evidence is owned by the active run, the TUI SHALL retain the diagnostic and display a stable active-limit explanation without promising Space or F5 retry.
+When an error occurs, TUI SHALL explicitly display the error state and the authoritative retry eligibility for the failed change. Retry guidance SHALL be shown only when the shared service currently permits retry. A retained Apply iteration-limit diagnostic SHALL remain inspectable as evidence, and for a settled terminal error it SHALL NOT suppress retry guidance that shared eligibility currently permits.
 
 #### Scenario: Mode transition on error
 
@@ -291,18 +291,18 @@ When an error occurs, TUI SHALL explicitly display the error state and the autho
 - **THEN** the errored Change status shows "[error]" in red
 - **AND** other queued Changes maintain their state
 
-#### Scenario: Active iteration limit replaces retry guidance
+#### Scenario: Settled iteration limit keeps authoritative retry guidance
 
-- **WHEN** TUI displays an error change carrying typed Apply iteration-limit evidence owned by the active run
-- **THEN** its retained error detail remains inspectable
-- **AND** Space/F5 retry guidance is not displayed for that change
-- **AND** the TUI explains that retry is unavailable until the active run closes
+- **WHEN** TUI displays a settled terminal-error change retaining typed Apply iteration-limit evidence
+- **AND** the shared service currently permits retry for that change
+- **THEN** its retained error detail and attempts/max evidence remain inspectable
+- **AND** Space/F5 retry guidance is displayed for that change
 
 ### Requirement: Error Retry with F5 Key
 
 Pressing a configured Start key such as F5 SHALL retry marked retry-eligible targets according to shared authoritative eligibility without requiring the process-wide execution mode to be Error. Running mode SHALL permit retry-only Start against a live scheduler. Select and Stopped SHALL preserve ordinary marked `not queued` Start priority and SHALL fall back to marked retry routes only when no ordinary target is startable. Process-wide Error SHALL retain its existing retry behavior, and Stopping SHALL refuse Start without mutation.
 
-If typed Apply iteration-limit evidence is still owned by the active run, F5 SHALL be a mutation-free refusal and SHALL NOT transition the TUI to Running. Once the owning run closes and eligibility is refreshed, F5 MAY start a later boundary through the ordinary retry path. A typed runtime-limit failure SHALL NOT be retried automatically by the failed invocation's scheduler cycle, but it MAY be retried by a later explicit F5 request when shared eligibility permits it.
+A settled terminal Error that retains typed Apply iteration-limit evidence SHALL be retryable by a later explicit F5 request, including while the persistent scheduler remains live. The failed invocation's scheduler cycle SHALL NOT retry the target automatically. The TUI SHALL keep the retained diagnostic visible while presenting the same retry eligibility enforced by the shared command service.
 
 #### Scenario: Retry with F5 key
 
@@ -321,22 +321,6 @@ If typed Apply iteration-limit evidence is still owned by the active run, F5 SHA
 - **WHEN** the retried processing succeeds
 - **THEN** the Change status updates to "completed" or "archived"
 - **AND** remaining queued Changes continue processing
-
-#### Scenario: F5 cannot target an active limited run
-
-- **WHEN** TUI displays a marked retry target carrying active-run Apply iteration-limit evidence
-- **AND** user presses F5 key
-- **THEN** no retry, queue, mark, explicit-retry, or scheduler command is emitted
-- **AND** TUI does not transition to Running because of the refused target
-- **AND** the active-limit explanation remains visible
-
-#### Scenario: F5 becomes available after boundary closure
-
-- **GIVEN** the prior run's finish-hook ownership completed and its active limit gate was retired
-- **WHEN** TUI refreshes authoritative eligibility for the still-retryable change
-- **AND** user presses F5
-- **THEN** ordinary retry admission may start a later scheduler boundary
-- **AND** the later boundary uses workspace-derived state and a fresh Apply budget
 
 #### Scenario: Persistent-idle Select retries a marked change-local error
 
@@ -375,14 +359,16 @@ If typed Apply iteration-limit evidence is still owned by the active run, F5 SHA
 - **THEN** the new operator command MAY retry `alpha`
 - **AND** the prior no-automatic-retry guarantee SHALL remain satisfied
 
-#### Scenario: Active iteration limit remains mutation-free
+#### Scenario: Later explicit retry follows iteration-limit termination
 
-- **GIVEN** marked error change `alpha` carries typed Apply iteration-limit evidence owned by a live run
-- **WHEN** the user presses F5 in Select, Running, Stopped, or Error
-- **THEN** Start SHALL refuse or exclude `alpha` according to the shared retry contract
-- **AND** reducer status, error detail, mark, queue, explicit-retry edges, scheduler, and mode SHALL remain unchanged
-
-<!-- Expected canonical result after archive: F5 retry is governed by marked target evidence and lifecycle safety rather than requiring process-wide Error mode, while ordinary Start priority and active-limit refusal remain intact. -->
+- **GIVEN** an Apply invocation for `alpha` terminated at its iteration limit
+- **AND** that invocation did not retry automatically
+- **AND** the resulting terminal Error retains the iteration-limit diagnostic
+- **AND** the persistent scheduler remains live
+- **WHEN** the operator marks `alpha` and presses F5
+- **THEN** the new operator command SHALL retry `alpha` exactly once
+- **AND** the new invocation SHALL receive fresh Apply budget
+- **AND** the prior no-automatic-retry guarantee SHALL remain satisfied
 
 ### Requirement: init Subcommand
 
@@ -439,7 +425,7 @@ If typed Apply iteration-limit evidence is still owned by the active run, F5 SHA
 
 ### Requirement: Footer Dynamic Guidance Display
 
-The selection and error-mode footer SHALL display guidance based on application state and authoritative per-change action eligibility. It SHALL NOT instruct the operator to use Space or F5 for a row whose active-run Apply iteration limit blocks retry.
+The selection and error-mode footer SHALL display guidance based on application state and authoritative per-change action eligibility. It SHALL NOT instruct the operator to use Space or F5 for a row whose authoritative eligibility currently refuses retry, and it SHALL NOT withhold that guidance for a settled terminal-error row merely because a retained Apply iteration-limit diagnostic exists.
 
 #### Scenario: Guidance when no changes
 
@@ -460,19 +446,22 @@ The selection and error-mode footer SHALL display guidance based on application 
 - **AND** one or more eligible changes are selected
 - **THEN** the footer displays "Press F5/! to start processing" when no TUI config override exists
 
-#### Scenario: Limited error rows do not produce retry promises
+#### Scenario: Settled limited error rows receive ordinary retry guidance
 
-- **WHEN** every otherwise visible error row is blocked by active-run Apply iteration-limit evidence
-- **THEN** the footer does not instruct the operator to mark those rows with Space or retry them with F5
-- **AND** it reports the stable active-limit condition
+- **WHEN** every otherwise visible error row is a settled terminal error retaining typed Apply iteration-limit evidence
+- **AND** shared eligibility permits retry for those rows
+- **THEN** the footer presents the same Space/F5 guidance as for ordinary retryable error rows
+- **AND** no stable active-limit condition replaces that guidance
 
-#### Scenario: Bulk mark selection excludes a limited error row
+#### Scenario: Bulk mark selection includes a settled limited error row
 
-- **GIVEN** an active-run-limited error row and unrelated eligible rows are visible
+- **GIVEN** a settled limited terminal-error row and unrelated eligible rows are visible
 - **WHEN** the operator invokes bulk execution-mark selection
-- **THEN** the limited row's mark and Running queue intent remain unchanged
+- **THEN** the settled row is classified exactly as an ordinary terminal-error row
 - **AND** eligible rows still receive the coherent bulk target state atomically
-- **AND** the exclusion is explained with `apply_iteration_limit_active`
+- **AND** no `apply_iteration_limit_active` exclusion is reported
+
+<!-- Expected canonical result after archive: F5 retries settled Apply-limit errors through explicit intent even when the persistent scheduler remains live, without enabling automatic redispatch; error display and footer guidance follow the same shared eligibility instead of an active-limit exception. -->
 
 ### Requirement: Running Footer Progress Bar Display
 
