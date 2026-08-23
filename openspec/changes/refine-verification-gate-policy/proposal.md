@@ -57,6 +57,12 @@ Refine the landed policy before hard-error adoption:
 - An active-proposal survey is recorded in `design.md` before any future hard-error promotion.
 - `cargo test openspec_cmd --lib` passes and selects at least one relevant test.
 
+## Retired Scenarios
+
+- cflx-proposal-validation: Proposal verification plans bound Apply-owned work / Heavy repository gate is not an Apply checkbox
+
+Superseded by `Heavy repository gate produces a migration warning`: the same declared forms are still discouraged, but during migration they are reported as strict-validation warnings rather than as a rejected Apply checkbox.
+
 ## Out of Scope
 
 - Semantic task-cohesion inference.
