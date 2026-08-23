@@ -476,6 +476,31 @@ pub fn observe_completed_acceptance_invocation(
     agent.clear_acceptance_command_recovery(change_id);
 }
 
+/// Observe one Acceptance invocation's non-command-failure result against the
+/// shared command-recovery budget.
+///
+/// A deliberate termination never *completed* an invocation: the absolute
+/// runtime limit and an operator stop both ended the work rather than producing
+/// evidence about it, so neither resets nor consumes the budget, and neither
+/// creates corrective command-recovery prompt context. Every other result ends
+/// the consecutive sequence before it follows its own existing routing.
+///
+/// The admissibility test lives inside this call on purpose. Leaving it at the
+/// call site is what lets a second caller re-derive it slightly differently and
+/// quietly count a terminated invocation as a completed one — which for a
+/// runtime-limit expiry would mean resetting a budget the expiry is not
+/// supposed to touch at all.
+pub fn observe_acceptance_invocation_result(
+    counter: &mut AcceptanceCommandRetryCounter,
+    agent: &mut AgentRunner,
+    change_id: &str,
+    result: &AcceptanceResult,
+) {
+    if result.permits_acceptance_retry() {
+        observe_completed_acceptance_invocation(counter, agent, change_id);
+    }
+}
+
 /// Next step after an acceptance command violated a verdict protocol contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissingVerdictRetryStep {
@@ -1437,21 +1462,6 @@ pub fn build_acceptance_tail_findings(
     }
 }
 
-/// The absolute runtime bound one Acceptance invocation runs under.
-///
-/// `command_max_runtime_secs` is the safety budget every command class shares,
-/// so a positive value still caps Acceptance. `0` disables that common budget
-/// only: the dedicated Acceptance limit is not disableable, so it remains the
-/// bound. Pure over both inputs so the precedence rule is verifiable without a
-/// configuration file or a process.
-pub fn acceptance_runtime_limit_secs(acceptance_limit_secs: u64, common_limit_secs: u64) -> u64 {
-    if common_limit_secs == 0 {
-        acceptance_limit_secs
-    } else {
-        acceptance_limit_secs.min(common_limit_secs)
-    }
-}
-
 /// Typed evidence for an Acceptance invocation stopped by its runtime limit.
 ///
 /// Carries the configured limit that expired and the owned process group's
@@ -2080,51 +2090,16 @@ mod tests {
             )
         }
 
-        /// The dedicated limit is shorter than the shared command budget, so the
-        /// default Acceptance invocation is bounded by 30 minutes rather than by
-        /// Apply's three hours.
-        #[test]
-        fn acceptance_uses_the_shorter_default() {
-            assert_eq!(
-                acceptance_runtime_limit_secs(ACCEPTANCE_DEFAULT, COMMON_DEFAULT),
-                ACCEPTANCE_DEFAULT,
-                "the dedicated Acceptance limit is the binding one at the defaults"
-            );
-        }
-
-        /// `0` disables the *common* budget only. Acceptance has no disable
-        /// token at all, so its own limit still bounds the invocation.
-        #[test]
-        fn a_disabled_common_limit_does_not_unbound_acceptance() {
-            assert_eq!(
-                acceptance_runtime_limit_secs(ACCEPTANCE_DEFAULT, 0),
-                ACCEPTANCE_DEFAULT,
-                "disabling the shared command budget must never unbound Acceptance"
-            );
-        }
-
-        /// The common budget is a safety limit every class shares, so a shorter
-        /// positive value still wins.
-        #[test]
-        fn a_shorter_common_safety_limit_still_applies() {
-            assert_eq!(
-                acceptance_runtime_limit_secs(ACCEPTANCE_DEFAULT, 300),
-                300,
-                "Acceptance takes the minimum of the dedicated and common limits"
-            );
-            assert_eq!(
-                acceptance_runtime_limit_secs(600, 10_800),
-                600,
-                "a configured Acceptance limit below the common one is honored"
-            );
-        }
-
-        /// Acceptance is routed through a runner carrying the dedicated limit,
-        /// and building it leaves the runner every other command class uses
-        /// exactly as configured.
+        /// One runner bounds Acceptance and every other command class at once.
+        ///
+        /// There is no forked Acceptance runner to build and no per-call-site
+        /// limit to pass: the class-specific deadline is selected from the
+        /// operation type, so the *same* runner reports 1,800 seconds for
+        /// Acceptance and the untouched common limit for everything else.
         #[test]
         fn routing_bounds_acceptance_without_moving_other_command_classes() {
             use crate::ai_command_runner::AiCommandRunner;
+            use crate::command_queue::ACCEPTANCE_OPERATION_TYPE;
             use crate::config::OrchestratorConfig;
             use std::sync::Arc;
             use tokio::sync::Mutex;
@@ -2137,57 +2112,31 @@ mod tests {
             };
             let runner =
                 AiCommandRunner::from_orchestrator_config(&config, Arc::new(Mutex::new(None)));
-            let acceptance =
-                runner.with_max_runtime_secs(config.get_acceptance_runtime_limit_secs());
+            let queue = runner.queue_config();
 
             assert_eq!(
-                acceptance.queue_config().max_runtime_secs,
+                queue.effective_max_runtime_secs(Some(ACCEPTANCE_OPERATION_TYPE)),
                 ACCEPTANCE_DEFAULT,
                 "the Acceptance invocation runs under the dedicated limit"
             );
+            for class in [
+                Some("apply"),
+                Some("archive"),
+                Some("analyze"),
+                Some("resolve"),
+                Some("cleanup-review"),
+                None,
+            ] {
+                assert_eq!(
+                    queue.effective_max_runtime_secs(class),
+                    COMMON_DEFAULT,
+                    "{class:?} keeps `command_max_runtime_secs`"
+                );
+            }
             assert_eq!(
-                runner.queue_config().max_runtime_secs,
-                COMMON_DEFAULT,
-                "Apply, Archive, analysis, and resolution keep `command_max_runtime_secs`"
+                queue.max_runtime_secs, COMMON_DEFAULT,
+                "the stored common limit is never rewritten for one command class"
             );
-            assert_eq!(
-                acceptance.queue_config().inactivity_timeout_secs,
-                runner.queue_config().inactivity_timeout_secs,
-                "only the absolute deadline moves; the rest of the command policy is shared"
-            );
-            assert_eq!(
-                acceptance.queue_config().max_retries,
-                runner.queue_config().max_retries
-            );
-        }
-
-        /// The effective bound composes the two configured knobs the same way at
-        /// the configuration boundary as the pure rule does.
-        #[test]
-        fn the_configured_effective_limit_matches_the_rule() {
-            use crate::config::OrchestratorConfig;
-
-            let defaults = OrchestratorConfig::default();
-            assert_eq!(
-                defaults.get_acceptance_runtime_limit_secs(),
-                ACCEPTANCE_DEFAULT,
-                "an unconfigured project still bounds Acceptance at 30 minutes"
-            );
-
-            let disabled_common = OrchestratorConfig {
-                command_max_runtime_secs: Some(0),
-                ..OrchestratorConfig::default()
-            };
-            assert_eq!(
-                disabled_common.get_acceptance_runtime_limit_secs(),
-                ACCEPTANCE_DEFAULT
-            );
-
-            let shorter_common = OrchestratorConfig {
-                command_max_runtime_secs: Some(300),
-                ..OrchestratorConfig::default()
-            };
-            assert_eq!(shorter_common.get_acceptance_runtime_limit_secs(), 300);
         }
 
         /// Only the runtime limit classifies as one. A SIGKILLed agent, an agent

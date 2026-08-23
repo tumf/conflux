@@ -1070,6 +1070,8 @@ mod tests {
         let config = crate::config::OrchestratorConfig::default();
         let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
         let queue_config = CommandQueueConfig {
+            acceptance_max_runtime_secs:
+                crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
             stagger_delay_ms: config
                 .command_queue_stagger_delay_ms
                 .unwrap_or(DEFAULT_STAGGER_DELAY_MS),

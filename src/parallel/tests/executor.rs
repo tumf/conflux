@@ -1026,6 +1026,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
     let shared_stagger_state = Arc::new(Mutex::new(None));
     let config = create_test_config();
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -1187,6 +1188,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -1364,6 +1366,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -1591,6 +1594,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
     let shared_stagger_state = Arc::new(Mutex::new(None));
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
 
         max_retries: DEFAULT_MAX_RETRIES,
@@ -1815,6 +1819,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
     let shared_stagger_state = Arc::new(Mutex::new(None));
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
 
         max_retries: DEFAULT_MAX_RETRIES,
@@ -2045,6 +2050,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
     let shared_stagger_state = Arc::new(Mutex::new(None));
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
 
         max_retries: DEFAULT_MAX_RETRIES,
@@ -2182,6 +2188,7 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -2298,6 +2305,7 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -2475,6 +2483,7 @@ async fn test_acceptance_history_records_end_revision_when_head_changes() {
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -2564,6 +2573,7 @@ async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -2684,6 +2694,7 @@ async fn test_archive_guard_allows_archive_after_acceptance_head_change_pass() {
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -11960,6 +11971,7 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -12072,6 +12084,7 @@ async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -12159,6 +12172,7 @@ async fn test_acceptance_cancels_while_waiting_for_silent_streaming_output() {
         ..Default::default()
     });
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -12243,6 +12257,7 @@ async fn test_archive_cancels_while_waiting_for_silent_streaming_output() {
         ..Default::default()
     });
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -12322,6 +12337,7 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -12415,6 +12431,7 @@ async fn test_acceptance_status_only_exit_is_missing_verdict_not_continue() {
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -12532,6 +12549,7 @@ async fn test_acceptance_explicit_continue_verdict_retains_continue_routing() {
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -12631,6 +12649,7 @@ async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -12768,6 +12787,7 @@ exit 0\n",
     });
 
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -12913,6 +12933,7 @@ async fn test_archived_dirty_finalization_resume_does_not_rerun_archive_command(
         ..Default::default()
     });
     let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
         stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
         max_retries: DEFAULT_MAX_RETRIES,
         retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -13661,6 +13682,191 @@ async fn parallel_new_finding_id_receives_its_own_repair_apply_in_the_dispatch_c
         "the new ID received its own automatic repair apply"
     );
     assert!(observed.result.final_revision.is_none());
+}
+
+// === Acceptance absolute-runtime-limit routing, end to end ===
+//
+// The unit-scoped routing decisions live in
+// `parallel::tests::acceptance_runtime_limit`. This drives
+// `dispatch_change_to_workspace` so the terminal outcome is observed on the
+// production path: what matters is not only that the invocation is classified
+// as a runtime-limit expiry, but that dispatch schedules nothing after it.
+
+/// Observations from one dispatch whose acceptance command never returns.
+struct RuntimeLimitDispatch {
+    result: WorkspaceResult,
+    acceptance_invocations: u32,
+    apply_invocations: u32,
+    /// How many acceptance command *processes* actually started, counted by the
+    /// command itself rather than by an event.
+    acceptance_processes: u32,
+    acceptance_error_logs: Vec<String>,
+}
+
+/// Dispatch one change whose acceptance command hangs forever, under an
+/// injected one-second dedicated Acceptance limit and a *disabled* common
+/// budget — so nothing but `acceptance_max_runtime_secs` can end it.
+///
+/// One second is an injected test limit, not the configured floor: production
+/// validation still refuses anything below 300 seconds, and no test may spend
+/// that.
+async fn dispatch_runtime_limited_acceptance(change_id: &str) -> RuntimeLimitDispatch {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let state_dir = TempDir::new().or_fail("create acceptance counter dir");
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    let counter = state_dir.path().join("attempts").display().to_string();
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some(format!(
+            "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
+             > openspec/changes/{change_id}/tasks.next \
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md \
+             && git add -A\""
+        )),
+        // Records that it started, then never returns a verdict and never exits.
+        acceptance_command: Some(format!(
+            "sh -c 'n=$(cat \"{counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+             echo $n > \"{counter}\"; while :; do sleep 1; done'"
+        )),
+        archive_command: Some(format!(
+            "sh -c 'mkdir -p openspec/changes/archive \
+             && mv openspec/changes/{change_id} openspec/changes/archive/{change_id}'"
+        )),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
+        // Disabled: neither inactivity nor the common budget may end this
+        // command, so the dedicated Acceptance limit is the only thing that can.
+        command_inactivity_timeout_secs: Some(0),
+        command_inactivity_timeout_max_retries: Some(0),
+        command_max_runtime_secs: Some(0),
+        acceptance_max_runtime_secs: Some(1),
+        ..Default::default()
+    });
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch runtime-limited acceptance");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    let mut observed = RuntimeLimitDispatch {
+        result,
+        acceptance_invocations: 0,
+        apply_invocations: 0,
+        acceptance_processes: std::fs::read_to_string(&counter)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        acceptance_error_logs: Vec::new(),
+    };
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
+                observed.acceptance_invocations += 1;
+            }
+            ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
+                observed.apply_invocations += 1;
+            }
+            ExecutionEvent::Log(log)
+                if matches!(log.level, crate::events::LogLevel::Error)
+                    && log.operation.as_deref() == Some("acceptance") =>
+            {
+                observed.acceptance_error_logs.push(log.message.clone());
+            }
+            _ => {}
+        }
+    }
+
+    observed
+}
+
+/// Runtime expiry ends the run: no second Acceptance invocation, no Apply
+/// re-entry, and no archive.
+///
+/// This is the whole point of routing expiry as its own terminal outcome. If it
+/// were an ordinary Acceptance failure it would return to Apply and start
+/// another Acceptance cycle, and the per-invocation deadline would multiply by
+/// however many cycles the retry counters allow.
+///
+/// One real apply plus a full one-second Acceptance deadline through a managed
+/// worktree puts this over one second, so it belongs to the heavy tier.
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+#[tokio::test]
+async fn parallel_acceptance_runtime_limit_is_terminal_and_never_re_enters_apply() {
+    let change_id = "parallel-acceptance-runtime-limit";
+    let observed = dispatch_runtime_limited_acceptance(change_id).await;
+
+    let error = observed
+        .result
+        .error
+        .as_deref()
+        .or_fail("runtime expiry is a terminal error for the run, not a silent hold");
+    assert!(
+        error.contains("absolute runtime limit of 1s"),
+        "the terminal error names the effective limit that expired: {error}"
+    );
+    assert!(
+        error.contains("acceptance_max_runtime_secs"),
+        "the terminal error names the knob an operator changes: {error}"
+    );
+    assert!(
+        error.contains("not retried automatically"),
+        "the terminal error states that nothing is retried for the operator: {error}"
+    );
+
+    assert_eq!(
+        observed.acceptance_invocations, 1,
+        "one run admits at most one Acceptance invocation after runtime expiry"
+    );
+    assert_eq!(
+        observed.acceptance_processes, 1,
+        "no command-recovery retry re-ran the acceptance command either"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "expiry must not return to the Apply loop; only the initial apply ran"
+    );
+    assert!(
+        observed.result.final_revision.is_none(),
+        "a terminated review never produces an archived revision"
+    );
+    assert_eq!(
+        observed.acceptance_error_logs.len(),
+        2,
+        "one executor diagnostic and one dispatch diagnostic: {:?}",
+        observed.acceptance_error_logs
+    );
 }
 
 /// Parse the machine-readable diagnostics out of a repair stop summary.

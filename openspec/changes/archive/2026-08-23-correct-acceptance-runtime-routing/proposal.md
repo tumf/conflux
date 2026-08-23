@@ -12,6 +12,7 @@ references:
   - src/orchestration/acceptance.rs
   - openspec/specs/configuration/spec.md
   - openspec/specs/parallel-execution/spec.md
+  - openspec/specs/command-queue/spec.md
 verifications:
   - id: acceptance-runtime-routing-tests
     requirement: Acceptance runtime expiry is terminal for the run and bypasses command retry, Acceptance retry, and Apply re-entry
@@ -71,6 +72,21 @@ The limit must terminate the current run through a distinct typed outcome rather
 - Tests cover common limit 30 seconds versus dedicated limit 1,800 seconds, common zero, and cleanup-review classification.
 - Configuration tests cover default, precedence, 299/300/10,800/10,801, and zero.
 - `cargo test parallel:: --lib` and `cargo test config:: --lib` pass.
+
+## Retired Scenarios
+
+Scenarios this change deliberately retires from a MODIFIED requirement, rather
+than losing by accident. Declared here because the promotion-safety regression
+treats every other disappearance as a coverage regression, and because a
+declaration inside a delta block would be copied verbatim into a canonical spec
+that should describe the system rather than the history of one change.
+
+- command-queue: Acceptance commands have a dedicated absolute runtime limit / Acceptance deadline cannot be disabled
+
+Replaced by `Dedicated range is validated` and `Valid boundaries load` in the
+configuration capability, which is where this change puts configuration-load
+validation. The retired scenario also stated the old `60`-second floor, so
+keeping it would leave two capabilities asserting contradictory ranges.
 
 ## Out of Scope
 

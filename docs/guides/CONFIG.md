@@ -134,7 +134,7 @@ Command templates support these placeholders:
 | `command_inactivity_kill_grace_secs` | integer | No | `5` | Grace period before force kill |
 | `command_inactivity_timeout_max_retries` | integer | No | `3` | `0` disables inactivity retries |
 | `command_max_runtime_secs` | integer | No | `10800` | Absolute runtime limit per command invocation (3 hours), measured from child spawn; output never extends it; `0` disables it |
-| `acceptance_max_runtime_secs` | integer | No | `1800` | Absolute runtime limit for one acceptance invocation (30 minutes), measured from child spawn; output never extends it. Accepts `60`–`10800`; `0` is rejected because acceptance cannot disable its guard. A positive `command_max_runtime_secs` still caps it (the shorter of the two wins); a disabled (`0`) one does not unbound it |
+| `acceptance_max_runtime_secs` | integer | No | `1800` | Absolute runtime limit for one acceptance invocation (30 minutes), measured from child spawn; output never extends it. Accepts `300`–`10800`; `0` is rejected because acceptance cannot disable its guard. The floor bounds this key only: a positive `command_max_runtime_secs` still caps it (the shorter of the two wins, including below `300`); a disabled (`0`) one does not unbound it. Cleanup review and every other command class keep `command_max_runtime_secs` |
 | `stream_json_textify` | boolean | No | `true` | Converts Claude Code NDJSON to readable text |
 | `command_strict_process_cleanup` | boolean | No | `true` | Sweeps the full process group after completion and verifies that no members remain |
 | `lifecycle_integration` | object | No | unset | External lifecycle adapter (observability only) |

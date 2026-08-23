@@ -1522,7 +1522,7 @@ mod tests {
             "the diagnostic must name the field: {message}"
         );
         assert!(
-            message.contains("between 60 and 10800"),
+            message.contains("between 300 and 10800"),
             "the diagnostic must state the accepted range: {message}"
         );
         assert!(
@@ -1536,20 +1536,29 @@ mod tests {
         );
     }
 
+    /// The floor is 300, not 60: a minute-scale interval reads as a generally
+    /// safe production value while being closer to skill-loading overhead than
+    /// to a review. 299 and 10,801 are the two values that prove the inclusive
+    /// bounds are the bounds.
     #[test]
     fn acceptance_max_runtime_enforces_its_range_bounds() {
-        for rejected in [1_u64, 59, 10_801, 86_400] {
+        assert_eq!(defaults::MIN_ACCEPTANCE_MAX_RUNTIME_SECS, 300);
+        assert_eq!(defaults::MAX_ACCEPTANCE_MAX_RUNTIME_SECS, 10_800);
+
+        for rejected in [1_u64, 60, 299, 10_801, 86_400] {
             assert!(
                 config_with_required_commands(Some(rejected))
                     .validate_acceptance_max_runtime_secs()
                     .is_err(),
-                "{rejected}s is outside 60..=10800 and must be refused"
+                "{rejected}s is outside 300..=10800 and must be refused"
             );
         }
 
         for accepted in [
             defaults::MIN_ACCEPTANCE_MAX_RUNTIME_SECS,
+            300,
             1800,
+            10_800,
             defaults::MAX_ACCEPTANCE_MAX_RUNTIME_SECS,
         ] {
             let config = config_with_required_commands(Some(accepted));
@@ -1571,6 +1580,14 @@ mod tests {
         );
     }
 
+    /// The effective Acceptance bound, read the way the runner reads it: the
+    /// configured layers produce a `CommandQueueConfig`, and that resolves the
+    /// class deadline. There is no second accessor computing the same rule.
+    fn effective_acceptance_limit_secs(config: &OrchestratorConfig) -> u64 {
+        crate::command_queue::CommandQueueConfig::from(config)
+            .effective_max_runtime_secs(Some(crate::command_queue::ACCEPTANCE_OPERATION_TYPE))
+    }
+
     /// The two knobs are independent: the Acceptance guard survives a disabled
     /// common budget, and a shorter common budget still caps Acceptance.
     #[test]
@@ -1583,7 +1600,7 @@ mod tests {
         .unwrap();
         assert_eq!(disabled_common.get_command_max_runtime_secs(), 0);
         assert_eq!(
-            disabled_common.get_acceptance_runtime_limit_secs(),
+            effective_acceptance_limit_secs(&disabled_common),
             1800,
             "disabling the common command budget must not unbound Acceptance"
         );
@@ -1596,7 +1613,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            shorter_common.get_acceptance_runtime_limit_secs(),
+            effective_acceptance_limit_secs(&shorter_common),
             300,
             "a shorter common safety limit still applies to Acceptance"
         );
@@ -1612,12 +1629,139 @@ mod tests {
         }"#,
         )
         .unwrap();
-        assert_eq!(acceptance_only.get_acceptance_runtime_limit_secs(), 600);
+        assert_eq!(effective_acceptance_limit_secs(&acceptance_only), 600);
         assert_eq!(
             acceptance_only.get_command_max_runtime_secs(),
             10800,
             "configuring the Acceptance limit must never move the common one"
         );
+    }
+
+    /// A common limit far below the dedicated key's own configuration floor is
+    /// still an overriding safety bound. The floor says what may be *configured*
+    /// for `acceptance_max_runtime_secs`; it is not a clamp on the effective
+    /// bound, so 30 seconds wins over 1,800.
+    #[test]
+    fn a_shorter_common_limit_overrides_the_dedicated_floor() {
+        let config = OrchestratorConfig::parse_jsonc(
+            r#"{
+            "command_max_runtime_secs": 30,
+            "acceptance_max_runtime_secs": 1800
+        }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            effective_acceptance_limit_secs(&config),
+            30,
+            "a 30-second common safety limit binds Acceptance below its own floor"
+        );
+        assert!(
+            effective_acceptance_limit_secs(&config) < defaults::MIN_ACCEPTANCE_MAX_RUNTIME_SECS,
+            "the dedicated floor must not be treated as a clamp on the effective bound"
+        );
+        assert!(
+            config.validate_acceptance_max_runtime_secs().is_ok(),
+            "the dedicated key itself is in range; only the common limit is shorter"
+        );
+    }
+
+    /// The effective bound is selected inside the common runner from the
+    /// operation type the invocation already declares. Acceptance is the only
+    /// class that gets the dedicated deadline; cleanup review runs the *same
+    /// configured agent command* under its own operation type and keeps the
+    /// common limit, `0`-disable semantics included.
+    #[test]
+    fn command_queue_config_selects_the_limit_by_operation_type() {
+        use crate::command_queue::{CommandQueueConfig, ACCEPTANCE_OPERATION_TYPE};
+
+        const OTHER_CLASSES: [Option<&str>; 6] = [
+            Some("cleanup-review"),
+            Some("apply"),
+            Some("archive"),
+            Some("analyze"),
+            Some("resolve"),
+            None,
+        ];
+
+        // Defaults: 1,800 for Acceptance, 10,800 for everyone else.
+        let defaults_queue = CommandQueueConfig::from(&OrchestratorConfig::default());
+        assert_eq!(
+            defaults_queue.effective_max_runtime_secs(Some(ACCEPTANCE_OPERATION_TYPE)),
+            1800
+        );
+        for class in OTHER_CLASSES {
+            assert_eq!(
+                defaults_queue.effective_max_runtime_secs(class),
+                10800,
+                "{class:?} keeps `command_max_runtime_secs`"
+            );
+        }
+
+        // A 30-second common limit binds every class, Acceptance included.
+        let shorter_common = CommandQueueConfig::from(&OrchestratorConfig {
+            command_max_runtime_secs: Some(30),
+            acceptance_max_runtime_secs: Some(1800),
+            ..OrchestratorConfig::default()
+        });
+        assert_eq!(
+            shorter_common.effective_max_runtime_secs(Some(ACCEPTANCE_OPERATION_TYPE)),
+            30
+        );
+        for class in OTHER_CLASSES {
+            assert_eq!(
+                shorter_common.effective_max_runtime_secs(class),
+                30,
+                "{class:?} keeps the common limit"
+            );
+        }
+
+        // A disabled common limit unbounds every other class but not Acceptance.
+        let disabled_common = CommandQueueConfig::from(&OrchestratorConfig {
+            command_max_runtime_secs: Some(0),
+            acceptance_max_runtime_secs: Some(1800),
+            ..OrchestratorConfig::default()
+        });
+        assert_eq!(
+            disabled_common.effective_max_runtime_secs(Some(ACCEPTANCE_OPERATION_TYPE)),
+            1800,
+            "`0` disables the common budget only"
+        );
+        for class in OTHER_CLASSES {
+            assert_eq!(
+                disabled_common.effective_max_runtime_secs(class),
+                0,
+                "{class:?} keeps the `0`-disable semantics of the common limit"
+            );
+        }
+
+        // Sharing the Acceptance *agent command* is not sharing its deadline.
+        let cleanup_review_shares_the_command = CommandQueueConfig::from(&OrchestratorConfig {
+            acceptance_command: Some("agent accept".to_string()),
+            cleanup_review_skill: Some("cflx-cleanup-review".to_string()),
+            command_max_runtime_secs: Some(10800),
+            acceptance_max_runtime_secs: Some(600),
+            ..OrchestratorConfig::default()
+        });
+        assert_eq!(
+            cleanup_review_shares_the_command.effective_max_runtime_secs(Some("cleanup-review")),
+            10800,
+            "cleanup review must not inherit the dedicated limit from a shared command"
+        );
+        assert_eq!(
+            cleanup_review_shares_the_command
+                .effective_max_runtime_secs(Some(ACCEPTANCE_OPERATION_TYPE)),
+            600
+        );
+
+        // Only the exact operation-type token selects the dedicated limit.
+        for near_miss in ["Acceptance", "acceptance-repair", "accept", " acceptance"] {
+            assert_eq!(
+                defaults_queue.effective_max_runtime_secs(Some(near_miss)),
+                10800,
+                "{near_miss:?} is not the Acceptance operation type"
+            );
+        }
     }
 
     /// Every generated configuration example is a distributed contract: an
@@ -1641,7 +1785,7 @@ mod tests {
                 "{template:?} example must name the default explicitly"
             );
             assert!(
-                example.contains("Accepts 60 through 10800"),
+                example.contains("Accepts 300 through 10800"),
                 "{template:?} example must state the accepted range"
             );
             assert!(
