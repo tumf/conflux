@@ -83,81 +83,25 @@ pub fn is_final_status(display_status: &str) -> bool {
 }
 
 // ============================================================================
-// Active-run Apply iteration limit
+// Run boundary liveness
 // ============================================================================
-
-/// Stable machine-readable token for an active-run Apply iteration limit.
-///
-/// One spelling for the internal refusal, the bulk-mark exclusion, and the
-/// `/api/v2` blocked reason, so no surface has to invent its own.
-pub const APPLY_ITERATION_LIMIT_ACTIVE: &str = "apply_iteration_limit_active";
 
 /// Whether the scheduler task that owns the current active-run state is alive.
 ///
-/// This is the *only* thing that retires the retry gate. The typed
-/// [`crate::orchestration::state::ApplyIterationLimit`] record deliberately
-/// survives its boundary — the finish hook still has to read it — so record
-/// presence alone can never say whether the gate is active.
+/// Observability only. It reports `scheduler_running` on the execution-status
+/// resource and tells a frontend whether an existing boundary can be notified
+/// or a new one has to be started — it is deliberately *not* an operator-action
+/// gate. A retained
+/// [`crate::orchestration::state::ApplyIterationLimit`] record answers why one
+/// invocation stopped; a later explicit retry is admitted on the target's own
+/// terminal-error evidence, so owner lifetime never decides whether an operator
+/// may act.
 ///
 /// A process with no command-capable boundary (headless `cflx run`) binds
-/// nothing here and therefore has no gate to report.
+/// nothing here and reports no live scheduler.
 pub trait RunBoundaryLiveness: Send + Sync {
     /// True when the scheduler task owning the current active-run state is live.
     fn boundary_running(&self) -> bool;
-}
-
-/// An Apply-dispatch ceiling that is still owned by a live scheduler boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ActiveApplyIterationLimit {
-    /// Exact cumulative configured Apply dispatches reserved for the change.
-    pub attempts: u32,
-    /// The configured ceiling that refused the next dispatch.
-    pub max: u32,
-}
-
-/// The one shared active-limit query.
-///
-/// Operator command admission, TUI eligibility, and the command-capable v2
-/// projection all call this rather than re-deriving the lifetime rule, which is
-/// what keeps a keypress, a remote command, and a rendered control from
-/// disagreeing about the same row.
-///
-/// `boundary` is `None` for a process with no command-capable scheduler
-/// authority; such a process never reports an active gate.
-pub fn active_apply_iteration_limit(
-    state: &OrchestratorState,
-    boundary: Option<&dyn RunBoundaryLiveness>,
-    change_id: &str,
-) -> Option<ActiveApplyIterationLimit> {
-    // Liveness first: it is the cheap half, and a closed boundary makes the
-    // record irrelevant no matter what it says.
-    if !boundary.is_some_and(RunBoundaryLiveness::boundary_running) {
-        return None;
-    }
-    state
-        .apply_iteration_limit(change_id)
-        .map(|record| ActiveApplyIterationLimit {
-            attempts: record.attempts,
-            max: record.max,
-        })
-}
-
-/// Every change whose Apply-dispatch ceiling is owned by a live boundary.
-///
-/// One liveness observation for the whole set, so a bulk classification cannot
-/// see the boundary alive for one row and closed for the next.
-pub fn active_apply_iteration_limited_ids(
-    state: &OrchestratorState,
-    boundary: Option<&dyn RunBoundaryLiveness>,
-) -> HashSet<String> {
-    if !boundary.is_some_and(RunBoundaryLiveness::boundary_running) {
-        return HashSet::new();
-    }
-    state
-        .apply_iteration_limits()
-        .iter()
-        .map(|record| record.change_id.clone())
-        .collect()
 }
 
 // ============================================================================
@@ -421,8 +365,6 @@ pub enum MarkExclusion {
     ParallelIneligible,
     /// A change whose proposal is absent from `HEAD` cannot be queued.
     ParallelProposalAbsent,
-    /// The active run owns the change's exhausted Apply-dispatch ceiling.
-    ApplyIterationLimitActive,
     /// The reducer recorded archive completion, so the row has no next run left.
     ///
     /// Distinct from [`MarkExclusion::FinalStatus`] on purpose: the row's display
@@ -434,9 +376,8 @@ pub enum MarkExclusion {
 
 impl MarkExclusion {
     /// Every exclusion, in the order used when grouping reasons for display.
-    pub const ALL: [MarkExclusion; 9] = [
+    pub const ALL: [MarkExclusion; 8] = [
         MarkExclusion::ChangeActive,
-        MarkExclusion::ApplyIterationLimitActive,
         MarkExclusion::ParallelIneligible,
         MarkExclusion::ParallelProposalAbsent,
         MarkExclusion::ArchiveComplete,
@@ -457,7 +398,6 @@ impl MarkExclusion {
             Self::StatusImmutable => "status_immutable",
             Self::ParallelIneligible => "parallel_ineligible",
             Self::ParallelProposalAbsent => "parallel_proposal_absent",
-            Self::ApplyIterationLimitActive => APPLY_ITERATION_LIMIT_ACTIVE,
         }
     }
 
@@ -472,9 +412,6 @@ impl MarkExclusion {
             Self::StatusImmutable => "not mutable in this mode",
             Self::ParallelIneligible => "uncommitted (commit first)",
             Self::ParallelProposalAbsent => "not present in HEAD (cannot queue)",
-            Self::ApplyIterationLimitActive => {
-                "at the active run's Apply iteration limit (retry after it closes)"
-            }
         }
     }
 }
@@ -1041,19 +978,6 @@ pub enum OperatorCommandError {
         /// Display status that carries no retryable evidence.
         display_status: String,
     },
-    /// The active run owns the change's exhausted Apply-dispatch ceiling.
-    ///
-    /// Refused *before* any mutation: retry cannot create budget inside the
-    /// boundary that already spent it, so admitting it would only reach the same
-    /// ceiling again after destroying the row's failed classification.
-    ApplyIterationLimitActive {
-        /// Target change.
-        change_id: String,
-        /// Exact cumulative Apply dispatches the active run reserved.
-        attempts: u32,
-        /// The configured ceiling that refused the next dispatch.
-        max: u32,
-    },
 }
 
 impl std::fmt::Display for OperatorCommandError {
@@ -1081,15 +1005,6 @@ impl std::fmt::Display for OperatorCommandError {
             } => write!(
                 f,
                 "retry is not supported for '{change_id}' with status '{display_status}'"
-            ),
-            Self::ApplyIterationLimitActive {
-                change_id,
-                attempts,
-                max,
-            } => write!(
-                f,
-                "'{change_id}' reached the active run's Apply iteration limit \
-                 ({attempts}/{max}); retry becomes available after that run closes"
             ),
         }
     }
@@ -1361,11 +1276,6 @@ pub struct OperatorCommandService {
     marks: Arc<ExecutionMarkStore>,
     parallel: Arc<ParallelRuntime>,
     cancellation_timeout: Duration,
-    /// Scheduler-task liveness authority for the active-limit gate.
-    ///
-    /// Unbound for a process with no command-capable scheduler, which is exactly
-    /// the process that has no retry to admit.
-    run_boundary: Option<Arc<dyn RunBoundaryLiveness>>,
     /// Shared process-local execution facts.
     ///
     /// Read-only here, and only for explanatory settlement evidence: no
@@ -1393,7 +1303,6 @@ impl OperatorCommandService {
             marks,
             parallel: Arc::new(ParallelRuntime::new()),
             cancellation_timeout: DEFAULT_CANCELLATION_TIMEOUT,
-            run_boundary: None,
             execution_facts: None,
         }
     }
@@ -1401,16 +1310,6 @@ impl OperatorCommandService {
     /// Bind the shared parallel runtime store.
     pub fn with_parallel(mut self, parallel: Arc<ParallelRuntime>) -> Self {
         self.parallel = parallel;
-        self
-    }
-
-    /// Bind the scheduler-task liveness authority the active-limit gate uses.
-    ///
-    /// The same handle the run-control service dispatches through and the same
-    /// one `/api/v2` projection reads, so admission and eligibility can never
-    /// disagree about whether the owning boundary is still alive.
-    pub fn with_run_boundary(mut self, boundary: Arc<dyn RunBoundaryLiveness>) -> Self {
-        self.run_boundary = Some(boundary);
         self
     }
 
@@ -1443,39 +1342,6 @@ impl OperatorCommandService {
     /// Shared process-local parallel runtime facts.
     pub fn parallel(&self) -> Arc<ParallelRuntime> {
         self.parallel.clone()
-    }
-
-    /// The bound scheduler-task liveness authority, if this process has one.
-    fn boundary(&self) -> Option<&dyn RunBoundaryLiveness> {
-        self.run_boundary.as_deref()
-    }
-
-    /// The active Apply-dispatch ceiling owning `change_id`, if any.
-    ///
-    /// The single query every admission path and every command-capable frontend
-    /// consults; see [`active_apply_iteration_limit`].
-    pub async fn active_apply_iteration_limit(
-        &self,
-        change_id: &str,
-    ) -> Option<ActiveApplyIterationLimit> {
-        active_apply_iteration_limit(&*self.state.read().await, self.boundary(), change_id)
-    }
-
-    /// Every change whose Apply-dispatch ceiling the active run still owns.
-    pub async fn active_apply_iteration_limited_ids(&self) -> HashSet<String> {
-        active_apply_iteration_limited_ids(&*self.state.read().await, self.boundary())
-    }
-
-    /// The refusal an active-limited target produces, or `Ok(())` when free.
-    async fn admit_past_apply_iteration_limit(&self, change_id: &str) -> OperatorResult<()> {
-        match self.active_apply_iteration_limit(change_id).await {
-            Some(limit) => Err(OperatorCommandError::ApplyIterationLimitActive {
-                change_id: change_id.to_string(),
-                attempts: limit.attempts,
-                max: limit.max,
-            }),
-            None => Ok(()),
-        }
     }
 
     /// Current display status for a change.
@@ -1874,19 +1740,10 @@ impl OperatorCommandService {
             let mut guard = self.state.write().await;
             // A terminal-error addition *is* a retry: it applies `RetryError`,
             // releases the failed classification, and publishes an explicit-retry
-            // edge. It therefore consults the same gate `retry_change` does,
-            // before the reducer is touched, so `set_queue_intent=true` cannot
-            // become a bypass.
+            // edge. It is therefore classified exactly like `retry_change` — the
+            // alias is explicit retry intent, which is the one thing allowed to
+            // consume a terminal error, retained Apply-limit diagnostic or not.
             if guard.is_terminal_error_change(change_id) {
-                if let Some(limit) =
-                    active_apply_iteration_limit(&guard, self.boundary(), change_id)
-                {
-                    return Err(OperatorCommandError::ApplyIterationLimitActive {
-                        change_id: change_id.to_string(),
-                        attempts: limit.attempts,
-                        max: limit.max,
-                    });
-                }
                 (
                     guard.apply_command(ReducerCommand::RetryError(change_id.to_string())),
                     true,
@@ -2125,9 +1982,10 @@ impl OperatorCommandService {
     /// evidence must survive rather than be consumed — and is distinct from the
     /// typed refusal an unsupported status produces.
     pub async fn plan_retry_change(&self, change_id: &str) -> OperatorResult<Option<RetryRoute>> {
-        // Ahead of route classification, and therefore ahead of every reducer,
-        // mark, queue, hook, explicit-retry, and scheduler effect a route implies.
-        self.admit_past_apply_iteration_limit(change_id).await?;
+        // Classification reads the target's own evidence and nothing about the
+        // invocation that failed it: a retained Apply-limit diagnostic explains
+        // why one invocation stopped, never whether a later explicit command may
+        // open a new one.
         let display_status = self.display_status(change_id).await;
         let blocker_kind = self.blocker_kind(change_id).await;
         let Some(route) = classify_retry_route(&display_status, blocker_kind) else {
@@ -2147,14 +2005,8 @@ impl OperatorCommandService {
     /// The bulk counterpart of [`Self::plan_retry_change`], and read-only for the
     /// same reason.
     pub async fn plan_retry_errors(&self, change_ids: &[String]) -> Vec<(String, RetryRoute)> {
-        // One coherent eligibility snapshot for the whole request: a boundary
-        // that closes mid-loop must not make the request partly gated.
-        let limited = self.active_apply_iteration_limited_ids().await;
         let mut routes = Vec::new();
         for change_id in change_ids {
-            if limited.contains(change_id) {
-                continue;
-            }
             let display_status = self.display_status(change_id).await;
             let blocker_kind = self.blocker_kind(change_id).await;
             let Some(route) = classify_retry_route(&display_status, blocker_kind) else {

@@ -906,13 +906,26 @@ impl OrchestratorState {
         &self.apply_iteration_limits
     }
 
+    /// Drop the Apply-dispatch ceiling record for one change.
+    ///
+    /// Returns true when a record was actually removed. Called from
+    /// [`Self::retry_terminal_error`], so the diagnostic is consumed by the same
+    /// explicit intent that consumes the terminal error it explains — and by
+    /// nothing else.
+    pub fn clear_apply_iteration_limit(&mut self, change_id: &str) -> bool {
+        let before = self.apply_iteration_limits.len();
+        self.apply_iteration_limits
+            .retain(|record| record.change_id != change_id);
+        self.apply_iteration_limits.len() != before
+    }
+
     /// The typed Apply-dispatch ceiling record for one change, if it has one.
     ///
-    /// Record presence alone is *not* the retry gate: this reducer is active-run
-    /// memory that outlives the boundary which wrote it, so the caller must pair
-    /// this with the owning scheduler task's liveness. See
-    /// [`crate::orchestration::operator_command::active_apply_iteration_limit`],
-    /// the one query every admission and projection path goes through.
+    /// Diagnostic evidence, never an operator-action gate: it answers why one
+    /// invocation stopped, not whether a later explicit command may open a new
+    /// one. Retry admission reads the target's own terminal-error evidence
+    /// instead, so a record retained under a still-live persistent scheduler
+    /// cannot make an explicit retry impossible.
     pub fn apply_iteration_limit(&self, change_id: &str) -> Option<&ApplyIterationLimit> {
         self.apply_iteration_limits
             .iter()
@@ -1749,6 +1762,14 @@ impl OrchestratorState {
     ///
     /// This is the only reducer-owned transition that may turn `TerminalState::Error`
     /// back into apply-dispatch eligibility. Final terminal states remain immutable.
+    ///
+    /// Reached only from `ReducerCommand::RetryError`, which only explicit retry
+    /// intent — individual retry, bulk retry, retry-class Start, or the explicit
+    /// per-target terminal-error queue alias — ever submits. That is what makes
+    /// this the right place to consume the change's retained Apply
+    /// iteration-limit diagnostic: the record stays observable for exactly as
+    /// long as the terminal error it explains, and no automatic path can retire
+    /// either one.
     pub fn retry_terminal_error(&mut self, change_id: &str) -> ReduceOutcome {
         {
             let rt = self.runtime_entry(change_id);
@@ -1761,6 +1782,7 @@ impl OrchestratorState {
             rt.dequeued = false;
             rt.observation = WorkspaceObservation::None;
         }
+        self.clear_apply_iteration_limit(change_id);
         self.clear_stalled_change(change_id);
         self.clear_error_history(change_id);
         self.clear_base_mutating_wait_queues(change_id);

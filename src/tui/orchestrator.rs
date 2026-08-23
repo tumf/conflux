@@ -655,25 +655,14 @@ mod tests {
             assert_eq!(lines(&log), vec!["completed 0".to_string()]);
         }
 
-        /// A failing finish hook is a hook failure, not a permanent gate.
+        /// A failing finish hook is a hook failure, not a lost diagnostic.
         ///
-        /// The hook still observed the exact typed record before it ran, the
-        /// record survives the failure, and nothing durable is written — so the
-        /// gate is still retired by scheduler-task exit alone.
+        /// The hook still observed the exact typed record before it ran, and the
+        /// record survives the failure — it is consumed by explicit retry alone,
+        /// never by a hook outcome.
         #[cfg_attr(windows, ignore)]
         #[tokio::test]
-        async fn active_iteration_limit_run_boundary_survives_a_failing_finish_hook() {
-            use crate::orchestration::operator_command::{
-                active_apply_iteration_limit, RunBoundaryLiveness,
-            };
-
-            struct Boundary(bool);
-            impl RunBoundaryLiveness for Boundary {
-                fn boundary_running(&self) -> bool {
-                    self.0
-                }
-            }
-
+        async fn settled_iteration_limit_record_survives_a_failing_finish_hook() {
             let temp_dir = TempDir::new().unwrap();
             let log = temp_dir.path().join("on-finish.log");
             let hooks = HookRunner::new(
@@ -716,15 +705,6 @@ mod tests {
             assert!(
                 state.apply_iteration_limit("change-a").is_some(),
                 "a hook failure never clears the record"
-            );
-            assert!(
-                active_apply_iteration_limit(&state, Some(&Boundary(true)), "change-a").is_some(),
-                "the gate is active while the owning task is live"
-            );
-            assert_eq!(
-                active_apply_iteration_limit(&state, Some(&Boundary(false)), "change-a"),
-                None,
-                "and scheduler-task exit retires it regardless of the hook outcome"
             );
         }
 

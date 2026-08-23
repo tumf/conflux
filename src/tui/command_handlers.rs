@@ -413,20 +413,18 @@ fn describe_start(retry: RetryContext) -> impl FnOnce(ApplicationResult) -> Comm
     }
 }
 
-/// The Apply-ceiling facts a retry refusal has to be worded against.
+/// The retry facts a refusal has to be worded against.
 ///
 /// Captured at submission time because the message is produced on a worker task
 /// that has no access to this frontend's rows.
 #[derive(Debug, Clone, Copy)]
 struct RetryContext {
-    active_limit: bool,
     admissible_target: bool,
 }
 
 impl RetryContext {
     fn observe(app: &AppState) -> Self {
         Self {
-            active_limit: app.has_active_apply_iteration_limit(),
             admissible_target: app.has_admissible_retry_target(),
         }
     }
@@ -434,14 +432,12 @@ impl RetryContext {
 
 /// Message for a retry the shared service settled without a target.
 ///
-/// `NoRetryableTarget` is truthful but not actionable when the reason is an
-/// active-run Apply ceiling, so the active condition is named when one exists.
+/// A visible admissible target with a settled empty request means the marks, not
+/// the evidence, are what the operator has to change.
 fn no_retryable_target_message(retry: RetryContext) -> String {
-    if retry.active_limit && !retry.admissible_target {
-        return format!(
-            "Retry is unavailable: every candidate is {}",
-            crate::tui::state::ACTIVE_APPLY_LIMIT_EXPLANATION
-        );
+    if retry.admissible_target {
+        return "No marked change carries retryable evidence (mark a retryable row first)"
+            .to_string();
     }
     "No marked change carries retryable evidence".to_string()
 }

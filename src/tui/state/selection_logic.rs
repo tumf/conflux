@@ -35,13 +35,6 @@ pub(super) struct BulkToggleSnapshot {
     pub(super) target_state: bool,
 }
 
-/// Operator-facing explanation shown wherever retry guidance is suppressed.
-///
-/// Stable text: it names the condition and what ends it, and never promises a
-/// key the service would refuse.
-pub(crate) const ACTIVE_APPLY_LIMIT_EXPLANATION: &str =
-    "at the active run's Apply iteration limit; retry becomes available after that run closes";
-
 /// Classifies a single change for bulk toggle; `None` means eligible.
 pub(super) fn classify_bulk_toggle_change(change: &ChangeState) -> Option<BulkToggleExclusion> {
     crate::orchestration::operator_command::classify_bulk_mark_row(
@@ -250,7 +243,6 @@ mod tests {
             elapsed_time: None,
             iteration_number: None,
             apply_operation_cache: "apply".to_string(),
-            apply_iteration_limit_active: false,
             archive_complete_cache: false,
         }
     }
@@ -300,12 +292,12 @@ mod tests {
         }
     }
 
-    /// Unit: a worktree-ineligible or Apply-limited row still carries intent.
-    /// Both conditions are decided at final run admission, not at mark time.
+    /// Unit: a worktree-ineligible or settled terminal-error row still carries
+    /// intent. Both conditions are decided at final run admission, not at mark
+    /// time — and a settled Apply-limit failure adds no exclusion of its own.
     #[test]
     fn run_mark_intent_admits_ineligible_and_apply_limited_rows() {
-        let mut limited = make_change_state("limited", "error", true);
-        limited.apply_iteration_limit_active = true;
+        let limited = make_change_state("limited", "error", true);
         let rows = vec![
             make_change_state("uncommitted", "not queued", false),
             make_change_state_with_eligibility(

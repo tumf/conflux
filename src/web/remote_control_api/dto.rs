@@ -784,11 +784,14 @@ pub enum ActionBlockedReason {
     NotMergeWaiting,
     /// Worktree execution refuses a change that is not committed cleanly yet.
     ParallelIneligible,
-    /// The active run owns this change's exhausted Apply-dispatch ceiling.
+    /// Retired: the server no longer refuses an action for this reason.
     ///
-    /// Process-local and ephemeral: it is published only while typed
-    /// iteration-limit evidence exists *and* the owning scheduler task is live,
-    /// and it disappears when that task exits even though the record remains.
+    /// The Apply-iteration ceiling is diagnostic evidence about the invocation
+    /// that stopped, not an operator-action block, so no current projection or
+    /// command admission produces this token. The variant remains published so a
+    /// client generated against an older contract — or one still handling a
+    /// recorded snapshot that carries it — keeps deserializing rather than
+    /// failing on an unknown reason.
     ApplyIterationLimitActive,
 }
 
@@ -814,7 +817,6 @@ impl ActionBlockedReason {
             // Both parallel refusals block the same actions; the reason they
             // differ on is published per change in `parallel.blocked_reason`.
             E::ParallelIneligible | E::ParallelProposalAbsent => Self::ParallelIneligible,
-            E::ApplyIterationLimitActive => Self::ApplyIterationLimitActive,
         }
     }
 }

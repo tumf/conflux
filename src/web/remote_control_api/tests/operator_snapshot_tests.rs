@@ -526,21 +526,6 @@ fn run_mark_intent_api_markability_is_the_shared_classifier_on_every_axis() {
                     );
                 }
             }
-
-            for apply_iteration_limit_active in [true, false] {
-                let actions =
-                    crate::web::remote_control_api::projection::limited_change_actions_for_test(
-                        mode,
-                        status,
-                        apply_iteration_limit_active,
-                    );
-                assert_eq!(
-                    actions.set_execution_mark.allowed, markable,
-                    "{mode}/{status}/limit={apply_iteration_limit_active}: an Apply ceiling must \
-                     not reach mark eligibility: {:?}",
-                    actions.set_execution_mark
-                );
-            }
         }
     }
 }
@@ -1636,45 +1621,21 @@ fn every_stable_reason_token_round_trips_as_snake_case() {
 }
 
 // ============================================================================
-// Active-run Apply iteration limit: typed eligibility projection
+// Settled Apply iteration limit: typed eligibility projection
 // ============================================================================
 //
 // Integration evidence for the projection path: a real `WebState`, a real
-// reducer, and an explicitly driven liveness authority, published through the
-// real `project_snapshot`. Nothing spawns a process or touches a repository.
+// reducer, published through the real `project_snapshot`. Nothing spawns a
+// process or touches a repository.
+//
+// The retained ceiling record is diagnostic evidence about the invocation that
+// stopped. Projection and command admission share one retry classifier, and
+// that classifier cannot see the record at all — which is what makes it
+// impossible for the snapshot to advertise a block the shared service would not
+// produce.
 
-/// Liveness authority double for the projection tests.
-#[derive(Debug, Default)]
-struct TestBoundary {
-    running: std::sync::atomic::AtomicBool,
-}
-
-impl TestBoundary {
-    fn live() -> Self {
-        let boundary = Self::default();
-        boundary.running.store(true, Ordering::SeqCst);
-        boundary
-    }
-
-    fn set_running(&self, running: bool) {
-        self.running.store(running, Ordering::SeqCst);
-    }
-}
-
-impl crate::orchestration::operator_command::RunBoundaryLiveness for TestBoundary {
-    fn boundary_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-}
-
-use std::sync::atomic::Ordering;
-
-/// Arrange a limited terminal-error change behind a live command-capable run.
-async fn limited_web_state() -> (
-    Arc<WebState>,
-    Arc<tokio::sync::RwLock<OrchestratorState>>,
-    Arc<TestBoundary>,
-) {
+/// Arrange a settled terminal-error change that retains its Apply ceiling.
+async fn limited_web_state() -> (Arc<WebState>, Arc<tokio::sync::RwLock<OrchestratorState>>) {
     let (web_state, reducer, _marks) = wired_web_state(&["alpha"]).await;
     let web_state = Arc::new(web_state);
     web_state.update(&[change("alpha")]).await;
@@ -1682,18 +1643,16 @@ async fn limited_web_state() -> (
         let mut guard = reducer.write().await;
         guard.apply_execution_event(&ExecutionEvent::ProcessingError {
             id: "alpha".to_string(),
-            error: "max iterations reached".to_string(),
+            error: "reached maximum iterations (50/50) without completion".to_string(),
         });
         guard.record_apply_iteration_limit("alpha", 50, 50);
     }
-    let boundary = Arc::new(TestBoundary::live());
-    web_state.set_run_boundary(boundary.clone()).await;
-    (web_state, reducer, boundary)
+    (web_state, reducer)
 }
 
 #[tokio::test]
-async fn active_iteration_limit_projection_blocks_retry_while_the_task_is_live() {
-    let (web_state, _reducer, _boundary) = limited_web_state().await;
+async fn settled_apply_limit_projection_exposes_ordinary_retry_eligibility() {
+    let (web_state, reducer) = limited_web_state().await;
     web_state.sync_remote_control_projection().await;
 
     let (snapshot, _revision, _) = web_state.remote_control().projection().snapshot();
@@ -1704,54 +1663,40 @@ async fn active_iteration_limit_projection_blocks_retry_while_the_task_is_live()
         .expect("the limited change is projected");
 
     assert_eq!(alpha.display_status, "error");
-    assert!(!alpha.actions.retry_change.allowed);
-    assert_eq!(
-        alpha.actions.retry_change.blocked_reason,
-        Some(ActionBlockedReason::ApplyIterationLimitActive),
-        "the stable token is projected, not prose"
-    );
-    // The terminal-error queue alias is refused by the same guard, so it must
-    // not be advertised either.
-    assert_eq!(
-        alpha.actions.set_queue_intent.blocked_reason,
-        Some(ActionBlockedReason::ApplyIterationLimitActive)
-    );
-    // The mark is not: a ceiling on the *active* run says nothing about which
-    // change the operator wants the next run to consider. Retry is where the
-    // limit is reported, and it is reported there.
-    assert!(
-        alpha.actions.set_execution_mark.allowed,
-        "an Apply ceiling never refuses next-run intent: {:?}",
-        alpha.actions.set_execution_mark
-    );
-}
-
-#[tokio::test]
-async fn active_iteration_limit_projection_clears_the_block_after_task_exit() {
-    let (web_state, reducer, boundary) = limited_web_state().await;
-    web_state.sync_remote_control_projection().await;
-    let projection = web_state.remote_control().projection();
-    let revision_before = projection.revision();
-
-    // The owning scheduler task returned; its typed record is deliberately kept.
-    boundary.set_running(false);
-    web_state.sync_remote_control_projection().await;
-
-    let (snapshot, revision_after, _) = projection.snapshot();
-    assert_eq!(
-        revision_after,
-        revision_before + 1,
-        "the liveness transition publishes one new authoritative revision"
-    );
-    let alpha = snapshot
-        .changes
-        .iter()
-        .find(|change| change.id == "alpha")
-        .expect("the change is still projected");
     assert!(
         alpha.actions.retry_change.allowed,
-        "eligibility falls back to the row's remaining evidence: {:?}",
+        "a settled terminal error is retryable on its own evidence: {:?}",
         alpha.actions.retry_change
+    );
+    assert_eq!(alpha.actions.retry_change.blocked_reason, None);
+    // The terminal-error queue alias routes through the same explicit retry, so
+    // the ceiling never refuses it either. Whether this fixture's mode owns a
+    // runtime queue at all is a separate, pre-existing rule: what matters here
+    // is that the retired gate is not what answers.
+    assert_ne!(
+        alpha.actions.set_queue_intent.blocked_reason,
+        Some(ActionBlockedReason::ApplyIterationLimitActive),
+        "the alias is classified by mode and status alone: {:?}",
+        alpha.actions.set_queue_intent
+    );
+    // And in the mode that does own a queue, the alias is advertised on exactly
+    // the terms an ordinary terminal error gets.
+    assert!(
+        change_actions_for_test("running", "error", None)
+            .set_queue_intent
+            .allowed,
+        "a running-mode terminal error keeps the explicit-retry alias"
+    );
+    assert!(alpha.actions.set_execution_mark.allowed);
+    // The diagnostic itself is still reachable, through evidence rather than
+    // through an action gate: the client reads it, it does not parse it.
+    assert!(
+        alpha
+            .error_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("50/50")),
+        "the attempts/ceiling evidence stays observable: {:?}",
+        alpha.error_detail
     );
     assert!(
         reducer
@@ -1759,12 +1704,37 @@ async fn active_iteration_limit_projection_clears_the_block_after_task_exit() {
             .await
             .apply_iteration_limit("alpha")
             .is_some(),
-        "retirement is by task exit, not by clearing the record"
+        "and the typed record is retained until explicit retry consumes it"
     );
 }
 
+/// No projection path may reintroduce the retired token for any change.
 #[tokio::test]
-async fn active_iteration_limit_projection_leaves_ordinary_errors_retryable() {
+async fn settled_apply_limit_projection_publishes_no_blocked_reason() {
+    let (web_state, _reducer) = limited_web_state().await;
+    web_state.sync_remote_control_projection().await;
+
+    let (snapshot, _revision, _) = web_state.remote_control().projection().snapshot();
+    for change in &snapshot.changes {
+        for (name, action) in [
+            ("retry_change", &change.actions.retry_change),
+            ("set_queue_intent", &change.actions.set_queue_intent),
+            ("set_execution_mark", &change.actions.set_execution_mark),
+            ("stop_and_dequeue", &change.actions.stop_and_dequeue),
+            ("resolve_merge", &change.actions.resolve_merge),
+        ] {
+            assert_ne!(
+                action.blocked_reason,
+                Some(ActionBlockedReason::ApplyIterationLimitActive),
+                "{}.{name} must not project the retired gate: {action:?}",
+                change.id
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn settled_apply_limit_projection_leaves_ordinary_errors_retryable() {
     let (web_state, reducer, _marks) = wired_web_state(&["alpha"]).await;
     let web_state = Arc::new(web_state);
     web_state.update(&[change("alpha")]).await;
@@ -1775,9 +1745,6 @@ async fn active_iteration_limit_projection_leaves_ordinary_errors_retryable() {
             id: "alpha".to_string(),
             error: "boom".to_string(),
         });
-    web_state
-        .set_run_boundary(Arc::new(TestBoundary::live()))
-        .await;
     web_state.sync_remote_control_projection().await;
 
     let (snapshot, _revision, _) = web_state.remote_control().projection().snapshot();
@@ -1789,10 +1756,10 @@ async fn active_iteration_limit_projection_leaves_ordinary_errors_retryable() {
     );
 }
 
-/// Headless `cflx run` binds no command executor and no liveness authority, so a
-/// retained record must never become a current action block.
+/// Headless `cflx run` binds no command executor, so its retained record is read
+/// as evidence and command submission stays refused by the unbound-runtime rule.
 #[tokio::test]
-async fn active_iteration_limit_projection_is_absent_for_an_unbound_runtime() {
+async fn settled_apply_limit_projection_is_evidence_only_for_an_unbound_runtime() {
     let (web_state, reducer, _marks) = wired_web_state(&["alpha"]).await;
     let web_state = Arc::new(web_state);
     web_state.update(&[change("alpha")]).await;
@@ -1800,7 +1767,7 @@ async fn active_iteration_limit_projection_is_absent_for_an_unbound_runtime() {
         let mut guard = reducer.write().await;
         guard.apply_execution_event(&ExecutionEvent::ProcessingError {
             id: "alpha".to_string(),
-            error: "max iterations reached".to_string(),
+            error: "reached maximum iterations (50/50) without completion".to_string(),
         });
         guard.record_apply_iteration_limit("alpha", 50, 50);
     }
@@ -1810,25 +1777,36 @@ async fn active_iteration_limit_projection_is_absent_for_an_unbound_runtime() {
     assert_ne!(
         snapshot.changes[0].actions.retry_change.blocked_reason,
         Some(ActionBlockedReason::ApplyIterationLimitActive),
-        "no bound boundary means no process-local action block to publish"
+        "no projection publishes the retired process-local action block"
+    );
+    assert!(
+        reducer
+            .read()
+            .await
+            .apply_iteration_limit("alpha")
+            .is_some(),
+        "the headless finish-hook owner keeps its typed evidence regardless"
     );
     assert!(!web_state.remote_control().is_bound().await);
 }
 
+/// The retired variant stays serializable so an older client keeps deserializing
+/// a recorded snapshot that still carries it. Nothing produces it any more.
 #[test]
-fn active_iteration_limit_projection_serializes_the_stable_token() {
-    use crate::web::remote_control_api::projection::limited_change_actions_for_test;
-
+fn settled_apply_limit_retired_token_remains_deserializable() {
     assert_eq!(
         serde_json::to_value(ActionBlockedReason::ApplyIterationLimitActive).unwrap(),
         json!("apply_iteration_limit_active")
     );
-
-    let blocked = limited_change_actions_for_test("running", "error", true);
     assert_eq!(
-        blocked.retry_change.blocked_reason,
-        Some(ActionBlockedReason::ApplyIterationLimitActive)
+        serde_json::from_value::<ActionBlockedReason>(json!("apply_iteration_limit_active"))
+            .unwrap(),
+        ActionBlockedReason::ApplyIterationLimitActive
     );
-    let allowed = limited_change_actions_for_test("running", "error", false);
-    assert!(allowed.retry_change.allowed);
+
+    // And the shared classifier's own answer for the condition that used to
+    // produce it: an ordinary terminal-error row, retryable.
+    let actions = change_actions_for_test("running", "error", None);
+    assert!(actions.retry_change.allowed);
+    assert_eq!(actions.retry_change.blocked_reason, None);
 }

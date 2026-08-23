@@ -202,13 +202,8 @@ pub trait RemoteControlExecutor: Send + Sync {
 /// different target.
 pub fn map_operator_error(error: &OperatorCommandError) -> CommandFailure {
     match error {
-        // The active run owns this target's exhausted Apply ceiling. It is a
-        // target problem, not a mode problem: unrelated targets in the same run
-        // are still retryable, and this one becomes retryable again once its
-        // owning boundary closes.
         OperatorCommandError::MissingCancellationHandle { .. }
-        | OperatorCommandError::RetryUnsupported { .. }
-        | OperatorCommandError::ApplyIterationLimitActive { .. } => {
+        | OperatorCommandError::RetryUnsupported { .. } => {
             CommandFailure::new(ErrorCode::TargetIneligible, error.to_string())
         }
         // Termination did not confirm: the change is still occupying the root.
