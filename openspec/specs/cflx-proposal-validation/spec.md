@@ -410,7 +410,7 @@ The bundled `cflx-apply` skill MUST require Apply agents to stage only change-ow
 
 ### Requirement: Proposal verification plans bound Apply-owned work
 
-Bundled proposal guidance MUST keep Apply-blocking verification repository-local and bounded to one direct execution by default. Docker, database, heavy, credentialed, deployed-service, physical-device, external-approval, and long-running repository-wide gates MUST be assigned to repository automation, Acceptance, benchmark, manual, or operational-observation ownership unless the proposal declares a bounded repository-local path that can complete within one Apply invocation. Proposal guidance MUST NOT create checkbox tasks whose sole purpose is repeated stability execution of the same verification command.
+Bundled proposal guidance MUST keep Apply-blocking verification repository-local and bounded to one direct execution by default. Docker orchestration, database services, heavy or credentialed execution, deployed-service checks, physical-device checks, external approval, and long-running repository-wide gates MUST be assigned to repository automation, Acceptance, benchmark, manual, or operational-observation ownership unless the proposal declares a bounded repository-local path that can complete within one Apply invocation. Proposal guidance MUST NOT create checkbox tasks whose sole purpose is repeated stability execution of the same verification command. Native validation MUST inspect only structured `verifications[].evidence` and `verifications[].rerun` commands for deterministic heavyweight forms; task prose MUST NOT be a command-authority source. During migration, matches MUST produce actionable strict-validation warnings and MUST NOT fail archive-gate validation. Matching MUST use exact command tokens or explicit adjacent token pairs rather than substring inference. Bounded `docker build` evidence MUST remain valid.
 
 #### Scenario: Heavy repository gate is not an Apply checkbox
 
@@ -421,12 +421,44 @@ Bundled proposal guidance MUST keep Apply-blocking verification repository-local
 **And**: the heavy suite is assigned to repository automation, Acceptance, or operational observation
 **And**: no checkbox requires repeated execution of the heavy suite
 
+#### Scenario: Heavy repository gate produces a migration warning
+
+**Given**: a change-blocking verification declares `docker compose up --wait`, `docker run`, `cargo bench`, `--workspace`, `--all-features`, `--ignored`, `--include-ignored`, `--features heavy`, `--exhaustive`, `qemu-system-*`, `cross`, `seq`, or `xargs` in `evidence` or `rerun`
+**When**: strict validation runs during migration
+**Then**: validation emits an actionable warning naming the verification ID and matched form
+**And**: archive-gate validation does not fail from that warning
+
+#### Scenario: Bounded Docker build may block completion
+
+**Given**: a Dockerfile change declares a bounded repository-local `docker build` command
+**When**: strict validation runs
+**Then**: no heavyweight-command finding is emitted for `docker build`
+
+#### Scenario: Command substrings do not trigger warnings
+
+**Given**: a bounded test selector contains `full`, `heavy`, `benchmark`, or `exhaustive` inside a longer token
+**When**: strict validation runs
+**Then**: no heavyweight-command finding is emitted from that substring
+
+#### Scenario: Task prose is not command authority
+
+**Given**: task prose contains heavyweight words or a task-local command that differs from frontmatter
+**When**: strict validation runs
+**Then**: validation emits no cohesion or heavyweight finding from that prose
+
+#### Scenario: Legacy verification declarations remain valid
+
+**Given**: an active proposal lacks structured execution or completion roles required for current verification linkage
+**When**: strict validation runs
+**Then**: the new warning policy remains inert for that declaration
+**And**: existing migration compatibility is preserved
+
 #### Scenario: Bounded repository-local integration test may block completion
 
-**Given**: a database behavior can be verified with a local fixture in one direct bounded command
+**Given**: a behavior can be verified with a local fixture in one direct bounded command
 **When**: proposal guidance declares that verification
 **Then**: it may be `pre-integration`, `repository-local`, and `change-blocking`
-**And**: the task names one rerun command and does not prescribe a stability loop
+**And**: the task references the verification ID without duplicating command authority
 
 #### Scenario: Non-local verification cannot be hidden in task prose
 
@@ -434,50 +466,3 @@ Bundled proposal guidance MUST keep Apply-blocking verification repository-local
 **When**: proposal guidance writes tasks and structured verifications
 **Then**: the outcome is not attached to an Apply-blocking checkbox
 **And**: its structured verification role is operational observation or narrative Future Work
-
-### Requirement: Change-blocking verification declarations remain cohesive and bounded
-
-Native proposal validation MUST use structured verification declarations and parseable task verification references to reject heterogeneous or heavyweight work bundled into one change-blocking Acceptance gate. Reuse of one change-blocking verification ID across active task checkboxes MUST require the same exact ownership marker and the same normalized concrete command on every reference. The marker MUST be one case-insensitive closed-set token immediately after `verification:` and before the first ` - `; missing or ambiguous markers MUST produce a diagnostic. Command normalization MUST remove Markdown backticks, fold whitespace, trim, and compare case-insensitively. Validation MUST apply its structural denylist to every declared command form: `evidence`, `rerun`, task-line concrete commands, and structured argv when present. It MUST reject Docker/container orchestration, cross-architecture emulation, benchmark, explicit full/exhaustive/heavy suite, or repeated-stability forms as change-blocking commands and direct authors to bounded repository-local proof plus operational observation or repository automation. This native syntax rule MUST take precedence over generic evidence-hint recognition and guidance that otherwise permits a bounded repository-local integration path; an allowed bounded path MUST not match the denylist. The resulting diagnostic MUST be the heavyweight-command diagnostic, not `missing repository evidence`. Validation MUST NOT infer task meaning from free-text prose and does not detect unrelated tasks that deliberately declare the same marker and command.
-
-#### Scenario: Heterogeneous tasks cannot share one blocker
-
-**Given**: active task checkboxes reference one change-blocking verification ID
-**And**: the task verification notes declare different ownership markers or concrete commands
-**When**: strict validation runs
-**Then**: validation fails with the verification ID and affected task lines
-**And**: the diagnostic directs the author to split the verification declarations
-
-#### Scenario: Heavy broad suite cannot block Acceptance
-
-**Given**: any `evidence`, `rerun`, task concrete command, or structured argv for a change-blocking verification structurally selects container orchestration, cross-architecture emulation, benchmark, full, exhaustive, heavy, or repeated stability execution
-**When**: strict validation runs
-**Then**: validation fails
-**And**: the diagnostic requires bounded repository-local proof and separately owned broad verification
-
-#### Scenario: Heavy evidence cannot hide behind a focused rerun
-
-**Given**: a change-blocking declaration has a focused `rerun` command
-**And**: its `evidence` or structured argv matches the heavyweight denylist
-**When**: strict validation runs
-**Then**: validation fails with the heavyweight-command diagnostic
-
-#### Scenario: Native denylist overrides bounded-path guidance
-
-**Given**: a proposal declares a bounded repository-local path
-**And**: its command form matches the structural denylist
-**When**: strict validation runs
-**Then**: native validation rejects the command
-**And**: generic evidence-hint recognition does not make it valid
-
-#### Scenario: Focused proof may cover coupled tasks
-
-**Given**: implementation and regression-test tasks reference the same change-blocking ID
-**And**: both name the same focused ownership marker and concrete command
-**When**: strict validation runs
-**Then**: the shared declaration remains valid
-
-#### Scenario: Prose does not control cohesion
-
-**Given**: narrative text uses words such as heavy or full outside parseable verification syntax
-**When**: strict validation runs
-**Then**: that prose does not create or alter a workflow-control classification

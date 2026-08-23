@@ -1245,29 +1245,33 @@ mod tests {
         );
     }
 
-    /// The proposal skill is the authoring half of the verification-cohesion
-    /// contract: native validation rejects bundled gates, and the bundled
+    /// The proposal skill is the authoring half of the heavyweight-command
+    /// contract: native validation warns about declared forms, and the bundled
     /// guidance has to teach the same rule with the same vocabulary.
     #[test]
-    fn proposal_skill_documents_cohesive_bounded_change_blocking_gates() {
+    fn proposal_skill_documents_declared_command_authority_and_migration_warnings() {
         let content = embedded_skill_content("cflx-proposal");
 
         for required in [
-            "## One Change-Blocking Gate Proves One Cohesive Claim",
-            "**A shared change-blocking ID needs one ownership marker and one command.**",
-            "the single closed-set token immediately after `verification:` and\nbefore the first ` - `",
-            "Markdown backticks, spacing, and letter case are normalized away",
-            "**Structurally heavyweight command forms cannot be change-blocking.**",
-            "so a heavy `evidence` is still rejected behind a focused `rerun`",
-            // Every denied structural class, named as the validator names it.
+            "## Structured Frontmatter Is the Only Command Authority",
+            "**Task prose is never parsed for commands.**",
+            "Several checkboxes may share one change-blocking",
+            "## Heavyweight Command Forms on a Change-Blocking Gate",
+            "**During migration these are warnings.**",
+            "does **not**\nfail `cflx openspec validate <id> --archive-gate`",
+            "so a\nheavy `evidence` is still reported behind a focused `rerun`",
+            // Every warned structural class, named as the validator names it.
             "| Container orchestration |",
-            "| Cross-architecture emulation |",
+            "| Architecture emulation |",
             "| Benchmark |",
-            "| Fuzzing |",
-            "| Full / exhaustive / heavy suite |",
-            "| Repeated stability execution |",
+            "| Broad selector |",
+            "| Structural repetition |",
+            // Exact-token matching and its two documented false-positive cures.
+            "**Matching is exact, by whole token.**",
+            "Substring containment is never\na match",
+            "`docker build .` — a bounded image build is explicitly permitted",
             // The prescribed split: bounded proof blocks, broad execution observes.
-            "Rewrite the gate as bounded proof plus separately owned broad verification",
+            "Rewrite a warned gate as bounded proof plus separately owned broad verification",
             "completion_role: change-blocking",
             "completion_role: operational-observation",
         ] {
@@ -1278,18 +1282,36 @@ mod tests {
         }
 
         // The bounded repository-local exception must not read as an escape
-        // hatch from the command-form denylist.
+        // hatch from the warned command forms.
         assert!(
             content.contains(
                 "The bounded path\nis an exception for the *requirement*, never for the *command form*"
             ),
-            "cflx-proposal must keep the bounded-path exception subordinate to the denylist"
+            "cflx-proposal must keep the bounded-path exception subordinate to the warned forms"
         );
         assert!(
-            content
-                .contains("only a\nrepetition count of two or more is treated as a stability loop"),
+            content.contains(
+                "Cache-busting forms such as `-count=1` are bounded and are not matched at all."
+            ),
             "cflx-proposal must keep cache-busting repetition counts valid"
         );
+        // The validator constrains declared authorization, not what a session runs.
+        assert!(
+            content
+                .contains("**Validation constrains what you declare, not what a session runs.**")
+                && content.contains("cannot stop an AI session"),
+            "cflx-proposal must state the runtime boundary of native validation"
+        );
+        // Cohesion enforcement is gone; the guidance must not resurrect it.
+        for removed in [
+            "## One Change-Blocking Gate Proves One Cohesive Claim",
+            "**A shared change-blocking ID needs one ownership marker and one command.**",
+        ] {
+            assert!(
+                !content.contains(removed),
+                "cflx-proposal must no longer teach the retired cohesion rule `{removed}`"
+            );
+        }
     }
 
     /// The apply skill must separate agent staging from Conflux commit
