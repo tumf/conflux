@@ -35,7 +35,9 @@ The retained `ApplyIterationLimit` record is valid diagnostic evidence. It must 
 
 Scope the Apply-limit guard to automatic work in the invocation that exhausted the budget. Once the failure is settled as a terminal change-local error, preserve the diagnostic record but allow an explicit `RetryChange`, bulk retry, or Start-selected retry to consume the ordinary terminal-error route and create a fresh execution boundary with a fresh Apply budget.
 
-Remove `apply_iteration_limit_active` as an operator-action block from the shared command service, TUI eligibility, and `/api/v2` action projection. Keep the existing rule that queue reconciliation, mark settlement, and generic scheduler notification cannot synthesize a retry; only explicit retry intent may clear the terminal error.
+Remove `apply_iteration_limit_active` as an operator-action block from the shared command service, TUI eligibility, and `/api/v2` action projection. Keep the existing rule that queue reconciliation, mark settlement, and generic scheduler notification cannot synthesize a retry; only explicit retry intent — individual retry, bulk retry, retry-class Start, or the explicit per-target terminal-error queue-intent alias — may clear the terminal error.
+
+Retire the gate from every canonical requirement that mandates it: `operator-command-execution` (`Retry routing preserves reconciled evidence`, `Mode-aware mark and queue behavior`), `cli` (`Error Retry with F5 Key`, `Error State Display`, `Footer Dynamic Guidance Display`), and `remote-control-api` (`Authoritative operator snapshot`, `Shared lifecycle scheduling semantics`). A partial retirement would leave canonical requirements simultaneously mandating and forbidding the same blocked reason.
 
 ## Acceptance Criteria
 
@@ -59,6 +61,7 @@ Remove `apply_iteration_limit_active` as an operator-action block from the share
 - Removing iteration-limit diagnostics.
 - Automatically retrying an exhausted invocation.
 - Changing retry behavior for unsupported evidence, acceptance holds, or terminal outcomes other than `error`.
+- Rewriting `web-monitoring` console scenarios whose Given is a snapshot blocked by `apply_iteration_limit_active` (`Server-blocked error row offers no Retry`, `Later allowed snapshot restores Retry`). They condition on a projection this change makes unreachable rather than mandating the gate, so they become vacuous, not contradictory; a follow-up change must retire or generalize them.
 
 ## Root-cause evidence
 
