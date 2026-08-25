@@ -15,7 +15,7 @@ verifications:
     trigger: pull-request-validation
     automation: src/tui/render.rs
     evidence: Focused Rust render-test output proving the captured project path is visible and the workspaces badge is absent
-    rerun: cargo test tui_header_shows_project_path --locked
+    rerun: cargo test --locked tui::render
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -54,7 +54,7 @@ Preserve existing status, dirty badge, and right-aligned version behavior. Compu
 - `AppState` receives the startup repository path from the existing `repo_root` in the local TUI runner.
 - Header rendering uses that state rather than calling `current_dir()`.
 - Focused unit and render tests assert the exact full path when it fits; deterministic middle elision when it does not; terminal-column safety for ASCII, wide Unicode, and combining marks; absence of `[workspaces:`; preservation of adjacent badges/version; and bounded narrow-width rendering.
-- `cargo test tui_header_shows_project_path --locked` succeeds.
+- `cargo test --locked tui::render` succeeds.
 
 ## Out of Scope
 
