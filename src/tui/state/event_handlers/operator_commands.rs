@@ -111,7 +111,16 @@ impl AppState {
     /// `Stopping` is the exact existing event for this, so the projection lives
     /// on the event path like every other lifecycle transition rather than in the
     /// command handler that happened to cause it.
+    ///
+    /// A stop admitted from Ready is an idle-origin stop over a live parked
+    /// scheduler, so the episode fact is established through the shared rule
+    /// before the mode moves. Ready reached through `AllCompleted` settlement
+    /// carries no idle edge of its own, and cancel-stop reads this fact to decide
+    /// whether it is returning to Ready or to a run episode that really existed.
     pub(crate) fn handle_stopping(&mut self) {
+        if crate::events::graceful_stop_is_idle_origin(self.execution_mode.app_mode_token()) {
+            self.persistent_scheduler_idle = true;
+        }
         self.stop_mode = StopMode::GracefulPending;
         self.execution_mode = AppExecutionMode::Stopping;
     }

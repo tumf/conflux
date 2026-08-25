@@ -61,6 +61,12 @@ pub struct ParallelRunService {
     /// Explicit-target classification deferred to the executor's post-checkpoint
     /// boundary. Only an enabled real `-u` run installs one.
     explicit_target_plan: Option<crate::orchestration::target_resolution::ExplicitTargetPlan>,
+    /// The run owner's pending graceful-stop request, when one is bound.
+    ///
+    /// Handed to the executor this service builds so the scheduler loop reads the
+    /// same request shared run control records through the scheduler port. A
+    /// service no owner bound one to builds an executor that observes none.
+    graceful_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ParallelRunService {
@@ -90,6 +96,7 @@ impl ParallelRunService {
             diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
             upstream_integration: None,
             explicit_target_plan: None,
+            graceful_stop: None,
         }
     }
 
@@ -122,6 +129,7 @@ impl ParallelRunService {
             diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
             upstream_integration: None,
             explicit_target_plan: None,
+            graceful_stop: None,
         }
     }
 
@@ -146,6 +154,15 @@ impl ParallelRunService {
     #[cfg(test)]
     pub fn upstream_integration(&self) -> Option<&crate::upstream::UpstreamRuntime> {
         self.upstream_integration.as_ref()
+    }
+
+    /// Bind the run owner's pending graceful-stop request.
+    ///
+    /// Only a run owner that already owns the flag shared run control writes
+    /// through calls this; every other caller leaves the executor with no request
+    /// to observe.
+    pub fn set_graceful_stop_flag(&mut self, graceful_stop: Arc<std::sync::atomic::AtomicBool>) {
+        self.graceful_stop = Some(graceful_stop);
     }
 
     /// Install deferred explicit-target classification.
@@ -254,6 +271,10 @@ impl ParallelRunService {
             // Loop-based frontends (TUI/server) should stay alive when idle
             // and wait for new queue notifications.
             executor.set_persistent_lifetime();
+        }
+
+        if let Some(graceful_stop) = &self.graceful_stop {
+            executor.set_graceful_stop_flag(graceful_stop.clone());
         }
 
         executor.set_hooks(hooks);

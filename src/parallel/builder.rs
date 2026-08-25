@@ -149,6 +149,9 @@ impl ParallelExecutor {
             auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             scheduler_lifetime: SchedulerLifetime::Finite,
+            // Default-off: an executor no run owner bound a stop request to can
+            // never observe one, so its loop behaves exactly as before.
+            graceful_stop: None,
             persistent_idle_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             persistent_idle_baseline: Arc::new(std::sync::Mutex::new(None)),
             post_archive_action: PostArchiveAction::MergeToBase,
@@ -354,6 +357,16 @@ impl ParallelExecutor {
     /// Keep scheduler alive until explicit stop (loop-based frontends).
     pub fn set_persistent_lifetime(&mut self) {
         self.set_scheduler_lifetime(SchedulerLifetime::Persistent);
+    }
+
+    /// Bind the run owner's pending graceful-stop request.
+    ///
+    /// The same flag shared run control writes through the scheduler port, so a
+    /// stop the operator already had accepted is visible to the loop that has to
+    /// honour it. Nothing else about the request is duplicated here: the flag is
+    /// read, never written.
+    pub fn set_graceful_stop_flag(&mut self, graceful_stop: Arc<std::sync::atomic::AtomicBool>) {
+        self.graceful_stop = Some(graceful_stop);
     }
 
     /// Set the manual resolve counter for tracking active manual resolve operations (TUI mode).

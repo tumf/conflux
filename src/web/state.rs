@@ -1293,10 +1293,16 @@ impl WebState {
 
                 // Completion events
                 ExecutionEvent::Stopping => {
-                    // The idle-episode fact is intentionally retained: a stop
-                    // requested from persistent-idle Ready is still that same
-                    // episode until work starts or the run terminates, which is
+                    // The idle-episode fact is established or retained here: a
+                    // stop admitted from Ready is an idle-origin stop over a live
+                    // parked scheduler, and it stays that same episode until work
+                    // starts or the run terminates. Establishing it — rather than
+                    // only retaining what a typed idle edge left — is what covers
+                    // the Ready an `AllCompleted` settlement produced, and it is
                     // what lets cancel-stop return to Ready rather than Running.
+                    if crate::events::graceful_stop_is_idle_origin(&state.app_mode) {
+                        state.persistent_scheduler_idle = true;
+                    }
                     state.app_mode = "stopping".to_string();
                 }
                 ExecutionEvent::Stopped => {

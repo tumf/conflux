@@ -50,8 +50,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::events::{
     accepted_start_opens_idle_run_episode, all_completed_may_overwrite_mode,
-    is_admitted_work_start, persistent_idle_may_project_ready, EventDispatcher, ExecutionEvent,
-    OperatorCommandEffect, OutcomeRevisions,
+    graceful_stop_is_idle_origin, is_admitted_work_start, persistent_idle_may_project_ready,
+    EventDispatcher, ExecutionEvent, OperatorCommandEffect, OutcomeRevisions,
 };
 use crate::orchestration::apply_commit_evidence::ApplyCommitEvidencePort;
 use crate::orchestration::mark_settlement::{
@@ -188,7 +188,18 @@ impl CoreMode {
             // Typed run activation. The scheduler really started work, so the
             // process is Running whether or not a command put it there.
             ExecutionEvent::ProcessingStarted(_) => OperatorMode::Running,
-            ExecutionEvent::Stopping => OperatorMode::Stopping,
+            // An accepted graceful stop. A stop admitted from Ready is an
+            // idle-origin stop over a live parked scheduler, so the episode fact
+            // is established here rather than assumed to already exist: Ready
+            // reached through `AllCompleted` settlement owns no typed idle edge,
+            // and without this a later cancel-stop would restore Running for an
+            // episode nothing ever opened.
+            ExecutionEvent::Stopping => {
+                if graceful_stop_is_idle_origin(guard.mode.as_app_mode()) {
+                    guard.persistent_idle = true;
+                }
+                OperatorMode::Stopping
+            }
             ExecutionEvent::Stopped => OperatorMode::Stopped,
             ExecutionEvent::Error { .. } => OperatorMode::Error,
             // A change-scoped failure. The reducer records terminal Error on

@@ -94,6 +94,26 @@ impl Converged {
     async fn web_mode(&self) -> String {
         self.web.get_state().await.app_mode
     }
+
+    /// Arrange a live run in every projection at once.
+    ///
+    /// The scheduler, Core, and both frontends hold one value in production, and
+    /// a lifecycle projection reads the mode its event arrived in — so arranging
+    /// only some of them would exercise a split state the process cannot be in
+    /// and make the transitions asserted afterwards meaningless.
+    async fn arrange_running(&mut self) {
+        self.harness.scheduler.set_running(true);
+        self.harness.core_mode.set(OperatorMode::Running);
+        self.app.execution_mode = AppExecutionMode::Running;
+        let changes: Vec<_> = self
+            .app
+            .changes
+            .iter()
+            .map(|change| create_test_change(&change.id))
+            .collect();
+        self.web.update_with_mode(&changes, "running").await;
+        self.web.sync_remote_control_projection().await;
+    }
 }
 
 /// A remote mark reaches the next TUI event-processing pass.
@@ -297,9 +317,7 @@ async fn accepted_operator_command_tui_convergence_process_stop_retains_marks() 
 #[tokio::test]
 async fn accepted_operator_command_tui_convergence_remote_stop_family_reaches_both_frontends() {
     let mut converged = Converged::new(&["alpha"]).await;
-    converged.harness.scheduler.set_running(true);
-    converged.harness.core_mode.set(OperatorMode::Running);
-    converged.app.execution_mode = AppExecutionMode::Running;
+    converged.arrange_running().await;
 
     converged.remote(OperatorIntent::Stop).await;
     assert_eq!(converged.app.execution_mode, AppExecutionMode::Stopping);

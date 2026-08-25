@@ -470,7 +470,7 @@ When a typed persistent-scheduler idle transition projects Ready/`select` while 
 
 Execution-mark mutations MUST remain Select-mode mark-only mutations. Accepted Start MUST resolve the authoritative marked target set and commit existing reducer queue or explicit-retry intent before publishing its outcome. When that accepted Start wakes the live scheduler with at least one committed target, the same authoritative outcome MUST project Running immediately in Core, TUI, and Web, clear `persistent_scheduler_idle`, and project the admitted targets as queued without spawning another scheduler task. Raw key input, refused Start, an empty target set, and a generic scheduler notification MUST NOT project Running. Accepted graceful stop and force stop MUST continue to address the live scheduler; graceful stop MUST wake the idle wait after recording the stop request so the scheduler can reach its existing stop boundary.
 
-The Running projection acknowledges accepted operator intent; it MUST NOT by itself certify active lifecycle work or a typed execution phase. Existing execution-facts authorities MUST continue to derive dependency-analysis and admitted-work activity from their own typed events. If the accepted intent produces no admitted work and the persistent scheduler parks again, a newly rearmed idle edge MUST project Ready again. Existing typed workspace or base-lane work-start evidence MUST still clear an idle fact and project Running when no accepted Start already did so, including queue admission through non-Start paths, and MUST preserve Stopping when a graceful-stop request arrived first. Cancel-stop MUST remain valid only after graceful stop has projected Stopping; it MUST restore Ready when the idle-episode fact is true, whether set by the original idle transition or a later rearmed one, and Running when accepted Start or admitted work has cleared the fact.
+The Running projection acknowledges accepted operator intent; it MUST NOT by itself certify active lifecycle work or a typed execution phase. Existing execution-facts authorities MUST continue to derive dependency-analysis and admitted-work activity from their own typed events. The shared boundary MUST establish or preserve the idle-episode fact for every Ready state from which run control accepts graceful stop over a live parked scheduler, including Ready reached through `AllCompleted` settlement. A stop accepted from such a state is an idle-origin stop. When no executable, queued, admitted, active, resolve, merge, or cleanup work remains, that graceful stop MUST settle to inactive `Stopped`/Ready and MUST NOT retain `Stopping` while waiting for a nonexistent work boundary. If the accepted intent produces no admitted work and the persistent scheduler parks again, a newly rearmed idle edge MUST project Ready again. Existing typed workspace or base-lane work-start evidence MUST still clear an idle fact and project Running when no accepted Start already did so, including queue admission through non-Start paths, and MUST preserve Stopping when a graceful-stop request arrived first. Cancel-stop MUST remain valid only after graceful stop has projected Stopping; it MUST restore Ready when the idle-episode fact is true, whether set by the original idle transition or a later rearmed one, and Running when accepted Start or admitted work has cleared the fact.
 
 <!-- replaces-scenario: Start wakes the existing idle scheduler -->
 #### Scenario: Accepted Start wakes the existing idle scheduler and projects Running
@@ -509,16 +509,19 @@ The Running projection acknowledges accepted operator intent; it MUST NOT by its
 - **AND** the idle scheduler is notified to reach its stop boundary
 - **AND** the frontend projects Stopping while retaining `persistent_scheduler_idle: true`
 
-#### Scenario: cancel stop returns to idle Ready
+<!-- replaces-scenario: cancel stop returns to idle Ready -->
+#### Scenario: Cancel idle-origin stop does not invent Running
 
-- **GIVEN** graceful stop originated from persistent-idle Ready
-- **AND** `persistent_scheduler_idle` remains true while the frontend is Stopping
+- **GIVEN** Ready was reached with the scheduler parked and no remaining work through a typed idle edge or `AllCompleted` settlement over the live scheduler
+- **AND** graceful stop was accepted from that idle-origin state
+- **AND** no accepted Start or typed work-start event opened a later run episode
 - **WHEN** cancel-stop is accepted
 - **THEN** the graceful-stop request is withdrawn
 - **AND** the frontend returns to Ready / `app_mode: select`
 - **AND** it does not claim Running without an accepted Start or typed work-start event
 
-#### Scenario: accepted Start makes later cancel stop return to Running
+<!-- replaces-scenario: accepted Start makes later cancel stop return to Running -->
+#### Scenario: Cancel stop after real work restores Running
 
 - **GIVEN** accepted Start from persistent-idle Ready projected Running and cleared `persistent_scheduler_idle`
 - **AND** graceful stop then projected Stopping
@@ -571,3 +574,10 @@ The Running projection acknowledges accepted operator intent; it MUST NOT by its
 - **AND** no current lifecycle phase is invented from Start acceptance, queue intent, marks, or application mode
 
 <!-- Expected canonical result after archive: accepted persistent-idle Start will project Running immediately while preserving live-scheduler controls, non-Start admission, refusal, stop/cancel races, and no-work return-to-Ready. -->
+#### Scenario: No-work graceful stop reaches inactive Ready
+
+- **GIVEN** Ready was reached with a live parked scheduler and no executable, queued, admitted, active, resolve, merge, or cleanup work
+- **WHEN** graceful stop is accepted and the scheduler settles the request
+- **THEN** Core, TUI, and Web leave `Stopping`
+- **AND** the process reaches inactive `Stopped` whose TUI header is Ready
+- **AND** no synthetic queue intent, work-start event, or mark mutation is introduced

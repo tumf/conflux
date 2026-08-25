@@ -613,6 +613,19 @@ async fn late_persistent_idle_retains_transitional_and_terminal_modes() {
         let (web_state, reducer) = bound_web_state(&["change-a"]).await;
         let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(WebEventSink::new(web_state.clone()))];
 
+        // Each of the three modes is reached from a live run, which is the only
+        // way the process reaches them: a graceful stop is never admitted from
+        // pre-run Select, so arranging one there would be a state that cannot
+        // exist — and `Stopping` over parked Ready means something else entirely
+        // (an idle-origin stop, which keeps its episode on purpose).
+        dispatch(
+            &reducer,
+            &sinks,
+            ExecutionEvent::WorkspacePreparationStarted {
+                change_id: "change-a".to_string(),
+            },
+        )
+        .await;
         dispatch(&reducer, &sinks, earlier).await;
         dispatch(&reducer, &sinks, ExecutionEvent::PersistentSchedulerIdle).await;
 
