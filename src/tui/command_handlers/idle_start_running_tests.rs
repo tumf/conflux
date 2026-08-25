@@ -1,4 +1,5 @@
-//! Immediate Running feedback for an accepted persistent-idle Start.
+//! Lifecycle projection over a live parked scheduler: the accepted Start that
+//! opens a run episode, and the graceful stop that closes one.
 //!
 //! The change these cover moves one decision — "is this woken dispatch the
 //! operator's accepted Start?" — into a shared gate that Core, the TUI, and Web
@@ -14,9 +15,18 @@
 //! reducer-derived row status, the scheduler calls, and how many authoritative
 //! dispatches and projection revisions the command produced.
 //!
-//! Integration-scoped by the shared `WebState` projection; the scheduler is the
-//! recording double and the queue is the in-memory `DynamicQueue`, so no
-//! repository, process, or network is touched.
+//! The stop cases add one more real object. A graceful stop that has no work
+//! boundary left to reach is settled by the *scheduler*, not by the command, so
+//! those cases drive a real `ParallelExecutor` over this process's own reducer
+//! and its own graceful-stop request, and converge the frontends on the terminal
+//! event that executor published. Injecting a `Stopped` instead would have
+//! proven nothing: the defect was that no such event ever arrived.
+//!
+//! Integration-scoped by the shared `WebState` projection; the run-control
+//! scheduler is the recording double and the queue is the in-memory
+//! `DynamicQueue`. The real executor is constructed over a `TempDir` workspace
+//! root its no-work boundary never reads, so no repository, process, or network
+//! work happens on any of these paths.
 
 use std::sync::Arc;
 
@@ -168,6 +178,12 @@ impl Wired {
         self.harness.dispatcher.dispatch(event).await;
         self.harness.deliver(&mut self.app).await;
     }
+
+    /// Treat the arrangement as done: later counts are the command's own.
+    fn baseline(&mut self) {
+        self.baseline_revision = self.web.remote_control().projection().revision();
+        self.baseline_dispatches = self.harness.dispatch_count();
+    }
 }
 
 // ============================================================================
@@ -222,12 +238,12 @@ async fn arrange(harness: &AdapterHarness, setup: Setup) {
     }
 }
 
-/// Build the arranged process, parked in a persistent-idle episode.
+/// Build the arranged process, mid-run, before anything closes the run.
 ///
 /// `scheduler_live` false is the stale-presentation case: the frontends hold an
 /// idle fact for a scheduler that has since exited, which is precisely the state
 /// the projection must not treat as scheduler-wake evidence.
-async fn arranged(setup: Setup, scheduler_live: bool) -> Wired {
+async fn running(setup: Setup, scheduler_live: bool) -> Wired {
     let harness = AdapterHarness::new(&CHANGES);
     arrange(&harness, setup).await;
     harness.scheduler.set_running(scheduler_live);
@@ -266,14 +282,19 @@ async fn arranged(setup: Setup, scheduler_live: bool) -> Wired {
     harness.attach_revisions(web.clone());
     harness.core_mode.set(OperatorMode::Running);
 
-    let mut wired = Wired {
+    Wired {
         harness,
         app,
         web,
         runs,
         baseline_revision: 0,
         baseline_dispatches: 0,
-    };
+    }
+}
+
+/// Build the arranged process, parked in a persistent-idle episode.
+async fn arranged(setup: Setup, scheduler_live: bool) -> Wired {
+    let mut wired = running(setup, scheduler_live).await;
 
     // The one typed transition that opens the episode, delivered to Core and
     // both frontends from the single owner they share.
@@ -299,8 +320,42 @@ async fn arranged(setup: Setup, scheduler_live: bool) -> Wired {
         "the arrangement is persistent-idle Ready in Core and both frontends"
     );
 
-    wired.baseline_revision = wired.web.remote_control().projection().revision();
-    wired.baseline_dispatches = wired.harness.dispatch_count();
+    wired.baseline();
+    wired
+}
+
+/// Build the arranged process Ready the *other* way: `AllCompleted` settlement.
+///
+/// The scheduler is the same live parked task, and run control admits a graceful
+/// stop against it exactly as it does from the typed idle edge. What is missing
+/// is the idle-episode fact: nothing about a completion settlement establishes
+/// one, which is why this Ready — not the one above — is where cancel-stop used
+/// to invent a run episode. The arrangement asserts that absence rather than
+/// papering over it, so the regressions below start from the real state.
+async fn arranged_after_all_completed(setup: Setup, scheduler_live: bool) -> Wired {
+    let mut wired = running(setup, scheduler_live).await;
+
+    wired.dispatch(ExecutionEvent::AllCompleted).await;
+    let settled = wired.settled().await;
+    assert_eq!(
+        (
+            settled.core_mode,
+            settled.tui_mode,
+            settled.tui_idle,
+            settled.web_mode.as_str(),
+            settled.web_idle
+        ),
+        (
+            OperatorMode::Select,
+            AppExecutionMode::Select,
+            false,
+            "select",
+            false
+        ),
+        "an `AllCompleted` settlement leaves Ready with no idle episode of its own"
+    );
+
+    wired.baseline();
     wired
 }
 
@@ -854,7 +909,249 @@ async fn idle_start_running_cancel_stop_restores_the_interrupted_episode() {
     );
 }
 
-/// Verification `idle-start-running-regressions`: force stop and terminal
+// ============================================================================
+// The no-work graceful stop
+// ============================================================================
+
+/// The scheduler configuration a real executor needs to exist at all.
+fn scheduler_config() -> crate::config::OrchestratorConfig {
+    crate::config::OrchestratorConfig {
+        apply_command: Some("echo apply {change_id}".to_string()),
+        archive_command: Some("echo archive {change_id}".to_string()),
+        analyze_command: Some("echo analyze".to_string()),
+        acceptance_command: Some("echo acceptance".to_string()),
+        resolve_command: Some("echo resolve".to_string()),
+        ..Default::default()
+    }
+}
+
+/// A real persistent scheduler over this process's reducer and stop request.
+///
+/// Everything that decides the boundary is the production object: the executor
+/// reads the same `OrchestratorState` the accepted command mutated and the same
+/// graceful-stop flag it recorded. The `TempDir` is a workspace root the
+/// no-work boundary never touches — no repository, process, or network work
+/// happens on this path.
+fn scheduler_over(
+    wired: &Wired,
+    graceful_stop: Arc<std::sync::atomic::AtomicBool>,
+) -> (
+    tempfile::TempDir,
+    crate::parallel::ParallelExecutor,
+    tokio::sync::mpsc::Receiver<ExecutionEvent>,
+) {
+    let repo = tempfile::TempDir::new().expect("a workspace root for the scheduler");
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
+    let mut executor = crate::parallel::ParallelExecutor::new(
+        repo.path().to_path_buf(),
+        scheduler_config(),
+        Some(events_tx),
+    );
+    executor.set_persistent_lifetime();
+    executor.set_shared_orchestrator_state(wired.harness.state.clone());
+    executor.set_graceful_stop_flag(graceful_stop);
+    (repo, executor, events_rx)
+}
+
+/// Verification `idle-stopping-regressions`: a graceful stop with no work left
+/// settles, and every adapter leaves `Stopping` for the truthful inactive state.
+///
+/// Driven through the whole chain rather than asserted from a projection rule:
+/// the run is closed by a real `AllCompleted`, the stop is the real command, the
+/// request it records is the real shared flag, and the terminal event the
+/// frontends converge on is the one a *real* persistent scheduler published from
+/// its own no-work boundary. Nothing here injects a synthetic `Stopped`, which is
+/// the whole point — the defect was that no such event ever arrived, so a test
+/// that supplied one would have proven nothing.
+#[tokio::test]
+async fn idle_stopping_no_work_graceful_stop_settles_on_every_adapter() {
+    let mut wired = arranged_after_all_completed(Setup::MarkedOrdinary, true).await;
+    let graceful_stop = wired.harness.scheduler.graceful_stop_flag();
+
+    wired.harness.run(&mut wired.app, TuiCommand::Stop).await;
+    let stopping = wired.settled().await;
+    assert_eq!(
+        (
+            stopping.core_mode,
+            stopping.tui_mode,
+            stopping.web_mode.as_str()
+        ),
+        (
+            OperatorMode::Stopping,
+            AppExecutionMode::Stopping,
+            "stopping"
+        ),
+        "the accepted stop is projected as the pending request it is"
+    );
+    assert!(
+        graceful_stop.load(std::sync::atomic::Ordering::SeqCst),
+        "the accepted stop really recorded its request on the scheduler"
+    );
+
+    let (_repo, executor, mut scheduler_events) = scheduler_over(&wired, graceful_stop);
+
+    // A pass that still holds a reconciled candidate keeps waiting: the request
+    // has a later boundary to reach, so this control proves the settlement is
+    // "no work is left", not "a stop was asked for".
+    assert!(
+        !executor
+            .settle_graceful_stop_at_idle_boundary(&[create_test_change(ALPHA)])
+            .await,
+        "a graceful stop still owes the work boundary it asked to stop at"
+    );
+
+    assert!(
+        executor.settle_graceful_stop_at_idle_boundary(&[]).await,
+        "a graceful stop with nothing left owes no boundary, so this park is one"
+    );
+    let published = scheduler_events
+        .try_recv()
+        .expect("the scheduler published its own terminal stop at that boundary");
+    assert!(
+        matches!(published, ExecutionEvent::Stopped),
+        "the settlement is the run's one terminal stop, got {published:?}"
+    );
+
+    wired.dispatch(published).await;
+    let stopped = wired.settled().await;
+    assert_eq!(
+        (
+            stopped.core_mode,
+            stopped.tui_mode,
+            stopped.web_mode.as_str()
+        ),
+        (OperatorMode::Stopped, AppExecutionMode::Stopped, "stopped"),
+        "Core, TUI, and Web all leave Stopping for the inactive state"
+    );
+    assert!(
+        !stopped.tui_idle && !stopped.web_idle,
+        "a terminal stop ends the idle episode on both frontends"
+    );
+    // `Stopped` is the mode whose TUI header is Ready; the header projection
+    // itself is owned by the renderer's own coverage.
+    assert!(
+        stopped.runs.is_empty() && stopped.explicit_retries.is_empty(),
+        "no run, retry, or queue intent was synthesized to reach the stop"
+    );
+    assert_eq!(
+        stopped.statuses,
+        vec![
+            (ALPHA.to_string(), "not queued".to_string()),
+            (BETA.to_string(), "not queued".to_string()),
+        ],
+        "the rows are exactly where the settled run left them"
+    );
+}
+
+/// Verification `idle-stopping-regressions`: the same boundary settles nothing
+/// when no stop was ever requested.
+///
+/// Without this, a settlement keyed on emptiness alone would end every parked
+/// persistent run the moment it drained, which is the opposite of what the idle
+/// scheduler exists for.
+#[tokio::test]
+async fn idle_stopping_empty_boundary_settles_nothing_without_a_request() {
+    let wired = arranged(Setup::MarkedOrdinary, true).await;
+    let graceful_stop = wired.harness.scheduler.graceful_stop_flag();
+    let (_repo, executor, mut scheduler_events) = scheduler_over(&wired, graceful_stop);
+
+    assert!(
+        !executor.settle_graceful_stop_at_idle_boundary(&[]).await,
+        "an idle park with no pending stop stays parked"
+    );
+    assert!(
+        scheduler_events.try_recv().is_err(),
+        "a scheduler that did not settle publishes no terminal event"
+    );
+}
+
+/// Verification `idle-stopping-regressions`: cancel-stop from Ready that an
+/// `AllCompleted` settlement produced returns to Ready, not Running.
+///
+/// This is the reported F5 sequence. The stop is admitted against a live parked
+/// scheduler from a Ready that owns no typed idle edge, so before the fix the
+/// withdrawal had nothing to restore and claimed a run episode that no accepted
+/// Start and no typed work-start event ever opened.
+#[tokio::test]
+async fn idle_stopping_cancel_stop_after_all_completed_returns_to_ready() {
+    let mut wired = arranged_after_all_completed(Setup::MarkedOrdinary, true).await;
+
+    wired.harness.run(&mut wired.app, TuiCommand::Stop).await;
+    let stopping = wired.settled().await;
+    assert_eq!(
+        (
+            stopping.core_mode,
+            stopping.tui_mode,
+            stopping.tui_idle,
+            stopping.web_mode.as_str(),
+            stopping.web_idle
+        ),
+        (
+            OperatorMode::Stopping,
+            AppExecutionMode::Stopping,
+            true,
+            "stopping",
+            true
+        ),
+        "a stop admitted from parked Ready carries its idle-origin identity"
+    );
+    assert_eq!(wired.app.stop_mode, StopMode::GracefulPending);
+
+    wired
+        .harness
+        .run(&mut wired.app, TuiCommand::CancelStop)
+        .await;
+    let cancelled = wired.settled().await;
+    assert_eq!(
+        (
+            cancelled.core_mode,
+            cancelled.tui_mode,
+            cancelled.tui_idle,
+            cancelled.web_mode.as_str(),
+            cancelled.web_idle
+        ),
+        (
+            OperatorMode::Select,
+            AppExecutionMode::Select,
+            true,
+            "select",
+            true
+        ),
+        "withdrawing the stop restores the Ready it interrupted"
+    );
+    assert!(
+        cancelled.runs.is_empty(),
+        "nothing was dispatched, so no run episode may be claimed"
+    );
+    assert_eq!(
+        cancelled.statuses,
+        vec![
+            (ALPHA.to_string(), "not queued".to_string()),
+            (BETA.to_string(), "not queued".to_string()),
+        ],
+        "no queue intent was synthesized by the stop or its withdrawal"
+    );
+
+    // And typed work-start evidence still wins from there, exactly as before.
+    wired
+        .dispatch(ExecutionEvent::WorkspacePreparationStarted {
+            change_id: ALPHA.to_string(),
+        })
+        .await;
+    let working = wired.settled().await;
+    assert_eq!(
+        (
+            working.core_mode,
+            working.tui_mode,
+            working.web_mode.as_str()
+        ),
+        (OperatorMode::Running, AppExecutionMode::Running, "running"),
+        "real work still opens the run episode from this Ready"
+    );
+    assert!(!working.tui_idle && !working.web_idle);
+}
+
+/// Verification `idle-stopping-regressions`: force stop and terminal
 /// retention are unchanged by the new projection.
 #[tokio::test]
 async fn idle_start_running_force_stop_and_terminal_modes_are_preserved() {

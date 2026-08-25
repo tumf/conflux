@@ -375,6 +375,7 @@ impl TuiRunSupervisor {
 
             let run_cancel = cancel.clone();
             let run_scope = scope.clone();
+            let run_graceful_stop = graceful_stop.clone();
             let handle = tokio::spawn(async move {
                 run_orchestrator_parallel(
                     targets,
@@ -389,6 +390,7 @@ impl TuiRunSupervisor {
                     launch.manual_resolve_counter,
                     launch.post_archive_action,
                     launch.upstream_runtime,
+                    run_graceful_stop,
                 )
                 .await
             });

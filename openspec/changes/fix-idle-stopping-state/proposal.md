@@ -55,6 +55,25 @@ Keep F5 as cancel-stop while a genuine graceful stop is pending. Do not fix the 
 - Existing stop/cancel-stop and persistent-idle tests remain green.
 - `cargo test idle_start_running_tests --locked` succeeds.
 
+## Retired Scenarios
+
+Scenarios this change deliberately retires from the MODIFIED requirement, rather
+than losing by accident. Declared here because the promotion-safety regression
+treats every other disappearance as a coverage regression, and because a
+declaration inside a delta block would be copied verbatim into a canonical spec
+that should describe the system rather than the history of one change.
+
+- operator-command-execution: Persistent-idle Ready remains a live run-control target / cancel stop returns to idle Ready
+  — replaced by `Cancel idle-origin stop does not invent Running`, which asserts
+  strictly more: the withdrawal returns to Ready for *every* parked Ready the
+  stop could have been accepted from, including the one an `AllCompleted`
+  settlement produced, and it names the absence of accepted Start or typed
+  work-start evidence as the reason rather than the presence of an idle edge.
+- operator-command-execution: Persistent-idle Ready remains a live run-control target / accepted Start makes later cancel stop return to Running
+  — replaced by `Cancel stop after real work restores Running`, which states the
+  same restoration for the same episode and keeps the accepted-Start evidence as
+  its precondition.
+
 ## Out of Scope
 
 - Changing F5 key bindings or removing cancel-stop.

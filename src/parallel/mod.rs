@@ -264,6 +264,14 @@ pub struct ParallelExecutor {
     pending_merge_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Scheduler lifetime policy (finite for CLI run, persistent for loop-based frontends).
     scheduler_lifetime: SchedulerLifetime,
+    /// The run owner's pending graceful-stop request, when one is bound.
+    ///
+    /// Shared with the run supervisor that shared run control sets it through, so
+    /// the scheduler reads the *same* request the operator's accepted stop
+    /// recorded rather than a copy taken at launch. Process-local and
+    /// invocation-scoped: a launch clears it, and a restart begins with no
+    /// pending stop.
+    graceful_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Edge-trigger latch for the persistent-idle transition.
     ///
     /// Set when the scheduler emits its one idle event for an episode and

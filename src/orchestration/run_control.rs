@@ -1449,6 +1449,13 @@ pub(crate) mod testing {
     struct SchedulerRecorder {
         calls: Mutex<Vec<SchedulerCall>>,
         running: std::sync::atomic::AtomicBool,
+        /// The graceful-stop request this scheduler currently holds.
+        ///
+        /// Modelled as the shared flag the real supervisor owns, not just as a
+        /// recorded call, so coverage can hand the *same* handle to a real
+        /// scheduler and prove it settles the stop an accepted command really
+        /// recorded.
+        graceful_stop: Arc<std::sync::atomic::AtomicBool>,
         /// Events an activated launch publishes, in activation order.
         ///
         /// This is how a test proves scheduler progress cannot precede the
@@ -1531,6 +1538,14 @@ pub(crate) mod testing {
             *self.recorder.on_activate.lock().unwrap() = Some(hook);
         }
 
+        /// The graceful-stop request handle this scheduler writes through.
+        ///
+        /// Shared, so a scheduler that has to honour the request reads exactly
+        /// what the accepted stop command recorded.
+        pub(crate) fn graceful_stop_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            self.recorder.graceful_stop.clone()
+        }
+
         /// Every recorded call, in order.
         pub(crate) fn calls(&self) -> Vec<SchedulerCall> {
             self.recorder.calls.lock().unwrap().clone()
@@ -1594,6 +1609,9 @@ pub(crate) mod testing {
 
         fn set_graceful_stop(&self, requested: bool) {
             self.recorder.record(SchedulerCall::GracefulStop(requested));
+            self.recorder
+                .graceful_stop
+                .store(requested, std::sync::atomic::Ordering::SeqCst);
         }
 
         async fn stop_activity(&self) -> StopActivitySnapshot {

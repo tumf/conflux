@@ -1075,6 +1075,26 @@ pub fn persistent_idle_may_project_ready(current_mode: &str) -> bool {
 /// The `app_mode` token a persistent-idle Ready episode is presented as.
 pub const PERSISTENT_IDLE_READY_MODE: &str = "select";
 
+/// Whether an accepted graceful stop originated from persistent-idle Ready.
+///
+/// Shared run control admits a graceful stop from Ready only over a live parked
+/// scheduler — ordinary pre-run Select is refused, and both terminal modes are
+/// refused — so a `Stopping` transition observed in Ready is exactly the
+/// idle-origin case and nothing else.
+///
+/// Reading the origin from the mode the stop arrived in is what makes the fact
+/// hold for *every* parked Ready, not just the one a typed idle edge produced.
+/// Ready reached through `AllCompleted` settlement over the same live scheduler
+/// owns no idle edge of its own, and a cancel-stop that could not tell the two
+/// apart restored Running for a run episode no accepted Start and no typed
+/// work-start event ever opened.
+///
+/// Core, TUI, and Web route the decision through here so they cannot disagree
+/// about the same stop.
+pub fn graceful_stop_is_idle_origin(current_mode: &str) -> bool {
+    current_mode == PERSISTENT_IDLE_READY_MODE
+}
+
 /// Whether an accepted `RunDispatched` outcome opens the operator-visible run
 /// episode over persistent-idle Ready.
 ///

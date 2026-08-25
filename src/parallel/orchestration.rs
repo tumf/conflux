@@ -278,6 +278,73 @@ impl ParallelExecutor {
         true
     }
 
+    /// Whether the run owner has an accepted graceful stop pending.
+    ///
+    /// Read-only: the request belongs to shared run control, which records it
+    /// through the scheduler port and withdraws it on cancel-stop. A run no
+    /// owner bound a request to never observes one.
+    pub(super) fn graceful_stop_requested(&self) -> bool {
+        self.graceful_stop
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Settle a pending graceful stop that has no work boundary left to reach.
+    ///
+    /// A graceful stop means "stop at the next safe boundary". When no
+    /// executable, queued, admitted, active, resolve, merge, or cleanup work
+    /// remains, that boundary is *this* evaluation: there is nothing left whose
+    /// completion could produce a later one. A persistent scheduler that parked
+    /// instead would sit in its event-driven wait with no timer and no pending
+    /// work to wake it, leaving every frontend in `Stopping` indefinitely.
+    ///
+    /// The drain evidence is [`Self::is_fully_drained`] over the evaluation's own
+    /// coherent reducer view, so this settles only the genuinely empty case: a
+    /// blocked-only park, a resolve or reject wait, and a pending merge all keep
+    /// work the stop is still owed, and reach their existing boundary as before.
+    /// An incomplete view has observed nothing and never settles.
+    ///
+    /// Emits the run's one terminal `Stopped` and reports whether the caller must
+    /// leave its loop.
+    pub(super) async fn settle_graceful_stop_when_no_work(
+        &self,
+        join_set_empty: bool,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        work_snapshot: &ReducerWorkSnapshot,
+    ) -> bool {
+        if !self.graceful_stop_requested() || !work_snapshot.is_complete() {
+            return false;
+        }
+        if !self.is_fully_drained(join_set_empty, queued.is_empty(), in_flight.is_empty()) {
+            return false;
+        }
+        info!(
+            "Graceful stop requested with no work remaining; settling the scheduler at this boundary"
+        );
+        send_event(&self.event_tx, ParallelEvent::Stopped).await;
+        true
+    }
+
+    /// Drive the graceful-stop boundary from outside a scheduler pass.
+    ///
+    /// The loop calls [`Self::settle_graceful_stop_when_no_work`] with the
+    /// coherent view and the reconciled candidate list its own evaluation
+    /// produced. Cross-adapter coverage owns no such pass, so this captures an
+    /// equivalent view over an idle executor with nothing in flight and takes
+    /// `queued` — the reducer queue intent a pass would have reconciled into
+    /// scheduler candidates — from the caller, then returns the same decision
+    /// through the same code path, including its terminal event.
+    #[cfg(test)]
+    pub(crate) async fn settle_graceful_stop_at_idle_boundary(
+        &self,
+        queued: &[crate::openspec::Change],
+    ) -> bool {
+        let work_snapshot = self.capture_reducer_work_snapshot().await;
+        self.settle_graceful_stop_when_no_work(true, queued, &HashSet::new(), &work_snapshot)
+            .await
+    }
+
     /// Record the queue intent the episode about to park has already evaluated.
     pub(super) fn record_persistent_idle_baseline(&self, work_snapshot: &ReducerWorkSnapshot) {
         let baseline: HashSet<String> = work_snapshot.queued_intent_ids().iter().cloned().collect();
@@ -541,6 +608,10 @@ impl ParallelExecutor {
         // Reanalysis reason is derived from scheduler events/state each iteration.
         let mut reanalysis_reason = ReanalysisReason::Initial;
         let mut cancelled = false;
+        // Set when an accepted graceful stop had no work boundary left to reach
+        // and settled the run at its own idle evaluation. Its terminal `Stopped`
+        // was emitted there, so the exits below owe no second one.
+        let mut graceful_stop_settled = false;
         // Set when the loop exits because nothing is dispatchable while blocked
         // or waiting work remains. Such a run owes a truthful blocked report,
         // never `AllCompleted`.
@@ -806,6 +877,24 @@ impl ParallelExecutor {
                 break;
             }
 
+            // An accepted graceful stop with nothing left to wait for. This
+            // evaluation is the safe boundary the request asked for, so the run
+            // ends here instead of parking in a wait that no remaining work
+            // could ever end — which is what left the frontends `Stopping` for a
+            // scheduler that had already settled.
+            if self
+                .settle_graceful_stop_when_no_work(
+                    join_set.is_empty(),
+                    &queued,
+                    &in_flight,
+                    &work_snapshot,
+                )
+                .await
+            {
+                graceful_stop_settled = true;
+                break;
+            }
+
             // One typed transition per idle episode, emitted from the same
             // coherent admission decision that is about to park, so the
             // frontends stop claiming Running for a scheduler that has nothing
@@ -851,6 +940,14 @@ impl ParallelExecutor {
         // its one terminal `Stopped` rather than an execution failure.
         if cancelled {
             send_event(&self.event_tx, ParallelEvent::Stopped).await;
+            return Ok(SchedulerRunReport::Stopped);
+        }
+
+        // A graceful stop that settled at an empty boundary is a stop, not a
+        // completion: nothing drained here, so it must never reach upstream
+        // finalization or announce `AllCompleted`. Its terminal event was already
+        // emitted at the boundary that decided it.
+        if graceful_stop_settled {
             return Ok(SchedulerRunReport::Stopped);
         }
 

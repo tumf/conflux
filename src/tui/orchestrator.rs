@@ -270,6 +270,11 @@ pub async fn run_orchestrator_parallel(
     manual_resolve_counter: Arc<std::sync::atomic::AtomicUsize>,
     post_archive_action: PostArchiveAction,
     upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
+    // The run owner's pending graceful-stop request. Shared run control records a
+    // stop through the supervisor that owns this flag, so handing the same handle
+    // to the scheduler is what lets a stop with no work left to wait for settle
+    // instead of parking forever in `Stopping`.
+    graceful_stop: Arc<AtomicBool>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native_from;
     use crate::parallel::ParallelEvent;
@@ -295,6 +300,7 @@ pub async fn run_orchestrator_parallel(
     // both frontends drive one change-scoped publication implementation.
     configure_parallel_upstream_integration(&mut service, upstream_runtime);
     service.set_shared_orchestrator_state(shared_state.clone());
+    service.set_graceful_stop_flag(graceful_stop);
 
     // Check if Git is available for parallel execution
     service.check_vcs_available().await?;
