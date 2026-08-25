@@ -509,6 +509,10 @@ async fn run_tui_loop(
     // worktree execution is available here by construction.
     app.max_concurrent = config.get_max_concurrent_workspaces();
     app.vcs_backend = config.get_vcs_backend().to_string();
+    // Header project identity, captured once. The same `repo_root` backs the
+    // refresh task and the dirty predicate, so a later process `chdir` moves
+    // none of the three.
+    app.set_project_path(repo_root.clone());
     app.publish_parallel_runtime();
     app.apply_parallel_eligibility(&committed_change_ids, &uncommitted_file_change_ids);
     app.apply_worktree_status(&worktree_change_ids);

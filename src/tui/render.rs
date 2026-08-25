@@ -175,6 +175,85 @@ fn display_width(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(text)
 }
 
+/// The single character a middle-elided string spends on its gap.
+const MIDDLE_ELLIPSIS: char = '…';
+
+/// Middle-elide `text` to at most `max_width` terminal columns.
+///
+/// A project path is most distinguishing at both ends — the account or checkout
+/// root at the front, the repository name at the back — so a trailing-ellipsis
+/// truncation would throw away exactly the part that tells two Conflux instances
+/// apart. This is the conventional `ElideMiddle` behavior: reserve one column for
+/// `…`, split what is left between a retained prefix and suffix, and give the
+/// suffix the spare column when that remainder is odd.
+///
+/// Accounting is in display columns, not bytes or scalars: a CJK path component
+/// is half as many characters as it is columns, and a combining mark is none.
+/// Both sides are taken whole characters at a time, so the result is always
+/// valid UTF-8 and never wider than `max_width`. A budget no wider than the
+/// ellipsis itself yields the ellipsis alone (or nothing at zero columns) rather
+/// than a panic.
+fn middle_elide_to_display_width(text: &str, max_width: usize) -> String {
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    // One column for the gap; the rest is split, suffix-favoring.
+    let retained = max_width - 1;
+    let prefix_budget = retained / 2;
+    let suffix_budget = retained - prefix_budget;
+
+    let mut prefix = String::new();
+    let mut prefix_used = 0;
+    for ch in text.chars() {
+        let ch_width = char_display_width(ch);
+        if prefix_used + ch_width > prefix_budget {
+            break;
+        }
+        prefix.push(ch);
+        prefix_used += ch_width;
+    }
+
+    // Taken in reverse and flipped back, so a combining mark is admitted before
+    // the base character it belongs to and stays attached to it.
+    let mut suffix_rev = String::new();
+    let mut suffix_used = 0;
+    for ch in text.chars().rev() {
+        let ch_width = char_display_width(ch);
+        if suffix_used + ch_width > suffix_budget {
+            break;
+        }
+        suffix_rev.push(ch);
+        suffix_used += ch_width;
+    }
+    let mut suffix: String = suffix_rev.chars().rev().collect();
+
+    // A side that retained no visible column retained nothing worth showing:
+    // keeping a bare combining mark there would only reattach it to the `…`.
+    if prefix_used == 0 {
+        prefix.clear();
+    }
+    if suffix_used == 0 {
+        suffix.clear();
+    }
+
+    let mut out = prefix;
+    out.push(MIDDLE_ELLIPSIS);
+    out.push_str(&suffix);
+    out
+}
+
+/// Terminal display columns one character occupies.
+///
+/// Control characters and combining marks report `None`/zero and are carried
+/// along for free, which is what keeps a mark with its base character.
+fn char_display_width(ch: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
 /// True when the row's *display status* is a post-archive presentation.
 ///
 /// `archived`, `merged`, and `pushed` are all post-archive presentations of the
@@ -634,11 +713,31 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         },
     };
 
+    let version = get_version_string();
+    let version_width = version.len() as u16 + 2; // +2 for padding
+
+    // Split area into left content and right-aligned version. The split has to
+    // happen before the spans are built, because the project path's width budget
+    // is whatever the left chunk has left after every other header segment.
+    let chunks =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(version_width)]).split(area);
+
+    let status_segment = if show_status && !mode_text.is_empty() {
+        format!("  [{}]", mode_text)
+    } else {
+        String::new()
+    };
+    let dirty_segment = if app.workspace_dirty().shows_dirty_badge() {
+        " [dirty]"
+    } else {
+        ""
+    };
+
     // Build header spans
     let mut header_spans = vec![Span::styled("Conflux", Style::default().fg(Color::White))];
 
     // Add status label only when show_status is true
-    if show_status && !mode_text.is_empty() {
+    if !status_segment.is_empty() {
         header_spans.push(Span::raw("  "));
         header_spans.push(Span::styled(
             format!("[{}]", mode_text),
@@ -646,20 +745,38 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         ));
     }
 
-    // Worktree execution facts. This is not a mode indicator: there is one
-    // execution model, so the badge reports its concurrency and backend.
-    header_spans.push(Span::raw(" "));
-    header_spans.push(Span::styled(
-        format!("[workspaces:{}:{}]", app.max_concurrent, app.vcs_backend),
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-    ));
+    // The project this TUI owns, captured at startup. It takes the slot the
+    // workspace concurrency/backend badge used to hold: an operator with several
+    // instances open needs to know which repository is in front of them, and the
+    // execution configuration stays readable from `/api/v2` and the status panel.
+    //
+    // The budget is the left chunk's own interior — its width less the single
+    // LEFT border column — after the segments around the path are reserved. That
+    // is real column accounting, so a wide-Unicode path cannot silently overrun
+    // the version area.
+    let project_path = app.project_path().display().to_string();
+    if !project_path.is_empty() {
+        let left_interior = chunks[0].width.saturating_sub(1) as usize;
+        let reserved = display_width("Conflux")
+            + display_width(&status_segment)
+            + display_width(" ")
+            + display_width(dirty_segment);
+        let path_budget = left_interior.saturating_sub(reserved);
+        if path_budget > 0 {
+            header_spans.push(Span::raw(" "));
+            header_spans.push(Span::styled(
+                middle_elide_to_display_width(&project_path, path_budget),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
 
     // Workspace dirty observation from the existing auto-refresh. Only a known
     // dirty result draws: a clean observation and a not-yet-observed workspace
     // both stay silent, so the badge's absence is never evidence of anything.
-    if app.workspace_dirty().shows_dirty_badge() {
+    if !dirty_segment.is_empty() {
         header_spans.push(Span::raw(" "));
         header_spans.push(Span::styled(
             "[dirty]",
@@ -668,13 +785,6 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
     }
 
     let header_text = Line::from(header_spans);
-
-    let version = get_version_string();
-    let version_width = version.len() as u16 + 2; // +2 for padding
-
-    // Split area into left content and right-aligned version
-    let chunks =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(version_width)]).split(area);
 
     // Render left content (title and mode) with left and top/bottom borders
     let left_header = Paragraph::new(header_text).block(
@@ -2418,10 +2528,17 @@ mod tests {
         }
     }
 
+    /// The project path every render test starts from.
+    ///
+    /// Fixed so header assertions never depend on where the suite happens to
+    /// run, and short enough that a normal-width terminal renders it whole.
+    const TEST_PROJECT_PATH: &str = "/projects/conflux";
+
     fn create_test_app(changes: Vec<Change>) -> AppState {
         let mut app = AppState::new(changes);
         app.logs.clear();
         app.web_url = None;
+        app.set_project_path(TEST_PROJECT_PATH);
         app
     }
 
@@ -2474,16 +2591,22 @@ mod tests {
             let buffer = render_buffer(&mut app, 120, 30);
             let content = buffer_to_string(&buffer);
 
-            for forbidden in ["=: parallel", "=: sequential", "[parallel:"] {
+            for forbidden in [
+                "=: parallel",
+                "=: sequential",
+                "[parallel:",
+                // The concurrency/backend badge is retired: the header slot now
+                // reports which project this instance owns.
+                "[workspaces:",
+            ] {
                 assert!(
                     !content.contains(forbidden),
                     "{mode:?} must not render '{forbidden}':\n{content}"
                 );
             }
-            // The worktree facts themselves stay visible, without naming a mode.
             assert!(
-                content.contains("[workspaces:"),
-                "{mode:?} must still report concurrency and backend:\n{content}"
+                content.contains(TEST_PROJECT_PATH),
+                "{mode:?} must identify the owned project:\n{content}"
             );
         }
     }
@@ -2516,8 +2639,6 @@ mod tests {
 
         for (label, observation, expects_badge) in cases {
             let mut app = create_test_app(vec![create_test_change("change-a")]);
-            let workspaces_badge =
-                format!("[workspaces:{}:{}]", app.max_concurrent, app.vcs_backend);
             if let Some(dirty) = observation {
                 observe_workspace_dirty(&mut app, dirty);
             }
@@ -2535,8 +2656,12 @@ mod tests {
                 "{label}: the status label must survive:\n{header}"
             );
             assert!(
-                header.contains(&workspaces_badge),
-                "{label}: the workspaces badge must survive:\n{header}"
+                header.contains(TEST_PROJECT_PATH),
+                "{label}: the project path must survive:\n{header}"
+            );
+            assert!(
+                !header.contains("[workspaces:"),
+                "{label}: the retired concurrency/backend badge must not return:\n{header}"
             );
             assert!(
                 header.contains(&crate::tui::utils::get_version_string()),
@@ -2544,16 +2669,16 @@ mod tests {
             );
         }
 
-        // The badge sits after the workspaces badge, not in place of it.
+        // The badge sits after the project path, not in place of it.
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         observe_workspace_dirty(&mut app, true);
         let buffer = render_buffer(&mut app, 120, 30);
         let header = header_line(&buffer);
-        let workspaces_at = header.find("[workspaces:").expect("workspaces badge");
+        let project_at = header.find(TEST_PROJECT_PATH).expect("project path");
         let dirty_at = header.find("[dirty]").expect("dirty badge");
         assert!(
-            workspaces_at < dirty_at,
-            "the dirty badge must follow the workspaces badge:\n{header}"
+            project_at < dirty_at,
+            "the dirty badge must follow the project path:\n{header}"
         );
 
         // Warning styling: the badge is a caution, so it must read as one.
@@ -2577,8 +2702,6 @@ mod tests {
             app.execution_mode = AppExecutionMode::Running;
             app.changes[0].set_display_status_cache("applying");
             observe_workspace_dirty(&mut app, true);
-            let workspaces_badge =
-                format!("[workspaces:{}:{}]", app.max_concurrent, app.vcs_backend);
 
             let buffer = render_buffer(&mut app, width, 30);
             let header = header_line(&buffer);
@@ -2587,8 +2710,8 @@ mod tests {
                 "width {width}: the running status must survive:\n{header}"
             );
             assert!(
-                header.contains(&workspaces_badge) && header.contains("[dirty]"),
-                "width {width}: both badges must render:\n{header}"
+                header.contains(TEST_PROJECT_PATH) && header.contains("[dirty]"),
+                "width {width}: the project path and the dirty badge must render:\n{header}"
             );
             assert!(
                 header.contains(&crate::tui::utils::get_version_string()),
@@ -2606,6 +2729,251 @@ mod tests {
             assert!(
                 !header.contains("[Running 1]"),
                 "width {width}: the modal still owns the status label:\n{header}"
+            );
+        }
+    }
+
+    /// Every retained column of a middle-elided string still comes from the
+    /// source string, on the side it came from. This is the proof that no
+    /// character representation was cut in half.
+    fn assert_elision_retains_source_sides(source: &str, elided: &str) {
+        let (prefix, suffix) = elided
+            .split_once(MIDDLE_ELLIPSIS)
+            .unwrap_or_else(|| panic!("{elided:?} carries no ellipsis"));
+        assert!(
+            source.starts_with(prefix),
+            "{elided:?} kept a prefix {prefix:?} that {source:?} does not start with"
+        );
+        assert!(
+            source.ends_with(suffix),
+            "{elided:?} kept a suffix {suffix:?} that {source:?} does not end with"
+        );
+    }
+
+    /// Exact middle elision for ASCII, including the suffix-favoring split of an
+    /// odd non-ellipsis budget.
+    #[test]
+    fn middle_elision_splits_an_ascii_path_around_one_ellipsis() {
+        let path = "/projects/conflux";
+        assert_eq!(display_width(path), 17);
+
+        // Fits: returned untouched, at exact width and above it.
+        assert_eq!(middle_elide_to_display_width(path, 17), path);
+        assert_eq!(middle_elide_to_display_width(path, 40), path);
+
+        // Even non-ellipsis budget: both sides keep the same column count.
+        assert_eq!(middle_elide_to_display_width(path, 9), "/pro…flux");
+        // Odd non-ellipsis budget: the spare column goes to the suffix, because
+        // the tail of a path is what distinguishes two checkouts.
+        assert_eq!(middle_elide_to_display_width(path, 10), "/pro…nflux");
+        assert_eq!(middle_elide_to_display_width(path, 16), "/projec…/conflux");
+
+        for budget in [9, 10, 16] {
+            let elided = middle_elide_to_display_width(path, budget);
+            assert_eq!(display_width(&elided), budget);
+            assert_elision_retains_source_sides(path, &elided);
+        }
+    }
+
+    /// Wide characters are accounted in columns, not scalars, and a side that
+    /// cannot fit a whole wide character simply keeps fewer of them.
+    #[test]
+    fn middle_elision_measures_wide_unicode_in_display_columns() {
+        let path = "/日本語/conflux";
+        assert_eq!(display_width(path), 15);
+        assert_eq!(path.chars().count(), 12);
+
+        assert_eq!(middle_elide_to_display_width(path, 8), "/日…flux");
+        // One column narrower is one *column*, not one character: the wide
+        // prefix cannot give up half of 日, so the suffix pays instead.
+        assert_eq!(middle_elide_to_display_width(path, 7), "/日…lux");
+
+        for budget in 1..=display_width(path) {
+            let elided = middle_elide_to_display_width(path, budget);
+            assert!(
+                display_width(&elided) <= budget,
+                "budget {budget} produced {elided:?}, which is wider than its budget"
+            );
+        }
+    }
+
+    /// A combining mark carries no column of its own, so it must travel with the
+    /// base character it modifies rather than being orphaned onto the ellipsis.
+    #[test]
+    fn middle_elision_keeps_combining_marks_with_their_base_characters() {
+        let path = "/a\u{301}bcdefg/hij\u{301}";
+        assert_eq!(display_width(path), 12);
+
+        let elided = middle_elide_to_display_width(path, 7);
+        assert_eq!(elided, "/a\u{301}b…hij\u{301}");
+        assert_eq!(display_width(&elided), 7);
+        assert_elision_retains_source_sides(path, &elided);
+
+        // No side may start or end on a mark whose base was left behind.
+        let (prefix, suffix) = elided.split_once(MIDDLE_ELLIPSIS).expect("ellipsis");
+        assert!(!prefix.ends_with('\u{301}') || prefix.chars().count() > 1);
+        assert!(
+            !suffix.starts_with('\u{301}'),
+            "{suffix:?} orphans a combining mark onto the ellipsis"
+        );
+    }
+
+    /// Budgets at or below the width of the ellipsis stay bounded instead of
+    /// panicking or overflowing their assigned columns.
+    #[test]
+    fn middle_elision_stays_bounded_for_budgets_no_wider_than_the_ellipsis() {
+        let samples = [
+            "/projects/conflux",
+            "/日本語/conflux",
+            "/a\u{301}bcdefg/hij\u{301}",
+            "/",
+        ];
+
+        for source in samples {
+            assert_eq!(middle_elide_to_display_width(source, 0), "");
+            for budget in 0..=display_width(source) + 2 {
+                let elided = middle_elide_to_display_width(source, budget);
+                assert!(
+                    display_width(&elided) <= budget,
+                    "{source:?} at budget {budget} produced {elided:?}"
+                );
+            }
+        }
+
+        // A source wider than one column and a one-column budget: the gap is all
+        // that is left, and it is exactly one column.
+        assert_eq!(middle_elide_to_display_width("/projects/conflux", 1), "…");
+        assert_eq!(middle_elide_to_display_width("/日本語/conflux", 1), "…");
+    }
+
+    /// The header identifies the owned project, and the retired concurrency /
+    /// backend badge does not come back with it.
+    #[test]
+    fn header_shows_the_captured_project_path_instead_of_the_workspaces_badge() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        let buffer = render_buffer(&mut app, 120, 30);
+        let header = header_line(&buffer);
+
+        assert!(
+            header.contains(TEST_PROJECT_PATH),
+            "the captured project path must be visible in full:\n{header}"
+        );
+        assert!(
+            !header.contains("[workspaces:"),
+            "the concurrency/backend badge must be gone:\n{header}"
+        );
+        assert!(
+            !header.contains(MIDDLE_ELLIPSIS),
+            "a path that fits must not be elided:\n{header}"
+        );
+    }
+
+    /// Header identity is a function of the captured startup path alone.
+    ///
+    /// Rendering reads `AppState::project_path`, whose only writer is
+    /// `set_project_path`, and never re-resolves identity from ambient process
+    /// state. Two otherwise identical apps therefore differ in the header by
+    /// exactly their captured paths — which is what makes a later `chdir`
+    /// unable to retarget the header, since nothing consults the current
+    /// directory after startup.
+    #[test]
+    fn header_project_identity_comes_only_from_the_captured_startup_path() {
+        let mut owned = create_test_app(vec![create_test_change("change-a")]);
+        owned.set_project_path("/projects/conflux");
+        let mut elsewhere = create_test_app(vec![create_test_change("change-a")]);
+        elsewhere.set_project_path("/tmp");
+
+        let owned_header = header_line(&render_buffer(&mut owned, 120, 30));
+        let elsewhere_header = header_line(&render_buffer(&mut elsewhere, 120, 30));
+
+        assert!(
+            owned_header.contains("/projects/conflux"),
+            "the captured project must be the one shown:\n{owned_header}"
+        );
+        assert!(
+            !owned_header.contains("/tmp"),
+            "an unrelated directory must not appear:\n{owned_header}"
+        );
+        assert!(
+            elsewhere_header.contains("/tmp"),
+            "the other app shows its own captured path:\n{elsewhere_header}"
+        );
+
+        // Rendering is a read: the capture survives repeated frames unchanged.
+        let _ = render_buffer(&mut owned, 120, 30);
+        assert_eq!(
+            owned.project_path(),
+            std::path::Path::new("/projects/conflux")
+        );
+    }
+
+    /// A path wider than its header budget is middle-elided in place, without
+    /// displacing the status label, the dirty badge, or the version area.
+    #[test]
+    fn header_middle_elides_a_project_path_wider_than_its_budget() {
+        let long_path =
+            "/Users/operator/very/deeply/nested/checkouts/organization/conflux-worktrees/show-project-path-in-tui-header";
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.set_project_path(long_path);
+        observe_workspace_dirty(&mut app, true);
+
+        let buffer = render_buffer(&mut app, 80, 30);
+        let header = header_line(&buffer);
+
+        assert!(
+            !header.contains(long_path),
+            "the full path cannot fit at width 80:\n{header}"
+        );
+        assert!(
+            header.contains(MIDDLE_ELLIPSIS),
+            "an over-wide path must be elided:\n{header}"
+        );
+        assert!(
+            header.contains("/Users/") && header.contains("-tui-header"),
+            "both the path prefix and its distinguishing tail must survive:\n{header}"
+        );
+        assert!(
+            header.contains("[Ready]") && header.contains("[dirty]"),
+            "elision must not displace the other header segments:\n{header}"
+        );
+        assert!(
+            header.contains(&crate::tui::utils::get_version_string()),
+            "the right-aligned version must stay intact:\n{header}"
+        );
+
+        // The path stays on the header row: nothing spilled into the row below.
+        let second_row = {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, 2)].symbol());
+            }
+            line
+        };
+        assert!(
+            !second_row.contains("-tui-header"),
+            "the header must not wrap onto the next row:\n{second_row}"
+        );
+    }
+
+    /// Narrow terminals stay bounded: the header renders, the version area keeps
+    /// its reservation, and nothing panics down to a single column.
+    #[test]
+    fn header_project_path_rendering_stays_bounded_at_narrow_widths() {
+        for width in [1u16, 2, 4, 8, 12, 20, 24, 30, 40, 60] {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            app.set_project_path("/Users/operator/checkouts/conflux");
+            observe_workspace_dirty(&mut app, true);
+
+            let buffer = render_buffer(&mut app, width, 20);
+            let header = header_line(&buffer);
+            assert_eq!(
+                header.chars().count(),
+                width as usize,
+                "width {width}: the header row must fill exactly its terminal width"
+            );
+            assert!(
+                header.matches(MIDDLE_ELLIPSIS).count() <= 1,
+                "width {width}: at most one elision gap belongs in the header:\n{header}"
             );
         }
     }
