@@ -27,7 +27,7 @@ use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -285,6 +285,19 @@ pub struct AppState {
     pub vcs_backend: String,
     /// Max concurrent workspaces for worktree execution
     pub max_concurrent: usize,
+    /// Repository root captured once at TUI startup, as header project identity.
+    ///
+    /// Private on purpose: the header must report the project this process was
+    /// started against, so the only way in is
+    /// [`AppState::set_project_path`], which the runner calls with the same
+    /// `repo_root` the refresh task and the dirty predicate already use.
+    /// Rendering never re-derives it from the process current directory, which
+    /// can move after startup.
+    ///
+    /// Presentation-only, process-local state. It is never persisted and never
+    /// used as scheduler dispatch, resume routing, acceptance, archive, or
+    /// next-action input.
+    project_path: PathBuf,
     /// When orchestration started (for overall elapsed time)
     pub orchestration_started_at: Option<Instant>,
     /// Total elapsed time when orchestration finished
@@ -589,6 +602,7 @@ impl AppState {
             persistent_scheduler_idle: false,
             vcs_backend: "git".to_string(),
             max_concurrent: 4, // Default value, can be overridden from config
+            project_path: PathBuf::new(),
             orchestration_started_at: None,
             orchestration_elapsed: None,
             web_url: None,
@@ -613,6 +627,23 @@ impl AppState {
             workspace_dirty: WorkspaceDirtyState::default(),
             pending_mark_writes: Vec::new(),
         }
+    }
+
+    /// Adopt the startup repository root as this process's project identity.
+    ///
+    /// Called once by the local TUI runner with the `repo_root` it captured
+    /// before any refresh ran. Nothing re-reads the process current directory
+    /// afterwards, so a later `chdir` cannot retarget the header.
+    pub fn set_project_path(&mut self, repo_root: impl Into<PathBuf>) {
+        self.project_path = repo_root.into();
+    }
+
+    /// The captured project path, for the header.
+    ///
+    /// Empty until the runner sets it; the header renders no path segment in
+    /// that case rather than inventing one.
+    pub fn project_path(&self) -> &Path {
+        &self.project_path
     }
 
     /// Latest workspace dirty observation, for the header badge.
