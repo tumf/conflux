@@ -118,9 +118,17 @@ caller as soon as the row is one only a new operator action can move. `error`,
 `merge wait`, `stopped`, and `stalled` return `change_requires_action` with exit
 status `27`, carrying `detail.observed_status`, `detail.error_detail` when the
 owner published one, and `detail.commands_submitted: 0`; `rejected` keeps its own
-`change_rejected`. Releasing is still not repairing: no start, retry, queue,
-resolve, archive, merge, or cleanup command is submitted on the way out, and what
-to do about a parked change remains the operator's decision. The classification
+`change_rejected`. `blocked` is the one row the display status cannot classify
+alone, so its structured blocker decides: a dependency wait — or a hold with no
+structured blocker at all — is work this owner clears by itself and keeps the
+wait observing, while blocker kind `external` is a validated non-repository
+prerequisite the owner already handed back to you. That releases with the same
+`change_requires_action`, and `detail.blocker` carries the blocker's own
+`unblock_condition` and `prerequisite_owner` so the released caller knows what to
+satisfy rather than parsing a message. Releasing is still not repairing: no
+start, retry, queue, resolve, archive, merge, or cleanup command is submitted on
+the way out, and what to do about a parked change remains the operator's
+decision. The classification
 runs on the first observation and on every later coherent one, so waiting on a
 change that was already parked before you asked reports it immediately instead of
 hanging until your deadline. A settled `merged`, `pushed`, or `archived` row is

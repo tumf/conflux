@@ -2462,7 +2462,7 @@ Client commands MUST support concise human output and a machine-readable JSON mo
 
 `cflx client wait <change-id>` MUST observe one owner and repository until the requested change reaches a repository-verifiable terminal success, a typed unsuccessful terminal outcome, owner replacement, or an explicitly configured positive timeout. Omitting `--timeout` MUST select an unbounded operation duration, and every accepted timeout spelling whose value is exactly zero (for example `0`, `0s`, `0ms`) MUST select the same unbounded operation duration; positive values below the existing minimum and above the existing maximum MUST remain usage errors. A positive timeout MUST create one monotonic operation deadline that bounds initial observation, repeated observation, event/poll recovery, repository classification, and every local or remote Git subprocess. Positive deadline expiry MUST terminate and reap owned subprocesses, return typed `timeout`, and MUST NOT be replaced by a later inner transport or evidence error. An unbounded wait has no operation deadline to reach a Git child, so it MUST place a finite per-invocation deadline of its own on every local or remote Git subprocess; expiry of that inner deadline MUST terminate and reap the child and be handled as a recoverable or typed evidence condition, and MUST NOT produce the operation-level `timeout` outcome, which remains reserved for explicit positive timeouts. Unbounded operation duration MUST NOT disable per-request transport limits or process cleanup. It MUST use event streaming when available and authoritative multi-resource polling to recover from gaps. Reads MUST agree on `instance_id`; revision-bearing resources must reconcile at one `state_revision`, and `event_sequence` must not move backwards. `status` may end bounded rereads with typed observation conflict, while `wait` must keep reconciling until its configured positive deadline or a terminal outcome. API presentation and command records MAY provide progress but MUST NOT alone certify implementation or integration completion.
 
-Wait MUST submit no mutation command. Change disappearance alone MUST NOT count as success. The display statuses `not queued`, `queued`, `blocked`, `applying`, `accepting`, `rejecting`, `archiving`, and `resolving` MUST continue observing. The statuses `error`, `merge wait`, `stopped`, and `stalled` MUST release immediately with outcome `change_requires_action`; `rejected` MUST retain `change_rejected`. This classification MUST run on the initial observation and every later coherent observation.
+Wait MUST submit no mutation command. Change disappearance alone MUST NOT count as success. The display statuses `not queued`, `queued`, `applying`, `accepting`, `rejecting`, `archiving`, and `resolving` MUST continue observing. A `blocked` row without a structured external blocker, including a dependency wait, MUST continue observing. A `blocked` row whose structured blocker kind is `external` MUST release immediately with outcome `change_requires_action`. The statuses `error`, `merge wait`, `stopped`, and `stalled` MUST also release immediately with outcome `change_requires_action`; `rejected` MUST retain `change_rejected`. This classification MUST run on the initial observation and every later coherent observation.
 
 For terminal mode `merged`, success requires the existing repository completion oracle to return `Completed` for the captured base branch. For `base_published`, the selected remote base ref must additionally equal the locally verified base tip. For `branch_pushed`, archived proposal evidence must exist on the named local change branch and the selected remote branch ref must equal that local branch tip; this proves publication, not base integration. On an observed `merged` row whose first certification returns `NotCompleted`, wait MUST perform one bounded coherent re-observation and re-certification to avoid reporting in-flight publication as failure. If that second certification remains `NotCompleted`, wait MUST release with `change_requires_action` rather than hold indefinitely. `Contradictory`, `EvidenceError`, unsupported mode, and missing or ambiguous repository evidence MUST remain their existing typed non-success outcomes.
 
@@ -2499,8 +2499,32 @@ For terminal mode `merged`, success requires the existing repository completion 
 **Given**: `alpha` enters an error, blocked, stalled, merge-wait, or retryable state
 **When**: wait observes that state
 **Then**: it submits no start, retry, queue, resolve, archive, merge, cleanup, or worktree command
-**And**: `blocked` and other automatically progressing states continue observing
-**And**: `error`, `merge wait`, and `stalled` release with `change_requires_action`
+**And**: `blocked` without a structured external blocker and other automatically progressing states continue observing
+**And**: `blocked` with structured blocker kind `external`, `error`, `merge wait`, and `stalled` release with `change_requires_action`
+
+#### Scenario: External blocker releases an unbounded waiter
+
+**Given**: a coherent owner snapshot reports `alpha` as `blocked`
+**And**: the structured blocker kind is `external`
+**When**: a caller runs `cflx client wait alpha --json` without a positive timeout
+**Then**: wait releases with outcome `change_requires_action` and exit status `27`
+**And**: detail reports observed status `blocked`, available blocker detail, and zero submitted commands
+**And**: wait does not retry, start, dequeue, resolve, or mutate repository state
+
+#### Scenario: Owner-progressing blocked state continues observing
+
+**Given**: a coherent owner snapshot reports `alpha` as `blocked`
+**And**: the row has no structured external blocker or has blocker kind `dependency`
+**When**: wait evaluates the observation
+**Then**: wait continues observing for owner progress or another typed outcome
+**And**: wait submits no mutation command
+
+#### Scenario: Live work later becomes externally blocked
+
+**Given**: wait is observing `alpha` in an active phase
+**When**: a later coherent observation reports `alpha` as `blocked` with structured blocker kind `external`
+**Then**: wait releases with `change_requires_action`
+**And**: the same classification applies as on the initial observation
 
 #### Scenario: Owner replacement invalidates the wait
 

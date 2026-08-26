@@ -154,7 +154,12 @@ advance the change on its own — `not queued`, `queued`, `blocked`, `applying`,
 row is one only a new operator action can move: `error`, `merge wait`, `stopped`,
 and `stalled` return `change_requires_action` (exit `27`) carrying
 `detail.observed_status`, any `detail.error_detail` the owner published, and
-`detail.commands_submitted: 0`. `rejected` keeps its own `change_rejected`. The
+`detail.commands_submitted: 0`. `rejected` keeps its own `change_rejected`.
+`blocked` is the one row the status alone cannot classify: a dependency wait is
+work the owner clears by itself and keeps the wait observing, while a validated
+external prerequisite is a hold the owner already handed back, so it releases
+with the same `change_requires_action` and publishes the blocker's
+`unblock_condition` and `prerequisite_owner` in `detail.blocker`. The
 classification runs on the first observation too, so waiting on an already-parked
 change reports it immediately instead of hanging. A settled `merged`, `pushed`,
 or `archived` row still has to be certified from the repository; it gets one

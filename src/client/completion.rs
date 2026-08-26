@@ -20,6 +20,7 @@
 //! from the snapshot, and not a callback exiting zero.
 
 pub use crate::client::repo::{verify as certify, Verdict};
+use crate::web::remote_control_api::dto::BlockerKind;
 
 /// Display statuses that claim the change reached a terminal success.
 ///
@@ -75,17 +76,32 @@ pub enum Disposition {
 /// Classify one observed display status for an observer that never mutates.
 ///
 /// The distinction it draws is not "terminal versus not" but "can this owner
-/// still advance it": `blocked` is a hold that clears when its prerequisite
-/// does, while `merge wait` is a hold that clears when a human resolves a
-/// conflict. Only the second is worth releasing a waiter for.
+/// still advance it": a dependency wait is a hold that clears when the owner
+/// archives the proposal it is waiting on, while `merge wait` is a hold that
+/// clears when a human resolves a conflict. Only the second is worth releasing
+/// a waiter for.
+///
+/// `blocked` is the one status where the display string alone cannot answer
+/// that, which is why the structured blocker is a parameter rather than
+/// something a caller folds in beforehand. A `dependency` hold — or a hold the
+/// owner published no structured blocker for — is owner-progressing work. An
+/// `external` hold is the opposite: the owner validated a non-repository
+/// prerequisite, parked the change, and will not look again until an operator
+/// retries it, so an observer sitting there is waiting for a human who does not
+/// know they are being waited for.
 ///
 /// `None` — the owner stopped tracking the change — stays [`Disposition::Certify`]
 /// for the same reason [`claims_terminal_success`] does: disappearance proves
 /// nothing either way, so the repository has to answer.
-pub fn classify(display_status: Option<&str>) -> Disposition {
+pub fn classify(display_status: Option<&str>, blocker: Option<BlockerKind>) -> Disposition {
     match display_status {
         Some("rejected") => Disposition::Rejected,
         Some(status) if MANUAL_ACTION_STATUSES.contains(&status) => Disposition::RequiresAction,
+        // Gated on the status rather than on the kind alone: the projection
+        // publishes a blocker only for `blocked` and `stalled`, and reading a
+        // stale or unexpected one on any other row would release a waiter from
+        // work that is still moving.
+        Some("blocked") if blocker == Some(BlockerKind::External) => Disposition::RequiresAction,
         other if claims_terminal_success(other) => Disposition::Certify,
         _ => Disposition::KeepObserving,
     }
@@ -144,25 +160,75 @@ mod tests {
             "reject pending",
         ] {
             assert_eq!(
-                classify(Some(status)),
+                classify(Some(status), None),
                 Disposition::KeepObserving,
                 "'{status}' can still advance without an operator"
             );
         }
         for status in ["error", "merge wait", "stopped", "stalled"] {
             assert_eq!(
-                classify(Some(status)),
+                classify(Some(status), None),
                 Disposition::RequiresAction,
                 "'{status}' needs a new operator action"
             );
         }
         for status in ["merged", "pushed", "archived"] {
-            assert_eq!(classify(Some(status)), Disposition::Certify, "{status}");
+            assert_eq!(
+                classify(Some(status), None),
+                Disposition::Certify,
+                "{status}"
+            );
         }
-        assert_eq!(classify(Some("rejected")), Disposition::Rejected);
+        assert_eq!(classify(Some("rejected"), None), Disposition::Rejected);
         // Disappearance is the one case with no status to read; the repository
         // answers it, exactly as it did before this classification existed.
-        assert_eq!(classify(None), Disposition::Certify);
+        assert_eq!(classify(None, None), Disposition::Certify);
+    }
+
+    /// The one status whose disposition the display string cannot decide alone.
+    ///
+    /// Both halves are asserted together because they are the same rule: an
+    /// external prerequisite is a hold only an operator clears, and every other
+    /// blocked row is the owner's own work queue. Splitting them would let one
+    /// half regress while the other kept passing.
+    #[test]
+    fn a_blocked_row_is_classified_by_its_structured_blocker() {
+        assert_eq!(
+            classify(Some("blocked"), Some(BlockerKind::External)),
+            Disposition::RequiresAction,
+            "an external prerequisite will not clear without an operator"
+        );
+        for kind in [None, Some(BlockerKind::None), Some(BlockerKind::Dependency)] {
+            assert_eq!(
+                classify(Some("blocked"), kind),
+                Disposition::KeepObserving,
+                "{kind:?} is a hold the owner clears by itself"
+            );
+        }
+    }
+
+    /// A blocker kind read off any other row changes nothing.
+    ///
+    /// The projection publishes one only for `blocked` and `stalled`, so a kind
+    /// arriving with a live phase is either stale or a future projection this
+    /// build does not understand. Neither is a reason to abandon moving work,
+    /// and neither may downgrade a success claim away from verification.
+    #[test]
+    fn an_external_kind_on_another_status_does_not_release_the_waiter() {
+        assert_eq!(
+            classify(Some("applying"), Some(BlockerKind::External)),
+            Disposition::KeepObserving
+        );
+        assert_eq!(
+            classify(Some("merged"), Some(BlockerKind::External)),
+            Disposition::Certify
+        );
+        // `stalled` already needs an operator; the kind neither adds to that nor
+        // takes anything away.
+        assert_eq!(
+            classify(Some("stalled"), Some(BlockerKind::External)),
+            Disposition::RequiresAction
+        );
     }
 
     /// An unknown status is live work, not settled work.
@@ -172,8 +238,11 @@ mod tests {
     /// wait that keeps observing, which is what a waiter is for.
     #[test]
     fn an_unrecognized_status_keeps_observing() {
-        assert_eq!(classify(Some("polishing")), Disposition::KeepObserving);
-        assert_eq!(classify(Some("")), Disposition::KeepObserving);
+        assert_eq!(
+            classify(Some("polishing"), None),
+            Disposition::KeepObserving
+        );
+        assert_eq!(classify(Some(""), None), Disposition::KeepObserving);
     }
 
     /// The two success claims part company only when the repository says no.
