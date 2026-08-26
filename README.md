@@ -144,13 +144,29 @@ status. The successes are narrow: `observed`, `marked`, `unmarked`, `unchanged`,
 `owner_not_running`, `owner_not_command_capable`, `owner_restarted`,
 `change_not_found`, `target_ineligible`, `revision_conflict`,
 `transport_not_permitted`, `unsupported_owner`, `partial_intent`,
-`observation_conflict`, `evidence_error`, `change_rejected`, `process_failed`,
-`timeout`, `usage_error` — is a non-zero refusal.
+`observation_conflict`, `evidence_error`, `change_rejected`,
+`change_requires_action`, `process_failed`, `timeout`, `usage_error` — is a
+non-zero refusal.
+
+**`wait` waits for the owner, not for you.** It holds while the owner can still
+advance the change on its own — `not queued`, `queued`, `blocked`, `applying`,
+`accepting`, `rejecting`, `archiving`, `resolving` — and releases the moment the
+row is one only a new operator action can move: `error`, `merge wait`, `stopped`,
+and `stalled` return `change_requires_action` (exit `27`) carrying
+`detail.observed_status`, any `detail.error_detail` the owner published, and
+`detail.commands_submitted: 0`. `rejected` keeps its own `change_rejected`. The
+classification runs on the first observation too, so waiting on an already-parked
+change reports it immediately instead of hanging. A settled `merged`, `pushed`,
+or `archived` row still has to be certified from the repository; it gets one
+bounded re-observation for evidence that landed a moment late, and then either
+`completed` or the same `change_requires_action`.
 
 **Accepted is not completion.** A settled control command proves the owner took
 the intent, nothing more, and a settled mark proves less still. `wait` is the
 observation-only counterpart: it submits no command and returns `completed` only
 when current Git/OpenSpec evidence proves the owner's declared terminal mode.
+Releasing on a parked row is not a repair: nothing is started, retried,
+resolved, merged, or cleaned up on the way out.
 
 ### `cflx client mcp`
 

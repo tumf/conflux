@@ -43,6 +43,65 @@ pub fn claims_terminal_success(display_status: Option<&str>) -> bool {
     }
 }
 
+/// Display statuses the current owner will not advance on its own.
+///
+/// Each one is a row the owner has already settled or parked: a failed
+/// execution, a merge the owner refuses to retry unattended, an operator stop,
+/// and an execution hold with no prerequisite left to clear. None of them
+/// becomes anything else without a new operator command, so an observer holding
+/// out for a later event is holding out for the operator, not for the owner.
+///
+/// `rejected` is deliberately absent: it is equally final, but it already has
+/// its own outcome and reporting it as "needs an action" would lose the verdict.
+pub const MANUAL_ACTION_STATUSES: [&str; 4] = ["error", "merge wait", "stopped", "stalled"];
+
+/// What a `wait` observer should do about one observed display status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// The owner can still advance this row by itself, so keep observing.
+    ///
+    /// This is the default for anything unrecognized, on purpose: an owner that
+    /// grows a new intermediate status must not make existing waits give up on
+    /// work that is still moving.
+    KeepObserving,
+    /// A success is being claimed; the repository decides whether it is one.
+    Certify,
+    /// The change reached its terminal rejection.
+    Rejected,
+    /// Nothing will move without a new operator action.
+    RequiresAction,
+}
+
+/// Classify one observed display status for an observer that never mutates.
+///
+/// The distinction it draws is not "terminal versus not" but "can this owner
+/// still advance it": `blocked` is a hold that clears when its prerequisite
+/// does, while `merge wait` is a hold that clears when a human resolves a
+/// conflict. Only the second is worth releasing a waiter for.
+///
+/// `None` — the owner stopped tracking the change — stays [`Disposition::Certify`]
+/// for the same reason [`claims_terminal_success`] does: disappearance proves
+/// nothing either way, so the repository has to answer.
+pub fn classify(display_status: Option<&str>) -> Disposition {
+    match display_status {
+        Some("rejected") => Disposition::Rejected,
+        Some(status) if MANUAL_ACTION_STATUSES.contains(&status) => Disposition::RequiresAction,
+        other if claims_terminal_success(other) => Disposition::Certify,
+        _ => Disposition::KeepObserving,
+    }
+}
+
+/// Whether a success-claiming status is a row the owner has already settled.
+///
+/// It matters only when the repository refuses to certify the claim. A settled
+/// row that evidence does not back will never be re-settled, so continuing to
+/// observe it is waiting for an event the owner has no reason to publish; a
+/// change that merely vanished from the snapshot may still come back, and an
+/// observer that gave up on it would abandon live work.
+pub fn is_settled_success_claim(display_status: Option<&str>) -> bool {
+    display_status.is_some_and(|status| CLAIMED_SUCCESS_STATUSES.contains(&status))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +120,83 @@ mod tests {
     #[test]
     fn a_change_that_stopped_being_tracked_must_still_be_verified() {
         assert!(claims_terminal_success(None));
+    }
+
+    /// Every status the owner's own projection can produce, classified once.
+    ///
+    /// Written as the full list rather than as samples because the bug this
+    /// exists to prevent is an *omission*: a status nobody classified falls into
+    /// the `KeepObserving` default, and a hold that needs an operator would then
+    /// look exactly like work still in flight.
+    #[test]
+    fn every_owner_status_is_classified_by_whether_the_owner_can_still_advance_it() {
+        for status in [
+            "not queued",
+            "queued",
+            "blocked",
+            "preparing",
+            "applying",
+            "accepting",
+            "rejecting",
+            "archiving",
+            "resolving",
+            "resolve pending",
+            "reject pending",
+        ] {
+            assert_eq!(
+                classify(Some(status)),
+                Disposition::KeepObserving,
+                "'{status}' can still advance without an operator"
+            );
+        }
+        for status in ["error", "merge wait", "stopped", "stalled"] {
+            assert_eq!(
+                classify(Some(status)),
+                Disposition::RequiresAction,
+                "'{status}' needs a new operator action"
+            );
+        }
+        for status in ["merged", "pushed", "archived"] {
+            assert_eq!(classify(Some(status)), Disposition::Certify, "{status}");
+        }
+        assert_eq!(classify(Some("rejected")), Disposition::Rejected);
+        // Disappearance is the one case with no status to read; the repository
+        // answers it, exactly as it did before this classification existed.
+        assert_eq!(classify(None), Disposition::Certify);
+    }
+
+    /// An unknown status is live work, not settled work.
+    ///
+    /// A future owner that adds an intermediate phase must not silently release
+    /// every waiter observing it; the cost of guessing wrong the other way is a
+    /// wait that keeps observing, which is what a waiter is for.
+    #[test]
+    fn an_unrecognized_status_keeps_observing() {
+        assert_eq!(classify(Some("polishing")), Disposition::KeepObserving);
+        assert_eq!(classify(Some("")), Disposition::KeepObserving);
+    }
+
+    /// The two success claims part company only when the repository says no.
+    #[test]
+    fn only_a_present_success_row_is_a_settled_claim() {
+        assert!(is_settled_success_claim(Some("merged")));
+        assert!(is_settled_success_claim(Some("pushed")));
+        assert!(is_settled_success_claim(Some("archived")));
+        // Still verified, never released: it may reappear in the next snapshot.
+        assert!(!is_settled_success_claim(None));
+        assert!(!is_settled_success_claim(Some("applying")));
+    }
+
+    /// The two status tables must stay disjoint: a status that both claimed
+    /// success and demanded an operator would be classified by whichever branch
+    /// happened to run first.
+    #[test]
+    fn no_status_both_claims_success_and_demands_an_operator() {
+        for status in MANUAL_ACTION_STATUSES {
+            assert!(
+                !CLAIMED_SUCCESS_STATUSES.contains(&status),
+                "'{status}' cannot be both"
+            );
+        }
     }
 }
