@@ -10,7 +10,11 @@ Parallel merge retry dispatch SHALL handle deferred merge attempts as pending/de
 
 Parallel ordinary apply dispatch MUST treat reducer terminal-error state as a stop gate. After a change emits an apply, acceptance, archive, dispatch, runtime-limit, or workspace execution error, scheduler reanalysis, queue reconciliation, ordinary queue notification, and workspace resume scans MUST NOT dispatch that same change to apply again unless explicit retry intent has cleared the recoverable error terminal state. Existing workspaces MAY remain available for operator inspection or explicit retry.
 
-An accepted Start/F5 retry for a marked terminal-error target MUST create the same target-specific explicit-retry scheduler edge used by other accepted retry commands. A live scheduler MUST consume that edge as an immediate reanalysis reason for the matching target; a newly started boundary MUST begin with explicit-retry semantics. The edge MUST NOT release another target's failed classification, and ordinary mark settlement or generic queue notification MUST NOT manufacture equivalent retry authority.
+An accepted explicit retry MUST create a target-specific explicit-retry scheduler edge for every accepted retry route, whether that route applies `RetryError` to a terminal-error target or restores ordinary queue intent for an acceptance-stalled or externally blocked target. `retry_change`, bulk retry, Start/F5 retry, and the terminal-error alias of an add-to-queue request MUST all arm that same edge; a refused or reducer-no-op retry MUST arm none.
+
+A live scheduler MUST consume that edge at the next eligible dependency-analysis evaluation for the matching target, and the edge MUST bypass queue debounce and unchanged-analysis-input suppression exactly once. Carrying a consumed edge as the scheduler's existing bypass-eligible reanalysis reason preserves that authority; reducing it to an ordinarily suppressible wake before the authorized evaluation MUST NOT happen. A scheduler pass that ends before the analysis evaluation it authorized MUST leave the edge available to the next eligible evaluation rather than discarding its authority with that pass. A newly started boundary MUST begin with explicit-retry semantics.
+
+The authority an edge carries MUST stay route-scoped and fail-closed: releasing a scheduler-local failed classification, dropping a dependency-blocker fingerprint, and resetting a target's scheduler-local Apply budget remain exclusive to the accepted terminal-error retry route, while an acceptance-stall route edge grants analysis-bypass authority only. The edge MUST NOT release another target's failed classification, and ordinary mark settlement or generic queue notification MUST NOT manufacture equivalent retry authority.
 
 Dependency analysis MUST continue to treat an errored dependency as a dispatch blocker for dependents until the dependency is explicitly retried and reaches repository-visible success.
 
@@ -69,10 +73,52 @@ When configured for push post-archive mode, the parallel service SHALL preserve 
 - **AND** a distinct dependency-analysis attempt including `alpha` SHALL start without ordinary queue debounce or mark-settlement delay
 - **AND** Apply dispatch SHALL still obey dependency and capacity guards
 
+#### Scenario: retry_change on a stalled target bypasses matching analysis cache
+
+- **GIVEN** a persistent scheduler previously completed dependency analysis for an input containing retry-eligible `alpha`
+- **AND** `alpha` is displayed as `stalled`, so its accepted retry route restores ordinary queue intent instead of applying `RetryError`
+- **AND** reducer-visible queued work for `alpha` remains undispatched and contributes no scheduler-visible queued addition
+- **WHEN** `retry_change` accepts `alpha` and wakes the scheduler
+- **THEN** the accepted retry SHALL arm a target-specific retry edge for `alpha`
+- **AND** the matching completed analysis-input signature SHALL NOT suppress the evaluation that consumes that edge
+- **AND** `alpha` SHALL reach Apply dispatch when dependency and capacity guards allow it, without queue-intent toggling or a second operator command
+
+#### Scenario: Stall-route retry edge grants analysis bypass only
+
+- **GIVEN** acceptance-stalled `alpha` holds no scheduler-local failed classification and a spent scheduler-local Apply budget
+- **WHEN** an accepted stall-route retry arms an edge and the scheduler consumes it
+- **THEN** the authorized evaluation SHALL bypass unchanged-analysis-input suppression exactly once
+- **AND** that edge SHALL NOT release a scheduler-local failed classification
+- **AND** that edge SHALL NOT reset the target's scheduler-local Apply budget
+- **AND** run-level explicit-retry semantics for a newly started boundary SHALL remain unchanged
+
+#### Scenario: Explicit retry bypass is one-shot
+
+- **GIVEN** an accepted retry edge for `alpha` has authorized one dependency-analysis evaluation
+- **WHEN** that evaluation completes and later timer wakes observe the same analysis input
+- **THEN** the retry edge SHALL have been consumed
+- **AND** unchanged-analysis-input suppression SHALL apply normally to the later timer wakes
+
+#### Scenario: Retry edge survives a pass that ends before its analysis
+
+- **GIVEN** an accepted retry edge for `alpha` is armed
+- **AND** the scheduler pass that took the edge ends before its dependency-analysis evaluation because it is cancelled or its reducer view is incomplete
+- **WHEN** the next eligible evaluation runs against the same matching analysis input
+- **THEN** the edge's bypass authority SHALL NOT have been discarded with the abandoned pass
+- **AND** that next eligible evaluation SHALL bypass unchanged-analysis-input suppression exactly once for `alpha`
+
+#### Scenario: Generic wake without retry edge remains suppressible
+
+- **GIVEN** queued work has the same signature as the last completed dependency analysis
+- **AND** no target-specific explicit-retry edge was accepted
+- **WHEN** a generic scheduler wake performs no scheduler-visible queue addition
+- **THEN** the wake SHALL NOT acquire explicit-retry bypass authority
+- **AND** ordinary debounce and unchanged-analysis-input suppression SHALL remain applicable
+
 #### Scenario: Target-specific edge does not release another failed change
 
 - **GIVEN** failed changes `alpha` and `beta` both retain scheduler-local failed classifications
-- **AND** Start/F5 accepts explicit retry only for marked `alpha`
+- **AND** an explicit retry is accepted only for `alpha`
 - **WHEN** the scheduler consumes retry edges and reanalyzes
 - **THEN** only `alpha` MAY be released for candidate evaluation
 - **AND** `beta` SHALL remain terminal-error gated
@@ -85,7 +131,7 @@ When configured for push post-archive mode, the parallel service SHALL preserve 
 - **THEN** one fresh scheduler boundary SHALL start for `alpha` with explicit-retry semantics
 - **AND** retry-specific repair budget release SHALL apply only through the accepted retry path
 
-<!-- Expected canonical result after archive: terminal errors remain fail-closed after runtime-limit and other failures until a target-specific accepted retry creates immediate reanalysis, whether waking a persistent scheduler or starting a fresh boundary; push post-archive behavior remains intact. -->
+<!-- Expected canonical result after archive: every accepted retry route arms a target-specific one-shot scheduler edge that survives until an eligible analysis evaluation consumes it; matching analysis cache cannot suppress that evaluation, failed-classification and Apply-budget release stay exclusive to the terminal-error route, generic wakes gain no retry authority, and all existing shared parallel orchestration scenarios remain preserved. -->
 
 ### Requirement: Archived dependency references are explicitly classified
 
@@ -1717,7 +1763,11 @@ Parallel merge retry dispatch SHALL handle deferred merge attempts as pending/de
 
 Parallel ordinary apply dispatch MUST treat reducer terminal-error state as a stop gate. After a change emits an apply, acceptance, archive, dispatch, runtime-limit, or workspace execution error, scheduler reanalysis, queue reconciliation, ordinary queue notification, and workspace resume scans MUST NOT dispatch that same change to apply again unless explicit retry intent has cleared the recoverable error terminal state. Existing workspaces MAY remain available for operator inspection or explicit retry.
 
-An accepted Start/F5 retry for a marked terminal-error target MUST create the same target-specific explicit-retry scheduler edge used by other accepted retry commands. A live scheduler MUST consume that edge as an immediate reanalysis reason for the matching target; a newly started boundary MUST begin with explicit-retry semantics. The edge MUST NOT release another target's failed classification, and ordinary mark settlement or generic queue notification MUST NOT manufacture equivalent retry authority.
+An accepted explicit retry MUST create a target-specific explicit-retry scheduler edge for every accepted retry route, whether that route applies `RetryError` to a terminal-error target or restores ordinary queue intent for an acceptance-stalled or externally blocked target. `retry_change`, bulk retry, Start/F5 retry, and the terminal-error alias of an add-to-queue request MUST all arm that same edge; a refused or reducer-no-op retry MUST arm none.
+
+A live scheduler MUST consume that edge at the next eligible dependency-analysis evaluation for the matching target, and the edge MUST bypass queue debounce and unchanged-analysis-input suppression exactly once. Carrying a consumed edge as the scheduler's existing bypass-eligible reanalysis reason preserves that authority; reducing it to an ordinarily suppressible wake before the authorized evaluation MUST NOT happen. A scheduler pass that ends before the analysis evaluation it authorized MUST leave the edge available to the next eligible evaluation rather than discarding its authority with that pass. A newly started boundary MUST begin with explicit-retry semantics.
+
+The authority an edge carries MUST stay route-scoped and fail-closed: releasing a scheduler-local failed classification, dropping a dependency-blocker fingerprint, and resetting a target's scheduler-local Apply budget remain exclusive to the accepted terminal-error retry route, while an acceptance-stall route edge grants analysis-bypass authority only. The edge MUST NOT release another target's failed classification, and ordinary mark settlement or generic queue notification MUST NOT manufacture equivalent retry authority.
 
 Dependency analysis MUST continue to treat an errored dependency as a dispatch blocker for dependents until the dependency is explicitly retried and reaches repository-visible success.
 
@@ -1776,10 +1826,52 @@ When configured for push post-archive mode, the parallel service SHALL preserve 
 - **AND** a distinct dependency-analysis attempt including `alpha` SHALL start without ordinary queue debounce or mark-settlement delay
 - **AND** Apply dispatch SHALL still obey dependency and capacity guards
 
+#### Scenario: retry_change on a stalled target bypasses matching analysis cache
+
+- **GIVEN** a persistent scheduler previously completed dependency analysis for an input containing retry-eligible `alpha`
+- **AND** `alpha` is displayed as `stalled`, so its accepted retry route restores ordinary queue intent instead of applying `RetryError`
+- **AND** reducer-visible queued work for `alpha` remains undispatched and contributes no scheduler-visible queued addition
+- **WHEN** `retry_change` accepts `alpha` and wakes the scheduler
+- **THEN** the accepted retry SHALL arm a target-specific retry edge for `alpha`
+- **AND** the matching completed analysis-input signature SHALL NOT suppress the evaluation that consumes that edge
+- **AND** `alpha` SHALL reach Apply dispatch when dependency and capacity guards allow it, without queue-intent toggling or a second operator command
+
+#### Scenario: Stall-route retry edge grants analysis bypass only
+
+- **GIVEN** acceptance-stalled `alpha` holds no scheduler-local failed classification and a spent scheduler-local Apply budget
+- **WHEN** an accepted stall-route retry arms an edge and the scheduler consumes it
+- **THEN** the authorized evaluation SHALL bypass unchanged-analysis-input suppression exactly once
+- **AND** that edge SHALL NOT release a scheduler-local failed classification
+- **AND** that edge SHALL NOT reset the target's scheduler-local Apply budget
+- **AND** run-level explicit-retry semantics for a newly started boundary SHALL remain unchanged
+
+#### Scenario: Explicit retry bypass is one-shot
+
+- **GIVEN** an accepted retry edge for `alpha` has authorized one dependency-analysis evaluation
+- **WHEN** that evaluation completes and later timer wakes observe the same analysis input
+- **THEN** the retry edge SHALL have been consumed
+- **AND** unchanged-analysis-input suppression SHALL apply normally to the later timer wakes
+
+#### Scenario: Retry edge survives a pass that ends before its analysis
+
+- **GIVEN** an accepted retry edge for `alpha` is armed
+- **AND** the scheduler pass that took the edge ends before its dependency-analysis evaluation because it is cancelled or its reducer view is incomplete
+- **WHEN** the next eligible evaluation runs against the same matching analysis input
+- **THEN** the edge's bypass authority SHALL NOT have been discarded with the abandoned pass
+- **AND** that next eligible evaluation SHALL bypass unchanged-analysis-input suppression exactly once for `alpha`
+
+#### Scenario: Generic wake without retry edge remains suppressible
+
+- **GIVEN** queued work has the same signature as the last completed dependency analysis
+- **AND** no target-specific explicit-retry edge was accepted
+- **WHEN** a generic scheduler wake performs no scheduler-visible queue addition
+- **THEN** the wake SHALL NOT acquire explicit-retry bypass authority
+- **AND** ordinary debounce and unchanged-analysis-input suppression SHALL remain applicable
+
 #### Scenario: Target-specific edge does not release another failed change
 
 - **GIVEN** failed changes `alpha` and `beta` both retain scheduler-local failed classifications
-- **AND** Start/F5 accepts explicit retry only for marked `alpha`
+- **AND** an explicit retry is accepted only for `alpha`
 - **WHEN** the scheduler consumes retry edges and reanalyzes
 - **THEN** only `alpha` MAY be released for candidate evaluation
 - **AND** `beta` SHALL remain terminal-error gated
@@ -1792,7 +1884,7 @@ When configured for push post-archive mode, the parallel service SHALL preserve 
 - **THEN** one fresh scheduler boundary SHALL start for `alpha` with explicit-retry semantics
 - **AND** retry-specific repair budget release SHALL apply only through the accepted retry path
 
-<!-- Expected canonical result after archive: terminal errors remain fail-closed after runtime-limit and other failures until a target-specific accepted retry creates immediate reanalysis, whether waking a persistent scheduler or starting a fresh boundary; push post-archive behavior remains intact. -->
+<!-- Expected canonical result after archive: every accepted retry route arms a target-specific one-shot scheduler edge that survives until an eligible analysis evaluation consumes it; matching analysis cache cannot suppress that evaluation, failed-classification and Apply-budget release stay exclusive to the terminal-error route, generic wakes gain no retry authority, and all existing shared parallel orchestration scenarios remain preserved. -->
 
 ### Requirement: Non-blocking Merge in Scheduler Loop
 
