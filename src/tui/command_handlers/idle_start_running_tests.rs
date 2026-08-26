@@ -167,7 +167,14 @@ impl Wired {
             statuses,
             // Draining is the queue's only read and this is the process's last
             // observation, so nothing downstream can miss an edge.
-            explicit_retries: self.harness.queue.drain_explicit_retries().await,
+            explicit_retries: self
+                .harness
+                .queue
+                .drain_explicit_retries()
+                .await
+                .into_iter()
+                .map(|edge| edge.change_id)
+                .collect(),
             dispatches: self.harness.dispatch_count() - self.baseline_dispatches,
             revisions: self.web.remote_control().projection().revision() - self.baseline_revision,
         }

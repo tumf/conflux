@@ -191,7 +191,14 @@ impl Wired {
             reducer_queue,
             // Draining is the only read the queue offers, and this is the last
             // observation of the process, so nothing downstream can miss it.
-            explicit_retries: self.harness.queue.drain_explicit_retries().await,
+            explicit_retries: self
+                .harness
+                .queue
+                .drain_explicit_retries()
+                .await
+                .into_iter()
+                .map(|edge| edge.change_id)
+                .collect(),
             active_resolver: self.harness.resolves.active(),
             queued_resolves: self.harness.resolves.waiting(),
             marks: self.harness.marks.marked_ids(),

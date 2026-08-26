@@ -13,7 +13,7 @@ use super::*;
 use crate::events::{ExecutionEvent, StalledBlocker};
 use crate::orchestration::operator_command::{
     ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, ParallelEligibility, QueuePort,
-    TerminationWaiter,
+    RetryEdgeAuthority, TerminationWaiter,
 };
 
 /// In-memory [`QueuePort`] with no runtime behind it.
@@ -27,7 +27,7 @@ struct FakeQueue {
     /// releases a scheduler's ephemeral failed classification: a retry that
     /// committed the reducer transition without it would start nothing, and one
     /// that published it twice would release a classification once too often.
-    explicit_retries: Mutex<Vec<String>>,
+    explicit_retries: Mutex<Vec<(String, RetryEdgeAuthority)>>,
 }
 
 #[async_trait]
@@ -59,11 +59,11 @@ impl QueuePort for FakeQueue {
         *self.notifications.lock().unwrap() += 1;
     }
 
-    async fn publish_explicit_retry(&self, change_id: &str) {
+    async fn publish_explicit_retry(&self, change_id: &str, authority: RetryEdgeAuthority) {
         self.explicit_retries
             .lock()
             .unwrap()
-            .push(change_id.to_string());
+            .push((change_id.to_string(), authority));
     }
 }
 
@@ -214,7 +214,7 @@ struct RunEffects {
     queue: Vec<String>,
     notifications: usize,
     /// Explicit-retry edges published so far, in order.
-    explicit_retries: Vec<String>,
+    explicit_retries: Vec<(String, RetryEdgeAuthority)>,
     statuses: Vec<(String, String)>,
 }
 
@@ -1375,7 +1375,7 @@ async fn settled_apply_limit_error_mode_start_retries_the_marked_row() {
     );
     assert_eq!(
         harness.effects().await.explicit_retries,
-        vec!["limited".to_string()],
+        vec![("limited".to_string(), RetryEdgeAuthority::TerminalError)],
         "exactly one target-specific explicit-retry edge reaches the scheduler"
     );
     assert!(!harness.retains_iteration_limit("limited").await);

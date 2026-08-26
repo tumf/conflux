@@ -18,7 +18,7 @@ use super::*;
 use crate::events::{EventSink, ExecutionEvent};
 use crate::orchestration::operator_command::{
     ExecutionMarkStore, OperatorCommandService, ParallelEligibility, ParallelRuntime, QueuePort,
-    TerminationWaiter,
+    RetryEdgeAuthority, TerminationWaiter,
 };
 use crate::orchestration::operator_coordinator::{
     bind_mark_settlement, CoreMode, OperatorApplication, OperatorIntent,
@@ -103,7 +103,7 @@ impl QueuePort for RecordingQueue {
         self.record(QueueCall::Notify);
     }
 
-    async fn publish_explicit_retry(&self, change_id: &str) {
+    async fn publish_explicit_retry(&self, change_id: &str, _authority: RetryEdgeAuthority) {
         self.record(QueueCall::ExplicitRetry(change_id.to_string()));
     }
 }

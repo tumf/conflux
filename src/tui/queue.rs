@@ -3,10 +3,20 @@
 //! This module provides a thread-safe queue for dynamically adding changes
 //! during orchestrator execution.
 
+use crate::orchestration::operator_command::RetryEdgeAuthority;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
+
+/// One accepted, not-yet-consumed explicit-retry edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitRetryEdge {
+    /// The retried target.
+    pub change_id: String,
+    /// What consuming this edge authorizes.
+    pub authority: RetryEdgeAuthority,
+}
 
 /// Execution handle registered while a change owns a running workspace task.
 ///
@@ -45,14 +55,14 @@ pub struct DynamicQueue {
     stopped: Arc<Mutex<HashSet<String>>>,
     /// Per-change execution handles for immediate force-kill and termination waiting
     kill_tokens: Arc<Mutex<HashMap<String, ChangeExecutionHandle>>>,
-    /// Change IDs whose accepted, state-changing `RetryError` admission has not
-    /// been consumed by the scheduler yet.
+    /// Accepted retry admissions the scheduler has not consumed yet, keyed by
+    /// target and carrying the authority their route granted.
     ///
-    /// This is a target-ID-bearing one-shot edge, deliberately separate from the
+    /// These are target-ID-bearing one-shot edges, deliberately separate from the
     /// ordinary queue and from the generic notification: only an explicit retry
-    /// may release a change's ephemeral failed classification, so a plain
-    /// `AddToQueue` or a generic wake must not be able to look like one.
-    explicit_retries: Arc<Mutex<HashSet<String>>>,
+    /// may bypass unchanged-analysis-input suppression, so a plain `AddToQueue`
+    /// or a generic wake must not be able to look like one.
+    explicit_retries: Arc<Mutex<HashMap<String, RetryEdgeAuthority>>>,
     /// Notification for queue changes (used to wake up re-analysis loop)
     notify: Arc<Notify>,
 }
@@ -65,23 +75,37 @@ impl DynamicQueue {
             removed: Arc::new(Mutex::new(HashSet::new())),
             stopped: Arc::new(Mutex::new(HashSet::new())),
             kill_tokens: Arc::new(Mutex::new(HashMap::new())),
-            explicit_retries: Arc::new(Mutex::new(HashSet::new())),
+            explicit_retries: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
         }
     }
 
     /// Publish an accepted explicit-retry edge for `id` and wake the scheduler.
     ///
-    /// Callers must only publish after a `ReducerCommand::RetryError` returned
+    /// Callers must only publish after the route's reducer command returned
     /// `ReduceOutcome::Changed`: a refused or no-op retry proves nothing about
-    /// the change and must not release its failed classification.
+    /// the change and must not authorize anything.
+    ///
+    /// A second publication for a target whose edge is still pending widens the
+    /// authority rather than replacing it, so an accepted terminal-error retry
+    /// can never be downgraded by a stall-route edge that happened to arrive
+    /// first.
     ///
     /// Returns true when this is a newly armed edge rather than a duplicate that
     /// is still waiting to be consumed.
-    pub async fn publish_explicit_retry(&self, id: String) -> bool {
+    pub async fn publish_explicit_retry(&self, id: String, authority: RetryEdgeAuthority) -> bool {
         let armed = {
             let mut retries = self.explicit_retries.lock().await;
-            retries.insert(id)
+            match retries.get_mut(&id) {
+                Some(pending) => {
+                    *pending = pending.widen(authority);
+                    false
+                }
+                None => {
+                    retries.insert(id, authority);
+                    true
+                }
+            }
         };
         // Notify regardless: a duplicate publication still deserves a wake so an
         // idle persistent scheduler re-evaluates promptly.
@@ -89,14 +113,22 @@ impl DynamicQueue {
         armed
     }
 
-    /// Take every pending explicit-retry target, leaving the set empty.
+    /// Take every pending explicit-retry edge, leaving the set empty.
     ///
-    /// One-shot by construction: an edge is consumed exactly once, so a later
-    /// timer wake cannot replay it.
-    pub async fn drain_explicit_retries(&self) -> Vec<String> {
+    /// One-shot at *this* boundary: the queue hands each edge out exactly once,
+    /// so a later timer wake cannot re-drain it. Whether the authority it carried
+    /// has actually been spent is decided by the scheduler, which holds it until
+    /// an eligible dependency-analysis evaluation consumes it.
+    pub async fn drain_explicit_retries(&self) -> Vec<ExplicitRetryEdge> {
         let mut retries = self.explicit_retries.lock().await;
-        let mut drained: Vec<String> = retries.drain().collect();
-        drained.sort_unstable();
+        let mut drained: Vec<ExplicitRetryEdge> = retries
+            .drain()
+            .map(|(change_id, authority)| ExplicitRetryEdge {
+                change_id,
+                authority,
+            })
+            .collect();
+        drained.sort_unstable_by(|left, right| left.change_id.cmp(&right.change_id));
         drained
     }
 

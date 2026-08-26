@@ -136,6 +136,7 @@ impl ParallelExecutor {
             last_queue_change_at,
             last_available_slots: None,
             analyzer_capacity_suppressed: false,
+            pending_retry_bypass: HashSet::new(),
             dynamic_queue: None,
             ai_runner,
             run_command_scope,

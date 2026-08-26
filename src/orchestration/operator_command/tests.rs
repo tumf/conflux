@@ -114,7 +114,7 @@ struct FakeQueue {
     contents: StdMutex<Vec<String>>,
     cancellation: CancellationBehavior,
     notified: StdMutex<usize>,
-    explicit_retries: StdMutex<Vec<String>>,
+    explicit_retries: StdMutex<Vec<(String, RetryEdgeAuthority)>>,
     added: StdMutex<Vec<String>>,
     removed: StdMutex<Vec<String>>,
     cancellations: StdMutex<Vec<String>>,
@@ -133,7 +133,16 @@ impl FakeQueue {
         }
     }
 
+    /// Retried target IDs, in publication order.
     fn explicit_retries(&self) -> Vec<String> {
+        self.explicit_retry_edges()
+            .into_iter()
+            .map(|(change_id, _)| change_id)
+            .collect()
+    }
+
+    /// Retried targets with the authority their route granted, in publication order.
+    fn explicit_retry_edges(&self) -> Vec<(String, RetryEdgeAuthority)> {
         self.explicit_retries
             .lock()
             .expect("explicit retries lock")
@@ -189,11 +198,11 @@ impl QueuePort for FakeQueue {
         *self.notified.lock().expect("notified lock") += 1;
     }
 
-    async fn publish_explicit_retry(&self, change_id: &str) {
+    async fn publish_explicit_retry(&self, change_id: &str, authority: RetryEdgeAuthority) {
         self.explicit_retries
             .lock()
             .expect("explicit retries lock")
-            .push(change_id.to_string());
+            .push((change_id.to_string(), authority));
     }
 }
 
@@ -1179,28 +1188,95 @@ async fn failed_dependency_retry_edge_follows_accepted_state_changing_retry_only
     );
 }
 
-/// A refused acceptance-stall retry keeps its blocker evidence and dispatches
-/// nothing, so it must not publish a retry edge either.
+/// Every accepted retry route arms a target-specific edge, and the routes are
+/// told apart by the authority the edge carries rather than by whether one
+/// exists: an acceptance-stall retry restores queue intent for work the reducer
+/// already lists as queued, so without an edge a live scheduler has nothing to
+/// distinguish it from an ordinarily suppressible wake.
 #[tokio::test]
-async fn failed_dependency_retry_edge_absent_for_acceptance_stall_routes() {
-    let fixture = fixture(&["change-a"]);
+async fn accepted_retry_publishes_explicit_retry_edge_for_every_route() {
+    let fixture = fixture(&["stalled-change", "failed-change", "held-change"]);
     {
         let mut guard = fixture.state.write().await;
         guard.apply_execution_event(&ExecutionEvent::AcceptanceGated {
-            change_id: "change-a".to_string(),
+            change_id: "stalled-change".to_string(),
             blocker: acceptance_blocker(),
+        });
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "failed-change".to_string(),
+            error: "boom".to_string(),
+        });
+        // A non-resumable hold: classification refuses it, so it arms nothing.
+        guard.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "held-change".to_string(),
+            blocker: StalledBlocker {
+                resumable: false,
+                ..acceptance_blocker()
+            },
         });
     }
 
-    let plan = fixture
+    let stalled = fixture
         .service
-        .retry_change("change-a")
+        .retry_change("stalled-change")
         .await
         .expect("acceptance stall must be retryable");
-    assert_eq!(plan.routes, vec![RetryRoute::AcceptanceStall]);
+    assert_eq!(stalled.routes, vec![RetryRoute::AcceptanceStall]);
+    assert_eq!(
+        fixture.queue.explicit_retry_edges(),
+        vec![(
+            "stalled-change".to_string(),
+            RetryEdgeAuthority::AnalysisBypass
+        )],
+        "the stall route arms one edge for its own target, carrying analysis-bypass \
+         authority only: no failed-classification release and no Apply-budget reset"
+    );
+
+    let failed = fixture
+        .service
+        .retry_change("failed-change")
+        .await
+        .expect("terminal error must be retryable");
+    assert_eq!(failed.routes, vec![RetryRoute::TerminalError]);
+    assert_eq!(
+        fixture.queue.explicit_retry_edges(),
+        vec![
+            (
+                "stalled-change".to_string(),
+                RetryEdgeAuthority::AnalysisBypass
+            ),
+            (
+                "failed-change".to_string(),
+                RetryEdgeAuthority::TerminalError
+            ),
+        ],
+        "the terminal-error route keeps its own wider authority, for its own target"
+    );
+
+    let refused = fixture
+        .service
+        .retry_change("held-change")
+        .await
+        .expect("refusal is not an error");
     assert!(
-        fixture.queue.explicit_retries().is_empty(),
-        "an acceptance-stall retry restores queue intent; it clears no failed classification"
+        refused.routes.is_empty(),
+        "a non-resumable hold dispatches nothing"
+    );
+
+    // A retried change is `queued` now, so a second request carries no retryable
+    // evidence, and a duplicate ordinary add is a reducer no-op.
+    assert!(fixture.service.retry_change("failed-change").await.is_err());
+    fixture
+        .service
+        .add_to_queue("stalled-change")
+        .await
+        .expect("duplicate queue add");
+    fixture.service.queue.notify_scheduler().await;
+
+    assert_eq!(
+        fixture.queue.explicit_retry_edges().len(),
+        2,
+        "a refused retry, a reducer no-op, an ordinary add, and a generic wake arm nothing"
     );
 }
 
@@ -1223,8 +1299,11 @@ async fn failed_dependency_retry_edge_reaches_the_real_dynamic_queue_once() {
 
     assert_eq!(
         queue.drain_explicit_retries().await,
-        vec!["change-a".to_string()],
-        "the scheduler receives the retried change ID"
+        vec![crate::tui::queue::ExplicitRetryEdge {
+            change_id: "change-a".to_string(),
+            authority: RetryEdgeAuthority::TerminalError,
+        }],
+        "the scheduler receives the retried change ID with terminal-error authority"
     );
     assert!(
         queue.drain_explicit_retries().await.is_empty(),
@@ -2606,9 +2685,13 @@ async fn settled_apply_limit_bulk_retry_includes_the_limited_target() {
         "each target keeps its own independent route"
     );
     assert_eq!(
-        fixture.queue.explicit_retries(),
-        vec!["limited".to_string(), "ordinary".to_string()],
-        "each admitted terminal error is dispatched exactly once"
+        fixture.queue.explicit_retry_edges(),
+        vec![
+            ("limited".to_string(), RetryEdgeAuthority::TerminalError),
+            ("ordinary".to_string(), RetryEdgeAuthority::TerminalError),
+            ("held".to_string(), RetryEdgeAuthority::AnalysisBypass),
+        ],
+        "each admitted target arms exactly one edge, carrying its own route's authority"
     );
     assert_eq!(fixture.retained_limit("limited").await, None);
 }
