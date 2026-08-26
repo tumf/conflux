@@ -109,9 +109,16 @@ impl QueuePort for RecordingQueue {
 }
 
 /// Queue hooks that record every dispatch, in order.
-#[derive(Debug, Default)]
+///
+/// Optionally they also *cause* one, which is how the classify/apply race is
+/// made deterministic: a hook runs inside an accepted mutation, so a transition
+/// it triggers lands after every row in the batch was classified and before the
+/// remaining rows reach their own write boundary.
+#[derive(Default)]
 struct RecordingHooks {
     calls: Mutex<Vec<HookCall>>,
+    #[allow(clippy::type_complexity)]
+    fail_on_add: Mutex<Option<(String, String, Arc<RwLock<OrchestratorState>>)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +131,11 @@ impl RecordingHooks {
     fn calls(&self) -> Vec<HookCall> {
         self.calls.lock().unwrap().clone()
     }
+
+    /// When `trigger` is queued, fail `victim` terminally in `state`.
+    fn fail_on_add(&self, trigger: &str, victim: &str, state: Arc<RwLock<OrchestratorState>>) {
+        *self.fail_on_add.lock().unwrap() = Some((trigger.to_string(), victim.to_string(), state));
+    }
 }
 
 #[async_trait]
@@ -133,6 +145,18 @@ impl crate::orchestration::operator_command::QueueHookPort for RecordingHooks {
             .lock()
             .unwrap()
             .push(HookCall::Add(change_id.to_string()));
+        let scripted = self.fail_on_add.lock().unwrap().clone();
+        if let Some((trigger, victim, state)) = scripted {
+            if trigger == change_id {
+                state
+                    .write()
+                    .await
+                    .apply_execution_event(&ExecutionEvent::ApplyFailed {
+                        change_id: victim,
+                        error: "boom".to_string(),
+                    });
+            }
+        }
     }
 
     async fn on_queue_remove(&self, change_id: &str) {
@@ -170,6 +194,9 @@ struct ScriptedRuntime {
     batches: Mutex<Vec<Vec<String>>>,
     abandonments: Mutex<Vec<Vec<String>>>,
     marks: Mutex<Vec<String>>,
+    /// Targets the reducer cannot load, classified `NotLoadable` every pass.
+    unloadable: Mutex<Vec<String>>,
+    failures: Mutex<Vec<(MarkSettlementFailure, Vec<String>)>>,
 }
 
 impl ScriptedRuntime {
@@ -202,6 +229,15 @@ impl ScriptedRuntime {
     fn abandonments(&self) -> Vec<Vec<String>> {
         self.abandonments.lock().unwrap().clone()
     }
+
+    /// Declare targets the reducer has no runtime state for.
+    fn set_unloadable(&self, targets: &[&str]) {
+        *self.unloadable.lock().unwrap() = targets.iter().map(|id| (*id).to_string()).collect();
+    }
+
+    fn failures(&self) -> Vec<(MarkSettlementFailure, Vec<String>)> {
+        self.failures.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -216,9 +252,13 @@ impl MarkSettlementRuntime for ScriptedRuntime {
         // does, so a revocation during the deadline is visible in the pass — and
         // only within the batch's scope, which is what the batch is for.
         let marks = self.marks.lock().unwrap().clone();
+        let unloadable = self.unloadable.lock().unwrap().clone();
         let mut plan = MarkSettlementPlan::default();
         for change_id in targets {
-            if marks.contains(&change_id) {
+            if unloadable.contains(&change_id) {
+                plan.excluded
+                    .push((change_id, MarkSettlementExclusion::NotLoadable));
+            } else if marks.contains(&change_id) {
                 plan.additions.push(change_id);
             } else {
                 plan.removals.push(change_id);
@@ -233,6 +273,14 @@ impl MarkSettlementRuntime for ScriptedRuntime {
 
     async fn report_abandoned_settlement(&self, pending: Vec<String>) {
         self.abandonments.lock().unwrap().push(pending);
+    }
+
+    async fn report_settlement_failure(
+        &self,
+        failure: MarkSettlementFailure,
+        targets: Vec<String>,
+    ) {
+        self.failures.lock().unwrap().push((failure, targets));
     }
 }
 
@@ -1076,6 +1124,227 @@ async fn running_mark_reanalysis_abandonment_reports_one_operator_visible_outcom
     );
     assert!(abandonment[0].contains("alpha"));
     assert!(harness.queue.calls().is_empty());
+}
+
+// ============================================================================
+// Settlement lifecycle failures are observable
+// ============================================================================
+
+#[tokio::test(start_paused = true)]
+async fn running_mark_reanalysis_unbound_runtime_reports_a_stable_reason() {
+    // A CLI run or a frontend built before the application transaction exists.
+    // Mark-only is correct here; being unable to say so is not.
+    let coordinator = Arc::new(MarkSettlementCoordinator::new());
+    assert!(!coordinator.notify(vec!["alpha".to_string()]));
+    assert_eq!(
+        coordinator.last_failure(),
+        Some(MarkSettlementFailure::RuntimeUnbound)
+    );
+    assert!(!coordinator.is_armed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_mark_reanalysis_dropped_runtime_reports_a_stable_reason() {
+    let coordinator = Arc::new(MarkSettlementCoordinator::new());
+    {
+        let runtime = Arc::new(ScriptedRuntime::live(&["alpha"]));
+        let weak: std::sync::Weak<ScriptedRuntime> = Arc::downgrade(&runtime);
+        coordinator.bind_runtime(weak);
+    }
+
+    // Bound and then dropped is a different fact from never bound, and only this
+    // one is a defect in a command-capable owner.
+    assert!(!coordinator.notify(vec!["alpha".to_string()]));
+    assert_eq!(
+        coordinator.last_failure(),
+        Some(MarkSettlementFailure::RuntimeGone)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_mark_reanalysis_runtime_lost_under_a_pending_deadline_closes_the_pass() {
+    let coordinator = Arc::new(MarkSettlementCoordinator::new());
+    let runtime = Arc::new(ScriptedRuntime::live(&["alpha"]));
+    let weak: std::sync::Weak<ScriptedRuntime> = Arc::downgrade(&runtime);
+    coordinator.bind_runtime(weak);
+    assert!(coordinator.notify(vec!["alpha".to_string()]));
+
+    // The runtime disappears while the deadline is pending. The batch has
+    // already been taken by the expiring pass, so returning quietly would both
+    // destroy the accepted intent and hang every observer waiting on the pass.
+    advance_within_window().await;
+    drop(runtime);
+
+    settle(&coordinator).await;
+
+    assert_eq!(
+        coordinator.last_failure(),
+        Some(MarkSettlementFailure::RuntimeGone)
+    );
+    assert_eq!(coordinator.abandoned_count(), 1);
+    assert!(!coordinator.is_armed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_mark_reanalysis_unloadable_target_keeps_its_deadline() {
+    // The reducer has no runtime state for the target yet — the catalog is ahead
+    // of it, which is the state a just-created proposal is marked in.
+    let runtime = ScriptedRuntime::live(&["alpha"]);
+    runtime.set_unloadable(&["alpha"]);
+    let harness = TimerHarness::new(runtime);
+    assert!(harness.arm(&["alpha"]));
+
+    settle(&harness.coordinator).await;
+    assert_eq!(
+        harness.coordinator.pending_snapshot(),
+        Some(vec!["alpha".to_string()]),
+        "the absence of evidence is not a settled answer"
+    );
+    assert!(harness.runtime.failures().is_empty());
+
+    // The refresh lands and the row becomes loadable.
+    harness.runtime.set_unloadable(&[]);
+    settle(&harness.coordinator).await;
+
+    assert_eq!(
+        harness.runtime.settlements(),
+        vec![Vec::<String>::new(), vec!["alpha".to_string()]],
+        "the retained batch is admitted as soon as it can be classified"
+    );
+    assert!(!harness.coordinator.is_armed());
+    assert!(harness.runtime.failures().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_mark_reanalysis_unloadable_target_exhausts_a_bounded_budget() {
+    let runtime = ScriptedRuntime::live(&["ghost"]);
+    runtime.set_unloadable(&["ghost"]);
+    let harness = TimerHarness::new(runtime);
+    harness.arm(&["ghost"]);
+
+    for _ in 0..MARK_SETTLEMENT_ATTEMPTS {
+        settle(&harness.coordinator).await;
+    }
+
+    assert_eq!(
+        harness.runtime.batches().len(),
+        MARK_SETTLEMENT_ATTEMPTS as usize,
+        "the retry budget bounds the passes a never-loadable target may cost"
+    );
+    assert_eq!(
+        harness.runtime.failures(),
+        vec![(
+            MarkSettlementFailure::UnreconciledBatch,
+            vec!["ghost".to_string()]
+        )],
+        "the operator is told the accepted mark produced no admission"
+    );
+    assert!(!harness.coordinator.is_armed());
+    settle_expect_no_pass(&harness.coordinator).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_mark_reanalysis_a_later_write_restores_the_attempt_budget() {
+    let runtime = ScriptedRuntime::live(&["alpha"]);
+    runtime.set_unloadable(&["alpha"]);
+    let harness = TimerHarness::new(runtime);
+    harness.arm(&["alpha"]);
+    settle(&harness.coordinator).await;
+
+    // A second accepted operator write is fresh intent, so it is entitled to the
+    // whole budget rather than whatever the first one had left.
+    harness.arm(&["alpha"]);
+    for _ in 0..MARK_SETTLEMENT_ATTEMPTS {
+        settle(&harness.coordinator).await;
+    }
+
+    assert_eq!(
+        harness.runtime.batches().len(),
+        1 + MARK_SETTLEMENT_ATTEMPTS as usize
+    );
+    assert_eq!(
+        harness.runtime.failures(),
+        vec![(
+            MarkSettlementFailure::UnreconciledBatch,
+            vec!["alpha".to_string()]
+        )]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_mark_reanalysis_exhausted_batch_is_operator_visible() {
+    // End to end through the real application transaction: the reason has to
+    // reach the operator, not just the coordinator's diagnostics.
+    let harness = Harness::running(&["alpha"]);
+    harness.operator.apply_execution_mark("ghost", true).await;
+
+    for _ in 0..MARK_SETTLEMENT_ATTEMPTS {
+        settle(&harness.coordinator()).await;
+    }
+
+    let reported: Vec<_> = harness
+        .logs()
+        .into_iter()
+        .filter(|message| message.contains("Mark settlement did not admit"))
+        .collect();
+    assert_eq!(
+        reported.len(),
+        1,
+        "exactly one operator-visible reason: {:?}",
+        harness.logs()
+    );
+    assert!(reported[0].contains("reason=unreconciled_batch"));
+    assert!(reported[0].contains("ghost"));
+    assert!(
+        harness.queue.calls().is_empty(),
+        "an unreconciled batch mutates nothing: {:?}",
+        harness.queue.calls()
+    );
+    assert_eq!(
+        harness.queue_intent("alpha").await,
+        QueueIntent::NotQueued,
+        "an unrelated row keeps its intent throughout the retries"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_mark_reanalysis_write_boundary_refusal_reaches_the_plan() {
+    // Classification and application are two instants, and a lifecycle
+    // transition can land between them. The refusal the write boundary produces
+    // used to be dropped entirely, so a settled batch could report an addition
+    // that never happened — and a caller could not see the refusal at all.
+    //
+    // The race is made deterministic by the queue hook: it runs inside `alpha`'s
+    // accepted mutation, which is after both rows were classified and before
+    // `beta` reaches its own guard.
+    let harness = Harness::running(&["alpha", "beta"]);
+    harness
+        .hooks
+        .fail_on_add("alpha", "beta", harness.state.clone());
+    harness.operator.apply_execution_mark("alpha", true).await;
+    harness.operator.apply_execution_mark("beta", true).await;
+
+    settle(&harness.coordinator()).await;
+
+    let plan = harness.coordinator().last_plan().expect("a pass ran");
+    assert_eq!(
+        plan.additions,
+        vec!["alpha".to_string()],
+        "a refused mutation must not be reported as applied: {plan:?}"
+    );
+    assert_eq!(
+        plan.excluded,
+        vec![("beta".to_string(), MarkSettlementExclusion::Terminal)],
+        "the write boundary's own reason is what the caller gets"
+    );
+    assert_eq!(harness.status("alpha").await, "queued");
+    assert_eq!(harness.status("beta").await, "error");
+    assert_eq!(
+        harness.queue.added(),
+        vec!["alpha".to_string()],
+        "the refused row reached no runtime: {:?}",
+        harness.queue.calls()
+    );
 }
 
 #[tokio::test(start_paused = true)]

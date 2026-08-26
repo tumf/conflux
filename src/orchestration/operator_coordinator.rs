@@ -55,7 +55,8 @@ use crate::events::{
 };
 use crate::orchestration::apply_commit_evidence::ApplyCommitEvidencePort;
 use crate::orchestration::mark_settlement::{
-    MarkSettlementAction, MarkSettlementPlan, MarkSettlementRuntime,
+    MarkSettlementAction, MarkSettlementExclusion, MarkSettlementFailure, MarkSettlementPlan,
+    MarkSettlementRuntime,
 };
 use crate::orchestration::operator_command::{OperatorMode, OperatorOutcome, PendingTermination};
 use crate::orchestration::run_control::{
@@ -966,23 +967,30 @@ impl MarkSettlementRuntime for OperatorApplication {
         // Classification happens outside the application gate; only the derived
         // plan is applied under it. Settlement therefore never holds the gate
         // across a reducer read, and never waits on a base-mutating lane.
-        let plan = self
+        let mut plan = self
             .run_control
             .operator()
             .plan_mark_settlement(&targets)
             .await;
 
-        let mutations = plan
+        let mutations: Vec<(String, MarkSettlementAction)> = plan
             .additions
             .iter()
-            .map(|change_id| (change_id, MarkSettlementAction::Add))
+            .map(|change_id| (change_id.clone(), MarkSettlementAction::Add))
             .chain(
                 plan.removals
                     .iter()
-                    .map(|change_id| (change_id, MarkSettlementAction::Remove)),
-            );
+                    .map(|change_id| (change_id.clone(), MarkSettlementAction::Remove)),
+            )
+            .collect();
 
         let mut applied_membership_change = false;
+        // Reasons the write boundary produced for targets classification had
+        // planned a mutation for. They belong in the returned plan: a target the
+        // guard refused gained no queue effect, so leaving it listed as an
+        // applied addition or removal would be a false claim — and a refusal the
+        // plan never carried is a refusal the caller cannot act on.
+        let mut guard_skipped: Vec<(String, MarkSettlementExclusion)> = Vec::new();
         for (change_id, action) in mutations {
             let application = {
                 // One target, one gate acquisition. Holding the gate across the
@@ -992,11 +1000,14 @@ impl MarkSettlementRuntime for OperatorApplication {
                 let _guard = self.gate.clone().lock_owned().await;
                 self.run_control
                     .operator()
-                    .apply_settlement_queue_intent(change_id, action)
+                    .apply_settlement_queue_intent(&change_id, action)
                     .await
             };
             if application.applied() {
                 applied_membership_change = true;
+            }
+            if let Some(reason) = application.skipped {
+                guard_skipped.push((change_id.clone(), reason));
             }
             // Publish the same queue delta an explicit frontend command
             // publishes, so the TUI and `/api/v2` project `queued` and
@@ -1004,6 +1015,12 @@ impl MarkSettlementRuntime for OperatorApplication {
             // the mark set.
             self.publish_operator_outcome(OperatorOutcome::Queue(application.outcome))
                 .await;
+        }
+
+        for (change_id, reason) in guard_skipped {
+            plan.additions.retain(|planned| planned != &change_id);
+            plan.removals.retain(|planned| planned != &change_id);
+            plan.excluded.push((change_id, reason));
         }
 
         // Exactly one wake for the whole settled batch, and only when membership
@@ -1042,6 +1059,28 @@ impl MarkSettlementRuntime for OperatorApplication {
         self.dispatch
             .dispatch(ExecutionEvent::Log(crate::events::LogEntry::info(format!(
                 "Mark settlement abandoned because the scheduler ended: {targets}"
+            ))))
+            .await;
+    }
+
+    async fn report_settlement_failure(
+        &self,
+        failure: MarkSettlementFailure,
+        targets: Vec<String>,
+    ) {
+        // Operator-facing, unlike the per-row exclusion diagnostic: a row that
+        // settlement reasoned about keeps its mark for a reason the operator can
+        // see on the row itself, but a batch the owner could not carry to a
+        // decision at all is invisible everywhere else.
+        let named = if targets.is_empty() {
+            "no marked change".to_string()
+        } else {
+            targets.join(", ")
+        };
+        self.dispatch
+            .dispatch(ExecutionEvent::Log(crate::events::LogEntry::warn(format!(
+                "Mark settlement did not admit (reason={}): {named}",
+                failure.as_str()
             ))))
             .await;
     }
