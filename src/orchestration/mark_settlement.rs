@@ -35,6 +35,15 @@
 //! because every row that is active, waiting, or terminal is excluded before a
 //! mutation is ever planned.
 //!
+//! *A batch is held until it is answered, not until it is read.* Reconciliation
+//! classifies each target from reducer runtime state, and a mark is accepted
+//! against the *catalog*, which can be ahead of the reducer by a refresh
+//! interval. A target the reducer cannot load yet has therefore produced no
+//! answer at all, so it stays in the batch and the deadline is re-armed, for a
+//! bounded number of attempts. Every other classification — terminal, active,
+//! waiting, already reconciled, worktree-refused — is an answer, and ends the
+//! batch's interest in that target immediately.
+//!
 //! *Nothing here is durable.* The deadline and the pending snapshot live in
 //! memory for one process lifetime. Under `openspec/CONSTITUTION.md` a restart
 //! recomputes the next action from workspace and Git evidence alone, so a
@@ -54,6 +63,22 @@ use crate::orchestration::operator_command::{is_active_status, is_final_status};
 /// but it is an independent *pre-admission* interval — the scheduler's existing
 /// explicit queue-addition bypass is what keeps the two from stacking.
 pub const MARK_STABILITY_WINDOW: Duration = Duration::from_secs(10);
+
+/// How many settlement passes one accepted batch may spend on targets the
+/// reducer has not observed yet.
+///
+/// A mark is accepted against the *catalog*, and the catalog can be ahead of the
+/// reducer: a proposal created seconds ago is markable through the TUI and
+/// `cflx client` before any `ChangesRefreshed` has given it reducer runtime
+/// state. The first pass then classifies it [`MarkSettlementExclusion::NotLoadable`],
+/// which is the absence of evidence rather than evidence — so the batch keeps
+/// its deadline instead of dropping the operator's intent.
+///
+/// Bounded on purpose. A target that never becomes loadable — a mark for a
+/// change ID that does not exist — must stop costing passes and start producing
+/// [`MarkSettlementFailure::UnreconciledBatch`] evidence instead of re-arming
+/// for the rest of the process lifetime.
+pub const MARK_SETTLEMENT_ATTEMPTS: u32 = 3;
 
 // ============================================================================
 // Classification
@@ -96,6 +121,55 @@ impl MarkSettlementExclusion {
             Self::AlreadyQueued => "already_queued",
             Self::AlreadyNotQueued => "already_not_queued",
             Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// Whether this reason is evidence *about* the row, or merely its absence.
+    ///
+    /// Every reason but one is a decision taken over reducer runtime state the
+    /// owner actually holds: terminal, active, waiting, already reconciled, or
+    /// refused by worktree execution. [`Self::NotLoadable`] is the exception —
+    /// it means the reducer has no runtime state for the target at all, which
+    /// says nothing about whether the mark should become queue intent. Treating
+    /// it as a settled answer is what let an accepted mark for a
+    /// just-created proposal stay `not queued` forever: the catalog admitted the
+    /// mark, the deadline expired before the next `ChangesRefreshed`, and the
+    /// batch was discarded a second before the row became loadable.
+    pub fn is_stable(self) -> bool {
+        !matches!(self, Self::NotLoadable)
+    }
+}
+
+/// Why a settlement lifecycle could not carry an accepted batch to a decision.
+///
+/// Distinct from [`MarkSettlementExclusion`], which is a *classification* of a
+/// row that settlement did reach. These are failures of the machinery itself,
+/// and the requirement they exist for is that none of them may present as a
+/// silent mark-only result while the owner reports a live scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkSettlementFailure {
+    /// No settlement runtime was ever bound to this process.
+    ///
+    /// Correct and expected for a CLI run or a unit test; a defect only in a
+    /// command-capable owner, where binding happens right after the application
+    /// transaction is built.
+    RuntimeUnbound,
+    /// The bound runtime was dropped before the batch could be settled.
+    RuntimeGone,
+    /// No async runtime handle was available to own the deadline task.
+    NoTaskRuntime,
+    /// The batch spent its whole attempt budget without becoming loadable.
+    UnreconciledBatch,
+}
+
+impl MarkSettlementFailure {
+    /// Stable machine-readable token for logs, events, and tests.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeUnbound => "runtime_unbound",
+            Self::RuntimeGone => "runtime_gone",
+            Self::NoTaskRuntime => "no_task_runtime",
+            Self::UnreconciledBatch => "unreconciled_batch",
         }
     }
 }
@@ -242,6 +316,24 @@ pub trait MarkSettlementRuntime: Send + Sync {
     /// operator learns that the marks they made will not be reconciled rather
     /// than discovering it from a run that silently did nothing.
     async fn report_abandoned_settlement(&self, pending: Vec<String>);
+
+    /// Report a settlement lifecycle failure with a stable reason.
+    ///
+    /// The counterpart of [`Self::report_abandoned_settlement`] for everything
+    /// that is *not* an orderly scheduler end: a batch that never became
+    /// loadable, or a runtime that vanished under a pending deadline. A
+    /// command-capable owner turns this into an operator-visible entry, because
+    /// the alternative — a mark that stays marked and `not queued` with nothing
+    /// said about it — is the exact failure this whole path exists to prevent.
+    ///
+    /// The default drops it, which is correct for a runtime with no
+    /// operator-facing dispatch behind it.
+    async fn report_settlement_failure(
+        &self,
+        _failure: MarkSettlementFailure,
+        _targets: Vec<String>,
+    ) {
+    }
 }
 
 // ============================================================================
@@ -293,6 +385,13 @@ struct CoordinatorInner {
     abandoned: u64,
     /// The plan the most recent completed pass derived.
     last_plan: Option<MarkSettlementPlan>,
+    /// Passes the current batch has already spent on unloadable targets.
+    ///
+    /// Reset by every accepted operator write, because a fresh write is fresh
+    /// intent and deserves the full budget again.
+    attempts: u32,
+    /// The most recent lifecycle failure, for diagnostics and tests.
+    last_failure: Option<MarkSettlementFailure>,
 }
 
 impl std::fmt::Debug for MarkSettlementCoordinator {
@@ -368,21 +467,32 @@ impl MarkSettlementCoordinator {
     /// guard held, so it must never take the reducer, take that guard again, or
     /// await anything; it records timer state and spawns the settlement task.
     pub fn notify(self: &Arc<Self>, changed: Vec<String>) -> bool {
-        let Some(runtime) = self.runtime() else {
-            return false;
+        let runtime = match self.runtime_or_failure() {
+            Ok(runtime) => runtime,
+            Err(failure) => {
+                self.record_failure(failure, &changed);
+                return false;
+            }
         };
+        // Not a failure: a process with no live scheduler has nothing to admit
+        // work into, so a mark-only result is the correct one.
         if !runtime.admits_dynamic_queue() {
             return false;
         }
         // No runtime handle means no task can be spawned to settle the deadline,
         // and an armed deadline that can never expire would be a lie.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.record_failure(MarkSettlementFailure::NoTaskRuntime, &changed);
             return false;
         };
 
         let generation = {
             let mut guard = self.lock();
             guard.generation += 1;
+            // Fresh operator intent, so the batch gets its whole attempt budget
+            // back: a retry budget spent waiting for an earlier target to become
+            // loadable must not shorten the wait this write is entitled to.
+            guard.attempts = 0;
             let batch = guard.pending.get_or_insert_with(Vec::new);
             for change_id in changed {
                 // Acceptance order, deduplicated: a target marked, unmarked, and
@@ -396,13 +506,18 @@ impl MarkSettlementCoordinator {
             guard.generation
         };
 
+        self.arm(&handle, generation);
+        true
+    }
+
+    /// Spawn the one task that owns `generation`'s deadline.
+    fn arm(self: &Arc<Self>, handle: &tokio::runtime::Handle, generation: u64) {
         let coordinator = self.clone();
         let window = self.window;
         handle.spawn(async move {
             tokio::time::sleep(window).await;
             coordinator.settle(generation).await;
         });
-        true
     }
 
     /// The batch the current deadline is waiting on, if one is pending.
@@ -444,12 +559,54 @@ impl MarkSettlementCoordinator {
         self.passes.subscribe()
     }
 
+    /// The most recent settlement lifecycle failure, if one was recorded.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn last_failure(&self) -> Option<MarkSettlementFailure> {
+        self.lock().last_failure
+    }
+
     fn record_pass(&self) {
         self.passes.send_modify(|passes| *passes += 1);
     }
 
+    /// Record a lifecycle failure and say so with a stable reason token.
+    ///
+    /// `RuntimeUnbound` is the one that is ordinary rather than wrong: a CLI run
+    /// and a unit test both reach it by construction, so it is a debug line
+    /// while the rest are warnings a command-capable owner should never emit.
+    fn record_failure(&self, failure: MarkSettlementFailure, targets: &[String]) {
+        self.lock().last_failure = Some(failure);
+        let reason = failure.as_str();
+        let targets = if targets.is_empty() {
+            "no marked change".to_string()
+        } else {
+            targets.join(", ")
+        };
+        match failure {
+            MarkSettlementFailure::RuntimeUnbound => {
+                tracing::debug!("Mark settlement is mark-only (reason={reason}): {targets}");
+            }
+            _ => tracing::warn!("Mark settlement could not complete (reason={reason}): {targets}"),
+        }
+    }
+
     fn runtime(&self) -> Option<Arc<dyn MarkSettlementRuntime>> {
         self.lock().runtime.as_ref().and_then(Weak::upgrade)
+    }
+
+    /// The bound runtime, or which half of the binding is missing.
+    ///
+    /// "Never bound" and "bound and then dropped" are two different facts about
+    /// a process, and only the second one is a defect in a command-capable
+    /// owner. Collapsing them into `Option` is what made both silent.
+    fn runtime_or_failure(
+        &self,
+    ) -> std::result::Result<Arc<dyn MarkSettlementRuntime>, MarkSettlementFailure> {
+        let bound = self.lock().runtime.clone();
+        match bound {
+            None => Err(MarkSettlementFailure::RuntimeUnbound),
+            Some(weak) => weak.upgrade().ok_or(MarkSettlementFailure::RuntimeGone),
+        }
     }
 
     /// Run one expired deadline, or exit because it was superseded.
@@ -464,7 +621,15 @@ impl MarkSettlementCoordinator {
             }
             guard.pending.take()
         };
+        let batch = batch.unwrap_or_default();
         let Some(runtime) = self.runtime() else {
+            // The batch has already been taken, so returning quietly here would
+            // destroy the operator's accepted intent *and* leave every observer
+            // waiting on a pass that can no longer arrive. Report it and close
+            // the pass instead.
+            self.record_failure(MarkSettlementFailure::RuntimeGone, &batch);
+            self.lock().abandoned += 1;
+            self.record_pass();
             return;
         };
 
@@ -473,18 +638,76 @@ impl MarkSettlementCoordinator {
         // also what keeps the pending deadline from being a termination barrier.
         if !runtime.admits_dynamic_queue() {
             self.lock().abandoned += 1;
-            runtime
-                .report_abandoned_settlement(batch.unwrap_or_default())
-                .await;
+            runtime.report_abandoned_settlement(batch).await;
             self.record_pass();
             return;
         }
 
-        let plan = runtime.settle_marks(batch.unwrap_or_default()).await;
-        {
+        let plan = runtime.settle_marks(batch).await;
+        // Targets the reducer could not even load carry no decision, so the
+        // batch keeps them rather than dropping intent the owner never judged.
+        let unreconciled: Vec<String> = plan
+            .excluded
+            .iter()
+            .filter(|(_, reason)| !reason.is_stable())
+            .map(|(change_id, _)| change_id.clone())
+            .collect();
+
+        let retry = {
             let mut guard = self.lock();
             guard.settled += 1;
             guard.last_plan = Some(plan);
+            if unreconciled.is_empty() {
+                None
+            } else {
+                guard.attempts += 1;
+                if guard.attempts >= MARK_SETTLEMENT_ATTEMPTS {
+                    None
+                } else {
+                    guard.generation += 1;
+                    let pending = guard.pending.get_or_insert_with(Vec::new);
+                    for change_id in &unreconciled {
+                        if !pending.iter().any(|existing| existing == change_id) {
+                            pending.push(change_id.clone());
+                        }
+                    }
+                    Some(guard.generation)
+                }
+            }
+        };
+
+        match retry {
+            // The deadline task is re-armed *before* the pass is published, so an
+            // observer that wakes on the pass already sees the pending batch.
+            Some(generation) => match tokio::runtime::Handle::try_current() {
+                Ok(handle) => self.arm(&handle, generation),
+                // Unreachable in practice — this method only ever runs on a
+                // spawned task — but the batch is deliberately left pending
+                // rather than cleared: with no runtime there is nothing left to
+                // race it, and clearing it here would also discard targets a
+                // concurrent accepted write had merged in.
+                Err(_) => {
+                    self.record_failure(MarkSettlementFailure::NoTaskRuntime, &unreconciled);
+                    runtime
+                        .report_settlement_failure(
+                            MarkSettlementFailure::NoTaskRuntime,
+                            unreconciled,
+                        )
+                        .await;
+                }
+            },
+            None if !unreconciled.is_empty() => {
+                // The budget is spent. Say so with a stable reason rather than
+                // leaving a marked row silently outside the queue forever.
+                self.record_failure(MarkSettlementFailure::UnreconciledBatch, &unreconciled);
+                runtime
+                    .report_settlement_failure(
+                        MarkSettlementFailure::UnreconciledBatch,
+                        unreconciled,
+                    )
+                    .await;
+            }
+            None => {}
         }
         self.record_pass();
     }

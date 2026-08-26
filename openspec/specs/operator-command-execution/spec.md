@@ -144,6 +144,8 @@ The service MUST allow execution-mark mutation in Select and Stopped modes, reso
 
 Every accepted individual, bulk, or API execution-mark mutation MUST add exactly the targets whose marks actually changed to one process-local settlement batch. After the existing stability window, settlement MUST re-read only those named targets from one coherent current snapshot and reconcile each target in both directions: a marked, tracked, parallel-eligible ordinary `not queued` target MUST gain queue intent; an unmarked ordinary pending target whose reducer queue intent is `Queued`, whose activity is idle, and which is outside active, in-flight, lane-wait, retry, MergeWait, ResolveWait, RejectWait, blocked, stalled, terminal, archive-complete, unknown-status, or otherwise ineligible states MUST lose queue intent. Targets not named by the mark-mutation batch MUST retain queue intent, including explicitly queued unmarked targets and marked targets explicitly removed from queue. Unknown or ambiguous status MUST fail closed with stable exclusion evidence.
 
+A command-capable owner whose persistent scheduler is live MUST retain the process-local settlement runtime binding and deadline task until each accepted changed-target batch either reconciles or produces stable observable exclusion evidence. Existing unrelated active work MUST NOT make an ordinary eligible marked target remain silently `not queued`. Frontends MUST NOT require or synthesize another Start to recover such a target. Failure to bind, arm, spawn, upgrade, or execute the settlement runtime MUST be observable with a stable reason.
+
 Settlement-derived queue mutations MUST use an application-time guard under the authoritative reducer write boundary. A removal whose target became active, in-flight, waiting, terminal, or otherwise excluded MUST become a reasoned no-op and MUST NOT clear active lifecycle evidence. An addition whose target became terminal-error or otherwise excluded MUST become a reasoned no-op, MUST NOT route through `RetryError`, and MUST NOT publish an explicit-retry edge. Mark removal MUST NOT cancel, stop, dequeue, alter phase, or clear active lifecycle evidence.
 
 A settled batch with one or more applied queue-membership mutations MUST notify the scheduler exactly once after all mutations; a batch with no applied membership mutation MUST NOT notify it. `on_queue_add` and `on_queue_remove` remain governed by their successful per-target mutation rules. Frontends and settlement MUST NOT start Analyze directly; the scheduler alone applies the capacity, candidate, edge, and runtime-signature rules in `parallel-execution`.
@@ -215,6 +217,23 @@ Bulk execution-mark classification MUST exclude a reducer-recorded archive-compl
 **When**: All target mutations finish
 **Then**: The scheduler receives exactly one notification for the batch
 **And**: A batch with zero applied membership changes emits none
+
+#### Scenario: Running owner settles a newly marked target without another Start
+
+**Given**: A command-capable persistent owner is already running one change and its scheduler remains live
+**And**: Another tracked, parallel-eligible ordinary target is `not queued`
+**When**: TUI, client, or API accepts a changed execution mark for that target and the stability window expires
+**Then**: The target gains reducer queue intent without another Start
+**And**: The scheduler receives exactly one reanalysis notification for the applied batch
+**And**: The unrelated active change and unrelated queue intent remain unchanged
+
+#### Scenario: Settlement lifecycle failure is observable
+
+**Given**: A command-capable owner reports a live persistent scheduler and accepts a changed execution mark
+**When**: Settlement cannot bind, arm, spawn, upgrade, or execute its runtime before reconciliation
+**Then**: The owner exposes a stable reason for the incomplete settlement
+**And**: It does not silently present the target as marked and `not queued` indefinitely
+**And**: It does not synthesize Start, Retry, cancellation, or dequeue
 
 <!-- Expected canonical result after archive: settled Apply-limit diagnostics remain observable but no longer prevent a later explicit retry from creating a fresh execution boundary, and mark/queue classification treats a settled limited row exactly as an ordinary terminal-error row. -->
 

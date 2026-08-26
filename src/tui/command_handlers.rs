@@ -1031,6 +1031,75 @@ mod tests {
         }
     }
 
+    /// The production [`DynamicQueue`] port with its scheduler wakes counted.
+    ///
+    /// Pure passthrough: every call reaches the same queue instance the harness
+    /// hands back as `queue`, so nothing observable changes. What it adds is the
+    /// one fact the real queue cannot answer — `tokio::sync::Notify` stores at
+    /// most one permit, so "the scheduler was woken exactly once for this
+    /// settled batch" is not derivable from the queue itself.
+    pub(super) struct CountingQueue {
+        inner: DynamicQueue,
+        wakes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingQueue {
+        fn new(inner: DynamicQueue) -> Self {
+            Self {
+                inner,
+                wakes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Scheduler wakes emitted through the queue port since construction.
+        pub(super) fn wakes(&self) -> usize {
+            self.wakes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::orchestration::operator_command::QueuePort for CountingQueue {
+        async fn add(&self, change_id: &str) -> bool {
+            crate::orchestration::operator_command::QueuePort::add(&self.inner, change_id).await
+        }
+
+        async fn remove(&self, change_id: &str) -> bool {
+            crate::orchestration::operator_command::QueuePort::remove(&self.inner, change_id).await
+        }
+
+        async fn request_cancellation(
+            &self,
+            change_id: &str,
+        ) -> std::result::Result<
+            Option<crate::orchestration::operator_command::TerminationWaiter>,
+            String,
+        > {
+            crate::orchestration::operator_command::QueuePort::request_cancellation(
+                &self.inner,
+                change_id,
+            )
+            .await
+        }
+
+        async fn notify_scheduler(&self) {
+            self.wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::orchestration::operator_command::QueuePort::notify_scheduler(&self.inner).await;
+        }
+
+        async fn publish_explicit_retry(
+            &self,
+            change_id: &str,
+            authority: crate::orchestration::operator_command::RetryEdgeAuthority,
+        ) {
+            crate::orchestration::operator_command::QueuePort::publish_explicit_retry(
+                &self.inner,
+                change_id,
+                authority,
+            )
+            .await;
+        }
+    }
+
     /// Everything a TUI adapter test needs, wired to one recording scheduler.
     ///
     /// The adapter under test is given exactly the production services; only the
@@ -1039,6 +1108,8 @@ mod tests {
     pub(super) struct AdapterHarness {
         pub(super) state: Arc<RwLock<OrchestratorState>>,
         pub(super) queue: DynamicQueue,
+        /// The same queue as a counted port, as the operator service sees it.
+        pub(super) queue_port: Arc<CountingQueue>,
         pub(super) scheduler: Arc<RecordingScheduler>,
         pub(super) run_control: Arc<RunControlService>,
         /// The one application transaction both adapters submit to.
@@ -1167,10 +1238,11 @@ mod tests {
                 PathBuf::from("."),
                 tx.clone(),
             );
+            let queue_port = Arc::new(CountingQueue::new(queue.clone()));
             let operator = Arc::new(
                 OperatorCommandService::new(
                     state.clone(),
-                    Arc::new(queue.clone()),
+                    queue_port.clone(),
                     Arc::new(HookRunnerQueueHooks::new(hook_runner)),
                     marks.clone(),
                 )
@@ -1234,6 +1306,7 @@ mod tests {
             Self {
                 state,
                 queue,
+                queue_port,
                 scheduler,
                 run_control,
                 application,
