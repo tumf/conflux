@@ -156,6 +156,16 @@ pub enum Outcome {
     EvidenceError,
     /// The change reached a terminal rejection.
     ChangeRejected,
+    /// The observed change cannot advance without a new operator action.
+    ///
+    /// Distinct from [`Self::ChangeRejected`], which is one specific verdict,
+    /// and from [`Self::Timeout`], which says only that a clock ran out. This
+    /// says the owner has stopped: the row is `error`, `merge wait`, `stopped`,
+    /// `stalled`, or a final success row whose repository evidence never
+    /// materialized, and no amount of further observing will change it. A wait
+    /// that kept holding there would be reporting the absence of an operator as
+    /// if it were progress.
+    ChangeRequiresAction,
     /// The owner reported a fatal process-level error.
     ProcessFailed,
     /// The deadline passed with no terminal outcome.
@@ -205,6 +215,7 @@ impl Outcome {
             Self::UnsupportedTerminalMode => "unsupported_terminal_mode",
             Self::EvidenceError => "evidence_error",
             Self::ChangeRejected => "change_rejected",
+            Self::ChangeRequiresAction => "change_requires_action",
             Self::ProcessFailed => "process_failed",
             Self::Timeout => "timeout",
             Self::FeatureUnavailable => "feature_unavailable",
@@ -272,6 +283,7 @@ impl Outcome {
             Self::TransportError => 21,
             Self::TransportNotPermitted => 25,
             Self::UnsupportedOwner => 26,
+            Self::ChangeRequiresAction => 27,
         }
     }
 }
@@ -281,7 +293,7 @@ impl Outcome {
 /// Read by the CLI's own contract assertions, which is what stops an added
 /// variant from silently reusing an exit status.
 #[allow(dead_code)] // Read by the outcome-contract assertions, not by the binary.
-pub const ALL_OUTCOMES: [Outcome; 30] = [
+pub const ALL_OUTCOMES: [Outcome; 31] = [
     Outcome::Observed,
     Outcome::Completed,
     Outcome::Subscribed,
@@ -305,6 +317,7 @@ pub const ALL_OUTCOMES: [Outcome; 30] = [
     Outcome::UnsupportedTerminalMode,
     Outcome::EvidenceError,
     Outcome::ChangeRejected,
+    Outcome::ChangeRequiresAction,
     Outcome::ProcessFailed,
     Outcome::Timeout,
     Outcome::FeatureUnavailable,
@@ -502,6 +515,28 @@ mod tests {
                 "unchanged",
                 "accepted",
             ]
+        );
+    }
+
+    /// The manual-action release is a *refusal*, and its exit status is part of
+    /// the contract a shell script branches on without parsing JSON.
+    #[test]
+    fn a_manual_action_release_is_an_unsuccessful_outcome_with_its_own_status() {
+        assert!(!Outcome::ChangeRequiresAction.is_success());
+        assert_eq!(Outcome::ChangeRequiresAction.exit_code(), 27);
+        assert_eq!(
+            Outcome::ChangeRequiresAction.as_str(),
+            "change_requires_action"
+        );
+        // Never collapsed into the two neighbours it is easiest to confuse with:
+        // one names a verdict, the other names a clock.
+        assert_ne!(
+            Outcome::ChangeRequiresAction.exit_code(),
+            Outcome::ChangeRejected.exit_code()
+        );
+        assert_ne!(
+            Outcome::ChangeRequiresAction.exit_code(),
+            Outcome::Timeout.exit_code()
         );
     }
 

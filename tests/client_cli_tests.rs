@@ -670,6 +670,16 @@ mod enabled {
         /// Advances applied just before each command POST reaches the handler,
         /// popped in order; an exhausted script injects nothing.
         before_command: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
+        /// Advances applied just before each `GET /api/v2/state` reaches the
+        /// handler, popped in order; an exhausted script injects nothing.
+        ///
+        /// `/state` is the last resource every observation reads, and exactly
+        /// one is read per observation, so the Nth entry of this script runs
+        /// strictly after the (N-1)th observation was fully evaluated and
+        /// strictly before the Nth one is. That is the only way to place a
+        /// *repository* change between two of the client's own verification
+        /// rounds without racing a clock against a `git commit`.
+        before_state: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl ApiSpy {
@@ -679,6 +689,10 @@ mod enabled {
 
         fn inject_before_commands(&self, script: Vec<Box<dyn Fn() + Send + Sync>>) {
             *self.before_command.lock().unwrap() = script;
+        }
+
+        fn inject_before_state_reads(&self, script: Vec<Box<dyn Fn() + Send + Sync>>) {
+            *self.before_state.lock().unwrap() = script;
         }
 
         fn requests(&self) -> Vec<String> {
@@ -700,6 +714,16 @@ mod enabled {
                 .lock()
                 .unwrap()
                 .push(format!("{method} {path}"));
+
+            if method == "GET" && path == "/api/v2/state" {
+                let advance = {
+                    let mut script = self.before_state.lock().unwrap();
+                    (!script.is_empty()).then(|| script.remove(0))
+                };
+                if let Some(advance) = advance {
+                    advance();
+                }
+            }
 
             // Everything else is forwarded untouched: buffering a body here
             // would break the streaming endpoints this router also serves.
@@ -3091,17 +3115,7 @@ mod enabled {
 
         /// Archive the change: entry present, active directory gone.
         fn archive(&self, change_id: &str) {
-            let _ = std::fs::remove_dir_all(
-                self.dir
-                    .path()
-                    .join(format!("openspec/changes/{change_id}")),
-            );
-            self.write(
-                &format!("openspec/changes/archive/2026-01-01-{change_id}/proposal.md"),
-                "# Proposal\n",
-            );
-            self.git(&["add", "-A"]);
-            self.git(&["commit", "-m", "archive change"]);
+            archive_in(self.dir.path(), change_id);
         }
 
         /// Leave both the archive entry and the active directory in place.
@@ -3116,6 +3130,35 @@ mod enabled {
             );
             self.git(&["add", "-A"]);
             self.git(&["commit", "-m", "contradictory"]);
+        }
+    }
+
+    /// Archive one change in `repo`: archive entry present, active directory gone.
+    ///
+    /// A free function rather than a method so an [`ApiSpy`] hook — which owns
+    /// nothing but a path — can land this repository change at one exact point
+    /// in the client's request sequence.
+    fn archive_in(repo: &Path, change_id: &str) {
+        let _ = std::fs::remove_dir_all(repo.join(format!("openspec/changes/{change_id}")));
+        let archived = repo.join(format!(
+            "openspec/changes/archive/2026-01-01-{change_id}/proposal.md"
+        ));
+        std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        std::fs::write(archived, "# Proposal\n").unwrap();
+        for args in [
+            ["add", "-A"].as_slice(),
+            ["commit", "-m", "archive change"].as_slice(),
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git must be available");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -3367,6 +3410,244 @@ mod enabled {
             .unwrap()
             .contains("rejected in review"));
         assert_eq!(spy.call_count(), 0, "wait must never retry a rejection");
+        owner.stop().await;
+    }
+
+    /// The rows this owner has already settled or parked, each released on the
+    /// very first observation.
+    ///
+    /// Unbounded on purpose: with no deadline to reach there is no `timeout`
+    /// outcome available, so a result arriving at all is proof the wait
+    /// classified the row rather than outlasting a clock.
+    #[tokio::test]
+    async fn wait_releases_immediately_on_every_status_that_needs_an_operator() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+        let head_before = repo.git(&["rev-parse", "HEAD"]);
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.contract(merged_contract("main"));
+
+        for (status, error_detail) in [
+            ("error", Some("the apply phase exited non-zero")),
+            ("merge wait", Some("conflicting hunk in src/lib.rs")),
+            ("stopped", None),
+            ("stalled", None),
+        ] {
+            let mut row = change("alpha", "select", status);
+            row.error_detail = error_detail.map(str::to_string);
+            owner.publish(snapshot("select", vec![row]));
+
+            let output = spawn_wait(&owner, repo.path(), "alpha", None)
+                .await
+                .unwrap();
+            let parsed = envelope(&output);
+            assert_eq!(
+                parsed["outcome"],
+                "change_requires_action",
+                "'{status}' must release the caller, stderr={}",
+                stderr_of(&output)
+            );
+            assert_eq!(output.status.code(), Some(27), "status '{status}'");
+            assert!(!parsed["ok"].as_bool().unwrap(), "status '{status}'");
+            // The observed status is the fact a caller branches on: a conflict
+            // to resolve and a failed apply need different operators.
+            assert_eq!(parsed["detail"]["observed_status"], status);
+            assert_eq!(parsed["detail"]["commands_submitted"], 0);
+            match error_detail {
+                Some(detail) => assert_eq!(parsed["detail"]["error_detail"], detail),
+                None => assert!(
+                    parsed["detail"].get("error_detail").is_none(),
+                    "'{status}' published no detail, so none must be invented"
+                ),
+            }
+        }
+
+        assert_eq!(spy.call_count(), 0, "wait must submit no command");
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD"]),
+            head_before,
+            "wait must not touch the repository on its way out"
+        );
+        owner.stop().await;
+    }
+
+    /// The same classification on a later observation, not only the first.
+    ///
+    /// A wait that only read the initial snapshot would hold forever on work
+    /// that failed one second after it started — the common case, since a caller
+    /// normally starts waiting while the change is still moving.
+    #[tokio::test]
+    async fn wait_releases_when_a_live_change_transitions_into_a_manual_action_row() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "applying")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let waiting = spawn_wait(&owner, repo.path(), "alpha", None);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !waiting.is_finished(),
+            "an active phase must keep the wait observing"
+        );
+
+        let mut failed = change("alpha", "select", "error");
+        failed.error_detail = Some("acceptance never passed".to_string());
+        owner.publish(snapshot("select", vec![failed]));
+
+        let output = waiting.await.unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "change_requires_action",
+            "stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(27));
+        assert_eq!(parsed["detail"]["observed_status"], "error");
+        assert_eq!(parsed["detail"]["error_detail"], "acceptance never passed");
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// The other half of the same rule: a row the owner can still advance keeps
+    /// the wait observing, and the only thing that ends it is the deadline the
+    /// caller asked for.
+    ///
+    /// Run concurrently against one owner because the three cases are
+    /// independent, and a caller's deadline is the assertion in each.
+    #[tokio::test]
+    async fn wait_keeps_observing_every_status_the_owner_can_still_advance() {
+        let repo = Fixture::new();
+        repo.stage_active("held-not-queued");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![
+                change("held-not-queued", "select", "not queued"),
+                change("held-blocked", "select", "blocked"),
+                change("held-applying", "select", "applying"),
+            ],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let (not_queued, blocked, applying) = tokio::join!(
+            wait_for(&owner, repo.path(), "held-not-queued", "250ms"),
+            wait_for(&owner, repo.path(), "held-blocked", "250ms"),
+            wait_for(&owner, repo.path(), "held-applying", "250ms"),
+        );
+        for (output, change_id) in [
+            (&not_queued, "held-not-queued"),
+            (&blocked, "held-blocked"),
+            (&applying, "held-applying"),
+        ] {
+            let parsed = envelope(output);
+            assert_eq!(
+                parsed["outcome"],
+                "timeout",
+                "'{change_id}' must keep observing until the caller's deadline, stderr={}",
+                stderr_of(output)
+            );
+            assert_eq!(output.status.code(), Some(19), "{change_id}");
+        }
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// A settled `merged` row the repository will not certify is released, not
+    /// held: the owner published its last word, so no later event is coming.
+    #[tokio::test]
+    async fn wait_releases_a_settled_merged_row_whose_evidence_never_arrives() {
+        let repo = Fixture::new();
+        // Active directory present, no archive entry anywhere: the row claims a
+        // merge the repository does not show.
+        repo.stage_active("alpha");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "merged")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let output = spawn_wait(&owner, repo.path(), "alpha", None)
+            .await
+            .unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "change_requires_action",
+            "an unbounded wait must not hold on an uncertifiable settled row, stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(27));
+        assert_eq!(parsed["detail"]["observed_status"], "merged");
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        // And it says what the repository actually reported, rather than only
+        // that something was wrong.
+        assert!(
+            !parsed["detail"]["error_detail"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+            "the oracle's own reason must survive into the release: {parsed}"
+        );
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// Publication landing just after the row moved is a real race, and the one
+    /// bounded re-certification exists for it.
+    ///
+    /// The archive is injected by request ordering rather than by a sleep: it
+    /// runs immediately before the second observation's `/state` read, which is
+    /// strictly after the first certification failed and strictly before the
+    /// second one runs. No wall clock decides the outcome.
+    #[tokio::test]
+    async fn wait_certifies_a_merged_row_whose_evidence_lands_between_two_observations() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let api = ApiSpy::new();
+        let spy = SpyExecutor::new();
+        let owner = Owner::start_intercepted(Some(spy.clone()), None, api.clone()).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "merged")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let repo_path = repo.path().to_path_buf();
+        api.inject_before_state_reads(vec![
+            // The first observation reads an unarchived repository.
+            Box::new(|| {}),
+            // The evidence arrives before the second one does.
+            Box::new(move || archive_in(&repo_path, "alpha")),
+        ]);
+
+        let output = spawn_wait(&owner, repo.path(), "alpha", None)
+            .await
+            .unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "completed",
+            "late evidence must still certify, stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(spy.call_count(), 0);
         owner.stop().await;
     }
 
@@ -4942,6 +5223,60 @@ mod enabled {
     // ========================================================================
     // documentation
     // ========================================================================
+
+    /// The rule a caller cannot infer from an envelope it has never seen.
+    ///
+    /// Named `wait_*` so it runs under the same filter the wait behaviour does:
+    /// the contract and the sentence describing it fail together or not at all.
+    #[test]
+    fn wait_documentation_states_which_statuses_hold_and_which_release() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let agents = std::fs::read_to_string(repo_root.join("AGENTS.md")).expect("AGENTS.md");
+        let readme = std::fs::read_to_string(repo_root.join("README.md")).expect("README.md");
+
+        for (document, name) in [(&agents, "AGENTS.md"), (&readme, "README.md")] {
+            assert!(
+                document.contains("change_requires_action"),
+                "{name} must name the new outcome a script has to branch on"
+            );
+            assert!(
+                document.contains("`27`"),
+                "{name} must give the exit status a shell branches on"
+            );
+            for released in ["error", "merge wait", "stopped", "stalled"] {
+                assert!(
+                    document.contains(released),
+                    "{name} must name '{released}' as a status that releases"
+                );
+            }
+            for held in ["queued", "blocked", "applying", "archiving"] {
+                assert!(
+                    document.contains(held),
+                    "{name} must name '{held}' as a status that keeps observing"
+                );
+            }
+            assert!(
+                document.contains("observed_status"),
+                "{name} must name the detail field that says which status released"
+            );
+            // The release must never read as an invitation to repair.
+            assert!(
+                document.contains("not repairing") || document.contains("not a repair"),
+                "{name} must say releasing is still observation-only"
+            );
+        }
+
+        let cwd = neutral_cwd();
+        let help = stdout_of(&run_cli(cwd.path(), &["client", "wait", "--help"], &[]));
+        assert!(
+            help.contains("change_requires_action"),
+            "`client wait --help` must document the new outcome, got:\n{help}"
+        );
+        assert!(
+            help.contains("merge wait") && help.contains("stalled"),
+            "`client wait --help` must say which rows release, got:\n{help}"
+        );
+    }
 
     #[test]
     fn documentation_recommends_the_client_for_existing_owner_delegation() {

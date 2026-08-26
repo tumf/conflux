@@ -86,8 +86,9 @@ each outcome has its own stable exit status. Operations are `status`,
 `owner_not_running`, `owner_not_command_capable`, `owner_restarted`,
 `change_not_found`, `target_ineligible`, `revision_conflict`,
 `transport_not_permitted`, `unsupported_owner`, `partial_intent`,
-`observation_conflict`, `evidence_error`, `change_rejected`, `process_failed`,
-`timeout`, `usage_error` — is a non-zero refusal.
+`observation_conflict`, `evidence_error`, `change_rejected`,
+`change_requires_action`, `process_failed`, `timeout`, `usage_error` — is a
+non-zero refusal.
 
 A multi-target request names no single `change_id`; `detail.targets` lists each
 proposal with whether it changed and why. A mark result never carries an
@@ -109,6 +110,26 @@ resolve, archive, merge, or cleanup command, and returns `completed` only when
 current Git/OpenSpec evidence proves the owner's declared terminal mode
 (`merged`, `base_published`, or `branch_pushed`) was reached. A change
 disappearing from the snapshot is never completion.
+
+**`wait` waits for the owner, not for you.** It keeps observing exactly the rows
+this owner can still advance by itself — `not queued`, `queued`, `blocked`,
+`applying`, `accepting`, `rejecting`, `archiving`, `resolving` — and releases the
+caller as soon as the row is one only a new operator action can move. `error`,
+`merge wait`, `stopped`, and `stalled` return `change_requires_action` with exit
+status `27`, carrying `detail.observed_status`, `detail.error_detail` when the
+owner published one, and `detail.commands_submitted: 0`; `rejected` keeps its own
+`change_rejected`. Releasing is still not repairing: no start, retry, queue,
+resolve, archive, merge, or cleanup command is submitted on the way out, and what
+to do about a parked change remains the operator's decision. The classification
+runs on the first observation and on every later coherent one, so waiting on a
+change that was already parked before you asked reports it immediately instead of
+hanging until your deadline. A settled `merged`, `pushed`, or `archived` row is
+still only a claim: it is certified against the repository, gets one bounded
+re-observation and re-certification for evidence that landed just after the row
+moved, and then returns either `completed` or the same `change_requires_action`
+rather than holding forever on a verdict nobody will revise. Script the new
+outcome: an automatically progressing wait behaves exactly as before, but a
+change that needs a human now says so instead of never returning.
 
 **`wait` has no deadline unless you ask for one.** `--timeout` defaults to `0`,
 and `0` in any unit — `0`, `0s`, `0ms`, `0m`, `0h` — means "wait for as long as

@@ -1161,6 +1161,15 @@ pub enum ClientCommands {
     /// for the owner's terminal mode; a change merely disappearing from the
     /// snapshot is never completion.
     ///
+    /// It observes while the owner can still advance the change on its own —
+    /// `not queued`, `queued`, `blocked`, and the active phases — and releases
+    /// as soon as the row is one only a new operator action can move: `error`,
+    /// `merge wait`, `stopped`, and `stalled` return `change_requires_action`
+    /// with exit status 27 and the observed status in `detail`, while `rejected`
+    /// keeps `change_rejected`. Releasing is not repairing; nothing is submitted
+    /// on the way out. The same classification runs on the first observation, so
+    /// waiting on an already-parked change reports it rather than hanging.
+    ///
     /// There is no deadline unless one is asked for: `--timeout` defaults to 0,
     /// which waits for as long as the work takes. `--timeout D` adds one
     /// operation deadline whose expiry is the typed `timeout` outcome. Either

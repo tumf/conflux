@@ -23,6 +23,19 @@
 //! needs a push, that is an operator's decision, and a waiter that quietly made
 //! it would be an owner wearing a client's name.
 //!
+//! # Waiting for the owner, not for the operator
+//!
+//! Refusing to act on a parked change is not the same as refusing to *report*
+//! one. `error`, `merge wait`, `stopped`, and `stalled` are rows this owner will
+//! not advance by itself, so an observer sitting on them is waiting for a human
+//! who does not know they are being waited for — the caller learns nothing, and
+//! an unbounded wait learns nothing forever. Those release immediately with
+//! `change_requires_action`, carrying the observed status so the caller can tell
+//! a conflict from a failure. Everything the owner can still move on its own —
+//! the active phases, `queued`, `blocked`, and any status a future owner adds —
+//! keeps observing, because giving up on live work is the opposite mistake and
+//! the more expensive one.
+//!
 //! # One deadline, not several budgets
 //!
 //! `--timeout D` is a promise about the whole operation, so exactly one
@@ -54,7 +67,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::bounded_git::GitDeadline;
-use crate::client::completion::{certify, claims_terminal_success, Verdict};
+use crate::client::completion::{
+    certify, classify, is_settled_success_claim, Disposition, Verdict,
+};
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
 use crate::client::session::{observe, Connection, Observation};
 use crate::client::transport::Wake;
@@ -78,6 +93,14 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// Generous on purpose — expiry costs a respawn on the next poll, so the only
 /// way this can hurt is by being *shorter* than a slow-but-healthy `ls-remote`.
 const GIT_INVOCATION_BUDGET: Duration = Duration::from_secs(30);
+
+/// How many coherent observations a settled success row gets before release.
+///
+/// Two: the one that found the row, and one more. A settled row is the owner's
+/// last word, so the only thing a second look can add is evidence that landed
+/// in the gap — a push completing just after the status moved. A third look
+/// would be polling a verdict nobody is going to revise.
+const UNCERTIFIED_CLAIM_ROUNDS: usize = 2;
 
 /// Run one step under the operation deadline, if there is one.
 ///
@@ -158,6 +181,10 @@ pub async fn run(
     };
 
     let mut observation = initial;
+    // How many consecutive rounds a settled success row went uncertified. The
+    // second one is the last: the row cannot change, so a third look would read
+    // the same two facts again.
+    let mut uncertified_rounds = 0usize;
     loop {
         match evaluate(
             &observation,
@@ -173,7 +200,29 @@ pub async fn run(
             Step::Expired { detail } => {
                 return timeout_envelope(change_id, &instance_id, timeout, detail)
             }
+            Step::UncertifiedClaim { status, detail } => {
+                uncertified_rounds += 1;
+                if uncertified_rounds >= UNCERTIFIED_CLAIM_ROUNDS {
+                    return requires_action_envelope(
+                        change_id,
+                        &instance_id,
+                        &status,
+                        Some(detail),
+                        format!(
+                            "'{change_id}' is at settled status '{status}', but repository \
+                             evidence still does not prove completion"
+                        ),
+                    );
+                }
+                if reached(deadline) {
+                    return timeout_envelope(change_id, &instance_id, timeout, Some(detail));
+                }
+            }
             Step::KeepObserving { detail } => {
+                // A row that moved back into live work starts the allowance
+                // over: the next settled claim is a new claim, not the tail of
+                // the previous one.
+                uncertified_rounds = 0;
                 if reached(deadline) {
                     return timeout_envelope(change_id, &instance_id, timeout, detail);
                 }
@@ -254,6 +303,12 @@ enum Step {
     Settled(Box<ResultEnvelope>),
     /// Nothing terminal yet; `detail` explains what is still missing.
     KeepObserving { detail: Option<String> },
+    /// A settled success row the repository did not certify.
+    ///
+    /// Separate from [`Self::KeepObserving`] because the *row* will not move
+    /// again: the loop grants exactly one more coherent observation and then
+    /// releases the caller, instead of polling a verdict that is already final.
+    UncertifiedClaim { status: String, detail: String },
     /// The operation deadline passed inside repository verification.
     Expired { detail: Option<String> },
 }
@@ -317,32 +372,48 @@ async fn evaluate(
     }
 
     let change = observation.change(change_id);
+    let status = change.map(|change| change.display_status.as_str());
+    let error_detail = change.and_then(|change| change.error_detail.clone());
 
-    if change.is_some_and(|change| change.display_status == "rejected") {
-        let detail = change
-            .and_then(|change| change.error_detail.clone())
-            .unwrap_or_else(|| "the change was rejected".to_string());
-        return Step::settled(
-            ResultEnvelope::new(Operation::Wait, Outcome::ChangeRejected)
-                .with_change(change_id)
-                .with_instance(Some(instance_id.to_string()))
-                .with_message(detail),
-        );
-    }
-
-    // Verification is not free, so it runs when the owner claims a terminal
-    // success or when the change stopped being tracked at all. Disappearance is
-    // the case that matters: it proves nothing on its own, and treating it as
-    // success is the exact bug this contract exists to prevent.
-    if !claims_terminal_success(change.map(|change| change.display_status.as_str())) {
-        return Step::KeepObserving {
-            detail: change.map(|change| {
+    match classify(status) {
+        Disposition::Rejected => {
+            let detail = error_detail.unwrap_or_else(|| "the change was rejected".to_string());
+            return Step::settled(
+                ResultEnvelope::new(Operation::Wait, Outcome::ChangeRejected)
+                    .with_change(change_id)
+                    .with_instance(Some(instance_id.to_string()))
+                    .with_message(detail),
+            );
+        }
+        // The owner has stopped here and will not resume on its own, so holding
+        // on would be waiting for an operator rather than for the work. Nothing
+        // is submitted on the way out: deciding what to do about a parked change
+        // is exactly the decision a client must not make.
+        Disposition::RequiresAction => {
+            let status = status.unwrap_or_default();
+            return Step::settled(requires_action_envelope(
+                change_id,
+                instance_id,
+                status,
+                error_detail,
                 format!(
-                    "'{change_id}' is at status '{}' with no terminal evidence yet",
-                    change.display_status
-                )
-            }),
-        };
+                    "'{change_id}' is at status '{status}', which the owner cannot advance without \
+                     a new operator action"
+                ),
+            ));
+        }
+        Disposition::KeepObserving => {
+            return Step::KeepObserving {
+                detail: status.map(|status| {
+                    format!("'{change_id}' is at status '{status}' with no terminal evidence yet")
+                }),
+            }
+        }
+        // Verification is not free, so it runs when the owner claims a terminal
+        // success or when the change stopped being tracked at all. Disappearance
+        // is the case that matters: it proves nothing on its own, and treating
+        // it as success is the exact bug this contract exists to prevent.
+        Disposition::Certify => {}
     }
 
     match certify(change_id, repo_root, contract, git_deadline(deadline)).await {
@@ -352,6 +423,17 @@ async fn evaluate(
             contract,
             evidence,
         )),
+        // A settled success row that the repository will not back is the one
+        // "not finished" that never finishes: the owner published its verdict
+        // and has nothing left to publish. It gets one more coherent look — a
+        // push landing a few milliseconds after the row moved is a real race —
+        // and then it is released rather than held forever.
+        Verdict::NotCompleted { detail } if is_settled_success_claim(status) => {
+            Step::UncertifiedClaim {
+                status: status.unwrap_or_default().to_string(),
+                detail,
+            }
+        }
         Verdict::NotCompleted { detail } => Step::KeepObserving {
             detail: Some(detail),
         },
@@ -392,6 +474,38 @@ fn completed_envelope(
         .with_change(change_id)
         .with_instance(Some(instance_id.to_string()))
         .with_message(evidence)
+        .with_detail(detail)
+}
+
+/// The release that says "an operator has to look at this".
+///
+/// It reports the observed status rather than prose, because that is the fact a
+/// caller branches on: `merge wait` needs a conflict resolved, `error` needs a
+/// retry decision, and a settled success row with no evidence needs someone to
+/// look at the repository. `commands_submitted: 0` is stated here for the same
+/// reason every other wait result states it — the release is an observation,
+/// and nothing about reaching it moved the change.
+fn requires_action_envelope(
+    change_id: &str,
+    instance_id: &str,
+    observed_status: &str,
+    error_detail: Option<String>,
+    message: String,
+) -> ResultEnvelope {
+    let mut detail = serde_json::json!({
+        "observed_status": observed_status,
+        "commands_submitted": 0,
+    });
+    if let (Some(object), Some(error_detail)) = (detail.as_object_mut(), error_detail) {
+        object.insert(
+            "error_detail".to_string(),
+            serde_json::Value::String(error_detail),
+        );
+    }
+    ResultEnvelope::new(Operation::Wait, Outcome::ChangeRequiresAction)
+        .with_change(change_id)
+        .with_instance(Some(instance_id.to_string()))
+        .with_message(message)
         .with_detail(detail)
 }
 
@@ -489,6 +603,45 @@ mod tests {
         assert!(message.contains("within 90000ms"), "{message}");
         assert!(message.contains("no archive entry"), "{message}");
         assert_eq!(envelope.detail["commands_submitted"], 0);
+    }
+
+    #[test]
+    fn a_manual_action_release_names_the_status_and_submits_nothing() {
+        let envelope = requires_action_envelope(
+            "alpha",
+            "i-1",
+            "merge wait",
+            Some("conflict in src/lib.rs".to_string()),
+            "needs an operator".to_string(),
+        );
+        assert_eq!(envelope.outcome, Outcome::ChangeRequiresAction);
+        assert!(!envelope.ok);
+        assert_eq!(envelope.exit_code(), 27);
+        assert_eq!(envelope.change_id.as_deref(), Some("alpha"));
+        assert_eq!(envelope.detail["observed_status"], "merge wait");
+        assert_eq!(envelope.detail["error_detail"], "conflict in src/lib.rs");
+        assert_eq!(envelope.detail["commands_submitted"], 0);
+    }
+
+    /// Absent detail is omitted rather than nulled, the way every other optional
+    /// field in this contract is: a caller testing for presence must not have to
+    /// also test for `null`.
+    #[test]
+    fn a_manual_action_release_omits_error_detail_when_the_owner_published_none() {
+        let envelope =
+            requires_action_envelope("alpha", "i-1", "stopped", None, "stopped".to_string());
+        let detail = envelope.detail.as_object().unwrap();
+        assert!(!detail.contains_key("error_detail"));
+        assert_eq!(detail["observed_status"], "stopped");
+        assert_eq!(detail["commands_submitted"], 0);
+    }
+
+    /// One extra look, not a poll loop: the row is the owner's last word, so the
+    /// only thing a second observation can add is evidence that landed in the
+    /// gap between the status moving and the push completing.
+    #[test]
+    fn a_settled_success_claim_gets_exactly_one_second_look() {
+        assert_eq!(UNCERTIFIED_CLAIM_ROUNDS, 2);
     }
 
     #[test]
