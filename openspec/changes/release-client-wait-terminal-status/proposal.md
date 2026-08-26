@@ -42,15 +42,15 @@ A bounded status-classification correction to `cflx client wait`, with typed non
 1. Classify observed per-change statuses by whether the current owner can still advance them without a new operator command.
 2. Keep observing statuses that may advance automatically, including active phases and recoverable external-condition holds.
 3. Return immediately for `error`, `merge wait`, `stopped`, `rejected`, and other final rows. Preserve repository certification before `merged` can return successful `completed`; if the row is final but success evidence is not yet usable, return a typed non-success result rather than hold indefinitely.
-4. Add one stable non-success outcome for a settled/manual-action status, carrying the observed display status and error detail. Reuse existing `change_rejected`, `process_failed`, evidence, and completed outcomes where they already fit.
+4. Add stable non-success outcome `change_requires_action` with exit status `27`, carrying `detail.observed_status`, optional `detail.error_detail`, and `detail.commands_submitted: 0`. Reuse existing `change_rejected`, `process_failed`, evidence, and completed outcomes where they already fit.
 5. Apply the same classification on initial observation and every subsequent coherent snapshot. Submit no workflow command.
 
 ## Acceptance Criteria
 
 1. An initial snapshot with `error` or `merge wait` exits immediately with the typed non-success outcome and includes the observed status.
 2. A wait already in progress exits when the row transitions into `error`, `merge wait`, `stopped`, `rejected`, or another final/manual-action status.
-3. An initial `merged` row exits immediately: `completed` only when repository evidence certifies success, otherwise a typed non-success evidence/status result.
-4. Applying, accepting, archiving, merging, resolving, queued, blocked-on-recoverable-external-condition, and equivalent states that can advance without a new operator command continue to hold.
+3. An initial `merged` row is classified immediately: after at most one bounded coherent re-observation and re-certification, it returns `completed` when evidence certifies success and otherwise releases with a typed non-success result.
+4. `not queued`, `queued`, `blocked`, `applying`, `accepting`, `rejecting`, `archiving`, and `resolving` continue to hold. `error`, `merge wait`, `stopped`, and `stalled` release with `change_requires_action`.
 5. Every result reports `commands_submitted: 0`; no start, retry, resolve, merge, archive, queue, cleanup, or worktree mutation occurs.
 6. Existing timeout, owner replacement, repository evidence, rejection, and fatal-process behavior remains compatible.
 
