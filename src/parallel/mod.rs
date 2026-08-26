@@ -51,9 +51,6 @@ pub use types::{
 #[allow(unused_imports)]
 pub use types::resolve_failure_detail;
 
-// Re-exports used in tests via `use super::super::*`.
-#[cfg(test)]
-pub use crate::vcs::Workspace;
 #[cfg(all(test, feature = "heavy-tests"))]
 #[allow(unused_imports)]
 pub use merge::MergeAttempt;
