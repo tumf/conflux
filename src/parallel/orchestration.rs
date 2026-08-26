@@ -102,7 +102,9 @@ use tracing::{error, info, warn};
 use super::cleanup::WorkspaceCleanupGuard;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
-use super::queue_state::ReanalysisDispatchContext;
+use super::queue_state::{
+    QueueReconciliationOutcome, ReanalysisDispatchContext, RetryEdgeConsumption,
+};
 use super::types::WorkspaceResult;
 use super::work_snapshot::ReducerWorkSnapshot;
 use super::ParallelEvent;
@@ -445,6 +447,40 @@ impl ParallelExecutor {
         !self.change_failures_this_run.is_empty()
     }
 
+    /// Derive one scheduler pass's reanalysis reason from what that pass observed.
+    ///
+    /// This is where an explicit-retry edge becomes bypass-carrying authority
+    /// rather than an ordinarily suppressible wake. Armed bypass authority ranks
+    /// with a real queue addition, because both are committed operator state
+    /// transitions the retried target is owed an immediate evaluation for — and
+    /// an acceptance-stall retry produces *no* queue addition at all, since the
+    /// reducer already listed the target as queued work.
+    ///
+    /// Expressing the authority as [`ReanalysisReason::QueueNotification`] is not
+    /// a downgrade: that reason already bypasses queue debounce and
+    /// unchanged-analysis-input suppression. Reducing it to `Initial` before the
+    /// authorized evaluation is what loses it, which is exactly what the last
+    /// branch must not do while an edge is still armed.
+    pub(super) fn derive_pass_reanalysis_reason(
+        current: ReanalysisReason,
+        retry_edges: RetryEdgeConsumption,
+        reconciliation: QueueReconciliationOutcome,
+        dynamic_queue_added: bool,
+    ) -> ReanalysisReason {
+        if reconciliation.has_queued_additions() || retry_edges.bypass_armed {
+            ReanalysisReason::QueueNotification
+        } else if reconciliation.has_repair_additions() {
+            ReanalysisReason::RepairCandidate
+        } else if matches!(current, ReanalysisReason::QueueNotification) && !dynamic_queue_added {
+            // A scheduler wake without scheduler-visible queue additions remains
+            // debounceable.  `QueueNotification` only carries operator-intent
+            // priority into analysis when the current loop ingested new queued work.
+            ReanalysisReason::Initial
+        } else {
+            current
+        }
+    }
+
     /// Execute changes with order-based dependency analysis and concurrent re-analysis.
     ///
     /// This method uses a `tokio::select!` based scheduler loop that:
@@ -730,11 +766,12 @@ impl ParallelExecutor {
                 break;
             }
 
-            // Step 0: Consume accepted explicit-retry edges before reconciliation
-            // and classification, so a retried change's ephemeral failed
+            // Step 0: Take accepted explicit-retry edges before reconciliation and
+            // classification, so a terminal-error retry's ephemeral failed
             // classification is already gone when this pass classifies its
-            // dependents.
-            let explicit_retry_edge = self.consume_explicit_retry_edges().await;
+            // dependents, and so any retried target's analysis-bypass authority is
+            // armed before the gates below can suppress it.
+            let retry_edges = self.consume_explicit_retry_edges().await;
 
             // Step 1: Capture one coherent reducer work view for this evaluation.
             //
@@ -786,23 +823,16 @@ impl ParallelExecutor {
             // as a level from the same coherent view above rather than from the
             // reconciliation outcome, so a concurrent queue addition that made
             // one reduction a no-op cannot swallow the closing edge.
-            self.rearm_persistent_idle_from_observed_intent(&work_snapshot, explicit_retry_edge);
-            if reconciliation.has_queued_additions() || explicit_retry_edge {
-                // A consumed explicit-retry edge arms exactly one reevaluation:
-                // it is a real operator state transition, so this pass bypasses
-                // debounce and unchanged-input suppression once, and the branch
-                // below returns the loop to the ordinary policy afterwards.
-                reanalysis_reason = ReanalysisReason::QueueNotification;
-            } else if reconciliation.has_repair_additions() {
-                reanalysis_reason = ReanalysisReason::RepairCandidate;
-            } else if matches!(reanalysis_reason, ReanalysisReason::QueueNotification)
-                && !dynamic_queue_added
-            {
-                // A scheduler wake without scheduler-visible queue additions remains
-                // debounceable.  `QueueNotification` only carries operator-intent
-                // priority into analysis when the current loop ingested new queued work.
-                reanalysis_reason = ReanalysisReason::Initial;
-            }
+            self.rearm_persistent_idle_from_observed_intent(
+                &work_snapshot,
+                retry_edges.newly_drained > 0,
+            );
+            reanalysis_reason = Self::derive_pass_reanalysis_reason(
+                reanalysis_reason,
+                retry_edges,
+                reconciliation,
+                dynamic_queue_added,
+            );
 
             // Step 5: Re-analysis decision is derived from scheduler state.
             //

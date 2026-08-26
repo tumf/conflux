@@ -225,6 +225,19 @@ pub struct ParallelExecutor {
     /// edge never got an evaluation", without every direct caller of the pass
     /// having to thread a richer return value through.
     analyzer_capacity_suppressed: bool,
+    /// Retried targets whose explicit-retry edge has left the queue but whose
+    /// analysis-bypass authority no eligible evaluation has spent yet.
+    ///
+    /// Draining the queue at Step 0 is not the same event as consuming the edge.
+    /// A pass can end before the dependency-analysis evaluation it authorized —
+    /// cancellation, an incomplete reducer view, an early break, a candidate list
+    /// that is momentarily empty — and the authority must outlive that pass
+    /// rather than be discarded with it. It is spent when the analyzer really
+    /// runs, and only then.
+    ///
+    /// Ephemeral process-local control state: it is never persisted and a restart
+    /// recomputes routing from the workspace alone.
+    pending_retry_bypass: HashSet<String>,
     /// Dynamic queue for runtime change additions (TUI mode)
     dynamic_queue: Option<Arc<crate::tui::queue::DynamicQueue>>,
     /// Shared AI command runner for stagger coordination

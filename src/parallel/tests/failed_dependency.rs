@@ -20,8 +20,9 @@ use crate::analyzer::{AnalysisOutcome, AnalysisProvenance, AnalysisResult};
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
+use crate::orchestration::operator_command::RetryEdgeAuthority;
 use crate::orchestration::state::{OrchestratorState, ReducerCommand};
-use crate::parallel::queue_state::QueuedWorkClass;
+use crate::parallel::queue_state::{QueuedWorkClass, RetryEdgeConsumption};
 use crate::parallel::{ParallelEvent, ParallelExecutor, SchedulerLifetime, SchedulerRunReport};
 use crate::tui::queue::DynamicQueue;
 use std::collections::{HashMap, HashSet};
@@ -541,8 +542,9 @@ async fn failed_dependency_retry_edge_clears_only_the_retried_failure() {
         .failed_tracker
         .begin_blocker_epoch("other", &other_blockers);
 
-    assert!(
-        !executor.consume_explicit_retry_edges().await,
+    assert_eq!(
+        executor.consume_explicit_retry_edges().await,
+        RetryEdgeConsumption::default(),
         "no pending edge means no armed reevaluation"
     );
     assert_eq!(
@@ -550,10 +552,16 @@ async fn failed_dependency_retry_edge_clears_only_the_retried_failure() {
         Some("a".to_string())
     );
 
-    queue.publish_explicit_retry("a".to_string()).await;
-    assert!(
+    queue
+        .publish_explicit_retry("a".to_string(), RetryEdgeAuthority::TerminalError)
+        .await;
+    assert_eq!(
         executor.consume_explicit_retry_edges().await,
-        "a consumed edge must arm exactly one reevaluation"
+        RetryEdgeConsumption {
+            newly_drained: 1,
+            bypass_armed: true,
+        },
+        "a drained edge must arm a reevaluation"
     );
     assert!(
         executor.failed_tracker.should_skip("b").is_none(),
@@ -573,9 +581,27 @@ async fn failed_dependency_retry_edge_clears_only_the_retried_failure() {
         "an unrelated notification epoch must survive"
     );
 
-    assert!(
-        !executor.consume_explicit_retry_edges().await,
-        "the retry edge is one-shot and must not be replayable"
+    // The queue-side edge is one-shot: nothing republishes it, so a later pass
+    // performs no second release. The bypass authority it left behind stays armed
+    // until an eligible analysis evaluation spends it, which is what keeps a pass
+    // that ends before analysis from discarding the operator's retry.
+    executor.failed_tracker.mark_failed("a");
+    assert_eq!(
+        executor.consume_explicit_retry_edges().await,
+        RetryEdgeConsumption {
+            newly_drained: 0,
+            bypass_armed: true,
+        },
+        "the drained edge is not replayable, and its unspent bypass survives the pass"
+    );
+    assert_eq!(
+        executor.failed_tracker.should_skip("b"),
+        Some("a".to_string()),
+        "a retained bypass releases no second failed classification"
+    );
+    assert_eq!(
+        executor.pending_retry_bypass_targets(),
+        vec!["a".to_string()]
     );
 }
 
@@ -596,8 +622,10 @@ async fn failed_dependency_retry_does_not_prove_dependency_resolution() {
     executor.set_dynamic_queue(queue.clone());
     seed_failed_blocker(&mut executor, "b", "a");
 
-    queue.publish_explicit_retry("a".to_string()).await;
-    assert!(executor.consume_explicit_retry_edges().await);
+    queue
+        .publish_explicit_retry("a".to_string(), RetryEdgeAuthority::TerminalError)
+        .await;
+    assert!(executor.consume_explicit_retry_edges().await.bypass_armed);
 
     let queued = vec![test_change("a"), test_change("b")];
     let classification = executor
@@ -637,8 +665,10 @@ async fn failed_dependency_retry_authoritative_resolution_unblocks_dependent() {
     executor.set_dynamic_queue(queue.clone());
     seed_failed_blocker(&mut executor, "b", "a");
 
-    queue.publish_explicit_retry("a".to_string()).await;
-    assert!(executor.consume_explicit_retry_edges().await);
+    queue
+        .publish_explicit_retry("a".to_string(), RetryEdgeAuthority::TerminalError)
+        .await;
+    assert!(executor.consume_explicit_retry_edges().await.bypass_armed);
 
     let analysis = dependency_analysis(&["b"], b_depends_on_a());
     assert!(

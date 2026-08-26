@@ -686,6 +686,56 @@ pub enum RetryRoute {
     AcceptanceStall,
 }
 
+/// What an accepted explicit-retry scheduler edge authorizes.
+///
+/// Every accepted retry route arms an edge, because every accepted retry owes
+/// the retried target one immediate dependency-analysis evaluation that ordinary
+/// unchanged-input suppression may not swallow. What the routes do *not* share is
+/// the rest of the authority: releasing a scheduler-local failed classification,
+/// dropping a dependency-blocker fingerprint, and resetting a target's
+/// scheduler-local Apply budget are consequences of consuming a *terminal error*,
+/// and nothing weaker may look like one.
+///
+/// Fail-closed by construction: the weaker variant is the one a new route gets by
+/// default, and widening it is an explicit decision at the arming point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryEdgeAuthority {
+    /// Analysis-bypass authority only, and nothing else.
+    AnalysisBypass,
+    /// Analysis bypass plus the terminal-error releases: failed classification,
+    /// blocked fingerprint, and Apply budget.
+    TerminalError,
+}
+
+impl RetryEdgeAuthority {
+    /// Whether this edge may release terminal-error scheduler state.
+    pub fn releases_terminal_error_state(self) -> bool {
+        matches!(self, Self::TerminalError)
+    }
+
+    /// Merge two edges armed for the same target before either is consumed.
+    ///
+    /// Authority only ever widens: an accepted terminal-error retry that lands on
+    /// top of a pending stall-route edge really did happen, while the reverse
+    /// order must not silently revoke the release the terminal-error retry was
+    /// accepted for.
+    pub fn widen(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::TerminalError, _) | (_, Self::TerminalError) => Self::TerminalError,
+            _ => Self::AnalysisBypass,
+        }
+    }
+}
+
+impl From<RetryRoute> for RetryEdgeAuthority {
+    fn from(route: RetryRoute) -> Self {
+        match route {
+            RetryRoute::TerminalError => Self::TerminalError,
+            RetryRoute::AcceptanceStall => Self::AnalysisBypass,
+        }
+    }
+}
+
 /// Decide the retry route for a change from its reducer-derived status and
 /// blocker kind.
 ///
@@ -1203,13 +1253,18 @@ pub trait QueuePort: Send + Sync {
 
     /// Publish a target-ID-bearing one-shot explicit-retry edge to a live scheduler.
     ///
-    /// Only an accepted, state-changing `ReducerCommand::RetryError` reaches
-    /// here. A refused or no-op retry, an ordinary `AddToQueue`, and a generic
-    /// queue notification deliberately do not: retry intent is what releases a
-    /// change's ephemeral failed classification, and nothing else may look like
-    /// it. The default implementation drops the edge, which is correct for
-    /// ports without a live scheduler behind them.
-    async fn publish_explicit_retry(&self, _change_id: &str) {}
+    /// Only an accepted, state-changing retry reaches here — either route. A
+    /// refused retry, a reducer no-op, an ordinary `AddToQueue`, and a generic
+    /// queue notification deliberately do not: an edge is what lets a retried
+    /// target bypass unchanged-analysis-input suppression once, and nothing else
+    /// may look like one.
+    ///
+    /// `authority` keeps the two routes apart at the boundary rather than in the
+    /// scheduler's guesswork: only [`RetryEdgeAuthority::TerminalError`] releases
+    /// a failed classification, a blocked fingerprint, or an Apply budget. The
+    /// default implementation drops the edge, which is correct for ports without
+    /// a live scheduler behind them.
+    async fn publish_explicit_retry(&self, _change_id: &str, _authority: RetryEdgeAuthority) {}
 }
 
 /// Queue hook dispatch, isolated so the service can be verified without
@@ -1759,9 +1814,12 @@ impl OperatorCommandService {
 
         // Only the `RetryError` half of this branch is an explicit retry, and
         // only when the reducer actually changed state. An ordinary `AddToQueue`
-        // never releases a failed classification.
+        // is not a retry at all: it arms no edge, so it never bypasses
+        // unchanged-input suppression and never releases a failed classification.
         if was_error_retry && reducer_changed {
-            self.queue.publish_explicit_retry(change_id).await;
+            self.queue
+                .publish_explicit_retry(change_id, RetryEdgeAuthority::TerminalError)
+                .await;
         }
 
         // Effect before commit: hooks describe real runtime mutations only.
@@ -2084,7 +2142,6 @@ impl OperatorCommandService {
             // [`Self::route_is_committable`] during classification.
             RetryRoute::AcceptanceStall => ReducerCommand::AddToQueue(change_id.to_string()),
         };
-        let is_error_retry = matches!(command, ReducerCommand::RetryError(_));
         // Retry restores fresh execution intent, so it is a mark mutation and
         // serializes with event reconciliation like every other one.
         let _mutation = self.parallel.lock_mutations().await;
@@ -2099,13 +2156,24 @@ impl OperatorCommandService {
                 explicit_retry: false,
             };
         }
-        // A live scheduler holds an ephemeral failed classification for this
-        // change that only an accepted, state-changing `RetryError` may release.
-        // The acceptance-stall route restores ordinary queue intent instead and
-        // deliberately publishes nothing.
-        if is_error_retry {
-            self.queue.publish_explicit_retry(change_id).await;
-        }
+        // The single arming point every accepted retry route goes through.
+        //
+        // Both routes owe the retried target one immediate dependency-analysis
+        // evaluation. The acceptance-stall route in particular restores ordinary
+        // queue intent for a change the reducer already listed as queued work, so
+        // it produces no scheduler-visible queue addition at all — without an
+        // edge, a live scheduler reduces the wake to an ordinarily suppressible
+        // one and the matching analysis-input signature swallows it.
+        //
+        // What stays route-scoped is the *authority* the edge carries: only the
+        // terminal-error route releases a scheduler-local failed classification,
+        // a blocked fingerprint, or an Apply budget.
+        //
+        // Refused and reducer-no-op retries never reach here: classification
+        // refused the former and the `NoOp` return above left with the latter.
+        self.queue
+            .publish_explicit_retry(change_id, RetryEdgeAuthority::from(route))
+            .await;
         self.marks.set(change_id, true);
         RetryPlan {
             change_ids: vec![change_id.to_string()],
@@ -2151,8 +2219,13 @@ impl QueuePort for crate::tui::queue::DynamicQueue {
         crate::tui::queue::DynamicQueue::notify_scheduler(self);
     }
 
-    async fn publish_explicit_retry(&self, change_id: &str) {
-        crate::tui::queue::DynamicQueue::publish_explicit_retry(self, change_id.to_string()).await;
+    async fn publish_explicit_retry(&self, change_id: &str, authority: RetryEdgeAuthority) {
+        crate::tui::queue::DynamicQueue::publish_explicit_retry(
+            self,
+            change_id.to_string(),
+            authority,
+        )
+        .await;
     }
 }
 

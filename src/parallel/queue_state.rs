@@ -33,6 +33,21 @@ pub(super) struct QueueReconciliationOutcome {
     pub revoked_removed: usize,
 }
 
+/// What one scheduler pass's explicit-retry Step 0 found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct RetryEdgeConsumption {
+    /// Edges this pass took out of the dynamic queue.
+    ///
+    /// Committed operator intent this pass is the first to observe, which is what
+    /// the persistent-idle episode rearms on. A latch retained from an earlier
+    /// pass is deliberately not counted here: rearming on it again would republish
+    /// the closing Ready edge on every later wake.
+    pub newly_drained: usize,
+    /// Whether analysis-bypass authority is armed for this pass, from a newly
+    /// drained edge or from one an earlier pass could not spend.
+    pub bypass_armed: bool,
+}
+
 fn analysis_attempt_id(
     iteration: u32,
     trigger: impl std::fmt::Display,
@@ -2480,34 +2495,52 @@ impl ParallelExecutor {
         }
     }
 
-    /// Consume every pending explicit-retry edge before reconciliation and
-    /// classification, and report whether one reevaluation must be armed.
+    /// Take every pending explicit-retry edge before reconciliation and
+    /// classification, and report what this pass may act on.
     ///
-    /// An edge is produced only by an accepted, state-changing
-    /// `ReducerCommand::RetryError` carrying the retried change ID, so this is
-    /// the one path that may clear an ephemeral failed classification. Clearing
-    /// removes a fast dispatch gate and the dependents' blocker-notification
-    /// epoch — never more: whether the dependency is actually resolved is still
-    /// decided by ordinary repository and dependency evidence, so a dependent
-    /// stays blocked while its blocker is queued, in flight, or unmerged.
+    /// An edge is produced only by an accepted, state-changing retry carrying the
+    /// retried change ID, and it arrives with the authority its route granted.
     ///
-    /// It is also where the retried change's Apply budget is released. The
-    /// budget owner is scoped to this scheduler boundary rather than to one
-    /// invocation, so a persistent scheduler that outlives the invocation which
-    /// spent the ceiling would otherwise refuse the very first dispatch of the
-    /// retry the operator just authorized. Release is keyed to the explicit edge
-    /// alone: reconciliation, notification, ordinary queue additions, and mark
-    /// settlement produce no edge and therefore grant no budget.
-    pub(super) async fn consume_explicit_retry_edges(&mut self) -> bool {
-        let Some(queue) = self.dynamic_queue.clone() else {
-            return false;
+    /// Two different things happen here, and keeping them apart is the whole
+    /// point:
+    ///
+    /// - The **route-scoped releases** are applied once, immediately, and only for
+    ///   [`RetryEdgeAuthority::TerminalError`]. Clearing an ephemeral failed
+    ///   classification removes a fast dispatch gate and the dependents'
+    ///   blocker-notification epoch — never more: whether the dependency is
+    ///   actually resolved is still decided by ordinary repository and dependency
+    ///   evidence, so a dependent stays blocked while its blocker is queued, in
+    ///   flight, or unmerged. The retried change's Apply budget is released here
+    ///   too, because that budget is owned by this scheduler boundary rather than
+    ///   by the invocation which spent the ceiling. An acceptance-stall edge
+    ///   performs neither, and reconciliation, notification, ordinary queue
+    ///   additions, and mark settlement produce no edge at all.
+    /// - The **analysis-bypass authority** is latched rather than spent. Every
+    ///   drained target joins [`Self::pending_retry_bypass`], where it stays until
+    ///   an eligible dependency-analysis evaluation actually runs. A pass that
+    ///   ends before that evaluation therefore leaves the authority available to
+    ///   the next one instead of discarding it.
+    ///
+    /// The returned consumption separates "this pass drained new edges" from
+    /// "bypass authority is armed", because only the former is committed operator
+    /// intent this pass observed: a retained latch must not keep rearming the
+    /// persistent-idle episode on every later wake.
+    pub(super) async fn consume_explicit_retry_edges(&mut self) -> RetryEdgeConsumption {
+        let drained = match self.dynamic_queue.clone() {
+            Some(queue) => queue.drain_explicit_retries().await,
+            None => Vec::new(),
         };
-        let retried = queue.drain_explicit_retries().await;
-        if retried.is_empty() {
-            return false;
-        }
 
-        for change_id in &retried {
+        for edge in &drained {
+            let change_id = edge.change_id.as_str();
+            self.pending_retry_bypass.insert(change_id.to_string());
+            if !edge.authority.releases_terminal_error_state() {
+                info!(
+                    change_id = %change_id,
+                    "Consumed acceptance-stall retry edge before queue reconciliation; it grants analysis bypass only"
+                );
+                continue;
+            }
             let cleared = self.failed_tracker.clear_failed(change_id);
             // A retried change's own blocked fingerprint is dropped too, so a
             // later blocked observation for it is a new transition rather than a
@@ -2519,11 +2552,46 @@ impl ParallelExecutor {
                 change_id = %change_id,
                 cleared_failed_marker = cleared,
                 released_apply_attempts = released_attempts,
-                "Consumed explicit-retry edge before queue reconciliation"
+                "Consumed terminal-error retry edge before queue reconciliation"
             );
         }
 
-        true
+        RetryEdgeConsumption {
+            newly_drained: drained.len(),
+            bypass_armed: !self.pending_retry_bypass.is_empty(),
+        }
+    }
+
+    /// Spend the latched analysis-bypass authority once an eligible evaluation
+    /// has really run.
+    ///
+    /// Called from the one place the analyzer is actually invoked, so the
+    /// authority is one-shot with respect to *evaluations* rather than to passes:
+    /// later timer wakes observing the same analysis input fall back to ordinary
+    /// unchanged-input suppression.
+    fn spend_pending_retry_bypass(&mut self) {
+        if self.pending_retry_bypass.is_empty() {
+            return;
+        }
+        let mut spent: Vec<&str> = self
+            .pending_retry_bypass
+            .iter()
+            .map(String::as_str)
+            .collect();
+        spent.sort_unstable();
+        info!(
+            targets = %spent.join(","),
+            "Dependency analysis consumed the pending explicit-retry bypass"
+        );
+        self.pending_retry_bypass.clear();
+    }
+
+    /// Targets whose explicit-retry bypass authority is still armed (tests).
+    #[cfg(test)]
+    pub(super) fn pending_retry_bypass_targets(&self) -> Vec<String> {
+        let mut targets: Vec<String> = self.pending_retry_bypass.iter().cloned().collect();
+        targets.sort_unstable();
+        targets
     }
 
     /// Test-only convenience: production reconciliation runs through
@@ -4131,6 +4199,12 @@ impl ParallelExecutor {
                 ));
             }
         };
+
+        // The evaluation the edge authorized is now certain to happen, so this is
+        // where its authority is spent. Everything above may end the pass early,
+        // and every one of those exits must leave the latch armed for the next
+        // eligible evaluation instead of discarding it with this pass.
+        self.spend_pending_retry_bypass();
 
         let attempt = self
             .run_dependency_analysis_attempt(

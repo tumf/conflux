@@ -73,7 +73,7 @@ async fn change_error_f5_retry_running_start_routes_only_marked_retry_targets() 
     );
     assert_eq!(
         harness.effects().await.explicit_retries,
-        vec![ALPHA.to_string()],
+        vec![(ALPHA.to_string(), RetryEdgeAuthority::TerminalError)],
         "the retried target gets exactly one target-specific edge"
     );
     assert_eq!(
@@ -118,7 +118,7 @@ async fn change_error_f5_retry_persistent_idle_select_retries_a_marked_error() {
     );
     assert_eq!(
         harness.effects().await.explicit_retries,
-        vec![ALPHA.to_string()]
+        vec![(ALPHA.to_string(), RetryEdgeAuthority::TerminalError)]
     );
 }
 
@@ -211,9 +211,12 @@ async fn change_error_f5_retry_resumable_hold_keeps_its_existing_route() {
         ),
         "unexpected outcome: {outcome:?}"
     );
-    assert!(
-        harness.effects().await.explicit_retries.is_empty(),
-        "an acceptance hold releases no failed classification, so it publishes no edge"
+    assert_eq!(
+        harness.effects().await.explicit_retries,
+        vec![(ALPHA.to_string(), RetryEdgeAuthority::AnalysisBypass)],
+        "the hold route arms its own target-specific edge so the resumed evaluation \
+         cannot be swallowed by a matching analysis-input signature — and it carries \
+         analysis-bypass authority only, releasing no failed classification"
     );
 }
 
@@ -428,7 +431,7 @@ async fn change_error_f5_retry_settled_iteration_limit_retries_in_every_mode() {
         );
         assert_eq!(
             harness.effects().await.explicit_retries,
-            vec![ALPHA.to_string()],
+            vec![(ALPHA.to_string(), RetryEdgeAuthority::TerminalError)],
             "{mode:?}: exactly one target-specific explicit-retry edge is published"
         );
         assert!(
@@ -562,7 +565,7 @@ async fn change_error_f5_retry_terminal_error_publishes_exactly_one_target_speci
     let effects = harness.effects().await;
     assert_eq!(
         effects.explicit_retries,
-        vec![ALPHA.to_string()],
+        vec![(ALPHA.to_string(), RetryEdgeAuthority::TerminalError)],
         "only the retried target's edge is published"
     );
     assert!(

@@ -119,6 +119,14 @@ fn counting_analyzer(
     }
 }
 
+/// What one drained batch of scheduler events observed.
+#[derive(Debug, Default)]
+struct ObservedEvents {
+    analysis_started: usize,
+    /// Changes whose workspace preparation really started, in dispatch order.
+    dispatch_started: Vec<String>,
+}
+
 /// A live scheduler plus the production operator services that address it.
 struct Harness {
     executor: ParallelExecutor,
@@ -137,6 +145,7 @@ struct Harness {
     max_parallelism: usize,
     analyses: Arc<AtomicUsize>,
     events: mpsc::Receiver<ExecutionEvent>,
+    repo_root: std::path::PathBuf,
     _repo_dir: TempDir,
     _workspace_base: TempDir,
 }
@@ -204,6 +213,7 @@ impl Harness {
             max_parallelism,
             analyses: Arc::new(AtomicUsize::new(0)),
             events,
+            repo_root: repo_dir.path().to_path_buf(),
             _repo_dir: repo_dir,
             _workspace_base: workspace_base,
         }
@@ -265,35 +275,47 @@ impl Harness {
             .is_some()
     }
 
-    /// The production loop's Step 0, with the one consequence it has.
-    ///
-    /// `src/parallel/orchestration.rs` consumes the edges before reconciliation
-    /// and, when one was consumed, arms exactly one reevaluation that bypasses
-    /// debounce and unchanged-input suppression.
+    /// The production loop's Step 0, without the reason derivation that follows
+    /// it: the drain applies its route-scoped releases and latches whatever
+    /// analysis-bypass authority the edges carried.
     async fn consume_retry_edges(&mut self) -> bool {
-        let armed = self.executor.consume_explicit_retry_edges().await;
-        if armed {
-            self.reanalysis_reason = ReanalysisReason::QueueNotification;
-        }
-        armed
+        self.executor
+            .consume_explicit_retry_edges()
+            .await
+            .bypass_armed
     }
 
     /// One scheduler loop pass: ingest, reconcile, then evaluate and dispatch.
+    ///
+    /// Step 0, hint ingestion, and reconciliation run in the loop's own order,
+    /// and the pass's reanalysis reason is derived by the production
+    /// `derive_pass_reanalysis_reason` from what those steps observed. No test
+    /// supplies a `ReanalysisReason`, so a pass that reaches the analyzer proves
+    /// the production path produced the authority for it.
     async fn run_loop_iteration<F>(&mut self, analyzer: &F) -> Option<(bool, u32)>
     where
         for<'a> F: Fn(&'a [Change], &'a [String], u32) -> AnalysisFuture<'a> + Send + Sync,
     {
+        let retry_edges = self.executor.consume_explicit_retry_edges().await;
         let in_flight = self.in_flight.clone();
-        self.executor
+        let dynamic_queue_added = self
+            .executor
             .check_dynamic_queue_and_add_changes(
                 &mut self.queued,
                 &in_flight,
                 &mut self.reanalysis_reason,
             )
             .await;
-        self.executor
+        let reconciliation = self
+            .executor
             .reconcile_queued_candidates_from_shared_state(&mut self.queued, &in_flight)
             .await;
+        self.reanalysis_reason = ParallelExecutor::derive_pass_reanalysis_reason(
+            self.reanalysis_reason,
+            retry_edges,
+            reconciliation,
+            dynamic_queue_added,
+        );
 
         let outcome = self
             .executor
@@ -330,17 +352,85 @@ impl Harness {
         self.analyses.load(Ordering::SeqCst)
     }
 
-    /// Drain the event channel, counting the two events under test.
+    /// Drain the event channel, counting analysis starts and dispatch starts.
     fn drain_events(&mut self) -> (usize, usize) {
-        let (mut analysis_started, mut apply_started) = (0, 0);
+        let observed = self.drain_observed_events();
+        (observed.analysis_started, observed.dispatch_started.len())
+    }
+
+    /// The catalog entry queue reconciliation admits for `change_id`.
+    ///
+    /// Built from the same `list_changes_native_from` read reconciliation uses,
+    /// so a candidate restored here is byte-identical to the one the scheduler
+    /// admitted — which matters because the analysis-input signature is derived
+    /// from the candidate's own fields.
+    fn catalog_candidate(&self, change_id: &str) -> Change {
+        crate::openspec::list_changes_native_from(&self.repo_root)
+            .expect("load the OpenSpec catalog")
+            .into_iter()
+            .find(|change| change.id == change_id)
+            .expect("the catalog contains the change")
+    }
+
+    /// Settle a dispatched change the way a finished workspace task plus the next
+    /// reconciliation pass would.
+    ///
+    /// This harness never joins the `JoinSet`, so the spawned task is aborted and
+    /// reaped here; what it leaves behind is the two facts that matter to the
+    /// scheduler — the change is no longer in flight, and reducer queue intent
+    /// still holds it as a scheduler-local candidate. Nothing about analysis
+    /// suppression, retry edges, or the failed tracker is touched.
+    async fn settle_dispatch_back_to_queued(&mut self, change_id: &str) {
+        self.join_set.abort_all();
+        while self.join_set.join_next().await.is_some() {}
+        self.in_flight.remove(change_id);
+        if !self.queued.iter().any(|change| change.id == change_id) {
+            let candidate = self.catalog_candidate(change_id);
+            self.queued.push(candidate);
+        }
+    }
+
+    /// Record an Acceptance-owned resumable stall, exactly as an `AcceptanceGated`
+    /// report classifies for repository-fixable facts with no unblock condition.
+    async fn stall_in_acceptance(&self, change_id: &str) {
+        self.state
+            .write()
+            .await
+            .apply_execution_event(&ExecutionEvent::AcceptanceGated {
+                change_id: change_id.to_string(),
+                blocker: crate::events::StalledBlocker {
+                    category: "acceptance_finding".to_string(),
+                    phase: "acceptance".to_string(),
+                    gate: "acceptance".to_string(),
+                    error_summary: "unresolved acceptance finding".to_string(),
+                    evidence: vec!["tests/acceptance.rs:1".to_string()],
+                    unblock_condition: None,
+                    prerequisite_owner: None,
+                    next_action: "resolve finding and retry".to_string(),
+                    resumable: true,
+                    worktree_preserved: true,
+                },
+            });
+    }
+
+    /// Drain the event channel, keeping dispatch-start attribution.
+    fn drain_observed_events(&mut self) -> ObservedEvents {
+        let mut observed = ObservedEvents::default();
         while let Ok(event) = self.events.try_recv() {
             match event {
-                ExecutionEvent::AnalysisStarted { .. } => analysis_started += 1,
-                ExecutionEvent::ApplyStarted { .. } => apply_started += 1,
+                ExecutionEvent::AnalysisStarted { .. } => observed.analysis_started += 1,
+                // Preparation is announced by `dispatch_change_to_workspace`
+                // itself, for a change that has passed the stop and terminal
+                // gates and now owns an execution slot. It is the reducer's
+                // `preparing` transition, so a stubbed or no-op dispatch emits
+                // none of these.
+                ExecutionEvent::WorkspacePreparationStarted { change_id } => {
+                    observed.dispatch_started.push(change_id)
+                }
                 _ => {}
             }
         }
-        (analysis_started, apply_started)
+        observed
     }
 
     async fn status(&self, change_id: &str) -> String {
@@ -748,6 +838,195 @@ async fn change_error_f5_retry_iteration_limit_budget_survives_ordinary_notifica
     assert_eq!(harness.status(ALPHA).await, "error");
     let (_, apply_started) = harness.drain_events();
     assert_eq!(apply_started, 0);
+
+    harness.shutdown().await;
+}
+
+// ============================================================================
+// Acceptance-stall retry: bypassing a matching analysis cache and dispatching
+// ============================================================================
+//
+// The two cases above are terminal-error retries, whose reducer command is
+// `RetryError` and which therefore always armed an edge. The reproduced defect
+// lives on the other route: a `stalled` change is retried with `AddToQueue`, and
+// the reducer already listed it as queued work, so the retry changes no
+// scheduler-visible queue membership at all. Without an edge, the live scheduler
+// reduced the resulting wake to an ordinarily suppressible one and the matching
+// analysis-input signature swallowed it — the observed
+// `Queue notification received while scheduler idle` /
+// `No analysis started: reason=unchanged_analysis_input` pair, with the queued
+// work left undispatched until the operator toggled queue intent off and on.
+
+impl Harness {
+    /// Whether the next Apply dispatch for `change_id` would find its ceiling spent.
+    fn budget_spent(&self, change_id: &str, max: u32) -> bool {
+        self.executor
+            .apply_budget
+            .exhaustion(change_id, max)
+            .is_some()
+    }
+
+    /// Occupy `count` execution slots with work this harness does not model.
+    ///
+    /// Capacity is derived from the in-flight set, so this is how a pass reaches
+    /// the production zero-capacity gate — the gate that ends a scheduler pass
+    /// after classification but before the analyzer runs.
+    fn occupy_slots(&mut self, count: usize) {
+        for index in 0..count {
+            self.in_flight.insert(format!("unrelated-{index}"));
+        }
+    }
+
+    fn release_occupied_slots(&mut self) {
+        self.in_flight.retain(|id| !id.starts_with("unrelated-"));
+    }
+}
+
+/// The whole regression, in the order it happens to an operator.
+///
+/// A completed dependency analysis records its input; the change then stalls in
+/// Acceptance and sits as reducer-visible queued work whose signature still
+/// matches that record. `retry_change` accepts it through the acceptance-stall
+/// route, and from there everything is production: the accepted retry arms an
+/// edge, the scheduler's own Step 0 latches its bypass authority, the loop's own
+/// `derive_pass_reanalysis_reason` turns that into a bypass-carrying reason, and
+/// the matching signature no longer suppresses the evaluation. The test supplies
+/// no `ReanalysisReason` anywhere.
+#[tokio::test(start_paused = true)]
+async fn retry_change_bypasses_unchanged_analysis_input_and_dispatches() {
+    const MAX: u32 = 3;
+    let mut harness = Harness::new(&[ALPHA, BETA], 1);
+    let analyzer = counting_analyzer(harness.analyses.clone());
+
+    // An unrelated failed change, so every release below can be shown to be
+    // target-specific.
+    harness.fail_with_runtime_limit(BETA).await;
+    harness.depends_on(&[("beta-dep", BETA)]);
+    assert!(harness.is_gated_by_failure("beta-dep"));
+
+    // ── A completed analysis records this input ───────────────────────────
+    {
+        let mut guard = harness.state.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(ALPHA.to_string()));
+    }
+    harness.run_loop_iteration(&analyzer).await;
+    let baseline = harness.drain_observed_events();
+    assert_eq!(baseline.analysis_started, 1);
+    assert_eq!(
+        baseline.dispatch_started,
+        vec![ALPHA.to_string()],
+        "the first evaluation really dispatched the change it analysed"
+    );
+
+    // The invocation returns having stalled in Acceptance, and the change goes
+    // back to being reducer-visible queued work the scheduler already holds. Its
+    // Apply ceiling is spent: this scheduler boundary owns that budget.
+    harness.settle_dispatch_back_to_queued(ALPHA).await;
+    for _ in 0..MAX {
+        harness.executor.apply_budget.reserve(ALPHA, MAX);
+    }
+    harness.stall_in_acceptance(ALPHA).await;
+    assert_eq!(harness.status(ALPHA).await, "stalled");
+    assert!(harness.budget_spent(ALPHA, MAX));
+
+    // ── A stalled change is held, not analysed ───────────────────────────
+    for _ in 0..3 {
+        harness.timer_wake().await;
+        harness.run_loop_iteration(&analyzer).await;
+    }
+    assert_eq!(
+        harness.analyses(),
+        1,
+        "an acceptance hold is classified blocked-only; no wake analyses it"
+    );
+    assert!(
+        harness.queued.iter().any(|change| change.id == ALPHA),
+        "the held change stays reducer-visible queued work the scheduler already holds, \
+         so a later retry produces no scheduler-visible queue addition"
+    );
+
+    // ── The operator retries the stalled change ──────────────────────────
+    let plan = harness
+        .run_control
+        .operator()
+        .retry_change(ALPHA)
+        .await
+        .expect("a resumable acceptance stall is retryable");
+    assert_eq!(
+        plan.change_ids,
+        vec![ALPHA.to_string()],
+        "the retry is accepted through the acceptance-stall route"
+    );
+    assert_eq!(harness.status(ALPHA).await, "queued");
+
+    // ── A pass that ends before its analysis keeps the authority ─────────
+    // Zero capacity is a production gate that ends the pass after classification
+    // and before the analyzer. The authority the retry armed must outlive it.
+    harness.occupy_slots(1);
+    harness.timer_wake().await;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(
+        harness.analyses(),
+        1,
+        "the pass ended at the capacity gate without evaluating anything"
+    );
+    assert_eq!(
+        harness.executor.pending_retry_bypass_targets(),
+        vec![ALPHA.to_string()],
+        "an abandoned pass must not discard the authority it took"
+    );
+    harness.release_occupied_slots();
+    harness.drain_observed_events();
+
+    // ── The authorized evaluation runs against the matching signature ────
+    harness.timer_wake().await;
+    harness.run_loop_iteration(&analyzer).await;
+    let retried = harness.drain_observed_events();
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "the retry's edge produced one fresh analyzer invocation even though the \
+         analysis input still matches the last completed one"
+    );
+    assert_eq!(retried.analysis_started, 1);
+    assert_eq!(
+        retried.dispatch_started,
+        vec![ALPHA.to_string()],
+        "and the retried change reached real Apply dispatch, not just re-analysis"
+    );
+    assert!(harness.in_flight.contains(ALPHA));
+
+    // The stall route granted analysis bypass and nothing else.
+    assert!(
+        harness.budget_spent(ALPHA, MAX),
+        "a stall-route edge must not reset the retried target's Apply budget"
+    );
+    harness.depends_on(&[("beta-dep", BETA)]);
+    assert!(
+        harness.is_gated_by_failure("beta-dep"),
+        "and it must not release another change's failed classification"
+    );
+
+    // ── One-shot: later unchanged wakes are suppressed again ─────────────
+    harness.settle_dispatch_back_to_queued(ALPHA).await;
+    assert!(
+        harness.executor.pending_retry_bypass_targets().is_empty(),
+        "the authorized evaluation spent the bypass"
+    );
+    harness.queue.notify_scheduler();
+    for _ in 0..3 {
+        harness.timer_wake().await;
+        harness.run_loop_iteration(&analyzer).await;
+    }
+    let after = harness.drain_observed_events();
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "ordinary timer wakes and a generic notification observe the same analysis \
+         input and are suppressed exactly as before"
+    );
+    assert_eq!(after.analysis_started, 0);
+    assert!(after.dispatch_started.is_empty());
 
     harness.shutdown().await;
 }
