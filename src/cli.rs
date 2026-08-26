@@ -1166,9 +1166,13 @@ pub enum ClientCommands {
     /// as soon as the row is one only a new operator action can move: `error`,
     /// `merge wait`, `stopped`, and `stalled` return `change_requires_action`
     /// with exit status 27 and the observed status in `detail`, while `rejected`
-    /// keeps `change_rejected`. Releasing is not repairing; nothing is submitted
-    /// on the way out. The same classification runs on the first observation, so
-    /// waiting on an already-parked change reports it rather than hanging.
+    /// keeps `change_rejected`. `blocked` is the one status split by its
+    /// structured blocker: a dependency wait keeps observing, while a validated
+    /// external prerequisite releases the same way, publishing the blocker's
+    /// `unblock_condition` and `prerequisite_owner` in `detail.blocker`.
+    /// Releasing is not repairing; nothing is submitted on the way out. The same
+    /// classification runs on the first observation, so waiting on an
+    /// already-parked change reports it rather than hanging.
     ///
     /// There is no deadline unless one is asked for: `--timeout` defaults to 0,
     /// which waits for as long as the work takes. `--timeout D` adds one

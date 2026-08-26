@@ -14,7 +14,7 @@ verifications:
     trigger: change-implementation
     automation: tests/client_cli_tests.rs
     evidence: focused client CLI regression test output
-    rerun: cargo test --test client_cli_tests wait_releases_external_blocker_without_waiting_for_operator -- --exact
+    rerun: cargo test --test client_cli_tests enabled::wait_releases_external_blocker_without_waiting_for_operator -- --exact
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -48,7 +48,7 @@ Keep observing blocked rows that have no external blocker classification, includ
 
 - `src/client/wait.rs` classifies structured external blockers separately from owner-progressing blocked states.
 - `tests/client_cli_tests.rs` covers immediate and transitioned external blockers plus the retained generic-blocked behavior.
-- `cargo test --test client_cli_tests wait_releases_external_blocker_without_waiting_for_operator -- --exact` reports exactly one executed and passing test.
+- `cargo test --test client_cli_tests enabled::wait_releases_external_blocker_without_waiting_for_operator -- --exact` reports exactly one executed and passing test. The `enabled::` prefix is the module path libtest requires under `--exact`; the bare name matches zero tests because the wait suite lives in the `web-monitoring` module.
 - The existing generic-blocked wait test remains passing.
 - The CLI help and canonical CLI requirement describe the external-blocker exception.
 

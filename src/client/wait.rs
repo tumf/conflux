@@ -32,9 +32,16 @@
 //! an unbounded wait learns nothing forever. Those release immediately with
 //! `change_requires_action`, carrying the observed status so the caller can tell
 //! a conflict from a failure. Everything the owner can still move on its own —
-//! the active phases, `queued`, `blocked`, and any status a future owner adds —
-//! keeps observing, because giving up on live work is the opposite mistake and
-//! the more expensive one.
+//! the active phases, `queued`, and any status a future owner adds — keeps
+//! observing, because giving up on live work is the opposite mistake and the
+//! more expensive one.
+//!
+//! `blocked` is on both sides of that line, and only its structured blocker says
+//! which. A dependency wait clears when the owner archives what it is waiting
+//! on, so it is live work. A validated *external* prerequisite is a hold the
+//! owner already handed back to the operator, and the row will not move again
+//! until someone retries it — so it releases with the same
+//! `change_requires_action`, carrying the blocker's own prerequisite facts.
 //!
 //! # One deadline, not several budgets
 //!
@@ -73,7 +80,7 @@ use crate::client::completion::{
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
 use crate::client::session::{observe, Connection, Observation};
 use crate::client::transport::Wake;
-use crate::web::remote_control_api::dto::OwnerExecutionContract;
+use crate::web::remote_control_api::dto::{BlockerKind, ChangeBlocker, OwnerExecutionContract};
 
 /// Longest gap between authoritative rehydrations.
 ///
@@ -208,6 +215,7 @@ pub async fn run(
                         &instance_id,
                         &status,
                         Some(detail),
+                        None,
                         format!(
                             "'{change_id}' is at settled status '{status}', but repository \
                              evidence still does not prove completion"
@@ -373,9 +381,10 @@ async fn evaluate(
 
     let change = observation.change(change_id);
     let status = change.map(|change| change.display_status.as_str());
+    let blocker = change.and_then(|change| change.blocker.as_ref());
     let error_detail = change.and_then(|change| change.error_detail.clone());
 
-    match classify(status) {
+    match classify(status, blocker.map(|blocker| blocker.kind)) {
         Disposition::Rejected => {
             let detail = error_detail.unwrap_or_else(|| "the change was rejected".to_string());
             return Step::settled(
@@ -391,15 +400,30 @@ async fn evaluate(
         // is exactly the decision a client must not make.
         Disposition::RequiresAction => {
             let status = status.unwrap_or_default();
+            // An external hold names its own prerequisite, so the release says
+            // what is being waited on rather than only which row it stopped at.
+            // Every other manual-action row has no such fact to report.
+            let external = blocker.filter(|blocker| blocker.kind == BlockerKind::External);
+            let message = match external {
+                Some(_) => format!(
+                    "'{change_id}' is blocked on an external prerequisite the owner cannot clear \
+                     by itself, so it will not advance without a new operator action"
+                ),
+                None => format!(
+                    "'{change_id}' is at status '{status}', which the owner cannot advance without \
+                     a new operator action"
+                ),
+            };
             return Step::settled(requires_action_envelope(
                 change_id,
                 instance_id,
                 status,
-                error_detail,
-                format!(
-                    "'{change_id}' is at status '{status}', which the owner cannot advance without \
-                     a new operator action"
-                ),
+                // The change-local error is the more specific fact when the
+                // owner published one; the blocker's own line is what a
+                // validated external hold has instead of an error.
+                error_detail.or_else(|| external.and_then(|blocker| blocker.detail.clone())),
+                external,
+                message,
             ));
         }
         Disposition::KeepObserving => {
@@ -482,14 +506,18 @@ fn completed_envelope(
 /// It reports the observed status rather than prose, because that is the fact a
 /// caller branches on: `merge wait` needs a conflict resolved, `error` needs a
 /// retry decision, and a settled success row with no evidence needs someone to
-/// look at the repository. `commands_submitted: 0` is stated here for the same
-/// reason every other wait result states it — the release is an observation,
-/// and nothing about reaching it moved the change.
+/// look at the repository. An external hold adds the structured blocker for the
+/// same reason — `unblock_condition` and `prerequisite_owner` are what the
+/// operator actually needs, and re-deriving them from a message would be
+/// parsing prose. `commands_submitted: 0` is stated here for the same reason
+/// every other wait result states it — the release is an observation, and
+/// nothing about reaching it moved the change.
 fn requires_action_envelope(
     change_id: &str,
     instance_id: &str,
     observed_status: &str,
     error_detail: Option<String>,
+    blocker: Option<&ChangeBlocker>,
     message: String,
 ) -> ResultEnvelope {
     let mut detail = serde_json::json!({
@@ -501,6 +529,14 @@ fn requires_action_envelope(
             "error_detail".to_string(),
             serde_json::Value::String(error_detail),
         );
+    }
+    // Serialized whole rather than field by field: the wire shape a caller sees
+    // here is the same one the snapshot published, so a new blocker field never
+    // has to be remembered in two places.
+    if let (Some(object), Some(blocker)) = (detail.as_object_mut(), blocker) {
+        if let Ok(blocker) = serde_json::to_value(blocker) {
+            object.insert("blocker".to_string(), blocker);
+        }
     }
     ResultEnvelope::new(Operation::Wait, Outcome::ChangeRequiresAction)
         .with_change(change_id)
@@ -579,6 +615,19 @@ mod tests {
         }
     }
 
+    fn external_blocker() -> ChangeBlocker {
+        ChangeBlocker {
+            status: "blocked".to_string(),
+            kind: BlockerKind::External,
+            category: Some("pending_verification".to_string()),
+            detail: Some("waiting on the signing certificate".to_string()),
+            unblock_condition: Some("the certificate is issued".to_string()),
+            prerequisite_owner: Some("release".to_string()),
+            origin: Some("apply".to_string()),
+            resumable: true,
+        }
+    }
+
     #[test]
     fn a_completion_envelope_carries_its_evidence_and_no_command_count() {
         let envelope = completed_envelope("alpha", "i-1", &contract(), "proof".to_string());
@@ -612,6 +661,7 @@ mod tests {
             "i-1",
             "merge wait",
             Some("conflict in src/lib.rs".to_string()),
+            None,
             "needs an operator".to_string(),
         );
         assert_eq!(envelope.outcome, Outcome::ChangeRequiresAction);
@@ -621,6 +671,45 @@ mod tests {
         assert_eq!(envelope.detail["observed_status"], "merge wait");
         assert_eq!(envelope.detail["error_detail"], "conflict in src/lib.rs");
         assert_eq!(envelope.detail["commands_submitted"], 0);
+        // A row with no structured blocker says nothing about one, rather than
+        // publishing a null a caller would have to test for.
+        assert!(!envelope.detail.as_object().unwrap().contains_key("blocker"));
+    }
+
+    /// The external hold publishes the prerequisite, not just the row.
+    ///
+    /// The whole point of releasing here is that someone has to act, so the
+    /// release has to carry what they act on — the condition that clears the
+    /// wait and who owns it — as data rather than inside the message.
+    #[test]
+    fn an_external_blocker_release_publishes_the_prerequisite_facts() {
+        let envelope = requires_action_envelope(
+            "alpha",
+            "i-1",
+            "blocked",
+            Some("waiting on the signing certificate".to_string()),
+            Some(&external_blocker()),
+            "blocked externally".to_string(),
+        );
+        assert_eq!(envelope.outcome, Outcome::ChangeRequiresAction);
+        assert_eq!(envelope.exit_code(), 27);
+        assert_eq!(envelope.detail["observed_status"], "blocked");
+        assert_eq!(envelope.detail["commands_submitted"], 0);
+        assert_eq!(
+            envelope.detail["error_detail"],
+            "waiting on the signing certificate"
+        );
+        assert_eq!(envelope.detail["blocker"]["kind"], "external");
+        assert_eq!(
+            envelope.detail["blocker"]["category"],
+            "pending_verification"
+        );
+        assert_eq!(
+            envelope.detail["blocker"]["unblock_condition"],
+            "the certificate is issued"
+        );
+        assert_eq!(envelope.detail["blocker"]["prerequisite_owner"], "release");
+        assert_eq!(envelope.detail["blocker"]["resumable"], true);
     }
 
     /// Absent detail is omitted rather than nulled, the way every other optional
@@ -629,7 +718,7 @@ mod tests {
     #[test]
     fn a_manual_action_release_omits_error_detail_when_the_owner_published_none() {
         let envelope =
-            requires_action_envelope("alpha", "i-1", "stopped", None, "stopped".to_string());
+            requires_action_envelope("alpha", "i-1", "stopped", None, None, "stopped".to_string());
         let detail = envelope.detail.as_object().unwrap();
         assert!(!detail.contains_key("error_detail"));
         assert_eq!(detail["observed_status"], "stopped");

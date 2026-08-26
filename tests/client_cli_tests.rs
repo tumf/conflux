@@ -1041,8 +1041,8 @@ mod enabled {
     // ────────────────────────────────────────────────────────────────────────
 
     use conflux::web::remote_control_api::dto::{
-        AttentionState, ChangeResource, ChangeTiming, InstanceSnapshot, ParallelEligibility,
-        ParallelRuntimeState, QueueIntent, SnapshotTotals,
+        AttentionState, BlockerKind, ChangeBlocker, ChangeResource, ChangeTiming, InstanceSnapshot,
+        ParallelEligibility, ParallelRuntimeState, QueueIntent, SnapshotTotals,
     };
 
     /// One projected change with real action eligibility for `app_mode`.
@@ -1073,6 +1073,48 @@ mod enabled {
             timing: ChangeTiming::default(),
             latest_activity: None,
             worktree: None,
+        }
+    }
+
+    /// One `blocked` row carrying the structured blocker the reducer publishes.
+    ///
+    /// The kind is the only thing that separates a dependency wait the owner
+    /// clears by itself from an external prerequisite it handed back to the
+    /// operator, so the fixture takes it rather than assuming one, and the
+    /// action eligibility is classified *with* the blocker exactly as the
+    /// projection does it.
+    fn blocked_change(id: &str, app_mode: &str, kind: BlockerKind) -> ChangeResource {
+        let blocker = ChangeBlocker {
+            status: "blocked".to_string(),
+            kind,
+            category: match kind {
+                BlockerKind::External => Some("pending_verification".to_string()),
+                _ => None,
+            },
+            detail: match kind {
+                BlockerKind::External => Some("waiting on the signing certificate".to_string()),
+                BlockerKind::Dependency => Some("waiting on 'upstream'".to_string()),
+                BlockerKind::None => None,
+            },
+            unblock_condition: match kind {
+                BlockerKind::External => Some("the certificate is issued".to_string()),
+                _ => None,
+            },
+            prerequisite_owner: match kind {
+                BlockerKind::External => Some("release".to_string()),
+                _ => None,
+            },
+            origin: Some("apply".to_string()),
+            resumable: true,
+        };
+        ChangeResource {
+            actions: conflux::web::remote_control_api::projection::change_actions_for_test(
+                app_mode,
+                "blocked",
+                Some(&blocker),
+            ),
+            blocker: Some(blocker),
+            ..change(id, app_mode, "blocked")
         }
     }
 
@@ -3517,6 +3559,110 @@ mod enabled {
         owner.stop().await;
     }
 
+    /// A validated external prerequisite is a hold the *operator* clears.
+    ///
+    /// The bug this covers is the expensive one: the owner had already returned
+    /// control as `blocked:external`, and an unbounded waiter — the documented
+    /// default — held on forever waiting for a retry only a human was going to
+    /// submit. No `--timeout` here on purpose, so the release can only come from
+    /// the classification and never from a clock.
+    #[tokio::test]
+    async fn wait_releases_external_blocker_without_waiting_for_operator() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+        let head_before = repo.git(&["rev-parse", "HEAD"]);
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![blocked_change("alpha", "select", BlockerKind::External)],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let output = spawn_wait(&owner, repo.path(), "alpha", None)
+            .await
+            .unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "change_requires_action",
+            "an external blocker must release an unbounded waiter, stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(27));
+        assert!(!parsed["ok"].as_bool().unwrap());
+        assert_eq!(parsed["detail"]["observed_status"], "blocked");
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        // The prerequisite facts are what the released caller acts on, so they
+        // are published as data rather than left inside the message.
+        assert_eq!(parsed["detail"]["blocker"]["kind"], "external");
+        assert_eq!(
+            parsed["detail"]["blocker"]["unblock_condition"],
+            "the certificate is issued"
+        );
+        assert_eq!(parsed["detail"]["blocker"]["prerequisite_owner"], "release");
+        assert_eq!(
+            parsed["detail"]["error_detail"],
+            "waiting on the signing certificate"
+        );
+
+        // Releasing is not repairing.
+        assert_eq!(spy.call_count(), 0, "wait must submit no command");
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD"]),
+            head_before,
+            "wait must not touch the repository on its way out"
+        );
+        owner.stop().await;
+    }
+
+    /// The same classification on a later observation, not only the first.
+    ///
+    /// The common shape is a caller that starts waiting while the change is
+    /// still applying and only then hits the external prerequisite; a wait that
+    /// classified once at startup would hold forever on exactly that.
+    #[tokio::test]
+    async fn wait_releases_when_live_work_becomes_externally_blocked() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "applying")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let waiting = spawn_wait(&owner, repo.path(), "alpha", None);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !waiting.is_finished(),
+            "an active phase must keep the wait observing"
+        );
+
+        owner.publish(snapshot(
+            "select",
+            vec![blocked_change("alpha", "select", BlockerKind::External)],
+        ));
+
+        let output = waiting.await.unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "change_requires_action",
+            "stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(27));
+        assert_eq!(parsed["detail"]["observed_status"], "blocked");
+        assert_eq!(parsed["detail"]["blocker"]["kind"], "external");
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
     /// The other half of the same rule: a row the owner can still advance keeps
     /// the wait observing, and the only thing that ends it is the deadline the
     /// caller asked for.
@@ -3535,19 +3681,25 @@ mod enabled {
             vec![
                 change("held-not-queued", "select", "not queued"),
                 change("held-blocked", "select", "blocked"),
+                // A dependency wait is the owner's own work queue: it clears
+                // when the owner archives what it is waiting on, so releasing
+                // there would abandon work that is still moving.
+                blocked_change("held-dependency", "select", BlockerKind::Dependency),
                 change("held-applying", "select", "applying"),
             ],
         ));
         owner.contract(merged_contract("main"));
 
-        let (not_queued, blocked, applying) = tokio::join!(
+        let (not_queued, blocked, dependency, applying) = tokio::join!(
             wait_for(&owner, repo.path(), "held-not-queued", "250ms"),
             wait_for(&owner, repo.path(), "held-blocked", "250ms"),
+            wait_for(&owner, repo.path(), "held-dependency", "250ms"),
             wait_for(&owner, repo.path(), "held-applying", "250ms"),
         );
         for (output, change_id) in [
             (&not_queued, "held-not-queued"),
             (&blocked, "held-blocked"),
+            (&dependency, "held-dependency"),
             (&applying, "held-applying"),
         ] {
             let parsed = envelope(output);
@@ -5264,6 +5416,21 @@ mod enabled {
                 document.contains("not repairing") || document.contains("not a repair"),
                 "{name} must say releasing is still observation-only"
             );
+            // `blocked` appears in both lists, so a document that only listed it
+            // as held would now be wrong. The exception has to be stated, along
+            // with the fact that decides it.
+            assert!(
+                document.contains("external"),
+                "{name} must name the external blocker that releases a blocked row"
+            );
+            assert!(
+                document.contains("dependency"),
+                "{name} must name the blocked hold that keeps observing"
+            );
+            assert!(
+                document.contains("detail.blocker"),
+                "{name} must name the detail field carrying the prerequisite facts"
+            );
         }
 
         let cwd = neutral_cwd();
@@ -5275,6 +5442,10 @@ mod enabled {
         assert!(
             help.contains("merge wait") && help.contains("stalled"),
             "`client wait --help` must say which rows release, got:\n{help}"
+        );
+        assert!(
+            help.contains("external") && help.contains("dependency"),
+            "`client wait --help` must say which blocked rows release, got:\n{help}"
         );
     }
 
