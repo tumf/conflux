@@ -8,9 +8,13 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+#[cfg(test)]
+pub(crate) mod fixtures;
+
 use super::events::{send_event, ParallelEvent};
 use super::resolve_state::{
-    self, BatchState, GitResolveEvidence, ResolveEvidence, SequentialMergeItem,
+    self, BatchState, GitResolveEvidence, MergeAuthorizationLatch, ResolveEvidence,
+    SequentialMergeItem,
 };
 use super::types::{resolve_failure_detail, ResolveFailureClassification};
 
@@ -503,12 +507,26 @@ pub async fn resolve_merges_with_retry(
     );
     let evidence = GitResolveEvidence::new(workspace_manager.repo_root());
 
+    // One latch for the whole batch, created here and dropped with it, so a
+    // final merge this batch refuses stays refused for every later attempt in
+    // the same batch. It lives only in this stack frame: the next process
+    // recomputes authorization from the workspace alone.
+    let merge_authorization = MergeAuthorizationLatch::new();
+
     // Repository evidence decides entry, not process memory. A conflict-free
     // `MERGE_HEAD` no longer short-circuits into a blind commit: it enters the
     // classifier like every other state and reaches the agent as identity-proven
     // continuation guidance.
     let mut batch_state = if is_git {
-        Some(resolve_state::classify_batch(&evidence, items, base_revision).await)
+        Some(
+            resolve_state::classify_batch_with_latch(
+                &evidence,
+                items,
+                base_revision,
+                &merge_authorization,
+            )
+            .await,
+        )
     } else {
         None
     };
@@ -731,7 +749,13 @@ pub async fn resolve_merges_with_retry(
                 // decides whether the batch progressed. Every unfinished state
                 // returns as one structured phase diagnosis instead of the old
                 // generic "missing merge commits" fallback.
-                let state = resolve_state::classify_batch(&evidence, items, base_revision).await;
+                let state = resolve_state::classify_batch_with_latch(
+                    &evidence,
+                    items,
+                    base_revision,
+                    &merge_authorization,
+                )
+                .await;
                 let complete = state.is_complete();
                 let retryable = state.allows_agent_action();
                 let reason = state.diagnosis();
@@ -942,6 +966,9 @@ fn build_sequential_merge_resolve_prompt(
         diagnosis_block
     )
 }
+
+#[cfg(test)]
+mod merge_authorization_retry_tests;
 
 #[cfg(test)]
 mod tests {

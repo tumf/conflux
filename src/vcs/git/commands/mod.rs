@@ -32,11 +32,11 @@ pub use commit::{
 #[allow(unused_imports)]
 pub use merge::{
     bounded_prefix, check_merge_conflicts, commit_diff_entries, commits_with_exact_subject,
-    committed_tree_paths, diff_paths_between, first_parent_lineage, index_conflict_entries,
-    index_stage0_paths, is_ancestor, is_clean_including_untracked, is_merge_in_progress, merge,
-    merge_base, merge_branch, merge_branch_preserving_conflict, merge_head, parents_of,
-    rev_parse_commit, summarize_merge_tree, CommitDiffEntry, MergeSimulation,
-    PreservedMergeOutcome, MAX_CONFLICT_SAMPLE, MAX_OUTPUT_PREFIX_BYTES,
+    committed_file_text, committed_tree_paths, diff_paths_between, first_parent_lineage,
+    index_conflict_entries, index_stage0_paths, is_ancestor, is_clean_including_untracked,
+    is_merge_in_progress, merge, merge_base, merge_branch, merge_branch_preserving_conflict,
+    merge_head, parents_of, rev_parse_commit, summarize_merge_tree, CommitDiffEntry,
+    MergeSimulation, PreservedMergeOutcome, MAX_CONFLICT_SAMPLE, MAX_OUTPUT_PREFIX_BYTES,
 };
 #[allow(unused_imports)]
 pub use worktree::{

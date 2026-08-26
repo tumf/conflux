@@ -17,6 +17,11 @@ use crate::vcs::git::commands::{self as git_commands, CommitDiffEntry, WorktreeI
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+pub(crate) mod fixtures;
+#[cfg(test)]
+mod tests;
+
 /// Exact subject of a per-change final integration merge commit.
 pub fn final_merge_subject(change_id: &str) -> String {
     format!("Merge change: {}", change_id)
@@ -99,6 +104,13 @@ pub trait ResolveEvidence: Send + Sync {
         revision: &str,
         prefix: &str,
     ) -> EvidenceResult<Vec<String>>;
+
+    /// Committed text of `path` at `revision`, or `None` when it is unreadable.
+    async fn committed_file_text(
+        &self,
+        revision: &str,
+        path: &str,
+    ) -> EvidenceResult<Option<String>>;
 }
 
 /// Closed classification of the batch, ordered by the action it requires.
@@ -140,6 +152,18 @@ pub enum BatchState {
         /// Concrete state detail.
         reason: String,
     },
+    /// Repository-visible task evidence does not authorize a final merge.
+    ///
+    /// Deliberately distinct from [`BatchState::UnsafeEvidence`]: topology is
+    /// fine, the change is simply not finished. It carries no command, is not
+    /// agent-actionable, and leaves both the base and the change worktree
+    /// exactly as they were.
+    MergeNotAuthorized {
+        /// Change whose final merge is withheld.
+        change_id: String,
+        /// Concrete task-evidence or refusal detail.
+        reason: String,
+    },
     /// The item is next in order and its final merge has not started.
     FinalMergeMissing {
         /// Change awaiting final integration.
@@ -168,6 +192,7 @@ impl BatchState {
             Self::PreSyncUnfinished { .. } => "presync_unfinished",
             Self::PreSyncInvalid { .. } => "presync_invalid",
             Self::TargetMergeUnfinished { .. } => "target_merge_unfinished",
+            Self::MergeNotAuthorized { .. } => "merge_not_authorized",
             Self::FinalMergeMissing { .. } => "final_merge_missing",
             Self::ResurrectionCleanupRequired { .. } => "resurrection_cleanup_required",
             Self::Complete => "complete",
@@ -182,9 +207,15 @@ impl BatchState {
     /// Whether continuation may ask the agent to mutate the repository.
     ///
     /// `UnsafeEvidence` deliberately answers `false`: unproven identity must
-    /// preserve state rather than trigger a blind commit.
+    /// preserve state rather than trigger a blind commit. `MergeNotAuthorized`
+    /// answers `false` for the mirror-image reason: the evidence is trustworthy
+    /// and says the change is not finished, so handing it to another agent
+    /// would only re-issue the instruction that must not run.
     pub fn allows_agent_action(&self) -> bool {
-        !matches!(self, Self::UnsafeEvidence { .. } | Self::Complete)
+        !matches!(
+            self,
+            Self::UnsafeEvidence { .. } | Self::MergeNotAuthorized { .. } | Self::Complete
+        )
     }
 
     /// Structured, bounded phase diagnosis for resolve continuation context.
@@ -257,6 +288,17 @@ impl BatchState {
                         final_merge_subject(change_id)
                     ));
                 }
+            }
+            Self::MergeNotAuthorized { change_id, reason } => {
+                lines.push(format!("change_id: {}", change_id));
+                lines.push(format!("detail: {}", reason));
+                // No command, no commit subject, no branch: an unauthorized
+                // merge must not be describable as a next step, or the next
+                // attempt simply performs it.
+                lines.push(
+                    "required_action: none; the change is not proven complete, so do not integrate it and do not mutate any repository state; operator action is required"
+                        .to_string(),
+                );
             }
             Self::FinalMergeMissing {
                 change_id,
@@ -331,6 +373,188 @@ pub enum ItemIntegration {
 fn unsafe_evidence(context: &str, error: String) -> BatchState {
     BatchState::UnsafeEvidence {
         reason: format!("{}: {}", context, error),
+    }
+}
+
+/// Repository-visible task completion of one change, as committed on its branch.
+///
+/// The three answers are deliberately not two: "cannot be established" is not
+/// the same fact as "incomplete", but both withhold the merge. Collapsing them
+/// would either hide a broken task list behind a progress count or report a
+/// genuinely unfinished change as unreadable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCompletion {
+    /// Every recorded task in every task list found is complete.
+    Complete {
+        /// Task lists that proved it, repository-relative.
+        sources: Vec<String>,
+        /// Total tasks counted across those lists.
+        total: u32,
+    },
+    /// At least one task list records unfinished work.
+    Incomplete {
+        /// The task list carrying the unfinished work.
+        source: String,
+        /// Completed tasks in that list.
+        completed: u32,
+        /// Total tasks in that list.
+        total: u32,
+    },
+    /// Completion could not be established from committed evidence.
+    Unestablished {
+        /// Why the evidence does not prove completion.
+        reason: String,
+    },
+}
+
+impl TaskCompletion {
+    /// One-line evidence detail for the withheld-merge diagnosis.
+    fn detail(&self, change_id: &str) -> Option<String> {
+        match self {
+            Self::Complete { .. } => None,
+            Self::Incomplete {
+                source,
+                completed,
+                total,
+            } => Some(format!(
+                "Change '{}' records {}/{} tasks complete in {}; an unfinished change is never integrated",
+                change_id, completed, total, source
+            )),
+            Self::Unestablished { reason } => Some(format!(
+                "Change '{}' has no task evidence that proves completion: {}",
+                change_id, reason
+            )),
+        }
+    }
+}
+
+/// Repository-relative task lists that can speak for `change_id` at a revision.
+///
+/// Both identities are accepted because a sequential batch item is read at the
+/// point where it may hold either: the active list before archiving, and the
+/// archived list after. Anything else under `openspec/changes` — another
+/// change, a nested archive layout, a suffix collision — is not this change's
+/// evidence and is ignored rather than silently believed.
+fn task_evidence_paths(tree_paths: &[String], change_id: &str) -> Vec<String> {
+    let active = archive_layout::active_change_tasks_path(change_id);
+    let mut paths: Vec<String> = tree_paths
+        .iter()
+        .filter(|path| {
+            path.as_str() == active || archive_layout::is_valid_archive_tasks_path(path, change_id)
+        })
+        .cloned()
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Read committed task completion for `change_id` at `revision`.
+///
+/// Fails closed at every step: no task list, an unreadable one, a list with no
+/// recorded tasks at all, or an evidence error all answer
+/// [`TaskCompletion::Unestablished`]. When several lists exist they must all be
+/// complete, because the merge integrates all of them at once.
+pub async fn read_task_completion(
+    evidence: &dyn ResolveEvidence,
+    change_id: &str,
+    revision: &str,
+    tree_paths: &[String],
+) -> TaskCompletion {
+    let paths = task_evidence_paths(tree_paths, change_id);
+    if paths.is_empty() {
+        return TaskCompletion::Unestablished {
+            reason: format!(
+                "neither {} nor an archived tasks.md exists at {}",
+                archive_layout::active_change_tasks_path(change_id),
+                revision
+            ),
+        };
+    }
+
+    let mut total = 0u32;
+    for path in &paths {
+        let content = match evidence.committed_file_text(revision, path).await {
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                return TaskCompletion::Unestablished {
+                    reason: format!("{} is not readable at {}", path, revision),
+                }
+            }
+            Err(error) => {
+                return TaskCompletion::Unestablished {
+                    reason: format!("failed to read {} at {}: {}", path, revision, error),
+                }
+            }
+        };
+        let progress = crate::task_parser::parse_content(&content, None);
+        if progress.total == 0 {
+            return TaskCompletion::Unestablished {
+                reason: format!("{} records no tasks at all", path),
+            };
+        }
+        if progress.completed < progress.total {
+            return TaskCompletion::Incomplete {
+                source: path.clone(),
+                completed: progress.completed,
+                total: progress.total,
+            };
+        }
+        total = total.saturating_add(progress.total);
+    }
+
+    TaskCompletion::Complete {
+        sources: paths,
+        total,
+    }
+}
+
+/// Ephemeral, process-local record of final merges this run has refused.
+///
+/// Constitutionally this is in-memory state only: it is never persisted, never
+/// consulted across processes, and disappears on restart, after which
+/// authorization is recomputed from the workspace alone. Its one job is to be
+/// *monotonic* — a refusal recorded during a batch can be observed again but
+/// never cleared, so a later attempt inside the same batch cannot talk the
+/// classifier back into emitting the merge instruction it already withheld. It
+/// authorizes nothing: an empty latch means "no refusal seen", not "approved".
+#[derive(Debug, Default)]
+pub struct MergeAuthorizationLatch {
+    refusals: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+}
+
+impl MergeAuthorizationLatch {
+    /// An empty latch, refusing nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, String>> {
+        // A poisoned latch still holds real refusals; discarding them would
+        // re-authorize a merge that was already refused.
+        self.refusals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Record a refusal for `change_id`, keeping the first reason seen.
+    pub fn refuse(&self, change_id: &str, reason: &str) {
+        self.guard()
+            .entry(change_id.to_string())
+            .or_insert_with(|| reason.to_string());
+    }
+
+    /// The latched refusal reason for `change_id`, when one exists.
+    pub fn refusal(&self, change_id: &str) -> Option<String> {
+        self.guard().get(change_id).cloned()
+    }
+
+    /// Number of distinct changes this latch has refused.
+    ///
+    /// Observation only; production code decides from [`Self::refusal`].
+    #[allow(dead_code)]
+    pub fn refused_count(&self) -> usize {
+        self.guard().len()
     }
 }
 
@@ -651,12 +875,39 @@ async fn validate_cleanup_commits(
 }
 
 /// Classify the complete ordered batch from repository evidence.
+///
+/// Equivalent to [`classify_batch_with_latch`] with a latch that has refused
+/// nothing, which is the correct reading for a one-shot classification.
+///
+/// Production callers all run inside a batch and carry their own latch, so this
+/// convenience form is currently exercised only by the classifier's own tests.
+#[allow(dead_code)]
 pub async fn classify_batch(
     evidence: &dyn ResolveEvidence,
     items: &[SequentialMergeItem],
     base_revision: &str,
 ) -> BatchState {
-    match classify_batch_inner(evidence, items, base_revision).await {
+    classify_batch_with_latch(
+        evidence,
+        items,
+        base_revision,
+        &MergeAuthorizationLatch::new(),
+    )
+    .await
+}
+
+/// Classify the batch, consulting and extending an in-process refusal latch.
+///
+/// The latch is only ever read to withhold and written to refuse, so passing a
+/// shared one across the attempts of a single batch can turn an authorized
+/// merge into a withheld one but never the reverse.
+pub async fn classify_batch_with_latch(
+    evidence: &dyn ResolveEvidence,
+    items: &[SequentialMergeItem],
+    base_revision: &str,
+    latch: &MergeAuthorizationLatch,
+) -> BatchState {
+    match classify_batch_inner(evidence, items, base_revision, latch).await {
         Ok(state) | Err(state) => state,
     }
 }
@@ -665,6 +916,7 @@ async fn classify_batch_inner(
     evidence: &dyn ResolveEvidence,
     items: &[SequentialMergeItem],
     base_revision: &str,
+    latch: &MergeAuthorizationLatch,
 ) -> std::result::Result<BatchState, BatchState> {
     if items.is_empty() {
         return Err(BatchState::UnsafeEvidence {
@@ -952,6 +1204,41 @@ async fn classify_batch_inner(
             });
         }
 
+        // Last gate before the one instruction that integrates the change:
+        // repository-visible task completion. Topology being provable says the
+        // merge *can* be made, not that it *may* be. Everything before this
+        // point is worktree-side pre-sync and conflict work, which stays
+        // available either way — conflict resolution and merge authorization are
+        // separate questions, and resolving a conflict never authorizes a merge.
+        //
+        // Placing the gate here also means an unfinished change never reaches
+        // the state where a final merge is in progress, so `TargetMergeUnfinished`
+        // needs no gate of its own: an in-progress merge can only exist because
+        // authorization already succeeded, or because an operator started it by
+        // hand, and abandoning that merge mid-flight would be a worse outcome
+        // than committing what the operator explicitly asked for.
+        if let Some(reason) = latch.refusal(&item.change_id) {
+            return Ok(BatchState::MergeNotAuthorized {
+                change_id: item.change_id.clone(),
+                reason,
+            });
+        }
+        // Evidence is the validated branch tip's own committed tree — exactly
+        // what the final merge would integrate — so a task list completed only
+        // in an uncommitted worktree cannot authorize anything.
+        let completion =
+            read_task_completion(evidence, &item.change_id, &item.tip, &worktree_tree_paths).await;
+        if let Some(reason) = completion.detail(&item.change_id) {
+            // Latched before returning: inside this batch the same unchanged
+            // evidence must keep producing the same refusal, so no later attempt
+            // can be handed the merge instruction again.
+            latch.refuse(&item.change_id, &reason);
+            return Ok(BatchState::MergeNotAuthorized {
+                change_id: item.change_id.clone(),
+                reason,
+            });
+        }
+
         return Ok(BatchState::FinalMergeMissing {
             change_id: item.change_id.clone(),
             worktree: item.worktree.clone(),
@@ -1173,6 +1460,16 @@ impl ResolveEvidence for GitResolveEvidence {
         prefix: &str,
     ) -> EvidenceResult<Vec<String>> {
         git_commands::committed_tree_paths(&self.repo_root, revision, prefix)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn committed_file_text(
+        &self,
+        revision: &str,
+        path: &str,
+    ) -> EvidenceResult<Option<String>> {
+        git_commands::committed_file_text(&self.repo_root, revision, path)
             .await
             .map_err(|error| error.to_string())
     }

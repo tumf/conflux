@@ -419,6 +419,13 @@ async fn per_change_upstream_base_lane_orders_merge_hook_verification_and_public
     let archive_dir = workspace_path.join("openspec/changes/archive/alpha");
     std::fs::create_dir_all(&archive_dir).expect("archive dir");
     std::fs::write(archive_dir.join("proposal.md"), "# archived alpha\n").expect("archive file");
+    // "Completed" has to be provable: the final merge is only authorized when
+    // the branch's own committed task list says every task is done.
+    std::fs::write(
+        archive_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] Do the work\n",
+    )
+    .expect("archive tasks");
     git(&workspace_path, &["add", "-A"]).expect("stage archive");
     git(&workspace_path, &["commit", "-m", "Archive: alpha"]).expect("archive commit");
     let change_revision = git(&workspace_path, &["rev-parse", "HEAD"]).expect("change revision");

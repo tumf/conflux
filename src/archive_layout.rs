@@ -96,6 +96,28 @@ pub(crate) fn is_active_change_path(path: &str, change_id: &str) -> bool {
     path.starts_with(&prefix)
 }
 
+/// Repository-relative path of the active (live) change task list.
+pub(crate) fn active_change_tasks_path(change_id: &str) -> String {
+    format!("{ACTIVE_CHANGES_PREFIX}/{change_id}/tasks.md")
+}
+
+/// Whether a repository-relative path is `file_name` inside the valid archive
+/// entry for `change_id`.
+///
+/// Accepts the exact `<change_id>` entry and the dated `YYYY-MM-DD-<change_id>`
+/// entry only. Nested date directories, unrelated entries, and suffix
+/// collisions such as `prefix-<change_id>` are rejected, so they can never
+/// stand in for the change's own archived file.
+pub(crate) fn is_valid_archive_file_path(path: &str, change_id: &str, file_name: &str) -> bool {
+    let Some(rest) = path.strip_prefix(&format!("{ARCHIVE_PREFIX}/")) else {
+        return false;
+    };
+    let Some(entry) = rest.strip_suffix(&format!("/{file_name}")) else {
+        return false;
+    };
+    is_valid_archive_entry_name(entry, change_id)
+}
+
 /// Whether a repository-relative path is the archived proposal identity for `change_id`.
 ///
 /// Accepts the exact `<change_id>` entry and the dated `YYYY-MM-DD-<change_id>`
@@ -103,13 +125,12 @@ pub(crate) fn is_active_change_path(path: &str, change_id: &str) -> bool {
 /// collisions such as `prefix-<change_id>` are rejected, so they can never
 /// authorize deletion of the live change.
 pub(crate) fn is_valid_archive_proposal_path(path: &str, change_id: &str) -> bool {
-    let Some(rest) = path.strip_prefix(&format!("{ARCHIVE_PREFIX}/")) else {
-        return false;
-    };
-    let Some(entry) = rest.strip_suffix("/proposal.md") else {
-        return false;
-    };
-    is_valid_archive_entry_name(entry, change_id)
+    is_valid_archive_file_path(path, change_id, "proposal.md")
+}
+
+/// Whether a repository-relative path is the archived task list for `change_id`.
+pub(crate) fn is_valid_archive_tasks_path(path: &str, change_id: &str) -> bool {
+    is_valid_archive_file_path(path, change_id, "tasks.md")
 }
 
 /// Whether a repository-relative path sits under an invalid nested archive layout
@@ -244,6 +265,40 @@ mod tests {
             "openspec/changes/archive/2026-07-09-my-change/proposal.md",
             "my-change"
         ));
+    }
+
+    #[test]
+    fn archive_task_paths_use_the_same_entry_rules_as_proposals() {
+        assert!(is_valid_archive_tasks_path(
+            "openspec/changes/archive/my-change/tasks.md",
+            "my-change"
+        ));
+        assert!(is_valid_archive_tasks_path(
+            "openspec/changes/archive/2026-07-09-my-change/tasks.md",
+            "my-change"
+        ));
+        for invalid in [
+            // nested date layout
+            "openspec/changes/archive/2026-07-09/my-change/tasks.md",
+            // suffix collision
+            "openspec/changes/archive/prefix-my-change/tasks.md",
+            // a different change's task list
+            "openspec/changes/archive/other-change/tasks.md",
+            // the live task list, not the archived one
+            "openspec/changes/my-change/tasks.md",
+            // a different file inside the right entry
+            "openspec/changes/archive/my-change/proposal.md",
+        ] {
+            assert!(
+                !is_valid_archive_tasks_path(invalid, "my-change"),
+                "'{}' must not count as archived task evidence",
+                invalid
+            );
+        }
+        assert_eq!(
+            active_change_tasks_path("my-change"),
+            "openspec/changes/my-change/tasks.md"
+        );
     }
 
     #[test]

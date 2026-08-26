@@ -5,6 +5,7 @@
 
 use super::basic::{get_conflict_files, is_working_directory_clean, run_git};
 use super::status_policy::{read_only_status_argv, PORCELAIN_UNTRACKED_STATUS_ARGS};
+use crate::vcs::commands::run_vcs_command_captured;
 use crate::vcs::{VcsError, VcsResult};
 use std::path::Path;
 use std::process::Stdio;
@@ -699,6 +700,30 @@ pub async fn committed_tree_paths<P: AsRef<Path>>(
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// Return the committed text of `path` at `revision`, or `None` when the
+/// revision has no readable blob there.
+///
+/// A missing path and an unreadable object are deliberately the same answer:
+/// every caller reads committed files as safety evidence, so both must fail
+/// closed rather than be distinguished by an error string. Content is returned
+/// byte-for-byte (only invalid UTF-8 is replaced), because trimming would
+/// silently change what a line-oriented parser sees.
+pub async fn committed_file_text<P: AsRef<Path>>(
+    cwd: P,
+    revision: &str,
+    path: &str,
+) -> VcsResult<Option<String>> {
+    let object = format!("{}:{}", revision, path);
+    let output = run_vcs_command_captured(
+        "git",
+        &["cat-file", "blob", &object],
+        cwd,
+        crate::vcs::VcsBackend::Git,
+    )
+    .await?;
+    Ok(output.success.then_some(output.stdout))
 }
 
 /// A single `name-status` entry of a commit's own tree diff.
