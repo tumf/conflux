@@ -105,12 +105,14 @@ would contend for the lock with the process you meant to talk to.
 cflx client status --json                 # read the owner; mutates nothing
 cflx client mark add-my-change --json     # select it; unrelated marks are preserved
 cflx client start --json                  # F5 equivalent over the authoritative marks
+cflx client force-stop-change add-my-change --json   # kill exactly this one, now
 cflx client wait add-my-change --json     # waits for as long as the work takes
 cflx client mcp                           # serve the same controls over stdio MCP
 ```
 
 The verbs are the operator's own: `status`, `mark`, `unmark`, `start`, `stop`,
-`force-stop`, `wait`, and the `subscribe` group, plus `mcp` for hosts that speak
+`force-stop`, `force-stop-change`, `wait`, and the `subscribe` group, plus `mcp`
+for hosts that speak
 the protocol instead of a shell. `--project-dir ABSOLUTE_PATH` names any
 directory inside the project's Git working tree and is the normal explicit route;
 `--unix-socket PATH` is the low-level override of the default
@@ -128,6 +130,23 @@ stop controls submit — `start` consumes the owner's authoritative mark set and
 takes no target list, because "start only these" is not something the shared
 transaction can express.
 
+**`force-stop-change` kills exactly one proposal.** It is the target-scoped
+counterpart of process-wide `force-stop`, and the only control that bypasses the
+graceful SIGTERM escalation window `stop` gives a change: the owner sends SIGKILL
+straight to the managed process group that proposal owns, waits for confirmed
+reaping, then clears its queue admission and execution mark together so later
+mark settlement cannot redispatch it. Unrelated changes keep their processes,
+marks, queue intent, execution IDs, and subscriptions, and the process-wide run
+mode, scheduler state, and stop state do not change. Completed worktree
+effects — an Apply commit that already landed — are preserved, and the settled
+result says so with `effects_rolled_back: false`. Its success token is `stopped`,
+not `accepted`, because one settled command really did end one execution
+episode. A target that is admitted but owns no live process is dequeued outright;
+a terminal, unadmitted, merge-wait, or resolve-wait target is refused with
+`target_ineligible`, and the owner publishes the same fact ahead of time as
+`actions.force_stop_change`. `stop_and_dequeue` keeps its own
+cancel-confirm-dequeue contract unchanged.
+
 **`wait` has no deadline unless you ask for one.** `--timeout` defaults to `0`,
 and zero in any unit means "wait for as long as the work takes": the wait ends at
 verified completion, a typed failure, owner replacement, or your own
@@ -140,7 +159,7 @@ per-invocation deadline of its own rather than reported as `timeout`.
 **Read `outcome`, not prose.** `--json` prints exactly one versioned envelope on
 stdout; diagnostics go to stderr, and each outcome has its own stable exit
 status. The successes are narrow: `observed`, `marked`, `unmarked`, `unchanged`,
-`accepted`, `subscribed`, `cleared`, and `completed`. Everything else —
+`stopped`, `accepted`, `subscribed`, `cleared`, and `completed`. Everything else —
 `owner_not_running`, `owner_not_command_capable`, `owner_restarted`,
 `change_not_found`, `target_ineligible`, `revision_conflict`,
 `transport_not_permitted`, `unsupported_owner`, `partial_intent`,
@@ -178,7 +197,10 @@ resolved, merged, or cleaned up on the way out.
 `cflx client mcp` is a stdio Model Context Protocol server over exactly that
 boundary, with three closed tools: `cflx_status`, `cflx_control`, and
 `cflx_subscribe`. `cflx_control` takes one action — `mark`, `unmark`, `start`,
-`stop`, or `force_stop` — and each tool calls the same module its command does.
+`stop`, `force_stop`, or `force_stop_change` — and each tool calls the same
+module its command does. The two mark actions take 1 through 64 distinct
+`change_ids`, `force_stop_change` takes exactly one, and the three process-wide
+lifecycle actions take none.
 It exposes no raw `/api/v2` command construction, so a model cannot name a
 command type, an expected revision, an idempotency key, queue intent, or shell
 source. stdout carries JSON-RPC frames and nothing else.

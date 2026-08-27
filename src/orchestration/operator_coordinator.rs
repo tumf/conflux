@@ -58,7 +58,9 @@ use crate::orchestration::mark_settlement::{
     MarkSettlementAction, MarkSettlementExclusion, MarkSettlementFailure, MarkSettlementPlan,
     MarkSettlementRuntime,
 };
-use crate::orchestration::operator_command::{OperatorMode, OperatorOutcome, PendingTermination};
+use crate::orchestration::operator_command::{
+    OperatorMode, OperatorOutcome, PendingForceStop, PendingTermination,
+};
 use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
     SchedulerEffect,
@@ -445,6 +447,16 @@ pub enum OperatorIntent {
         /// Target change.
         change_id: String,
     },
+    /// Kill one change's managed process group immediately and dequeue it.
+    ///
+    /// The other two-phase intent, and the only target-scoped control that
+    /// bypasses the graceful SIGTERM escalation window. It names exactly one
+    /// change and never touches the process-wide mode, the scheduler, or any
+    /// other change's marks, queue intent, or processes.
+    ForceStopChange {
+        /// Target change.
+        change_id: String,
+    },
 }
 
 /// What an accepted command actually did, in the shared service vocabulary.
@@ -581,6 +593,9 @@ impl OperatorApplication {
         if let OperatorIntent::StopAndDequeue { change_id } = &intent {
             return self.apply_stop_and_dequeue(change_id, None).await;
         }
+        if let OperatorIntent::ForceStopChange { change_id } = &intent {
+            return self.apply_force_stop_change(change_id, None).await;
+        }
         let guard = self.gate.clone().lock_owned().await;
         self.apply_ordinary(intent, &guard).await
     }
@@ -597,6 +612,10 @@ impl OperatorApplication {
         if let OperatorIntent::StopAndDequeue { change_id } = &intent {
             let change_id = change_id.clone();
             return self.apply_stop_and_dequeue(&change_id, Some(guard)).await;
+        }
+        if let OperatorIntent::ForceStopChange { change_id } = &intent {
+            let change_id = change_id.clone();
+            return self.apply_force_stop_change(&change_id, Some(guard)).await;
         }
         self.apply_ordinary(intent, &guard).await
     }
@@ -690,6 +709,95 @@ impl OperatorApplication {
         }
     }
 
+    /// Begin a two-phase targeted force-stop under a held gate.
+    ///
+    /// Phase one only: eligibility validation against the fresh authoritative
+    /// state, then the immediate SIGKILL and its reaping proof. The caller
+    /// releases the gate and later drives [`Self::settle_force_stop_change`], so
+    /// unrelated commands, event fan-out, and rendering stay live while the
+    /// killed task unwinds.
+    pub async fn begin_force_stop_change(
+        &self,
+        change_id: &str,
+    ) -> Result<PendingForceStop, RunControlError> {
+        self.run_control
+            .operator()
+            .begin_force_stop_change(change_id)
+            .await
+            .map_err(RunControlError::Operator)
+    }
+
+    /// Settle a two-phase targeted force-stop after its target was killed.
+    ///
+    /// Structurally the same shape as [`Self::settle_stop_and_dequeue`], and for
+    /// the same reasons: the settlement revision is read under the reacquired
+    /// gate, and explanatory Git evidence is read outside the boundary over the
+    /// now-quiescent worktree.
+    ///
+    /// The event it dispatches is the ordinary `ChangeDequeued`. A targeted
+    /// force-stop ends one execution episode exactly the way a stop does, so a
+    /// subscription's terminal `stopped` classification and `wait`'s
+    /// `change_requires_action` release come from the existing edge rather than
+    /// from a second spelling of the same fact.
+    pub async fn settle_force_stop_change(&self, pending: PendingForceStop) -> ApplicationResult {
+        let change_id = pending.change_id().to_string();
+        if let Err(error) = pending.confirm_termination().await {
+            // The kill was already issued and proven; only the task handshake
+            // failed. No dequeue decision state may be committed on that.
+            let _guard = self.gate.clone().lock_owned().await;
+            return ApplicationResult {
+                outcome: Err(RunControlError::Operator(error)),
+                revision: Some(self.current_revision()),
+            };
+        }
+
+        let apply_commit = crate::orchestration::apply_commit_evidence::observe_apply_commit(
+            self.run_control.operator().execution_facts().as_deref(),
+            self.apply_commit_evidence.as_deref(),
+            &change_id,
+        )
+        .await;
+
+        let _guard = self.gate.clone().lock_owned().await;
+        match self
+            .run_control
+            .operator()
+            .commit_force_stop_change(&pending, apply_commit)
+            .await
+        {
+            Ok(outcome @ OperatorOutcome::ForceStopped { .. }) => {
+                let revision = self
+                    .dispatch_outcome(ExecutionEvent::ChangeDequeued {
+                        change_id: change_id.clone(),
+                    })
+                    .await;
+                ApplicationResult::operator(outcome, Some(revision))
+            }
+            Ok(outcome) => ApplicationResult::operator(outcome, Some(self.current_revision())),
+            Err(error) => ApplicationResult {
+                outcome: Err(RunControlError::Operator(error)),
+                revision: Some(self.current_revision()),
+            },
+        }
+    }
+
+    async fn apply_force_stop_change(
+        &self,
+        change_id: &str,
+        held: Option<ApplicationGuard>,
+    ) -> ApplicationResult {
+        let guard = match held {
+            Some(guard) => guard,
+            None => self.gate.clone().lock_owned().await,
+        };
+        let pending = match self.begin_force_stop_change(change_id).await {
+            Ok(pending) => pending,
+            Err(error) => return ApplicationResult::failed(error),
+        };
+        drop(guard);
+        self.settle_force_stop_change(pending).await
+    }
+
     async fn apply_stop_and_dequeue(
         &self,
         change_id: &str,
@@ -743,8 +851,8 @@ impl OperatorApplication {
             }
             OperatorIntent::SetAllExecutionMarks => self.apply_bulk_marks().await,
             // Routed before the gate was taken.
-            OperatorIntent::StopAndDequeue { .. } => {
-                unreachable!("a two-phase intent is routed through apply_stop_and_dequeue")
+            OperatorIntent::StopAndDequeue { .. } | OperatorIntent::ForceStopChange { .. } => {
+                unreachable!("a two-phase intent is routed before the ordinary transaction")
             }
         }
     }
@@ -1176,8 +1284,10 @@ fn operator_outcome_event(outcome: &OperatorOutcome) -> Option<ExecutionEvent> {
         // which does hold the scheduler effect and does publish the outcome.
         OperatorOutcome::Retry(_) => None,
         // `ChangeDequeued` already means exactly this and is published by the
-        // two-phase settlement path.
-        OperatorOutcome::Dequeued { .. } => None,
+        // two-phase settlement paths. A targeted force-stop ends one execution
+        // episode the same way a stop does, so it reuses that edge rather than
+        // giving the same fact a second authority.
+        OperatorOutcome::Dequeued { .. } | OperatorOutcome::ForceStopped { .. } => None,
         OperatorOutcome::NoOp { .. } => None,
     }
 }

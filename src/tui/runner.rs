@@ -550,6 +550,7 @@ async fn run_tui_loop(
         ws.set_shared_state(shared_state.clone()).await;
         ws.set_execution_marks(app.execution_marks()).await;
         ws.set_parallel_runtime(app.parallel_runtime()).await;
+        // Bound later, once the supervisor exists: see `managed_termination`.
         ws.set_repo_root(repo_root.clone()).await;
     }
 
@@ -646,6 +647,21 @@ async fn run_tui_loop(
     let external_shutdown = crate::tui::run_supervisor::ExternalShutdownRequest::new();
     external_shutdown.install();
 
+    // The one managed-process authority for this process. The supervisor holds
+    // whichever run is live, so reading its scope per call is what keeps a
+    // targeted force-stop bound to the run that owns the processes rather than
+    // to a scope captured once at startup and reaped several runs ago.
+    let managed_termination: Arc<
+        dyn crate::orchestration::operator_command::ManagedProcessTermination,
+    > = {
+        let scope_owner = supervisor.clone();
+        Arc::new(
+            crate::orchestration::operator_command::LiveRunManagedProcesses::new(move || {
+                scope_owner.run_command_scope()
+            }),
+        )
+    };
+
     // The single process-local application services every frontend commands
     // through. They are built once here, before the first keypress and before v2
     // is bound, so a remote command and a keypress cannot reach different
@@ -670,7 +686,12 @@ async fn run_tui_loop(
             // Read-only, and only at stop settlement: the phase a settled
             // command reports comes from the same store the status resource
             // publishes.
-            .with_execution_facts(execution_facts.clone()),
+            .with_execution_facts(execution_facts.clone())
+            // The managed ownership graph a targeted force-stop signals
+            // through. It re-reads the *live* run's command scope on every
+            // call, so a kill always reaches the run that is actually
+            // executing and reports "owns nothing" between runs.
+            .with_managed_termination(managed_termination.clone()),
         )
     };
     // One store, three readers: the start guard, the operator service that
@@ -705,6 +726,11 @@ async fn run_tui_loop(
         // command record to bind a revision to.
         let revisions: Arc<dyn crate::events::OutcomeRevisions> = ws.clone();
         application = application.with_revisions(Some(revisions));
+        // The same port the shared transaction kills through, so the
+        // `actions.force_stop_change` a client reads and the admission a
+        // command hits are one fact rather than two.
+        ws.set_managed_termination(managed_termination.clone())
+            .await;
     }
     let application = Arc::new(application);
     // Mark settlement becomes possible only now: the transaction that admits its

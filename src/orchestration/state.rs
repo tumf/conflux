@@ -1121,6 +1121,15 @@ impl OrchestratorState {
         self.change_runtime.get(change_id)
     }
 
+    /// Whether the reducer tracks this change at all.
+    ///
+    /// Distinct from `display_status(change_id) == "not queued"`, which is also
+    /// what an untracked ID answers: a command that must refuse an unknown
+    /// target cannot tell the two apart from the status string alone.
+    pub fn is_tracked_change(&self, change_id: &str) -> bool {
+        self.change_runtime.contains_key(change_id)
+    }
+
     /// Derive the UI display status string for a change (Phase 1.4).
     pub fn display_status(&self, change_id: &str) -> &'static str {
         match self.change_runtime.get(change_id) {

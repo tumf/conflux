@@ -31,6 +31,7 @@ cflx client mark add-my-change --json     # select it; unrelated marks are prese
 cflx client unmark add-my-change --json
 cflx client start --json                  # F5 equivalent over the authoritative marks
 cflx client stop --json                   # graceful; force-stop for the immediate one
+cflx client force-stop-change add-my-change --json   # kill exactly this proposal, now
 cflx client wait add-my-change --json     # waits for as long as the work takes
 cflx client wait add-my-change --timeout 45m --json   # or give up at an explicit deadline
 I=$(cflx client status --json | jq -r .instance_id)
@@ -44,8 +45,9 @@ cflx client --project-dir /absolute/path/to/repo status --json
 ```
 
 The verbs are the operator's own — `status`, `mark`, `unmark`, `start`, `stop`,
-`force-stop`, `wait`, and the `subscribe` group — plus `mcp` for hosts that speak
-the protocol instead. Connection options belong to the namespace.
+`force-stop`, `force-stop-change`, `wait`, and the `subscribe` group — plus `mcp`
+for hosts that speak the protocol instead. Connection options belong to the
+namespace.
 `--project-dir ABSOLUTE_PATH` is the normal explicit route: it names any
 directory inside the project's Git working tree — the root, a subdirectory, a
 linked worktree, a submodule — and Conflux derives *both* the owner socket
@@ -72,6 +74,11 @@ option, the current working directory's repository is used.
   list, because "start only these" is not something the shared transaction can
   express. `stop` and `force-stop` are the shared stop controls with the same
   runtime classification the TUI applies.
+- *Targeted force-stop*: the one control that is lifecycle *and* target-scoped.
+  `force-stop-change` names exactly one proposal — never zero, never a list — and
+  is the only path that bypasses the graceful SIGTERM escalation window. It is
+  not a spelling of `force-stop`, and neither verb can be widened into the other
+  by adding or dropping an argument.
 - *Queue intent*: owner-side admission state, produced by the owner's own mark
   settlement and analysis. No client path constructs it.
 
@@ -80,9 +87,10 @@ stdout (`schema_version`, `ok`, `operation`, `outcome`, `instance_id`,
 `execution_id`, `change_id`, `message`, `detail`); diagnostics go to stderr, and
 each outcome has its own stable exit status. Operations are `status`,
 `control_mark`, `control_unmark`, `control_start`, `control_stop`,
-`control_force_stop`, `wait`, `subscribe_set`, `subscribe_get`, and
-`subscribe_clear`. Success is narrow: `observed`, `marked`, `unmarked`,
-`unchanged`, `accepted`, `subscribed`, `cleared`, `completed`. Everything else —
+`control_force_stop`, `control_force_stop_change`, `wait`, `subscribe_set`,
+`subscribe_get`, and `subscribe_clear`. Success is narrow: `observed`, `marked`,
+`unmarked`, `unchanged`, `stopped`, `accepted`, `subscribed`, `cleared`,
+`completed`. Everything else —
 `owner_not_running`, `owner_not_command_capable`, `owner_restarted`,
 `change_not_found`, `target_ineligible`, `revision_conflict`,
 `transport_not_permitted`, `unsupported_owner`, `partial_intent`,
@@ -100,6 +108,28 @@ and `start` against it return `owner_not_command_capable` rather than queueing
 for later; `status` and `wait` still work there. `wait` needs the owner's Git
 repository, because it certifies completion from repository evidence: run it
 inside that repository, or name the repository with `--project-dir`.
+
+**Targeted force-stop kills one proposal and nothing else.** `cflx client
+force-stop-change <change-id>` submits the shared `force_stop_change` command:
+the owner sends SIGKILL straight to the managed process group that proposal owns
+— no SIGTERM, no grace window, which is the whole difference from
+`stop_and_dequeue` — waits for confirmed termination and reaping, then clears
+that change's queue admission and execution mark atomically so later mark
+settlement cannot redispatch it. Unrelated changes keep their processes, marks,
+queue intent, execution IDs, and subscriptions; `app_mode`, scheduler state, and
+process-wide stop state do not change. Completed worktree effects are preserved
+and the settled result publishes `effects_rolled_back: false` alongside the
+target, its cancelled `execution_id` when one existed, the cancelled phase, the
+last completed phase, and whether a process was really terminated.
+
+The success outcome is `stopped`, with exit status `0`. Eligibility is the
+owner's own published fact, readable ahead of time as
+`actions.force_stop_change`: an applying, accepting, rejecting, archiving, or
+resolving target is eligible while it owns live managed activity; an admitted but
+idle `queued` or `blocked` target is eligible for dequeue-only settlement; and
+merge-wait, resolve-wait, terminal, rejected, unknown, and unadmitted rows are
+refused with `target_ineligible` and a typed reason. Process-wide `force_stop`
+and graceful `stop_and_dequeue` are unchanged.
 
 **Marking admits nothing.** A settled mark proves the owner recorded your
 selection, and nothing else. The owner's own settlement decides whether stable
@@ -163,9 +193,12 @@ commands do not cover; prefer `cflx client` for delegation.
 
 `cflx client mcp` serves the same boundary to an MCP host over stdio, as three
 closed tools: `cflx_status`, `cflx_control`, and `cflx_subscribe`.
-`cflx_control` takes one `action` — `mark`, `unmark`, `start`, `stop`, or
-`force_stop` — with `change_ids` required by the two mark actions and refused by
-the three lifecycle ones. `cflx_subscribe` takes `set`, `get`, or `clear` over 1
+`cflx_control` takes one `action` — `mark`, `unmark`, `start`, `stop`,
+`force_stop`, or `force_stop_change` — with `change_ids` required by the two mark
+actions (1 through 64, distinct), required as exactly one element by
+`force_stop_change`, and refused by the three process-wide lifecycle ones. Zero,
+several, duplicate, or blank targets on `force_stop_change` are refused through
+the normal validation error before any owner is contacted. `cflx_subscribe` takes `set`, `get`, or `clear` over 1
 through 64 distinct `change_ids`.
 
 Every tool accepts an optional absolute `project_dir` — the normal per-call

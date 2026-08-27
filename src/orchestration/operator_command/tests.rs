@@ -2939,3 +2939,650 @@ async fn tui_change_row_layout_mark_contract_bulk_mark_excludes_archive_complete
         "and nothing else about it moves either"
     );
 }
+
+// ============================================================================
+// Targeted force-stop: eligibility, target-only cancellation, settlement
+// ============================================================================
+
+/// Managed-ownership double for the targeted force-stop path.
+///
+/// It models exactly what the port can answer — which changes own a live
+/// managed process group, and what killing one proves — and records every
+/// change it was asked to kill. Recording the *calls* is what lets a test prove
+/// an unrelated change was never signalled, which a double that only tracked
+/// resulting state could not distinguish from a signal that happened to fail.
+struct FakeManagedProcesses {
+    live: StdMutex<std::collections::HashSet<String>>,
+    /// When set, every kill reports this unconfirmed evidence instead.
+    unconfirmed: Option<String>,
+    killed: StdMutex<Vec<String>>,
+}
+
+impl FakeManagedProcesses {
+    fn with_live(ids: &[&str]) -> Self {
+        Self {
+            live: StdMutex::new(ids.iter().map(|id| (*id).to_string()).collect()),
+            unconfirmed: None,
+            killed: StdMutex::new(Vec::new()),
+        }
+    }
+
+    fn none() -> Self {
+        Self::with_live(&[])
+    }
+
+    fn unconfirmed(ids: &[&str], detail: &str) -> Self {
+        let mut port = Self::with_live(ids);
+        port.unconfirmed = Some(detail.to_string());
+        port
+    }
+
+    fn killed(&self) -> Vec<String> {
+        self.killed.lock().expect("killed lock").clone()
+    }
+}
+
+#[async_trait]
+impl ManagedProcessTermination for FakeManagedProcesses {
+    async fn owns_managed_process(&self, change_id: &str) -> bool {
+        self.live.lock().expect("live lock").contains(change_id)
+    }
+
+    async fn kill_managed_process(&self, change_id: &str) -> ImmediateKillEvidence {
+        self.killed
+            .lock()
+            .expect("killed lock")
+            .push(change_id.to_string());
+        if let Some(detail) = &self.unconfirmed {
+            return ImmediateKillEvidence::unconfirmed(1, detail.clone());
+        }
+        let signalled = self.live.lock().expect("live lock").remove(change_id);
+        if signalled {
+            ImmediateKillEvidence::confirmed(1)
+        } else {
+            ImmediateKillEvidence::nothing_to_kill()
+        }
+    }
+}
+
+/// A fixture whose managed-ownership answers the test controls.
+fn force_stop_fixture(
+    ids: &[&str],
+    cancellation: CancellationBehavior,
+    managed: Arc<FakeManagedProcesses>,
+) -> Fixture {
+    let state = shared_state(ids);
+    let hooks = Arc::new(RecordingHooks::default());
+    let queue = Arc::new(FakeQueue::new(cancellation));
+    let marks = Arc::new(ExecutionMarkStore::new());
+    let service =
+        OperatorCommandService::new(state.clone(), queue.clone(), hooks.clone(), marks.clone())
+            .with_cancellation_timeout(Duration::from_millis(50))
+            .with_managed_termination(managed);
+    Fixture {
+        service,
+        state,
+        hooks,
+        queue,
+        marks,
+    }
+}
+
+async fn start_apply(fixture: &Fixture, change_id: &str) {
+    fixture
+        .state
+        .write()
+        .await
+        .apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: change_id.to_string(),
+            command: "apply".to_string(),
+        });
+}
+
+/// The eligibility table, as a pure function.
+///
+/// Unit evidence: no reducer, no queue, no process. Every row of the published
+/// contract is asserted here so a later change to the table cannot silently
+/// widen what an immediate kill is offered for.
+#[test]
+fn force_stop_change_eligibility_covers_every_row() {
+    use ForceStopAdmission::{DequeueOnly, KillAndDequeue, Refused};
+    use ForceStopExclusion as X;
+
+    // An untracked target is refused before any status is even consulted.
+    assert_eq!(
+        classify_force_stop_change("not queued", false, false),
+        Refused(X::UnknownTarget)
+    );
+    assert_eq!(
+        classify_force_stop_change("applying", false, true),
+        Refused(X::UnknownTarget),
+        "a live process is not evidence that the owner tracks the change"
+    );
+
+    for terminal in ["archived", "merged", "pushed", "rejected"] {
+        assert_eq!(
+            classify_force_stop_change(terminal, true, false),
+            Refused(X::TerminalTarget),
+            "{terminal}"
+        );
+    }
+
+    // Every active row: eligible exactly while a managed process is owned.
+    for active in ACTIVE_STATUSES {
+        assert_eq!(
+            classify_force_stop_change(active, true, true),
+            KillAndDequeue,
+            "{active} with a live process"
+        );
+        assert_eq!(
+            classify_force_stop_change(active, true, false),
+            Refused(X::NoLiveProcess),
+            "{active} without one"
+        );
+    }
+
+    // Admitted with nothing running: dequeue-only, signalling nothing.
+    for admitted in ["queued", "blocked"] {
+        assert_eq!(
+            classify_force_stop_change(admitted, true, false),
+            DequeueOnly,
+            "{admitted}"
+        );
+        assert_eq!(
+            classify_force_stop_change(admitted, true, true),
+            KillAndDequeue,
+            "{admitted} that started a phase between the read and the request"
+        );
+    }
+
+    assert_eq!(
+        classify_force_stop_change("merge wait", true, false),
+        Refused(X::MergeWait)
+    );
+    assert_eq!(
+        classify_force_stop_change("resolve pending", true, false),
+        Refused(X::ResolveWait)
+    );
+
+    // Unadmitted rows, including the parked ones an operator has to act on.
+    for unadmitted in ["not queued", "error", "stopped", "stalled"] {
+        assert_eq!(
+            classify_force_stop_change(unadmitted, true, false),
+            Refused(X::NotAdmitted),
+            "{unadmitted}"
+        );
+    }
+}
+
+/// Exclusion tokens are stable, distinct, and machine-readable.
+#[test]
+fn force_stop_change_exclusion_tokens_are_a_closed_stable_set() {
+    let mut seen = std::collections::BTreeSet::new();
+    for exclusion in ForceStopExclusion::ALL {
+        let token = exclusion.as_str();
+        assert!(seen.insert(token), "{token} appears twice");
+        assert!(
+            token.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+            "{token} is not snake_case"
+        );
+        assert!(!exclusion.reason().is_empty());
+    }
+    assert_eq!(seen.len(), ForceStopExclusion::ALL.len());
+}
+
+/// The whole point: one concurrent change is killed, the other is untouched.
+#[tokio::test]
+async fn force_stop_change_kills_only_the_named_target() {
+    let managed = Arc::new(FakeManagedProcesses::with_live(&["alpha", "beta"]));
+    let fixture = force_stop_fixture(
+        &["alpha", "beta"],
+        CancellationBehavior::ConfirmedImmediately,
+        managed.clone(),
+    );
+    start_apply(&fixture, "alpha").await;
+    start_apply(&fixture, "beta").await;
+    fixture.marks.set("alpha", true);
+    fixture.marks.set("beta", true);
+
+    let outcome = fixture
+        .service
+        .force_stop_change("alpha")
+        .await
+        .expect("an applying change with a live process can be force-stopped");
+
+    assert_eq!(
+        outcome,
+        OperatorOutcome::ForceStopped {
+            change_id: "alpha".to_string(),
+            // No facts store on this fixture, so the episode is honestly
+            // unknown rather than invented.
+            execution_id: None,
+            terminated: true,
+            settlement: StopSettlement {
+                cancelled_phase: ExecutionPhase::Apply,
+                last_completed_phase: None,
+                apply_commit_present: None,
+                apply_commit_oid: None,
+            },
+        }
+    );
+
+    // Exactly one change was ever signalled, and one cancellation issued.
+    assert_eq!(managed.killed(), vec!["alpha".to_string()]);
+    assert_eq!(
+        fixture
+            .queue
+            .cancellations
+            .lock()
+            .expect("cancellations lock")
+            .clone(),
+        vec!["alpha".to_string()]
+    );
+
+    let after_alpha = fixture.snapshot("alpha").await;
+    assert_eq!(after_alpha.display_status, "not queued");
+    assert_eq!(
+        after_alpha.marks,
+        vec!["beta".to_string()],
+        "the target's mark is revoked and only the target's"
+    );
+
+    let after_beta = fixture.snapshot("beta").await;
+    assert_eq!(
+        after_beta.display_status, "applying",
+        "the unrelated change keeps running"
+    );
+    assert!(
+        managed.owns_managed_process("beta").await,
+        "and keeps its managed process group"
+    );
+}
+
+/// Later mark settlement cannot re-admit a force-stopped change.
+#[tokio::test]
+async fn force_stop_change_revokes_the_mark_so_settlement_cannot_redispatch() {
+    let managed = Arc::new(FakeManagedProcesses::with_live(&["alpha"]));
+    let fixture = force_stop_fixture(
+        &["alpha"],
+        CancellationBehavior::ConfirmedImmediately,
+        managed,
+    );
+    start_apply(&fixture, "alpha").await;
+    fixture.marks.set("alpha", true);
+
+    fixture
+        .service
+        .force_stop_change("alpha")
+        .await
+        .expect("force-stop settles");
+
+    assert!(!fixture.marks.is_marked("alpha"));
+
+    // The batch a settlement would run over is derived from current marks, so
+    // an unmarked target contributes no addition at all.
+    let plan = fixture
+        .service
+        .plan_mark_settlement(&["alpha".to_string()])
+        .await;
+    assert!(
+        plan.additions.is_empty(),
+        "a revoked mark must produce no settlement addition: {plan:?}"
+    );
+}
+
+/// A dequeue-only target signals nothing at all.
+#[tokio::test]
+async fn force_stop_change_dequeues_an_admitted_target_without_signalling() {
+    let managed = Arc::new(FakeManagedProcesses::none());
+    let fixture = force_stop_fixture(
+        &["alpha", "beta"],
+        CancellationBehavior::NoHandle,
+        managed.clone(),
+    );
+    fixture
+        .service
+        .add_to_queue("alpha")
+        .await
+        .expect("queue alpha");
+    fixture
+        .service
+        .add_to_queue("beta")
+        .await
+        .expect("queue beta");
+
+    let outcome = fixture
+        .service
+        .force_stop_change("alpha")
+        .await
+        .expect("an admitted target with no process is dequeued");
+
+    assert_eq!(
+        outcome,
+        OperatorOutcome::ForceStopped {
+            change_id: "alpha".to_string(),
+            execution_id: None,
+            terminated: false,
+            settlement: StopSettlement::none(),
+        }
+    );
+    assert!(
+        managed.killed().is_empty(),
+        "no process belonging to any change may be signalled"
+    );
+    assert_eq!(fixture.snapshot("alpha").await.display_status, "not queued");
+    assert_eq!(
+        fixture.snapshot("beta").await.display_status,
+        "queued",
+        "the unrelated queued change keeps its admission"
+    );
+}
+
+/// An ineligible target changes nothing, and never reaches a signal.
+#[tokio::test]
+async fn force_stop_change_refuses_an_ineligible_target_without_side_effects() {
+    let managed = Arc::new(FakeManagedProcesses::none());
+    let fixture = force_stop_fixture(
+        &["alpha", "beta"],
+        CancellationBehavior::ConfirmedImmediately,
+        managed.clone(),
+    );
+    fixture
+        .service
+        .add_to_queue("beta")
+        .await
+        .expect("queue beta");
+    fixture.marks.set("alpha", true);
+    let before_beta = fixture.snapshot("beta").await;
+
+    // `alpha` is tracked but carries no admission at all.
+    let error = fixture
+        .service
+        .force_stop_change("alpha")
+        .await
+        .expect_err("an unadmitted target is refused");
+    assert_eq!(
+        error,
+        OperatorCommandError::ForceStopIneligible {
+            change_id: "alpha".to_string(),
+            display_status: "not queued".to_string(),
+            reason: ForceStopExclusion::NotAdmitted,
+        }
+    );
+
+    // An unknown target is refused the same way, and neither refusal signals.
+    let unknown = fixture
+        .service
+        .force_stop_change("never-heard-of-it")
+        .await
+        .expect_err("an unknown target is refused");
+    assert!(matches!(
+        unknown,
+        OperatorCommandError::ForceStopIneligible {
+            reason: ForceStopExclusion::UnknownTarget,
+            ..
+        }
+    ));
+
+    assert!(managed.killed().is_empty());
+    assert!(fixture
+        .queue
+        .cancellations
+        .lock()
+        .expect("cancellations lock")
+        .is_empty());
+    assert!(
+        fixture.marks.is_marked("alpha"),
+        "a refused force-stop must not revoke a mark"
+    );
+    assert_eq!(fixture.snapshot("beta").await, before_beta);
+}
+
+/// An active row without a managed process is refused rather than half-killed.
+#[tokio::test]
+async fn force_stop_change_refuses_an_active_row_that_owns_no_process() {
+    let managed = Arc::new(FakeManagedProcesses::none());
+    let fixture = force_stop_fixture(
+        &["alpha"],
+        CancellationBehavior::ConfirmedImmediately,
+        managed.clone(),
+    );
+    start_apply(&fixture, "alpha").await;
+
+    let error = fixture
+        .service
+        .force_stop_change("alpha")
+        .await
+        .expect_err("there is nothing to kill");
+
+    assert_eq!(
+        error,
+        OperatorCommandError::ForceStopIneligible {
+            change_id: "alpha".to_string(),
+            display_status: "applying".to_string(),
+            reason: ForceStopExclusion::NoLiveProcess,
+        }
+    );
+    assert!(managed.killed().is_empty());
+    assert_eq!(
+        fixture.snapshot("alpha").await.display_status,
+        "applying",
+        "a refused force-stop preserves active state"
+    );
+}
+
+/// A group that will not empty refuses settlement rather than dequeuing on top
+/// of a process that may still be writing to the worktree.
+#[tokio::test]
+async fn force_stop_change_refuses_to_settle_an_unproven_process_group() {
+    let managed = Arc::new(FakeManagedProcesses::unconfirmed(
+        &["alpha"],
+        "pgid=4242: members were still alive after SIGKILL",
+    ));
+    let fixture = force_stop_fixture(
+        &["alpha"],
+        CancellationBehavior::ConfirmedImmediately,
+        managed.clone(),
+    );
+    start_apply(&fixture, "alpha").await;
+    fixture.marks.set("alpha", true);
+
+    let error = fixture
+        .service
+        .force_stop_change("alpha")
+        .await
+        .expect_err("an unproven group must not settle");
+
+    assert!(matches!(
+        error,
+        OperatorCommandError::ForceStopUnconfirmed { .. }
+    ));
+    assert!(
+        error.to_string().contains("pgid=4242"),
+        "the refusal must carry the identity that survived: {error}"
+    );
+    assert_eq!(managed.killed(), vec!["alpha".to_string()]);
+    assert!(
+        fixture
+            .queue
+            .cancellations
+            .lock()
+            .expect("cancellations lock")
+            .is_empty(),
+        "cancellation is not issued after an unproven kill"
+    );
+    assert_eq!(
+        fixture.snapshot("alpha").await.display_status,
+        "applying",
+        "no dequeue is committed on an unproven group"
+    );
+    assert!(fixture.marks.is_marked("alpha"));
+}
+
+/// The settlement reports the phase that was really interrupted, read at commit.
+#[tokio::test]
+async fn force_stop_change_reports_the_phase_it_actually_cancelled() {
+    let managed = Arc::new(FakeManagedProcesses::with_live(&["alpha"]));
+    let fixture = force_stop_fixture(
+        &["alpha"],
+        CancellationBehavior::ConfirmedImmediately,
+        managed,
+    );
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ArchiveStarted {
+            change_id: "alpha".to_string(),
+            command: "archive".to_string(),
+        });
+    }
+
+    let outcome = fixture
+        .service
+        .force_stop_change("alpha")
+        .await
+        .expect("archiving is an eligible phase");
+
+    let OperatorOutcome::ForceStopped { settlement, .. } = outcome else {
+        panic!("a targeted force-stop settles as ForceStopped");
+    };
+    assert_eq!(settlement.cancelled_phase, ExecutionPhase::Archive);
+}
+
+/// A never-terminating task fails the settlement; the kill is not rolled back.
+#[tokio::test]
+async fn force_stop_change_fails_when_the_task_never_reports_completion() {
+    let managed = Arc::new(FakeManagedProcesses::with_live(&["alpha"]));
+    let fixture = force_stop_fixture(
+        &["alpha"],
+        CancellationBehavior::NeverTerminates,
+        managed.clone(),
+    );
+    start_apply(&fixture, "alpha").await;
+
+    let error = fixture
+        .service
+        .force_stop_change("alpha")
+        .await
+        .expect_err("an unconfirmed task handshake must not dequeue");
+
+    assert!(matches!(
+        error,
+        OperatorCommandError::TerminationTimeout { .. }
+    ));
+    assert_eq!(managed.killed(), vec!["alpha".to_string()]);
+    assert_eq!(
+        fixture.snapshot("alpha").await.display_status,
+        "applying",
+        "no dequeue is committed without the task's own completion evidence"
+    );
+}
+
+/// Published eligibility and admission read one table.
+#[tokio::test]
+async fn force_stop_change_admission_matches_published_eligibility() {
+    let managed = Arc::new(FakeManagedProcesses::with_live(&["alpha"]));
+    let fixture = force_stop_fixture(
+        &["alpha", "beta"],
+        CancellationBehavior::ConfirmedImmediately,
+        managed,
+    );
+    start_apply(&fixture, "alpha").await;
+    start_apply(&fixture, "beta").await;
+
+    assert_eq!(
+        fixture.service.force_stop_admission("alpha").await,
+        ForceStopAdmission::KillAndDequeue
+    );
+    assert_eq!(
+        fixture.service.force_stop_admission("beta").await,
+        ForceStopAdmission::Refused(ForceStopExclusion::NoLiveProcess),
+        "beta presents as active but owns nothing this owner can signal"
+    );
+    assert_eq!(
+        fixture.service.force_stop_admission("unknown").await,
+        ForceStopAdmission::Refused(ForceStopExclusion::UnknownTarget)
+    );
+}
+
+/// The episode identity is fixed before cancellation, not re-read after it.
+#[tokio::test]
+async fn force_stop_change_reports_the_execution_id_it_cancelled() {
+    let managed = Arc::new(FakeManagedProcesses::with_live(&["alpha"]));
+    let state = shared_state(&["alpha"]);
+    let hooks = Arc::new(RecordingHooks::default());
+    let queue = Arc::new(FakeQueue::new(CancellationBehavior::ConfirmedImmediately));
+    let marks = Arc::new(ExecutionMarkStore::new());
+    let facts = Arc::new(ExecutionFactsStore::new());
+    let started = ExecutionEvent::ApplyStarted {
+        change_id: "alpha".to_string(),
+        command: "apply".to_string(),
+    };
+    {
+        let mut guard = state.write().await;
+        guard.apply_execution_event(&started);
+        facts.observe(1, &started, Some(&guard), chrono::Utc::now());
+    }
+    let expected = facts
+        .execution_id("alpha")
+        .expect("an admitted phase opens an episode");
+    let service =
+        OperatorCommandService::new(state.clone(), queue.clone(), hooks.clone(), marks.clone())
+            .with_cancellation_timeout(Duration::from_millis(50))
+            .with_managed_termination(managed)
+            .with_execution_facts(facts);
+
+    let outcome = service
+        .force_stop_change("alpha")
+        .await
+        .expect("force-stop settles");
+
+    let OperatorOutcome::ForceStopped { execution_id, .. } = outcome else {
+        panic!("a targeted force-stop settles as ForceStopped");
+    };
+    assert_eq!(execution_id, Some(expected));
+}
+
+/// The targeted path never constructs a process-wide control.
+///
+/// A source guard rather than a behavioral one, because the property is an
+/// absence: no runtime observation can prove the code *cannot* reach process-wide
+/// ForceStop, but reading the module can.
+#[test]
+fn force_stop_change_never_reaches_process_wide_force_stop() {
+    let source = include_str!("../operator_command.rs");
+    let targeted = source
+        .split("Targeted force-stop\n    // ----")
+        .nth(1)
+        .expect("the targeted force-stop section exists");
+    let section = targeted
+        .split("/// Whether a typed push episode is open")
+        .next()
+        .expect("the section ends at the next helper");
+    for forbidden in [
+        // Process-wide lifecycle: the intent, the mode, and the run boundary.
+        "OperatorIntent",
+        "OperatorCommand::ForceStop",
+        "OperatorMode",
+        "RunControl",
+        "boundary_running",
+        // Whole-set mark writes, which would move marks nobody named.
+        "marks.replace(",
+        "marks.clear()",
+        "marked_ids()",
+        // Unscoped process addressing.
+        "kill_process_group_immediately",
+        "libc::",
+        "nix::",
+    ] {
+        assert!(
+            !section.contains(forbidden),
+            "the targeted force-stop path must not reach `{forbidden}`"
+        );
+    }
+    // The single kill route, named positively so removing the port would fail
+    // here rather than quietly leaving the guard above vacuously true.
+    assert!(
+        section.contains(".kill_managed_process("),
+        "the only kill route is the managed ownership port"
+    );
+}

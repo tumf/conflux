@@ -203,11 +203,18 @@ pub trait RemoteControlExecutor: Send + Sync {
 pub fn map_operator_error(error: &OperatorCommandError) -> CommandFailure {
     match error {
         OperatorCommandError::MissingCancellationHandle { .. }
-        | OperatorCommandError::RetryUnsupported { .. } => {
+        | OperatorCommandError::RetryUnsupported { .. }
+        // A refused targeted force-stop is always a fact about *this* target —
+        // terminal, unadmitted, or owning no killable process — so a different
+        // target is what would change the answer.
+        | OperatorCommandError::ForceStopIneligible { .. } => {
             CommandFailure::new(ErrorCode::TargetIneligible, error.to_string())
         }
         // Termination did not confirm: the change is still occupying the root.
-        OperatorCommandError::TerminationTimeout { .. } => {
+        OperatorCommandError::TerminationTimeout { .. }
+        // Same shape, stronger evidence: the OS still reports live members in
+        // the group this command killed.
+        | OperatorCommandError::ForceStopUnconfirmed { .. } => {
             CommandFailure::new(ErrorCode::RootBusy, error.to_string())
         }
         OperatorCommandError::CancellationFailed { .. } => {
@@ -240,6 +247,18 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
             settlement,
         } => ExecutionSummary::changed(settlement.describe(change_id))
             .with_result(stop_result(settlement)),
+        OperatorOutcome::ForceStopped {
+            change_id,
+            execution_id,
+            terminated,
+            settlement,
+        } => ExecutionSummary::changed(describe_force_stop(change_id, *terminated, settlement))
+            .with_result(force_stop_result(
+                change_id,
+                execution_id.as_deref(),
+                *terminated,
+                settlement,
+            )),
         OperatorOutcome::Retry(plan) => {
             if plan.is_empty() {
                 ExecutionSummary::no_op("no change carried retryable evidence")
@@ -310,6 +329,46 @@ pub fn stop_result(settlement: &StopSettlement) -> CommandResult {
         },
         effects_rolled_back: false,
     }
+}
+
+/// The typed result a settled successful targeted force-stop carries.
+///
+/// `effects_rolled_back` is a literal `false` for the same reason it is on the
+/// stop result: an immediate kill ends work, and there is no path in which it
+/// could undo a completed worktree effect.
+pub fn force_stop_result(
+    change_id: &str,
+    execution_id: Option<&str>,
+    terminated: bool,
+    settlement: &StopSettlement,
+) -> CommandResult {
+    CommandResult::ForceStopChange {
+        change_id: change_id.to_string(),
+        execution_id: execution_id.map(str::to_string),
+        cancelled_phase: DtoPhase::from_shared(settlement.cancelled_phase),
+        last_completed_phase: settlement.last_completed_phase.map(DtoPhase::from_shared),
+        terminated,
+        apply_commit: ApplyCommitEvidence {
+            present: settlement.apply_commit_present,
+            oid: settlement.apply_commit_oid.clone(),
+        },
+        effects_rolled_back: false,
+    }
+}
+
+/// The one operator-facing sentence a settled targeted force-stop records.
+///
+/// Presentation only, and it must not overclaim: it says whether a process was
+/// really killed, names the phase that was interrupted, and repeats the stop
+/// settlement's own Apply-commit and no-rollback language rather than inventing
+/// a second account of the same worktree.
+fn describe_force_stop(change_id: &str, terminated: bool, settlement: &StopSettlement) -> String {
+    let how = if terminated {
+        "its managed process group was killed immediately and confirmed reaped"
+    } else {
+        "it owned no managed process, so it was dequeued without signalling anything"
+    };
+    format!("{}; {how}", settlement.describe(change_id))
 }
 
 /// Group bulk-mark exclusions by reason with counts, e.g. `2 change_active`.
@@ -502,6 +561,9 @@ impl SharedServiceExecutor {
             CommandSpec::StopAndDequeue { change_id } => OperatorIntent::StopAndDequeue {
                 change_id: change_id.clone(),
             },
+            CommandSpec::ForceStopChange { change_id } => OperatorIntent::ForceStopChange {
+                change_id: change_id.clone(),
+            },
             CommandSpec::ResolveMerge { change_id } => OperatorIntent::ResolveMerge {
                 change_id: change_id.clone(),
             },
@@ -637,30 +699,47 @@ impl RemoteControlExecutor for SharedServiceExecutor {
     }
 
     async fn begin(&self, command: &CommandSpec, gate: Option<GateGuard>) -> Applied {
-        // A stop-and-dequeue is the only two-phase command: it issues
-        // cancellation under the caller's gate and settles later, so the gate
-        // and the TUI event loop are both free while termination confirms.
-        let CommandSpec::StopAndDequeue { change_id } = command else {
-            return Applied::Ordinary(gate);
-        };
+        // The two-phase commands: each does its irreversible runtime work under
+        // the caller's gate and settles later, so the gate and the TUI event
+        // loop are both free while confirmation is pending.
+        match command {
+            CommandSpec::StopAndDequeue { change_id } => {
+                let pending = match self.application.begin_stop_and_dequeue(change_id).await {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        // Phase one refused before cancellation was issued, so
+                        // this is an ordinary failure with no effect and no
+                        // revision.
+                        return Applied::Settled(Err(map_run_control_error(&error)));
+                    }
+                };
 
-        let pending = match self.application.begin_stop_and_dequeue(change_id).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                // Phase one refused before cancellation was issued, so this is
-                // an ordinary failure with no effect and no revision.
-                return Applied::Settled(Err(map_run_control_error(&error)));
+                // Phase one is over. Releasing the gate here — before the wait,
+                // not during it — is what keeps force stop, unrelated commands,
+                // event fan-out, and rendering live while confirmation is
+                // pending.
+                drop(gate);
+
+                let application = self.application.clone();
+                Applied::Pending(Box::pin(async move {
+                    summarize_application(application.settle_stop_and_dequeue(pending).await)
+                }))
             }
-        };
+            CommandSpec::ForceStopChange { change_id } => {
+                let pending = match self.application.begin_force_stop_change(change_id).await {
+                    Ok(pending) => pending,
+                    // Refused before any signal: an ineligible target, or a
+                    // stale revision the endpoint already rejected.
+                    Err(error) => return Applied::Settled(Err(map_run_control_error(&error))),
+                };
+                drop(gate);
 
-        // Phase one is over. Releasing the gate here — before the wait, not
-        // during it — is what keeps force stop, unrelated commands, event
-        // fan-out, and rendering live while confirmation is pending.
-        drop(gate);
-
-        let application = self.application.clone();
-        Applied::Pending(Box::pin(async move {
-            summarize_application(application.settle_stop_and_dequeue(pending).await)
-        }))
+                let application = self.application.clone();
+                Applied::Pending(Box::pin(async move {
+                    summarize_application(application.settle_force_stop_change(pending).await)
+                }))
+            }
+            _ => Applied::Ordinary(gate),
+        }
     }
 }

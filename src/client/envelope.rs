@@ -38,6 +38,14 @@ pub enum Operation {
     ControlStop,
     /// `cflx client force-stop`, and `cflx_control` with action `force_stop`
     ControlForceStop,
+    /// `cflx client force-stop-change`, and `cflx_control` with action
+    /// `force_stop_change`
+    ///
+    /// Deliberately a separate operation from [`Self::ControlForceStop`]: one
+    /// kills a single named proposal, the other stops everything the owner is
+    /// running, and a caller branching on `operation` must never have to read
+    /// `detail` to tell which one it invoked.
+    ControlForceStopChange,
     /// `cflx client subscribe set`, and `cflx_subscribe` with action `set`
     SubscribeSet,
     /// `cflx client subscribe get`, and `cflx_subscribe` with action `get`
@@ -57,6 +65,7 @@ impl Operation {
             Self::ControlStart => "control_start",
             Self::ControlStop => "control_stop",
             Self::ControlForceStop => "control_force_stop",
+            Self::ControlForceStopChange => "control_force_stop_change",
             Self::SubscribeSet => "subscribe_set",
             Self::SubscribeGet => "subscribe_get",
             Self::SubscribeClear => "subscribe_clear",
@@ -66,7 +75,7 @@ impl Operation {
 
 /// Every operation, in the order the contract advertises them.
 #[allow(dead_code)] // Read by the operation-contract assertions, not by the binary.
-pub const ALL_OPERATIONS: [Operation; 10] = [
+pub const ALL_OPERATIONS: [Operation; 11] = [
     Operation::Status,
     Operation::Wait,
     Operation::ControlMark,
@@ -74,6 +83,7 @@ pub const ALL_OPERATIONS: [Operation; 10] = [
     Operation::ControlStart,
     Operation::ControlStop,
     Operation::ControlForceStop,
+    Operation::ControlForceStopChange,
     Operation::SubscribeSet,
     Operation::SubscribeGet,
     Operation::SubscribeClear,
@@ -112,6 +122,14 @@ pub enum Outcome {
     /// asked for, and a client that reported "nothing to do" as a failure would
     /// make a second `mark` of the same proposal look like a problem.
     Unchanged,
+    /// The named proposal was killed immediately and dequeued.
+    ///
+    /// Distinct from [`Self::Accepted`] on purpose. `Accepted` says the owner
+    /// took a process-wide intent and what the run does next is the owner's;
+    /// this says one settled command ended one proposal's execution episode and
+    /// left it stopped. A caller that has to tell "my change is dead" from "the
+    /// owner heard me" must not have to parse prose for it.
+    Stopped,
     /// The owner accepted a lifecycle intent.
     ///
     /// Deliberately not "started" or "stopped": the client submits the shared
@@ -199,6 +217,7 @@ impl Outcome {
             Self::Marked => "marked",
             Self::Unmarked => "unmarked",
             Self::Unchanged => "unchanged",
+            Self::Stopped => "stopped",
             Self::Accepted => "accepted",
             Self::NotInRepository => "not_in_repository",
             Self::OwnerNotRunning => "owner_not_running",
@@ -241,6 +260,7 @@ impl Outcome {
                 | Self::Marked
                 | Self::Unmarked
                 | Self::Unchanged
+                | Self::Stopped
                 | Self::Accepted
         )
     }
@@ -260,6 +280,7 @@ impl Outcome {
             | Self::Marked
             | Self::Unmarked
             | Self::Unchanged
+            | Self::Stopped
             | Self::Accepted => 0,
             Self::UsageError => 2,
             Self::NotInRepository => 3,
@@ -293,7 +314,7 @@ impl Outcome {
 /// Read by the CLI's own contract assertions, which is what stops an added
 /// variant from silently reusing an exit status.
 #[allow(dead_code)] // Read by the outcome-contract assertions, not by the binary.
-pub const ALL_OUTCOMES: [Outcome; 31] = [
+pub const ALL_OUTCOMES: [Outcome; 32] = [
     Outcome::Observed,
     Outcome::Completed,
     Outcome::Subscribed,
@@ -301,6 +322,7 @@ pub const ALL_OUTCOMES: [Outcome; 31] = [
     Outcome::Marked,
     Outcome::Unmarked,
     Outcome::Unchanged,
+    Outcome::Stopped,
     Outcome::Accepted,
     Outcome::NotInRepository,
     Outcome::OwnerNotRunning,
@@ -513,6 +535,10 @@ mod tests {
                 "marked",
                 "unmarked",
                 "unchanged",
+                // One settled command really ended one proposal's execution
+                // episode, which is a stronger claim than "the owner accepted
+                // an intent" and gets its own token for exactly that reason.
+                "stopped",
                 "accepted",
             ]
         );
@@ -624,6 +650,7 @@ mod tests {
                 "control_start",
                 "control_stop",
                 "control_force_stop",
+                "control_force_stop_change",
                 "subscribe_set",
                 "subscribe_get",
                 "subscribe_clear",

@@ -875,6 +875,129 @@ pub(crate) async fn drive_process_group_cleanup<C: ProcessGroupControl>(
     )
 }
 
+/// Runs the bounded *immediate* forceful cleanup sequence and returns typed
+/// quiescence evidence.
+///
+/// Sequence: SIGKILL → poll until the group is empty or the budget is
+/// exhausted. There is no SIGTERM and no grace window, which is the whole
+/// difference from [`drive_process_group_cleanup`]: a targeted force-stop is an
+/// operator decision that the change must stop *now*, so nothing is given a
+/// chance to shut down cooperatively.
+///
+/// Quiescence is still proven the same way — only a membership probe reporting
+/// an empty group counts, never leader exit and never elapsed time.
+pub(crate) async fn drive_immediate_process_group_kill<C: ProcessGroupControl>(
+    control: &C,
+    pgid: Option<u32>,
+    budget: CleanupBudget,
+) -> ProcessGroupCleanupReport {
+    let deadline = tokio::time::Instant::now() + budget.total;
+    let mut notes: Vec<String> = Vec::new();
+
+    let mut force_killed = false;
+    match control.signal_kill() {
+        SignalResult::AlreadyGone => {
+            return ProcessGroupCleanupReport::new(
+                ProcessGroupQuiescence::Confirmed,
+                pgid,
+                false,
+                true,
+                "process group was already gone when SIGKILL was attempted",
+            );
+        }
+        SignalResult::Delivered => force_killed = true,
+        SignalResult::Failed(reason) => notes.push(format!("SIGKILL failed: {reason}")),
+    }
+
+    let forced = poll_until_empty(control, deadline, budget.probe_interval).await;
+    if matches!(forced, ProbeResult::Empty) {
+        return ProcessGroupCleanupReport::new(
+            ProcessGroupQuiescence::Confirmed,
+            pgid,
+            force_killed,
+            false,
+            join_detail(
+                "no members remained after immediate forced termination",
+                &notes,
+            ),
+        );
+    }
+
+    let (quiescence, detail) = unconfirmed_from(forced, "SIGKILL");
+    ProcessGroupCleanupReport::new(
+        quiescence,
+        pgid,
+        force_killed,
+        false,
+        join_detail(&detail, &notes),
+    )
+}
+
+/// Immediately SIGKILL one owned process group and prove it was reaped.
+///
+/// The targeted force-stop counterpart of [`cleanup_process_group_verified`]:
+/// same typed evidence, same probe-based proof, no SIGTERM escalation window.
+#[cfg(unix)]
+pub async fn kill_process_group_immediately(
+    pgid: u32,
+    cleanup_timeout_ms: u64,
+    op: Option<&str>,
+    change_id: Option<&str>,
+) -> ProcessGroupCleanupReport {
+    if pgid == 0 {
+        return ProcessGroupCleanupReport::not_applicable(
+            "no process group id was available for immediate termination",
+        );
+    }
+
+    let control = UnixProcessGroup { pgid };
+    let report = drive_immediate_process_group_kill(
+        &control,
+        Some(pgid),
+        // A zero grace window is not merely short: the immediate driver never
+        // sends SIGTERM at all, so the field is carried only for shape.
+        CleanupBudget::from_millis(0, cleanup_timeout_ms),
+    )
+    .await;
+
+    if report.is_confirmed() {
+        debug!(
+            pgid,
+            op,
+            change_id,
+            quiescence = report.quiescence().as_str(),
+            "force-stop: {}",
+            report.diagnostics()
+        );
+    } else {
+        warn!(
+            pgid,
+            op,
+            change_id,
+            quiescence = report.quiescence().as_str(),
+            "force-stop: {}",
+            report.diagnostics()
+        );
+    }
+
+    report
+}
+
+/// Non-Unix stub: Windows job objects own descendant lifetime, so there is no
+/// separate process group to kill or prove quiescent.
+#[cfg(not(unix))]
+pub async fn kill_process_group_immediately(
+    pgid: u32,
+    _cleanup_timeout_ms: u64,
+    _op: Option<&str>,
+    _change_id: Option<&str>,
+) -> ProcessGroupCleanupReport {
+    debug!("force-stop: no-op on non-Unix platform (pgid={})", pgid);
+    ProcessGroupCleanupReport::not_applicable(
+        "descendant lifetime is owned by the Windows job object",
+    )
+}
+
 fn join_detail(base: &str, notes: &[String]) -> String {
     if notes.is_empty() {
         base.to_string()
@@ -1239,6 +1362,66 @@ mod cleanup_driver_tests {
             "diagnostics must retain the signal failure: {}",
             report.diagnostics()
         );
+    }
+
+    /// Targeted force-stop sends SIGKILL first and never SIGTERM.
+    ///
+    /// The regression this pins: reusing the graceful driver for
+    /// `force_stop_change` would give the target the same cooperative shutdown
+    /// window `stop_and_dequeue` gives it, which is the one property the
+    /// command exists to remove.
+    #[tokio::test(start_paused = true)]
+    async fn force_stop_change_kill_never_sends_sigterm() {
+        let group = FakeProcessGroup::new();
+
+        let report = drive_immediate_process_group_kill(&group, Some(21), budget()).await;
+
+        assert_eq!(report.quiescence(), ProcessGroupQuiescence::Confirmed);
+        assert!(report.force_killed());
+        assert_eq!(group.kill_calls.get(), 1);
+        assert_eq!(
+            group.term_calls.get(),
+            0,
+            "an immediate force-stop must not open a SIGTERM grace window"
+        );
+    }
+
+    /// A group that exited on its own is confirmed without a signal escalation.
+    #[tokio::test(start_paused = true)]
+    async fn force_stop_change_kill_confirms_when_group_already_gone() {
+        let mut group = FakeProcessGroup::new();
+        group.kill = SignalResult::AlreadyGone;
+
+        let report = drive_immediate_process_group_kill(&group, Some(22), budget()).await;
+
+        assert_eq!(report.quiescence(), ProcessGroupQuiescence::Confirmed);
+        assert!(report.already_gone());
+        assert!(!report.force_killed());
+        assert_eq!(group.term_calls.get(), 0);
+    }
+
+    /// Reaping is proven by membership, never by having sent the signal.
+    #[tokio::test(start_paused = true)]
+    async fn force_stop_change_kill_never_confirms_a_surviving_group() {
+        let group = FakeProcessGroup::new().survives_sigkill();
+
+        let report = drive_immediate_process_group_kill(&group, Some(23), budget()).await;
+
+        assert_eq!(report.quiescence(), ProcessGroupQuiescence::MembersRemain);
+        assert!(!report.is_confirmed());
+        assert_eq!(group.term_calls.get(), 0);
+    }
+
+    /// Unknown membership stays unconfirmed on the immediate path too.
+    #[tokio::test(start_paused = true)]
+    async fn force_stop_change_kill_reports_unverifiable_membership() {
+        let group = FakeProcessGroup::new().with_probe_error("EPERM");
+
+        let report = drive_immediate_process_group_kill(&group, Some(24), budget()).await;
+
+        assert_eq!(report.quiescence(), ProcessGroupQuiescence::Unverifiable);
+        assert!(!report.is_confirmed());
+        assert!(report.diagnostics().contains("EPERM"));
     }
 
     #[test]
