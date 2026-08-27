@@ -2456,10 +2456,20 @@ impl OperatorCommandService {
     /// Phase two of a targeted force-stop: commit after confirmed reaping.
     ///
     /// One indivisible mutation, under the same guard event reconciliation
-    /// takes: the dequeue and the mark revocation cannot be observed apart, so a
-    /// mark settlement running between them cannot re-admit the change.
+    /// takes: the settlement and the mark revocation cannot be observed apart,
+    /// so a mark settlement running between them cannot re-admit the change.
     ///
-    /// The mark is cleared even when the reducer produced no queue transition.
+    /// The reducer command is `StopChange`, not the `DequeueChange` a graceful
+    /// stop applies, and the difference is the row every observer is left with.
+    /// A dequeued change reads `not queued` — an idle row this owner may still
+    /// admit by itself — so `cflx client wait` keeps observing a proposal whose
+    /// process the operator already killed, and with the default unbounded
+    /// timeout it would never return. `StopChange` settles the terminal
+    /// `stopped` outcome the change's spec declares: it clears queue intent the
+    /// same way, publishes the same `Stopped` execution state to subscriptions,
+    /// and is the status `wait` releases on with `change_requires_action`.
+    ///
+    /// The mark is cleared even when the reducer produced no state transition.
     /// That is the deliberate difference from [`Self::commit_stop_and_dequeue`]:
     /// the target's process is already dead, so leaving next-run intent behind
     /// would let settlement dispatch a change the operator just killed.
@@ -2470,15 +2480,16 @@ impl OperatorCommandService {
     ) -> OperatorResult<OperatorOutcome> {
         let change_id = pending.change_id().to_string();
         let _mutation = self.parallel.lock_mutations().await;
-        // Read under the same write guard that applies the dequeue, immediately
-        // before it: `DequeueChange` clears the activity the phase describes.
+        // Read under the same write guard that applies the settlement,
+        // immediately before it: `StopChange` clears the activity the phase
+        // describes.
         let cancelled_phase = {
             let mut guard = self.state.write().await;
             let phase = guard
                 .change_runtime(&change_id)
                 .map(|runtime| project_phase(runtime, self.push_open(&change_id)))
                 .unwrap_or(ExecutionPhase::Unknown);
-            guard.apply_command(ReducerCommand::DequeueChange(change_id.clone()));
+            guard.apply_command(ReducerCommand::StopChange(change_id.clone()));
             phase
         };
         self.marks.set(&change_id, false);

@@ -738,7 +738,10 @@ impl OperatorApplication {
     /// force-stop ends one execution episode exactly the way a stop does, so a
     /// subscription's terminal `stopped` classification and `wait`'s
     /// `change_requires_action` release come from the existing edge rather than
-    /// from a second spelling of the same fact.
+    /// from a second spelling of the same fact. The edge cannot undo the
+    /// terminal `stopped` row the commit just settled: the reducer treats an
+    /// already-stopped change as settled, exactly as it treats a merged, pushed,
+    /// or rejected one.
     pub async fn settle_force_stop_change(&self, pending: PendingForceStop) -> ApplicationResult {
         let change_id = pending.change_id().to_string();
         if let Err(error) = pending.confirm_termination().await {

@@ -91,7 +91,10 @@ cflx client force-stop-change <change-id> --json
 It names one proposal, never a list. The owner SIGKILLs that proposal's managed
 process group without the graceful SIGTERM window `stop` gives a change, waits
 for confirmed termination and reaping, then clears its queue admission and
-execution mark together so later mark settlement cannot redispatch it. Unrelated
+execution mark together so later mark settlement cannot redispatch it. The row
+settles as terminal `stopped` rather than idle `not queued`, so a `cflx client
+wait` already observing that proposal is released with `change_requires_action`
+instead of waiting on an owner that will never advance it. Unrelated
 changes keep their processes, marks, queue intent, execution IDs, and
 subscriptions, and `app_mode`, scheduler state, and process-wide stop state do
 not change.

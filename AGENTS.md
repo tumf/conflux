@@ -122,6 +122,11 @@ and the settled result publishes `effects_rolled_back: false` alongside the
 target, its cancelled `execution_id` when one existed, the cancelled phase, the
 last completed phase, and whether a process was really terminated.
 
+The killed proposal settles into the terminal `stopped` row, not into idle `not
+queued` work, so a concurrent `cflx client wait` on it is released with
+`change_requires_action` instead of holding out for an owner that will never
+advance it again.
+
 The success outcome is `stopped`, with exit status `0`. Eligibility is the
 owner's own published fact, readable ahead of time as
 `actions.force_stop_change`: an applying, accepting, rejecting, archiving, or

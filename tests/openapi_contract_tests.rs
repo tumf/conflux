@@ -764,7 +764,8 @@ fn execution_observability_errors(doc: &Value) -> Vec<String> {
             ] {
                 if !properties.contains(member) {
                     errors.push(format!(
-                        "the force_stop_change result must publish `{member}`; a client would                          otherwise have to re-observe the owner to learn what was killed"
+                        "the force_stop_change result must publish `{member}`; a client would \
+                         otherwise have to re-observe the owner to learn what was killed"
                     ));
                 }
             }
@@ -786,7 +787,8 @@ fn execution_observability_errors(doc: &Value) -> Vec<String> {
     for token in ["not_admitted", "no_managed_process"] {
         if !blocked_reasons.contains(token) {
             errors.push(format!(
-                "ActionBlockedReason must publish `{token}`, the targeted force-stop refusal a                  client branches on"
+                "ActionBlockedReason must publish `{token}`, the targeted force-stop refusal a \
+                 client branches on"
             ));
         }
     }

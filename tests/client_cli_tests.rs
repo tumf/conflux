@@ -5714,6 +5714,21 @@ mod enabled {
         }
     }
 
+    /// Every operator-facing envelope message is one flowing line.
+    ///
+    /// The defect this guards against is a collapsed multi-line string literal:
+    /// drop the trailing `\` and the source indentation stays inside the value,
+    /// which is then printed verbatim in `--json` and in an MCP tool result.
+    fn assert_message_is_unbroken(parsed: &serde_json::Value, context: &str) {
+        let message = parsed["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{context}: the envelope carries no message: {parsed}"));
+        assert!(
+            !message.contains("  "),
+            "{context}: the message carries collapsed literal indentation: {message:?}"
+        );
+    }
+
     /// The command names one change and submits exactly the targeted intent.
     #[tokio::test]
     async fn force_stop_change_submits_only_the_targeted_command() {
@@ -5734,6 +5749,7 @@ mod enabled {
         assert_eq!(parsed["operation"], "control_force_stop_change");
         assert_eq!(parsed["change_id"], "alpha");
         assert_eq!(output.status.code(), Some(0));
+        assert_message_is_unbroken(&parsed, "the settled stopped envelope");
         assert_eq!(
             spy.calls(),
             vec![CommandSpec::ForceStopChange {
@@ -5798,6 +5814,7 @@ mod enabled {
                 "{target}"
             );
             assert_eq!(output.status.code(), Some(10), "{target}");
+            assert_message_is_unbroken(&parsed, &format!("the {target} refusal"));
         }
 
         let unknown = control(&owner, &["force-stop-change", "never-tracked"]).await;

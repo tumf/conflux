@@ -3181,7 +3181,11 @@ async fn force_stop_change_kills_only_the_named_target() {
     );
 
     let after_alpha = fixture.snapshot("alpha").await;
-    assert_eq!(after_alpha.display_status, "not queued");
+    assert_eq!(
+        after_alpha.display_status, "stopped",
+        "the killed target settles as the terminal stopped outcome, which is \
+         the row an observing wait is released on"
+    );
     assert_eq!(
         after_alpha.marks,
         vec!["beta".to_string()],
@@ -3270,7 +3274,12 @@ async fn force_stop_change_dequeues_an_admitted_target_without_signalling() {
         managed.killed().is_empty(),
         "no process belonging to any change may be signalled"
     );
-    assert_eq!(fixture.snapshot("alpha").await.display_status, "not queued");
+    assert_eq!(
+        fixture.snapshot("alpha").await.display_status,
+        "stopped",
+        "a dequeue-only settlement is still a settlement: the row is stopped, \
+         not idle work the owner could admit again"
+    );
     assert_eq!(
         fixture.snapshot("beta").await.display_status,
         "queued",

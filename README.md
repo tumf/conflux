@@ -141,7 +141,9 @@ mode, scheduler state, and stop state do not change. Completed worktree
 effects — an Apply commit that already landed — are preserved, and the settled
 result says so with `effects_rolled_back: false`. Its success token is `stopped`,
 not `accepted`, because one settled command really did end one execution
-episode. A target that is admitted but owns no live process is dequeued outright;
+episode. The target's own row settles as terminal `stopped` rather than idle `not
+queued`, which is what releases a concurrent `wait` with `change_requires_action`
+instead of leaving it observing a proposal nobody will advance. A target that is admitted but owns no live process is dequeued outright;
 a terminal, unadmitted, merge-wait, or resolve-wait target is refused with
 `target_ineligible`, and the owner publishes the same fact ahead of time as
 `actions.force_stop_change`. `stop_and_dequeue` keeps its own

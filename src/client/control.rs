@@ -208,7 +208,8 @@ pub fn validate_request(action: Action, change_ids: &[String]) -> Result<(), Str
         validate_targets(change_ids)?;
         if change_ids.len() != 1 {
             return Err(format!(
-                "'{}' addresses exactly one proposal; {} were given. It is not a process-wide                  stop, and it accepts no target list",
+                "'{}' addresses exactly one proposal; {} were given. It is not a process-wide \
+                 stop, and it accepts no target list",
                 action.as_str(),
                 change_ids.len()
             ));
@@ -292,7 +293,8 @@ async fn single_target_lifecycle(
                 .with_instance(instance)
                 .with_change(change_id.to_string())
                 .with_message(format!(
-                    "this owner cannot force-stop '{change_id}' right now ({}); its display                      status is '{}'",
+                    "this owner cannot force-stop '{change_id}' right now ({}); its display \
+                     status is '{}'",
                     describe_block(eligibility.blocked_reason),
                     change.display_status
                 ))
@@ -323,7 +325,8 @@ async fn single_target_lifecycle(
                     .with_instance(instance)
                     .with_change(change_id.to_string())
                     .with_message(format!(
-                        "'{change_id}' was force-stopped and dequeued; completed worktree                          effects were not rolled back"
+                        "'{change_id}' was force-stopped and dequeued; completed worktree \
+                         effects were not rolled back"
                     ))
                     .with_detail(serde_json::json!({
                         "action": action.as_str(),

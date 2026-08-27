@@ -26,7 +26,10 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::events::{EventDispatcher, ExecutionEvent};
 use crate::orchestration::apply_commit_evidence::{ApplyCommitEvidence, ApplyCommitEvidencePort};
-use crate::orchestration::execution_facts::{ExecutionFactsStore, ExecutionPhase};
+use crate::orchestration::execution_facts::{
+    EpisodeObserver, EpisodeTerminal, EpisodeTransition, EpisodeTransitionKind,
+    ExecutionFactsStore, ExecutionPhase,
+};
 use crate::orchestration::operator_command::{
     ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, ParallelRuntime, QueuePort,
     StopSettlement, TerminationWaiter,
@@ -524,17 +527,57 @@ impl crate::orchestration::operator_command::ManagedProcessTermination for LiveM
     }
 }
 
-/// The same wiring `fixture` builds, plus the managed-ownership port.
+/// The episode transitions a completion subscription would be delivered.
+///
+/// The registry itself is an `EpisodeObserver`, so recording the same
+/// transitions here is what lets a settlement test assert the subscription's
+/// terminal classification without running a callback process.
+#[derive(Debug, Default)]
+struct RecordedEpisodes {
+    seen: Mutex<Vec<EpisodeTransition>>,
+}
+
+impl RecordedEpisodes {
+    /// How the named episode settled, if it settled at all.
+    fn terminal_of(&self, execution_id: &str) -> Option<EpisodeTerminal> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find_map(|transition| match transition.kind {
+                EpisodeTransitionKind::Terminal(terminal)
+                    if transition.execution_id == execution_id =>
+                {
+                    Some(terminal)
+                }
+                _ => None,
+            })
+    }
+}
+
+impl EpisodeObserver for RecordedEpisodes {
+    fn observe_episode(&self, transition: &EpisodeTransition) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(transition.clone());
+    }
+}
+
+/// The same wiring `fixture` builds, plus the managed-ownership port and the
+/// episode observer a completion subscription would bind.
 fn force_stop_fixture(
     queue: Arc<SignallingQueue>,
     managed: Arc<LiveManagedProcess>,
     evidence: Option<Arc<dyn ApplyCommitEvidencePort>>,
+    episodes: Arc<RecordedEpisodes>,
 ) -> Fixture {
     let state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
         vec!["c1".to_string()],
         10,
     )));
     let facts = Arc::new(ExecutionFactsStore::new());
+    facts.bind_episode_observer(episodes);
     let parallel = Arc::new(ParallelRuntime::new());
     let operator = OperatorCommandService::new(
         state.clone(),
@@ -580,10 +623,12 @@ async fn force_stop_change_settles_through_the_shared_intent() {
     let (issued_tx, issued_rx) = tokio::sync::oneshot::channel();
     let queue = Arc::new(SignallingQueue::live(token.clone(), issued_tx));
     let managed = LiveManagedProcess::owning();
+    let episodes = Arc::new(RecordedEpisodes::default());
     let fixture = force_stop_fixture(
         queue,
         managed.clone(),
         Some(Arc::new(ProvingPort::default())),
+        episodes.clone(),
     );
 
     fixture.dispatcher.dispatch(apply_started()).await;
@@ -621,15 +666,34 @@ async fn force_stop_change_settles_through_the_shared_intent() {
     assert_eq!(settlement.cancelled_phase, ExecutionPhase::Apply);
     assert_eq!(managed.kills(), 1, "exactly one immediate kill was issued");
 
-    // The dequeue really landed, and the settlement carries the revision the
-    // command's own outcome dispatch produced.
+    // The settlement really landed, and carries the revision the command's own
+    // outcome dispatch produced.
     assert_eq!(
         fixture.state.read().await.display_status("c1"),
-        "not queued"
+        "stopped",
+        "a killed proposal settles as the terminal stopped outcome, not as an \
+         idle row the owner could admit again"
     );
     assert!(
         result.revision.is_some(),
         "a settled force-stop publishes ChangeDequeued and reports its revision"
+    );
+
+    // The two observers of that settlement, read through the classifiers
+    // production itself uses.
+    let settled_status = fixture.state.read().await.display_status("c1").to_string();
+    assert_eq!(
+        crate::client::completion::classify(Some(&settled_status), None),
+        crate::client::completion::Disposition::RequiresAction,
+        "an observing `cflx client wait` is released rather than left holding \
+         out for an owner that will never move this row again"
+    );
+    let episode = expected_episode.expect("the episode opened above");
+    assert_eq!(
+        episodes.terminal_of(&episode),
+        Some(EpisodeTerminal::Stopped),
+        "and the cancelled execution ID settles as the subscription's terminal \
+         stopped event"
     );
 }
 
@@ -645,6 +709,7 @@ async fn force_stop_change_refusal_travels_as_a_typed_operator_error() {
         queue,
         managed.clone(),
         Some(Arc::new(ProvingPort::default())),
+        Arc::new(RecordedEpisodes::default()),
     );
 
     fixture.dispatcher.dispatch(apply_started()).await;

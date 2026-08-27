@@ -801,6 +801,17 @@ fn mcp_control_refuses_a_malformed_request_before_contacting_an_owner() {
             envelope.as_object().unwrap().get("instance_id").is_none(),
             "{what}: nothing was contacted, so no owner may be named: {envelope}"
         );
+        // The arity refusal is one flowing line. MCP is the only caller that
+        // reaches it — the CLI's own arity is owned by clap — so a collapsed
+        // multi-line literal there would surface in a tool result and nowhere
+        // else.
+        let message = envelope["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what}: the refusal carries no message: {envelope}"));
+        assert!(
+            !message.contains("  "),
+            "{what}: the message carries collapsed literal indentation: {message:?}"
+        );
     }
 
     // An action outside the closed set is a tool error rather than an envelope:
