@@ -299,7 +299,10 @@ async fn capabilities_and_state_never_disagree_about_parallel_execution() {
     assert_eq!(capabilities["parallel"]["vcs_backend"], "git");
     let reasons: Vec<String> =
         serde_json::from_value(capabilities["parallel"]["blocked_reasons"].clone()).unwrap();
-    assert_eq!(reasons, vec!["not_committed", "uncommitted_changes"]);
+    assert_eq!(
+        reasons,
+        vec!["not_committed", "uncommitted_changes", "dependency_blocked"]
+    );
     assert!(
         capabilities["parallel"].get("toggle_modes").is_none(),
         "there is no mode to toggle, so no toggle modes may be advertised"

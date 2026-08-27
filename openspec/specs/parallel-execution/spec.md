@@ -759,6 +759,12 @@ failed-dependent changeに対する`ChangeSkipped`はqueue intentの取消しで
 
 さらに、`MergeWait` により未統合のchangeを依存先に持つchangeは実行を保留し、今回のrunでは実行してはならない（MUST）。依存未解決により実行できないchangeはqueued状態のまま保持され、ステータス表示は依存待ちであることを示さなければならない（MUST）。
 
+schedulerは現在の未解決dependency集合を、operator diagnosticの重複抑止とは独立して、各coherent classificationでreducer/runtime projectionへreconcileしなければならない（MUST）。同一fingerprintの重複diagnosticは抑止してよいが（MAY）、その抑止によりcurrent blocker projectionの作成・維持・再構築を省略してはならない（MUST NOT）。
+
+当該changeのtyped projectionは`display_status=blocked`、`execution_state=queued`、retained `queue_intent=queued`、`parallel_eligible=false`を示し、structured blockerはkind `dependency`と現在の未解決dependency IDsを持たなければならない（MUST）。TUIは同じprojectionを`[blocked:dependency]`として表示しなければならず（MUST）、scheduler固有の別判定を実装してはならない（MUST NOT）。
+
+全dependencyがrepository-visible evidenceにより解消された場合に限りdependency blockerをclearし、retained queue intentに基づく通常のqueued/eligibility projectionへ戻さなければならない（MUST）。実行枠だけを待つready changeはdependency blockerを持たず、通常の`queued`表示を維持しなければならない（MUST）。
+
 #### Scenario: Failed dependent remains stably queued
 
 - **GIVEN** Aがfailedとして記録され、accepted queue intentを持つBがAに依存している
@@ -841,6 +847,42 @@ failed-dependent changeに対する`ChangeSkipped`はqueue intentの取消しで
 - **WHEN** processがrestartする
 - **THEN** ephemeral failed trackerとnotification epochは空で開始する
 - **AND** next actionはworkspace and Git evidenceから再計算される
+
+#### Scenario: Unresolved dependency is continuously projected
+
+- **GIVEN** accepted queue intentを持つBが未解決dependency Aに依存している
+- **WHEN** schedulerがBをcoherently classifyする
+- **THEN** Bはdispatchされずdependency-blocked queued workとして保持される
+- **AND** typed statusは`display_status=blocked`、`execution_state=queued`、`queue_intent=queued`、`parallel_eligible=false`を返す
+- **AND** structured blockerはkind `dependency`とAのchange IDを返す
+- **AND** TUIは`[blocked:dependency]`を表示する
+
+#### Scenario: Diagnostic deduplication does not erase state
+
+- **GIVEN** Bのunresolved dependency fingerprintが前回classificationから変化していない
+- **AND** duplicate operator diagnosticは既に発行済みである
+- **WHEN** schedulerがBを再classificationする、またはprojectionが再構築される
+- **THEN** duplicate diagnosticは抑止される
+- **BUT** current dependency blockerはreducer/runtime projectionへreconcileされる
+- **AND** coherent snapshotはBをplain `queued`として返さない
+
+#### Scenario: Dependency resolution restores retained queue intent
+
+- **GIVEN** dependency-blocked Bの全dependencyがeffective baseへrepository-visibly統合された
+- **WHEN** schedulerがBを再classificationする
+- **THEN** dependency blockerはclearされる
+- **AND** Bはretained queue intentに基づき`queued`へ戻る
+- **AND** capacityと通常policyが許せばdispatch eligibleになる
+
+#### Scenario: Capacity-only wait remains queued
+
+- **GIVEN** Cには未解決dependencyがない
+- **AND** 全execution slotが他changeにより使用中である
+- **WHEN** coherent status snapshotを取得する
+- **THEN** Cは`queued`でblockerなしとして表示される
+- **AND** dependency blockerを捏造しない
+
+<!-- Expected canonical result after archive: dependency-blocked queued work is continuously reconstructed from repository-visible classification, shared by typed status and TUI, while diagnostic deduplication remains edge-only and capacity-only waits remain plain queued. -->
 
 ### Requirement: ChangeSkipped Event
 
@@ -1839,6 +1881,7 @@ When configured for push post-archive mode, the parallel service SHALL preserve 
 - **AND** retry-specific repair budget release SHALL apply only through the accepted retry path
 
 <!-- Expected canonical result after archive: terminal errors remain fail-closed after runtime-limit and other failures until a target-specific accepted retry creates immediate reanalysis, whether waking a persistent scheduler or starting a fresh boundary; push post-archive behavior remains intact. -->
+
 ### Requirement: Non-blocking Merge in Scheduler Loop
 
 パラレルスケジューラの `tokio::select!` イベントループは、workspace 完了後の merge + コンフリクト解決処理によってブロックされてはならない（MUST NOT）。merge + resolve 処理はバックグラウンドタスクとして非同期に実行し、スケジューラループは queued change の dispatch を継続しなければならない（SHALL）。

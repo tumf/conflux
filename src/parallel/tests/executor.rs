@@ -4531,6 +4531,129 @@ fn drain_dependency_events(
     events
 }
 
+/// The regression: a suppressed duplicate diagnostic must not be able to leave
+/// the reducer describing an unresolved dependency wait as plain `queued`.
+///
+/// Integration scope — a real Git repository, the real scheduler classification
+/// path, and the real reducer — because the defect lived in the seam between
+/// the edge-triggered event and the state projection, which no in-memory double
+/// can reproduce.
+#[tokio::test]
+async fn dependency_blocker_projection_rebuild_survives_deduplicated_diagnostics() {
+    use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+        vec!["route".to_string()],
+        0,
+    )));
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("route".to_string()));
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let blocked_analysis = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["ghost".to_string()])]),
+        groups: None,
+    };
+    let ready_analysis = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::new(),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    // ── First classification: blocked, projected, announced once ────────────
+    assert!(executor
+        .select_changes_for_dispatch(&blocked_analysis, 1, &in_flight)
+        .await
+        .is_empty());
+    {
+        let guard = shared.read().await;
+        assert_eq!(guard.display_status("route"), "blocked");
+        let blocker = guard.blocker_view("route").expect("structured blocker");
+        assert_eq!(
+            blocker.kind,
+            crate::orchestration::state::BlockerKind::Dependency
+        );
+        assert_eq!(blocker.dependencies, vec!["ghost".to_string()]);
+    }
+
+    // ── Unchanged fingerprint: still no second diagnostic, still blocked ────
+    assert!(executor
+        .select_changes_for_dispatch(&blocked_analysis, 1, &in_flight)
+        .await
+        .is_empty());
+    assert_eq!(
+        shared.read().await.display_status("route"),
+        "blocked",
+        "a suppressed duplicate diagnostic must not withdraw the current blocker"
+    );
+
+    // ── Projection replaced mid-wait, fingerprints untouched ────────────────
+    //
+    // A refresh, a reducer rebuild, or any loss of the projection while the
+    // dependency is still unresolved. Nothing about the blocker changed, so the
+    // deduplication store will emit nothing; the reconciliation path is the
+    // only thing that can restore the wait.
+    {
+        let mut guard = shared.write().await;
+        *guard = OrchestratorState::new(vec!["route".to_string()], 0);
+        guard.apply_command(ReducerCommand::AddToQueue("route".to_string()));
+        assert_eq!(guard.display_status("route"), "queued");
+    }
+    assert!(executor
+        .select_changes_for_dispatch(&blocked_analysis, 1, &in_flight)
+        .await
+        .is_empty());
+    {
+        let guard = shared.read().await;
+        assert_eq!(
+            guard.display_status("route"),
+            "blocked",
+            "a rebuilt projection must be restored from classification, not from a changed fingerprint"
+        );
+        assert_eq!(
+            guard.blocker_view("route").expect("blocker").dependencies,
+            vec!["ghost".to_string()]
+        );
+    }
+
+    // Three coherent classifications, one operator diagnostic: deduplication is
+    // preserved exactly, and it is no longer current-state authority.
+    assert_eq!(
+        drain_dependency_events(&mut rx, "route"),
+        vec!["blocked:ghost".to_string()],
+        "an unchanged blocker fingerprint stays a single announced transition"
+    );
+
+    // ── Resolution: the wait is withdrawn and dispatch resumes ──────────────
+    assert_eq!(
+        executor
+            .select_changes_for_dispatch(&ready_analysis, 1, &in_flight)
+            .await,
+        vec!["route".to_string()],
+        "dispatch selection is unchanged by the projection work"
+    );
+    {
+        let guard = shared.read().await;
+        assert_eq!(
+            guard.display_status("route"),
+            "queued",
+            "the retained queue intent decides the display once evidence resolves"
+        );
+        assert!(guard.blocker_view("route").is_none());
+    }
+}
+
 #[tokio::test]
 async fn test_archived_dependency_is_blocked_without_rejection_until_merged() {
     let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");

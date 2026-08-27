@@ -333,6 +333,35 @@ fn project_blocker(view: crate::orchestration::state::BlockerView) -> ChangeBloc
             .map(crate::events::sanitize_detail),
         origin: view.origin.as_deref().map(crate::events::sanitize_detail),
         resumable: view.resumable,
+        dependencies: view.dependencies.clone(),
+    }
+}
+
+/// Fold a reducer-owned dependency wait into the published parallel eligibility.
+///
+/// The workspace observation answers "may this change take part in worktree
+/// execution at all"; a dependency wait answers "may it be dispatched right
+/// now". Both have to reach `parallel.eligible`, because a row reported as
+/// eligible while the scheduler is withholding it is exactly what makes an
+/// empty execution slot look unexplained.
+///
+/// The workspace reason wins when both apply: committing the proposal is the
+/// action an operator can actually take, while a dependency clears itself.
+fn fold_dependency_wait_into_eligibility(
+    observed: ParallelEligibility,
+    blocker: Option<&ChangeBlocker>,
+) -> ParallelEligibility {
+    if !observed.eligible {
+        return observed;
+    }
+    if !blocker.is_some_and(|blocker| matches!(blocker.kind, RemoteBlockerKind::Dependency)) {
+        return observed;
+    }
+    ParallelEligibility {
+        eligible: false,
+        blocked_reason: Some(
+            crate::web::remote_control_api::dto::ParallelBlockedReason::DependencyBlocked,
+        ),
     }
 }
 
@@ -730,7 +759,10 @@ impl WebState {
                 None => false,
             };
             let change_facts = facts.facts(&change.id);
-            change.parallel = change_facts.parallel;
+            change.parallel = fold_dependency_wait_into_eligibility(
+                change_facts.parallel,
+                change.blocker.as_ref(),
+            );
             change.worktree = change_facts.worktree.clone();
             change.timing = change_facts.timing.clone();
             change.latest_activity = change_facts.latest_activity.clone();
