@@ -32,8 +32,8 @@ verifications:
 ## Premise / Context
 
 - Process-wide `force_stop` immediately stops all work selected by the owner's authoritative lifecycle state.
-- `stop_and_dequeue` addresses one change, but follows confirmed normal termination and dequeue settlement rather than providing an immediate targeted kill.
-- Operators need to terminate one runaway or invalid execution while unrelated changes continue.
+- `stop_and_dequeue` cancels one change immediately but gives its managed process group a graceful SIGTERM escalation window before SIGKILL.
+- No target-scoped control currently bypasses that grace window when a runaway process must be killed immediately while unrelated changes continue.
 - Targeted force-stop is an operator intervention. It must not be inferred from errors or invoked automatically.
 
 ## Problem / Context
@@ -47,9 +47,9 @@ Add a typed `force_stop_change` operator command carrying exactly one `change_id
 The shared operator transaction MUST:
 
 1. validate the target against the fresh authoritative state;
-2. immediately cancel and terminate only managed activity owned by that change, including its current phase subprocesses;
-3. wait for confirmed target quiescence before settlement;
-4. remove that change's active/queued admission intent so it is not immediately redispatched;
+2. bypass the graceful SIGTERM window and immediately send SIGKILL to the managed process group owned by the target change, including its current phase subprocesses;
+3. wait for confirmed target quiescence and process reaping before settlement;
+4. atomically clear that change's queue admission intent and execution mark so mark settlement cannot redispatch it;
 5. classify the change as stopped while preserving its worktree and completed effects;
 6. leave unrelated changes, marks, queue intents, subprocesses, and the process-wide run mode unchanged.
 
@@ -66,15 +66,15 @@ Do not implement this by temporarily replacing the process-wide mark set or by i
 
 ## Acceptance Criteria
 
-1. An applying, accepting, rejecting, archiving, resolving, or otherwise managed in-flight target can be force-stopped individually when its published action eligibility permits it.
-2. Target settlement occurs only after the target's managed processes are confirmed terminated and reaped.
-3. The target is dequeued/stopped, retains completed worktree effects, and is not automatically redispatched from stale queue intent.
+1. An applying, accepting, rejecting, archiving, or resolving target with a live managed process can be force-stopped individually when its published action eligibility permits it. A queued or dependency-blocked admitted target without a live process is eligible for dequeue-only settlement; merge-wait, resolve-wait without a live resolver, terminal, rejected, unknown, and unadmitted rows are ineligible with typed reasons.
+2. A live target receives immediate managed-process-group SIGKILL without the `stop_and_dequeue` SIGTERM grace window, and settlement occurs only after confirmed termination and reaping.
+3. The target is dequeued/stopped, its execution mark is revoked atomically, completed worktree effects remain, and later mark settlement cannot redispatch it.
 4. Unrelated active and queued changes continue unchanged; their processes, marks, queue intents, execution IDs, and subscriptions are preserved.
 5. Process-wide `app_mode`, scheduler started/stopped state, and process-wide stop state do not change.
 6. Unknown, terminal, unsupported, and already-quiescent targets cannot cause cross-target cancellation.
 7. Stale revisions are rejected before side effects. Exact idempotent replay returns the original settled result without repeating termination.
-8. The API result identifies the target, cancelled phase, last completed phase, confirmed termination, and `effects_rolled_back: false`.
-9. CLI and MCP expose the operation without allowing zero, multiple, duplicate, or blank targets.
+8. The API result identifies the target, cancelled `execution_id` when one exists, cancelled phase, last completed phase, confirmed termination, and `effects_rolled_back: false`.
+9. CLI operation `control_force_stop_change` settles with success outcome `stopped`; MCP uses the existing `change_ids` array with exactly one element and rejects zero, multiple, duplicate, or blank targets.
 10. Existing process-wide `stop`, `force_stop`, and individual `stop_and_dequeue` semantics remain unchanged.
 
 ## Explicit Completion Conditions

@@ -2,9 +2,9 @@
 
 ### Requirement: Target-scoped force-stop API and clients
 
-The v2 command registry MUST accept `force_stop_change` with exactly one non-empty `change_id`, ordinary expected-revision fencing, and idempotency identity. Each projected change MUST publish `actions.force_stop_change` eligibility. A successful settled command result MUST identify the target, cancelled phase, last completed phase, confirmed termination, and `effects_rolled_back: false`.
+The v2 command registry MUST accept `force_stop_change` with exactly one non-empty `change_id`, ordinary expected-revision fencing, and idempotency identity. Each projected change MUST publish `actions.force_stop_change` eligibility. A successful settled command result MUST identify the target, cancelled execution ID when one exists, cancelled phase, last completed phase, confirmed termination, and `effects_rolled_back: false`.
 
-The CLI MUST expose `cflx client force-stop-change <change-id> --json`. MCP `cflx_control` MUST accept action `force_stop_change` with exactly one distinct `change_id`. Both clients MUST delegate through the ordinary v2 command and shared operator transaction; they MUST NOT invoke process-wide `force_stop`, rewrite marks, perform PID lookup, or reimplement cancellation policy.
+The CLI MUST expose `cflx client force-stop-change <change-id> --json` with operation `control_force_stop_change` and successful outcome `stopped`. MCP `cflx_control` MUST accept action `force_stop_change` using the existing `change_ids` array with exactly one non-empty element. Both clients MUST delegate through the ordinary v2 command and shared operator transaction; they MUST NOT invoke process-wide `force_stop`, rewrite unrelated marks, perform PID lookup, or reimplement cancellation policy.
 
 #### Scenario: API addresses one change
 
@@ -37,4 +37,5 @@ The CLI MUST expose `cflx client force-stop-change <change-id> --json`. MCP `cfl
 
 - **WHEN** a caller invokes existing `force_stop`
 - **THEN** its process-wide semantics and target-list refusal remain unchanged
-- **AND** `force_stop_change` remains the only immediate target-scoped kill operation
+- **AND** `force_stop_change` remains the only target-scoped control that bypasses the graceful SIGTERM escalation window
+- **AND** `stop_and_dequeue` retains its existing cancel-confirm-dequeue contract
