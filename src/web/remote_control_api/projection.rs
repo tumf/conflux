@@ -18,8 +18,9 @@ use tokio::sync::broadcast;
 
 use crate::events::{ExecutionEvent, LogEntry};
 use crate::orchestration::operator_command::{
-    classify_queue_intent_route, classify_retry_route, is_active_status, is_final_status,
-    is_markable_status, MarkExclusion, OperatorMode, QueueIntentRoute, RetryRoute,
+    classify_force_stop_change, classify_queue_intent_route, classify_retry_route,
+    is_active_status, is_final_status, is_markable_status, ForceStopAdmission, MarkExclusion,
+    OperatorMode, QueueIntentRoute, RetryRoute,
 };
 use crate::orchestration::state::BlockerKind;
 use crate::web::state::OrchestratorStateSnapshot;
@@ -569,6 +570,7 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
                     &display_status,
                     change.blocker.as_ref(),
                     change.parallel.eligible,
+                    change.managed_process_live,
                 ),
                 display_status,
                 progress_status: change.status.clone(),
@@ -639,6 +641,7 @@ fn classify_actions(
     display_status: &str,
     blocker: Option<&ChangeBlocker>,
     parallel_eligible: bool,
+    managed_process_live: bool,
 ) -> ChangeActions {
     let final_status = is_final_status(display_status);
     let route = classify_queue_intent_route(mode, display_status);
@@ -706,11 +709,26 @@ fn classify_actions(
         _ => ActionEligibility::blocked(ActionBlockedReason::NotMergeWaiting),
     };
 
+    // The projected row is by definition tracked, so the only remaining input
+    // is whether this owner really holds a process for it. Running the shared
+    // classifier — rather than restating its table here — is what keeps a
+    // published `allowed` from advertising a kill admission would refuse.
+    let force_stop_change =
+        match classify_force_stop_change(display_status, true, managed_process_live) {
+            ForceStopAdmission::KillAndDequeue | ForceStopAdmission::DequeueOnly => {
+                ActionEligibility::allowed()
+            }
+            ForceStopAdmission::Refused(reason) => {
+                ActionEligibility::blocked(ActionBlockedReason::from_force_stop_exclusion(reason))
+            }
+        };
+
     ChangeActions {
         set_execution_mark,
         set_queue_intent,
         retry_change,
         stop_and_dequeue,
+        force_stop_change,
         resolve_merge,
     }
 }
@@ -733,6 +751,25 @@ pub fn change_actions_for_test(
         display_status,
         blocker,
         true,
+        false,
+    )
+}
+
+/// Action eligibility with an explicit managed-process fact, for tests and
+/// fixtures that must exercise the targeted force-stop rule.
+#[doc(hidden)]
+#[allow(dead_code)] // Used by unit tests and by `tests/client_cli_tests.rs`.
+pub fn change_actions_with_live_process_for_test(
+    app_mode: &str,
+    display_status: &str,
+    managed_process_live: bool,
+) -> ChangeActions {
+    classify_actions(
+        OperatorMode::from_app_mode(app_mode),
+        display_status,
+        None,
+        true,
+        managed_process_live,
     )
 }
 
@@ -749,6 +786,7 @@ pub fn parallel_change_actions_for_test(
         display_status,
         None,
         parallel_eligible,
+        false,
     )
 }
 

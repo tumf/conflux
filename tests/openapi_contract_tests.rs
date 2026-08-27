@@ -731,6 +731,68 @@ fn execution_observability_errors(doc: &Value) -> Vec<String> {
         }
     }
 
+    // The targeted force-stop settlement. A client must be able to tell an
+    // immediate kill from a graceful stop, and to read which episode it ended,
+    // without inspecting Git or parsing the detail sentence.
+    let force_stop_variant = schemas(doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .and_then(|variants| {
+            variants.iter().find(|variant| {
+                variant["properties"]["kind"]["enum"]
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|value| value == "force_stop_change"))
+            })
+        })
+        .cloned();
+    match force_stop_variant {
+        None => errors.push(
+            "CommandResult must publish the force_stop_change settlement variant".to_string(),
+        ),
+        Some(variant) => {
+            let properties: BTreeSet<&str> = variant["properties"]
+                .as_object()
+                .map(|p| p.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            for member in [
+                "change_id",
+                "execution_id",
+                "cancelled_phase",
+                "last_completed_phase",
+                "terminated",
+                "apply_commit",
+                "effects_rolled_back",
+            ] {
+                if !properties.contains(member) {
+                    errors.push(format!(
+                        "the force_stop_change result must publish `{member}`; a client would \
+                         otherwise have to re-observe the owner to learn what was killed"
+                    ));
+                }
+            }
+        }
+    }
+
+    // Per-change eligibility for the targeted kill is published separately from
+    // the graceful stop, because the two are refused for different reasons.
+    let action_properties: BTreeSet<&str> = schemas(doc)["ChangeActions"]["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    for member in ["stop_and_dequeue", "force_stop_change"] {
+        if !action_properties.contains(member) {
+            errors.push(format!("ChangeActions must publish `{member}` eligibility"));
+        }
+    }
+    let blocked_reasons = published_enum(doc, "ActionBlockedReason");
+    for token in ["not_admitted", "no_managed_process"] {
+        if !blocked_reasons.contains(token) {
+            errors.push(format!(
+                "ActionBlockedReason must publish `{token}`, the targeted force-stop refusal a \
+                 client branches on"
+            ));
+        }
+    }
+
     // The latest-log projection is closed and path-free. `workspace_path` and the
     // display `timestamp` exist on the retained entry and must not travel here.
     let log_properties: BTreeSet<&str> = schemas(doc)["LatestLogProjection"]["properties"]
@@ -939,6 +1001,97 @@ fn published_schemas_describe_what_the_server_actually_serializes() {
 #[test]
 fn the_authoritative_snapshot_publishes_every_operator_field() {
     assert_eq!(snapshot_field_errors(&generated()), Vec::<String>::new());
+}
+
+/// A generated client can drive the targeted kill and read its settlement.
+///
+/// The surrounding completeness tests already fail if any of this is dropped;
+/// this one states the contract as a client meets it — command in, typed result
+/// out, eligibility readable ahead of time — so the change's own verification
+/// exercises the published document rather than only the aggregate checks.
+#[test]
+fn force_stop_change_contract_is_published_end_to_end() {
+    let doc = generated();
+
+    // Submitting it: one target, and a `change_id` that is a string. A client
+    // generated against this document has no way to spell a target *list*, which
+    // is what keeps the targeted kill from widening into the process-wide one.
+    let spec = schemas(&doc)["CommandSpec"]["oneOf"]
+        .as_array()
+        .expect("CommandSpec is a discriminated union")
+        .iter()
+        .find(|variant| variant["properties"]["type"]["enum"][0] == "force_stop_change")
+        .expect("the force_stop_change command variant is published")
+        .clone();
+    let required: BTreeSet<&str> = spec["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        required.contains("change_id"),
+        "the target is mandatory: {spec}"
+    );
+    assert_eq!(
+        spec["properties"]["change_id"]["type"], "string",
+        "the target is one change, never a list: {spec}"
+    );
+    assert!(
+        spec["properties"].get("change_ids").is_none(),
+        "a target list must not be publishable on this command: {spec}"
+    );
+
+    // Reading the settlement: its own `kind`, so a client can tell an immediate
+    // kill from a graceful stop without parsing prose, plus the members it needs
+    // to know what was ended and what survived.
+    let result = schemas(&doc)["CommandResult"]["oneOf"]
+        .as_array()
+        .expect("CommandResult is a discriminated union")
+        .iter()
+        .find(|variant| {
+            variant["properties"]["kind"]["enum"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "force_stop_change"))
+        })
+        .expect("the force_stop_change settlement variant is published")
+        .clone();
+    let members: BTreeSet<&str> = result["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    for member in [
+        "change_id",
+        "execution_id",
+        "cancelled_phase",
+        "last_completed_phase",
+        "terminated",
+        "apply_commit",
+        "effects_rolled_back",
+    ] {
+        assert!(
+            members.contains(member),
+            "the result must publish `{member}`"
+        );
+    }
+
+    // Eligibility ahead of time, and the two typed refusals a client branches on.
+    // The graceful control keeps its own field: neither answers for the other.
+    let actions: BTreeSet<&str> = schemas(&doc)["ChangeActions"]["properties"]
+        .as_object()
+        .map(|p| p.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    for member in ["stop_and_dequeue", "force_stop_change"] {
+        assert!(
+            actions.contains(member),
+            "ChangeActions must publish `{member}` eligibility"
+        );
+    }
+    let blocked = published_enum(&doc, "ActionBlockedReason");
+    for token in ["not_admitted", "no_managed_process"] {
+        assert!(
+            blocked.contains(token),
+            "ActionBlockedReason must publish `{token}`: {blocked:?}"
+        );
+    }
 }
 
 /// The retired Apply-limit token stays published, and stays a token.
@@ -1170,6 +1323,33 @@ fn incomplete_contracts_are_rejected_and_the_failure_names_what_is_missing() {
                         .unwrap()
                         .remove("apply_commit");
                 }
+            }),
+        ),
+        (
+            "the typed targeted force-stop result is dropped",
+            "force_stop_change",
+            Box::new(|doc| {
+                let variants = doc["components"]["schemas"]["CommandResult"]["oneOf"]
+                    .as_array_mut()
+                    .unwrap();
+                variants.retain(|variant| {
+                    variant["properties"]["kind"]["enum"]
+                        .as_array()
+                        .is_none_or(|values| {
+                            !values.iter().any(|value| value == "force_stop_change")
+                        })
+                });
+            }),
+        ),
+        (
+            "the per-change targeted force-stop eligibility is dropped",
+            "force_stop_change",
+            Box::new(|doc| {
+                doc["components"]["schemas"]["ChangeActions"]["properties"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("force_stop_change")
+                    .expect("the field was published");
             }),
         ),
         (
@@ -1455,6 +1635,9 @@ fn change_resource() -> ChangeResource {
             ),
             retry_change: ActionEligibility::allowed(),
             stop_and_dequeue: ActionEligibility::allowed(),
+            force_stop_change: ActionEligibility::blocked(
+                conflux::web::remote_control_api::dto::ActionBlockedReason::NoManagedProcess,
+            ),
             resolve_merge: ActionEligibility::blocked(
                 conflux::web::remote_control_api::dto::ActionBlockedReason::NotMergeWaiting,
             ),

@@ -49,6 +49,54 @@ const SCOPE_ESCALATION_SIGTERM_GRACE_MS: u64 = 500;
 /// Total budget for one retained-identity managed escalation sweep.
 const SCOPE_ESCALATION_TOTAL_MS: u64 = 5_000;
 
+/// Bound on proving that one targeted force-stop's SIGKILL emptied the group.
+///
+/// It bounds a *proof*, not a grace window: nothing is given time to shut down
+/// cooperatively, and the budget only limits how long membership is polled
+/// before the result is reported as unconfirmed.
+pub const FORCE_STOP_CHANGE_KILL_BUDGET: Duration = Duration::from_secs(5);
+
+/// Evidence from one targeted force-stop of a single change's process groups.
+///
+/// Every field describes only the addressed change: an unrelated change's
+/// processes are not reachable from the path that produces this, so a report
+/// can never account for one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChangeForceStopReport {
+    /// Owned process identities this force-stop signalled.
+    pub identities: usize,
+    /// Identities proven empty after SIGKILL.
+    pub confirmed: usize,
+    /// One bounded diagnostic per identity whose emptiness was not proven.
+    pub unconfirmed: Vec<String>,
+}
+
+impl ChangeForceStopReport {
+    /// Whether every signalled identity was proven reaped.
+    ///
+    /// A target that owned no process at all is confirmed: there was nothing to
+    /// terminate, which is exactly the dequeue-only case.
+    pub fn is_confirmed(&self) -> bool {
+        self.unconfirmed.is_empty()
+    }
+
+    /// One bounded operator-facing summary of what this force-stop proved.
+    pub fn diagnostics(&self) -> String {
+        if self.is_confirmed() {
+            return format!(
+                "targeted force-stop confirmed (identities={}, killed={})",
+                self.identities, self.confirmed
+            );
+        }
+        format!(
+            "targeted force-stop unconfirmed (identities={}, killed={}): {}",
+            self.identities,
+            self.confirmed,
+            self.unconfirmed.join("; ")
+        )
+    }
+}
+
 /// Lifecycle of one run-owned AI command execution inside its scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionPhase {
@@ -234,6 +282,85 @@ impl RunCommandScope {
             .entries
             .values()
             .any(|entry| entry.change_id.as_deref() == Some(change_id))
+    }
+
+    /// Whether this scope owns a live managed process group for `change_id`.
+    ///
+    /// The eligibility fact a targeted force-stop needs, read from the same
+    /// ownership graph the kill itself walks: a change with a registration but
+    /// no spawned identity is admitted work with nothing to signal, and a change
+    /// with no registration owns no command at all.
+    pub fn change_owns_managed_process(&self, change_id: &str) -> bool {
+        self.lock().entries.values().any(|entry| {
+            entry.change_id.as_deref() == Some(change_id) && !entry.unproven_pids.is_empty()
+        })
+    }
+
+    /// Immediately SIGKILL every process group this scope owns for `change_id`
+    /// and prove each one was reaped.
+    ///
+    /// Target-scoped by construction: the entry filter is the *only* way a PGID
+    /// reaches the signal, so an unrelated change's process group is
+    /// unreachable from here — there is no PID lookup, no "kill everything
+    /// retained", and no scope closure. Admission stays open and every other
+    /// registration keeps running, which is what separates this from
+    /// [`Self::force_cleanup_retained`].
+    ///
+    /// No SIGTERM is sent. `budget` bounds the proof of quiescence, not a grace
+    /// window, and an identity whose emptiness cannot be proven is reported as
+    /// unconfirmed rather than dropped from the ownership graph.
+    pub async fn force_stop_change(
+        &self,
+        change_id: &str,
+        budget: Duration,
+    ) -> ChangeForceStopReport {
+        let targets: Vec<(u64, ScopeEntry)> = {
+            let state = self.lock();
+            state
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.change_id.as_deref() == Some(change_id))
+                .filter(|(_, entry)| !entry.unproven_pids.is_empty())
+                .map(|(id, entry)| (*id, entry.clone()))
+                .collect()
+        };
+
+        let per_identity_ms = budget.as_millis().min(u64::MAX as u128) as u64;
+        let mut report = ChangeForceStopReport::default();
+
+        for (id, entry) in targets {
+            let mut proven = Vec::new();
+            for pid in &entry.unproven_pids {
+                report.identities += 1;
+                let evidence = crate::process_manager::kill_process_group_immediately(
+                    *pid,
+                    per_identity_ms,
+                    entry.operation.as_deref(),
+                    entry.change_id.as_deref(),
+                )
+                .await;
+                if evidence.is_confirmed() {
+                    report.confirmed += 1;
+                    proven.push(*pid);
+                } else {
+                    report
+                        .unconfirmed
+                        .push(format!("pgid={pid}: {}", evidence.diagnostics()));
+                }
+            }
+
+            let mut state = self.lock();
+            if let Some(current) = state.entries.get_mut(&id) {
+                current.unproven_pids.retain(|pid| !proven.contains(pid));
+                if current.unproven_pids.is_empty() && !current.phase.is_active() {
+                    state.entries.remove(&id);
+                }
+            }
+            drop(state);
+            self.inner.quiescence.notify_waiters();
+        }
+
+        report
     }
 
     /// Reserve one execution before its runner task is spawned.
@@ -2645,6 +2772,126 @@ mod tests {
             assert!(
                 scope.change_is_quiescent("change-a"),
                 "only confirmed cleanup releases the change"
+            );
+        }
+
+        /// A targeted force-stop kills exactly one change's process group and
+        /// proves it reaped, while an unrelated change's group keeps running.
+        ///
+        /// Integration evidence, deliberately: the property is about real
+        /// processes and real signals, and a double could not show that an
+        /// unrelated PGID survived. Both children are `setsid` leaders so each
+        /// PGID names one owned group and nothing else.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn force_stop_change_kills_only_the_named_changes_process_group() {
+            fn spawn_group() -> (tokio::process::Child, u32) {
+                let mut command = tokio::process::Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg("sleep 30")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                crate::process_manager::configure_process_group(&mut command);
+                let child = command.spawn().expect("spawn a real process group");
+                let pid = child.id().expect("a spawned child has a pid");
+                (child, pid)
+            }
+
+            fn group_is_alive(pgid: u32) -> bool {
+                use nix::sys::signal::killpg;
+                use nix::unistd::Pid;
+                killpg(Pid::from_raw(pgid as i32), None).is_ok()
+            }
+
+            let (target_child, target_pgid) = spawn_group();
+            let (bystander_child, bystander_pgid) = spawn_group();
+
+            let scope = RunCommandScope::new();
+            let _target = scope.register_unproven_for_test("apply", Some("alpha"), target_pgid);
+            let _bystander =
+                scope.register_unproven_for_test("apply", Some("beta"), bystander_pgid);
+
+            assert!(scope.change_owns_managed_process("alpha"));
+            assert!(scope.change_owns_managed_process("beta"));
+
+            // The owner of the target child reaps it, exactly as the workspace
+            // task that spawned it does in production. Without a reaper the
+            // killed leader stays a zombie and the group is *not* provably
+            // empty — which is the point: settlement waits for reaping, not
+            // merely for the signal.
+            let mut target_child = target_child;
+            let reaper = tokio::spawn(async move { target_child.wait().await });
+
+            let report = scope
+                .force_stop_change("alpha", FORCE_STOP_CHANGE_KILL_BUDGET)
+                .await;
+
+            assert!(
+                report.is_confirmed(),
+                "the target group must be proven empty: {}",
+                report.diagnostics()
+            );
+            assert_eq!(report.identities, 1);
+            assert_eq!(report.confirmed, 1);
+            assert!(
+                !group_is_alive(target_pgid),
+                "the target's process group must be gone before settlement"
+            );
+            assert!(
+                !scope.change_owns_managed_process("alpha"),
+                "a proven identity is released from the ownership graph"
+            );
+
+            // The unrelated change is untouched: same registration, same live
+            // group, and admission is still open for the rest of the run.
+            assert!(
+                group_is_alive(bystander_pgid),
+                "an unrelated change's process group must keep running"
+            );
+            assert!(scope.change_owns_managed_process("beta"));
+            assert!(
+                !scope.is_closed(),
+                "a targeted force-stop must not close run admission"
+            );
+
+            let status = reaper
+                .await
+                .expect("the reaper task")
+                .expect("the killed child is waitable");
+            assert!(
+                !status.success(),
+                "a SIGKILLed child never exits successfully"
+            );
+
+            // Leave no live process behind.
+            let mut bystander_child = bystander_child;
+            let _ = bystander_child.kill().await;
+            let _ = bystander_child.wait().await;
+        }
+
+        /// A target that owns no identity is neither signalled nor claimed.
+        #[tokio::test]
+        async fn force_stop_change_signals_nothing_for_a_change_with_no_process_group() {
+            let scope = RunCommandScope::new();
+            let _registration = scope
+                .register_for_test("apply", Some("alpha"))
+                .expect("an open scope admits the registration");
+
+            assert!(
+                !scope.change_owns_managed_process("alpha"),
+                "a reserved execution that never spawned owns no process group"
+            );
+
+            let report = scope
+                .force_stop_change("alpha", FORCE_STOP_CHANGE_KILL_BUDGET)
+                .await;
+
+            assert!(report.is_confirmed());
+            assert_eq!(
+                report.identities, 0,
+                "nothing was signalled, so nothing needed reaping"
             );
         }
 

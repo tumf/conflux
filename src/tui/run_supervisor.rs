@@ -254,7 +254,11 @@ impl TuiRunSupervisor {
     }
 
     /// The command scope of the live run, if any.
-    #[cfg(test)]
+    ///
+    /// The managed ownership graph a targeted force-stop signals through, read
+    /// per call rather than captured: a scope belongs to one run, so a caller
+    /// holding an old one would be addressing PGIDs that were reaped runs ago.
+    /// `None` between runs means this process owns no managed process at all.
     pub fn run_command_scope(&self) -> Option<RunCommandScope> {
         lock(&self.slots.scope).clone()
     }

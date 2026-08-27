@@ -79,6 +79,14 @@ pub enum Action {
     Stop,
     /// Submit the shared ForceStop intent.
     ForceStop,
+    /// Kill exactly one named proposal immediately and dequeue it.
+    ///
+    /// The one control that is target-scoped *and* lifecycle: it names a single
+    /// proposal, submits the shared `force_stop_change` command, and leaves
+    /// every unrelated mark, queue intent, process, and the process-wide run
+    /// mode untouched. It is never a spelling of [`Self::ForceStop`], which
+    /// stops everything the owner is running.
+    ForceStopChange,
 }
 
 impl Action {
@@ -90,6 +98,7 @@ impl Action {
             Self::Start => Operation::ControlStart,
             Self::Stop => Operation::ControlStop,
             Self::ForceStop => Operation::ControlForceStop,
+            Self::ForceStopChange => Operation::ControlForceStopChange,
         }
     }
 
@@ -101,6 +110,7 @@ impl Action {
             Self::Start => "start",
             Self::Stop => "stop",
             Self::ForceStop => "force_stop",
+            Self::ForceStopChange => "force_stop_change",
         }
     }
 
@@ -112,6 +122,7 @@ impl Action {
             "start" => Self::Start,
             "stop" => Self::Stop,
             "force_stop" => Self::ForceStop,
+            "force_stop_change" => Self::ForceStopChange,
             _ => return None,
         })
     }
@@ -125,6 +136,16 @@ impl Action {
         matches!(self, Self::Mark | Self::Unmark)
     }
 
+    /// Whether this action is lifecycle control addressed at exactly one proposal.
+    ///
+    /// Kept apart from [`Self::is_mark`] because the three shapes are three
+    /// contracts: a mark names 1..64 proposals and writes intent, a process-wide
+    /// lifecycle action names none and consumes the owner's mark set, and this
+    /// names exactly one and ends that one proposal's execution episode.
+    pub fn is_single_target_lifecycle(self) -> bool {
+        matches!(self, Self::ForceStopChange)
+    }
+
     /// The mark value this action requests, for the two that request one.
     fn desired_mark(self) -> Option<bool> {
         match self {
@@ -135,6 +156,9 @@ impl Action {
     }
 
     /// The shared lifecycle command this action submits, for the three that do.
+    ///
+    /// [`Self::ForceStopChange`] is deliberately absent: it carries a target, so
+    /// its command cannot be constructed from the action alone.
     fn lifecycle_command(self) -> Option<CommandSpec> {
         match self {
             Self::Start => Some(CommandSpec::Start),
@@ -180,6 +204,18 @@ pub fn validate_request(action: Action, change_ids: &[String]) -> Result<(), Str
     if action.is_mark() {
         return validate_targets(change_ids);
     }
+    if action.is_single_target_lifecycle() {
+        validate_targets(change_ids)?;
+        if change_ids.len() != 1 {
+            return Err(format!(
+                "'{}' addresses exactly one proposal; {} were given. It is not a process-wide \
+                 stop, and it accepts no target list",
+                action.as_str(),
+                change_ids.len()
+            ));
+        }
+        return Ok(());
+    }
     if !change_ids.is_empty() {
         return Err(format!(
             "'{}' consumes the owner's authoritative mark set and accepts no target list; \
@@ -196,10 +232,125 @@ pub async fn run(connection: &Connection, action: Action, change_ids: &[String])
     if let Err(message) = validate_request(action, change_ids) {
         return ResultEnvelope::new(operation, Outcome::UsageError).with_message(message);
     }
-    match action.is_mark() {
-        true => marks(connection, action, change_ids).await,
-        false => lifecycle(connection, action).await,
+    if action.is_mark() {
+        return marks(connection, action, change_ids).await;
     }
+    if action.is_single_target_lifecycle() {
+        return single_target_lifecycle(connection, action, &change_ids[0]).await;
+    }
+    lifecycle(connection, action).await
+}
+
+// ============================================================================
+// Target-scoped lifecycle control
+// ============================================================================
+
+/// Submit one target-scoped lifecycle command and report how it settled.
+///
+/// Like [`lifecycle`], nothing is derived here: eligibility, cancellation
+/// policy, process-group termination, reaping proof, and dequeue settlement all
+/// belong to the shared transaction. The one thing this client does read is the
+/// owner's own published `actions.force_stop_change`, and only to refuse before
+/// creating a command record — never to invent an admission the owner did not
+/// publish.
+async fn single_target_lifecycle(
+    connection: &Connection,
+    action: Action,
+    change_id: &str,
+) -> ResultEnvelope {
+    let operation = action.operation();
+    let mut first_instance: Option<String> = None;
+
+    for attempt in 0..MAX_REVISION_ATTEMPTS {
+        let observation = match observe(connection, None).await {
+            Ok(observation) => observation,
+            Err(error) if error.is_transient() && attempt + 1 < MAX_REVISION_ATTEMPTS => continue,
+            Err(error) => return error.into_envelope(operation),
+        };
+        match &first_instance {
+            None => first_instance = Some(observation.instance_id.clone()),
+            Some(expected) if *expected != observation.instance_id => {
+                return restarted_envelope(operation, expected, &observation.instance_id)
+            }
+            Some(_) => {}
+        }
+        let instance = Some(observation.instance_id.clone());
+        if !observation.command_capable() {
+            return not_command_capable(operation, instance);
+        }
+
+        let Some(change) = observation.change(change_id) else {
+            return ResultEnvelope::new(operation, Outcome::ChangeNotFound)
+                .with_instance(instance)
+                .with_change(change_id.to_string())
+                .with_message(format!(
+                    "the owner does not track a proposal named '{change_id}'"
+                ));
+        };
+        let eligibility = change.actions.force_stop_change;
+        if !eligibility.allowed {
+            return ResultEnvelope::new(operation, Outcome::TargetIneligible)
+                .with_instance(instance)
+                .with_change(change_id.to_string())
+                .with_message(format!(
+                    "this owner cannot force-stop '{change_id}' right now ({}); its display \
+                     status is '{}'",
+                    describe_block(eligibility.blocked_reason),
+                    change.display_status
+                ))
+                .with_detail(serde_json::json!({
+                    "action": action.as_str(),
+                    "commands_submitted": Vec::<serde_json::Value>::new(),
+                    "observed_status": change.display_status,
+                    "blocked_reason": eligibility.blocked_reason,
+                }));
+        }
+
+        let mut audit = Vec::new();
+        match submit_and_settle(
+            connection,
+            CommandSpec::ForceStopChange {
+                change_id: change_id.to_string(),
+            },
+            action.as_str(),
+            Some(change_id),
+            observation.state_revision,
+            &observation.instance_id,
+            &mut audit,
+        )
+        .await
+        {
+            Ok(record) => {
+                return ResultEnvelope::new(operation, Outcome::Stopped)
+                    .with_instance(instance)
+                    .with_change(change_id.to_string())
+                    .with_message(format!(
+                        "'{change_id}' was force-stopped and dequeued; completed worktree \
+                         effects were not rolled back"
+                    ))
+                    .with_detail(serde_json::json!({
+                        "action": action.as_str(),
+                        "commands_submitted": audit,
+                        "command_state": record.state,
+                        "result_revision": record.result_revision,
+                        "result": record.result,
+                        "detail": record.detail,
+                    }))
+            }
+            Err(SubmitFailure::Stale { .. }) => continue,
+            Err(failure) => {
+                return failure
+                    .into_envelope(operation, instance)
+                    .with_change(change_id.to_string())
+                    .with_detail(serde_json::json!({
+                        "action": action.as_str(),
+                        "commands_submitted": audit,
+                    }))
+            }
+        }
+    }
+
+    revision_conflict(operation, first_instance)
 }
 
 // ============================================================================

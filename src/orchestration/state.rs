@@ -674,10 +674,16 @@ pub enum ReducerCommand {
     RemoveFromQueue(String),
     /// Request merge resolution for a change in MergeWait or ResolveWait.
     ResolveMerge(String),
-    /// Force-stop a running or queued change and dequeue it back to not-queued.
+    /// Cancel a running or queued change and dequeue it back to not-queued.
     DequeueChange(String),
-    /// Legacy stop command (terminal stopped). Prefer DequeueChange for stop-and-dequeue semantics.
-    #[allow(dead_code)]
+    /// Settle a change into the terminal `stopped` outcome.
+    ///
+    /// The difference from [`Self::DequeueChange`] is the row an observer is
+    /// left with: a dequeued change is idle work the owner may admit again on
+    /// its own, while a stopped change is a settled outcome only a new operator
+    /// action can move. Targeted force-stop is the one path that produces it —
+    /// killing a proposal outright is an operator verdict on that proposal, not
+    /// a return to the queue.
     StopChange(String),
 }
 
@@ -1119,6 +1125,15 @@ impl OrchestratorState {
     /// Read-only access to the runtime state of a change.
     pub fn change_runtime(&self, change_id: &str) -> Option<&ChangeRuntimeState> {
         self.change_runtime.get(change_id)
+    }
+
+    /// Whether the reducer tracks this change at all.
+    ///
+    /// Distinct from `display_status(change_id) == "not queued"`, which is also
+    /// what an untracked ID answers: a command that must refuse an unknown
+    /// target cannot tell the two apart from the status string alone.
+    pub fn is_tracked_change(&self, change_id: &str) -> bool {
+        self.change_runtime.contains_key(change_id)
     }
 
     /// Derive the UI display status string for a change (Phase 1.4).
@@ -2721,9 +2736,17 @@ impl OrchestratorState {
             ExecutionEvent::ChangeDequeued { change_id }
             | ExecutionEvent::ChangeStopped { change_id } => {
                 let rt = self.runtime_entry(change_id);
+                // `Stopped` is in the guard for the same reason the others are:
+                // it is a settled outcome, and the dequeue edge a targeted
+                // force-stop publishes after its own terminal settlement must
+                // report that settlement rather than undo it back to an idle
+                // `not queued` row an observer would keep waiting on.
                 if matches!(
                     rt.terminal,
-                    TerminalState::Merged | TerminalState::Pushed | TerminalState::Rejected(_)
+                    TerminalState::Merged
+                        | TerminalState::Pushed
+                        | TerminalState::Rejected(_)
+                        | TerminalState::Stopped
                 ) {
                     return;
                 }
