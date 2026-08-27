@@ -26,7 +26,10 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::events::{EventDispatcher, ExecutionEvent};
 use crate::orchestration::apply_commit_evidence::{ApplyCommitEvidence, ApplyCommitEvidencePort};
-use crate::orchestration::execution_facts::{ExecutionFactsStore, ExecutionPhase};
+use crate::orchestration::execution_facts::{
+    EpisodeObserver, EpisodeTerminal, EpisodeTransition, EpisodeTransitionKind,
+    ExecutionFactsStore, ExecutionPhase,
+};
 use crate::orchestration::operator_command::{
     ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, ParallelRuntime, QueuePort,
     StopSettlement, TerminationWaiter,
@@ -477,4 +480,262 @@ fn agent_execution_observability_stop_result_unknown_phase_is_explicit() {
     let detail = settlement.describe("c1");
     assert!(detail.contains("could not be determined"), "{detail}");
     assert!(detail.contains("not rolled back"), "{detail}");
+}
+
+// ============================================================================
+// Targeted force-stop through the shared application transaction
+// ============================================================================
+
+/// Managed-ownership double for the coordinator-level force-stop path.
+struct LiveManagedProcess {
+    live: Mutex<bool>,
+    kills: AtomicUsize,
+}
+
+impl LiveManagedProcess {
+    fn owning() -> Arc<Self> {
+        Arc::new(Self {
+            live: Mutex::new(true),
+            kills: AtomicUsize::new(0),
+        })
+    }
+
+    fn kills(&self) -> usize {
+        self.kills.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl crate::orchestration::operator_command::ManagedProcessTermination for LiveManagedProcess {
+    async fn owns_managed_process(&self, _change_id: &str) -> bool {
+        *self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    async fn kill_managed_process(
+        &self,
+        _change_id: &str,
+    ) -> crate::orchestration::operator_command::ImmediateKillEvidence {
+        self.kills.fetch_add(1, Ordering::SeqCst);
+        *self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        crate::orchestration::operator_command::ImmediateKillEvidence::confirmed(1)
+    }
+}
+
+/// The episode transitions a completion subscription would be delivered.
+///
+/// The registry itself is an `EpisodeObserver`, so recording the same
+/// transitions here is what lets a settlement test assert the subscription's
+/// terminal classification without running a callback process.
+#[derive(Debug, Default)]
+struct RecordedEpisodes {
+    seen: Mutex<Vec<EpisodeTransition>>,
+}
+
+impl RecordedEpisodes {
+    /// How the named episode settled, if it settled at all.
+    fn terminal_of(&self, execution_id: &str) -> Option<EpisodeTerminal> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find_map(|transition| match transition.kind {
+                EpisodeTransitionKind::Terminal(terminal)
+                    if transition.execution_id == execution_id =>
+                {
+                    Some(terminal)
+                }
+                _ => None,
+            })
+    }
+}
+
+impl EpisodeObserver for RecordedEpisodes {
+    fn observe_episode(&self, transition: &EpisodeTransition) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(transition.clone());
+    }
+}
+
+/// The same wiring `fixture` builds, plus the managed-ownership port and the
+/// episode observer a completion subscription would bind.
+fn force_stop_fixture(
+    queue: Arc<SignallingQueue>,
+    managed: Arc<LiveManagedProcess>,
+    evidence: Option<Arc<dyn ApplyCommitEvidencePort>>,
+    episodes: Arc<RecordedEpisodes>,
+) -> Fixture {
+    let state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+        vec!["c1".to_string()],
+        10,
+    )));
+    let facts = Arc::new(ExecutionFactsStore::new());
+    facts.bind_episode_observer(episodes);
+    let parallel = Arc::new(ParallelRuntime::new());
+    let operator = OperatorCommandService::new(
+        state.clone(),
+        queue,
+        Arc::new(NoopQueueHooks),
+        Arc::new(ExecutionMarkStore::new()),
+    )
+    .with_parallel(parallel.clone())
+    .with_cancellation_timeout(Duration::from_secs(30))
+    .with_execution_facts(facts.clone())
+    .with_managed_termination(managed);
+    let run_control = Arc::new(RunControlService::new(
+        state.clone(),
+        Arc::new(operator),
+        Arc::new(RecordingScheduler::new()),
+        Arc::new(ResolveReservations::new()),
+        parallel,
+    ));
+    let dispatcher = Arc::new(
+        EventDispatcher::new(state.clone(), crate::events::cli_event_sinks())
+            .with_execution_facts(Some(facts.clone())),
+    );
+    let application = Arc::new(
+        OperatorApplication::new(Arc::new(CoreMode::new()), run_control, dispatcher.clone())
+            .with_apply_commit_evidence(evidence),
+    );
+    Fixture {
+        application,
+        dispatcher,
+        state,
+        facts,
+    }
+}
+
+/// The whole transaction, driven through the one intent every frontend submits.
+///
+/// Ordering is established by the channel, not by a sleep: the target task's
+/// completion handshake fires only after cancellation was observed, so
+/// "settlement happened after termination" is arranged rather than hoped for.
+#[tokio::test]
+async fn force_stop_change_settles_through_the_shared_intent() {
+    let token = CancellationToken::new();
+    let (issued_tx, issued_rx) = tokio::sync::oneshot::channel();
+    let queue = Arc::new(SignallingQueue::live(token.clone(), issued_tx));
+    let managed = LiveManagedProcess::owning();
+    let episodes = Arc::new(RecordedEpisodes::default());
+    let fixture = force_stop_fixture(
+        queue,
+        managed.clone(),
+        Some(Arc::new(ProvingPort::default())),
+        episodes.clone(),
+    );
+
+    fixture.dispatcher.dispatch(apply_started()).await;
+    let expected_episode = fixture.facts.execution_id("c1");
+    assert!(
+        expected_episode.is_some(),
+        "an admitted phase opens an execution episode"
+    );
+
+    let worker = tokio::spawn(async move {
+        issued_rx.await.expect("cancellation issued");
+        token.cancel();
+    });
+
+    let result = fixture
+        .application
+        .apply(OperatorIntent::ForceStopChange {
+            change_id: "c1".to_string(),
+        })
+        .await;
+    worker.await.expect("worker task");
+
+    let Ok(ApplicationOutcome::Operator(OperatorOutcome::ForceStopped {
+        change_id,
+        execution_id,
+        terminated,
+        settlement,
+    })) = result.outcome
+    else {
+        panic!("the shared intent must settle as ForceStopped");
+    };
+    assert_eq!(change_id, "c1");
+    assert_eq!(execution_id, expected_episode);
+    assert!(terminated);
+    assert_eq!(settlement.cancelled_phase, ExecutionPhase::Apply);
+    assert_eq!(managed.kills(), 1, "exactly one immediate kill was issued");
+
+    // The settlement really landed, and carries the revision the command's own
+    // outcome dispatch produced.
+    assert_eq!(
+        fixture.state.read().await.display_status("c1"),
+        "stopped",
+        "a killed proposal settles as the terminal stopped outcome, not as an \
+         idle row the owner could admit again"
+    );
+    assert!(
+        result.revision.is_some(),
+        "a settled force-stop publishes ChangeDequeued and reports its revision"
+    );
+
+    // The two observers of that settlement, read through the classifiers
+    // production itself uses.
+    let settled_status = fixture.state.read().await.display_status("c1").to_string();
+    assert_eq!(
+        crate::client::completion::classify(Some(&settled_status), None),
+        crate::client::completion::Disposition::RequiresAction,
+        "an observing `cflx client wait` is released rather than left holding \
+         out for an owner that will never move this row again"
+    );
+    let episode = expected_episode.expect("the episode opened above");
+    assert_eq!(
+        episodes.terminal_of(&episode),
+        Some(EpisodeTerminal::Stopped),
+        "and the cancelled execution ID settles as the subscription's terminal \
+         stopped event"
+    );
+}
+
+/// An ineligible target is refused by the transaction with nothing signalled.
+#[tokio::test]
+async fn force_stop_change_refusal_travels_as_a_typed_operator_error() {
+    let queue = Arc::new(SignallingQueue::already_terminated());
+    let managed = Arc::new(LiveManagedProcess {
+        live: Mutex::new(false),
+        kills: AtomicUsize::new(0),
+    });
+    let fixture = force_stop_fixture(
+        queue,
+        managed.clone(),
+        Some(Arc::new(ProvingPort::default())),
+        Arc::new(RecordedEpisodes::default()),
+    );
+
+    fixture.dispatcher.dispatch(apply_started()).await;
+
+    let result = fixture
+        .application
+        .apply(OperatorIntent::ForceStopChange {
+            change_id: "c1".to_string(),
+        })
+        .await;
+
+    let Err(error) = result.outcome else {
+        panic!("an active row owning no managed process must be refused");
+    };
+    assert!(
+        error.to_string().contains("owns no live managed process"),
+        "the refusal must name the reason: {error}"
+    );
+    assert_eq!(managed.kills(), 0);
+    assert_eq!(
+        result.revision, None,
+        "a refusal before any effect dispatches no outcome"
+    );
+    assert_eq!(
+        fixture.state.read().await.display_status("c1"),
+        "applying",
+        "and leaves the target running"
+    );
 }

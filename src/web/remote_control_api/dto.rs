@@ -284,6 +284,15 @@ pub enum CommandSpec {
         /// Target change.
         change_id: String,
     },
+    /// Immediately kill one change's managed process group and dequeue it.
+    ///
+    /// Exactly one target, and no target *list*: process-wide `force_stop` and
+    /// this are deliberately different commands, so a caller can never widen a
+    /// targeted kill into a process-wide one by adding IDs.
+    ForceStopChange {
+        /// Target change.
+        change_id: String,
+    },
     /// Request merge resolution for a change waiting on a merge.
     ResolveMerge {
         /// Target change.
@@ -369,6 +378,7 @@ impl CommandSpec {
             Self::RetryChange { .. } => "retry_change",
             Self::RetryErrors { .. } => "retry_errors",
             Self::StopAndDequeue { .. } => "stop_and_dequeue",
+            Self::ForceStopChange { .. } => "force_stop_change",
             Self::ResolveMerge { .. } => "resolve_merge",
             Self::SetAllExecutionMarks { .. } => "set_all_execution_marks",
             Self::CreateWorktree { .. } => "create_worktree",
@@ -385,6 +395,7 @@ impl CommandSpec {
             | Self::SetQueueIntent { change_id, .. }
             | Self::RetryChange { change_id }
             | Self::StopAndDequeue { change_id }
+            | Self::ForceStopChange { change_id }
             | Self::ResolveMerge { change_id } => Some(change_id),
             Self::CreateWorktree { target, .. } => Some(&target.change_id),
             Self::Start | Self::Stop | Self::CancelStop | Self::ForceStop => None,
@@ -399,7 +410,7 @@ impl CommandSpec {
 }
 
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 14] = [
+pub const SUPPORTED_COMMANDS: [&str; 15] = [
     "start",
     "stop",
     "cancel_stop",
@@ -409,6 +420,7 @@ pub const SUPPORTED_COMMANDS: [&str; 14] = [
     "retry_change",
     "retry_errors",
     "stop_and_dequeue",
+    "force_stop_change",
     "resolve_merge",
     "set_all_execution_marks",
     "create_worktree",
@@ -793,6 +805,15 @@ pub enum ActionBlockedReason {
     NotMergeWaiting,
     /// Worktree execution refuses a change that is not committed cleanly yet.
     ParallelIneligible,
+    /// The change carries no admission, so there is no episode to end.
+    NotAdmitted,
+    /// This owner holds no live managed process group for the change.
+    ///
+    /// The refusal a targeted force-stop reports for a row that presents as
+    /// active without owning a killable identity — inline worktree preparation
+    /// is the ordinary way to reach it — and for a base-lane or resolve wait,
+    /// which owns no process by construction.
+    NoManagedProcess,
     /// Retired: the server no longer refuses an action for this reason.
     ///
     /// The Apply-iteration ceiling is diagnostic evidence about the invocation
@@ -805,6 +826,24 @@ pub enum ActionBlockedReason {
 }
 
 impl ActionBlockedReason {
+    /// Project a shared targeted-force-stop exclusion onto the wire vocabulary.
+    ///
+    /// One vocabulary, not two: the reason the shared transaction refuses a
+    /// targeted force-stop is the reason the change's `actions` block publishes.
+    pub fn from_force_stop_exclusion(
+        exclusion: crate::orchestration::operator_command::ForceStopExclusion,
+    ) -> Self {
+        use crate::orchestration::operator_command::ForceStopExclusion as E;
+        match exclusion {
+            E::TerminalTarget => Self::FinalStatus,
+            // An untracked target has no projected row at all, so this arm is
+            // only reachable from a command refusal; "no admission" is the
+            // truthful wire spelling of both.
+            E::UnknownTarget | E::NotAdmitted => Self::NotAdmitted,
+            E::MergeWait | E::ResolveWait | E::NoLiveProcess => Self::NoManagedProcess,
+        }
+    }
+
     /// Project a shared bulk-mark exclusion onto the wire vocabulary.
     ///
     /// One vocabulary, not two: the reason a bulk mutation skipped a row is the
@@ -871,6 +910,14 @@ pub struct ChangeActions {
     pub retry_change: ActionEligibility,
     /// `stop_and_dequeue`.
     pub stop_and_dequeue: ActionEligibility,
+    /// `force_stop_change`.
+    ///
+    /// Published separately from `stop_and_dequeue` because the two answer
+    /// different questions: a graceful stop is offered for every non-final row,
+    /// while an immediate kill is offered only where this owner really holds a
+    /// managed process group — or where the row is admitted with nothing
+    /// running and can be dequeued outright.
+    pub force_stop_change: ActionEligibility,
     /// `resolve_merge`.
     pub resolve_merge: ActionEligibility,
 }
@@ -1817,6 +1864,35 @@ pub enum CommandResult {
         apply_commit: ApplyCommitEvidence,
         /// Always false. Dequeue cancels and removes; it never undoes a
         /// completed worktree effect, and a client must not infer that it does.
+        effects_rolled_back: bool,
+    },
+    /// Settlement evidence for a successful `force_stop_change`.
+    ///
+    /// A separate variant rather than a flag on the stop result: a client that
+    /// branches on `kind` must be able to tell "this was killed immediately"
+    /// from "this was asked to stop and then confirmed", because the two answer
+    /// different questions about how the worktree was left.
+    ForceStopChange {
+        /// The one change this command addressed.
+        change_id: String,
+        /// Execution episode this cancelled; `null` when the target owned none.
+        ///
+        /// Read before cancellation, so it names the episode that was actually
+        /// interrupted rather than whatever the runtime holds afterwards.
+        execution_id: Option<String>,
+        /// The typed phase active at settlement, immediately before dequeue.
+        cancelled_phase: ExecutionPhase,
+        /// The last phase that published a typed completion fact.
+        last_completed_phase: Option<ExecutionPhase>,
+        /// True when a live managed process group was SIGKILLed and proven reaped.
+        ///
+        /// `false` is the dequeue-only settlement: the target was admitted with
+        /// nothing running, so no process was signalled at all.
+        terminated: bool,
+        /// Final Apply commit evidence for the managed worktree.
+        apply_commit: ApplyCommitEvidence,
+        /// Always false. An immediate kill stops work; it never undoes a
+        /// completed worktree effect.
         effects_rolled_back: bool,
     },
 }

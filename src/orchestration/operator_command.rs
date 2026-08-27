@@ -787,6 +787,17 @@ pub enum OperatorCommand {
         /// Target change.
         change_id: String,
     },
+    /// Immediately kill one change's managed process group and dequeue it.
+    ///
+    /// Exactly one target, always. The process-wide [`OperatorMode`] controls
+    /// and the process-wide ForceStop intent are deliberately unreachable from
+    /// here: this command is the only target-scoped control that bypasses the
+    /// graceful SIGTERM escalation window, and it addresses one change or
+    /// nothing.
+    ForceStopChange {
+        /// Target change.
+        change_id: String,
+    },
     /// Retry a single change using its reconciled evidence.
     RetryChange {
         /// Target change.
@@ -794,6 +805,145 @@ pub enum OperatorCommand {
     },
     /// Apply one derived execution-mark state to every eligible change.
     SetAllExecutionMarks,
+}
+
+// ============================================================================
+// Targeted force-stop admission
+// ============================================================================
+
+/// Why a targeted force-stop is refused for one change.
+///
+/// Every variant is a stable token a frontend branches on rather than prose, so
+/// the API's per-change eligibility, the CLI's refusal, and the MCP tool's
+/// refusal all name the same fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceStopExclusion {
+    /// The owner does not track a change with this ID.
+    UnknownTarget,
+    /// Archived, merged, pushed, or rejected: nothing is left to stop.
+    TerminalTarget,
+    /// The change carries no admission at all, so there is no episode to end.
+    NotAdmitted,
+    /// The change is parked on a base-lane merge wait, which owns no process.
+    MergeWait,
+    /// The change is parked waiting for manual resolution, with no live resolver.
+    ResolveWait,
+    /// The change presents as active but owns no live managed process group.
+    ///
+    /// Inline workspace preparation is the ordinary way to reach this: the
+    /// worktree is being created or `.wt/setup` is running, and neither owns a
+    /// killable managed identity. A graceful `stop_and_dequeue` still records
+    /// the request; an immediate kill has nothing to send a signal to.
+    NoLiveProcess,
+}
+
+impl ForceStopExclusion {
+    /// Every exclusion, in the order used when documenting the vocabulary.
+    pub const ALL: [ForceStopExclusion; 6] = [
+        ForceStopExclusion::UnknownTarget,
+        ForceStopExclusion::TerminalTarget,
+        ForceStopExclusion::NotAdmitted,
+        ForceStopExclusion::MergeWait,
+        ForceStopExclusion::ResolveWait,
+        ForceStopExclusion::NoLiveProcess,
+    ];
+
+    /// Stable machine-readable token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownTarget => "unknown_target",
+            Self::TerminalTarget => "terminal_target",
+            Self::NotAdmitted => "not_admitted",
+            Self::MergeWait => "merge_wait",
+            Self::ResolveWait => "resolve_wait",
+            Self::NoLiveProcess => "no_live_process",
+        }
+    }
+
+    /// Short operator-facing reason describing what can be done about it.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownTarget => "not tracked by this owner",
+            Self::TerminalTarget => "final or rejected and already stopped",
+            Self::NotAdmitted => "not admitted (nothing is running for it)",
+            Self::MergeWait => "waiting on a base merge (no process to kill)",
+            Self::ResolveWait => "waiting for manual resolution (no live resolver)",
+            Self::NoLiveProcess => "owns no live managed process (use stop instead)",
+        }
+    }
+}
+
+/// What a targeted force-stop request may do to one change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceStopAdmission {
+    /// Kill the change's managed process group, then dequeue and stop it.
+    KillAndDequeue,
+    /// Admitted with nothing running: dequeue and stop it, signalling nothing.
+    DequeueOnly,
+    /// Refused with a stable reason, before any signal.
+    Refused(ForceStopExclusion),
+}
+
+impl ForceStopAdmission {
+    /// True when the request is accepted in either of its two shapes.
+    pub fn is_allowed(self) -> bool {
+        !matches!(self, Self::Refused(_))
+    }
+
+    /// The exclusion this admission refuses with, if it refuses.
+    pub fn exclusion(self) -> Option<ForceStopExclusion> {
+        match self {
+            Self::Refused(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Decide what a targeted force-stop may do to one change.
+///
+/// The whole eligibility rule, as a pure function of three caller-supplied
+/// facts, so the API's published `actions.force_stop_change`, the shared
+/// transaction's admission, and every test read the same table.
+///
+/// `owns_managed_process` is *evidence from the managed ownership graph*, never
+/// a display-status inference: a row can present as `applying` while its
+/// worktree is still being prepared inline, and that row owns nothing a signal
+/// could reach.
+pub fn classify_force_stop_change(
+    display_status: &str,
+    tracked: bool,
+    owns_managed_process: bool,
+) -> ForceStopAdmission {
+    use ForceStopAdmission::{DequeueOnly, KillAndDequeue, Refused};
+
+    if !tracked {
+        return Refused(ForceStopExclusion::UnknownTarget);
+    }
+    if is_final_status(display_status) {
+        return Refused(ForceStopExclusion::TerminalTarget);
+    }
+    match display_status {
+        "merge wait" => Refused(ForceStopExclusion::MergeWait),
+        "resolve pending" => Refused(ForceStopExclusion::ResolveWait),
+        status if is_active_status(status) => {
+            if owns_managed_process {
+                KillAndDequeue
+            } else {
+                Refused(ForceStopExclusion::NoLiveProcess)
+            }
+        }
+        // Admitted but not executing. A live identity is still honoured if one
+        // exists — a phase can start between the projection and this read — but
+        // its absence is the ordinary case and settles as dequeue-only.
+        "queued" | "blocked" => {
+            if owns_managed_process {
+                KillAndDequeue
+            } else {
+                DequeueOnly
+            }
+        }
+        _ => Refused(ForceStopExclusion::NotAdmitted),
+    }
 }
 
 /// Which direction a dynamic queue mutation went.
@@ -956,6 +1106,23 @@ pub enum OperatorOutcome {
         /// Explanatory evidence fixed at the settlement boundary.
         settlement: StopSettlement,
     },
+    /// One change was killed immediately, confirmed reaped, and dequeued.
+    ForceStopped {
+        /// Target change. Never more than one.
+        change_id: String,
+        /// The execution episode this cancelled, read before cancellation.
+        ///
+        /// `None` when the target owned no episode — the dequeue-only case — or
+        /// when this process publishes no execution facts at all.
+        execution_id: Option<String>,
+        /// True when a live managed process group was signalled and proven reaped.
+        ///
+        /// `false` is the dequeue-only settlement: admitted work that owned no
+        /// process, so nothing was signalled and nothing needed reaping.
+        terminated: bool,
+        /// Explanatory evidence fixed at the settlement boundary.
+        settlement: StopSettlement,
+    },
     /// A retry was accepted and routed.
     Retry(RetryPlan),
     /// A bulk execution-mark mutation completed.
@@ -1028,6 +1195,27 @@ pub enum OperatorCommandError {
         /// Display status that carries no retryable evidence.
         display_status: String,
     },
+    /// A targeted force-stop was refused before any signal was sent.
+    ForceStopIneligible {
+        /// Target change.
+        change_id: String,
+        /// Display status the refusal was classified from.
+        display_status: String,
+        /// Stable reason the target cannot be force-stopped.
+        reason: ForceStopExclusion,
+    },
+    /// The target's managed process group could not be proven empty after SIGKILL.
+    ///
+    /// Distinct from [`Self::TerminationTimeout`], which is a *task* that never
+    /// reported completion: this says the operating system still reports live
+    /// members in the group this command killed, so the change may still be
+    /// mutating its worktree and no dequeue may be committed on top of it.
+    ForceStopUnconfirmed {
+        /// Target change.
+        change_id: String,
+        /// Bounded diagnostic naming the identities that stayed alive.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for OperatorCommandError {
@@ -1055,6 +1243,20 @@ impl std::fmt::Display for OperatorCommandError {
             } => write!(
                 f,
                 "retry is not supported for '{change_id}' with status '{display_status}'"
+            ),
+            Self::ForceStopIneligible {
+                change_id,
+                display_status,
+                reason,
+            } => write!(
+                f,
+                "'{change_id}' cannot be force-stopped with status '{display_status}': {}",
+                reason.reason()
+            ),
+            Self::ForceStopUnconfirmed { change_id, detail } => write!(
+                f,
+                "the managed process group of '{change_id}' was not proven empty after SIGKILL, \
+                 so no dequeue was committed: {detail}"
             ),
         }
     }
@@ -1230,6 +1432,124 @@ impl PendingTermination {
     }
 }
 
+/// A targeted force-stop that has killed its target and not yet settled.
+///
+/// Carries the facts fixed before cancellation — the episode identity and
+/// whether a process was really signalled — so the settled result cannot
+/// re-derive them from a runtime the kill has already emptied.
+#[derive(Clone, Debug)]
+pub struct PendingForceStop {
+    pending: PendingTermination,
+    execution_id: Option<String>,
+    terminated: bool,
+}
+
+impl PendingForceStop {
+    /// The change whose force-stop is pending.
+    pub fn change_id(&self) -> &str {
+        self.pending.change_id()
+    }
+
+    /// The execution episode this force-stop cancelled, if there was one.
+    pub fn execution_id(&self) -> Option<&str> {
+        self.execution_id.as_deref()
+    }
+
+    /// Whether a live managed process group was signalled and proven reaped.
+    pub fn terminated(&self) -> bool {
+        self.terminated
+    }
+
+    /// Await the target task's own completion handshake within the bound.
+    pub async fn confirm_termination(&self) -> OperatorResult<()> {
+        self.pending.confirm_termination().await
+    }
+}
+
+/// Immediate, target-scoped termination of one change's managed process group.
+///
+/// The port exists so the shared transaction can express "kill exactly this
+/// change now" without knowing what owns the processes. Its implementation walks
+/// the run's managed ownership graph; nothing here accepts a PID, a path, or a
+/// process-wide selector, so a targeted force-stop structurally cannot reach an
+/// unrelated change's processes.
+///
+/// A process with no port bound owns no managed processes, which is the honest
+/// answer for a headless or test assembly: eligibility then reports
+/// [`ForceStopExclusion::NoLiveProcess`] for an active row instead of claiming a
+/// kill it cannot perform.
+#[async_trait]
+pub trait ManagedProcessTermination: Send + Sync {
+    /// Whether this change currently owns a live managed process group.
+    async fn owns_managed_process(&self, change_id: &str) -> bool;
+
+    /// Immediately SIGKILL this change's managed process group, bypassing any
+    /// graceful escalation window, and report whether it was proven reaped.
+    async fn kill_managed_process(&self, change_id: &str) -> ImmediateKillEvidence;
+}
+
+/// Typed evidence from one immediate, target-scoped kill.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImmediateKillEvidence {
+    /// Owned process identities signalled for this change.
+    pub identities: usize,
+    /// True when every signalled identity was proven empty afterwards.
+    ///
+    /// Vacuously true when nothing was signalled: there was no group to empty.
+    pub confirmed: bool,
+    /// Bounded diagnostic; empty when confirmed.
+    pub detail: String,
+}
+
+impl ImmediateKillEvidence {
+    /// Nothing was running, so nothing was signalled.
+    pub fn nothing_to_kill() -> Self {
+        Self {
+            identities: 0,
+            confirmed: true,
+            detail: String::new(),
+        }
+    }
+
+    /// Every signalled identity was proven empty.
+    pub fn confirmed(identities: usize) -> Self {
+        Self {
+            identities,
+            confirmed: true,
+            detail: String::new(),
+        }
+    }
+
+    /// At least one identity could not be proven empty.
+    pub fn unconfirmed(identities: usize, detail: impl Into<String>) -> Self {
+        Self {
+            identities,
+            confirmed: false,
+            detail: detail.into(),
+        }
+    }
+
+    /// True when a live managed process group was actually signalled.
+    pub fn signalled(&self) -> bool {
+        self.identities > 0
+    }
+}
+
+/// The port a process without a managed run binds: it owns nothing and kills
+/// nothing.
+pub struct NoManagedProcesses;
+
+#[async_trait]
+impl ManagedProcessTermination for NoManagedProcesses {
+    async fn owns_managed_process(&self, _change_id: &str) -> bool {
+        false
+    }
+
+    async fn kill_managed_process(&self, _change_id: &str) -> ImmediateKillEvidence {
+        ImmediateKillEvidence::nothing_to_kill()
+    }
+}
+
 /// Runtime queue operations the service coordinates.
 #[async_trait]
 pub trait QueuePort: Send + Sync {
@@ -1337,6 +1657,11 @@ pub struct OperatorCommandService {
     /// admission, routing, or reducer decision consults it. `None` for a process
     /// with no observability consumer, which then reports unknown.
     execution_facts: Option<Arc<ExecutionFactsStore>>,
+    /// The managed ownership graph a targeted force-stop signals through.
+    ///
+    /// Defaults to [`NoManagedProcesses`], which is the honest answer for an
+    /// assembly with no live run behind it.
+    managed_termination: Arc<dyn ManagedProcessTermination>,
 }
 
 impl OperatorCommandService {
@@ -1359,12 +1684,25 @@ impl OperatorCommandService {
             parallel: Arc::new(ParallelRuntime::new()),
             cancellation_timeout: DEFAULT_CANCELLATION_TIMEOUT,
             execution_facts: None,
+            managed_termination: Arc::new(NoManagedProcesses),
         }
     }
 
     /// Bind the shared parallel runtime store.
     pub fn with_parallel(mut self, parallel: Arc<ParallelRuntime>) -> Self {
         self.parallel = parallel;
+        self
+    }
+
+    /// Bind the managed ownership graph a targeted force-stop signals through.
+    ///
+    /// One port for the whole process, so every frontend's `force_stop_change`
+    /// reaches the same process groups the run actually owns.
+    pub fn with_managed_termination(
+        mut self,
+        termination: Arc<dyn ManagedProcessTermination>,
+    ) -> Self {
+        self.managed_termination = termination;
         self
     }
 
@@ -1431,6 +1769,9 @@ impl OperatorCommandService {
                 .map(OperatorOutcome::Queue),
             OperatorCommand::StopAndDequeue { change_id } => {
                 self.stop_and_dequeue(&change_id).await
+            }
+            OperatorCommand::ForceStopChange { change_id } => {
+                self.force_stop_change(&change_id).await
             }
             OperatorCommand::RetryChange { change_id } => self
                 .retry_change(&change_id)
@@ -1987,6 +2328,188 @@ impl OperatorCommandService {
         })
     }
 
+    // ------------------------------------------------------------------
+    // Targeted force-stop
+    // ------------------------------------------------------------------
+
+    /// Kill one change immediately and dequeue it once reaping is confirmed.
+    ///
+    /// The convenience shape of the two-phase path, for callers with no gate to
+    /// release between the phases and nothing consuming explanatory Git
+    /// evidence.
+    pub async fn force_stop_change(&self, change_id: &str) -> OperatorResult<OperatorOutcome> {
+        let pending = self.begin_force_stop_change(change_id).await?;
+        pending.confirm_termination().await?;
+        self.commit_force_stop_change(&pending, ApplyCommitEvidence::unknown())
+            .await
+    }
+
+    /// The eligibility one targeted force-stop request would be classified with.
+    ///
+    /// Read-only, and the same classification admission runs, so a caller that
+    /// wants to publish eligibility never re-derives the table.
+    pub async fn force_stop_admission(&self, change_id: &str) -> ForceStopAdmission {
+        let (display_status, tracked) = self.force_stop_facts(change_id).await;
+        classify_force_stop_change(
+            &display_status,
+            tracked,
+            self.managed_termination
+                .owns_managed_process(change_id)
+                .await,
+        )
+    }
+
+    /// One coherent read of the two reducer facts force-stop admission needs.
+    async fn force_stop_facts(&self, change_id: &str) -> (String, bool) {
+        let guard = self.state.read().await;
+        (
+            guard.display_status(change_id).to_string(),
+            guard.is_tracked_change(change_id),
+        )
+    }
+
+    /// Phase one of a targeted force-stop: validate, then kill immediately.
+    ///
+    /// Ordering is validate, kill, prove reaped, confirm the task exited,
+    /// commit. Validation runs against the fresh authoritative state and refuses
+    /// *before* any signal, so an ineligible or stale request cannot terminate
+    /// anything. A group that will not empty refuses here too, with the kill
+    /// already issued and no dequeue committed: an unproven group may still be
+    /// writing to the worktree, and settling on top of it is exactly what this
+    /// ordering exists to prevent.
+    ///
+    /// The returned handle is deliberately not awaited here, for the same reason
+    /// [`Self::begin_stop_and_dequeue`] is not: a caller holding a serialization
+    /// gate must release it before confirmation.
+    pub async fn begin_force_stop_change(
+        &self,
+        change_id: &str,
+    ) -> OperatorResult<PendingForceStop> {
+        let (display_status, tracked) = self.force_stop_facts(change_id).await;
+        let owns_managed_process = self
+            .managed_termination
+            .owns_managed_process(change_id)
+            .await;
+
+        let admission = classify_force_stop_change(&display_status, tracked, owns_managed_process);
+        if let Some(reason) = admission.exclusion() {
+            return Err(OperatorCommandError::ForceStopIneligible {
+                change_id: change_id.to_string(),
+                display_status,
+                reason,
+            });
+        }
+
+        // Read before anything is signalled: cancellation empties the runtime
+        // this identity comes from, so reading it at settlement would report
+        // `None` for an episode that really was cancelled.
+        let execution_id = self
+            .execution_facts
+            .as_ref()
+            .and_then(|facts| facts.execution_id(change_id));
+
+        let kill = match admission {
+            ForceStopAdmission::KillAndDequeue => {
+                self.managed_termination
+                    .kill_managed_process(change_id)
+                    .await
+            }
+            // Admitted with nothing running. Nothing is signalled at all, which
+            // is what makes "no process belonging to another change is
+            // signalled" structural rather than a rule to re-check.
+            _ => ImmediateKillEvidence::nothing_to_kill(),
+        };
+        if !kill.confirmed {
+            return Err(OperatorCommandError::ForceStopUnconfirmed {
+                change_id: change_id.to_string(),
+                detail: kill.detail,
+            });
+        }
+
+        // The group is empty; the workspace task still has to unwind. Cancelling
+        // its token is what makes it release the change and fire the executor's
+        // own completion handshake. A target with no registered handle has no
+        // task to unwind, which is the dequeue-only case and the already-killed
+        // race alike.
+        let waiter = match self.queue.request_cancellation(change_id).await {
+            Err(message) => {
+                return Err(OperatorCommandError::CancellationFailed {
+                    change_id: change_id.to_string(),
+                    message,
+                })
+            }
+            Ok(Some(waiter)) => waiter,
+            Ok(None) => TerminationWaiter::already_terminated(),
+        };
+
+        Ok(PendingForceStop {
+            pending: PendingTermination {
+                change_id: change_id.to_string(),
+                waiter,
+                timeout: self.cancellation_timeout,
+            },
+            execution_id,
+            terminated: kill.signalled(),
+        })
+    }
+
+    /// Phase two of a targeted force-stop: commit after confirmed reaping.
+    ///
+    /// One indivisible mutation, under the same guard event reconciliation
+    /// takes: the settlement and the mark revocation cannot be observed apart,
+    /// so a mark settlement running between them cannot re-admit the change.
+    ///
+    /// The reducer command is `StopChange`, not the `DequeueChange` a graceful
+    /// stop applies, and the difference is the row every observer is left with.
+    /// A dequeued change reads `not queued` — an idle row this owner may still
+    /// admit by itself — so `cflx client wait` keeps observing a proposal whose
+    /// process the operator already killed, and with the default unbounded
+    /// timeout it would never return. `StopChange` settles the terminal
+    /// `stopped` outcome the change's spec declares: it clears queue intent the
+    /// same way, publishes the same `Stopped` execution state to subscriptions,
+    /// and is the status `wait` releases on with `change_requires_action`.
+    ///
+    /// The mark is cleared even when the reducer produced no state transition.
+    /// That is the deliberate difference from [`Self::commit_stop_and_dequeue`]:
+    /// the target's process is already dead, so leaving next-run intent behind
+    /// would let settlement dispatch a change the operator just killed.
+    pub async fn commit_force_stop_change(
+        &self,
+        pending: &PendingForceStop,
+        apply_commit: ApplyCommitEvidence,
+    ) -> OperatorResult<OperatorOutcome> {
+        let change_id = pending.change_id().to_string();
+        let _mutation = self.parallel.lock_mutations().await;
+        // Read under the same write guard that applies the settlement,
+        // immediately before it: `StopChange` clears the activity the phase
+        // describes.
+        let cancelled_phase = {
+            let mut guard = self.state.write().await;
+            let phase = guard
+                .change_runtime(&change_id)
+                .map(|runtime| project_phase(runtime, self.push_open(&change_id)))
+                .unwrap_or(ExecutionPhase::Unknown);
+            guard.apply_command(ReducerCommand::StopChange(change_id.clone()));
+            phase
+        };
+        self.marks.set(&change_id, false);
+
+        Ok(OperatorOutcome::ForceStopped {
+            change_id: change_id.clone(),
+            execution_id: pending.execution_id.clone(),
+            terminated: pending.terminated,
+            settlement: StopSettlement {
+                cancelled_phase,
+                last_completed_phase: self
+                    .execution_facts
+                    .as_ref()
+                    .and_then(|facts| facts.change(&change_id).last_completed_phase),
+                apply_commit_present: apply_commit.present,
+                apply_commit_oid: apply_commit.oid,
+            },
+        })
+    }
+
     /// Whether a typed push episode is open for a change.
     ///
     /// Publication reuses the reducer's `Resolving` activity, so without this
@@ -2182,6 +2705,62 @@ impl OperatorCommandService {
             // releases the repair budget and lets a valid acceptance hold resume
             // acceptance instead of rerunning apply.
             explicit_retry: true,
+        }
+    }
+}
+
+// ============================================================================
+// RunCommandScope adapter
+// ============================================================================
+
+/// The managed ownership graph of whichever run is live right now.
+///
+/// A [`crate::ai_command_runner::RunCommandScope`] belongs to one run, while the
+/// operator service is built once for the process. This adapter closes that gap
+/// by re-reading the *current* scope on every call, so a force-stop always
+/// signals the run that is actually executing — and reports "owns nothing" when
+/// no run is live, rather than holding a stale scope whose PGIDs were reaped
+/// runs ago.
+pub struct LiveRunManagedProcesses<F>
+where
+    F: Fn() -> Option<crate::ai_command_runner::RunCommandScope> + Send + Sync,
+{
+    current_scope: F,
+}
+
+impl<F> LiveRunManagedProcesses<F>
+where
+    F: Fn() -> Option<crate::ai_command_runner::RunCommandScope> + Send + Sync,
+{
+    /// Bind a reader for the live run's command scope.
+    pub fn new(current_scope: F) -> Self {
+        Self { current_scope }
+    }
+}
+
+#[async_trait]
+impl<F> ManagedProcessTermination for LiveRunManagedProcesses<F>
+where
+    F: Fn() -> Option<crate::ai_command_runner::RunCommandScope> + Send + Sync,
+{
+    async fn owns_managed_process(&self, change_id: &str) -> bool {
+        (self.current_scope)().is_some_and(|scope| scope.change_owns_managed_process(change_id))
+    }
+
+    async fn kill_managed_process(&self, change_id: &str) -> ImmediateKillEvidence {
+        let Some(scope) = (self.current_scope)() else {
+            return ImmediateKillEvidence::nothing_to_kill();
+        };
+        let report = scope
+            .force_stop_change(
+                change_id,
+                crate::ai_command_runner::FORCE_STOP_CHANGE_KILL_BUDGET,
+            )
+            .await;
+        if report.is_confirmed() {
+            ImmediateKillEvidence::confirmed(report.identities)
+        } else {
+            ImmediateKillEvidence::unconfirmed(report.identities, report.diagnostics())
         }
     }
 }

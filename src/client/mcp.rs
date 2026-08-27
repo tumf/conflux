@@ -16,7 +16,7 @@
 //! way an operator does, and ask to be told when a proposal finishes. So the
 //! tools are `cflx_status`, `cflx_control`, and `cflx_subscribe`, and the
 //! actions inside `cflx_control` are exactly the operator's: mark, unmark,
-//! start, stop, force_stop.
+//! start, stop, force_stop, force_stop_change.
 //!
 //! # Why the tool set is closed
 //!
@@ -101,11 +101,13 @@ struct StatusArgs {
 
 /// `cflx_control` arguments.
 ///
-/// One tool with an action rather than five tools, because the five are one
+/// One tool with an action rather than six tools, because the six are one
 /// decision an operator makes: which of the controls the TUI offers to use. The
-/// target list is optional at the parsing layer and *required* by the two mark
-/// actions, so a lifecycle action that carried one is refused as a usage error
-/// rather than silently ignoring it.
+/// target list is optional at the parsing layer and required in a different
+/// shape by each family — 1..64 for the two mark actions, exactly one for
+/// `force_stop_change`, none for the three process-wide lifecycle actions — so
+/// an action carrying the wrong one is refused as a usage error rather than
+/// silently ignoring it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ControlArgs {
@@ -255,7 +257,7 @@ impl ToolHost for ClientToolHost {
                     crate::client::control::Action::parse(&args.action).ok_or_else(|| {
                         ToolError::new(format!(
                             "'{}' is not a control action; use one of mark, unmark, start, stop, \
-                             or force_stop",
+                             force_stop, or force_stop_change",
                             args.action
                         ))
                     })?;
@@ -421,13 +423,13 @@ pub fn tool_descriptors() -> serde_json::Value {
             {
                 "name": "cflx_control",
                 "title": "Control the owner exactly as an operator does",
-                "description": "Do one of the five things a Conflux operator does at the TUI. 'mark' and 'unmark' set or clear the named proposals' execution marks: target-scoped desired-state writes that preserve every unrelated mark, submit no queue intent, start nothing, and return without waiting for admission — the owner's own settlement decides whether stable marked work later runs. 'start', 'stop', and 'force_stop' submit the shared lifecycle intents F5/'!' and the stop controls submit; 'start' consumes the marks the owner already holds and takes no target list. Branch on the envelope's `outcome`: marked, unmarked, unchanged, and accepted are the successes.",
+                "description": "Do one of the six things a Conflux operator does at the TUI. 'mark' and 'unmark' set or clear the named proposals' execution marks: target-scoped desired-state writes that preserve every unrelated mark, submit no queue intent, start nothing, and return without waiting for admission — the owner's own settlement decides whether stable marked work later runs. 'start', 'stop', and 'force_stop' submit the shared lifecycle intents F5/'!' and the stop controls submit; 'start' consumes the marks the owner already holds and takes no target list. 'force_stop_change' names exactly one proposal in change_ids and kills that one: the owner SIGKILLs the managed process group it owns without the graceful SIGTERM window 'stop' gives it, waits for confirmed reaping, then dequeues it and clears its execution mark, leaving every unrelated change and the process-wide run mode untouched. It is never a way to stop everything — that is 'force_stop'. Branch on the envelope's `outcome`: marked, unmarked, unchanged, stopped, and accepted are the successes.",
                 "inputSchema": {
                     "type": "object",
                     "properties": with_connection(serde_json::json!({
                         "action": {
                             "type": "string",
-                            "enum": ["mark", "unmark", "start", "stop", "force_stop"],
+                            "enum": ["mark", "unmark", "start", "stop", "force_stop", "force_stop_change"],
                             "description": "Which operator control to use."
                         },
                         "change_ids": {
@@ -435,7 +437,7 @@ pub fn tool_descriptors() -> serde_json::Value {
                             "items": {"type": "string"},
                             "minItems": 1,
                             "maxItems": 64,
-                            "description": "Proposals to mark or unmark: 1 through 64, all distinct. Required by mark and unmark; refused by start, stop, and force_stop, which consume the owner's authoritative mark set."
+                            "description": "Proposals this call addresses. mark and unmark take 1 through 64 distinct proposals. force_stop_change takes exactly one — zero, several, duplicate, or blank targets are refused before anything is contacted. start, stop, and force_stop take none: they consume the owner's authoritative mark set."
                         }
                     })),
                     "required": ["action"],

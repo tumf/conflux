@@ -296,6 +296,7 @@ pub enum Commands {
     ///   cflx client mark alpha beta --json      # Select proposals; admission stays the owner's
     ///   cflx client start --json                # F5 equivalent over the authoritative marks
     ///   cflx client stop --json                 # Graceful stop; force-stop for the immediate one
+    ///   cflx client force-stop-change ID --json # Kill exactly one proposal now
     ///   cflx client wait alpha                  # Observe until verified completion; no deadline
     ///   cflx client wait alpha --timeout 30m    # Give up after an explicit deadline instead
     ///   cflx client subscribe set alpha --instance-id ID --json -- /absolute/callback
@@ -1154,6 +1155,31 @@ pub enum ClientCommands {
     /// classify or terminate work itself.
     ForceStop(ClientLifecycleArgs),
 
+    /// Kill one named proposal immediately and dequeue it
+    ///
+    /// The target-scoped counterpart of `force-stop`, and the only control that
+    /// bypasses the graceful SIGTERM escalation window `stop` gives a change:
+    /// the owner sends SIGKILL straight to the managed process group that
+    /// proposal owns, waits for confirmed reaping, then clears its queue
+    /// admission and execution mark together so later mark settlement cannot
+    /// redispatch it.
+    ///
+    /// Exactly one proposal, always. Unrelated changes keep their processes,
+    /// marks, queue intent, execution IDs, and subscriptions, and the
+    /// process-wide run mode, scheduler state, and stop state do not change.
+    /// Completed worktree effects — an Apply commit that already landed — are
+    /// preserved; the settled result reports `effects_rolled_back: false`.
+    ///
+    /// The successful outcome is `stopped`, not `accepted`: one settled command
+    /// ended one execution episode. A target that owns no live managed process
+    /// but is admitted is dequeued outright; a terminal, unadmitted, merge-wait,
+    /// or resolve-wait target is refused with `target_ineligible`.
+    ///
+    /// EXAMPLES:
+    ///   cflx client force-stop-change add-my-change
+    ///   cflx client force-stop-change add-my-change --json
+    ForceStopChange(ClientForceStopChangeArgs),
+
     /// Observe one change until verified completion or a typed failure
     ///
     /// Observation only: it submits no start, retry, queue, resolve, archive,
@@ -1235,9 +1261,11 @@ pub enum ClientCommands {
     /// or shell source.
     ///
     /// Three closed tools: cflx_status, cflx_control, and cflx_subscribe.
-    /// cflx_control takes one action — mark, unmark, start, stop, or force_stop
-    /// — and calls the same client boundary the matching command does, so
-    /// routing and typed outcomes are shared rather than reimplemented.
+    /// cflx_control takes one action — mark, unmark, start, stop, force_stop, or
+    /// force_stop_change — and calls the same client boundary the matching
+    /// command does, so routing and typed outcomes are shared rather than
+    /// reimplemented. force_stop_change names exactly one proposal in
+    /// change_ids; the three process-wide lifecycle actions accept none.
     ///
     /// cflx_wait is deliberately absent from MCP: a completion wait stays open
     /// for as long as the work takes, which is not the shape of a tool call.
@@ -1279,6 +1307,22 @@ pub struct ClientMarkArgs {
     /// Proposals whose execution mark to set, 1 through 64 and all distinct
     #[arg(required = true, num_args = 1.., value_parser = parse_change_id)]
     pub change_ids: Vec<String>,
+
+    /// Emit one versioned JSON envelope on stdout
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `cflx client force-stop-change`.
+///
+/// Exactly one proposal, and no `--all`, no glob, and no target list: widening
+/// an immediate kill is what process-wide `force-stop` is for, and the two must
+/// never be reachable by adding an argument to the other.
+#[derive(Parser, Debug)]
+pub struct ClientForceStopChangeArgs {
+    /// The one proposal to kill immediately and dequeue
+    #[arg(value_parser = parse_change_id)]
+    pub change_id: String,
 
     /// Emit one versioned JSON envelope on stdout
     #[arg(long)]

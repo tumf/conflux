@@ -69,6 +69,16 @@ pub struct ChangeStatus {
     /// Operator attention state.
     #[serde(default)]
     pub attention: AttentionState,
+    /// Whether this owner holds a live managed process group for the change.
+    ///
+    /// Read from the managed ownership graph a targeted force-stop signals
+    /// through — never inferred from the display status, which can present as
+    /// active while a worktree is still being prepared inline. It is the one
+    /// input that decides whether `actions.force_stop_change` is offered for an
+    /// executing row, so publishing it from any second source would let the API
+    /// advertise a kill the shared transaction refuses.
+    #[serde(default)]
+    pub managed_process_live: bool,
 }
 
 impl From<&Change> for ChangeStatus {
@@ -103,6 +113,7 @@ impl From<&Change> for ChangeStatus {
             latest_activity: None,
             worktree: None,
             attention: AttentionState::None,
+            managed_process_live: false,
         }
     }
 }
@@ -447,6 +458,15 @@ pub struct WebState {
     /// which is exactly what a process that cannot start a run should report.
     parallel_runtime:
         tokio::sync::RwLock<Option<Arc<crate::orchestration::operator_command::ParallelRuntime>>>,
+    /// The managed ownership graph a targeted force-stop signals through.
+    ///
+    /// Late-bound like the marks. Until an orchestration runtime exists this
+    /// process owns no managed process group, so every change reports
+    /// `managed_process_live: false` — exactly what a process with no run should
+    /// report, and exactly what makes `force_stop_change` unavailable there.
+    managed_termination: tokio::sync::RwLock<
+        Option<Arc<dyn crate::orchestration::operator_command::ManagedProcessTermination>>,
+    >,
     /// Timing, latest activity, attention, parallel eligibility, and worktree
     /// relation for this process incarnation.
     operator_facts: tokio::sync::RwLock<OperatorFactsStore>,
@@ -559,6 +579,7 @@ impl WebState {
             remote_control: Arc::new(crate::web::remote_control_api::RemoteControlRuntime::new()),
             execution_marks: tokio::sync::RwLock::new(None),
             parallel_runtime: tokio::sync::RwLock::new(None),
+            managed_termination: tokio::sync::RwLock::new(None),
             operator_facts: tokio::sync::RwLock::new(OperatorFactsStore::new()),
             execution_facts: tokio::sync::RwLock::new(None),
             projected_dispatches: Mutex::new(RecentDispatchIds::default()),
@@ -581,6 +602,19 @@ impl WebState {
         marks: Arc<crate::orchestration::operator_command::ExecutionMarkStore>,
     ) {
         *self.execution_marks.write().await = Some(marks);
+        self.sync_remote_control_projection().await;
+    }
+
+    /// Bind the managed ownership graph a targeted force-stop signals through.
+    ///
+    /// The same port the shared operator transaction kills through, so the
+    /// eligibility this snapshot publishes and the eligibility that command
+    /// admission enforces read one fact.
+    pub async fn set_managed_termination(
+        &self,
+        termination: Arc<dyn crate::orchestration::operator_command::ManagedProcessTermination>,
+    ) {
+        *self.managed_termination.write().await = Some(termination);
         self.sync_remote_control_projection().await;
     }
 
@@ -714,11 +748,16 @@ impl WebState {
             None => ParallelRuntimeState::default(),
         };
         let facts = self.operator_facts.read().await;
+        let managed_termination = self.managed_termination.read().await.clone();
         snapshot.process_error = facts.process_error();
         for change in &mut snapshot.changes {
             change.execution_marked = marks
                 .as_ref()
                 .is_some_and(|marks| marks.is_marked(&change.id));
+            change.managed_process_live = match &managed_termination {
+                Some(port) => port.owns_managed_process(&change.id).await,
+                None => false,
+            };
             let change_facts = facts.facts(&change.id);
             change.parallel = fold_dependency_wait_into_eligibility(
                 change_facts.parallel,

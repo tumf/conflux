@@ -214,6 +214,7 @@ fn client_control_help_documents_operator_verbs_and_retires_enqueue() {
         "start",
         "stop",
         "force-stop",
+        "force-stop-change",
         "wait",
         "subscribe",
         "mcp",
@@ -491,6 +492,7 @@ mod feature_disabled {
             vec!["client", "start", "--json"],
             vec!["client", "stop", "--json"],
             vec!["client", "force-stop", "--json"],
+            vec!["client", "force-stop-change", "alpha", "--json"],
             vec!["client", "wait", "alpha", "--json"],
             vec![
                 "client",
@@ -2482,6 +2484,7 @@ mod enabled {
                 CommandSpec::SetQueueIntent { .. } => "set_queue_intent",
                 CommandSpec::RetryChange { .. } => "retry_change",
                 CommandSpec::RetryErrors { .. } => "retry_errors",
+                CommandSpec::ForceStopChange { .. } => "force_stop_change",
                 _ => "other",
             })
             .collect()
@@ -5693,5 +5696,248 @@ mod enabled {
             agents.contains("owner_restarted"),
             "AGENTS.md must name the typed answer for a lost owner"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Targeted force-stop
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// A change with a live managed process, so the owner offers the kill.
+    ///
+    /// Built through the same classifier the server publishes with, so the
+    /// fixture cannot advertise an admission production would refuse.
+    fn killable(id: &str, app_mode: &str, display_status: &str) -> ChangeResource {
+        ChangeResource {
+            actions:
+                conflux::web::remote_control_api::projection::change_actions_with_live_process_for_test(
+                    app_mode,
+                    display_status,
+                    true,
+                ),
+            ..change(id, app_mode, display_status)
+        }
+    }
+
+    /// Every operator-facing envelope message is one flowing line.
+    ///
+    /// The defect this guards against is a collapsed multi-line string literal:
+    /// drop the trailing `\` and the source indentation stays inside the value,
+    /// which is then printed verbatim in `--json` and in an MCP tool result.
+    fn assert_message_is_unbroken(parsed: &serde_json::Value, context: &str) {
+        let message = parsed["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{context}: the envelope carries no message: {parsed}"));
+        assert!(
+            !message.contains("  "),
+            "{context}: the message carries collapsed literal indentation: {message:?}"
+        );
+    }
+
+    /// The command names one change and submits exactly the targeted intent.
+    #[tokio::test]
+    async fn force_stop_change_submits_only_the_targeted_command() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "running",
+            vec![
+                killable("alpha", "running", "applying"),
+                killable("beta", "running", "applying"),
+            ],
+        ));
+
+        let output = control(&owner, &["force-stop-change", "alpha"]).await;
+        let parsed = envelope(&output);
+
+        assert_eq!(parsed["outcome"], "stopped", "{}", stderr_of(&output));
+        assert_eq!(parsed["operation"], "control_force_stop_change");
+        assert_eq!(parsed["change_id"], "alpha");
+        assert_eq!(output.status.code(), Some(0));
+        assert_message_is_unbroken(&parsed, "the settled stopped envelope");
+        assert_eq!(
+            spy.calls(),
+            vec![CommandSpec::ForceStopChange {
+                change_id: "alpha".to_string()
+            }],
+            "the client submits the shared targeted command and nothing else"
+        );
+        owner.stop().await;
+    }
+
+    /// Zero or several targets is a usage failure before the owner is contacted.
+    #[tokio::test]
+    async fn force_stop_change_requires_exactly_one_target() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "running",
+            vec![
+                killable("alpha", "running", "applying"),
+                killable("beta", "running", "applying"),
+            ],
+        ));
+
+        // Clap owns the arity for the CLI, so both shapes are usage errors and
+        // neither creates a command record.
+        for tail in [
+            vec!["force-stop-change"],
+            vec!["force-stop-change", "alpha", "beta"],
+        ] {
+            let output = control(&owner, &tail).await;
+            assert_eq!(output.status.code(), Some(2), "{tail:?}");
+        }
+        assert!(
+            spy.calls().is_empty(),
+            "a shape refusal must create no command record"
+        );
+        owner.stop().await;
+    }
+
+    /// A target the owner refuses is reported before a record exists.
+    #[tokio::test]
+    async fn force_stop_change_refuses_an_ineligible_target_before_submitting() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "running",
+            vec![
+                // Presents as active, but this owner holds no process for it.
+                change("alpha", "running", "applying"),
+                change("gamma", "running", "merge wait"),
+            ],
+        ));
+
+        for (target, expected_status) in [("alpha", "applying"), ("gamma", "merge wait")] {
+            let output = control(&owner, &["force-stop-change", target]).await;
+            let parsed = envelope(&output);
+            assert_eq!(parsed["outcome"], "target_ineligible", "{target}");
+            assert_eq!(parsed["operation"], "control_force_stop_change", "{target}");
+            assert_eq!(parsed["change_id"], target);
+            assert_eq!(
+                parsed["detail"]["observed_status"], expected_status,
+                "{target}"
+            );
+            assert_eq!(output.status.code(), Some(10), "{target}");
+            assert_message_is_unbroken(&parsed, &format!("the {target} refusal"));
+        }
+
+        let unknown = control(&owner, &["force-stop-change", "never-tracked"]).await;
+        assert_eq!(envelope(&unknown)["outcome"], "change_not_found");
+        assert_eq!(unknown.status.code(), Some(9));
+
+        assert!(
+            spy.calls().is_empty(),
+            "a refused target must create no command record"
+        );
+        owner.stop().await;
+    }
+
+    /// The two force-stops stay separate contracts at the CLI boundary.
+    #[tokio::test]
+    async fn force_stop_change_is_never_a_spelling_of_process_wide_force_stop() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "running",
+            vec![killable("alpha", "running", "applying")],
+        ));
+
+        control(&owner, &["force-stop-change", "alpha"]).await;
+        control(&owner, &["force-stop"]).await;
+
+        assert_eq!(
+            submitted_names(&spy),
+            vec!["force_stop_change", "force_stop"],
+            "each verb submits its own command; neither can produce the other"
+        );
+
+        // And the process-wide verb still refuses a target list outright.
+        let widened = control(&owner, &["force-stop", "alpha"]).await;
+        assert_eq!(envelope(&widened)["outcome"], "usage_error");
+        assert_eq!(spy.call_count(), 2);
+        owner.stop().await;
+    }
+
+    /// The CLI help documents the one-target contract and its distinct outcome.
+    #[test]
+    fn force_stop_change_help_documents_the_one_target_contract() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let help = run_cli(tmp.path(), &["client", "force-stop-change", "--help"], &[]);
+        assert!(help.status.success(), "{}", stderr_of(&help));
+        let text = stdout_of(&help);
+        for phrase in [
+            "SIGKILL",
+            "one named proposal",
+            "stopped",
+            "effects_rolled_back",
+        ] {
+            assert!(
+                text.contains(phrase),
+                "the help must document `{phrase}`:\n{text}"
+            );
+        }
+    }
+
+    /// The documented contract of the targeted kill, in every place an agent
+    /// reads before invoking it.
+    ///
+    /// Named `force_stop_change_*` so it runs under the same filter the
+    /// behaviour does: the contract and the sentences describing it fail
+    /// together or not at all.
+    #[test]
+    fn force_stop_change_documentation_states_the_one_target_contract() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let agents = std::fs::read_to_string(repo_root.join("AGENTS.md")).expect("AGENTS.md");
+        let readme = std::fs::read_to_string(repo_root.join("README.md")).expect("README.md");
+        let skill = std::fs::read_to_string(repo_root.join("skills/cflx-run/SKILL.md"))
+            .expect("the bundled client skill");
+        let reference =
+            std::fs::read_to_string(repo_root.join("skills/cflx-run/references/cflx-run.md"))
+                .expect("the bundled client skill reference");
+
+        for (document, name) in [
+            (&agents, "AGENTS.md"),
+            (&readme, "README.md"),
+            (&skill, "skills/cflx-run/SKILL.md"),
+            (&reference, "skills/cflx-run/references/cflx-run.md"),
+        ] {
+            assert!(
+                document.contains("force-stop-change") || document.contains("force_stop_change"),
+                "{name} must document the targeted control"
+            );
+            assert!(
+                document.contains("SIGKILL"),
+                "{name} must say the graceful window is bypassed"
+            );
+            assert!(
+                document.contains("effects_rolled_back"),
+                "{name} must say completed worktree effects survive"
+            );
+            assert!(
+                document.contains("`stopped`") || document.contains("outcome is `stopped`"),
+                "{name} must name the distinct success token"
+            );
+        }
+
+        // The two force-stops must never read as one command with a wider
+        // argument list. Both operator-facing documents keep them apart.
+        assert!(
+            agents.contains("control_force_stop_change"),
+            "AGENTS.md must name the envelope operation a script branches on"
+        );
+        for (document, name) in [(&agents, "AGENTS.md"), (&readme, "README.md")] {
+            assert!(
+                document.contains("actions.force_stop_change"),
+                "{name} must point at the published per-change eligibility"
+            );
+            assert!(
+                document.contains("exactly one"),
+                "{name} must state the one-target rule"
+            );
+            assert!(
+                document.contains("stop_and_dequeue"),
+                "{name} must say the graceful control is unchanged"
+            );
+        }
     }
 }

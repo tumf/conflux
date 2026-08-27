@@ -709,7 +709,14 @@ fn mcp_tools_list_exposes_exactly_the_three_closed_tools() {
         .unwrap();
     assert_eq!(
         control["inputSchema"]["properties"]["action"]["enum"],
-        serde_json::json!(["mark", "unmark", "start", "stop", "force_stop"])
+        serde_json::json!([
+            "mark",
+            "unmark",
+            "start",
+            "stop",
+            "force_stop",
+            "force_stop_change"
+        ])
     );
     let subscribe = tools
         .iter()
@@ -768,6 +775,24 @@ fn mcp_control_refuses_a_malformed_request_before_contacting_an_owner() {
             serde_json::json!({"action": "force_stop", "change_ids": ["alpha"]}),
             "force_stop carrying targets",
         ),
+        // The targeted kill is the inverse shape: exactly one, never zero,
+        // never several, never a duplicate.
+        (
+            serde_json::json!({"action": "force_stop_change", "change_ids": []}),
+            "force_stop_change with no target",
+        ),
+        (
+            serde_json::json!({"action": "force_stop_change"}),
+            "force_stop_change with the field omitted entirely",
+        ),
+        (
+            serde_json::json!({"action": "force_stop_change", "change_ids": ["alpha", "beta"]}),
+            "force_stop_change with several targets",
+        ),
+        (
+            serde_json::json!({"action": "force_stop_change", "change_ids": ["alpha", "alpha"]}),
+            "force_stop_change with a duplicated target",
+        ),
     ] {
         let envelope = host.call("cflx_control", arguments);
         assert_eq!(envelope["outcome"], "usage_error", "{what}: {envelope}");
@@ -775,6 +800,17 @@ fn mcp_control_refuses_a_malformed_request_before_contacting_an_owner() {
         assert!(
             envelope.as_object().unwrap().get("instance_id").is_none(),
             "{what}: nothing was contacted, so no owner may be named: {envelope}"
+        );
+        // The arity refusal is one flowing line. MCP is the only caller that
+        // reaches it — the CLI's own arity is owned by clap — so a collapsed
+        // multi-line literal there would surface in a tool result and nowhere
+        // else.
+        let message = envelope["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what}: the refusal carries no message: {envelope}"));
+        assert!(
+            !message.contains("  "),
+            "{what}: the message carries collapsed literal indentation: {message:?}"
         );
     }
 
@@ -798,6 +834,83 @@ fn mcp_control_refuses_a_malformed_request_before_contacting_an_owner() {
         serde_json::json!({"action": "mark", "change_ids": ["../escape"]}),
     );
     assert_eq!(escaping["isError"], true, "{escaping}");
+
+    // A blank target is refused by the same shape rule, on the action whose
+    // whole contract is "exactly one".
+    for blank in ["", "   "] {
+        let refused = host.call_raw(
+            "cflx_control",
+            serde_json::json!({"action": "force_stop_change", "change_ids": [blank]}),
+        );
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert!(
+            refused.get("structuredContent").is_none(),
+            "a blank target reached nobody"
+        );
+    }
+    host.stop();
+}
+
+/// The targeted kill is published as its own action with its own target rule.
+///
+/// The action vocabulary is the security boundary of `cflx_control`, so the
+/// distinction between "kill this proposal" and "stop everything" is asserted
+/// on the published schema rather than left to the description prose.
+#[test]
+fn mcp_control_publishes_force_stop_change_as_a_single_target_action() {
+    let (_dir, mut host) = unrouted_host();
+    let listed = host.request("tools/list", serde_json::json!({}));
+    let tools = listed["result"]["tools"].as_array().expect("a tool list");
+    let control = tools
+        .iter()
+        .find(|tool| tool["name"] == "cflx_control")
+        .expect("cflx_control is published");
+
+    let actions = control["inputSchema"]["properties"]["action"]["enum"]
+        .as_array()
+        .expect("a closed action vocabulary");
+    assert!(actions.iter().any(|a| a == "force_stop_change"));
+    assert!(
+        actions.iter().any(|a| a == "force_stop"),
+        "the process-wide control stays a separate action"
+    );
+
+    // No raw command construction comes in with it. The description may explain
+    // what the owner does; the *schema* is what a model can actually set, and it
+    // still offers no signal, grace window, expected revision, or idempotency
+    // key to choose.
+    let inputs: Vec<&str> = control["inputSchema"]["properties"]
+        .as_object()
+        .expect("an object schema")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        inputs
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "action",
+            "change_ids",
+            "project_dir",
+            "unix_socket",
+            "auth_token_env"
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>(),
+        "the control tool accepts exactly the closed argument set"
+    );
+
+    let description = control["description"].as_str().expect("a description");
+    assert!(
+        description.contains("exactly one"),
+        "the one-target contract must be documented: {description}"
+    );
+    assert!(
+        description.contains("stopped"),
+        "and its distinct success token: {description}"
+    );
     host.stop();
 }
 

@@ -11,7 +11,8 @@
 //! every caller break whenever the orchestration state model moves.
 //!
 //! So this is a thin, control-shaped client whose verbs are the operator's own:
-//! `status`, `mark`, `unmark`, `start`, `stop`, `force-stop`, `wait`, the nested
+//! `status`, `mark`, `unmark`, `start`, `stop`, `force-stop`,
+//! `force-stop-change`, `wait`, the nested
 //! `subscribe` group, and `mcp` — stable JSON, stable exit statuses, and no
 //! protocol details in the public surface at all.
 //!
@@ -338,6 +339,7 @@ fn operation_of(subcommand: &str) -> Option<Operation> {
         "start" => Some(Operation::ControlStart),
         "stop" => Some(Operation::ControlStop),
         "force-stop" => Some(Operation::ControlForceStop),
+        "force-stop-change" => Some(Operation::ControlForceStopChange),
         "wait" => Some(Operation::Wait),
         // `mcp` is a server, not an operation: a usage failure there has no
         // envelope to belong to, so it keeps Clap's human behavior.
@@ -500,6 +502,11 @@ pub async fn run(args: ClientArgs) -> i32 {
             OutputMode::from_json_flag(force.json),
             None,
         ),
+        ClientCommands::ForceStopChange(force) => (
+            Operation::ControlForceStopChange,
+            OutputMode::from_json_flag(force.json),
+            Some(force.change_id.clone()),
+        ),
         ClientCommands::Wait(wait) => (
             Operation::Wait,
             OutputMode::from_json_flag(wait.json),
@@ -615,6 +622,14 @@ async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
         ClientCommands::Stop(_) => control::run(&connection, control::Action::Stop, &[]).await,
         ClientCommands::ForceStop(_) => {
             control::run(&connection, control::Action::ForceStop, &[]).await
+        }
+        ClientCommands::ForceStopChange(force) => {
+            control::run(
+                &connection,
+                control::Action::ForceStopChange,
+                std::slice::from_ref(&force.change_id),
+            )
+            .await
         }
         ClientCommands::Wait(wait) => {
             wait::run(&connection, &wait.change_id, wait.timeout.deadline()).await
