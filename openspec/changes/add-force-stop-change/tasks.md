@@ -1,0 +1,9 @@
+## Implementation Tasks
+
+- [ ] Add the target-scoped `ForceStopChange` shared operator intent, authoritative eligibility, managed-process cancellation, confirmed quiescence, dequeue/stopped settlement, and typed result. (verification: unit - `cargo test --features web-monitoring force_stop_change` exercises focused tests in `src/orchestration/` for phase coverage, target-only cancellation, reaping, replay, and no cross-target mutation; verification-id: targeted-force-stop-tests)
+
+- [ ] Publish `force_stop_change` through v2 DTOs, command execution, projections, per-change actions, capabilities, generated OpenAPI, and command records. (verification: integration - `cargo test --features web-monitoring --test openapi_contract_tests force_stop_change` and focused tests under `tests/remote_control_api_tests.rs` verify revision fencing, typed settlement, schema completeness, and exact replay; verification-id: targeted-force-stop-tests)
+
+- [ ] Add `cflx client force-stop-change <change-id>` and MCP `cflx_control` action `force_stop_change`, both delegating to the shared operation and requiring exactly one target. (verification: integration - `cargo test --test client_cli_tests force_stop_change && cargo test --test client_mcp_integration force_stop_change`; verification-id: targeted-force-stop-tests)
+
+- [ ] Update `README.md`, `AGENTS.md`, CLI help, MCP descriptions, generated OpenAPI assertions, and bundled client skill documentation while retaining the distinct process-wide `force_stop` and graceful `stop_and_dequeue` contracts. (verification: integration - `cargo test --test client_cli_tests force_stop_change && cargo test --test client_mcp_integration force_stop_change && cargo test --features web-monitoring --test openapi_contract_tests force_stop_change` verify the public schemas/help text, followed by `cflx openspec validate add-force-stop-change --archive-gate`; verification-id: targeted-force-stop-tests)
