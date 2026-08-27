@@ -5695,4 +5695,81 @@ mod tests {
             );
         }
     }
+
+    /// The shared projection — not a scheduler judgement of its own — is what
+    /// makes a dependency wait render as `[blocked:dependency]`.
+    ///
+    /// Unit scope: the reducer is in-memory and the badge is a pure function of
+    /// the display status and blocker kind the TUI adopts from it, so nothing
+    /// here touches Git, the filesystem, a process, or a clock.
+    #[test]
+    fn dependency_blocker_projection_tui_badge() {
+        use crate::orchestration::state::OrchestratorState;
+        use std::sync::Arc;
+
+        let changes = vec![
+            create_test_change("dependency-wait", 0, 1),
+            create_test_change("capacity-wait", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["dependency-wait".to_string(), "capacity-wait".to_string()],
+            0,
+        )));
+        app.set_shared_state(shared.clone());
+
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                "dependency-wait".to_string(),
+            ));
+            guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                "capacity-wait".to_string(),
+            ));
+            // Exactly the reconciliation the scheduler performs on every
+            // coherent classification. The TUI reads the result; it never
+            // re-derives dependency eligibility itself.
+            guard.reconcile_dependency_blocker("dependency-wait", &["alpha".to_string()]);
+        }
+
+        let (display_map, blocker_views) = {
+            let guard = shared.blocking_read();
+            (guard.all_display_statuses(), guard.all_blocker_views())
+        };
+        app.apply_display_statuses_from_reducer(&display_map);
+        app.apply_blocker_views_from_reducer(&blocker_views);
+
+        fn badge(app: &AppState, id: &str) -> String {
+            app.changes
+                .iter()
+                .find(|change| change.id == id)
+                .expect("row")
+                .status_badge()
+        }
+
+        assert_eq!(
+            badge(&app, "dependency-wait"),
+            "blocked:dependency",
+            "a dependency wait must not render as a plain queued row"
+        );
+        assert_eq!(
+            badge(&app, "capacity-wait"),
+            "queued",
+            "a change waiting only for a slot keeps its plain badge"
+        );
+
+        // Resolution hands the row back to its retained queue intent, and the
+        // badge follows the same shared projection back.
+        shared
+            .blocking_write()
+            .clear_dependency_blocker("dependency-wait");
+        let (display_map, blocker_views) = {
+            let guard = shared.blocking_read();
+            (guard.all_display_statuses(), guard.all_blocker_views())
+        };
+        app.apply_display_statuses_from_reducer(&display_map);
+        app.apply_blocker_views_from_reducer(&blocker_views);
+        assert_eq!(badge(&app, "dependency-wait"), "queued");
+    }
 }

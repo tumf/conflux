@@ -153,6 +153,26 @@ impl BlockerKind {
     }
 }
 
+/// Operator-facing one-line explanation of a dependency wait.
+fn dependency_blocker_detail(dependency_ids: &[String]) -> String {
+    if dependency_ids.is_empty() {
+        return "waiting for unresolved dependencies".to_string();
+    }
+    format!("waiting for dependencies: {}", dependency_ids.join(", "))
+}
+
+/// Verifiable condition that clears a dependency wait.
+fn dependency_unblock_condition(dependency_ids: &[String]) -> String {
+    if dependency_ids.is_empty() {
+        return "every declared dependency is integrated into the effective dependency base"
+            .to_string();
+    }
+    format!(
+        "dependencies {} are integrated into the effective dependency base",
+        dependency_ids.join(", ")
+    )
+}
+
 /// Additional metadata preserved while a change is blocked.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BlockedMetadata {
@@ -184,6 +204,12 @@ pub struct BlockedMetadata {
     pub prerequisite_owner: Option<String>,
     /// Phase that observed a validated external prerequisite.
     pub blocker_origin: Option<String>,
+    /// Current unresolved dependency IDs for a dependency wait.
+    ///
+    /// Structured rather than folded into the detail string: a consumer that
+    /// has to decide *which* dependency it is waiting on must not have to parse
+    /// operator prose. Empty for every non-dependency hold.
+    pub dependency_ids: Vec<String>,
 }
 
 /// Reducer-derived operator-facing view of one blocked or stalled change.
@@ -209,6 +235,8 @@ pub struct BlockerView {
     pub origin: Option<String>,
     /// Whether work can resume once the prerequisite is satisfied.
     pub resumable: bool,
+    /// Current unresolved dependency IDs for a dependency wait; empty otherwise.
+    pub dependencies: Vec<String>,
 }
 
 /// Terminal outcome for a change (once reached, no further transitions).
@@ -330,7 +358,42 @@ impl ChangeRuntimeState {
             unblock_condition: None,
             prerequisite_owner: None,
             blocker_origin: None,
+            dependency_ids: Vec::new(),
         };
+    }
+
+    /// Record — or reconcile — the current unresolved dependency wait.
+    ///
+    /// This is a *state* write, deliberately separate from the edge-triggered
+    /// `DependencyBlocked` diagnostic: the scheduler calls it on every coherent
+    /// classification, so a reducer that was replaced, refreshed, or never saw
+    /// the original transition still carries the current blocker. It is
+    /// idempotent, and it never touches queue intent — a dependency wait is a
+    /// dispatch exclusion, not a revocation of admitted work.
+    ///
+    /// Returns `true` when the projected wait or its dependency set changed.
+    fn reconcile_dependency_blocker(&mut self, dependency_ids: &[String]) -> bool {
+        let unchanged = matches!(self.wait_state, WaitState::DependencyBlocked)
+            && self.blocked_metadata.dependency_ids == dependency_ids;
+        if unchanged {
+            return false;
+        }
+        self.wait_state = WaitState::DependencyBlocked;
+        self.blocked_metadata = BlockedMetadata {
+            blocker_reason: Some("dependency_blocked".to_string()),
+            unblock_metadata: Some(dependency_blocker_detail(dependency_ids)),
+            worktree_snapshot: Some(
+                "worktree snapshot not required for dependency blocker".to_string(),
+            ),
+            acceptance_stall: false,
+            resumable: true,
+            blocker_kind: BlockerKind::Dependency,
+            unblock_condition: Some(dependency_unblock_condition(dependency_ids)),
+            prerequisite_owner: None,
+            blocker_origin: Some("scheduler".to_string()),
+            dependency_ids: dependency_ids.to_vec(),
+        };
+        true
     }
 
     /// Reset transient execution state for non-terminal idle/wait transitions.
@@ -412,6 +475,7 @@ impl ChangeRuntimeState {
             unblock_condition: Some(blocker.unblock_condition.clone()),
             prerequisite_owner: blocker.prerequisite_owner.clone(),
             blocker_origin: Some(blocker.origin.as_str().to_string()),
+            dependency_ids: Vec::new(),
         };
     }
 
@@ -500,6 +564,13 @@ impl ChangeRuntimeState {
             prerequisite_owner: self.blocked_metadata.prerequisite_owner.clone(),
             origin: self.blocked_metadata.blocker_origin.clone(),
             resumable: self.blocked_metadata.resumable,
+            // Only a dependency wait publishes IDs; deriving them from the kind
+            // rather than from the retained field keeps a stale metadata list
+            // from decorating an external or stalled hold.
+            dependencies: match self.blocker_kind() {
+                BlockerKind::Dependency => self.blocked_metadata.dependency_ids.clone(),
+                _ => Vec::new(),
+            },
         })
     }
 
@@ -1600,6 +1671,53 @@ impl OrchestratorState {
             .and_then(ChangeRuntimeState::blocker_view)
     }
 
+    /// Reconcile the current unresolved dependency set for one change.
+    ///
+    /// The scheduler calls this on every coherent dependency classification,
+    /// whether or not the edge-triggered `DependencyBlocked` diagnostic was
+    /// suppressed as a duplicate. Deduplication decides whether an *operator
+    /// diagnostic* is worth emitting again; it must never decide whether the
+    /// current blocker exists, or a refreshed, replaced, or newly built reducer
+    /// would report an unresolved dependency wait as plain `queued`.
+    ///
+    /// Queue intent is deliberately untouched: a dependency wait excludes a
+    /// change from dispatch and never revokes admitted work.
+    ///
+    /// Returns `true` when the projection changed.
+    pub fn reconcile_dependency_blocker(
+        &mut self,
+        change_id: &str,
+        dependency_ids: &[String],
+    ) -> bool {
+        let rt = self.runtime_entry(change_id);
+        // Exactly the guard the `DependencyBlocked` event applies, so the
+        // reconciliation path and the transition path can never disagree about
+        // which rows may carry a dependency wait.
+        if rt.is_terminal() || rt.is_active() {
+            return false;
+        }
+        rt.reconcile_dependency_blocker(dependency_ids)
+    }
+
+    /// Clear a dependency wait once classification proved every dependency resolved.
+    ///
+    /// Only a dependency wait is cleared: an external prerequisite, an
+    /// acceptance stall, or a merge wait belongs to another owner, and dropping
+    /// it here would let dependency evidence erase an unrelated hold.
+    ///
+    /// Returns `true` when a dependency wait was actually cleared.
+    pub fn clear_dependency_blocker(&mut self, change_id: &str) -> bool {
+        let Some(rt) = self.change_runtime.get_mut(change_id) else {
+            return false;
+        };
+        if !matches!(rt.wait_state, WaitState::DependencyBlocked) {
+            return false;
+        }
+        rt.wait_state = WaitState::None;
+        rt.clear_blocked_metadata();
+        true
+    }
+
     /// Return true if the change has reached a terminal state.
     pub fn is_terminal_change(&self, change_id: &str) -> bool {
         self.change_runtime
@@ -2601,15 +2719,14 @@ impl OrchestratorState {
             }
 
             // Dependency events
-            ExecutionEvent::DependencyBlocked { change_id, .. } => {
+            ExecutionEvent::DependencyBlocked {
+                change_id,
+                dependency_ids,
+            } => {
+                let ids = dependency_ids.clone();
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.is_active() {
-                    rt.wait_state = WaitState::DependencyBlocked;
-                    rt.set_blocked_metadata(
-                        "dependency_blocked",
-                        "resolve dependencies and retry queue",
-                        "worktree snapshot not required for dependency blocker",
-                    );
+                    rt.reconcile_dependency_blocker(&ids);
                 }
             }
             ExecutionEvent::DependencyResolved { change_id } => {
@@ -7791,5 +7908,172 @@ mod tests {
             worktree_not_ahead_ids: HashSet::new(),
             merge_wait_ids: HashSet::from([change_id.to_string()]),
         }
+    }
+
+    // =======================================================================
+    // Dependency blocker projection
+    //
+    // Unit scope on purpose: the reducer is in-memory, so these exercise the
+    // state contract itself with no Git, filesystem, process, or clock
+    // involved. The scheduler-side reconciliation call and the deduplicated
+    // diagnostics around it are covered by the parallel-executor regression.
+    // =======================================================================
+
+    /// An admitted change with an unresolved dependency is blocked from the
+    /// first coherent classification, with the complete typed contract.
+    #[test]
+    fn dependency_blocker_projection_initial() {
+        let mut state = OrchestratorState::new(vec!["beta".to_string()], 0);
+        state.apply_command(ReducerCommand::AddToQueue("beta".to_string()));
+
+        assert!(
+            state.reconcile_dependency_blocker("beta", &["alpha".to_string()]),
+            "the first classification must publish the wait"
+        );
+
+        let rt = state.change_runtime("beta").expect("runtime entry");
+        assert_eq!(state.display_status("beta"), "blocked");
+        assert_eq!(
+            rt.queue_intent,
+            QueueIntent::Queued,
+            "a dependency wait excludes dispatch and never revokes admitted work"
+        );
+        assert_eq!(rt.wait_state, WaitState::DependencyBlocked);
+        assert!(!rt.is_active(), "no execution episode has started");
+
+        let view = state.blocker_view("beta").expect("structured blocker");
+        assert_eq!(view.status, "blocked");
+        assert_eq!(view.kind, BlockerKind::Dependency);
+        assert_eq!(view.dependencies, vec!["alpha".to_string()]);
+        assert_eq!(view.category.as_deref(), Some("dependency_blocked"));
+        assert!(view
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("alpha")));
+
+        // The typed execution state is the retained admission, not a new
+        // episode: the change is queued behind evidence, not running.
+        assert_eq!(
+            crate::orchestration::execution_facts::project_execution_state(
+                rt,
+                crate::orchestration::execution_facts::ExecutionPhase::None,
+                false,
+            ),
+            crate::orchestration::execution_facts::ChangeExecutionState::Queued
+        );
+    }
+
+    /// The bug this change repairs: diagnostic deduplication must not be able
+    /// to erase or withhold the current blocker, and a reducer that never saw
+    /// the original transition must still report it.
+    #[test]
+    fn dependency_blocker_projection_rebuild() {
+        let mut state = OrchestratorState::new(vec!["beta".to_string()], 0);
+        state.apply_command(ReducerCommand::AddToQueue("beta".to_string()));
+        state.reconcile_dependency_blocker("beta", &["alpha".to_string()]);
+
+        // Same unresolved set, reclassified: no state churn, and no revision of
+        // the projection either.
+        assert!(
+            !state.reconcile_dependency_blocker("beta", &["alpha".to_string()]),
+            "an unchanged fingerprint must settle as a no-op, not a rewrite"
+        );
+        assert_eq!(state.display_status("beta"), "blocked");
+
+        // A changed blocker set is still reconciled, not suppressed.
+        assert!(
+            state.reconcile_dependency_blocker("beta", &["alpha".to_string(), "gamma".to_string()])
+        );
+        assert_eq!(
+            state.blocker_view("beta").expect("blocker").dependencies,
+            vec!["alpha".to_string(), "gamma".to_string()]
+        );
+
+        // Reducer replacement — a refresh, a restart of the projection, any
+        // loss of the ephemeral diagnostic fingerprints. The next
+        // classification republishes the same current blocker without needing a
+        // changed fingerprint to justify itself.
+        let mut rebuilt = OrchestratorState::new(vec!["beta".to_string()], 0);
+        rebuilt.apply_command(ReducerCommand::AddToQueue("beta".to_string()));
+        assert_eq!(
+            rebuilt.display_status("beta"),
+            "queued",
+            "a fresh reducer starts from retained queue intent alone"
+        );
+        assert!(rebuilt.blocker_view("beta").is_none());
+
+        rebuilt.reconcile_dependency_blocker("beta", &["alpha".to_string()]);
+        assert_eq!(rebuilt.display_status("beta"), "blocked");
+        assert_eq!(
+            rebuilt.blocker_view("beta").expect("blocker").dependencies,
+            vec!["alpha".to_string()]
+        );
+    }
+
+    /// Resolution clears the wait exactly once and hands the row back to its
+    /// retained queue intent — and nothing else's hold is cleared with it.
+    #[test]
+    fn dependency_blocker_projection_resolution() {
+        let mut state = OrchestratorState::new(vec!["beta".to_string(), "held".to_string()], 0);
+        state.apply_command(ReducerCommand::AddToQueue("beta".to_string()));
+        state.apply_command(ReducerCommand::AddToQueue("held".to_string()));
+        state.reconcile_dependency_blocker("beta", &["alpha".to_string()]);
+
+        assert!(state.clear_dependency_blocker("beta"));
+        assert_eq!(
+            state.display_status("beta"),
+            "queued",
+            "the retained queue intent decides the display again"
+        );
+        assert!(state.blocker_view("beta").is_none());
+        assert!(
+            !state.clear_dependency_blocker("beta"),
+            "clearing an already-cleared wait changes nothing"
+        );
+
+        // An unrelated hold belongs to another owner and survives dependency
+        // evidence about a different change.
+        state.runtime_entry("held").transition_to_stalled(
+            "acceptance_finding",
+            "no progress",
+            "snapshot",
+        );
+        assert!(!state.clear_dependency_blocker("held"));
+        assert_eq!(state.display_status("held"), "stalled");
+    }
+
+    /// A ready change waiting only for an execution slot keeps plain `queued`:
+    /// the projection reports the blockers classification found, and fabricates
+    /// none.
+    #[test]
+    fn dependency_blocker_projection_capacity_only() {
+        let mut state = OrchestratorState::new(vec!["ready".to_string()], 0);
+        state.apply_command(ReducerCommand::AddToQueue("ready".to_string()));
+
+        // Classification found nothing unresolved, so the withdrawal path runs
+        // and leaves the row exactly as it was.
+        assert!(!state.clear_dependency_blocker("ready"));
+        assert_eq!(state.display_status("ready"), "queued");
+        assert!(
+            state.blocker_view("ready").is_none(),
+            "an occupied execution slot is not a blocker"
+        );
+        let rt = state.change_runtime("ready").expect("runtime entry");
+        assert_eq!(rt.wait_state, WaitState::None);
+        assert_eq!(rt.blocker_kind(), BlockerKind::None);
+    }
+
+    /// A terminal or active row is never decorated with a dependency wait: the
+    /// reconciliation path applies exactly the guard the transition path does.
+    #[test]
+    fn dependency_blocker_projection_refuses_terminal_and_active_rows() {
+        let mut state = OrchestratorState::new(vec!["done".to_string(), "running".to_string()], 0);
+        state.runtime_entry("done").terminal = TerminalState::Merged;
+        state.runtime_entry("running").activity = ActivityState::Applying;
+
+        assert!(!state.reconcile_dependency_blocker("done", &["alpha".to_string()]));
+        assert!(!state.reconcile_dependency_blocker("running", &["alpha".to_string()]));
+        assert_eq!(state.display_status("done"), "merged");
+        assert_eq!(state.display_status("running"), "applying");
     }
 }

@@ -1446,6 +1446,7 @@ fn change_resource() -> ChangeResource {
             prerequisite_owner: Some("platform".to_string()),
             origin: Some("analyze".to_string()),
             resumable: true,
+            dependencies: vec!["another-change".to_string()],
         }),
         error_detail: Some("sanitized change error".to_string()),
         actions: ChangeActions {

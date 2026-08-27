@@ -755,6 +755,15 @@ pub struct ChangeBlocker {
     pub origin: Option<String>,
     /// Whether work resumes once the prerequisite is satisfied.
     pub resumable: bool,
+    /// Current unresolved dependency IDs for a `dependency` wait.
+    ///
+    /// Empty for every other kind. Published as its own list so a client that
+    /// has to know *which* proposal it is waiting on never parses `detail`.
+    ///
+    /// `#[serde(default)]` so a client built against this contract can still
+    /// read an owner that predates structured dependency projection.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }
 
 /// Why an operator action is refused right now.
@@ -874,10 +883,19 @@ pub enum ParallelBlockedReason {
     NotCommitted,
     /// The change has uncommitted or untracked files under its directory.
     UncommittedChanges,
+    /// The change is currently held by an unresolved proposal dependency.
+    ///
+    /// Unlike the two workspace observations, this one is transient and clears
+    /// itself: the owner resumes the change as soon as repository-visible
+    /// evidence proves every dependency integrated. It is published so an empty
+    /// execution slot next to a `blocked` row is explained rather than left
+    /// looking like a ready change nobody dispatched.
+    DependencyBlocked,
 }
 
 /// Every parallel-eligibility blocked reason, in capability-advertised order.
-pub const ALL_PARALLEL_BLOCKED_REASONS: [&str; 2] = ["not_committed", "uncommitted_changes"];
+pub const ALL_PARALLEL_BLOCKED_REASONS: [&str; 3] =
+    ["not_committed", "uncommitted_changes", "dependency_blocked"];
 
 /// Process-wide worktree execution runtime facts.
 ///

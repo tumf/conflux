@@ -1106,6 +1106,10 @@ mod enabled {
             },
             origin: Some("apply".to_string()),
             resumable: true,
+            dependencies: match kind {
+                BlockerKind::Dependency => vec!["upstream".to_string()],
+                _ => Vec::new(),
+            },
         };
         ChangeResource {
             actions: conflux::web::remote_control_api::projection::change_actions_for_test(

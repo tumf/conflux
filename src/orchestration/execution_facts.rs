@@ -819,6 +819,17 @@ pub fn project_execution_state(
             ChangeExecutionState::Active
         };
     }
+    // A dependency wait is a dispatch exclusion applied to admitted queue
+    // intent: no execution episode has started, and the retained intent is what
+    // will dispatch the change once the dependency resolves. It therefore stays
+    // `queued` here, and the `blocked` display plus the structured dependency
+    // blocker are what explain *why* the slot is empty. Every other wait state
+    // holds an episode that already began, so it stays `waiting`.
+    if matches!(runtime.wait_state, WaitState::DependencyBlocked)
+        && matches!(runtime.queue_intent, QueueIntent::Queued)
+    {
+        return ChangeExecutionState::Queued;
+    }
     if !matches!(runtime.wait_state, WaitState::None) {
         return ChangeExecutionState::Waiting;
     }

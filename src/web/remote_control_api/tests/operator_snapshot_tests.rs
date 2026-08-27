@@ -580,6 +580,7 @@ fn a_non_resumable_hold_is_never_advertised_as_retryable() {
         prerequisite_owner: None,
         origin: None,
         resumable: true,
+        dependencies: Vec::new(),
     };
     let stuck = ChangeBlocker {
         resumable: false,
@@ -1609,6 +1610,10 @@ fn every_stable_reason_token_round_trips_as_snake_case() {
             ParallelBlockedReason::UncommittedChanges,
             "uncommitted_changes",
         ),
+        (
+            ParallelBlockedReason::DependencyBlocked,
+            "dependency_blocked",
+        ),
     ] {
         assert_eq!(serde_json::to_value(reason).unwrap(), json!(token));
     }
@@ -1809,4 +1814,172 @@ fn settled_apply_limit_retired_token_remains_deserializable() {
     let actions = change_actions_for_test("running", "error", None);
     assert!(actions.retry_change.allowed);
     assert_eq!(actions.retry_change.blocked_reason, None);
+}
+
+// ============================================================================
+// Dependency blocker projection — the complete snapshot contract
+//
+// Integration scope: these drive the real reducer, the real operator facts
+// store, and the real `/api/v2` projection, so what they assert is what a
+// controller reading `GET /api/v2/state` actually receives.
+// ============================================================================
+
+/// A queued change with an unresolved dependency publishes every field an
+/// operator needs to tell dependency exclusion from a capacity wait: `blocked`,
+/// retained queue intent, `parallel_eligible=false`, and the structured
+/// dependency blocker naming what it waits on.
+#[tokio::test]
+async fn dependency_blocker_projection_initial_publishes_the_complete_snapshot_contract() {
+    use crate::orchestration::state::ReducerCommand;
+
+    let (web_state, reducer, _) = wired_web_state(&["beta"]).await;
+    let changes = vec![change("beta")];
+    web_state.update(&changes).await;
+    // Committed and clean, so the workspace observation alone would report the
+    // change as parallel eligible — which is exactly the reading the live
+    // project saw next to an empty execution slot.
+    web_state
+        .apply_execution_event(&changes_refreshed(
+            changes.clone(),
+            &["beta"],
+            &[],
+            HashMap::new(),
+        ))
+        .await;
+    reducer
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("beta".to_string()));
+
+    web_state.sync_remote_control_projection().await;
+    let (snapshot, _, _) = web_state.remote_control().projection().snapshot();
+    let before = snapshot
+        .changes
+        .iter()
+        .find(|c| c.id == "beta")
+        .expect("beta must be projected");
+    assert_eq!(before.display_status, "queued");
+    assert!(before.parallel.eligible);
+
+    reducer
+        .write()
+        .await
+        .reconcile_dependency_blocker("beta", &["alpha".to_string()]);
+    web_state.sync_remote_control_projection().await;
+
+    let (snapshot, _, _) = web_state.remote_control().projection().snapshot();
+    let projected = snapshot
+        .changes
+        .iter()
+        .find(|c| c.id == "beta")
+        .expect("beta must be projected");
+
+    assert_eq!(projected.display_status, "blocked");
+    assert_eq!(
+        projected.queue_intent,
+        QueueIntent::Queued,
+        "the admitted queue intent is retained through the wait"
+    );
+    assert!(
+        !projected.parallel.eligible,
+        "a withheld change must not be published as eligible next to an empty slot"
+    );
+    assert_eq!(
+        projected.parallel.blocked_reason,
+        Some(ParallelBlockedReason::DependencyBlocked)
+    );
+
+    let blocker = projected.blocker.as_ref().expect("structured blocker");
+    assert_eq!(blocker.kind, BlockerKind::Dependency);
+    assert_eq!(blocker.dependencies, vec!["alpha".to_string()]);
+    assert_eq!(blocker.status, "blocked");
+    assert!(blocker
+        .unblock_condition
+        .as_deref()
+        .is_some_and(|condition| condition.contains("alpha")));
+}
+
+/// A ready change that is only waiting for an occupied execution slot stays
+/// plain `queued`, eligible, and blocker-free. Without this control the
+/// projection above could be satisfied by blocking everything.
+#[tokio::test]
+async fn dependency_blocker_projection_capacity_only_stays_queued_without_a_blocker() {
+    use crate::orchestration::state::ReducerCommand;
+
+    let (web_state, reducer, _) = wired_web_state(&["ready", "held"]).await;
+    let changes = vec![change("ready"), change("held")];
+    web_state.update(&changes).await;
+    web_state
+        .apply_execution_event(&changes_refreshed(
+            changes.clone(),
+            &["ready", "held"],
+            &[],
+            HashMap::new(),
+        ))
+        .await;
+
+    {
+        let mut guard = reducer.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue("ready".to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue("held".to_string()));
+        // Only `held` has an unresolved dependency; `ready` is genuinely ready
+        // and merely unscheduled.
+        guard.reconcile_dependency_blocker("held", &["alpha".to_string()]);
+    }
+    web_state.sync_remote_control_projection().await;
+
+    let (snapshot, _, _) = web_state.remote_control().projection().snapshot();
+    let by_id: HashMap<&str, _> = snapshot
+        .changes
+        .iter()
+        .map(|change| (change.id.as_str(), change))
+        .collect();
+
+    assert_eq!(by_id["ready"].display_status, "queued");
+    assert!(
+        by_id["ready"].blocker.is_none(),
+        "an occupied slot is not a dependency blocker and must not be fabricated as one"
+    );
+    assert!(by_id["ready"].parallel.eligible);
+    assert!(by_id["ready"].parallel.blocked_reason.is_none());
+
+    assert_eq!(by_id["held"].display_status, "blocked");
+    assert!(!by_id["held"].parallel.eligible);
+}
+
+/// The dependency downgrade never overwrites a workspace observation: an
+/// uncommitted proposal keeps the reason its operator can actually act on.
+#[tokio::test]
+async fn dependency_blocker_projection_keeps_the_actionable_workspace_reason() {
+    use crate::orchestration::state::ReducerCommand;
+
+    let (web_state, reducer, _) = wired_web_state(&["dirty"]).await;
+    let changes = vec![change("dirty")];
+    web_state.update(&changes).await;
+    web_state
+        .apply_execution_event(&changes_refreshed(
+            changes.clone(),
+            &["dirty"],
+            &["dirty"],
+            HashMap::new(),
+        ))
+        .await;
+    {
+        let mut guard = reducer.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue("dirty".to_string()));
+        guard.reconcile_dependency_blocker("dirty", &["alpha".to_string()]);
+    }
+    web_state.sync_remote_control_projection().await;
+
+    let (snapshot, _, _) = web_state.remote_control().projection().snapshot();
+    let projected = snapshot
+        .changes
+        .iter()
+        .find(|c| c.id == "dirty")
+        .expect("dirty must be projected");
+    assert_eq!(
+        projected.parallel.blocked_reason,
+        Some(ParallelBlockedReason::UncommittedChanges),
+        "committing the proposal is the action the operator can take; a dependency clears itself"
+    );
 }

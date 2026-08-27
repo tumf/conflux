@@ -625,6 +625,7 @@ mod tests {
             prerequisite_owner: Some("release".to_string()),
             origin: Some("apply".to_string()),
             resumable: true,
+            dependencies: Vec::new(),
         }
     }
 

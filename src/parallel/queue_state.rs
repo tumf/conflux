@@ -658,6 +658,60 @@ impl ParallelExecutor {
         false
     }
 
+    /// Publish the current unresolved dependency set into reducer projection.
+    ///
+    /// Called on *every* coherent classification, never behind
+    /// [`Self::should_emit_dependency_blocked_transition`]. The fingerprint
+    /// store decides whether another operator diagnostic is worth emitting; it
+    /// is not current-state authority, and using it as one is what let a
+    /// refreshed or replaced reducer report an unresolved dependency wait as
+    /// plain `queued` with no blocker.
+    ///
+    /// Nothing durable is written: this is in-memory reducer state for one
+    /// process lifetime, reconstructed from repository-visible classification
+    /// on the next pass.
+    async fn reconcile_dependency_blocker_projection(
+        &self,
+        change_id: &str,
+        dependency_ids: &[String],
+    ) {
+        let Some(shared) = &self.shared_orchestrator_state else {
+            return;
+        };
+        let changed = {
+            let mut guard = shared.write().await;
+            guard.reconcile_dependency_blocker(change_id, dependency_ids)
+        };
+        if changed {
+            debug!(
+                change_id,
+                dependency_ids = ?dependency_ids,
+                "Reconciled dependency blocker into reducer projection"
+            );
+        }
+    }
+
+    /// Withdraw a dependency wait once classification found nothing unresolved.
+    ///
+    /// Unconditional for the same reason the publish side is: the retained
+    /// queue intent must decide the display again as soon as the evidence says
+    /// so, whether or not a `DependencyResolved` diagnostic edge was emitted.
+    async fn clear_dependency_blocker_projection(&self, change_id: &str) {
+        let Some(shared) = &self.shared_orchestrator_state else {
+            return;
+        };
+        let cleared = {
+            let mut guard = shared.write().await;
+            guard.clear_dependency_blocker(change_id)
+        };
+        if cleared {
+            debug!(
+                change_id,
+                "Cleared dependency blocker projection after repository-visible resolution"
+            );
+        }
+    }
+
     async fn emit_dependency_blocker_diagnostic(
         &self,
         change_id: &str,
@@ -895,6 +949,15 @@ impl ParallelExecutor {
                             error
                         );
                         warn!("{}", message);
+                        // Unreadable dependency metadata is still a current
+                        // dependency wait: project it before the diagnostic
+                        // gate, so a suppressed duplicate cannot leave the row
+                        // looking plainly `queued`.
+                        self.reconcile_dependency_blocker_projection(
+                            change_id,
+                            std::slice::from_ref(change_id),
+                        )
+                        .await;
                         if self.should_emit_dependency_blocked_transition(
                             change_id,
                             &[(change_id.clone(), DependencyTargetClass::Error)],
@@ -1004,6 +1067,12 @@ impl ParallelExecutor {
                 }
 
                 if !unresolved_deps.is_empty() {
+                    // State first, diagnostics second. The projection describes
+                    // what is true right now and is rebuilt on every coherent
+                    // classification; the events below describe a *transition*
+                    // and stay deduplicated per blocker fingerprint.
+                    self.reconcile_dependency_blocker_projection(change_id, &unresolved_deps)
+                        .await;
                     if self.should_emit_dependency_blocked_transition(change_id, &blockers) {
                         info!(
                             "Change '{}' blocked: waiting for dependencies {:?}",
@@ -1023,12 +1092,18 @@ impl ParallelExecutor {
                         debug!(
                             change_id,
                             blockers = ?blockers,
-                            "Suppressing repeated dependency blocked transition"
+                            "Suppressing repeated dependency blocked transition while the current \
+                             blocker projection stays reconciled"
                         );
                     }
                     continue;
                 }
             }
+
+            // Nothing is unresolved for this change any more, so the dependency
+            // wait is withdrawn from the projection unconditionally — the
+            // retained queue intent decides the display again from here.
+            self.clear_dependency_blocker_projection(change_id).await;
 
             // Check if this change was previously blocked and is now resolved.
             // Clearing the in-memory fingerprint makes the next blocked observation a new transition.
@@ -3836,6 +3911,12 @@ impl ParallelExecutor {
         }
 
         for (change_id, blockers) in &blocked {
+            // The blocker epoch bounds *events*, not state: the current failed
+            // dependency set is reconciled into the projection on every pass so
+            // a rebuilt reducer still reports the wait.
+            self.reconcile_dependency_blocker_projection(change_id, blockers)
+                .await;
+
             if !self.failed_tracker.begin_blocker_epoch(change_id, blockers) {
                 debug!(
                     change_id = %change_id,
