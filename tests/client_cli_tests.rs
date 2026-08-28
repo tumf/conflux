@@ -3378,25 +3378,225 @@ mod enabled {
         owner.stop().await;
     }
 
+    /// A row that vanishes mid-wait is neither finished nor a bad target.
+    ///
+    /// This is the case initial-absence classification must not swallow: the
+    /// change was really observed, so its disappearance is ambiguous and only
+    /// the repository can end the wait. The snapshot edits are placed by request
+    /// ordering rather than by a sleep — entry N runs strictly between the
+    /// (N-1)th and Nth observation — so a wait that ended at the wrong one is
+    /// caught by the state-read count rather than by a clock.
     #[tokio::test]
     async fn wait_does_not_treat_disappearance_as_completion() {
         let repo = Fixture::new();
         repo.stage_active("alpha");
 
+        let api = ApiSpy::new();
+        let spy = SpyExecutor::new();
+        let owner = Owner::start_intercepted(Some(spy.clone()), None, api.clone()).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "applying")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let projection = owner.projection.clone();
+        let repo_path = repo.path().to_path_buf();
+        api.inject_before_state_reads(vec![
+            // The first observation knows the change, so everything after it is
+            // about a row this wait has really seen.
+            Box::new(|| {}),
+            // Gone by the second one, with no archive entry anywhere: nothing
+            // here proves anything finished, and nothing makes it a typo either.
+            Box::new(move || {
+                projection.apply_state(
+                    "test_snapshot",
+                    None,
+                    serde_json::json!({}),
+                    snapshot("select", vec![change("beta", "select", "not queued")]),
+                );
+            }),
+            // Only the evidence ends it.
+            Box::new(move || archive_in(&repo_path, "alpha")),
+        ]);
+
+        let output = spawn_wait(&owner, repo.path(), "alpha", None)
+            .await
+            .unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "completed",
+            "only repository evidence may end this wait, stderr={}",
+            stderr_of(&output)
+        );
+        let state_reads = api
+            .requests()
+            .iter()
+            .filter(|request| *request == "GET /api/v2/state")
+            .count();
+        assert!(
+            state_reads >= 3,
+            "the wait must have observed the disappearance and kept going rather than \
+             concluding at it: {state_reads} state reads"
+        );
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    // ------------------------------------------------------------------------
+    // wait_refuses_unknown_change
+    // ------------------------------------------------------------------------
+    //
+    // Absence on the *first* coherent observation is the one absence that
+    // answers itself: no row was ever there, so none can start moving, and the
+    // documented unbounded default would otherwise turn a mistyped change-id
+    // into a wait that never returns. The repository still gets one question
+    // first, because "already archived" is the ordinary reason a proposal is
+    // missing from the snapshot.
+
+    /// The refusal, proven without a clock that could have produced it.
+    ///
+    /// No `--timeout` at all: an implementation that kept observing an unknown
+    /// target never reaches the assertion, which is exactly the bug.
+    #[tokio::test]
+    async fn wait_refuses_unknown_change_rather_than_waiting_for_a_row_that_cannot_appear() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+        let head_before = repo.git(&["rev-parse", "HEAD"]);
+
         let spy = SpyExecutor::new();
         let owner = Owner::start(Some(spy.clone()), None).await;
-        // The change is simply not in the snapshot, and base holds no archive
-        // entry. Nothing here proves anything finished.
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let output = spawn_wait(&owner, repo.path(), "aaaa", None).await.unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "change_not_found",
+            "stderr={}",
+            stderr_of(&output)
+        );
+        assert!(!parsed["ok"].as_bool().unwrap());
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(parsed["change_id"], "aaaa");
+        assert!(
+            parsed["instance_id"]
+                .as_str()
+                .is_some_and(|instance| !instance.is_empty()),
+            "the refusal must name the owner it observed: {parsed}"
+        );
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(spy.call_count(), 0, "wait must submit no command");
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+        assert_eq!(
+            repo.git(&["status", "--porcelain"]),
+            "",
+            "wait must leave the worktree clean"
+        );
+        owner.stop().await;
+    }
+
+    /// The same refusal outranks a deadline the caller did supply.
+    ///
+    /// The budget is generous on purpose: if the refusal ever regressed into
+    /// "keep observing", this returns `timeout` instead of hanging, and the
+    /// outcome assertion is what fails.
+    #[tokio::test]
+    async fn wait_refuses_unknown_change_before_its_deadline_rather_than_at_it() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let output = wait_for(&owner, repo.path(), "aaaa", "5s").await;
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "change_not_found",
+            "an unknown target must be refused, not waited out, stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// An archived proposal is absent for the best possible reason.
+    ///
+    /// The repository, not the snapshot, decides this one: refusing a finished
+    /// change as a bad target would be the expensive half of the mistake, since
+    /// waiting on a change that just completed is the normal thing to do.
+    #[tokio::test]
+    async fn wait_refuses_unknown_change_only_when_the_repository_cannot_certify_it() {
+        let repo = Fixture::new();
+        // Never active in this repository's history: archived and gone, which is
+        // exactly the shape an owner stops tracking.
+        repo.archive("alpha");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
         owner.publish(snapshot(
             "select",
             vec![change("beta", "select", "not queued")],
         ));
         owner.contract(merged_contract("main"));
 
+        let output = spawn_wait(&owner, repo.path(), "alpha", None)
+            .await
+            .unwrap();
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "completed",
+            "certified completion must outrank an unknown-target refusal, stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(parsed["detail"]["terminal_mode"], "merged");
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// Idle is not unknown.
+    ///
+    /// `not queued` is a row the owner can still admit by itself, so refusing it
+    /// as a bad target would break the ordinary "mark it, then wait for it"
+    /// sequence. It has to reach the caller's own deadline instead.
+    #[tokio::test]
+    async fn wait_refuses_unknown_change_without_refusing_a_known_unqueued_row() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+        owner.contract(merged_contract("main"));
+
         let output = wait_for(&owner, repo.path(), "alpha", "300ms").await;
         let parsed = envelope(&output);
-        assert_eq!(parsed["outcome"], "timeout");
-        assert!(!parsed["ok"].as_bool().unwrap());
+        assert_eq!(
+            parsed["outcome"],
+            "timeout",
+            "a tracked idle row must keep observing, stderr={}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(19));
         assert_eq!(spy.call_count(), 0);
         owner.stop().await;
     }

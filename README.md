@@ -187,6 +187,15 @@ or `archived` row still has to be certified from the repository; it gets one
 bounded re-observation for evidence that landed a moment late, and then either
 `completed` or the same `change_requires_action`.
 
+**A target the owner never had is refused, not waited out.** A change missing
+from the *first* coherent observation gets one bounded repository certification —
+"already archived" is the ordinary reason a proposal is absent — and otherwise
+returns `change_not_found` (exit `9`) immediately, naming the requested change,
+the observed owner, and `detail.commands_submitted: 0`. That is what stops
+`cflx client wait aaaa` from hanging forever under the unbounded default.
+Disappearance *after* the row was observed keeps its existing meaning: it proves
+nothing, so the wait keeps going until the repository answers.
+
 **Accepted is not completion.** A settled control command proves the owner took
 the intent, nothing more, and a settled mark proves less still. `wait` is the
 observation-only counterpart: it submits no command and returns `completed` only
