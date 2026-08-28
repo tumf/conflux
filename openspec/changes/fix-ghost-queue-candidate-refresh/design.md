@@ -29,6 +29,10 @@ A long-lived owner may observe the reducer command and repository update in eith
 - Incomplete reducer evidence retains the hint fail-closed.
 - A truly absent candidate cannot launch Apply.
 - Marks and queue intent remain separate axes.
+- Reconciling unavailable queue intent must not make an unchanged stable mark level-trigger the same admission again. Existing mark-settlement epochs remain edge-triggered; if that cannot be preserved, the unavailable result needs a typed non-queued disposition that prevents an admit/reconcile loop without revoking the mark.
+- Repository creation can race the fresh absence check and the reducer transition. The transition must use the current reducer revision, must not overwrite concurrent reducer changes, and must leave the mark available for the next explicit Start or mark-settlement edge. It must never launch from an absence result.
+
+API and TUI controls converge through the same reducer command and scheduler admission path. Regression coverage should exercise that shared command boundary directly rather than infer route alignment only from helper behavior.
 
 ## Verification shape
 
