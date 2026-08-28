@@ -40,6 +40,15 @@ pub(super) struct QueueReconciliationOutcome {
     /// that had no scheduler-local work, no wake edge, and no typed wait behind
     /// it.
     pub unavailable_reconciled: usize,
+    /// Queued intent left exactly as it was because the archived-dirty repair
+    /// probe produced no answer at all.
+    ///
+    /// This is the counterpart of [`Self::unavailable_reconciled`], and the two
+    /// are mutually exclusive per change: a settle needs proven absence, and an
+    /// undetermined repair precondition is not proof of anything. Counted so a
+    /// deferral is observable rather than indistinguishable from a pass that
+    /// simply found nothing to do.
+    pub repair_evidence_deferred: usize,
 }
 
 /// What one scheduler pass's explicit-retry Step 0 found.
@@ -204,6 +213,24 @@ enum FreshCandidateLookup {
     Absent,
     /// The catalog could not be read, so absence is unproven.
     Unreadable(String),
+}
+
+/// What one archived-dirty repair probe proved about a reducer-queued change
+/// the pass's active-change catalog view could not load.
+///
+/// Mirrors [`FreshCandidateLookup`] on purpose: "no archived-dirty repair
+/// candidate applies" and "the repair evidence could not be gathered" are
+/// different facts, and only the first is a precondition the missing-candidate
+/// verdict may be built on.
+enum ArchivedDirtyRepairEvidence {
+    /// The change has a repairable archived-dirty workspace revision.
+    Candidate(Box<crate::openspec::Change>),
+    /// The evidence was read and proves no archived-dirty repair applies.
+    NotApplicable,
+    /// The evidence could not be gathered, so repair availability is unproven.
+    ///
+    /// Carries the bounded reason the probe could not answer, for diagnostics.
+    Undetermined(&'static str),
 }
 
 use super::cleanup::WorkspaceCleanupGuard;
@@ -2925,7 +2952,7 @@ impl ParallelExecutor {
                         base_branch_for_archived_dirty_repair =
                             Some(self.resolve_archived_dirty_repair_base_branch().await);
                     }
-                    let archived_dirty_candidate = if let Some(base_branch) =
+                    let archived_dirty_evidence = if let Some(base_branch) =
                         base_branch_for_archived_dirty_repair
                             .as_ref()
                             .and_then(|branch| branch.as_ref())
@@ -2936,48 +2963,84 @@ impl ParallelExecutor {
                             .await
                         {
                             Ok(Some(workspace)) => {
-                                archived_dirty_repair_candidate_from_workspace(
+                                match archived_dirty_repair_candidate_from_workspace(
                                     &queued_id,
                                     &workspace.path,
                                     base_branch,
                                 )
                                 .await
+                                {
+                                    Some(change) => {
+                                        ArchivedDirtyRepairEvidence::Candidate(Box::new(change))
+                                    }
+                                    None => ArchivedDirtyRepairEvidence::NotApplicable,
+                                }
                             }
-                            Ok(None) => None,
+                            Ok(None) => ArchivedDirtyRepairEvidence::NotApplicable,
                             Err(error) => {
+                                // The workspace question was asked and produced
+                                // no answer. "This change has no repairable
+                                // workspace" is exactly what was *not* proven,
+                                // so the row keeps its intent.
                                 warn!(
                                     change_id = %queued_id,
                                     "Failed to find workspace for reducer-queued archived dirty repair candidate: {}",
                                     error
                                 );
-                                None
+                                ArchivedDirtyRepairEvidence::Undetermined("workspace_lookup_failed")
                             }
                         }
                     } else {
-                        None
+                        // Base identity is a precondition of the repair probe,
+                        // not a repair verdict: without it the probe never ran.
+                        ArchivedDirtyRepairEvidence::Undetermined("base_branch_unresolved")
                     };
 
-                    if let Some(change) = archived_dirty_candidate {
-                        info!(
-                            "Queue reconciliation adding archived dirty repair candidate: {}",
-                            queued_id
-                        );
-                        self.emit_queue_reconciliation_diagnostic(
-                            QueueReconciliationDiagnosticLevel::Info,
-                            &queued_id,
-                            "archived_dirty_repair_candidate",
-                        )
-                        .await;
-                        queued.push(change);
-                        outcome.repair_added += 1;
-                    } else {
-                        self.resolve_missing_queued_candidate(
-                            &queued_id,
-                            queued,
-                            &mut outcome,
-                            snapshot,
-                        )
-                        .await;
+                    match archived_dirty_evidence {
+                        ArchivedDirtyRepairEvidence::Candidate(change) => {
+                            info!(
+                                "Queue reconciliation adding archived dirty repair candidate: {}",
+                                queued_id
+                            );
+                            self.emit_queue_reconciliation_diagnostic(
+                                QueueReconciliationDiagnosticLevel::Info,
+                                &queued_id,
+                                "archived_dirty_repair_candidate",
+                            )
+                            .await;
+                            queued.push(*change);
+                            outcome.repair_added += 1;
+                        }
+                        ArchivedDirtyRepairEvidence::Undetermined(reason) => {
+                            // Settling here would build the ghost-row verdict on
+                            // a precondition nobody proved, and because mark
+                            // settlement is edge-triggered the revoked intent
+                            // would need an explicit operator Start to come
+                            // back. Defer exactly as an unreadable catalog does:
+                            // queue intent and the wake edge stay untouched, and
+                            // a pass that can read the evidence decides.
+                            debug!(
+                                change_id = %queued_id,
+                                reason,
+                                "Deferring missing queued candidate whose archived-dirty repair evidence is undetermined"
+                            );
+                            self.emit_queue_reconciliation_diagnostic(
+                                QueueReconciliationDiagnosticLevel::Info,
+                                &queued_id,
+                                "repair_evidence_unavailable",
+                            )
+                            .await;
+                            outcome.repair_evidence_deferred += 1;
+                        }
+                        ArchivedDirtyRepairEvidence::NotApplicable => {
+                            self.resolve_missing_queued_candidate(
+                                &queued_id,
+                                queued,
+                                &mut outcome,
+                                snapshot,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -3036,6 +3099,12 @@ impl ParallelExecutor {
     ///
     /// Execution marks are a separate axis and are never touched here: a failed
     /// admission is not an operator decision to unselect the proposal.
+    ///
+    /// Callers must only reach this with *conclusive* archived-dirty repair
+    /// evidence ([`ArchivedDirtyRepairEvidence::NotApplicable`]). An
+    /// undetermined repair probe is deferred by the caller, because the settle
+    /// path below spends accepted queue intent and an edge-triggered mark will
+    /// not restore it.
     pub(super) async fn resolve_missing_queued_candidate(
         &mut self,
         queued_id: &str,

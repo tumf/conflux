@@ -138,6 +138,7 @@ pub(super) struct TestWorkspaceManager {
     existing_workspaces: HashMap<String, WorkspaceInfo>,
     remove_existing_on_lookup: Arc<AtomicBool>,
     fail_original_branch: Arc<AtomicBool>,
+    fail_existing_workspace_lookup: Arc<AtomicBool>,
 }
 
 impl TestWorkspaceManager {
@@ -150,6 +151,7 @@ impl TestWorkspaceManager {
             existing_workspaces: HashMap::new(),
             remove_existing_on_lookup: Arc::new(AtomicBool::new(false)),
             fail_original_branch: Arc::new(AtomicBool::new(false)),
+            fail_existing_workspace_lookup: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -178,6 +180,15 @@ impl TestWorkspaceManager {
     #[allow(dead_code)]
     pub(super) fn with_failing_original_branch(self) -> Self {
         self.fail_original_branch.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Make workspace discovery fail the way a broken or racing worktree list
+    /// does: the question is asked and produces no answer at all, which is not
+    /// the same as answering "this change has no workspace".
+    pub(super) fn with_failing_existing_workspace_lookup(self) -> Self {
+        self.fail_existing_workspace_lookup
+            .store(true, Ordering::SeqCst);
         self
     }
 }
@@ -327,6 +338,9 @@ impl WorkspaceManager for TestWorkspaceManager {
         &mut self,
         change_id: &str,
     ) -> VcsResult<Option<WorkspaceInfo>> {
+        if self.fail_existing_workspace_lookup.load(Ordering::SeqCst) {
+            return Err(VcsError::git_command("worktree list unavailable"));
+        }
         if self.remove_existing_on_lookup.load(Ordering::SeqCst) {
             Ok(self.existing_workspaces.remove(change_id))
         } else {
@@ -7614,6 +7628,14 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
 
     let (tx, mut rx) = mpsc::channel(16);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    // The missing-candidate verdict is reached only on *conclusive* archived-dirty
+    // repair evidence, and this temp directory is not a Git repository. The double
+    // resolves a base branch and answers "no workspace", which is the conclusive
+    // negative this bounded-warning test is about; without it the pass would
+    // correctly defer instead of warning.
+    executor.set_workspace_manager(Box::new(TestWorkspaceManager::new(Arc::new(
+        AtomicUsize::new(0),
+    ))));
 
     let missing_change_id = "definitely-missing-candidate-for-reconciliation";
     let shared = Arc::new(RwLock::new(OrchestratorState::new(
