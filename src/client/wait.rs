@@ -43,6 +43,22 @@
 //! until someone retries it — so it releases with the same
 //! `change_requires_action`, carrying the blocker's own prerequisite facts.
 //!
+//! # A target the owner never had
+//!
+//! Absence means two different things depending on when it happens. A change
+//! that vanishes *mid-wait* may come back — the owner reprojects, an execution
+//! is re-admitted — so the completion contract keeps observing it and refuses to
+//! read the gap as either success or failure. A change that is missing from the
+//! very first coherent observation has nothing to come back from: no row was
+//! ever there to move, and an unbounded wait on a mistyped `change-id` would
+//! otherwise never return at all. That absence releases as `change_not_found`,
+//! the same typed refusal every other target-scoped client operation gives.
+//!
+//! The repository is still asked exactly once before the refusal, because the
+//! most ordinary reason a proposal is missing from the snapshot is that it
+//! already finished and was archived. Calling a completed change a typo would be
+//! the worse of the two errors.
+//!
 //! # One deadline, not several budgets
 //!
 //! `--timeout D` is a promise about the whole operation, so exactly one
@@ -192,6 +208,9 @@ pub async fn run(
     // second one is the last: the row cannot change, so a third look would read
     // the same two facts again.
     let mut uncertified_rounds = 0usize;
+    // Only the first coherent observation can say the owner never tracked this
+    // change. Every later one is looking at a change it has already seen.
+    let mut first_observation = true;
     loop {
         match evaluate(
             &observation,
@@ -200,6 +219,7 @@ pub async fn run(
             &repo_root,
             &contract,
             deadline,
+            first_observation,
         )
         .await
         {
@@ -236,6 +256,7 @@ pub async fn run(
                 }
             }
         }
+        first_observation = false;
 
         // Wake on published activity, and fall back to the poll cadence. The
         // budget never outlives the caller's deadline, so a quiet owner cannot
@@ -334,6 +355,7 @@ async fn evaluate(
     repo_root: &std::path::Path,
     contract: &OwnerExecutionContract,
     deadline: Option<Instant>,
+    first_observation: bool,
 ) -> Step {
     // Owner replacement first: everything below would otherwise be read from a
     // process that never saw the work this wait is about.
@@ -380,6 +402,37 @@ async fn evaluate(
     }
 
     let change = observation.change(change_id);
+
+    // A target the owner never tracked, answered before anything is classified:
+    // there is no status to read, no row to keep observing, and nothing that
+    // would make one appear. Only the *first* observation can say this, which is
+    // why later disappearance falls through to the certification path below and
+    // keeps its existing meaning.
+    if first_observation && change.is_none() {
+        return match certify(change_id, repo_root, contract, git_deadline(deadline)).await {
+            // Archived-and-gone is the ordinary reason a proposal is missing,
+            // and it is completion, not a bad target.
+            Verdict::Completed { evidence } => Step::settled(completed_envelope(
+                change_id,
+                instance_id,
+                contract,
+                evidence,
+            )),
+            // An expired deadline proves nothing about the repository, so the
+            // caller who asked for one hears about the clock rather than a
+            // refusal this operation never finished qualifying.
+            Verdict::DeadlineExpired => Step::Expired { detail: None },
+            // Missing, broken, and unverifiable evidence all fail to rescue an
+            // untracked target; the oracle's own reason travels with the
+            // refusal so a broken proof is still readable behind it.
+            Verdict::NotCompleted { detail }
+            | Verdict::Broken { detail }
+            | Verdict::Unsupported { detail } => {
+                Step::settled(unknown_change_envelope(change_id, instance_id, detail))
+            }
+        };
+    }
+
     let status = change.map(|change| change.display_status.as_str());
     let blocker = change.and_then(|change| change.blocker.as_ref());
     let error_detail = change.and_then(|change| change.error_detail.clone());
@@ -499,6 +552,32 @@ fn completed_envelope(
         .with_instance(Some(instance_id.to_string()))
         .with_message(evidence)
         .with_detail(detail)
+}
+
+/// The refusal that says the owner never had this proposal to begin with.
+///
+/// It is the same `change_not_found` every other target-scoped client operation
+/// returns, for the same reason: a target the owner does not track is a mistake
+/// in the request, not a state the caller can wait out. The oracle's reason for
+/// declining to certify it rides along in `evidence_detail`, because "absent
+/// from the snapshot" and "the repository does not show it finished either" are
+/// two separate facts and a caller looking at a surprise refusal needs both.
+fn unknown_change_envelope(
+    change_id: &str,
+    instance_id: &str,
+    evidence_detail: String,
+) -> ResultEnvelope {
+    ResultEnvelope::new(Operation::Wait, Outcome::ChangeNotFound)
+        .with_change(change_id)
+        .with_instance(Some(instance_id.to_string()))
+        .with_message(format!(
+            "the owner does not track a proposal named '{change_id}', and repository evidence does \
+             not prove one finished"
+        ))
+        .with_detail(serde_json::json!({
+            "commands_submitted": 0,
+            "evidence_detail": evidence_detail,
+        }))
 }
 
 /// The release that says "an operator has to look at this".
@@ -711,6 +790,29 @@ mod tests {
         );
         assert_eq!(envelope.detail["blocker"]["prerequisite_owner"], "release");
         assert_eq!(envelope.detail["blocker"]["resumable"], true);
+    }
+
+    /// The unknown-target refusal is the shared one, at the shared exit status.
+    ///
+    /// A caller that already branches on `change_not_found` for `mark` or
+    /// `force-stop-change` must not need a second spelling for `wait`, and the
+    /// refusal has to say it submitted nothing like every other wait result.
+    #[test]
+    fn an_unknown_target_is_refused_with_the_shared_outcome_and_submits_nothing() {
+        let envelope =
+            unknown_change_envelope("aaaa", "i-1", "no archive entry on 'main'".to_string());
+        assert_eq!(envelope.outcome, Outcome::ChangeNotFound);
+        assert!(!envelope.ok);
+        assert_eq!(envelope.exit_code(), 9);
+        assert_eq!(envelope.change_id.as_deref(), Some("aaaa"));
+        assert_eq!(envelope.instance_id.as_deref(), Some("i-1"));
+        assert_eq!(envelope.detail["commands_submitted"], 0);
+        // Both facts, not just the first: absent from the snapshot *and*
+        // unproven by the repository.
+        assert_eq!(
+            envelope.detail["evidence_detail"],
+            "no archive entry on 'main'"
+        );
     }
 
     /// Absent detail is omitted rather than nulled, the way every other optional

@@ -174,6 +174,19 @@ rather than holding forever on a verdict nobody will revise. Script the new
 outcome: an automatically progressing wait behaves exactly as before, but a
 change that needs a human now says so instead of never returning.
 
+**A target the owner never tracked is refused, not waited out.** Absence means
+two different things depending on when it happens. A change missing from the
+*first* coherent observation has no row to start moving, so it gets one bounded
+repository certification — a proposal that already finished and was archived is
+absent for the best possible reason, and returns `completed` — and otherwise
+releases immediately with `change_not_found` and exit status `9`, naming the
+requested `change_id`, the observed `instance_id`, and
+`detail.commands_submitted: 0`, with the oracle's own reason in
+`detail.evidence_detail`. That is what stops `cflx client wait aaaa` from waiting
+forever under the unbounded default. Absence *after* the change was observed is
+unchanged: disappearance proves nothing, so the wait keeps observing until the
+repository answers.
+
 **`wait` has no deadline unless you ask for one.** `--timeout` defaults to `0`,
 and `0` in any unit — `0`, `0s`, `0ms`, `0m`, `0h` — means "wait for as long as
 the work takes": the wait ends at verified completion, a typed failure, owner
