@@ -599,7 +599,9 @@ Scheduler reconciliation は reducer-visible queued work が analysis 対象へ�
 
 Reducer-visible queued reconciliation MUST NOT refresh an existing queue debounce timestamp merely because the same reducer-visible queued intent is reconstructed again from repository-visible OpenSpec state. Reconciliation MAY initialize the debounce timestamp when reducer-visible queued work is first reconstructed and no timestamp exists, but repeated rediscovery of the same reducer-owned queued state MUST allow the original debounce window to elapse or must be handled by the existing explicit queue-notification bypass rules.
 
-<!-- Expected canonical result after archive: stable marks specialize the existing explicit queue-addition edge without dropping diagnostic, debounce, or queued-only analysis guarantees. -->
+Accepted queue intent and scheduler candidate discovery MUST converge without requiring owner restart when the active OpenSpec catalog changes in the repository after owner startup. An admitted dynamic queue hint that initially cannot load its candidate MUST NOT be permanently consumed while leaving reducer-visible queued intent without scheduler-local work, a retained wake edge, or a typed wait/block state. The scheduler MUST re-evaluate against a fresh repository-visible active-change view and either admit the loadable candidate or explicitly reconcile genuinely unavailable queue intent out of the queued projection. This recovery MUST remain event-driven and MUST NOT add filesystem polling or out-of-worktree durable control state.
+
+<!-- Expected canonical result after archive: queued projection cannot remain as ghost work after a transient or genuine candidate catalog miss; the same live owner refreshes repository-visible candidates or explicitly reconciles unavailable intent. -->
 
 #### Scenario: missing queued candidate diagnostic is bounded
 
@@ -695,6 +697,35 @@ Reducer-visible queued reconciliation MUST NOT refresh an existing queue debounc
 - **WHEN** settlement completes without adding a loadable queued candidate
 - **THEN** no queue-addition reanalysis edge is created
 - **AND** existing debounce, blocked-only, and persistent-idle behavior remains unchanged
+
+#### Scenario: proposal added after owner startup is admitted without restart
+
+- **GIVEN** a live owner started before active proposal `alpha` existed in the base repository
+- **AND** the proposal is then committed or merged under `openspec/changes/alpha`
+- **WHEN** an operator marks and starts `alpha` through an API or TUI route
+- **AND** the first scheduler candidate lookup reports `candidate_not_found`
+- **THEN** the same owner re-evaluates a fresh repository-visible active-change view
+- **AND** `alpha` is added to scheduler-local queued work without owner restart
+- **AND** Apply can advance to an active phase when no independent gate blocks it
+
+#### Scenario: transient catalog miss retains an execution edge
+
+- **GIVEN** reducer-visible queued intent exists for `alpha`
+- **AND** an admitted dynamic queue hint for `alpha` has been popped
+- **WHEN** candidate discovery cannot yet prove whether the active proposal is loadable
+- **THEN** the scheduler does not discard the only wake edge while retaining a bare queued projection
+- **AND** a later relevant repository or reducer transition can re-evaluate `alpha`
+
+#### Scenario: genuinely absent candidate does not remain a ghost queue
+
+- **GIVEN** reducer-visible queued intent exists for `missing`
+- **AND** a fresh repository-visible active-change view proves `missing` is not loadable
+- **AND** no archived-dirty repair candidate or typed lane wait applies
+- **WHEN** scheduler reconciliation classifies the target
+- **THEN** no Apply process is dispatched
+- **AND** the reducer-visible state is explicitly reconciled so `missing` does not remain indefinitely as queued pending work
+- **AND** the diagnostic identifies the unavailable-candidate result without repeating on every loop
+- **AND** any independent execution mark is preserved unless an existing explicit transition revokes it
 
 ### Requirement: Workspace State Detection
 既存workspaceの再開時に、archive 状態をコミットメッセージではなく **コミットされたファイルの状態** で判定しなければならない（MUST）。

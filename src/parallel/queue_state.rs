@@ -31,6 +31,24 @@ pub(super) struct QueueReconciliationOutcome {
     pub repair_added: usize,
     /// Scheduler-local candidates dropped because reducer intent revoked them.
     pub revoked_removed: usize,
+    /// Queued intent explicitly reconciled away because a fresh
+    /// repository-visible view proved the change is not an active candidate.
+    ///
+    /// Counted separately from [`Self::revoked_removed`]: that one records an
+    /// operator revocation this pass merely observed, while this one records a
+    /// transition the scheduler itself submitted to stop a queued projection
+    /// that had no scheduler-local work, no wake edge, and no typed wait behind
+    /// it.
+    pub unavailable_reconciled: usize,
+    /// Queued intent left exactly as it was because the archived-dirty repair
+    /// probe produced no answer at all.
+    ///
+    /// This is the counterpart of [`Self::unavailable_reconciled`], and the two
+    /// are mutually exclusive per change: a settle needs proven absence, and an
+    /// undetermined repair precondition is not proof of anything. Counted so a
+    /// deferral is observable rather than indistinguishable from a pass that
+    /// simply found nothing to do.
+    pub repair_evidence_deferred: usize,
 }
 
 /// What one scheduler pass's explicit-retry Step 0 found.
@@ -174,7 +192,45 @@ impl BlockedOnlyQueueClassification {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueReconciliationDiagnosticLevel {
     Info,
+    /// A fresh repository-visible view made a previously missing candidate
+    /// loadable, and this pass admitted it.
+    Admitted,
+    /// An explicit reducer transition settled queued intent this pass proved
+    /// could never produce scheduler-local work.
+    Settled,
     Warn,
+}
+
+/// What one fresh repository-visible lookup proved about a queued candidate.
+///
+/// The three arms are deliberately distinct: "the catalog says no" and "the
+/// catalog could not be read" are not the same fact, and only the first may
+/// justify reconciling accepted queue intent away.
+enum FreshCandidateLookup {
+    /// The active-change catalog now contains the change.
+    Loadable(Box<crate::openspec::Change>),
+    /// The catalog was read successfully and does not contain the change.
+    Absent,
+    /// The catalog could not be read, so absence is unproven.
+    Unreadable(String),
+}
+
+/// What one archived-dirty repair probe proved about a reducer-queued change
+/// the pass's active-change catalog view could not load.
+///
+/// Mirrors [`FreshCandidateLookup`] on purpose: "no archived-dirty repair
+/// candidate applies" and "the repair evidence could not be gathered" are
+/// different facts, and only the first is a precondition the missing-candidate
+/// verdict may be built on.
+enum ArchivedDirtyRepairEvidence {
+    /// The change has a repairable archived-dirty workspace revision.
+    Candidate(Box<crate::openspec::Change>),
+    /// The evidence was read and proves no archived-dirty repair applies.
+    NotApplicable,
+    /// The evidence could not be gathered, so repair availability is unproven.
+    ///
+    /// Carries the bounded reason the probe could not answer, for diagnostics.
+    Undetermined(&'static str),
 }
 
 use super::cleanup::WorkspaceCleanupGuard;
@@ -2435,33 +2491,54 @@ impl ParallelExecutor {
                                 queued.push(new_change);
                                 queue_changed = true;
                             } else {
+                                // A hint is a wake-up edge, and this lookup is
+                                // only its *first* observation. The owner and
+                                // the repository update can happen in either
+                                // order, so consuming the hint here is not the
+                                // verdict: reconciliation runs later in this
+                                // same pass on the same reducer view and either
+                                // re-reads a fresh catalog that now loads the
+                                // change or explicitly settles the queued
+                                // intent. Nothing is left queued with no work,
+                                // no edge, and no typed wait behind it.
                                 warn!(
                                     "Dynamically added change '{}' not found in openspec",
                                     dynamic_id
                                 );
-                                send_event(
-                                    &self.event_tx,
-                                    ParallelEvent::Log(LogEntry::warn(format!(
-                                        "Queue reconciliation pending for '{}': candidate_not_found",
-                                        dynamic_id
-                                    ))),
+                                self.emit_queue_reconciliation_diagnostic(
+                                    QueueReconciliationDiagnosticLevel::Warn,
+                                    &dynamic_id,
+                                    "candidate_not_found",
                                 )
                                 .await;
                             }
                         }
                         Err(e) => {
+                            // Unreadable is not absent. The catalog produced no
+                            // answer at all, so this hint keeps its wake edge
+                            // instead of being spent on a lookup that never
+                            // happened, and ingestion stops so the rest of the
+                            // queue is judged by a pass that can read the
+                            // repository.
                             warn!(
                                 "Failed to load dynamically added change '{}': {}",
                                 dynamic_id, e
                             );
-                            send_event(
-                                &self.event_tx,
-                                ParallelEvent::Log(LogEntry::warn(format!(
-                                    "Queue reconciliation pending for '{}': candidate_load_failed ({})",
-                                    dynamic_id, e
-                                ))),
-                            )
-                            .await;
+                            if self.should_emit_queue_reconciliation_diagnostic(
+                                &dynamic_id,
+                                "candidate_load_failed",
+                            ) {
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Log(LogEntry::warn(format!(
+                                        "Queue reconciliation pending for '{}': candidate_load_failed ({})",
+                                        dynamic_id, e
+                                    ))),
+                                )
+                                .await;
+                            }
+                            queue.requeue_front(dynamic_id).await;
+                            break;
                         }
                     }
                 } else if in_flight.contains(&dynamic_id) {
@@ -2529,6 +2606,14 @@ impl ParallelExecutor {
         let message = match level {
             QueueReconciliationDiagnosticLevel::Info => LogEntry::info(format!(
                 "Queue reconciliation deferred for '{}': {}",
+                change_id, reason
+            )),
+            QueueReconciliationDiagnosticLevel::Admitted => LogEntry::info(format!(
+                "Queue reconciliation admitted '{}': {}",
+                change_id, reason
+            )),
+            QueueReconciliationDiagnosticLevel::Settled => LogEntry::info(format!(
+                "Queue reconciliation settled '{}': {}",
                 change_id, reason
             )),
             QueueReconciliationDiagnosticLevel::Warn => LogEntry::warn(format!(
@@ -2867,7 +2952,7 @@ impl ParallelExecutor {
                         base_branch_for_archived_dirty_repair =
                             Some(self.resolve_archived_dirty_repair_base_branch().await);
                     }
-                    let archived_dirty_candidate = if let Some(base_branch) =
+                    let archived_dirty_evidence = if let Some(base_branch) =
                         base_branch_for_archived_dirty_repair
                             .as_ref()
                             .and_then(|branch| branch.as_ref())
@@ -2878,60 +2963,84 @@ impl ParallelExecutor {
                             .await
                         {
                             Ok(Some(workspace)) => {
-                                archived_dirty_repair_candidate_from_workspace(
+                                match archived_dirty_repair_candidate_from_workspace(
                                     &queued_id,
                                     &workspace.path,
                                     base_branch,
                                 )
                                 .await
+                                {
+                                    Some(change) => {
+                                        ArchivedDirtyRepairEvidence::Candidate(Box::new(change))
+                                    }
+                                    None => ArchivedDirtyRepairEvidence::NotApplicable,
+                                }
                             }
-                            Ok(None) => None,
+                            Ok(None) => ArchivedDirtyRepairEvidence::NotApplicable,
                             Err(error) => {
+                                // The workspace question was asked and produced
+                                // no answer. "This change has no repairable
+                                // workspace" is exactly what was *not* proven,
+                                // so the row keeps its intent.
                                 warn!(
                                     change_id = %queued_id,
                                     "Failed to find workspace for reducer-queued archived dirty repair candidate: {}",
                                     error
                                 );
-                                None
+                                ArchivedDirtyRepairEvidence::Undetermined("workspace_lookup_failed")
                             }
                         }
                     } else {
-                        None
+                        // Base identity is a precondition of the repair probe,
+                        // not a repair verdict: without it the probe never ran.
+                        ArchivedDirtyRepairEvidence::Undetermined("base_branch_unresolved")
                     };
 
-                    if let Some(change) = archived_dirty_candidate {
-                        info!(
-                            "Queue reconciliation adding archived dirty repair candidate: {}",
-                            queued_id
-                        );
-                        self.emit_queue_reconciliation_diagnostic(
-                            QueueReconciliationDiagnosticLevel::Info,
-                            &queued_id,
-                            "archived_dirty_repair_candidate",
-                        )
-                        .await;
-                        queued.push(change);
-                        outcome.repair_added += 1;
-                    } else if self.should_emit_queue_reconciliation_diagnostic(
-                        &queued_id,
-                        "candidate_not_found",
-                    ) {
-                        warn!(
-                            "Queue reconciliation could not load reducer-queued change '{}': candidate_not_found",
-                            queued_id
-                        );
-                        self.emit_queue_reconciliation_diagnostic_without_dedupe(
-                            QueueReconciliationDiagnosticLevel::Warn,
-                            &queued_id,
-                            "candidate_not_found",
-                        )
-                        .await;
-                    } else {
-                        debug!(
-                            change_id = %queued_id,
-                            reason = "candidate_not_found",
-                            "Suppressing repeated queue reconciliation candidate_not_found warning"
-                        );
+                    match archived_dirty_evidence {
+                        ArchivedDirtyRepairEvidence::Candidate(change) => {
+                            info!(
+                                "Queue reconciliation adding archived dirty repair candidate: {}",
+                                queued_id
+                            );
+                            self.emit_queue_reconciliation_diagnostic(
+                                QueueReconciliationDiagnosticLevel::Info,
+                                &queued_id,
+                                "archived_dirty_repair_candidate",
+                            )
+                            .await;
+                            queued.push(*change);
+                            outcome.repair_added += 1;
+                        }
+                        ArchivedDirtyRepairEvidence::Undetermined(reason) => {
+                            // Settling here would build the ghost-row verdict on
+                            // a precondition nobody proved, and because mark
+                            // settlement is edge-triggered the revoked intent
+                            // would need an explicit operator Start to come
+                            // back. Defer exactly as an unreadable catalog does:
+                            // queue intent and the wake edge stay untouched, and
+                            // a pass that can read the evidence decides.
+                            debug!(
+                                change_id = %queued_id,
+                                reason,
+                                "Deferring missing queued candidate whose archived-dirty repair evidence is undetermined"
+                            );
+                            self.emit_queue_reconciliation_diagnostic(
+                                QueueReconciliationDiagnosticLevel::Info,
+                                &queued_id,
+                                "repair_evidence_unavailable",
+                            )
+                            .await;
+                            outcome.repair_evidence_deferred += 1;
+                        }
+                        ArchivedDirtyRepairEvidence::NotApplicable => {
+                            self.resolve_missing_queued_candidate(
+                                &queued_id,
+                                queued,
+                                &mut outcome,
+                                snapshot,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -2954,6 +3063,215 @@ impl ParallelExecutor {
         }
 
         outcome
+    }
+
+    /// Re-read the repository-visible active-change catalog for one ID.
+    ///
+    /// Deliberately a *second* read rather than a reuse of this pass's map. A
+    /// long-lived owner can observe the reducer command and the repository
+    /// update in either order, so the point of this lookup is that it happens
+    /// later in wall-clock time than the one that missed — a proposal committed
+    /// or merged into the base in between is visible here, and that is what lets
+    /// the same owner admit it without a restart.
+    fn refresh_active_change_candidate(&self, change_id: &str) -> FreshCandidateLookup {
+        match crate::openspec::list_changes_native_from(&self.repo_root) {
+            Ok(changes) => match changes.into_iter().find(|change| change.id == change_id) {
+                Some(change) => FreshCandidateLookup::Loadable(Box::new(change)),
+                None => FreshCandidateLookup::Absent,
+            },
+            Err(error) => FreshCandidateLookup::Unreadable(error.to_string()),
+        }
+    }
+
+    /// Classify one reducer-queued change this pass's catalog view could not load.
+    ///
+    /// The first lookup is never the verdict. It is re-checked against a fresh
+    /// repository-visible view, and only that decides:
+    ///
+    /// - loadable now — the proposal landed after this pass's first read, so the
+    ///   same owner admits it as ordinary scheduler-local work;
+    /// - unreadable — absence is unproven, so queue intent is left exactly as it
+    ///   was for a pass that can actually read the repository;
+    /// - genuinely absent — the queued projection has no scheduler-local work,
+    ///   no wake edge, and no typed wait behind it, so it is explicitly
+    ///   reconciled out through the reducer instead of being left as a
+    ///   permanently queued ghost row.
+    ///
+    /// Execution marks are a separate axis and are never touched here: a failed
+    /// admission is not an operator decision to unselect the proposal.
+    ///
+    /// Callers must only reach this with *conclusive* archived-dirty repair
+    /// evidence ([`ArchivedDirtyRepairEvidence::NotApplicable`]). An
+    /// undetermined repair probe is deferred by the caller, because the settle
+    /// path below spends accepted queue intent and an edge-triggered mark will
+    /// not restore it.
+    pub(super) async fn resolve_missing_queued_candidate(
+        &mut self,
+        queued_id: &str,
+        queued: &mut Vec<crate::openspec::Change>,
+        outcome: &mut QueueReconciliationOutcome,
+        snapshot: &ReducerWorkSnapshot,
+    ) {
+        match self.refresh_active_change_candidate(queued_id) {
+            FreshCandidateLookup::Loadable(change) => {
+                info!(
+                    change_id = %queued_id,
+                    "Queue reconciliation admitted a candidate that a refreshed active-change view made loadable"
+                );
+                self.emit_queue_reconciliation_diagnostic(
+                    QueueReconciliationDiagnosticLevel::Admitted,
+                    queued_id,
+                    "candidate_refreshed",
+                )
+                .await;
+                // The missing-candidate epoch ends with the miss it described:
+                // if this change ever goes missing again, that is a new fact and
+                // must be reportable rather than suppressed as a repeat.
+                self.clear_missing_candidate_diagnostic_epoch(queued_id);
+                queued.push(*change);
+                outcome.queued_added += 1;
+            }
+            FreshCandidateLookup::Unreadable(error) => {
+                if self
+                    .should_emit_queue_reconciliation_diagnostic(queued_id, "candidate_load_failed")
+                {
+                    warn!(
+                        change_id = %queued_id,
+                        "Queue reconciliation could not read the active-change catalog: {}",
+                        error
+                    );
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Log(LogEntry::warn(format!(
+                            "Queue reconciliation pending for '{}': candidate_load_failed ({})",
+                            queued_id, error
+                        ))),
+                    )
+                    .await;
+                } else {
+                    debug!(
+                        change_id = %queued_id,
+                        reason = "candidate_load_failed",
+                        "Suppressing repeated queue reconciliation catalog read failure"
+                    );
+                }
+            }
+            FreshCandidateLookup::Absent => {
+                if self
+                    .should_emit_queue_reconciliation_diagnostic(queued_id, "candidate_not_found")
+                {
+                    warn!(
+                        "Queue reconciliation could not load reducer-queued change '{}': candidate_not_found",
+                        queued_id
+                    );
+                    self.emit_queue_reconciliation_diagnostic_without_dedupe(
+                        QueueReconciliationDiagnosticLevel::Warn,
+                        queued_id,
+                        "candidate_not_found",
+                    )
+                    .await;
+                } else {
+                    debug!(
+                        change_id = %queued_id,
+                        reason = "candidate_not_found",
+                        "Suppressing repeated queue reconciliation candidate_not_found warning"
+                    );
+                }
+
+                if self
+                    .reconcile_unavailable_queue_intent(queued_id, snapshot)
+                    .await
+                {
+                    outcome.unavailable_reconciled += 1;
+                    info!(
+                        change_id = %queued_id,
+                        "Queue reconciliation removed queue intent whose candidate a fresh repository view proved unavailable"
+                    );
+                    self.emit_queue_reconciliation_diagnostic(
+                        QueueReconciliationDiagnosticLevel::Settled,
+                        queued_id,
+                        "candidate_unavailable",
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Forget the bounded missing-candidate diagnostics recorded for one change.
+    fn clear_missing_candidate_diagnostic_epoch(&mut self, change_id: &str) {
+        self.diagnostic_dedup.reset_matching(|key| {
+            matches!(
+                key,
+                DiagnosticDeduplicationKey::QueueReconciliation {
+                    change_id: recorded,
+                    reason,
+                } if recorded == change_id
+                    && (reason == "candidate_not_found" || reason == "candidate_load_failed")
+            )
+        });
+    }
+
+    /// Submit the explicit reducer transition that ends an unavailable queued row.
+    ///
+    /// Returns whether queue intent actually changed.
+    ///
+    /// Three properties make this safe to run from the scheduler:
+    ///
+    /// *It is refused whenever some other state already explains the row.* A
+    /// merge, resolve, reject, resolving, held, or externally blocked change is
+    /// a typed wait, not a ghost, and stays reducer-owned.
+    ///
+    /// *It reads the revision it mutates.* The absence check and this transition
+    /// are separate observations, so eligibility is re-read under the write
+    /// guard rather than trusted from the pass's snapshot. A change that became
+    /// active, terminal, or newly re-queued in between is a concurrent decision
+    /// this pass may not overwrite, and `RemoveFromQueue` is a single targeted
+    /// command rather than a state overwrite.
+    ///
+    /// *It leaves the change re-admittable.* `RemoveFromQueue` clears queue
+    /// intent without setting the dequeued flag and without touching the
+    /// execution mark, so the next explicit Start or mark-settlement edge can
+    /// admit the proposal once it really exists. Nothing here launches Apply.
+    async fn reconcile_unavailable_queue_intent(
+        &self,
+        change_id: &str,
+        snapshot: &ReducerWorkSnapshot,
+    ) -> bool {
+        if snapshot.merge_wait_ids().contains(change_id)
+            || snapshot.resolve_wait_ids().contains(change_id)
+            || snapshot.reject_wait_ids().contains(change_id)
+            || snapshot.resolving_ids().contains(change_id)
+            || snapshot.held_ids().contains(change_id)
+            || self.merge_wait_changes.contains(change_id)
+            || self.resolve_wait_changes.contains(change_id)
+            || self.reject_wait_changes.contains(change_id)
+        {
+            debug!(
+                change_id,
+                "Leaving unavailable queued candidate to its typed wait state"
+            );
+            return false;
+        }
+
+        let Some(shared) = &self.shared_orchestrator_state else {
+            return false;
+        };
+
+        let mut guard = shared.write().await;
+        if !guard.queued_change_ids().iter().any(|id| id == change_id) {
+            return false;
+        }
+        if guard.active_change_ids().iter().any(|id| id == change_id) {
+            return false;
+        }
+
+        matches!(
+            guard.apply_command(
+                crate::orchestration::state::ReducerCommand::RemoveFromQueue(change_id.to_string(),)
+            ),
+            crate::orchestration::state::ReduceOutcome::Changed(_)
+        )
     }
 
     /// Test-only convenience: production classification runs through

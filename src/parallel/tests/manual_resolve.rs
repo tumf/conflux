@@ -683,3 +683,619 @@ async fn dynamic_queue_ingestion_validates_candidates_against_executor_repo_root
         "absent candidate must not be queued"
     );
 }
+
+// ============================================================================
+// Ghost queue prevention: accepted queue intent must converge with scheduler
+// candidate discovery when the active OpenSpec catalog changes under a live
+// owner.
+//
+// These are integration-scoped: they drive the real reducer, the real
+// `DynamicQueue`, the real shared operator command boundary, and a real
+// repository-visible `openspec/changes` tree on disk.
+// ============================================================================
+
+/// Reducer queue intent for one change, as an observer would read it.
+async fn has_queue_intent(
+    shared: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    change_id: &str,
+) -> bool {
+    shared
+        .read()
+        .await
+        .queued_change_ids()
+        .iter()
+        .any(|id| id == change_id)
+}
+
+/// Collect every scheduler log message emitted so far.
+fn drain_log_messages(rx: &mut tokio::sync::mpsc::Receiver<ExecutionEvent>) -> Vec<String> {
+    let mut messages = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(entry) = event {
+            messages.push(entry.message);
+        }
+    }
+    messages
+}
+
+/// The owner-before-proposal ordering, end to end on one executor.
+///
+/// The owner's first candidate lookup runs while `openspec/changes/<id>` does
+/// not exist yet. The proposal then lands in the repository, and the *same*
+/// executor — no restart, no new scheduler — must admit it from the refreshed
+/// repository-visible view.
+#[tokio::test]
+async fn queued_intent_is_admitted_without_owner_restart_after_the_proposal_lands() {
+    let temp_dir = TempDir::new().unwrap();
+    let change_id = "synthetic-merged-after-owner-start";
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    dynamic_queue.push(change_id.to_string()).await;
+
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.set_dynamic_queue(dynamic_queue);
+    let shared = shared_state_with_queue_intent(&[change_id]);
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+    let mut reanalysis_reason = ReanalysisReason::Initial;
+
+    // First lookup: the owner cannot see the proposal yet.
+    let ingested = executor
+        .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reanalysis_reason)
+        .await;
+    assert!(!ingested, "an absent candidate cannot be ingested");
+    assert!(queued.is_empty(), "no scheduler-local work exists yet");
+    let messages = drain_log_messages(&mut rx);
+    assert!(
+        messages.iter().any(|message| message
+            == &format!("Queue reconciliation pending for '{change_id}': candidate_not_found")),
+        "the first miss must stay observable, got {messages:?}"
+    );
+    assert!(
+        has_queue_intent(&shared, change_id).await,
+        "hint ingestion alone must never revoke accepted queue intent"
+    );
+
+    // The proposal is merged into the base under the live owner.
+    create_active_change_fixture(temp_dir.path(), change_id);
+
+    let outcome = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+
+    assert_eq!(
+        outcome.queued_added, 1,
+        "the same owner must admit the now-visible candidate"
+    );
+    assert_eq!(
+        outcome.unavailable_reconciled, 0,
+        "a loadable candidate is never reconciled away"
+    );
+    assert!(
+        queued.iter().any(|change| change.id == change_id),
+        "the refreshed candidate must become scheduler-local queued work"
+    );
+    assert!(
+        has_queue_intent(&shared, change_id).await,
+        "admitted queue intent must survive the refresh"
+    );
+}
+
+/// A miss inside one reconciliation pass is re-checked against a *fresh*
+/// repository-visible view before anything is decided.
+///
+/// This is the in-pass half of the race: the pass's own catalog map missed, the
+/// proposal landed, and the re-read admits it rather than settling accepted
+/// intent from a stale observation.
+#[tokio::test]
+async fn a_missing_candidate_is_re_read_before_any_verdict_is_reached() {
+    let temp_dir = TempDir::new().unwrap();
+    let change_id = "synthetic-visible-only-on-refresh";
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    let shared = shared_state_with_queue_intent(&[change_id]);
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    // The pass's first catalog read missed; the repository now has the proposal.
+    create_active_change_fixture(temp_dir.path(), change_id);
+
+    let snapshot = executor.capture_reducer_work_snapshot().await;
+    let mut queued = Vec::new();
+    let mut outcome = crate::parallel::queue_state::QueueReconciliationOutcome::default();
+    executor
+        .resolve_missing_queued_candidate(change_id, &mut queued, &mut outcome, &snapshot)
+        .await;
+
+    assert_eq!(
+        outcome.queued_added, 1,
+        "the fresh re-read must admit the candidate"
+    );
+    assert_eq!(
+        outcome.unavailable_reconciled, 0,
+        "a candidate the refresh can load is not unavailable"
+    );
+    assert!(
+        queued.iter().any(|change| change.id == change_id),
+        "the refreshed candidate must become scheduler-local queued work"
+    );
+    assert!(
+        has_queue_intent(&shared, change_id).await,
+        "queue intent must be preserved when the refresh admits the candidate"
+    );
+    let messages = drain_log_messages(&mut rx);
+    assert!(
+        messages.iter().any(|message| message
+            == &format!("Queue reconciliation admitted '{change_id}': candidate_refreshed")),
+        "the refreshed-and-admitted result must be identifiable, got {messages:?}"
+    );
+}
+
+/// A genuinely absent candidate leaves no queued row behind.
+///
+/// The queued projection has no scheduler-local work, no wake edge, and no
+/// typed wait behind it, so reconciliation settles it through an explicit
+/// reducer transition instead of reporting pending work forever. Diagnostics
+/// stay bounded and nothing is dispatched.
+///
+/// The repository is a real Git repository on purpose: settlement requires
+/// *conclusive* archived-dirty repair evidence, so a fixture where the base
+/// branch cannot be resolved at all would prove deferral rather than the
+/// settlement this test is about.
+#[tokio::test]
+async fn a_genuinely_absent_candidate_does_not_remain_a_ghost_queued_row() {
+    let temp_dir = TempDir::new().unwrap();
+    init_minimal_git_repo(temp_dir.path());
+    let change_id = "synthetic-never-created-anywhere";
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    let shared = shared_state_with_queue_intent(&[change_id]);
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+
+    let first = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+    assert_eq!(
+        first.unavailable_reconciled, 1,
+        "unavailable queue intent must be reconciled explicitly"
+    );
+    assert_eq!(
+        first.repair_evidence_deferred, 0,
+        "conclusive repair evidence must not be reported as a deferral"
+    );
+    assert_eq!(first.queued_added, 0, "nothing loadable was added");
+    assert!(
+        queued.is_empty(),
+        "an absent candidate must never become dispatchable work"
+    );
+    assert!(
+        !has_queue_intent(&shared, change_id).await,
+        "the queued projection must not survive as a ghost row"
+    );
+
+    // The reducer row is idle work again, not a dequeued or terminal outcome:
+    // a later explicit Start or mark settlement can still admit the proposal.
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+            change_id.to_string(),
+        ));
+    }
+    assert!(
+        has_queue_intent(&shared, change_id).await,
+        "reconciliation must leave the change re-admittable"
+    );
+
+    // A second pass over the same unavailable intent repeats no warning.
+    let _ = drain_log_messages(&mut rx);
+    let second = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+    assert_eq!(
+        second.unavailable_reconciled, 1,
+        "the re-added intent is settled again on its own evidence"
+    );
+    let messages = drain_log_messages(&mut rx);
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("candidate_not_found")),
+        "identical missing-candidate warnings must not repeat, got {messages:?}"
+    );
+}
+
+/// The shared operator command boundary both frontends submit through.
+///
+/// `OperatorIntent::SetQueueIntent` from the WebUI/`/api/v2` route and from the
+/// TUI route both reach `OperatorCommandService::add_to_queue`, so the boundary
+/// is exercised directly here rather than inferred from either frontend's
+/// helper. Neither route may require an owner restart after the base catalog
+/// gains the proposal, and neither may lose the operator's execution mark to a
+/// failed admission.
+#[tokio::test]
+async fn the_shared_queue_command_boundary_needs_no_owner_restart_after_a_catalog_update() {
+    use crate::orchestration::operator_command::{
+        ExecutionMarkStore, NoopQueueHooks, OperatorCommandService,
+    };
+
+    let temp_dir = TempDir::new().unwrap();
+    init_minimal_git_repo(temp_dir.path());
+    let change_id = "synthetic-shared-boundary-late-proposal";
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(32);
+    let dynamic_queue = DynamicQueue::new();
+    let shared = Arc::new(tokio::sync::RwLock::new(
+        crate::orchestration::state::OrchestratorState::new(vec![change_id.to_string()], 1),
+    ));
+    let marks = Arc::new(ExecutionMarkStore::new());
+    let service = OperatorCommandService::new(
+        shared.clone(),
+        Arc::new(dynamic_queue.clone()),
+        Arc::new(NoopQueueHooks),
+        marks.clone(),
+    );
+
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.set_dynamic_queue(Arc::new(dynamic_queue.clone()));
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    // Operator selection and admission, through the shared boundary.
+    marks.set(change_id, true);
+    service
+        .add_to_queue(change_id)
+        .await
+        .expect("shared queue command should be accepted");
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+    let mut reanalysis_reason = ReanalysisReason::Initial;
+
+    executor
+        .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reanalysis_reason)
+        .await;
+    let unavailable = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+
+    assert_eq!(
+        unavailable.unavailable_reconciled, 1,
+        "an admission the catalog cannot satisfy must be settled, not left queued"
+    );
+    assert!(queued.is_empty(), "nothing dispatchable was produced");
+    assert!(
+        marks.is_marked(change_id),
+        "a failed queue admission must not revoke the operator's execution mark"
+    );
+
+    // The proposal reaches the base catalog, and the same owner is asked again
+    // through the same shared command.
+    create_active_change_fixture(temp_dir.path(), change_id);
+    service
+        .add_to_queue(change_id)
+        .await
+        .expect("shared queue command should be accepted after the catalog update");
+
+    let mut reanalysis_reason = ReanalysisReason::Initial;
+    let ingested = executor
+        .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reanalysis_reason)
+        .await;
+
+    assert!(
+        ingested,
+        "the same owner must admit the change without a restart"
+    );
+    assert!(
+        queued.iter().any(|change| change.id == change_id),
+        "the shared boundary must produce scheduler-local queued work"
+    );
+    assert!(
+        marks.is_marked(change_id),
+        "the execution mark stays an independent axis throughout"
+    );
+}
+
+/// Inconclusive archived-dirty repair evidence is not proof of absence.
+///
+/// The settle path spends accepted queue intent, and mark settlement is
+/// edge-triggered, so a revoked row does not come back without an explicit
+/// operator Start. A base branch that cannot be resolved means the repair probe
+/// never ran at all — the precondition "no archived-dirty repair candidate
+/// applies" was never established — so the pass must defer exactly as an
+/// unreadable catalog does.
+#[tokio::test]
+async fn undetermined_repair_evidence_defers_instead_of_settling_queue_intent() {
+    let temp_dir = TempDir::new().unwrap();
+    init_minimal_git_repo(temp_dir.path());
+    let change_id = "synthetic-repair-evidence-unavailable";
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    // Detached HEAD with no recorded original branch: base identity is
+    // unreadable, so the archived-dirty repair probe has no base to compare to.
+    executor.set_workspace_manager(Box::new(
+        crate::parallel::tests::executor::TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_failing_original_branch(),
+    ));
+    let shared = shared_state_with_queue_intent(&[change_id]);
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+
+    let outcome = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+
+    assert_eq!(
+        outcome.unavailable_reconciled, 0,
+        "queue intent must never be settled on evidence that was never gathered"
+    );
+    assert_eq!(
+        outcome.repair_evidence_deferred, 1,
+        "the deferral must be observable rather than look like an idle pass"
+    );
+    assert_eq!(outcome.queued_added, 0, "nothing loadable was added");
+    assert_eq!(outcome.repair_added, 0, "no repair candidate was proven");
+    assert!(
+        queued.is_empty(),
+        "an undetermined candidate must never become dispatchable work"
+    );
+    assert!(
+        has_queue_intent(&shared, change_id).await,
+        "the wake edge and the operator's queue intent must both survive"
+    );
+
+    let messages = drain_log_messages(&mut rx);
+    assert!(
+        messages.iter().any(|message| message
+            == &format!(
+                "Queue reconciliation deferred for '{change_id}': repair_evidence_unavailable"
+            )),
+        "the deferral must be identifiable in operator-facing logs, got {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("candidate_unavailable")),
+        "an undetermined probe must not publish a settled verdict, got {messages:?}"
+    );
+
+    // Repeating the pass repeats neither the settle nor the diagnostic.
+    let second = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+    assert_eq!(
+        second.unavailable_reconciled, 0,
+        "repeating an undetermined pass still settles nothing"
+    );
+    assert!(
+        has_queue_intent(&shared, change_id).await,
+        "queue intent survives every undetermined pass"
+    );
+    let repeated = drain_log_messages(&mut rx);
+    assert!(
+        !repeated
+            .iter()
+            .any(|message| message.contains("repair_evidence_unavailable")),
+        "deferral diagnostics stay bounded, got {repeated:?}"
+    );
+}
+
+/// The same rule for the other half of the repair probe.
+///
+/// A workspace lookup that errors asked the question and got no answer, so
+/// "this change has no repairable workspace" is precisely what was not proven.
+#[tokio::test]
+async fn a_failed_workspace_lookup_defers_instead_of_settling_queue_intent() {
+    let temp_dir = TempDir::new().unwrap();
+    init_minimal_git_repo(temp_dir.path());
+    let change_id = "synthetic-workspace-lookup-failed";
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    // Base identity resolves; only workspace discovery fails.
+    executor.set_workspace_manager(Box::new(
+        crate::parallel::tests::executor::TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_failing_existing_workspace_lookup(),
+    ));
+    let shared = shared_state_with_queue_intent(&[change_id]);
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+
+    let outcome = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+
+    assert_eq!(
+        outcome.unavailable_reconciled, 0,
+        "a failed workspace lookup proves no absence"
+    );
+    assert_eq!(
+        outcome.repair_evidence_deferred, 1,
+        "the failed probe must be counted as a deferral"
+    );
+    assert!(queued.is_empty(), "nothing dispatchable was produced");
+    assert!(
+        has_queue_intent(&shared, change_id).await,
+        "queue intent must be preserved for a pass that can read the evidence"
+    );
+}
+
+/// An unreadable active-change catalog keeps the dynamic queue hint.
+///
+/// A popped hint may be the only wake edge a queued change has. A catalog read
+/// that fails produced no lookup at all, so ingestion puts the hint back
+/// instead of spending it, and the reducer's queue intent is untouched.
+#[tokio::test]
+async fn an_unreadable_catalog_retains_the_dynamic_queue_hint_and_queue_intent() {
+    let temp_dir = TempDir::new().unwrap();
+    let change_id = "synthetic-catalog-unreadable";
+
+    // `openspec/changes` exists but is not a directory, so the catalog read
+    // fails rather than reporting an empty active-change set.
+    std::fs::create_dir_all(temp_dir.path().join("openspec")).expect("create openspec directory");
+    std::fs::write(
+        temp_dir.path().join("openspec").join("changes"),
+        "not a dir\n",
+    )
+    .expect("write catalog blocker");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    dynamic_queue.push(change_id.to_string()).await;
+
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.set_dynamic_queue(dynamic_queue.clone());
+    let shared = shared_state_with_queue_intent(&[change_id]);
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+    let mut reanalysis_reason = ReanalysisReason::Initial;
+
+    let ingested = executor
+        .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reanalysis_reason)
+        .await;
+
+    assert!(!ingested, "an unreadable catalog ingests nothing");
+    assert!(queued.is_empty(), "no scheduler-local work was produced");
+    assert_eq!(
+        dynamic_queue.len().await,
+        1,
+        "the wake edge must be requeued, not spent on a lookup that never happened"
+    );
+    assert_eq!(
+        dynamic_queue.pop().await.as_deref(),
+        Some(change_id),
+        "the retained hint must be the same change, at the front"
+    );
+    assert!(
+        has_queue_intent(&shared, change_id).await,
+        "an unreadable catalog must not touch reducer queue intent"
+    );
+
+    let messages = drain_log_messages(&mut rx);
+    assert!(
+        messages.iter().any(|message| message.starts_with(&format!(
+            "Queue reconciliation pending for '{change_id}': candidate_load_failed"
+        ))),
+        "the unreadable read must stay observable, got {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("candidate_not_found")),
+        "unreadable is not absent, got {messages:?}"
+    );
+}
+
+/// The reconciliation half of the same rule.
+///
+/// `resolve_missing_queued_candidate` re-reads the catalog itself. When that
+/// re-read fails, absence is unproven, so queue intent is left exactly as it
+/// was and the diagnostic stays bounded.
+#[tokio::test]
+async fn an_unreadable_refresh_leaves_queue_intent_exactly_as_it_was() {
+    let temp_dir = TempDir::new().unwrap();
+    let change_id = "synthetic-refresh-unreadable";
+
+    std::fs::create_dir_all(temp_dir.path().join("openspec")).expect("create openspec directory");
+    std::fs::write(
+        temp_dir.path().join("openspec").join("changes"),
+        "not a dir\n",
+    )
+    .expect("write catalog blocker");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    let shared = shared_state_with_queue_intent(&[change_id]);
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let snapshot = executor.capture_reducer_work_snapshot().await;
+    let mut queued = Vec::new();
+    let mut outcome = crate::parallel::queue_state::QueueReconciliationOutcome::default();
+
+    executor
+        .resolve_missing_queued_candidate(change_id, &mut queued, &mut outcome, &snapshot)
+        .await;
+
+    assert_eq!(
+        outcome.unavailable_reconciled, 0,
+        "an unreadable refresh must never settle accepted queue intent"
+    );
+    assert_eq!(outcome.queued_added, 0, "nothing loadable was found");
+    assert!(queued.is_empty(), "nothing dispatchable was produced");
+    assert!(
+        has_queue_intent(&shared, change_id).await,
+        "queue intent must survive for a pass that can read the repository"
+    );
+
+    let messages = drain_log_messages(&mut rx);
+    assert!(
+        messages.iter().any(|message| message.starts_with(&format!(
+            "Queue reconciliation pending for '{change_id}': candidate_load_failed"
+        ))),
+        "the unreadable refresh must stay observable, got {messages:?}"
+    );
+
+    // A second unreadable refresh repeats neither the settle nor the warning.
+    executor
+        .resolve_missing_queued_candidate(change_id, &mut queued, &mut outcome, &snapshot)
+        .await;
+    assert_eq!(
+        outcome.unavailable_reconciled, 0,
+        "repetition still proves no absence"
+    );
+    assert!(
+        has_queue_intent(&shared, change_id).await,
+        "queue intent survives every unreadable refresh"
+    );
+    let repeated = drain_log_messages(&mut rx);
+    assert!(
+        !repeated
+            .iter()
+            .any(|message| message.contains("candidate_load_failed")),
+        "catalog read failure diagnostics stay bounded, got {repeated:?}"
+    );
+}
