@@ -1250,7 +1250,12 @@ fn run_outcome_event(outcome: &RunControlOutcome) -> Option<ExecutionEvent> {
 }
 
 /// The authoritative event one accepted per-change outcome publishes.
-fn operator_outcome_event(outcome: &OperatorOutcome) -> Option<ExecutionEvent> {
+///
+/// Crate-visible so a frontend-projection test can publish exactly what this
+/// coordinator publishes for the same outcome. Hand-constructing the event there
+/// would be a second answer to "what does an accepted mark broadcast", and the
+/// projection under test would stop being exercised by the real one.
+pub(crate) fn operator_outcome_event(outcome: &OperatorOutcome) -> Option<ExecutionEvent> {
     match outcome {
         OperatorOutcome::MarkSet { change_id, marked } => {
             Some(ExecutionEvent::OperatorCommandApplied {

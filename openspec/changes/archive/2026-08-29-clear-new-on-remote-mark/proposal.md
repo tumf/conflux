@@ -59,6 +59,16 @@ Make a settled operator execution-mark interaction acknowledge the target propos
 - `cargo test tui::state::execution_mark_tests --lib` passes.
 - Strict and archive-gate OpenSpec validation pass.
 
+## Retired Scenarios
+
+- cli: New Change Detection / NEW badge cleared on selection
+- cli: New Change Detection / NEW badge cleared on queue addition
+
+Both are replaced by the single mode-independent "NEW badge cleared on local
+selection" scenario. Select mode and Running/Stopped mode already reach the same
+execution-mark toggle, so the two titles asserted one behavior twice rather than
+two behaviors; no coverage is dropped.
+
 ## Out of Scope
 
 - Persisting NEW state across process restarts.
