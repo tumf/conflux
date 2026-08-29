@@ -18,7 +18,10 @@ use super::AppState;
 use crate::events::{dispatch_event_with_marks, EventSink, ExecutionEvent};
 use crate::openspec::{Change, ProposalMetadata};
 use crate::orchestration::mark_reconciliation::ExecutionMarkReconciler;
-use crate::orchestration::operator_command::{HookRunnerQueueHooks, OperatorCommandService};
+use crate::orchestration::operator_command::{
+    HookRunnerQueueHooks, NoOpReason, OperatorCommandService, OperatorOutcome,
+};
+use crate::orchestration::operator_coordinator::operator_outcome_event;
 use crate::orchestration::state::OrchestratorState;
 use crate::tui::queue::DynamicQueue;
 use crate::tui::types::AppExecutionMode;
@@ -91,6 +94,66 @@ impl Harness {
         let statuses = self.reducer.read().await.all_display_statuses();
         self.app.apply_display_statuses_from_reducer(&statuses);
         self.app.handle_orchestrator_event(event);
+    }
+
+    /// Submit an execution-mark request the way every *remote* operator surface
+    /// does, and let the frontend paint what it published.
+    ///
+    /// `/api/v2`, `cflx client`, and MCP differ only in transport: each resolves
+    /// to `OperatorIntent::SetExecutionMark`, which the coordinator applies
+    /// through this shared service and publishes through
+    /// `operator_outcome_event`. Both halves are the production ones here, so a
+    /// projection that only worked for a hand-built event cannot pass.
+    async fn remote_mark(&mut self, change_id: &str, marked: bool) -> OperatorOutcome {
+        let outcome = self
+            .operator
+            .set_execution_mark(change_id, marked)
+            .await
+            .unwrap_or_else(|error| panic!("a remote mark on '{change_id}' must settle: {error}"));
+        self.publish(&outcome).await;
+        outcome
+    }
+
+    /// The bulk equivalent, for the `x`/`set_all_execution_marks` route.
+    async fn remote_mark_all(&mut self) -> OperatorOutcome {
+        let outcome = self
+            .operator
+            .set_all_execution_marks()
+            .await
+            .unwrap_or_else(|error| panic!("a remote bulk mark must settle: {error}"));
+        self.publish(&outcome).await;
+        outcome
+    }
+
+    /// Publish an accepted outcome's own event, or run the passive frontend pass
+    /// a no-op leaves behind.
+    async fn publish(&mut self, outcome: &OperatorOutcome) {
+        match operator_outcome_event(outcome) {
+            Some(event) => self.dispatch(event).await,
+            // A refused or unchanged command broadcasts nothing, so the only
+            // thing that reaches the frontend is the next ordinary projection
+            // pass — which is exactly what must not acknowledge anything.
+            None => self.app.sync_execution_marks_from_store(),
+        }
+    }
+
+    /// Present `change_id` as newly detected, the way a refresh does.
+    fn arrange_new(&mut self, change_id: &str) {
+        for row in &mut self.app.changes {
+            if row.id == change_id {
+                row.is_new = true;
+            }
+        }
+        self.app.new_change_count = self.app.changes.iter().filter(|row| row.is_new).count();
+    }
+
+    fn row_is_new(&self, change_id: &str) -> bool {
+        self.app
+            .changes
+            .iter()
+            .find(|row| row.id == change_id)
+            .unwrap_or_else(|| panic!("row '{change_id}' must exist"))
+            .is_new
     }
 
     /// Force a row/store divergence the way a missed or late frontend update would.
@@ -377,4 +440,281 @@ async fn duplicate_failure_after_remark_preserves_fresh_intent() {
             "{name}: retry routing must not disturb the mark"
         );
     }
+}
+
+// ============================================================================
+// NEW attention state across the operator-mark boundary
+// ============================================================================
+//
+// `NEW` is ephemeral frontend attention state, but the *interaction* that
+// retires it is not frontend-local: it settles in the shared mark store, and
+// `/api/v2`, `cflx client`, and MCP all reach that store through the same
+// service the TUI does. The bug these cover is a change rendering as both
+// remotely marked and still new, purely because the acknowledgement lived in
+// key handling instead of in the projection every frontend shares.
+
+/// A remote mark or unmark retires the target's badge and nothing else's.
+#[tokio::test]
+async fn remote_mark_interaction_acknowledges_new_attention() {
+    // Both directions of a real operator interaction. Unmarking is arranged
+    // from an already-marked row so the request genuinely flips the store.
+    for (name, arrange_marked, requested) in [("mark", false, true), ("unmark", true, false)] {
+        let mut harness = Harness::new(&["alpha", "beta"]);
+        if arrange_marked {
+            harness.app.execution_marks().set("alpha", true);
+            harness.app.sync_execution_marks_from_store();
+        }
+        harness.arrange_new("alpha");
+        harness.arrange_new("beta");
+        assert_eq!(harness.app.new_change_count, 2, "{name}");
+
+        let outcome = harness.remote_mark("alpha", requested).await;
+
+        assert!(
+            matches!(outcome, OperatorOutcome::MarkSet { ref change_id, marked }
+                if change_id == "alpha" && marked == requested),
+            "{name}: the request must settle as a real mark delta, not a no-op"
+        );
+        assert!(
+            !harness.row_is_new("alpha"),
+            "{name}: a settled remote interaction left the target rendering as new"
+        );
+        assert_eq!(
+            harness.row_marked("alpha"),
+            requested,
+            "{name}: the row must also project the requested mark"
+        );
+        assert!(
+            harness.row_is_new("beta"),
+            "{name}: an unrelated change lost its badge"
+        );
+        assert_eq!(
+            harness.app.new_change_count, 1,
+            "{name}: the footer must count exactly the rows that kept a badge"
+        );
+    }
+}
+
+/// A remote bulk mark acknowledges every row it actually flipped.
+#[tokio::test]
+async fn remote_bulk_mark_acknowledges_only_the_rows_it_changed() {
+    let mut harness = Harness::new(&["alpha", "beta"]);
+    // `beta` already holds the mark the bulk plan is about to apply, so the bulk
+    // write flips `alpha` only — and only `alpha` is an interaction.
+    harness.app.execution_marks().set("beta", true);
+    harness.app.sync_execution_marks_from_store();
+    harness.arrange_new("alpha");
+    harness.arrange_new("beta");
+
+    let outcome = harness.remote_mark_all().await;
+
+    assert!(
+        matches!(outcome, OperatorOutcome::BulkMarks { marked: true, ref changed, .. }
+            if changed == &vec!["alpha".to_string()]),
+        "the bulk plan must report exactly the rows it flipped"
+    );
+    assert!(
+        !harness.row_is_new("alpha"),
+        "the flipped row must be acknowledged"
+    );
+    assert!(
+        harness.row_is_new("beta"),
+        "a row the bulk write did not move is not an interaction"
+    );
+    assert_eq!(harness.app.new_change_count, 1);
+}
+
+/// Passive projection of the shared store acknowledges nothing.
+#[tokio::test]
+async fn passive_mark_synchronization_preserves_new_attention() {
+    let mut harness = Harness::new(&["alpha"]);
+    harness.arrange_new("alpha");
+
+    // The store is written the way a non-operator writer does — no service, no
+    // settlement, no interaction — and then projected repeatedly.
+    harness.app.execution_marks().set("alpha", true);
+    for _ in 0..3 {
+        harness.app.sync_execution_marks_from_store();
+    }
+    // A whole refresh pass is the other passive route into the same projection.
+    harness
+        .dispatch(refresh(&["alpha"], &[], &["alpha"], &[]))
+        .await;
+
+    assert!(
+        harness.row_marked("alpha"),
+        "the passive projection must still mirror the store"
+    );
+    assert!(
+        harness.row_is_new("alpha"),
+        "synchronizing a mark nobody just set is not an operator interaction"
+    );
+    assert_eq!(harness.app.new_change_count, 1);
+}
+
+/// A remote request that changes nothing is not an interaction.
+#[tokio::test]
+async fn unchanged_remote_request_does_not_acknowledge_new_attention() {
+    let mut harness = Harness::new(&["alpha"]);
+    harness.app.execution_marks().set("alpha", true);
+    harness.app.sync_execution_marks_from_store();
+    harness.arrange_new("alpha");
+
+    // The authoritative mark already equals the requested value.
+    let outcome = harness.remote_mark("alpha", true).await;
+
+    assert!(
+        matches!(
+            outcome,
+            OperatorOutcome::NoOp {
+                reason: NoOpReason::MarkUnchanged,
+                ..
+            }
+        ),
+        "the request must settle as an unchanged no-op"
+    );
+    assert!(
+        harness.row_is_new("alpha"),
+        "a no-op carries no new operator interaction to acknowledge"
+    );
+    assert_eq!(harness.app.new_change_count, 1);
+}
+
+/// Lifecycle-driven mark revocation is the system acting, not the operator.
+#[tokio::test]
+async fn system_mark_revocation_does_not_acknowledge_new_attention() {
+    let mut harness = Harness::new(&["alpha"]);
+    harness.app.execution_marks().set("alpha", true);
+    harness.app.sync_execution_marks_from_store();
+    harness.arrange_new("alpha");
+
+    // The reconciler revokes the mark on the failure edge, through the real
+    // dispatch boundary — the one mark write that never arms settlement.
+    harness
+        .dispatch(ExecutionEvent::ApplyFailed {
+            change_id: "alpha".to_string(),
+            error: "boom".to_string(),
+        })
+        .await;
+
+    assert!(
+        !harness.row_marked("alpha"),
+        "the revocation must still reach the row"
+    );
+    assert!(
+        harness.row_is_new("alpha"),
+        "a mark the system took away was never looked at by an operator"
+    );
+    assert_eq!(harness.app.new_change_count, 1);
+}
+
+/// The local TUI toggle keeps its own behavior, in every execution mode.
+///
+/// One case per mode rather than the historical Select/Running split: both ran
+/// through this single execution-mark toggle path already, so a mode-specific
+/// rule would be a rule no code expresses.
+#[tokio::test]
+async fn local_toggle_acknowledges_new_attention_in_every_mode() {
+    for mode in [
+        AppExecutionMode::Select,
+        AppExecutionMode::Running,
+        AppExecutionMode::Stopping,
+        AppExecutionMode::Stopped,
+        AppExecutionMode::Error,
+    ] {
+        let mut harness = Harness::new(&["alpha", "beta"]);
+        harness.app.execution_mode = mode;
+        harness.arrange_new("alpha");
+        harness.arrange_new("beta");
+
+        harness.app.cursor_index = 0;
+        harness.app.toggle_selection();
+
+        assert!(!harness.row_is_new("alpha"), "{mode:?}");
+        assert!(harness.row_marked("alpha"), "{mode:?}");
+        assert!(harness.row_is_new("beta"), "{mode:?}");
+        assert_eq!(harness.app.new_change_count, 1, "{mode:?}");
+
+        // The deferred write then settles through the shared service, and the
+        // projection it triggers must not double-count anything.
+        for (change_id, marked) in harness.app.take_pending_mark_writes() {
+            harness
+                .operator
+                .apply_execution_mark(&change_id, marked)
+                .await;
+        }
+        harness.app.sync_execution_marks_from_store();
+
+        assert!(harness.row_marked("alpha"), "{mode:?}");
+        assert!(harness.row_is_new("beta"), "{mode:?}");
+        assert_eq!(harness.app.new_change_count, 1, "{mode:?}");
+    }
+}
+
+/// Acknowledgement writes attention state and no workflow state.
+#[tokio::test]
+async fn remote_mark_acknowledgement_mutates_no_queue_or_lifecycle_state() {
+    let mut harness = Harness::new(&["alpha"]);
+    harness.arrange_new("alpha");
+    let mode_before = harness.app.execution_mode;
+    let status_before = harness.row_status("alpha").to_string();
+
+    harness.remote_mark("alpha", true).await;
+
+    assert!(!harness.row_is_new("alpha"));
+    assert_eq!(
+        harness.row_status("alpha"),
+        status_before,
+        "acknowledgement must not move the reducer-derived status"
+    );
+    assert_eq!(
+        harness.reducer.read().await.display_status("alpha"),
+        status_before,
+        "and must not reach the reducer at all"
+    );
+    assert_eq!(
+        harness.app.execution_mode, mode_before,
+        "acknowledgement is not a lifecycle transition"
+    );
+    assert_eq!(
+        harness.app.execution_marks().marked_ids(),
+        vec!["alpha".to_string()],
+        "the mark itself is the only shared mutation"
+    );
+}
+
+/// A rejected row carries no badge, so there is nothing to acknowledge.
+#[tokio::test]
+async fn rejected_rows_have_no_new_attention_to_acknowledge() {
+    let mut harness = Harness::new(&["alpha", "beta"]);
+    harness.arrange_new("beta");
+
+    // `alpha` becomes terminal through the reducer edge the mark admission rules
+    // actually read; a rejected row is never given a badge in the first place.
+    harness
+        .dispatch(ExecutionEvent::ChangeRejected {
+            change_id: "alpha".to_string(),
+            reason: "blocker".to_string(),
+        })
+        .await;
+    assert_eq!(harness.row_status("alpha"), "rejected");
+    assert!(!harness.row_is_new("alpha"));
+
+    let outcome = harness.remote_mark("alpha", true).await;
+
+    assert!(
+        matches!(
+            outcome,
+            OperatorOutcome::NoOp {
+                reason: NoOpReason::TerminalMarkTarget,
+                ..
+            }
+        ),
+        "a terminal row is not a mark target"
+    );
+    assert!(
+        harness.row_is_new("beta"),
+        "and the refused request must not disturb an unrelated badge"
+    );
+    assert_eq!(harness.app.new_change_count, 1);
 }
