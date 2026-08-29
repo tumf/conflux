@@ -132,6 +132,7 @@ pub use crate::vcs::VcsBackend;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn env_test_lock() -> MutexGuard<'static, ()> {
@@ -1089,6 +1090,120 @@ mod tests {
         assert!(config.get_workspace_base_dir().is_none());
     }
 
+    // === Tests for state_base_dir config ===
+
+    #[test]
+    fn test_state_base_dir_default_is_none() {
+        let config = OrchestratorConfig::default();
+        assert!(config.get_state_base_dir().is_none());
+    }
+
+    #[test]
+    fn test_state_base_dir_can_be_configured() {
+        let config = OrchestratorConfig {
+            state_base_dir: Some("/Volumes/BigDisk/cflx/state".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.get_state_base_dir(),
+            Some("/Volumes/BigDisk/cflx/state")
+        );
+    }
+
+    #[test]
+    fn test_state_base_dir_empty_string_treated_as_none() {
+        let config = OrchestratorConfig {
+            state_base_dir: Some("".to_string()),
+            ..Default::default()
+        };
+        assert!(config.get_state_base_dir().is_none());
+    }
+
+    #[test]
+    fn test_parse_jsonc_storage_roots() {
+        let jsonc = r#"{
+            // Both storage roots are independent of each other.
+            "workspace_base_dir": "/Volumes/BigDisk/cflx/worktrees",
+            "state_base_dir": "/Volumes/BigDisk/cflx/state"
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+
+        assert_eq!(
+            config.get_workspace_base_dir(),
+            Some("/Volumes/BigDisk/cflx/worktrees")
+        );
+        assert_eq!(
+            config.get_state_base_dir(),
+            Some("/Volumes/BigDisk/cflx/state")
+        );
+    }
+
+    #[test]
+    fn test_state_base_dir_merge_follows_standard_precedence() {
+        let mut lower = OrchestratorConfig {
+            state_base_dir: Some("/global/state".to_string()),
+            ..Default::default()
+        };
+
+        // A higher-priority config without the key preserves the lower value.
+        lower.merge(OrchestratorConfig::default());
+        assert_eq!(lower.get_state_base_dir(), Some("/global/state"));
+
+        // A higher-priority value overwrites it.
+        lower.merge(OrchestratorConfig {
+            state_base_dir: Some("/project/state".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(lower.get_state_base_dir(), Some("/project/state"));
+
+        // An explicit empty value is set, and normalizes back to unset.
+        lower.merge(OrchestratorConfig {
+            state_base_dir: Some(String::new()),
+            ..Default::default()
+        });
+        assert!(lower.get_state_base_dir().is_none());
+    }
+
+    /// The configured state root scopes Conflux-owned paths only. The env
+    /// overlay Conflux applies to the commands it starts is the one place a
+    /// storage setting could leak into a child, so it must stay untouched:
+    /// children keep the `XDG_STATE_HOME` they inherited.
+    #[test]
+    fn test_state_base_dir_never_enters_the_child_command_environment() {
+        let config = OrchestratorConfig {
+            state_base_dir: Some("/Volumes/BigDisk/cflx/state".to_string()),
+            workspace_base_dir: Some("/Volumes/BigDisk/cflx/worktrees".to_string()),
+            ..Default::default()
+        };
+
+        let envs = config.get_command_envs();
+        assert!(
+            envs.is_empty(),
+            "storage roots must not add child environment entries, got {envs:?}"
+        );
+        assert!(!envs.contains_key("XDG_STATE_HOME"));
+        assert!(!envs.contains_key("XDG_DATA_HOME"));
+
+        // An explicitly configured child environment is still passed through
+        // untouched, including an XDG value the operator chose themselves.
+        let config = OrchestratorConfig {
+            state_base_dir: Some("/Volumes/BigDisk/cflx/state".to_string()),
+            envs: Some(HashMap::from([(
+                "XDG_STATE_HOME".to_string(),
+                "/operator/choice".to_string(),
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(
+            config
+                .get_command_envs()
+                .get("XDG_STATE_HOME")
+                .map(String::as_str),
+            Some("/operator/choice"),
+            "the configured state root must not rewrite an operator's own env"
+        );
+    }
+
     #[test]
     fn test_vcs_backend_defaults_to_auto() {
         let config = OrchestratorConfig::default();
@@ -1760,6 +1875,35 @@ mod tests {
                 defaults_queue.effective_max_runtime_secs(Some(near_miss)),
                 10800,
                 "{near_miss:?} is not the Acceptance operation type"
+            );
+        }
+    }
+
+    /// The generated template is where most operators first meet a key, so both
+    /// storage roots must appear there with the rule that makes them safe.
+    #[test]
+    fn generated_config_examples_document_both_storage_roots() {
+        for template in [
+            crate::cli::Template::Claude,
+            crate::cli::Template::Opencode,
+            crate::cli::Template::Codex,
+        ] {
+            let example = crate::templates::get_template_content(template);
+            assert!(
+                example.contains("\"workspace_base_dir\""),
+                "{template:?} example must document the managed-worktree root"
+            );
+            assert!(
+                example.contains("\"state_base_dir\""),
+                "{template:?} example must document the Conflux state root"
+            );
+            assert!(
+                example.contains("XDG_STATE_HOME"),
+                "{template:?} example must state the precedence over XDG_STATE_HOME"
+            );
+            assert!(
+                example.contains("never migrated"),
+                "{template:?} example must state that migration is the operator's job"
             );
         }
     }

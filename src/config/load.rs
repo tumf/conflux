@@ -86,6 +86,27 @@ impl OrchestratorConfig {
     ///
     /// After merging, validates that all required commands are present.
     pub fn load(custom_path: Option<&Path>) -> Result<Self> {
+        let config = Self::merge_all_sources(custom_path)?;
+
+        // Validate required commands after merging
+        config.validate_required_commands()?;
+
+        info!("Configuration loaded and merged successfully");
+        Ok(config)
+    }
+
+    /// Load only what a read-only surface needs: the merged storage settings,
+    /// without validating that AI commands are configured.
+    ///
+    /// `cflx logs` has to resolve the same state root the writers use, but it
+    /// starts nothing, so an installation that has not configured its commands
+    /// yet must still be able to read its logs.
+    pub fn load_storage_settings(custom_path: Option<&Path>) -> Result<Self> {
+        Self::merge_all_sources(custom_path)
+    }
+
+    /// Merge every configuration source in priority order without validating.
+    fn merge_all_sources(custom_path: Option<&Path>) -> Result<Self> {
         let mut config = Self::default();
 
         // 1-3. Global config candidates (low → high priority)
@@ -112,10 +133,6 @@ impl OrchestratorConfig {
             config.merge(custom_config);
         }
 
-        // Validate required commands after merging
-        config.validate_required_commands()?;
-
-        info!("Configuration loaded and merged successfully");
         Ok(config)
     }
 }
