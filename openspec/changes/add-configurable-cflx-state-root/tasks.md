@@ -51,7 +51,7 @@ configured storage root adds nothing to it and never rewrites an operator's own
 process-level probe there would have observed the test harness rather than
 Conflux.
 
-## Acceptance repair (attempt 1)
+## Acceptance Repair Notes (attempt 1)
 
 The reported failure was not reproducible as a runtime defect: every declared
 verification, plus clippy and fmt, passed unchanged on the applied tree. The
@@ -111,3 +111,4 @@ Expected archive gate: `cflx openspec validate add-configurable-cflx-state-root 
   evidence: `cargo test --test run_exit_tests configurable_state_root` — 4 passed, 0 failed; full file 34 passed, 0 failed, stable over 5 consecutive runs.
   evidence: `cargo test` — full suite green across all 20 targets; `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check` clean.
   evidence: `git diff --check -- docs/guides/CONFIG.md src/main.rs` — clean.
+  evidence: Task-format repair — renamed the repair narrative heading to `## Acceptance Repair Notes (attempt 1)` so `classify_task_section` (src/openspec_cmd/validation.rs:367) matches the `notes` narrative marker instead of treating its prose bullets as unchecked tasks; no task was unchecked and no evidence removed. `cflx openspec validate add-configurable-cflx-state-root --strict` — passed.
