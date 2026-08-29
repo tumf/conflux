@@ -14,8 +14,8 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: tests/client_cli_tests.rs
-    evidence: cargo test --test client_cli_tests client_wait
-    rerun: cargo test --test client_cli_tests client_wait
+    evidence: cargo test --test client_cli_tests wait_
+    rerun: cargo test --test client_cli_tests wait_
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
