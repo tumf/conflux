@@ -211,9 +211,11 @@ fn logs_rejects_a_relative_configured_state_root() {
     let output = cflx_command()
         .args(["logs", "--path"])
         .current_dir(&workspace)
+        .env("XDG_STATE_HOME", &state_home)
         .output()
         .expect("failed to run cflx logs --path");
 
+    let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         !output.status.success(),
@@ -226,5 +228,12 @@ fn logs_rejects_a_relative_configured_state_root() {
     assert!(
         !workspace.join("relative").exists(),
         "a refusal must not create the configured directory"
+    );
+    // A refusal is not a fallback: an unusable configured root must not send the
+    // reader to XDG_STATE_HOME or the platform default instead.
+    let state_home_str = state_home.to_string_lossy().to_string();
+    assert!(
+        !stdout.contains(&state_home_str) && !stderr.contains("xdg-only"),
+        "refusal must not fall back to XDG_STATE_HOME, stdout={stdout} stderr={stderr}"
     );
 }

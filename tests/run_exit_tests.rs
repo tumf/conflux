@@ -397,12 +397,30 @@ fn cflx_output(cwd: &Path, args: &[&str]) -> std::process::Output {
 /// Redirecting to files instead of pipes keeps the deadline honest — a full pipe
 /// buffer cannot stall the child while the parent waits.
 fn cflx_output_bounded(cwd: &Path, args: &[&str], timeout: Duration) -> std::process::Output {
+    cflx_output_bounded_with_env(cwd, args, &[], timeout)
+}
+
+/// [`cflx_output_bounded`] with explicit environment entries.
+///
+/// A state-root refusal has to be observed against a *known* `XDG_STATE_HOME`,
+/// because "did not fall back" is only provable when the fallback root is one the
+/// test owns and can inspect afterwards.
+fn cflx_output_bounded_with_env(
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &Path)],
+    timeout: Duration,
+) -> std::process::Output {
     let capture = tempfile::tempdir().expect("capture dir");
     let out_path = capture.path().join("stdout");
     let err_path = capture.path().join("stderr");
     // A null stdin keeps a TUI invocation from ever reaching the terminal that
     // is running the test suite.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cflx"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cflx"));
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let mut child = command
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -1690,4 +1708,58 @@ fn configurable_state_root_rejects_an_unwritable_root_before_startup() {
         !xdg_state_home.exists(),
         "an unusable configured root must not fall back to the default root"
     );
+}
+
+/// Fail-closed startup is a property of *every* orchestration entrypoint, not of
+/// `cflx run` alone. The TUI loads and validates configuration before logging
+/// initialization too, so both the explicit `tui` subcommand and the default
+/// no-subcommand invocation must refuse an unusable root before a listener, a
+/// lifecycle adapter, or an AI child process exists.
+#[test]
+#[cfg(unix)]
+fn configurable_state_root_rejects_a_relative_root_at_the_tui_entrypoint() {
+    for args in [
+        vec!["tui", "--no-web-unix-socket"],
+        vec!["--no-web-unix-socket"],
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let xdg_state_home = tmp.path().join("xdg-state");
+
+        setup_project_with_state_root(&workspace, "relative/state");
+        add_change(&workspace, "a");
+
+        let output = cflx_output_bounded_with_env(
+            &workspace,
+            &args,
+            &[("XDG_STATE_HOME", xdg_state_home.as_path())],
+            Duration::from_secs(30),
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.status.success(),
+            "cflx {} must refuse a relative state root, got {:?} (stderr={stderr})",
+            args.join(" "),
+            output.status
+        );
+        assert!(
+            stderr.contains("state_base_dir") && stderr.contains("absolute"),
+            "the diagnostic must name the setting and the rule, got stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("Starting cflx"),
+            "startup must be refused before logging announces it, got stdout={stdout}"
+        );
+        assert!(
+            !workspace.join("relative").exists(),
+            "a rejected root must not be created"
+        );
+        assert!(
+            !xdg_state_home.exists(),
+            "a rejected root must not silently fall back to the default root"
+        );
+    }
 }
