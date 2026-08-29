@@ -39,6 +39,7 @@ Make a settled operator execution-mark interaction acknowledge the target propos
 - During shared execution-mark projection into the TUI, detect target rows whose authoritative mark state changed because of an external operator mutation and clear their `is_new` flag.
 - Recompute or decrement `new_change_count` from the resulting rows without affecting unrelated NEW proposals.
 - Preserve the existing direct TUI behavior and keep execution marks separate from queue intent, retry, lifecycle, and admission.
+- Consolidate the two legacy local NEW-clearing scenarios (Select-mode selection, Running/Stopped queue addition) into one mode-independent local toggle scenario; both already run through the single execution-mark toggle path, so no behavior is removed.
 - Do not clear NEW for passive refreshes, lifecycle-driven mark revocation, rejected rows, or an unchanged/no-op remote request that did not constitute a new operator interaction.
 
 ## Acceptance Criteria

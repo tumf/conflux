@@ -22,9 +22,11 @@ When auto-refresh detects new changes, they SHALL be displayed appropriately. Th
 
 #### Scenario: NEW badge cleared on local selection
 - **GIVEN** a change has a NEW badge
-- **WHEN** the user toggles its execution mark from the TUI
+- **WHEN** the user toggles its execution mark from the TUI in any execution mode
 - **THEN** the NEW badge is removed
 - **AND** the new count in the footer is decremented
+
+This scenario consolidates the former "NEW badge cleared on selection" (Select mode) and "NEW badge cleared on queue addition" (Running/Stopped mode) scenarios: every mode shares the single execution-mark toggle path, so the mode split no longer describes distinct behavior.
 
 #### Scenario: NEW badge cleared on remote execution-mark interaction
 - **GIVEN** a live TUI displays a change with a NEW badge
