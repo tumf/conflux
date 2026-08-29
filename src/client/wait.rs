@@ -83,6 +83,25 @@
 //! on the first hop". A child that hits that budget is killed, reaped, and
 //! retried on the next poll; it never borrows the `timeout` outcome that belongs
 //! to callers who asked for a deadline.
+//!
+//! # What an expired deadline still owes the caller
+//!
+//! `timeout` is a statement about the clock, and on its own it is the least
+//! useful answer this command can give: an agent that asked for 30 minutes and
+//! got "no" cannot tell a change that is one phase from done from one the owner
+//! never admitted, or from an owner that never answered at all. Each of those
+//! needs a different next action, and re-reading the owner afterwards to find
+//! out is both an extra round trip and a lie — it describes the world *after*
+//! the deadline, not the wait that ran out.
+//!
+//! So the wait keeps the last thing it honestly knew. Every coherent
+//! observation replaces a target-only projection of itself — the change's own
+//! published row and its matching execution facts, at one reconciled revision —
+//! and the timeout envelope reports that projection alongside the configured
+//! budget, the measured elapsed time, and the [`TimeoutStage`] the deadline
+//! landed in. Nothing is read after expiry to fill it in, and a wait that never
+//! completed an observation says `null` rather than inventing an owner it never
+//! reconciled with.
 
 use std::future::Future;
 use std::time::Duration;
@@ -91,7 +110,7 @@ use tokio::time::Instant;
 
 use crate::bounded_git::GitDeadline;
 use crate::client::completion::{
-    certify, classify, is_settled_success_claim, Disposition, Verdict,
+    certify, classify, is_settled_success_claim, CertificationStage, Disposition, Verdict,
 };
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
 use crate::client::session::{observe, Connection, Observation};
@@ -170,6 +189,9 @@ pub async fn run(
     change_id: &str,
     timeout: Option<Duration>,
 ) -> ResultEnvelope {
+    // Started before the deadline is derived, so the measured elapsed time can
+    // never read as shorter than the budget it overran.
+    let mut diagnostics = Diagnostics::new(timeout);
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
 
     // Bounded from the very first read: a socket that accepts a connection and
@@ -178,8 +200,11 @@ pub async fn run(
     let initial = match within(deadline, observe(connection, Some(change_id))).await {
         Some(Ok(initial)) => initial,
         Some(Err(error)) => return error.into_envelope(Operation::Wait).with_change(change_id),
-        None => return unobserved_timeout_envelope(change_id, timeout),
+        None => {
+            return diagnostics.expire(change_id, None, TimeoutStage::InitialObservation, None);
+        }
     };
+    diagnostics.record(&initial, change_id);
     let instance_id = initial.instance_id.clone();
 
     let Some(contract) = initial.contract.contract.clone() else {
@@ -224,8 +249,8 @@ pub async fn run(
         .await
         {
             Step::Settled(envelope) => return *envelope,
-            Step::Expired { detail } => {
-                return timeout_envelope(change_id, &instance_id, timeout, detail)
+            Step::Expired { stage, detail } => {
+                return diagnostics.expire(change_id, Some(&instance_id), stage, detail)
             }
             Step::UncertifiedClaim { status, detail } => {
                 uncertified_rounds += 1;
@@ -243,7 +268,12 @@ pub async fn run(
                     );
                 }
                 if reached(deadline) {
-                    return timeout_envelope(change_id, &instance_id, timeout, Some(detail));
+                    return diagnostics.expire(
+                        change_id,
+                        Some(&instance_id),
+                        TimeoutStage::ObservingOwner,
+                        Some(detail),
+                    );
                 }
             }
             Step::KeepObserving { detail } => {
@@ -252,7 +282,12 @@ pub async fn run(
                 // the previous one.
                 uncertified_rounds = 0;
                 if reached(deadline) {
-                    return timeout_envelope(change_id, &instance_id, timeout, detail);
+                    return diagnostics.expire(
+                        change_id,
+                        Some(&instance_id),
+                        TimeoutStage::ObservingOwner,
+                        detail,
+                    );
                 }
             }
         }
@@ -265,7 +300,12 @@ pub async fn run(
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return timeout_envelope(change_id, &instance_id, timeout, None);
+                    return diagnostics.expire(
+                        change_id,
+                        Some(&instance_id),
+                        TimeoutStage::ObservingOwner,
+                        None,
+                    );
                 }
                 POLL_INTERVAL.min(remaining)
             }
@@ -282,16 +322,21 @@ pub async fn run(
 
         observation = loop {
             let Some(result) = within(deadline, observe(connection, Some(change_id))).await else {
-                return timeout_envelope(change_id, &instance_id, timeout, None);
+                return diagnostics.expire(
+                    change_id,
+                    Some(&instance_id),
+                    TimeoutStage::ObservingOwner,
+                    None,
+                );
             };
             match result {
                 Ok(next) => break next,
                 Err(error) if error.is_transient() => {
                     if reached(deadline) {
-                        return timeout_envelope(
+                        return diagnostics.expire(
                             change_id,
-                            &instance_id,
-                            timeout,
+                            Some(&instance_id),
+                            TimeoutStage::ObservingOwner,
                             Some(error.message().to_string()),
                         );
                     }
@@ -314,8 +359,13 @@ pub async fn run(
                         // read. `timeout` is the operation's answer; the
                         // transport error that arrived first was already too
                         // late to replace it.
-                        Verdict::DeadlineExpired => {
-                            return timeout_envelope(change_id, &instance_id, timeout, None)
+                        Verdict::DeadlineExpired { stage } => {
+                            return diagnostics.expire(
+                                change_id,
+                                Some(&instance_id),
+                                stage.into(),
+                                None,
+                            )
                         }
                         _ => {}
                     }
@@ -323,6 +373,10 @@ pub async fn run(
                 }
             }
         };
+        // Recorded before the next evaluation, so a deadline that expires inside
+        // certification still reports the observation that certification began
+        // from rather than a stale one.
+        diagnostics.record(&observation, change_id);
     }
 }
 
@@ -339,7 +393,14 @@ enum Step {
     /// releases the caller, instead of polling a verdict that is already final.
     UncertifiedClaim { status: String, detail: String },
     /// The operation deadline passed inside repository verification.
-    Expired { detail: Option<String> },
+    ///
+    /// `stage` distinguishes the local classification from the remote
+    /// comparison, because "which one was still running" is the only part of
+    /// this the caller can act on.
+    Expired {
+        stage: TimeoutStage,
+        detail: Option<String>,
+    },
 }
 
 impl Step {
@@ -375,7 +436,10 @@ async fn evaluate(
             // asked; a deadline that passed first leaves that question
             // unanswered, so the operation timed out rather than observing a
             // restart it could not qualify.
-            Verdict::DeadlineExpired => Step::Expired { detail: None },
+            Verdict::DeadlineExpired { stage } => Step::Expired {
+                stage: stage.into(),
+                detail: None,
+            },
             _ => Step::settled(
                 ResultEnvelope::new(Operation::Wait, Outcome::OwnerRestarted)
                     .with_change(change_id)
@@ -421,7 +485,10 @@ async fn evaluate(
             // An expired deadline proves nothing about the repository, so the
             // caller who asked for one hears about the clock rather than a
             // refusal this operation never finished qualifying.
-            Verdict::DeadlineExpired => Step::Expired { detail: None },
+            Verdict::DeadlineExpired { stage } => Step::Expired {
+                stage: stage.into(),
+                detail: None,
+            },
             // Missing, broken, and unverifiable evidence all fail to rescue an
             // untracked target; the oracle's own reason travels with the
             // refusal so a broken proof is still readable behind it.
@@ -530,7 +597,10 @@ async fn evaluate(
                 .with_message(detail)
                 .with_detail(contract_detail(contract)),
         ),
-        Verdict::DeadlineExpired => Step::Expired { detail: None },
+        Verdict::DeadlineExpired { stage } => Step::Expired {
+            stage: stage.into(),
+            detail: None,
+        },
     }
 }
 
@@ -646,44 +716,237 @@ fn budget_phrase(timeout: Option<Duration>) -> String {
     }
 }
 
-/// The timeout that happened before any owner incarnation was observed.
+/// Where the operation deadline landed.
 ///
-/// It carries no `instance_id` because none was ever reconciled — reporting one
-/// would claim an observation the operation never made.
-fn unobserved_timeout_envelope(change_id: &str, timeout: Option<Duration>) -> ResultEnvelope {
-    ResultEnvelope::new(Operation::Wait, Outcome::Timeout)
-        .with_change(change_id)
-        .with_message(format!(
-            "the owner did not answer the first observation{}",
-            budget_phrase(timeout)
-        ))
-        .with_detail(serde_json::json!({ "commands_submitted": 0 }))
+/// Four stages rather than one flag, because each one names a different thing
+/// to go and look at: an owner that never answered, an owner that answered and
+/// kept working, a local repository read, and a remote lookup. The vocabulary is
+/// closed and stable — a caller branches on it, so it must not grow a fifth
+/// spelling for a stage that already has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutStage {
+    /// The first coherent observation never completed.
+    InitialObservation,
+    /// The owner was being observed for progress it had not yet made.
+    ObservingOwner,
+    /// Local repository evidence for the terminal mode was being classified.
+    RepositoryCertification,
+    /// A remote ref was being compared against the locally verified tip.
+    RemoteVerification,
 }
 
-fn timeout_envelope(
-    change_id: &str,
-    instance_id: &str,
-    timeout: Option<Duration>,
-    detail: Option<String>,
-) -> ResultEnvelope {
-    let mut message = format!(
-        "no verified terminal outcome for '{change_id}'{}",
-        budget_phrase(timeout)
-    );
-    if let Some(detail) = detail {
-        message.push_str(&format!("; {detail}"));
+impl TimeoutStage {
+    /// The wire spelling. Stable: scripts branch on it.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialObservation => "initial_observation",
+            Self::ObservingOwner => "observing_owner",
+            Self::RepositoryCertification => "repository_certification",
+            Self::RemoteVerification => "remote_verification",
+        }
     }
-    ResultEnvelope::new(Operation::Wait, Outcome::Timeout)
-        .with_change(change_id)
-        .with_instance(Some(instance_id.to_string()))
-        .with_message(message)
-        .with_detail(serde_json::json!({ "commands_submitted": 0 }))
+}
+
+/// The oracle names which half of the proof it was in; this is the same fact.
+///
+/// Mapped rather than shared so the wire vocabulary stays this command's own:
+/// the oracle's stages describe Git work, and the client's describe where a
+/// caller's deadline expired.
+impl From<CertificationStage> for TimeoutStage {
+    fn from(stage: CertificationStage) -> Self {
+        match stage {
+            CertificationStage::Repository => Self::RepositoryCertification,
+            CertificationStage::Remote => Self::RemoteVerification,
+        }
+    }
+}
+
+/// Everything a timeout can honestly report, accumulated as the wait runs.
+///
+/// It exists because the useful facts are gone by the time they are needed: the
+/// observation that would explain the timeout is the one *before* the deadline,
+/// and reading the owner again afterwards would answer a different question.
+/// Collecting as we go costs one projection per observation and makes the
+/// post-deadline read unnecessary, which is what keeps the expiry
+/// observation-only.
+struct Diagnostics {
+    /// The configured positive timeout, when the caller asked for one.
+    timeout: Option<Duration>,
+    /// When the operation began; the origin for `wait_elapsed_ms`.
+    started: Instant,
+    /// Latest completed coherent observation, projected onto the target alone.
+    ///
+    /// `None` until the first one completes, which is the difference between
+    /// "the owner said nothing useful" and "the owner was never reached".
+    last_observation: Option<serde_json::Value>,
+}
+
+impl Diagnostics {
+    fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            timeout,
+            started: Instant::now(),
+            last_observation: None,
+        }
+    }
+
+    /// Retain one coherent observation, replacing whatever came before it.
+    ///
+    /// Only the requested change survives the projection. The snapshot carries
+    /// every proposal the owner tracks, and a timeout diagnostic that shipped
+    /// all of them would be publishing unrelated work to a caller who asked
+    /// about one change — so the row and its matching execution facts are
+    /// selected here, at the one revision they were reconciled at, rather than
+    /// filtered later.
+    fn record(&mut self, observation: &Observation, change_id: &str) {
+        let change = observation.change(change_id);
+        let execution = observation
+            .execution
+            .changes
+            .iter()
+            .find(|status| status.id == change_id);
+        // Serialized whole rather than field by field, for the same reason the
+        // blocker is: these are the owner's own sanitized projections, and a
+        // field added to one of them must not need remembering in two places.
+        self.last_observation = Some(serde_json::json!({
+            "observed_at": observation.execution.observed_at,
+            "state_revision": observation.state_revision,
+            "event_sequence": observation.event_sequence,
+            "change": change,
+            "execution": execution,
+        }));
+    }
+
+    /// Build the typed timeout envelope for an expiry at `stage`.
+    ///
+    /// `instance_id` is `None` only before the first coherent observation:
+    /// naming an incarnation the operation never reconciled with would claim an
+    /// observation it never made.
+    fn expire(
+        &self,
+        change_id: &str,
+        instance_id: Option<&str>,
+        stage: TimeoutStage,
+        detail: Option<String>,
+    ) -> ResultEnvelope {
+        let mut message = match stage {
+            TimeoutStage::InitialObservation => format!(
+                "the owner did not answer the first observation{}",
+                budget_phrase(self.timeout)
+            ),
+            _ => format!(
+                "no verified terminal outcome for '{change_id}'{}",
+                budget_phrase(self.timeout)
+            ),
+        };
+        if let Some(detail) = detail {
+            message.push_str(&format!("; {detail}"));
+        }
+        let mut body = serde_json::json!({
+            "commands_submitted": 0,
+            "timeout_stage": stage.as_str(),
+            // Measured, not assumed: a wait that overran its budget by a
+            // scheduling delay must say so rather than echo what was configured.
+            "wait_elapsed_ms": self.started.elapsed().as_millis() as u64,
+            // Explicitly null when nothing was observed, because a caller has to
+            // tell "no observation" from "an observation with nothing in it".
+            "last_observation": self.last_observation,
+        });
+        // Omitted rather than nulled when there is no configured budget, the way
+        // every other optional field here is. Unreachable in practice: an
+        // unbounded wait has no deadline to expire.
+        if let (Some(object), Some(timeout)) = (body.as_object_mut(), self.timeout) {
+            object.insert(
+                "timeout_ms".to_string(),
+                serde_json::json!(timeout.as_millis() as u64),
+            );
+        }
+        ResultEnvelope::new(Operation::Wait, Outcome::Timeout)
+            .with_change(change_id)
+            .with_instance(instance_id.map(str::to_string))
+            .with_message(message)
+            .with_detail(body)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web::remote_control_api::dto::TerminalMode;
+    use crate::web::remote_control_api::dto::{
+        AttentionState, ChangeActivity, ChangeExecutionState, ChangeExecutionStatus,
+        ChangeResource, ChangeTiming, ExecutionPhase, LatestLogProjection, ParallelEligibility,
+        QueueIntent, TerminalMode,
+    };
+
+    /// One projected row, at the status a caller would want a timeout to name.
+    fn change(id: &str, display_status: &str) -> ChangeResource {
+        ChangeResource {
+            id: id.to_string(),
+            display_status: display_status.to_string(),
+            progress_status: "in_progress".to_string(),
+            completed_tasks: 3,
+            total_tasks: 7,
+            progress_percent: 42.0,
+            dependencies: Vec::new(),
+            iteration_number: Some(2),
+            execution_marked: true,
+            queue_intent: QueueIntent::Queued,
+            attention: AttentionState::None,
+            blocker: None,
+            error_detail: None,
+            actions: crate::web::remote_control_api::projection::change_actions_for_test(
+                "select",
+                display_status,
+                None,
+            ),
+            parallel: ParallelEligibility::default(),
+            timing: ChangeTiming::default(),
+            latest_activity: None,
+            worktree: None,
+        }
+    }
+
+    /// The execution facts that belong to one row.
+    fn execution(id: &str, phase: ExecutionPhase) -> ChangeExecutionStatus {
+        ChangeExecutionStatus {
+            id: id.to_string(),
+            execution_id: Some(format!("x-{id}")),
+            execution_state: ChangeExecutionState::Active,
+            current_phase: phase,
+            last_completed_phase: Some(ExecutionPhase::Apply),
+            iteration: Some(2),
+            phase_started_at: Some("2026-01-01T00:00:00Z".to_string()),
+            last_completed_at: Some("2026-01-01T00:00:01Z".to_string()),
+            run_started_at: Some("2026-01-01T00:00:00Z".to_string()),
+            run_completed_at: None,
+            latest_activity: Some(ChangeActivity {
+                event_type: "phase_started".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                detail: Some("acceptance started".to_string()),
+            }),
+            latest_log: Some(LatestLogProjection {
+                message: "running acceptance".to_string(),
+                level: crate::events::LogLevel::Info,
+                operation: Some("acceptance".to_string()),
+                iteration: Some(2),
+                created_at: "2026-01-01T00:00:02Z".to_string(),
+            }),
+        }
+    }
+
+    /// One coherent observation at `revision`, carrying exactly these rows.
+    fn observation(
+        changes: Vec<ChangeResource>,
+        executions: Vec<ChangeExecutionStatus>,
+        revision: u64,
+    ) -> Observation {
+        let mut observation = crate::client::session::observation_for_test(changes);
+        observation.state_revision = revision;
+        observation.event_sequence = revision * 10;
+        observation.execution.changes = executions;
+        observation.execution.observed_at = format!("2026-01-01T00:00:0{revision}Z");
+        observation
+    }
 
     fn contract() -> OwnerExecutionContract {
         OwnerExecutionContract {
@@ -720,10 +983,11 @@ mod tests {
 
     #[test]
     fn a_timeout_reports_the_budget_and_the_missing_evidence() {
-        let envelope = timeout_envelope(
+        let diagnostics = Diagnostics::new(Some(Duration::from_secs(90)));
+        let envelope = diagnostics.expire(
             "alpha",
-            "i-1",
-            Some(Duration::from_secs(90)),
+            Some("i-1"),
+            TimeoutStage::ObservingOwner,
             Some("no archive entry".to_string()),
         );
         assert_eq!(envelope.outcome, Outcome::Timeout);
@@ -732,6 +996,206 @@ mod tests {
         assert!(message.contains("within 90000ms"), "{message}");
         assert!(message.contains("no archive entry"), "{message}");
         assert_eq!(envelope.detail["commands_submitted"], 0);
+        // The configured budget as data, not only inside the sentence: a caller
+        // deciding whether to wait again must not have to parse prose for it.
+        assert_eq!(envelope.detail["timeout_ms"], 90_000);
+        assert_eq!(envelope.detail["timeout_stage"], "observing_owner");
+        assert!(envelope.detail["wait_elapsed_ms"].is_u64());
+    }
+
+    /// The four stages are a closed vocabulary a script branches on.
+    ///
+    /// Asserted as the complete mapping rather than by sampling, because the
+    /// failure that matters is a *renamed* stage: a caller matching on
+    /// `remote_verification` gets no compile error when the string changes, only
+    /// a branch that silently stops firing.
+    #[test]
+    fn every_timeout_stage_has_its_own_stable_wire_spelling() {
+        assert_eq!(
+            TimeoutStage::InitialObservation.as_str(),
+            "initial_observation"
+        );
+        assert_eq!(TimeoutStage::ObservingOwner.as_str(), "observing_owner");
+        assert_eq!(
+            TimeoutStage::RepositoryCertification.as_str(),
+            "repository_certification"
+        );
+        assert_eq!(
+            TimeoutStage::RemoteVerification.as_str(),
+            "remote_verification"
+        );
+        // The oracle's own halves map onto the two certification stages and
+        // never onto an observation stage: a Git expiry is not an owner read.
+        assert_eq!(
+            TimeoutStage::from(CertificationStage::Repository),
+            TimeoutStage::RepositoryCertification
+        );
+        assert_eq!(
+            TimeoutStage::from(CertificationStage::Remote),
+            TimeoutStage::RemoteVerification
+        );
+    }
+
+    /// A wait that never reconciled with an owner claims nothing about one.
+    ///
+    /// `last_observation: null` rather than an omitted key, because the caller's
+    /// question is "what did you see", and the honest answer "nothing" has to be
+    /// readable without distinguishing an absent field from a failed read.
+    #[test]
+    fn a_timeout_before_the_first_observation_invents_no_owner_or_state() {
+        let diagnostics = Diagnostics::new(Some(Duration::from_millis(500)));
+        let envelope = diagnostics.expire("alpha", None, TimeoutStage::InitialObservation, None);
+        assert_eq!(envelope.outcome, Outcome::Timeout);
+        assert_eq!(envelope.instance_id, None);
+        assert_eq!(envelope.detail["timeout_stage"], "initial_observation");
+        assert!(envelope.detail["last_observation"].is_null());
+        assert_eq!(envelope.detail["timeout_ms"], 500);
+        assert_eq!(envelope.detail["commands_submitted"], 0);
+    }
+
+    /// The whole point of the retained observation: the target's own facts.
+    #[test]
+    fn a_timeout_after_an_observation_reports_the_target_row_and_its_execution() {
+        let mut diagnostics = Diagnostics::new(Some(Duration::from_secs(30)));
+        diagnostics.record(
+            &observation(
+                vec![change("alpha", "accepting")],
+                vec![execution("alpha", ExecutionPhase::Acceptance)],
+                4,
+            ),
+            "alpha",
+        );
+        let envelope = diagnostics.expire("alpha", Some("i-1"), TimeoutStage::ObservingOwner, None);
+        let last = &envelope.detail["last_observation"];
+        assert_eq!(last["state_revision"], 4);
+        assert_eq!(last["event_sequence"], 40);
+        assert_eq!(last["observed_at"], "2026-01-01T00:00:04Z");
+        assert_eq!(last["change"]["id"], "alpha");
+        assert_eq!(last["change"]["display_status"], "accepting");
+        assert_eq!(last["change"]["completed_tasks"], 3);
+        assert_eq!(last["change"]["total_tasks"], 7);
+        assert_eq!(last["execution"]["execution_id"], "x-alpha");
+        assert_eq!(last["execution"]["current_phase"], "acceptance");
+        assert_eq!(last["execution"]["last_completed_phase"], "apply");
+        assert_eq!(last["execution"]["execution_state"], "active");
+        assert_eq!(last["execution"]["run_started_at"], "2026-01-01T00:00:00Z");
+        // The bounded projections travel as themselves rather than as prose.
+        assert_eq!(
+            last["execution"]["latest_activity"]["event_type"],
+            "phase_started"
+        );
+        assert_eq!(
+            last["execution"]["latest_log"]["message"],
+            "running acceptance"
+        );
+    }
+
+    /// A timeout describes one change, even when the owner tracks many.
+    ///
+    /// The snapshot the wait already holds carries every proposal, so shipping
+    /// it whole would be the easy implementation and the wrong one: a caller
+    /// asked about `alpha`, and `beta`'s status is neither its business nor
+    /// something it can act on.
+    #[test]
+    fn a_retained_observation_carries_no_change_but_the_requested_one() {
+        let mut diagnostics = Diagnostics::new(Some(Duration::from_secs(30)));
+        diagnostics.record(
+            &observation(
+                vec![change("alpha", "applying"), change("beta", "archiving")],
+                vec![
+                    execution("alpha", ExecutionPhase::Apply),
+                    execution("beta", ExecutionPhase::Archive),
+                ],
+                2,
+            ),
+            "alpha",
+        );
+        let envelope = diagnostics.expire("alpha", Some("i-1"), TimeoutStage::ObservingOwner, None);
+        let rendered = envelope.detail["last_observation"].to_string();
+        assert!(rendered.contains("alpha"), "{rendered}");
+        assert!(!rendered.contains("beta"), "{rendered}");
+        assert!(!rendered.contains("archiving"), "{rendered}");
+    }
+
+    /// The latest coherent observation wins; nothing older survives beside it.
+    #[test]
+    fn a_newer_coherent_observation_replaces_the_retained_one() {
+        let mut diagnostics = Diagnostics::new(Some(Duration::from_secs(30)));
+        diagnostics.record(
+            &observation(
+                vec![change("alpha", "applying")],
+                vec![execution("alpha", ExecutionPhase::Apply)],
+                1,
+            ),
+            "alpha",
+        );
+        diagnostics.record(
+            &observation(
+                vec![change("alpha", "accepting")],
+                vec![execution("alpha", ExecutionPhase::Acceptance)],
+                5,
+            ),
+            "alpha",
+        );
+        let envelope = diagnostics.expire("alpha", Some("i-1"), TimeoutStage::ObservingOwner, None);
+        let last = &envelope.detail["last_observation"];
+        assert_eq!(last["state_revision"], 5);
+        assert_eq!(last["change"]["display_status"], "accepting");
+        assert_eq!(last["execution"]["current_phase"], "acceptance");
+    }
+
+    /// A row the owner stopped tracking is reported as absent, not as stale.
+    ///
+    /// Disappearance mid-wait proves nothing, so the wait keeps observing — but
+    /// the diagnostic must still describe the observation it actually took.
+    /// Carrying the previous revision's row forward under a newer
+    /// `state_revision` would be a mixed-revision projection, which is the one
+    /// shape a coherent observation exists to prevent.
+    #[test]
+    fn a_retained_observation_reports_an_absent_target_rather_than_a_stale_row() {
+        let mut diagnostics = Diagnostics::new(Some(Duration::from_secs(30)));
+        diagnostics.record(
+            &observation(
+                vec![change("alpha", "applying")],
+                vec![execution("alpha", ExecutionPhase::Apply)],
+                1,
+            ),
+            "alpha",
+        );
+        diagnostics.record(&observation(Vec::new(), Vec::new(), 2), "alpha");
+        let envelope = diagnostics.expire("alpha", Some("i-1"), TimeoutStage::ObservingOwner, None);
+        let last = &envelope.detail["last_observation"];
+        assert_eq!(last["state_revision"], 2);
+        assert!(last["change"].is_null());
+        assert!(last["execution"].is_null());
+    }
+
+    /// A certification expiry names where it happened and keeps the observation
+    /// that certification began from.
+    #[test]
+    fn a_certification_timeout_reports_its_stage_over_the_observation_it_started_from() {
+        let mut diagnostics = Diagnostics::new(Some(Duration::from_secs(30)));
+        diagnostics.record(
+            &observation(
+                vec![change("alpha", "merged")],
+                vec![execution("alpha", ExecutionPhase::Merge)],
+                9,
+            ),
+            "alpha",
+        );
+        for (stage, expected) in [
+            (CertificationStage::Repository, "repository_certification"),
+            (CertificationStage::Remote, "remote_verification"),
+        ] {
+            let envelope = diagnostics.expire("alpha", Some("i-1"), stage.into(), None);
+            assert_eq!(envelope.detail["timeout_stage"], expected);
+            assert_eq!(envelope.detail["last_observation"]["state_revision"], 9);
+            assert_eq!(
+                envelope.detail["last_observation"]["change"]["display_status"],
+                "merged"
+            );
+            assert_eq!(envelope.detail["commands_submitted"], 0);
+        }
     }
 
     #[test]

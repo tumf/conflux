@@ -199,6 +199,26 @@ each Git child an unbounded wait spawns keeps a finite per-invocation deadline
 whose expiry terminates and reaps that child and retries the check — it is never
 reported as the operation-level `timeout`.
 
+**A `timeout` is diagnosable without a second read.** Its detail carries
+`timeout_ms`, the measured `wait_elapsed_ms`, `commands_submitted: 0`, and a
+stable `timeout_stage` — `initial_observation`, `observing_owner`,
+`repository_certification`, or `remote_verification` — so "the owner never
+answered", "the work was still moving", "the local proof was being read", and
+"the remote lookup stalled" are four different answers rather than one. Alongside
+them, `detail.last_observation` is the latest coherent observation the wait
+completed *before* the deadline, projected onto your proposal alone: its
+`observed_at`, `state_revision`, and `event_sequence`, the change's own published
+row — status, task progress, blocker — and the matching execution projection with
+its identity, state, phases, timing boundaries, latest activity, and latest
+retained log. No unrelated change, no unrestricted log, and no mixed-revision
+projection travels with it. Nothing is read after expiry to enrich the report, so
+a wait whose first observation never completed reports `last_observation: null`
+and names no `instance_id` rather than inventing an owner it never reconciled
+with. And expiry remains observation-only in exactly the way the rest of `wait`
+is: no command is submitted, no repository state is touched, the proposal's
+lifecycle status does not change, and a later transport or evidence error cannot
+replace the deadline's own outcome.
+
 If a later target fails after earlier commands settled, the request returns
 `partial_intent` listing exactly the command records it created, in order. It
 never claims a rollback: undoing a settled mark would be a mark mutation racing

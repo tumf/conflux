@@ -1149,8 +1149,8 @@ impl CompletionSinkRegistry {
                         "completion evidence is not yet present"
                     );
                 }
-                Verdict::DeadlineExpired => {
-                    debug!(change_id = %change_id, "repository verification exceeded its budget");
+                Verdict::DeadlineExpired { stage } => {
+                    debug!(change_id = %change_id, stage = ?stage, "repository verification exceeded its budget");
                 }
             }
             if attempt + 1 < VERIFY_ATTEMPTS {
