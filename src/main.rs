@@ -848,12 +848,15 @@ fn run_openapi_subcommand() {
     }
 }
 
-fn run_logs_subcommand(args: LogsArgs) {
+fn run_logs_subcommand(args: LogsArgs, custom_config_path: Option<&Path>) {
     // Viewing logs starts nothing, so configuration is read only for the storage
     // root and required commands are deliberately not validated here. Resolving
     // the same root the writers use is what keeps `cflx logs` pointed at the
-    // directory this installation actually writes to.
-    let state_base_dir = match OrchestratorConfig::load_storage_settings(None) {
+    // directory this installation actually writes to — which means the viewer has
+    // to merge the *same* sources the writers merged, custom `--config` file
+    // included. Dropping it here would silently point the reader at a root the
+    // writers abandoned.
+    let state_base_dir = match OrchestratorConfig::load_storage_settings(custom_config_path) {
         Ok(config) => config.get_state_base_dir().map(str::to_string),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1301,7 +1304,7 @@ async fn main() -> Result<()> {
         // Logs subcommand: read-only persistent log viewer. Intentionally runs before
         // init_logging() so viewing logs never creates, appends, or cleans log files.
         Some(Commands::Logs(args)) => {
-            run_logs_subcommand(args);
+            run_logs_subcommand(args, cli.config.as_deref());
         }
 
         // Init subcommand: generate configuration file

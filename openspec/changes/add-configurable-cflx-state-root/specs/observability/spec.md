@@ -6,7 +6,7 @@ Conflux SHALL provide a read-only CLI log viewer that helps users locate, print,
 
 The CLI log viewer SHALL preserve the existing persistent log file layout and SHALL NOT use log contents or log file presence as authoritative workflow-control input for scheduler, resume, acceptance, archive, merge, or next-action decisions.
 
-Persistent logs SHALL live under the Conflux-owned state root defined by the `configuration` capability, at `<state root>/logs/<project_slug>/<YYYY-MM-DD>.log`. Logging initialization, retention cleanup, and the CLI log viewer SHALL resolve that root through one shared resolver, so a reader can never point at a directory the writers abandoned. The CLI log viewer SHALL remain read-only and SHALL list projects only from the currently resolved root; it SHALL NOT migrate, clean, or list logs left under a previously resolved root.
+Persistent logs SHALL live under the Conflux-owned state root defined by the `configuration` capability, at `<state root>/logs/<project_slug>/<YYYY-MM-DD>.log`. Logging initialization, retention cleanup, and the CLI log viewer SHALL resolve that root through one shared resolver, so a reader can never point at a directory the writers abandoned. Sharing the resolver is not sufficient on its own: when an invocation names a custom configuration file, the CLI log viewer SHALL merge that same file, so the root it resolves is the root the writers of that same invocation resolve. The CLI log viewer SHALL remain read-only and SHALL list projects only from the currently resolved root; it SHALL NOT migrate, clean, or list logs left under a previously resolved root.
 
 #### Scenario: Print selected log path without creating logs
 
@@ -68,6 +68,13 @@ Persistent logs SHALL live under the Conflux-owned state root defined by the `co
 - **THEN** the listed project slugs come from the currently resolved root
 - **AND** project slugs under the previously resolved root are not listed
 - **AND** the command creates, appends to, and cleans nothing under either root
+
+#### Scenario: Log viewer honors a state root supplied through a custom configuration file
+
+- **GIVEN** `state_base_dir` is set only in a configuration file named by the invocation's custom-configuration option, and `XDG_STATE_HOME` points somewhere else
+- **WHEN** the user runs the log viewer with that same custom configuration option
+- **THEN** the viewer selects, reads, and lists projects under the configured state root
+- **AND** it neither reads nor lists anything under the `XDG_STATE_HOME` root
 
 #### Scenario: Log viewer refuses an unusable configured root instead of falling back
 

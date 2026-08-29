@@ -176,7 +176,19 @@ state does not move with Conflux logs. That is the whole reason this key exists
 rather than "just export `XDG_STATE_HOME`".
 
 Logging, retention cleanup, and `cflx logs` all resolve the same root, so a
-reader can never point at a directory the writers abandoned.
+reader can never point at a directory the writers abandoned. That holds only when
+the reader is given the same configuration sources as the writer, so a
+`state_base_dir` that lives in a custom file needs the same `--config` on both
+sides:
+
+```bash
+cflx --config /path/to/custom.jsonc run --all
+cflx --config /path/to/custom.jsonc logs --last 200
+```
+
+`--config` is a top-level option, so it goes before `logs`. Without it the viewer
+merges only the global and project configuration files, exactly as the writers
+would have.
 
 ### Fail-closed startup
 

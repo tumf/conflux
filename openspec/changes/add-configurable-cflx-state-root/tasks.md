@@ -97,18 +97,43 @@ diagnosis.
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate add-configurable-cflx-state-root --archive-gate`
 
+## Acceptance Repair Notes (attempt 2)
+
+The finding was real and is fixed at the dispatch site, which was the option the
+finding listed first and the one that also removes the silent-ignore: `--config`
+is a *top-level* option, so `cflx --config F logs` parsed fine and then had its
+value dropped on the floor. `run_logs_subcommand` now takes the invocation's
+custom configuration path and hands it to `OrchestratorConfig::load_storage_settings`,
+so the viewer merges exactly the sources `launch_tui` (`src/main.rs:188`) and
+`Commands::Run` (`src/main.rs:960`) merge. No `--config` was added to `LogsArgs`:
+that would have left `cflx --config F logs` still silently ignoring the flag,
+which is the reported defect.
+
+Two files outside the finding's `required_changes` changed, both stating the
+repaired behavior rather than adding new scope:
+
+- `openspec/changes/add-configurable-cflx-state-root/specs/observability/spec.md` —
+  the finding quotes this delta's own "a reader can never point at a directory
+  the writers abandoned" clause as the contract that was violated. Sharing a
+  resolver never implied sharing its *inputs*, so the requirement now says the
+  viewer merges the invocation's custom configuration file too, with a scenario
+  for it. Without this the repaired behavior would be code with no spec.
+- `docs/guides/CONFIG.md` — the same section already promised writer/reader
+  parity (task 7 owns this file). It now shows that a `state_base_dir` living in
+  a custom file needs `--config` on both `run` and `logs`, and that `--config`
+  precedes the subcommand.
+
+Verification evidence for this attempt:
+
+- `cargo test --test logs_command_tests` — 7 passed, 0 failed (the new
+  `logs_reads_the_state_root_from_a_custom_config_path`, plus the six existing).
+- `cargo clippy --all-targets --all-features -- -D warnings` — clean.
+- `cargo fmt --check` — clean.
+- `cflx openspec validate add-configurable-cflx-state-root --strict` — passed.
+
 ## Current Acceptance Follow-up
-- attempt: 1
-- [x] Investigate acceptance failure and apply the required fix
-  evidence: Diagnosis — every declared verification, clippy, and fmt already passed, so the failure was spec/proof coverage, not runtime behavior; see "Acceptance repair (attempt 1)" in Notes.
-  evidence: Added missing `configuration` capability delta at openspec/changes/add-configurable-cflx-state-root/specs/configuration/spec.md — `state_base_dir` is a config key with no requirement in the capability that owns `workspace_base_dir`.
-  evidence: Re-scoped observability delta to viewer/logging concerns and replaced the misplaced startup/precedence scenarios with two viewer-owned ones (current-root-only listing, refusal without fallback).
-  evidence: Added tests/run_exit_tests.rs::configurable_state_root_rejects_a_relative_root_at_the_tui_entrypoint, proving fail-closed startup at the TUI entrypoint (`tui` and default) — previously only `cflx run` was proven despite the "both entrypoints" claim.
-  evidence: Strengthened tests/logs_command_tests.rs::logs_rejects_a_relative_configured_state_root to pass XDG_STATE_HOME and assert no fallback; the helper root was created but never used before.
-  evidence: `openspec validate add-configurable-cflx-state-root --strict` — valid.
-  evidence: `cargo test config --lib` — 251 passed, 0 failed.
-  evidence: `cargo test --test logs_command_tests` — 6 passed, 0 failed.
-  evidence: `cargo test --test run_exit_tests configurable_state_root` — 4 passed, 0 failed; full file 34 passed, 0 failed, stable over 5 consecutive runs.
-  evidence: `cargo test` — full suite green across all 20 targets; `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check` clean.
-  evidence: `git diff --check -- docs/guides/CONFIG.md src/main.rs` — clean.
-  evidence: Task-format repair — renamed the repair narrative heading to `## Acceptance Repair Notes (attempt 1)` so `classify_task_section` (src/openspec_cmd/validation.rs:367) matches the `notes` narrative marker instead of treating its prose bullets as unchecked tasks; no task was unchecked and no evidence removed. `cflx openspec validate add-configurable-cflx-state-root --strict` — passed.
+- attempt: 2
+- [x] [acceptance-logs-viewer-ignores-custom-config-path] (major) cflx logs hard-codes load_storage_settings(None), so a state_base_dir supplied through --config moves the writers' root but not the viewer's, leaving the reader pointed at a root the writers abandoned | evidence: src/main.rs:856 calls OrchestratorConfig::load_storage_settings(None) with a literal None, while the writers at src/main.rs:188 (launch_tui) and src/main.rs:960 (Commands::Run) load with args.config; Reproduced on the current worktree: `cflx run --config <tmp>/custom-run.jsonc --all` (that file sets state_base_dir) wrote <tmp>/custom-state/cflx/logs/ws-9be6ec02/2026-08-29.log; `cflx logs --last 3` in the same workspace then failed with "No Conflux log file found for project 'ws-9be6ec02' at <tmp>/xdg/cflx/logs/ws-9be6ec02/2026-08-29.log" and listed only the abandoned root's project slugs; `cflx --config <tmp>/custom-run.jsonc logs --path` printed that same nonexistent XDG path with exit status 0, so the top-level --config is silently ignored by the viewer rather than refused; LogsArgs (src/cli.rs:401) has no --config of its own; openspec/changes/add-configurable-cflx-state-root/specs/observability/spec.md:9 requires logging initialization, retention cleanup, and the CLI log viewer to resolve the root through one shared resolver 'so a reader can never point at a directory the writers abandoned'; tests/logs_command_tests.rs exercises only the project-local .cflx.jsonc route, so no case covers a state_base_dir supplied through --config | required_changes: src/main.rs — Give run_logs_subcommand the custom configuration path the invocation carries (forward cli.config at the Commands::Logs dispatch, or add a --config option to the logs subcommand) and pass it to OrchestratorConfig::load_storage_settings so the viewer merges the same configuration sources the writers do | verification: tests/logs_command_tests.rs — Add a case proving a state_base_dir set only in a --config-supplied file selects the viewer's log root, and that the overridden XDG_STATE_HOME root is neither read nor listed
+  finding: {"evidence":["src/main.rs:856 calls OrchestratorConfig::load_storage_settings(None) with a literal None, while the writers at src/main.rs:188 (launch_tui) and src/main.rs:960 (Commands::Run) load with args.config","Reproduced on the current worktree: `cflx run --config <tmp>/custom-run.jsonc --all` (that file sets state_base_dir) wrote <tmp>/custom-state/cflx/logs/ws-9be6ec02/2026-08-29.log; `cflx logs --last 3` in the same workspace then failed with \"No Conflux log file found for project 'ws-9be6ec02' at <tmp>/xdg/cflx/logs/ws-9be6ec02/2026-08-29.log\" and listed only the abandoned root's project slugs","`cflx --config <tmp>/custom-run.jsonc logs --path` printed that same nonexistent XDG path with exit status 0, so the top-level --config is silently ignored by the viewer rather than refused; LogsArgs (src/cli.rs:401) has no --config of its own","openspec/changes/add-configurable-cflx-state-root/specs/observability/spec.md:9 requires logging initialization, retention cleanup, and the CLI log viewer to resolve the root through one shared resolver 'so a reader can never point at a directory the writers abandoned'","tests/logs_command_tests.rs exercises only the project-local .cflx.jsonc route, so no case covers a state_base_dir supplied through --config"],"id":"acceptance-logs-viewer-ignores-custom-config-path","required_changes":[{"description":"Give run_logs_subcommand the custom configuration path the invocation carries (forward cli.config at the Commands::Logs dispatch, or add a --config option to the logs subcommand) and pass it to OrchestratorConfig::load_storage_settings so the viewer merges the same configuration sources the writers do","file":"src/main.rs"}],"severity":"major","summary":"cflx logs hard-codes load_storage_settings(None), so a state_base_dir supplied through --config moves the writers' root but not the viewer's, leaving the reader pointed at a root the writers abandoned","verification":[{"description":"Add a case proving a state_base_dir set only in a --config-supplied file selects the viewer's log root, and that the overridden XDG_STATE_HOME root is neither read nor listed","file":"tests/logs_command_tests.rs"}]}
+  evidence: src/main.rs — run_logs_subcommand now takes `custom_config_path: Option<&Path>` and passes it to OrchestratorConfig::load_storage_settings; the Commands::Logs dispatch forwards `cli.config.as_deref()`, so `cflx --config F logs` merges the same sources `cflx --config F run` merges instead of dropping the flag.
+  evidence: tests/logs_command_tests.rs — new `logs_reads_the_state_root_from_a_custom_config_path` sets state_base_dir only in a file outside the workspace passed via top-level `--config`, and asserts the viewer reads that root, lists only its slugs, and reports its `--path`, while the XDG_STATE_HOME decoy `xdg-only` is never read, listed, or printed; `cargo test --test logs_command_tests` — 7 passed, 0 failed.
