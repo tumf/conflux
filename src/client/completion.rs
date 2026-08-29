@@ -19,7 +19,7 @@
 //! `display_status`, not a settled command record, not the change disappearing
 //! from the snapshot, and not a callback exiting zero.
 
-pub use crate::client::repo::{verify as certify, Verdict};
+pub use crate::client::repo::{verify as certify, CertificationStage, Verdict};
 use crate::web::remote_control_api::dto::BlockerKind;
 
 /// Display statuses that claim the change reached a terminal success.

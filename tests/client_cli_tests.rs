@@ -4080,6 +4080,225 @@ mod enabled {
     }
 
     // ------------------------------------------------------------------------
+    // wait_timeout_diagnostics
+    // ------------------------------------------------------------------------
+    //
+    // A timeout that says only "no" makes the caller go and read the owner
+    // again to find out what it was waiting on — an extra round trip whose
+    // answer describes the world *after* the deadline. These tests pin the
+    // opposite: everything the expiry can honestly say was already collected
+    // before it, and nothing is read afterwards to fill it in.
+
+    /// The observed timeout: budget, measurement, stage, and the target's row.
+    ///
+    /// `beta` is in the same snapshot on purpose. Shipping the snapshot whole
+    /// would be the easy implementation, and it would publish work the caller
+    /// never asked about and cannot act on.
+    #[tokio::test]
+    async fn wait_timeout_reports_the_latest_target_observation_and_nothing_else() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        // Admitted, so the owner really publishes execution facts for the row:
+        // the projection under test is the owner's own, not a client-side guess.
+        let execution_id = owner.admit("alpha");
+        owner.publish(snapshot(
+            "select",
+            vec![
+                change("alpha", "select", "applying"),
+                change("beta", "select", "archiving"),
+            ],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let output = wait_for(&owner, repo.path(), "alpha", "300ms").await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "timeout");
+        assert_eq!(output.status.code(), Some(19));
+
+        let detail = &parsed["detail"];
+        assert_eq!(detail["commands_submitted"], 0);
+        assert_eq!(detail["timeout_ms"], 300);
+        assert_eq!(detail["timeout_stage"], "observing_owner");
+        let elapsed = detail["wait_elapsed_ms"]
+            .as_u64()
+            .expect("the measured wait must be a number");
+        assert!(
+            elapsed >= 300,
+            "a wait that reached its deadline cannot have taken less than it: {elapsed}"
+        );
+
+        let last = &detail["last_observation"];
+        assert_eq!(last["change"]["id"], "alpha");
+        assert_eq!(last["change"]["display_status"], "applying");
+        assert_eq!(last["execution"]["id"], "alpha");
+        assert_eq!(last["execution"]["execution_id"], execution_id);
+        assert!(
+            last["state_revision"].is_u64() && last["event_sequence"].is_u64(),
+            "the observation must identify the revision it was reconciled at: {last}"
+        );
+        assert!(
+            !last["observed_at"].as_str().unwrap_or_default().is_empty(),
+            "the observation must carry the owner's own observation instant: {last}"
+        );
+
+        // The isolation property, asserted over the whole rendered projection:
+        // an unrelated row must not reach the caller through any field.
+        let rendered = last.to_string();
+        assert!(
+            !rendered.contains("beta"),
+            "a timeout about 'alpha' must not publish another change: {rendered}"
+        );
+
+        assert_eq!(spy.call_count(), 0, "a timeout must submit no command");
+        owner.stop().await;
+    }
+
+    /// The retained observation is the newest one, not the first.
+    ///
+    /// Sequenced by request rather than by clock: `/state` is the last resource
+    /// of every observation, so publishing before the second one arrives puts
+    /// the new snapshot strictly between two of the client's own rounds.
+    #[tokio::test]
+    async fn wait_timeout_reports_the_newest_observation_rather_than_the_first() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let api = ApiSpy::new();
+        let spy = SpyExecutor::new();
+        let owner = Owner::start_intercepted(Some(spy.clone()), None, api.clone()).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "applying")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let projection = owner.projection.clone();
+        api.inject_before_state_reads(vec![
+            // The first observation reads what was already published.
+            Box::new(|| {}),
+            // The second reads a row that advanced in the meantime.
+            Box::new(move || {
+                projection.apply_state(
+                    "test_snapshot",
+                    None,
+                    serde_json::json!({}),
+                    snapshot("select", vec![change("alpha", "select", "accepting")]),
+                );
+            }),
+        ]);
+
+        let output = wait_for(&owner, repo.path(), "alpha", "900ms").await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "timeout");
+        assert_eq!(
+            parsed["detail"]["last_observation"]["change"]["display_status"], "accepting",
+            "the timeout must report the last thing the wait saw, not the first"
+        );
+        assert_eq!(parsed["detail"]["timeout_stage"], "observing_owner");
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
+
+    /// A deadline that expires inside the *local* half of the proof says so.
+    ///
+    /// The stall is injected into `git` itself: a shim that forwards every
+    /// command except the archive-tree listing, which blocks. Nothing else
+    /// about the run changes, so the outcome is decided by where the deadline
+    /// landed rather than by how fast this machine reads a repository.
+    #[tokio::test]
+    async fn wait_timeout_inside_local_certification_reports_the_repository_stage() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+        repo.archive("alpha");
+        let head_before = repo.git(&["rev-parse", "HEAD"]);
+
+        let real_git = String::from_utf8_lossy(
+            &std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .expect("git must be on PATH")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let shim_dir = tempfile::tempdir().expect("temp dir");
+        let shim = shim_dir.path().join("git");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = ls-tree ]; then\n    exec \
+                 sleep 20\n  fi\ndone\nexec {real_git} \"$@\"\n"
+            ),
+        )
+        .expect("the shim is writable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("the shim is executable");
+        }
+        let path = format!(
+            "{}:{}",
+            shim_dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let spy = SpyExecutor::new();
+        let owner = Owner::start(Some(spy.clone()), None).await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "merged")],
+        ));
+        owner.contract(merged_contract("main"));
+
+        let socket = owner.socket();
+        let cwd = repo.path().to_path_buf();
+        let output = tokio::time::timeout(
+            DEADLINE_TEST_GUARD,
+            tokio::task::spawn_blocking(move || {
+                run_cli(
+                    &cwd,
+                    &[
+                        "client",
+                        "--unix-socket",
+                        &socket,
+                        "wait",
+                        "alpha",
+                        "--timeout",
+                        "700ms",
+                        "--json",
+                    ],
+                    &[("PATH", path.as_str())],
+                )
+            }),
+        )
+        .await
+        .expect("a bounded wait must not hang")
+        .unwrap();
+
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "timeout");
+        assert_eq!(output.status.code(), Some(19));
+        assert_eq!(
+            parsed["detail"]["timeout_stage"], "repository_certification",
+            "a stalled local classification is not an owner read"
+        );
+        // The observation that certification began from, not a later one: no
+        // read happens after the deadline.
+        assert_eq!(
+            parsed["detail"]["last_observation"]["change"]["display_status"],
+            "merged"
+        );
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(spy.call_count(), 0);
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+        owner.stop().await;
+    }
+
+    // ------------------------------------------------------------------------
     // wait_unbounded
     // ------------------------------------------------------------------------
     //
@@ -4404,6 +4623,18 @@ mod enabled {
         );
         assert_eq!(output.status.code(), Some(19));
         assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        // Nothing was ever reconciled, so nothing may be claimed: no owner
+        // incarnation, and an explicit null rather than an invented row.
+        assert_eq!(parsed["detail"]["timeout_stage"], "initial_observation");
+        assert!(
+            parsed["detail"]["last_observation"].is_null(),
+            "a wait that saw nothing must say so: {parsed}"
+        );
+        assert!(
+            parsed["instance_id"].is_null(),
+            "an unobserved owner must not be named: {parsed}"
+        );
+        assert_eq!(parsed["detail"]["timeout_ms"], 500);
         assert!(
             accepted.load(Ordering::SeqCst) >= 1,
             "the client must have been inside a request, not failing to connect"
@@ -4490,6 +4721,16 @@ mod enabled {
         );
         assert_eq!(output.status.code(), Some(19));
         assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(
+            parsed["detail"]["timeout_stage"], "remote_verification",
+            "a stalled remote lookup is distinguishable from a local read"
+        );
+        // The observation certification began from, unchanged by the expiry:
+        // no owner read happens after the deadline to refresh it.
+        assert_eq!(
+            parsed["detail"]["last_observation"]["change"]["display_status"],
+            "merged"
+        );
         assert_eq!(spy.call_count(), 0, "wait must submit no command");
 
         // The lookup really happened, so the deadline cancelled work in flight
@@ -5654,6 +5895,67 @@ mod enabled {
             help.contains("external") && help.contains("dependency"),
             "`client wait --help` must say which blocked rows release, got:\n{help}"
         );
+    }
+
+    /// The timeout detail is a contract a script reads, so it has to be written
+    /// down where a caller looks before running the command rather than
+    /// discovered by triggering one.
+    ///
+    /// Named `wait_*` for the same reason its neighbour is: the envelope and the
+    /// sentence describing it fail together or not at all.
+    #[test]
+    fn wait_documentation_describes_the_machine_readable_timeout_detail() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let agents = std::fs::read_to_string(repo_root.join("AGENTS.md")).expect("AGENTS.md");
+        let readme = std::fs::read_to_string(repo_root.join("README.md")).expect("README.md");
+        let cwd = neutral_cwd();
+        let help = stdout_of(&run_cli(cwd.path(), &["client", "wait", "--help"], &[]));
+
+        for (document, name) in [
+            (&agents, "AGENTS.md"),
+            (&readme, "README.md"),
+            (&help, "client wait --help"),
+        ] {
+            for field in ["timeout_ms", "wait_elapsed_ms", "timeout_stage"] {
+                assert!(
+                    document.contains(field),
+                    "{name} must name the '{field}' a caller branches on"
+                );
+            }
+            // The stage vocabulary is closed; a document naming only some of it
+            // leaves a caller guessing at the branch it did not describe.
+            for stage in [
+                "initial_observation",
+                "observing_owner",
+                "repository_certification",
+                "remote_verification",
+            ] {
+                assert!(
+                    document.contains(stage),
+                    "{name} must name the '{stage}' timeout stage"
+                );
+            }
+            assert!(
+                document.contains("last_observation"),
+                "{name} must name the retained observation field"
+            );
+            // The two facts that keep the field honest: it is what was seen
+            // *before* the deadline, and nothing is read afterwards.
+            assert!(
+                document.contains("null"),
+                "{name} must say what an unobserved wait reports instead"
+            );
+            assert!(
+                document.contains("after expiry"),
+                "{name} must say no read happens after the deadline"
+            );
+            // Timing out is not a workflow event, and a document that left that
+            // implicit would invite exactly the repair `wait` never performs.
+            assert!(
+                document.contains("lifecycle status"),
+                "{name} must say a timeout leaves the proposal's status alone"
+            );
+        }
     }
 
     #[test]
