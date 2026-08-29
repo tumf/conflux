@@ -312,15 +312,146 @@ pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBu
     path
 }
 
-/// Generates log file path using XDG_STATE_HOME with project_slug and date.
-/// Format: `{XDG_STATE_HOME}/cflx/logs/<project_slug>/<YYYY-MM-DD>.log`
+/// Directory Conflux owns inside whichever persistent state root is resolved.
+pub const STATE_DIR_NAME: &str = "cflx";
+
+/// Reasons an explicitly configured `state_base_dir` cannot be used.
 ///
-/// - **All platforms**: Uses `${XDG_STATE_HOME}/cflx/logs/<project_slug>/<YYYY-MM-DD>.log` if set,
-///   otherwise falls back to `~/.local/state/cflx/logs/<project_slug>/<YYYY-MM-DD>.log`.
+/// Only an *explicit* configuration can produce one of these. An absent or empty
+/// setting falls back to `XDG_STATE_HOME` and then to the platform default
+/// exactly as before, so an unconfigured installation never sees them.
+#[derive(Debug, thiserror::Error)]
+pub enum StateRootError {
+    #[error(
+        "state_base_dir must be an absolute path, but '{0}' is relative. \
+         Set an absolute path in .cflx.jsonc or the global config, or remove \
+         state_base_dir to use XDG_STATE_HOME."
+    )]
+    NotAbsolute(String),
+
+    #[error(
+        "state_base_dir '{path}' is unavailable and could not be created: {source}. \
+         Mount the volume or grant write permission, or remove state_base_dir to \
+         use XDG_STATE_HOME."
+    )]
+    Uncreatable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error(
+        "state_base_dir '{path}' is not writable: {source}. \
+         Grant write permission on that directory, or remove state_base_dir to \
+         use XDG_STATE_HOME."
+    )]
+    NotWritable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+/// Resolve the Conflux-owned persistent state root from explicit inputs.
+///
+/// Precedence is `state_base_dir` → `XDG_STATE_HOME` → the platform default
+/// `~/.local/state`. Only Conflux-owned paths are affected: nothing here reads
+/// or writes the process environment, so child Apply, Acceptance, Archive,
+/// Resolve, and lifecycle commands keep the `XDG_STATE_HOME` they inherited.
+///
+/// An empty configured value behaves as unset, matching `workspace_base_dir`.
+/// `Ok(None)` means no root could be derived at all (no configuration, no XDG
+/// variable, and no home directory); callers own the temp-directory fallback.
+pub fn resolve_state_root_from(
+    configured: Option<&str>,
+    xdg_state_home: Option<&str>,
+    home_dir: Option<&std::path::Path>,
+) -> std::result::Result<Option<PathBuf>, StateRootError> {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(configured);
+        if !root.is_absolute() {
+            return Err(StateRootError::NotAbsolute(configured.to_string()));
+        }
+        return Ok(Some(root.join(STATE_DIR_NAME)));
+    }
+
+    if let Some(xdg_state_home) = xdg_state_home.filter(|value| !value.is_empty()) {
+        return Ok(Some(PathBuf::from(xdg_state_home).join(STATE_DIR_NAME)));
+    }
+
+    Ok(home_dir.map(|home| home.join(".local").join("state").join(STATE_DIR_NAME)))
+}
+
+/// Process-facing wrapper over [`resolve_state_root_from`].
+pub fn conflux_state_root(
+    configured: Option<&str>,
+) -> std::result::Result<Option<PathBuf>, StateRootError> {
+    let xdg_state_home = std::env::var("XDG_STATE_HOME").ok();
+    resolve_state_root_from(
+        configured,
+        xdg_state_home.as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// The single persistent log root shared by logging, retention cleanup, and
+/// `cflx logs`.
+///
+/// Format: `<state root>/logs`, i.e. `<state_base_dir>/cflx/logs` when the root
+/// is configured. When no root can be derived at all it keeps the historical
+/// temp-directory fallback.
+pub fn log_root_path(configured: Option<&str>) -> std::result::Result<PathBuf, StateRootError> {
+    Ok(match conflux_state_root(configured)? {
+        Some(root) => root.join("logs"),
+        None => std::env::temp_dir().join("cflx-logs-fallback"),
+    })
+}
+
+/// Prove an explicitly configured state root is usable before anything writes to it.
+///
+/// Creates the Conflux-owned directory when it is missing and probes it for
+/// write access, so a relative, unavailable, uncreatable, or unwritable root
+/// fails startup instead of silently falling back to the internal disk. Returns
+/// `Ok(None)` when no root is configured: the XDG and platform defaults keep
+/// their existing lenient behavior.
+pub fn ensure_state_root_usable(
+    configured: Option<&str>,
+) -> std::result::Result<Option<PathBuf>, StateRootError> {
+    let Some(configured) = configured.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    let Some(root) = resolve_state_root_from(Some(configured), None, None)? else {
+        return Ok(None);
+    };
+
+    std::fs::create_dir_all(&root).map_err(|source| StateRootError::Uncreatable {
+        path: root.clone(),
+        source,
+    })?;
+
+    // Existence is not permission: an unwritable mount answers `create_dir_all`
+    // with success for a directory that already exists.
+    let probe = root.join(format!(".cflx-write-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"").map_err(|source| StateRootError::NotWritable {
+        path: root.clone(),
+        source,
+    })?;
+    let _ = std::fs::remove_file(&probe);
+
+    Ok(Some(root))
+}
+
+/// Generates the log file path for a project under the resolved state root.
+/// Format: `<state root>/logs/<project_slug>/<YYYY-MM-DD>.log`
+///
+/// - Uses `state_base_dir` when configured, then `${XDG_STATE_HOME}`, then
+///   `~/.local/state`; see [`resolve_state_root_from`].
 /// - Fallback: system temp directory with `cflx-logs-fallback/<project_slug>/<YYYY-MM-DD>.log`.
 ///
 /// If `repo_root` is provided, the path includes a project-specific slug to avoid conflicts.
-pub fn get_log_file_path(repo_root: Option<&std::path::Path>) -> PathBuf {
+pub fn get_log_file_path(
+    state_base_dir: Option<&str>,
+    repo_root: Option<&std::path::Path>,
+) -> std::result::Result<PathBuf, StateRootError> {
     use chrono::Local;
 
     // Generate project slug if repo_root is provided
@@ -332,36 +463,18 @@ pub fn get_log_file_path(repo_root: Option<&std::path::Path>) -> PathBuf {
     let date_str = Local::now().format("%Y-%m-%d").to_string();
     let log_filename = format!("{}.log", date_str);
 
-    // Check XDG_STATE_HOME first
-    if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
-        return PathBuf::from(xdg_state_home)
-            .join("cflx")
-            .join("logs")
-            .join(&project_slug)
-            .join(&log_filename);
-    }
-
-    // Fall back to ~/.local/state
-    if let Some(home) = dirs::home_dir() {
-        return home
-            .join(".local")
-            .join("state")
-            .join("cflx")
-            .join("logs")
-            .join(&project_slug)
-            .join(&log_filename);
-    }
-
-    // Fallback for unsupported platforms or when home directory is not available
-    std::env::temp_dir()
-        .join("cflx-logs-fallback")
+    Ok(log_root_path(state_base_dir)?
         .join(&project_slug)
-        .join(&log_filename)
+        .join(&log_filename))
 }
 
 /// Cleans up old log files, retaining only the last N days.
 /// Returns the number of files deleted.
+///
+/// Reads the same root as logging and `cflx logs`, so retention can never
+/// clean a directory Conflux is no longer writing to.
 pub fn cleanup_old_logs(
+    state_base_dir: Option<&str>,
     repo_root: Option<&std::path::Path>,
     retain_days: u32,
 ) -> std::io::Result<usize> {
@@ -371,23 +484,9 @@ pub fn cleanup_old_logs(
         .map(generate_project_slug)
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Determine log directory
-    let log_dir = if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
-        PathBuf::from(xdg_state_home)
-            .join("cflx")
-            .join("logs")
-            .join(&project_slug)
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".local")
-            .join("state")
-            .join("cflx")
-            .join("logs")
-            .join(&project_slug)
-    } else {
-        std::env::temp_dir()
-            .join("cflx-logs-fallback")
-            .join(&project_slug)
-    };
+    let log_dir = log_root_path(state_base_dir)
+        .map_err(std::io::Error::other)?
+        .join(&project_slug);
 
     // If log directory doesn't exist, nothing to clean
     if !log_dir.exists() {
@@ -428,6 +527,7 @@ pub fn cleanup_old_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn set_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
         unsafe { std::env::set_var(key, value) }
@@ -609,7 +709,7 @@ mod tests {
     #[test]
     fn test_get_log_file_path_format() {
         let repo_root = PathBuf::from("/tmp/test-repo");
-        let log_path = get_log_file_path(Some(&repo_root));
+        let log_path = get_log_file_path(None, Some(&repo_root)).expect("default root resolves");
         let path_str = log_path.to_string_lossy();
 
         // Should contain cflx/logs
@@ -638,7 +738,7 @@ mod tests {
     fn test_cleanup_old_logs_with_nonexistent_directory() {
         // Should return Ok(0) for non-existent directory
         let repo_root = PathBuf::from("/tmp/nonexistent-repo-for-test");
-        let result = cleanup_old_logs(Some(&repo_root), 7);
+        let result = cleanup_old_logs(None, Some(&repo_root), 7);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }
@@ -687,7 +787,8 @@ mod tests {
         }
 
         // Run cleanup with retain_days = 7
-        let deleted_count = cleanup_old_logs(Some(&repo_root), 7).expect("cleanup_old_logs failed");
+        let deleted_count =
+            cleanup_old_logs(None, Some(&repo_root), 7).expect("cleanup_old_logs failed");
 
         // Should delete exactly 3 files (today-9, today-8, today-7)
         assert_eq!(deleted_count, 3, "Expected to delete 3 files");
@@ -729,5 +830,103 @@ mod tests {
             Some(val) => set_env_var("XDG_STATE_HOME", val),
             None => remove_env_var("XDG_STATE_HOME"),
         }
+    }
+
+    // ── State-root precedence ──────────────────────────────────────────────
+    //
+    // These cases are pure: every input is passed explicitly, so they assert
+    // the precedence rule itself rather than the ambient process environment.
+
+    #[test]
+    fn configured_state_root_wins_over_xdg_state_home() {
+        let root = resolve_state_root_from(
+            Some("/volumes/external/cflx-state"),
+            Some("/home/alice/.local/state"),
+            Some(Path::new("/home/alice")),
+        )
+        .expect("absolute configured root is accepted");
+
+        assert_eq!(
+            root,
+            Some(PathBuf::from("/volumes/external/cflx-state/cflx"))
+        );
+    }
+
+    #[test]
+    fn unset_state_root_falls_back_to_xdg_then_platform_default() {
+        let from_xdg = resolve_state_root_from(
+            None,
+            Some("/home/alice/.local/state"),
+            Some(Path::new("/home/alice")),
+        )
+        .expect("xdg root resolves");
+        assert_eq!(
+            from_xdg,
+            Some(PathBuf::from("/home/alice/.local/state/cflx"))
+        );
+
+        let from_home = resolve_state_root_from(None, None, Some(Path::new("/home/alice")))
+            .expect("platform default resolves");
+        assert_eq!(
+            from_home,
+            Some(PathBuf::from("/home/alice/.local/state/cflx"))
+        );
+
+        let nothing = resolve_state_root_from(None, None, None).expect("absence is not a failure");
+        assert_eq!(nothing, None);
+    }
+
+    #[test]
+    fn empty_state_root_behaves_as_unset() {
+        let root = resolve_state_root_from(
+            Some(""),
+            Some("/home/alice/.local/state"),
+            Some(Path::new("/home/alice")),
+        )
+        .expect("empty configured root is not a failure");
+        assert_eq!(root, Some(PathBuf::from("/home/alice/.local/state/cflx")));
+
+        // An empty XDG variable is equally unset, so writers and readers agree
+        // on the platform default instead of splitting over a relative path.
+        let root = resolve_state_root_from(Some(""), Some(""), Some(Path::new("/home/alice")))
+            .expect("empty xdg value is not a failure");
+        assert_eq!(root, Some(PathBuf::from("/home/alice/.local/state/cflx")));
+    }
+
+    #[test]
+    fn relative_state_root_is_rejected_with_an_actionable_message() {
+        let err = resolve_state_root_from(
+            Some("relative/state"),
+            Some("/home/alice/.local/state"),
+            Some(Path::new("/home/alice")),
+        )
+        .expect_err("a relative configured root must fail closed");
+
+        assert!(matches!(err, StateRootError::NotAbsolute(ref value) if value == "relative/state"));
+        let message = err.to_string();
+        assert!(message.contains("absolute"), "message: {message}");
+        assert!(message.contains("relative/state"), "message: {message}");
+        assert!(message.contains("state_base_dir"), "message: {message}");
+    }
+
+    #[test]
+    fn ensure_state_root_usable_is_a_no_op_without_configuration() {
+        assert!(ensure_state_root_usable(None)
+            .expect("absent configuration is not a failure")
+            .is_none());
+        assert!(ensure_state_root_usable(Some(""))
+            .expect("empty configuration is not a failure")
+            .is_none());
+    }
+
+    #[test]
+    fn ensure_state_root_usable_rejects_a_relative_root_before_touching_the_filesystem() {
+        let err = ensure_state_root_usable(Some("relative/state"))
+            .expect_err("a relative configured root must fail closed");
+        assert!(matches!(err, StateRootError::NotAbsolute(_)));
+        assert!(
+            !Path::new("relative/state").exists(),
+            "rejection must not create the configured directory"
+        );
     }
 }

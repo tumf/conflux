@@ -6,7 +6,7 @@ Conflux SHALL provide a read-only CLI log viewer that helps users locate, print,
 
 The CLI log viewer SHALL preserve the existing persistent log file layout and SHALL NOT use log contents or log file presence as authoritative workflow-control input for scheduler, resume, acceptance, archive, merge, or next-action decisions.
 
-Conflux SHALL allow operators to configure an absolute Conflux-owned persistent state root without changing process-wide XDG variables. The configured root SHALL take precedence over `XDG_STATE_HOME`; absent configuration SHALL preserve existing XDG and platform-default behavior. Logging, retention cleanup, and the CLI log viewer SHALL resolve the same root. An explicitly configured root that is relative, unavailable, uncreatable, or unwritable SHALL cause startup to fail before orchestration-owned child processes begin, and SHALL NOT silently fall back to another disk.
+Persistent logs SHALL live under the Conflux-owned state root defined by the `configuration` capability, at `<state root>/logs/<project_slug>/<YYYY-MM-DD>.log`. Logging initialization, retention cleanup, and the CLI log viewer SHALL resolve that root through one shared resolver, so a reader can never point at a directory the writers abandoned. Sharing the resolver is not sufficient on its own: when an invocation names a custom configuration file, the CLI log viewer SHALL merge that same file, so the root it resolves is the root the writers of that same invocation resolve. The CLI log viewer SHALL remain read-only and SHALL list projects only from the currently resolved root; it SHALL NOT migrate, clean, or list logs left under a previously resolved root.
 
 #### Scenario: Print selected log path without creating logs
 
@@ -61,26 +61,26 @@ Conflux SHALL allow operators to configure an absolute Conflux-owned persistent 
 - **AND** `cflx logs` and retention cleanup resolve that same directory
 - **AND** no process-wide XDG variable is changed for child commands
 
-#### Scenario: Configured state root overrides XDG only for Conflux
+#### Scenario: Log viewer lists projects from the currently resolved root only
 
-- **GIVEN** both `state_base_dir` and `XDG_STATE_HOME` are set
-- **WHEN** Conflux resolves its persistent state root
-- **THEN** Conflux uses `state_base_dir`
-- **AND** child Apply, Acceptance, Archive, Resolve, and lifecycle commands retain the original inherited `XDG_STATE_HOME`
+- **GIVEN** project log directories exist under both a configured state root and a previously resolved root
+- **WHEN** the user runs `cflx logs` and no matching log file is selected
+- **THEN** the listed project slugs come from the currently resolved root
+- **AND** project slugs under the previously resolved root are not listed
+- **AND** the command creates, appends to, and cleans nothing under either root
 
-#### Scenario: Unset state root preserves current behavior
+#### Scenario: Log viewer honors a state root supplied through a custom configuration file
 
-- **GIVEN** `state_base_dir` is absent or empty
-- **WHEN** Conflux resolves its persistent state root
-- **THEN** it uses `XDG_STATE_HOME` when available
-- **AND** otherwise uses the existing platform fallback
+- **GIVEN** `state_base_dir` is set only in a configuration file named by the invocation's custom-configuration option, and `XDG_STATE_HOME` points somewhere else
+- **WHEN** the user runs the log viewer with that same custom configuration option
+- **THEN** the viewer selects, reads, and lists projects under the configured state root
+- **AND** it neither reads nor lists anything under the `XDG_STATE_HOME` root
 
-#### Scenario: Invalid configured state root fails closed
+#### Scenario: Log viewer refuses an unusable configured root instead of falling back
 
-- **GIVEN** `state_base_dir` is relative, unavailable, uncreatable, or unwritable
-- **WHEN** Conflux starts
-- **THEN** startup exits non-zero with an actionable path diagnostic
-- **AND** no lifecycle adapter or AI command is started
-- **AND** Conflux does not silently write logs to its default internal-disk path
+- **GIVEN** `state_base_dir` is configured with a value the shared resolver rejects
+- **WHEN** the user runs `cflx logs`
+- **THEN** the command exits non-zero with an actionable path diagnostic
+- **AND** it does not read or list logs from `XDG_STATE_HOME` or the platform default
 
-<!-- Expected canonical result after archive: Conflux persistent observability paths can be scoped through config without changing child-process XDG state, while logs remain non-authoritative and all readers/writers share one fail-closed resolver. -->
+<!-- Expected canonical result after archive: Conflux persistent observability paths follow the configured Conflux-owned state root, logs remain non-authoritative, and logging, retention cleanup, and the read-only viewer share one resolver so they can never disagree about the current root. -->

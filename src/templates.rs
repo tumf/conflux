@@ -60,6 +60,17 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   "worktree_command": "tmux new-window -n wt ",
   // "worktree_command": "codex '/openspec:proposal --worktree {workspace_dir}'",
 
+  // Storage roots (both optional, both absolute paths, empty string = unset).
+  // workspace_base_dir holds managed Git worktrees; state_base_dir holds
+  // Conflux-owned persistent state, i.e. logs at
+  // <state_base_dir>/cflx/logs/<project_slug>/<YYYY-MM-DD>.log.
+  // state_base_dir takes precedence over XDG_STATE_HOME for Conflux paths only:
+  // child commands keep the XDG_STATE_HOME they inherited. An invalid or
+  // unwritable root fails startup instead of falling back to the internal disk.
+  // Existing worktrees and logs are never migrated or cleaned up for you.
+  // "workspace_base_dir": "/Volumes/BigDisk/cflx/worktrees",
+  // "state_base_dir": "/Volumes/BigDisk/cflx/state",
+
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
 
@@ -169,6 +180,17 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   "worktree_command": "tmux new-window -n wt ",
   // "worktree_command": "claude run '/openspec:proposal --worktree {workspace_dir}'",
 
+  // Storage roots (both optional, both absolute paths, empty string = unset).
+  // workspace_base_dir holds managed Git worktrees; state_base_dir holds
+  // Conflux-owned persistent state, i.e. logs at
+  // <state_base_dir>/cflx/logs/<project_slug>/<YYYY-MM-DD>.log.
+  // state_base_dir takes precedence over XDG_STATE_HOME for Conflux paths only:
+  // child commands keep the XDG_STATE_HOME they inherited. An invalid or
+  // unwritable root fails startup instead of falling back to the internal disk.
+  // Existing worktrees and logs are never migrated or cleaned up for you.
+  // "workspace_base_dir": "/Volumes/BigDisk/cflx/worktrees",
+  // "state_base_dir": "/Volumes/BigDisk/cflx/state",
+
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
 
@@ -277,6 +299,17 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // Supports {workspace_dir} and {repo_root} placeholders
   "worktree_command": "tmux new-window -n wt ",
   // "worktree_command": "opencode run '/openspec:proposal --worktree {workspace_dir}'",
+
+  // Storage roots (both optional, both absolute paths, empty string = unset).
+  // workspace_base_dir holds managed Git worktrees; state_base_dir holds
+  // Conflux-owned persistent state, i.e. logs at
+  // <state_base_dir>/cflx/logs/<project_slug>/<YYYY-MM-DD>.log.
+  // state_base_dir takes precedence over XDG_STATE_HOME for Conflux paths only:
+  // child commands keep the XDG_STATE_HOME they inherited. An invalid or
+  // unwritable root fails startup instead of falling back to the internal disk.
+  // Existing worktrees and logs are never migrated or cleaned up for you.
+  // "workspace_base_dir": "/Volumes/BigDisk/cflx/worktrees",
+  // "state_base_dir": "/Volumes/BigDisk/cflx/state",
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,

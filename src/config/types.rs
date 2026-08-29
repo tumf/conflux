@@ -300,6 +300,16 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub workspace_base_dir: Option<String>,
 
+    /// Absolute base directory for Conflux-owned persistent state.
+    ///
+    /// When set, Conflux stores its non-authoritative persistent state under
+    /// `<state_base_dir>/cflx/` — logs at `<state_base_dir>/cflx/logs/<project_slug>/`.
+    /// It takes precedence over `XDG_STATE_HOME` for Conflux-owned paths only and
+    /// never mutates the environment inherited by child commands.
+    /// Empty string behaves as unset. Default: `XDG_STATE_HOME`, then `~/.local/state`.
+    #[serde(default)]
+    pub state_base_dir: Option<String>,
+
     /// Command template for merge/conflict resolution.
     /// Supports `{prompt}` placeholder.
     /// If not set, uses automatic AI-based resolution.
@@ -609,6 +619,7 @@ impl OrchestratorConfig {
             max_iterations,
             max_concurrent_workspaces,
             workspace_base_dir,
+            state_base_dir,
             resolve_command,
             use_llm_analysis,
             vcs_backend,
@@ -685,6 +696,7 @@ impl OrchestratorConfig {
             max_concurrent_workspaces,
         );
         overwrite_if_some(&mut self.workspace_base_dir, workspace_base_dir);
+        overwrite_if_some(&mut self.state_base_dir, state_base_dir);
         overwrite_if_some(&mut self.use_llm_analysis, use_llm_analysis);
         overwrite_if_some(&mut self.vcs_backend, vcs_backend);
 
@@ -925,6 +937,13 @@ impl OrchestratorConfig {
     /// Returns None if using system temp directory.
     pub fn get_workspace_base_dir(&self) -> Option<&str> {
         self.workspace_base_dir.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// Get the configured Conflux-owned persistent state base directory.
+    /// Returns None when unset or empty, which preserves `XDG_STATE_HOME` and
+    /// the existing platform-default behavior.
+    pub fn get_state_base_dir(&self) -> Option<&str> {
+        self.state_base_dir.as_deref().filter(|s| !s.is_empty())
     }
 
     /// Get the resolve command for conflict resolution (required, returns error if not set).
