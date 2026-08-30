@@ -131,9 +131,9 @@ cflx openspec archive <id> --yes  # Archive change
 
 ### Task Management
 
-- Update `tasks.md` immediately after each task completion
-- Active sections must have checkboxes (`- [ ]` or `- [x]`)
-- Future Work sections must NOT have checkboxes
+- Update the change's resolved task file — the one artifact named by `tasks_path`, either `tasks.md` or versioned `tasks.json` — immediately after each task completion, and never create the other filename
+- In `tasks.md`, active sections must have checkboxes (`- [ ]` or `- [x]`), and Future Work sections must NOT have checkboxes
+- In `tasks.json`, completion is the task's `"status"` field (only `"completed"` is done) and narrative content lives in the `narrative` object, never as a task
 
 ### Implementation Blocker Stalled Hold
 

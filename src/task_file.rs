@@ -459,7 +459,11 @@ pub struct JsonTaskDocument {
     pub follow_up: Option<JsonFollowUp>,
 }
 
-const FOLLOW_UP_KEY: &str = "acceptance_follow_up";
+/// Object key carrying the runtime-owned acceptance follow-up in `tasks.json`.
+///
+/// Shared so progress detection can drop runtime bookkeeping without
+/// re-spelling the key it is supposed to ignore.
+pub const FOLLOW_UP_KEY: &str = "acceptance_follow_up";
 
 fn json_error(pointer: &str, message: impl AsRef<str>) -> OrchestratorError {
     OrchestratorError::ConfigLoad(format!(

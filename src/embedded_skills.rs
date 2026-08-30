@@ -586,6 +586,31 @@ mod tests {
                 && CFLX_PROPOSAL_SKILL_MD.contains("Never create both"),
             "cflx-proposal SKILL.md must keep tasks.md the default and forbid two artifacts"
         );
+
+        // Every embedded skill that tells an agent to read or write task state
+        // must name the resolved artifact. A skill that still mandates
+        // `tasks.md` would make an agent on a JSON-only change create the
+        // second file that resolution then refuses as ambiguous.
+        assert!(
+            CFLX_REJECTION_GUIDE_SKILL_MD.contains("named by `tasks_path`")
+                && CFLX_REJECTION_GUIDE_SKILL_MD.contains("versioned `openspec/changes/<change-id>/tasks.json`")
+                && CFLX_REJECTION_GUIDE_SKILL_MD.contains("never create the other filename")
+                && CFLX_REJECTION_GUIDE_SKILL_MD.contains("in that file's own format"),
+            "cflx-rejection-guide SKILL.md must route recovery work through the resolved task file and forbid the second filename"
+        );
+        assert!(
+            CFLX_WORKFLOW_SKILL_MD.contains("The prompt's `tasks_path` names it")
+                && CFLX_WORKFLOW_SKILL_MD.contains("versioned `tasks.json`")
+                && CFLX_WORKFLOW_SKILL_MD.contains("Never create the other filename")
+                && CFLX_WORKFLOW_SKILL_MD.contains("`\"status\"` becomes `\"completed\"`")
+                && CFLX_WORKFLOW_SKILL_MD.contains("`acceptance_follow_up` object in JSON"),
+            "cflx-workflow SKILL.md must give format-specific task rules and forbid the second filename"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("versioned `tasks.json`")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("`acceptance_follow_up` object in JSON"),
+            "cflx-accept-with-speca SKILL.md must mirror cflx-accept and name the resolved task artifact in both formats"
+        );
     }
 
     #[test]

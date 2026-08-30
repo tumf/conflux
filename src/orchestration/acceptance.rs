@@ -881,6 +881,17 @@ pub fn repository_findings(
 }
 
 pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Result<String> {
+    /// The task artifact a repository path carries, if any.
+    ///
+    /// Both supported basenames are task evidence, so a JSON-only change is
+    /// visible to progress detection exactly as a Markdown one is. The format
+    /// travels with the answer because the runtime-owned follow-up has to be
+    /// stripped differently in each.
+    fn task_file_format(path: &str) -> Option<crate::task_file::TaskFileFormat> {
+        path.rsplit('/')
+            .next()
+            .and_then(crate::task_file::TaskFileFormat::from_file_name)
+    }
     fn include(path: &str) -> bool {
         !path.starts_with(".git/")
             && !path.starts_with(".cflx/")
@@ -895,7 +906,42 @@ pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Re
                 || path == ".cflx.jsonc"
                 || path.ends_with("/.cflx.jsonc")
                 || path.ends_with("Cargo.toml")
-                || path.ends_with("tasks.md"))
+                || task_file_format(path).is_some())
+    }
+    /// Remove the runtime-owned follow-up from a task artifact's bytes.
+    ///
+    /// Runtime FAIL writes must never look like Apply progress, in either
+    /// format. Markdown drops the trailing follow-up sections; JSON drops the
+    /// `acceptance_follow_up` key and re-serializes the rest deterministically.
+    /// Bytes that do not parse are hashed as they are: a malformed artifact is
+    /// still repository content, and guessing at its structure would be worse
+    /// than hashing it verbatim.
+    fn strip_runtime_follow_up(
+        format: crate::task_file::TaskFileFormat,
+        contents: Vec<u8>,
+    ) -> Vec<u8> {
+        match format {
+            crate::task_file::TaskFileFormat::Markdown => {
+                let text = String::from_utf8_lossy(&contents);
+                text.split("\n## Current Acceptance Follow-up")
+                    .next()
+                    .unwrap_or(&text)
+                    .split("\n## Acceptance #")
+                    .next()
+                    .unwrap_or(&text)
+                    .as_bytes()
+                    .to_vec()
+            }
+            crate::task_file::TaskFileFormat::Json => {
+                match serde_json::from_slice::<serde_json::Value>(&contents) {
+                    Ok(serde_json::Value::Object(mut root)) => {
+                        root.remove(crate::task_file::FOLLOW_UP_KEY);
+                        serde_json::to_vec(&serde_json::Value::Object(root)).unwrap_or(contents)
+                    }
+                    _ => contents,
+                }
+            }
+        }
     }
     fn visit(
         root: &std::path::Path,
@@ -916,17 +962,8 @@ pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Re
                 .replace('\\', "/");
             if include(&relative) {
                 let mut contents = std::fs::read(path)?;
-                if relative.ends_with("tasks.md") {
-                    let text = String::from_utf8_lossy(&contents);
-                    contents = text
-                        .split("\n## Current Acceptance Follow-up")
-                        .next()
-                        .unwrap_or(&text)
-                        .split("\n## Acceptance #")
-                        .next()
-                        .unwrap_or(&text)
-                        .as_bytes()
-                        .to_vec();
+                if let Some(format) = task_file_format(&relative) {
+                    contents = strip_runtime_follow_up(format, contents);
                 }
                 output.push((relative, contents));
             }
@@ -3378,6 +3415,57 @@ mod tests {
         std::fs::write(&spec, "requirement two").unwrap();
         assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
         std::fs::write(temp.path().join(".cflx.jsonc"), "{ \"mode\": 2 }").unwrap();
+        assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+    }
+
+    /// A JSON-only change's task artifact is progress evidence exactly as the
+    /// Markdown one is: real task movement changes the fingerprint, and a
+    /// runtime-owned follow-up rewrite does not.
+    #[test]
+    fn semantic_fingerprint_tracks_json_tasks_but_excludes_runtime_follow_up() {
+        fn document(status: &str, follow_up: &str) -> String {
+            format!(
+                r#"{{"schema_version":1,"tasks":[{{"id":"a","title":"A","status":"{status}","section":"implementation"}}]{follow_up}}}"#
+            )
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let tasks = temp.path().join("openspec/changes/example/tasks.json");
+        std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
+        std::fs::write(&tasks, document("pending", "")).unwrap();
+        let before = semantic_progress_fingerprint(temp.path()).unwrap();
+
+        // Runtime bookkeeping: a FAIL write is never Apply progress.
+        std::fs::write(
+            &tasks,
+            document(
+                "pending",
+                r#","acceptance_follow_up":{"attempt":2,"findings":[{"identity":"repository|src/a.rs|verification","text":"Add the missing test","remediation_claimed":false}]}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+
+        // Real task movement: pending -> completed must be visible.
+        std::fs::write(&tasks, document("completed", "")).unwrap();
+        assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+    }
+
+    /// A task artifact whose bytes do not parse is still repository content.
+    /// It is hashed verbatim rather than guessed at, so a repair of the
+    /// malformed file registers as progress.
+    #[test]
+    fn semantic_fingerprint_hashes_malformed_json_tasks_verbatim() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let tasks = temp.path().join("openspec/changes/example/tasks.json");
+        std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
+        std::fs::write(&tasks, "{not json").unwrap();
+        let before = semantic_progress_fingerprint(temp.path()).unwrap();
+        std::fs::write(
+            &tasks,
+            r#"{"schema_version":1,"tasks":[{"id":"a","title":"A","status":"pending","section":"implementation"}]}"#,
+        )
+        .unwrap();
         assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
     }
 

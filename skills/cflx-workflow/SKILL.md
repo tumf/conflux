@@ -20,17 +20,17 @@ This router is self-contained so legacy prompts do not need another skill or ref
 
 Implement the approved change; do not only inspect, summarize, or plan.
 
-1. Read `proposal.md`, optional `design.md`, and `tasks.md` under `openspec/changes/<change-id>/`.
-2. Implement each active unchecked task and run its planned verification.
-3. Mark a task `[x]` only after its implementation artifact, runtime wiring when applicable, and verification evidence exist.
-4. Update `tasks.md` after each completed task. Internal agent todos are not OpenSpec completion evidence.
-5. Finish only when all active tasks are complete or validly moved to a non-checkbox Future Work section.
+1. Read `proposal.md`, optional `design.md`, and the change's task file under `openspec/changes/<change-id>/`. The prompt's `tasks_path` names it: a change entry owns exactly one task artifact, either checkbox `tasks.md` or versioned `tasks.json`. Never create the other filename; two task files in one entry is an ambiguity error that fails closed.
+2. Implement each active incomplete task and run its planned verification.
+3. Mark a task complete only after its implementation artifact, runtime wiring when applicable, and verification evidence exist — `- [ ]` becomes `- [x]` in `tasks.md`, and a task's `"status"` becomes `"completed"` in `tasks.json`.
+4. Update the resolved task file after each completed task, in that file's own format. Internal agent todos are not OpenSpec completion evidence.
+5. Finish only when all active tasks are complete or validly moved to narrative Future Work (a non-checkbox section in `tasks.md`, the `narrative` object in `tasks.json`).
 
 Unit-test claims require isolated tests using mocks, fakes, or in-memory doubles. Tests using real filesystem, process, VCS, network, database, clock, credentials, or OS state are integration or e2e evidence and cannot satisfy a unit-test task.
 
 Recoverable infrastructure failures such as Docker, DNS, registry, credential, port, rate-limit, or pending managed-job failures are non-terminal stalled holds. Record concrete evidence and recovery actions; do not create `REJECTED.md` for these cases.
 
-For a terminally invalid change intent, record a non-checkbox `## Implementation Blocker #<n>` in `tasks.md`, create `REJECTED.md` as a review proposal, and end with an `IMPLEMENTATION_BLOCKER:` payload containing category, evidence location, and required action.
+For a terminally invalid change intent, record the blocker in the change's task file — a non-checkbox `## Implementation Blocker #<n>` section in `tasks.md`, or a `narrative.notes` entry carrying the same fields in `tasks.json` — create `REJECTED.md` as a review proposal, and end with an `IMPLEMENTATION_BLOCKER:` payload containing category, evidence location, and required action.
 
 ## Rejecting Review
 
@@ -56,7 +56,7 @@ Do not perform new implementation or emit acceptance/rejection markers.
 
 ## Acceptance
 
-Acceptance is read-only review. Do not implement fixes or edit `tasks.md`.
+Acceptance is read-only review. Read the task file named by `tasks_path` — `tasks.md` or versioned `tasks.json` — and do not implement fixes, edit it, or edit the runtime-owned acceptance follow-up state it carries (the `## Current Acceptance Follow-up` section in Markdown, the `acceptance_follow_up` object in JSON).
 
 Review the proposal, tasks, spec deltas, implementation diff, planned verification ownership, tests, working-tree cleanliness, and actual commit-path blockers. Every FAIL finding must cite actionable repository evidence such as a file, symbol, or line.
 
