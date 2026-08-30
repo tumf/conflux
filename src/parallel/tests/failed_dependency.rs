@@ -389,10 +389,8 @@ impl EpochProbe {
                 ExecutionEvent::DependencyBlocked {
                     change_id,
                     dependency_ids,
-                } => {
-                    if dependency_ids.contains(&"a".to_string()) {
-                        emitted.dependency_blocked.push(change_id);
-                    }
+                } if dependency_ids.iter().any(|id| id == "a") => {
+                    emitted.dependency_blocked.push(change_id);
                 }
                 _ => {}
             }
@@ -911,10 +909,8 @@ where
             ParallelEvent::DependencyBlocked {
                 change_id,
                 dependency_ids,
-            } => {
-                if dependency_ids.contains(&"a".to_string()) {
-                    run.dependency_blocked.push(change_id);
-                }
+            } if dependency_ids.iter().any(|id| id == "a") => {
+                run.dependency_blocked.push(change_id);
             }
             _ => {}
         }
