@@ -91,7 +91,7 @@ A Conflux proposal consists of:
 ```
 openspec/changes/<change-id>/
 ├── proposal.md          # Change description and context
-├── tasks.md             # Implementation task checklist
+├── tasks.md             # Implementation task checklist (default; `tasks.json` is the structured alternative)
 ├── design.md            # Architecture and design (optional)
 └── specs/               # Spec deltas
     └── <capability>/
@@ -325,7 +325,10 @@ Create `openspec/changes/<id>/proposal.md`:
 
 ### 5. Create Task Breakdown
 
-Create `openspec/changes/<id>/tasks.md`:
+Create `openspec/changes/<id>/tasks.md`. (Conflux also accepts a versioned
+`openspec/changes/<id>/tasks.json` as the change's sole task artifact, but
+`tasks.md` remains the proposal default. Never create both: two task files in
+one change entry is an ambiguity error.)
 
 **Task format for `implementation` or `hybrid` proposals**:
 

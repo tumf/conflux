@@ -342,6 +342,94 @@ Current archive finalization state:\n\
     prompt
 }
 
+/// Refuse a staged archive snapshot that changes a change's task-file identity.
+///
+/// The staged diff is the only place the *deleted* active basename is still
+/// visible — after the commit the file is gone, so nothing downstream can tell
+/// `tasks.md` from `tasks.json`. Cross-format moves and two competing basenames
+/// are always wrong and are refused here. A missing half of the pair is not:
+/// archive finalization legitimately re-enters after a partial commit, and the
+/// filesystem archive-entry predicates already own that case.
+async fn verify_staged_archive_task_transition(change_id: &str, repo_root: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["diff", "--cached", "--name-status", "-z"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .map_err(|e| {
+            OrchestratorError::GitCommand(format!("Failed to read staged archive diff: {}", e))
+        })?;
+    if !output.status.success() {
+        return Err(OrchestratorError::GitCommand(format!(
+            "Failed to read staged archive diff: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let fields = String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|field| !field.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut entries: Vec<(char, String)> = Vec::new();
+    let mut index = 0;
+    while index + 1 < fields.len() {
+        let status = fields[index].chars().next().unwrap_or('?');
+        if matches!(status, 'R' | 'C') {
+            // A rename record carries source and destination. Archiving normally
+            // shows up as exactly this, so it is split into the delete and add
+            // halves the transition rule is written against.
+            let (Some(source), Some(destination)) = (fields.get(index + 1), fields.get(index + 2))
+            else {
+                break;
+            };
+            entries.push(('D', source.clone()));
+            entries.push(('A', destination.clone()));
+            index += 3;
+            continue;
+        }
+        if let Some(path) = fields.get(index + 1) {
+            entries.push((status, path.clone()));
+        }
+        index += 2;
+    }
+
+    match archive_layout::classify_archive_task_transition(&entries, change_id) {
+        Ok(format) => {
+            debug!(
+                change_id = %change_id,
+                task_file_format = ?format,
+                "Staged archive snapshot moves exactly one task artifact"
+            );
+            Ok(())
+        }
+        Err(
+            error @ (archive_layout::ArchiveTaskTransitionError::CrossFormat { .. }
+            | archive_layout::ArchiveTaskTransitionError::Ambiguous),
+        ) => {
+            let _ = Command::new("git")
+                .args(["reset"])
+                .current_dir(repo_root)
+                .output()
+                .await;
+            Err(OrchestratorError::AgentCommand(format!(
+                "Refusing archive commit: {}; staged changes were reset",
+                error.message(change_id)
+            )))
+        }
+        Err(error) => {
+            // A partial snapshot proves nothing either way; the filesystem
+            // archive predicates decide whether the archive is complete.
+            debug!(
+                change_id = %change_id,
+                "Staged archive snapshot carries no complete task transition: {}",
+                error.message(change_id)
+            );
+            Ok(())
+        }
+    }
+}
+
 async fn try_direct_archive_commit(
     change_id: &str,
     repo_root: &Path,
@@ -369,6 +457,7 @@ async fn try_direct_archive_commit(
         )));
     }
     crate::vcs::git::commands::validate_staged_snapshot(repo_root).await?;
+    verify_staged_archive_task_transition(change_id, repo_root).await?;
 
     let commit_output = Command::new("git")
         .args(["commit", "-m", &commit_message])
@@ -822,32 +911,24 @@ pub fn verify_archive_completion(
 /// ```
 #[allow(dead_code)] // Provided for API completeness; used by get_task_progress pattern
 pub fn verify_task_completion(change_id: &str, base_path: Option<&Path>) -> Result<bool> {
-    let tasks_path = match base_path {
-        Some(base) => base
-            .join("openspec/changes")
-            .join(change_id)
-            .join("tasks.md"),
-        None => Path::new("openspec/changes")
-            .join(change_id)
-            .join("tasks.md"),
+    let change_dir = active_change_dir(change_id, base_path);
+    let Some(tasks_file) = crate::task_file::find_in_entry(&change_dir)? else {
+        // If no task artifact exists, we can't verify completion.
+        // Return error to let caller decide how to handle.
+        return Err(OrchestratorError::ConfigLoad(format!(
+            "Tasks file not found for change '{}': {:?}",
+            change_id,
+            change_dir.join(crate::task_file::MARKDOWN_FILE_NAME)
+        )));
     };
 
     debug!(
         change_id = %change_id,
-        tasks_path = %tasks_path.display(),
+        tasks_path = %tasks_file.display(),
         "verify_task_completion: checking tasks"
     );
 
-    if !tasks_path.exists() {
-        // If tasks file doesn't exist, we can't verify completion
-        // Return error to let caller decide how to handle
-        return Err(OrchestratorError::ConfigLoad(format!(
-            "Tasks file not found for change '{}': {:?}",
-            change_id, tasks_path
-        )));
-    }
-
-    let progress = task_parser::parse_file(&tasks_path, Some(change_id))?;
+    let progress = crate::task_file::read_progress(&tasks_file, Some(change_id))?;
 
     debug!(
         change_id = %change_id,
@@ -886,20 +967,14 @@ pub fn get_task_progress(
     change_id: &str,
     base_path: Option<&Path>,
 ) -> Result<Option<task_parser::TaskProgress>> {
-    // Try primary location: openspec/changes/{change_id}/tasks.md
-    let tasks_path = match base_path {
-        Some(base) => base
-            .join("openspec/changes")
-            .join(change_id)
-            .join("tasks.md"),
-        None => Path::new("openspec/changes")
-            .join(change_id)
-            .join("tasks.md"),
-    };
-
-    if tasks_path.exists() {
-        let progress = task_parser::parse_file(&tasks_path, Some(change_id))?;
-        return Ok(Some(progress));
+    // Try primary location: the active change entry, in whichever format it declares
+    if let Some(tasks_file) =
+        crate::task_file::find_in_entry(&active_change_dir(change_id, base_path))?
+    {
+        return Ok(Some(crate::task_file::read_progress(
+            &tasks_file,
+            Some(change_id),
+        )?));
     }
 
     // Fallback: try archive location
@@ -909,19 +984,28 @@ pub fn get_task_progress(
     };
 
     if let Some(archive_entry_path) = find_archive_entry_path(change_id, &archive_dir) {
-        let archive_tasks_path = archive_entry_path.join("tasks.md");
-        if archive_tasks_path.exists() {
+        if let Some(archive_tasks) = crate::task_file::find_in_entry(&archive_entry_path)? {
             debug!(
                 change_id = %change_id,
-                archive_tasks_path = %archive_tasks_path.display(),
+                archive_tasks_path = %archive_tasks.display(),
                 "get_task_progress: using archive fallback"
             );
-            let progress = task_parser::parse_file(&archive_tasks_path, Some(change_id))?;
-            return Ok(Some(progress));
+            return Ok(Some(crate::task_file::read_progress(
+                &archive_tasks,
+                Some(change_id),
+            )?));
         }
     }
 
     Ok(None)
+}
+
+/// Active change entry directory, rooted at `base_path` or the current directory.
+fn active_change_dir(change_id: &str, base_path: Option<&Path>) -> std::path::PathBuf {
+    match base_path {
+        Some(base) => base.join("openspec/changes").join(change_id),
+        None => Path::new("openspec/changes").join(change_id),
+    }
 }
 
 /// Build an error message for failed archive verification.
@@ -1755,6 +1839,103 @@ fi\n";
         let progress = get_task_progress(change_id, Some(base)).unwrap().unwrap();
         assert_eq!(progress.completed, 3);
         assert_eq!(progress.total, 3);
+    }
+
+    #[test]
+    fn json_archive_completion_uses_the_same_gate_as_markdown() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        let change_id = "json-archive";
+
+        // Active JSON artifact: one open task blocks archive completion.
+        let change_dir = base.join("openspec/changes").join(change_id);
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[
+                {"id":"a","title":"A","status":"completed","section":"implementation"},
+                {"id":"b","title":"B","status":"in_progress","section":"implementation"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let progress = get_task_progress(change_id, Some(base)).unwrap().unwrap();
+        assert_eq!((progress.completed, progress.total), (1, 2));
+        assert!(!verify_task_completion(change_id, Some(base)).unwrap());
+
+        // An empty JSON task list is never archive-complete.
+        fs::write(
+            change_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[]}"#,
+        )
+        .unwrap();
+        assert!(!verify_task_completion(change_id, Some(base)).unwrap());
+
+        // All completed authorizes archive readiness.
+        fs::write(
+            change_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[
+                {"id":"a","title":"A","status":"completed","section":"implementation"}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(verify_task_completion(change_id, Some(base)).unwrap());
+
+        // An unclaimed acceptance finding is a virtual gate item that reopens it.
+        fs::write(
+            change_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[
+                {"id":"a","title":"A","status":"completed","section":"implementation"}
+            ],"acceptance_follow_up":{"attempt":1,"findings":[
+                {"identity":"f","text":"repair it","remediation_claimed":false}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(!verify_task_completion(change_id, Some(base)).unwrap());
+    }
+
+    #[test]
+    fn json_archive_entry_is_read_through_the_archive_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        let change_id = "json-archived";
+        let archive_dir = base
+            .join("openspec/changes/archive")
+            .join("2026-01-15-json-archived");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(
+            archive_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[
+                {"id":"a","title":"A","status":"completed","section":"implementation"},
+                {"id":"b","title":"B","status":"completed","section":"specification"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let progress = get_task_progress(change_id, Some(base)).unwrap().unwrap();
+        assert_eq!((progress.completed, progress.total), (2, 2));
+    }
+
+    #[test]
+    fn ambiguous_archive_entry_refuses_to_report_progress() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        let change_id = "ambiguous-archive";
+        let change_dir = base.join("openspec/changes").join(change_id);
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(change_dir.join("tasks.md"), "- [x] done\n").unwrap();
+        fs::write(
+            change_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[]}"#,
+        )
+        .unwrap();
+
+        let error = get_task_progress(change_id, Some(base))
+            .expect_err("ambiguity must not resolve by precedence");
+        assert!(
+            error.to_string().contains("Ambiguous task artifacts"),
+            "{error}"
+        );
     }
 
     #[test]

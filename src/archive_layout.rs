@@ -1,3 +1,4 @@
+use crate::task_file::TaskFileFormat;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -96,9 +97,128 @@ pub(crate) fn is_active_change_path(path: &str, change_id: &str) -> bool {
     path.starts_with(&prefix)
 }
 
-/// Repository-relative path of the active (live) change task list.
-pub(crate) fn active_change_tasks_path(change_id: &str) -> String {
-    format!("{ACTIVE_CHANGES_PREFIX}/{change_id}/tasks.md")
+/// Repository-relative path of the active (live) change task list in `format`.
+///
+/// The format is always explicit: no caller may silently construct `tasks.md`
+/// for a change whose artifact is `tasks.json`.
+pub(crate) fn active_change_tasks_path(change_id: &str, format: TaskFileFormat) -> String {
+    format!("{ACTIVE_CHANGES_PREFIX}/{change_id}/{}", format.file_name())
+}
+
+/// Every repository-relative active task path that can speak for `change_id`.
+pub(crate) fn active_change_tasks_paths(change_id: &str) -> Vec<(TaskFileFormat, String)> {
+    TaskFileFormat::ALL
+        .into_iter()
+        .map(|format| (format, active_change_tasks_path(change_id, format)))
+        .collect()
+}
+
+/// The format a repository-relative path names as `change_id`'s active task
+/// artifact, if it names one at all.
+pub(crate) fn active_change_tasks_format(path: &str, change_id: &str) -> Option<TaskFileFormat> {
+    let rest = path.strip_prefix(&format!("{ACTIVE_CHANGES_PREFIX}/{change_id}/"))?;
+    TaskFileFormat::from_file_name(rest)
+}
+
+/// The format a repository-relative path names as `change_id`'s archived task
+/// artifact, if it names one at all.
+///
+/// Uses the same entry rules as the archived proposal identity, so a nested
+/// date layout, a suffix collision, or another change's entry is never
+/// mistaken for this change's archived task evidence.
+pub(crate) fn archive_tasks_format(path: &str, change_id: &str) -> Option<TaskFileFormat> {
+    let rest = path.strip_prefix(&format!("{ARCHIVE_PREFIX}/"))?;
+    let (entry, file_name) = rest.rsplit_once('/')?;
+    let format = TaskFileFormat::from_file_name(file_name)?;
+    is_valid_archive_entry_name(entry, change_id).then_some(format)
+}
+
+/// Why a commit's diff does not prove a single-format archive transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArchiveTaskTransitionError {
+    /// No deletion of an active task artifact was found.
+    MissingDeletion,
+    /// No addition of an archived task artifact was found.
+    MissingAddition,
+    /// More than one active or archived task artifact was touched.
+    Ambiguous,
+    /// The deleted and added artifacts use different formats.
+    CrossFormat {
+        /// Format removed from the active entry.
+        deleted: TaskFileFormat,
+        /// Format added at the archived entry.
+        added: TaskFileFormat,
+    },
+}
+
+impl ArchiveTaskTransitionError {
+    /// Operator-facing reason, naming the change it applies to.
+    pub(crate) fn message(&self, change_id: &str) -> String {
+        match self {
+            Self::MissingDeletion => format!(
+                "archive transition for '{change_id}' deletes no active task artifact ({} or {})",
+                TaskFileFormat::Markdown.file_name(),
+                TaskFileFormat::Json.file_name()
+            ),
+            Self::MissingAddition => format!(
+                "archive transition for '{change_id}' adds no task artifact at a valid archived entry"
+            ),
+            Self::Ambiguous => format!(
+                "archive transition for '{change_id}' touches more than one task artifact; exactly one add/delete pair is required"
+            ),
+            Self::CrossFormat { deleted, added } => format!(
+                "archive transition for '{change_id}' deletes {} but adds {}; an archive move never changes task-file format",
+                deleted.file_name(),
+                added.file_name()
+            ),
+        }
+    }
+}
+
+/// Verify that a commit's diff moves exactly one task artifact from the active
+/// entry to the valid archived entry, keeping its basename.
+///
+/// Archive validation cannot infer the deleted active filename from filesystem
+/// existence — the file is gone by then — so the transition is proven from the
+/// diff itself. `entries` are `(status, repository-relative path)` pairs.
+pub(crate) fn classify_archive_task_transition(
+    entries: &[(char, String)],
+    change_id: &str,
+) -> std::result::Result<TaskFileFormat, ArchiveTaskTransitionError> {
+    let mut deleted: Vec<TaskFileFormat> = Vec::new();
+    let mut added: Vec<TaskFileFormat> = Vec::new();
+
+    // Only removal from the active entry and addition at the archived entry
+    // describe the move. Any other status on those paths (a modification, a
+    // type change) is unrelated churn and is ignored rather than guessed at;
+    // callers pre-split renames into their delete and add halves.
+    for (status, path) in entries {
+        if *status == 'D' {
+            if let Some(format) = active_change_tasks_format(path, change_id) {
+                deleted.push(format);
+            }
+        } else if *status == 'A' {
+            if let Some(format) = archive_tasks_format(path, change_id) {
+                added.push(format);
+            }
+        }
+    }
+
+    if deleted.len() > 1 || added.len() > 1 {
+        return Err(ArchiveTaskTransitionError::Ambiguous);
+    }
+    let deleted = deleted
+        .first()
+        .copied()
+        .ok_or(ArchiveTaskTransitionError::MissingDeletion)?;
+    let added = added
+        .first()
+        .copied()
+        .ok_or(ArchiveTaskTransitionError::MissingAddition)?;
+    if deleted != added {
+        return Err(ArchiveTaskTransitionError::CrossFormat { deleted, added });
+    }
+    Ok(added)
 }
 
 /// Whether a repository-relative path is `file_name` inside the valid archive
@@ -126,11 +246,6 @@ pub(crate) fn is_valid_archive_file_path(path: &str, change_id: &str, file_name:
 /// authorize deletion of the live change.
 pub(crate) fn is_valid_archive_proposal_path(path: &str, change_id: &str) -> bool {
     is_valid_archive_file_path(path, change_id, "proposal.md")
-}
-
-/// Whether a repository-relative path is the archived task list for `change_id`.
-pub(crate) fn is_valid_archive_tasks_path(path: &str, change_id: &str) -> bool {
-    is_valid_archive_file_path(path, change_id, "tasks.md")
 }
 
 /// Whether a repository-relative path sits under an invalid nested archive layout
@@ -269,14 +384,15 @@ mod tests {
 
     #[test]
     fn archive_task_paths_use_the_same_entry_rules_as_proposals() {
-        assert!(is_valid_archive_tasks_path(
-            "openspec/changes/archive/my-change/tasks.md",
-            "my-change"
-        ));
-        assert!(is_valid_archive_tasks_path(
+        assert!(
+            archive_tasks_format("openspec/changes/archive/my-change/tasks.md", "my-change")
+                .is_some()
+        );
+        assert!(archive_tasks_format(
             "openspec/changes/archive/2026-07-09-my-change/tasks.md",
             "my-change"
-        ));
+        )
+        .is_some());
         for invalid in [
             // nested date layout
             "openspec/changes/archive/2026-07-09/my-change/tasks.md",
@@ -290,15 +406,166 @@ mod tests {
             "openspec/changes/archive/my-change/proposal.md",
         ] {
             assert!(
-                !is_valid_archive_tasks_path(invalid, "my-change"),
+                archive_tasks_format(invalid, "my-change").is_none(),
                 "'{}' must not count as archived task evidence",
                 invalid
             );
         }
         assert_eq!(
-            active_change_tasks_path("my-change"),
+            active_change_tasks_path("my-change", TaskFileFormat::Markdown),
             "openspec/changes/my-change/tasks.md"
         );
+        assert_eq!(
+            active_change_tasks_path("my-change", TaskFileFormat::Json),
+            "openspec/changes/my-change/tasks.json"
+        );
+    }
+
+    #[test]
+    fn task_path_recognition_accepts_either_supported_basename() {
+        assert_eq!(
+            active_change_tasks_format("openspec/changes/my-change/tasks.json", "my-change"),
+            Some(TaskFileFormat::Json)
+        );
+        assert_eq!(
+            active_change_tasks_format("openspec/changes/my-change/tasks.md", "my-change"),
+            Some(TaskFileFormat::Markdown)
+        );
+        assert_eq!(
+            active_change_tasks_format("openspec/changes/my-change/tasks.yaml", "my-change"),
+            None
+        );
+        assert_eq!(
+            active_change_tasks_format("openspec/changes/other/tasks.json", "my-change"),
+            None
+        );
+
+        assert_eq!(
+            archive_tasks_format(
+                "openspec/changes/archive/2026-07-09-my-change/tasks.json",
+                "my-change"
+            ),
+            Some(TaskFileFormat::Json)
+        );
+        for invalid in [
+            "openspec/changes/archive/2026-07-09/my-change/tasks.json",
+            "openspec/changes/archive/prefix-my-change/tasks.json",
+            "openspec/changes/archive/other-change/tasks.json",
+            "openspec/changes/my-change/tasks.json",
+        ] {
+            assert_eq!(
+                archive_tasks_format(invalid, "my-change"),
+                None,
+                "'{invalid}' must not count as archived task evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_transition_requires_one_same_basename_add_delete_pair() {
+        let pair = |deleted: &str, added: &str| {
+            vec![
+                ('D', deleted.to_string()),
+                ('A', added.to_string()),
+                // Unrelated churn is ignored rather than treated as ambiguity.
+                ('M', "src/lib.rs".to_string()),
+            ]
+        };
+
+        assert_eq!(
+            classify_archive_task_transition(
+                &pair(
+                    "openspec/changes/my-change/tasks.json",
+                    "openspec/changes/archive/2026-07-09-my-change/tasks.json"
+                ),
+                "my-change"
+            ),
+            Ok(TaskFileFormat::Json)
+        );
+        assert_eq!(
+            classify_archive_task_transition(
+                &pair(
+                    "openspec/changes/my-change/tasks.md",
+                    "openspec/changes/archive/my-change/tasks.md"
+                ),
+                "my-change"
+            ),
+            Ok(TaskFileFormat::Markdown)
+        );
+
+        // Cross-format move.
+        assert_eq!(
+            classify_archive_task_transition(
+                &pair(
+                    "openspec/changes/my-change/tasks.json",
+                    "openspec/changes/archive/my-change/tasks.md"
+                ),
+                "my-change"
+            ),
+            Err(ArchiveTaskTransitionError::CrossFormat {
+                deleted: TaskFileFormat::Json,
+                added: TaskFileFormat::Markdown,
+            })
+        );
+
+        // Both basenames added.
+        assert_eq!(
+            classify_archive_task_transition(
+                &[
+                    ('D', "openspec/changes/my-change/tasks.json".to_string()),
+                    (
+                        'A',
+                        "openspec/changes/archive/my-change/tasks.json".to_string()
+                    ),
+                    (
+                        'A',
+                        "openspec/changes/archive/my-change/tasks.md".to_string()
+                    ),
+                ],
+                "my-change"
+            ),
+            Err(ArchiveTaskTransitionError::Ambiguous)
+        );
+
+        // Nested archive layout is not a valid archived entry.
+        assert_eq!(
+            classify_archive_task_transition(
+                &pair(
+                    "openspec/changes/my-change/tasks.json",
+                    "openspec/changes/archive/2026-07-09/my-change/tasks.json"
+                ),
+                "my-change"
+            ),
+            Err(ArchiveTaskTransitionError::MissingAddition)
+        );
+
+        // Another change's archived entry proves nothing about this one.
+        assert_eq!(
+            classify_archive_task_transition(
+                &pair(
+                    "openspec/changes/my-change/tasks.json",
+                    "openspec/changes/archive/other-change/tasks.json"
+                ),
+                "my-change"
+            ),
+            Err(ArchiveTaskTransitionError::MissingAddition)
+        );
+
+        // A missing deletion is never inferred from the addition alone.
+        assert_eq!(
+            classify_archive_task_transition(
+                &[(
+                    'A',
+                    "openspec/changes/archive/my-change/tasks.json".to_string()
+                )],
+                "my-change"
+            ),
+            Err(ArchiveTaskTransitionError::MissingDeletion)
+        );
+
+        assert!(ArchiveTaskTransitionError::MissingDeletion
+            .message("my-change")
+            .contains("my-change"));
     }
 
     #[test]

@@ -410,6 +410,54 @@ mod tests {
     }
 
     #[test]
+    fn decide_resume_action_reads_a_json_only_change_from_workspace_evidence() {
+        let tmp = TempDir::new().unwrap();
+        init_git_workspace(tmp.path());
+        let change_dir = tmp.path().join("openspec/changes/json-resume");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nchange_type: implementation\n---\n# Change\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[
+                {"id":"a","title":"Implement","status":"pending","section":"implementation"}
+            ]}"#,
+        )
+        .unwrap();
+
+        // Unfinished JSON work resumes into Apply, exactly as an unchecked box does.
+        assert_eq!(
+            decide_resume_action(
+                "json-resume",
+                tmp.path(),
+                &WorkspaceState::Applied,
+                &WorkspaceStageStatus::default()
+            ),
+            ResumeAction::Apply
+        );
+
+        fs::write(
+            change_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[
+                {"id":"a","title":"Implement","status":"completed","section":"implementation"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decide_resume_action(
+                "json-resume",
+                tmp.path(),
+                &WorkspaceState::Applied,
+                &WorkspaceStageStatus::default()
+            ),
+            ResumeAction::Acceptance
+        );
+    }
+
+    #[test]
     fn decide_resume_action_routes_applied_to_acceptance_without_state_file() {
         let tmp = TempDir::new().unwrap();
         init_git_workspace(tmp.path());
@@ -600,7 +648,10 @@ mod tests {
             "---\nchange_type: implementation\n---\n# Change\n",
         )
         .unwrap();
-        let tasks_path = change_dir.join("tasks.md");
+        let tasks_path = crate::task_file::TaskFile::in_entry(
+            &change_dir,
+            crate::task_file::TaskFileFormat::Markdown,
+        );
         fs::write(
             &tasks_path,
             "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- attempt: 1\n- [x] [SAME_FINDING] fixed wording\n- [x] [RETIRED_FINDING] fixed and not reported again\n- [x] [DIFFERENT_FINDING] unrelated completed defect\n",
@@ -627,7 +678,7 @@ mod tests {
         assert!(!content.contains("RETIRED_FINDING"));
         assert!(!content.contains("DIFFERENT_FINDING"));
         assert_eq!(
-            crate::task_parser::parse_file(&tasks_path, None).unwrap(),
+            crate::task_file::read_progress(&tasks_path, None).unwrap(),
             crate::task_parser::TaskProgress::with_counts(1, 3)
         );
         assert_eq!(
@@ -1272,16 +1323,12 @@ fn read_implementation_task_progress(
     change_id: &str,
     workspace_path: &Path,
 ) -> Result<Option<(u32, u32)>> {
-    let tasks_path = workspace_path
-        .join("openspec/changes")
-        .join(change_id)
-        .join("tasks.md");
-
-    if !tasks_path.exists() {
+    let change_dir = workspace_path.join("openspec/changes").join(change_id);
+    let Some(tasks_file) = crate::task_file::find_in_entry(&change_dir)? else {
         return Ok(None);
-    }
+    };
 
-    let progress = parse_tasks_progress(&tasks_path, change_id)?;
+    let progress = parse_tasks_progress(&tasks_file, change_id)?;
 
     if progress.total == 0 {
         Ok(None)
@@ -1291,13 +1338,13 @@ fn read_implementation_task_progress(
 }
 
 fn parse_tasks_progress(
-    tasks_path: &Path,
+    tasks_file: &crate::task_file::TaskFile,
     change_id: &str,
 ) -> Result<crate::task_parser::TaskProgress> {
-    task_parser::parse_file(tasks_path, Some(change_id)).map_err(|e| {
+    crate::task_file::read_progress(tasks_file, Some(change_id)).map_err(|e| {
         OrchestratorError::ConfigLoad(format!(
             "Failed to parse tasks file '{}' for resume routing: {}",
-            tasks_path.display(),
+            tasks_file.display(),
             e
         ))
     })
@@ -1349,8 +1396,10 @@ fn archived_dirty_repair_candidate_from_unmerged_workspace(
         return None;
     }
 
-    let tasks_path = archive_entry.join("tasks.md");
-    let (completed_tasks, total_tasks) = parse_tasks_progress(&tasks_path, change_id)
+    let (completed_tasks, total_tasks) = crate::task_file::find_in_entry(&archive_entry)
+        .ok()
+        .flatten()
+        .and_then(|tasks_file| parse_tasks_progress(&tasks_file, change_id).ok())
         .map(|progress| (progress.completed, progress.total))
         .unwrap_or((0, 0));
     let metadata =

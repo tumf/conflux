@@ -639,10 +639,12 @@ fn change_from_workspace(change_id: &str, workspace_path: &Path) -> Option<Chang
         return None;
     }
 
-    let (completed_tasks, total_tasks) =
-        crate::task_parser::parse_file(&archive_entry.join("tasks.md"), Some(change_id))
-            .map(|progress| (progress.completed, progress.total))
-            .unwrap_or((0, 0));
+    let (completed_tasks, total_tasks) = crate::task_file::find_in_entry(&archive_entry)
+        .ok()
+        .flatten()
+        .and_then(|tasks_file| crate::task_file::read_progress(&tasks_file, Some(change_id)).ok())
+        .map(|progress| (progress.completed, progress.total))
+        .unwrap_or((0, 0));
     let metadata = crate::openspec::parse_proposal_metadata_from_file(&proposal_path);
     let dependencies = metadata.dependencies.clone();
 

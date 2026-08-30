@@ -710,11 +710,28 @@ fn extract_dependency_id(item: &str) -> String {
         .to_string()
 }
 
+/// Read one change entry's task progress through the shared task-file contract.
+///
+/// `Ok(None)` means the entry declares no task artifact at all; an ambiguous or
+/// invalid artifact is an error rather than a silent zero.
+fn read_entry_task_progress(
+    entry_dir: &Path,
+    change_id: &str,
+) -> Result<Option<task_parser::TaskProgress>> {
+    match crate::task_file::find_in_entry(entry_dir)? {
+        Some(file) => Ok(Some(crate::task_file::read_progress(
+            &file,
+            Some(change_id),
+        )?)),
+        None => Ok(None),
+    }
+}
+
 /// List changes by directly reading the openspec/changes directory.
 ///
 /// This is the native implementation that avoids calling the external
 /// `openspec list --json` command. It reads the directory structure and
-/// parses tasks.md files to get accurate task progress.
+/// reads each change's own task artifact to get accurate task progress.
 pub fn list_changes_native() -> Result<Vec<Change>> {
     list_changes_native_from(Path::new("."))
 }
@@ -772,17 +789,16 @@ pub fn list_changes_native_from(base_path: &Path) -> Result<Vec<Change>> {
             continue;
         }
 
-        // Parse tasks.md for this change
-        let tasks_path = path.join("tasks.md");
-        let (completed_tasks, total_tasks) =
-            match task_parser::parse_file(&tasks_path, Some(dir_name)) {
-                Ok(progress) => (progress.completed, progress.total),
-                Err(_) => {
-                    // If tasks.md doesn't exist or can't be parsed, use 0/0
-                    debug!("Could not parse tasks for change '{}', using 0/0", dir_name);
-                    (0, 0)
-                }
-            };
+        // Read the change's own task artifact, in whichever format it declares
+        let (completed_tasks, total_tasks) = match read_entry_task_progress(&path, dir_name) {
+            Ok(Some(progress)) => (progress.completed, progress.total),
+            Ok(None) | Err(_) => {
+                // A missing, ambiguous, or unreadable artifact projects 0/0 for
+                // this read-only listing; every gating path fails closed instead.
+                debug!("Could not parse tasks for change '{}', using 0/0", dir_name);
+                (0, 0)
+            }
+        };
 
         // Parse dependencies and metadata from proposal.md
         let metadata = parse_dependencies_from_base(base_path, dir_name);
@@ -849,18 +865,16 @@ pub fn list_rejected_changes_native_from(base_path: &Path) -> Result<Vec<Change>
             continue;
         }
 
-        let tasks_path = path.join("tasks.md");
-        let (completed_tasks, total_tasks) =
-            match task_parser::parse_file(&tasks_path, Some(dir_name)) {
-                Ok(progress) => (progress.completed, progress.total),
-                Err(_) => {
-                    debug!(
-                        "Could not parse tasks for rejected change '{}', using 0/0",
-                        dir_name
-                    );
-                    (0, 0)
-                }
-            };
+        let (completed_tasks, total_tasks) = match read_entry_task_progress(&path, dir_name) {
+            Ok(Some(progress)) => (progress.completed, progress.total),
+            Ok(None) | Err(_) => {
+                debug!(
+                    "Could not parse tasks for rejected change '{}', using 0/0",
+                    dir_name
+                );
+                (0, 0)
+            }
+        };
 
         let metadata = parse_dependencies_from_base(base_path, dir_name);
         let dependencies = metadata.dependencies.clone();

@@ -2382,7 +2382,10 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
     );
 
     crate::task_parser::replace_acceptance_follow_up_from_latest_fail(
-        &tasks_dir.join("tasks.md"),
+        &crate::task_file::TaskFile::in_entry(
+            &tasks_dir,
+            crate::task_file::TaskFileFormat::Markdown,
+        ),
         iteration,
         &[
             "missing regression test".to_string().into(),

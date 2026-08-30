@@ -380,6 +380,37 @@ pub(crate) fn archived_tasks(change_id: &str) -> String {
     format!("openspec/changes/archive/2026-08-03-{}/tasks.md", change_id)
 }
 
+/// Repository-relative active JSON task artifact of `change_id`.
+pub(crate) fn live_tasks_json(change_id: &str) -> String {
+    format!("openspec/changes/{}/tasks.json", change_id)
+}
+
+/// Repository-relative archived JSON task artifact of `change_id`.
+pub(crate) fn archived_tasks_json(change_id: &str) -> String {
+    format!(
+        "openspec/changes/archive/2026-08-03-{}/tasks.json",
+        change_id
+    )
+}
+
+/// A JSON task document recording `completed` of `total` tasks done.
+pub(crate) fn tasks_json(completed: u32, total: u32) -> String {
+    let tasks = (0..total)
+        .map(|index| {
+            let status = if index < completed {
+                "completed"
+            } else {
+                "pending"
+            };
+            format!(
+                r#"{{"id":"task-{index}","title":"Task {index}","status":"{status}","section":"implementation"}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(r#"{{"schema_version":1,"tasks":[{tasks}]}}"#)
+}
+
 /// A task list recording `completed` of `total` tasks done.
 pub(crate) fn tasks_markdown(completed: u32, total: u32) -> String {
     let mut content = String::from("## Implementation Tasks\n\n");

@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use validation::{count_requirements_in_spec, count_tasks, ValidationEngine};
+use validation::{count_entry_tasks, count_requirements_in_spec, ValidationEngine};
 
 struct OpenSpecManager {
     root_dir: PathBuf,
@@ -169,9 +169,8 @@ impl OpenSpecManager {
             }
         }
 
-        // Count tasks
-        if let Ok(content) = fs::read_to_string(change_dir.join("tasks.md")) {
-            let (completed, total) = count_tasks(&content);
+        // Count tasks from the entry's own artifact, in either format
+        if let Some((completed, total, _)) = count_entry_tasks(change_dir) {
             info.tasks_completed = completed;
             info.tasks_total = total;
         }
@@ -217,9 +216,8 @@ impl OpenSpecManager {
                 .statuses_for(&info.dependencies);
         }
 
-        // Read tasks
-        if let Ok(content) = fs::read_to_string(change_dir.join("tasks.md")) {
-            let (completed, total) = count_tasks(&content);
+        // Read tasks from the entry's own artifact, in either format
+        if let Some((completed, total, content)) = count_entry_tasks(&change_dir) {
             info.tasks_completed = completed;
             info.tasks_total = total;
             info.tasks = Some(content);
@@ -712,7 +710,9 @@ mod archive_promotion_mark_contract_tests {
 #[cfg(test)]
 mod validation_tests {
     use super::*;
-    use crate::openspec_cmd::validation::{extract_change_type, validate_tasks_content};
+    use crate::openspec_cmd::validation::{
+        count_tasks, extract_change_type, validate_tasks_content,
+    };
 
     #[test]
     fn test_count_tasks_basic() {
@@ -937,7 +937,11 @@ mod validation_tests {
             "- [x] Implement gate\n",
             "- evidence: cargo test passed\n",
         );
-        let errors = crate::openspec_cmd::validation::validate_task_format(content, "alpha");
+        let errors = crate::openspec_cmd::validation::validate_task_format(
+            crate::task_file::TaskFileFormat::Markdown,
+            content,
+            "alpha",
+        );
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(
             errors[0].contains("Possible task without checkbox"),
@@ -3115,6 +3119,165 @@ mod openspec_list_show_tests {
                 .chain(errors.iter())
                 .any(|finding| finding.contains("heavyweight command form")),
             "errors={errors:?} warnings={warnings:?}"
+        );
+    }
+
+    /// A JSON-only change reaches the same native validation contract a
+    /// Markdown change does: required-file presence, verification linkage, and
+    /// the Final Validation non-task rule.
+    #[test]
+    fn test_strict_validation_accepts_a_json_only_change() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/json-only");
+        create_strict_valid_change(&change_dir, "Json Only");
+        fs::remove_file(change_dir.join("tasks.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nverifications:\n  - id: local-gate\n    requirement: json task behavior\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: pull request\n    automation: Cargo.toml\n    evidence: cargo test --lib\n    rerun: cargo test --lib\n    prerequisites: []\n    execution_class: repository-local\n    completion_role: change-blocking\n---\n# Json Only\n\n**Change Type**: implementation\n\n## Problem\njson task fixture\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[
+                {"id":"impl","title":"Implement the behavior","status":"pending","section":"implementation",
+                 "verification_id":"local-gate","verification":{"kind":"unit","command":"cargo test --lib"}}
+            ],"narrative":{"final_validation":"cflx openspec validate json-only --archive-gate"}}"#,
+        )
+        .unwrap();
+
+        let (valid, errors, _warnings) =
+            OpenSpecManager::new().validate_change(Some("json-only"), true, "error");
+        assert!(valid, "{errors:?}");
+
+        // The same entry projects its progress into list/show.
+        let info = OpenSpecManager::new()
+            .show_change("json-only", false)
+            .unwrap()
+            .expect("json change is shown");
+        assert_eq!((info.tasks_completed, info.tasks_total), (0, 1));
+        assert!(info
+            .tasks
+            .is_some_and(|tasks| tasks.contains("schema_version")));
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_invalid_and_ambiguous_json_task_artifacts() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        // Unsupported schema version fails closed with its JSON Pointer.
+        let unsupported = temp.path().join("openspec/changes/json-unsupported");
+        create_strict_valid_change(&unsupported, "Json Unsupported");
+        fs::remove_file(unsupported.join("tasks.md")).unwrap();
+        fs::write(
+            unsupported.join("tasks.json"),
+            r#"{"schema_version":9,"tasks":[]}"#,
+        )
+        .unwrap();
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("json-unsupported"), true, "error");
+        assert!(!valid);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("tasks.json:/schema_version")),
+            "{errors:?}"
+        );
+
+        // Two artifacts in one entry are ambiguous, never a precedence decision.
+        let ambiguous = temp.path().join("openspec/changes/json-ambiguous");
+        create_strict_valid_change(&ambiguous, "Json Ambiguous");
+        fs::write(
+            ambiguous.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[]}"#,
+        )
+        .unwrap();
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("json-ambiguous"), true, "error");
+        assert!(!valid);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("Ambiguous task artifacts")),
+            "{errors:?}"
+        );
+
+        // A missing artifact names both supported filenames.
+        let missing = temp.path().join("openspec/changes/json-missing");
+        create_strict_valid_change(&missing, "Json Missing");
+        fs::remove_file(missing.join("tasks.md")).unwrap();
+        let (_, errors, _) =
+            OpenSpecManager::new().validate_change(Some("json-missing"), true, "error");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("Missing tasks.md or tasks.json")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_json_self_referential_final_validation_task() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/json-final");
+        create_strict_valid_change(&change_dir, "Json Final");
+        fs::remove_file(change_dir.join("tasks.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nverifications:\n  - id: local-gate\n    requirement: json task behavior\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: pull request\n    automation: Cargo.toml\n    evidence: cargo test --lib\n    rerun: cargo test --lib\n    prerequisites: []\n    execution_class: repository-local\n    completion_role: change-blocking\n---\n# Json Final\n\n**Change Type**: implementation\n\n## Problem\njson task fixture\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[
+                {"id":"final","title":"Run cflx openspec validate json-final --archive-gate for final validation","status":"pending","section":"implementation",
+                 "verification_id":"local-gate","verification":{"kind":"unit","command":"cargo test --lib"}}
+            ]}"#,
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("json-final"), true, "error");
+        assert!(!valid);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("self-referential final OpenSpec validation")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_strict_validation_requires_json_verification_linkage() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/json-linkage");
+        create_strict_valid_change(&change_dir, "Json Linkage");
+        fs::remove_file(change_dir.join("tasks.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nverifications:\n  - id: local-gate\n    requirement: json task behavior\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: pull request\n    automation: Cargo.toml\n    evidence: cargo test --lib\n    rerun: cargo test --lib\n    prerequisites: []\n    execution_class: repository-local\n    completion_role: change-blocking\n---\n# Json Linkage\n\n**Change Type**: implementation\n\n## Problem\njson task fixture\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.json"),
+            r#"{"schema_version":1,"tasks":[
+                {"id":"impl","title":"Implement","status":"pending","section":"implementation",
+                 "verification":{"kind":"unit","command":"cargo test --lib"}}
+            ]}"#,
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("json-linkage"), true, "error");
+        assert!(!valid);
+        assert!(
+            errors.iter().any(|error| error
+                .contains("must reference a change-blocking verification")
+                && error.contains("tasks.json:/tasks/0/verification_id")),
+            "{errors:?}"
         );
     }
 

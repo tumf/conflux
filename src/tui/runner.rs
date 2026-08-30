@@ -892,7 +892,7 @@ async fn run_tui_loop(
                             // Collect worktree paths for all changes
                             let mut worktree_paths = std::collections::HashMap::new();
 
-                            // Enrich progress from worktrees (uncommitted tasks.md)
+                            // Enrich progress from worktrees (uncommitted task artifact)
                             for change in &mut changes {
                                 match crate::vcs::git::get_worktree_path_for_change(
                                     &refresh_repo_root,

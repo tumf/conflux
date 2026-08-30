@@ -5,8 +5,8 @@
 //! task evidence authorizes a final merge — not Git itself.
 
 use super::fixtures::{
-    archived, archived_tasks, item, live, live_tasks, presynced_repo, tasks_markdown, FakeEvidence,
-    FakeRepo,
+    archived, archived_tasks, archived_tasks_json, item, live, live_tasks, live_tasks_json,
+    presynced_repo, tasks_json, tasks_markdown, FakeEvidence, FakeRepo,
 };
 use super::{
     classify_batch, classify_batch_with_latch, read_task_completion, BatchState,
@@ -61,6 +61,92 @@ async fn archived_task_evidence_reports_its_own_progress() {
             total: 7,
         }
     );
+}
+
+#[tokio::test]
+async fn json_task_evidence_authorizes_a_merge_exactly_as_markdown_does() {
+    let mut repo = presynced_repo();
+    repo.file("a_tip", &archived_tasks_json("change-a"), &tasks_json(7, 7));
+    let evidence = FakeEvidence::new(repo, "t");
+    let tree = vec![archived("change-a"), archived_tasks_json("change-a")];
+
+    assert_eq!(
+        read_task_completion(&evidence, "change-a", "a_tip", &tree).await,
+        TaskCompletion::Complete {
+            sources: vec![archived_tasks_json("change-a")],
+            total: 7,
+        }
+    );
+}
+
+#[tokio::test]
+async fn incomplete_json_task_evidence_withholds_the_merge() {
+    let mut repo = presynced_repo();
+    repo.file("a_tip", &archived_tasks_json("change-a"), &tasks_json(6, 7));
+    let evidence = FakeEvidence::new(repo, "t");
+    let tree = vec![archived("change-a"), archived_tasks_json("change-a")];
+
+    assert_eq!(
+        read_task_completion(&evidence, "change-a", "a_tip", &tree).await,
+        TaskCompletion::Incomplete {
+            source: archived_tasks_json("change-a"),
+            completed: 6,
+            total: 7,
+        }
+    );
+}
+
+#[tokio::test]
+async fn mixed_format_task_evidence_is_never_resolved_by_precedence() {
+    let mut repo = presynced_repo();
+    repo.file("a_tip", &live_tasks("change-a"), &tasks_markdown(7, 7))
+        .file("a_tip", &archived_tasks_json("change-a"), &tasks_json(7, 7));
+    let evidence = FakeEvidence::new(repo, "t");
+    let tree = vec![live_tasks("change-a"), archived_tasks_json("change-a")];
+
+    let completion = read_task_completion(&evidence, "change-a", "a_tip", &tree).await;
+    match completion {
+        TaskCompletion::Unestablished { reason } => {
+            assert!(reason.contains("mixes task-file formats"), "{reason}")
+        }
+        other => panic!("mixed-format evidence must never authorize a merge: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn invalid_json_task_evidence_fails_closed_instead_of_counting_zero() {
+    let mut repo = presynced_repo();
+    repo.file(
+        "a_tip",
+        &live_tasks_json("change-a"),
+        r#"{"schema_version":2,"tasks":[]}"#,
+    );
+    let evidence = FakeEvidence::new(repo, "t");
+    let tree = vec![live("change-a"), live_tasks_json("change-a")];
+
+    let completion = read_task_completion(&evidence, "change-a", "a_tip", &tree).await;
+    match completion {
+        TaskCompletion::Unestablished { reason } => {
+            assert!(reason.contains("/schema_version"), "{reason}")
+        }
+        other => panic!("an unsupported schema must never authorize a merge: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn empty_json_task_list_is_never_merge_complete() {
+    let mut repo = presynced_repo();
+    repo.file("a_tip", &archived_tasks_json("change-a"), &tasks_json(0, 0));
+    let evidence = FakeEvidence::new(repo, "t");
+    let tree = vec![archived("change-a"), archived_tasks_json("change-a")];
+
+    let completion = read_task_completion(&evidence, "change-a", "a_tip", &tree).await;
+    match completion {
+        TaskCompletion::Unestablished { reason } => {
+            assert!(reason.contains("records no tasks at all"), "{reason}")
+        }
+        other => panic!("an empty task list must never authorize a merge: {other:?}"),
+    }
 }
 
 #[tokio::test]

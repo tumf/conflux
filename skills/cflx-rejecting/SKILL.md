@@ -18,7 +18,7 @@ When an apply operation determines that implementation is impossible and creates
 - If `openspec/CONSTITUTION.md` exists, read it before rejection review and treat it as higher-priority project law than proposal/spec deltas.
 
 1. Confirm `openspec/changes/<change-id>/REJECTED.md` exists and contains a concrete reason.
-2. Confirm blocker evidence in `tasks.md` (`## Implementation Blocker #N`) is specific and actionable.
+2. Confirm blocker evidence in the task file named by `tasks_path` (`## Implementation Blocker #N` in `tasks.md`, or the matching narrative note in `tasks.json`) is specific and actionable.
 3. Decide one outcome only:
    - `CONFIRM`: terminal rejection evidence proves the change intent is invalid, obsolete, contradictory, or constitution-violating.
    - `RESUME`: reject proposal is dismissed and change must return to apply because the issue is repository-fixable or the evidence is insufficient.
@@ -49,8 +49,8 @@ When an apply operation determines that implementation is impossible and creates
 ## Outcome Rules
 
 - On `REJECTION_REVIEW: CONFIRM`, runtime finalizes rejection flow and base branch records only `openspec/changes/<change-id>/REJECTED.md`.
-- On `REJECTION_REVIEW: RESUME`, runtime removes worktree-local `REJECTED.md`, appends at least one unchecked non-rejection recovery task to `tasks.md`, and routes directly back to apply.
-- On `REJECTION_REVIEW: BLOCK`, runtime removes worktree-local `REJECTED.md`, appends/retains recovery work in `tasks.md`, records a non-terminal stalled hold, and MUST NOT write base-branch `REJECTED.md`.
+- On `REJECTION_REVIEW: RESUME`, runtime removes worktree-local `REJECTED.md`, appends at least one incomplete non-rejection recovery task to the change's task file, in that file's own format, and routes directly back to apply.
+- On `REJECTION_REVIEW: BLOCK`, runtime removes worktree-local `REJECTED.md`, appends/retains recovery work in the change's task file, records a non-terminal stalled hold, and MUST NOT write base-branch `REJECTED.md`.
 - Rejecting review MUST NOT output `ACCEPTANCE: GATED`; that marker is reserved for acceptance operation output.
 
 ## Output Contract
