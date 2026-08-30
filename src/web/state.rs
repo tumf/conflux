@@ -1561,7 +1561,7 @@ impl WebState {
         let mut changes = openspec::list_changes_native_from(&repo_root)
             .map_err(|e| format!("Failed to refresh changes from disk: {}", e))?;
 
-        // Enrich progress from worktrees (uncommitted tasks.md)
+        // Enrich progress from worktrees (uncommitted task artifact)
         // Use unified fallback helper: worktree → archive → base
         // The same lookup also supplies the change-to-worktree relation the v2
         // snapshot publishes, so a monitoring-only process reports it too.

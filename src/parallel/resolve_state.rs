@@ -435,18 +435,46 @@ impl TaskCompletion {
 /// archived list after. Anything else under `openspec/changes` — another
 /// change, a nested archive layout, a suffix collision — is not this change's
 /// evidence and is ignored rather than silently believed.
-fn task_evidence_paths(tree_paths: &[String], change_id: &str) -> Vec<String> {
-    let active = archive_layout::active_change_tasks_path(change_id);
-    let mut paths: Vec<String> = tree_paths
+/// Task evidence for one change at a revision, with the format it is read in.
+///
+/// A change speaks in exactly one format, so mixed evidence is refused rather
+/// than resolved by precedence.
+enum TaskEvidence {
+    /// One coherent format with at least one path.
+    Coherent {
+        format: crate::task_file::TaskFileFormat,
+        paths: Vec<String>,
+    },
+    /// No task artifact for this change at this revision.
+    Absent,
+    /// Two supported basenames speak for the same change at one revision.
+    Ambiguous { paths: Vec<String> },
+}
+
+fn task_evidence_paths(tree_paths: &[String], change_id: &str) -> TaskEvidence {
+    let mut found: Vec<(crate::task_file::TaskFileFormat, String)> = tree_paths
         .iter()
-        .filter(|path| {
-            path.as_str() == active || archive_layout::is_valid_archive_tasks_path(path, change_id)
+        .filter_map(|path| {
+            archive_layout::active_change_tasks_format(path, change_id)
+                .or_else(|| archive_layout::archive_tasks_format(path, change_id))
+                .map(|format| (format, path.clone()))
         })
-        .cloned()
         .collect();
-    paths.sort();
-    paths.dedup();
-    paths
+    found.sort_by(|left, right| left.1.cmp(&right.1));
+    found.dedup_by(|left, right| left.1 == right.1);
+
+    let Some(format) = found.first().map(|(format, _)| *format) else {
+        return TaskEvidence::Absent;
+    };
+    if found.iter().any(|(candidate, _)| *candidate != format) {
+        return TaskEvidence::Ambiguous {
+            paths: found.into_iter().map(|(_, path)| path).collect(),
+        };
+    }
+    TaskEvidence::Coherent {
+        format,
+        paths: found.into_iter().map(|(_, path)| path).collect(),
+    }
 }
 
 /// Read committed task completion for `change_id` at `revision`.
@@ -461,16 +489,33 @@ pub async fn read_task_completion(
     revision: &str,
     tree_paths: &[String],
 ) -> TaskCompletion {
-    let paths = task_evidence_paths(tree_paths, change_id);
-    if paths.is_empty() {
-        return TaskCompletion::Unestablished {
-            reason: format!(
-                "neither {} nor an archived tasks.md exists at {}",
-                archive_layout::active_change_tasks_path(change_id),
-                revision
-            ),
-        };
-    }
+    let (format, paths) = match task_evidence_paths(tree_paths, change_id) {
+        TaskEvidence::Coherent { format, paths } => (format, paths),
+        TaskEvidence::Absent => {
+            return TaskCompletion::Unestablished {
+                reason: format!(
+                    "no active or archived task artifact ({}) exists for '{}' at {}",
+                    archive_layout::active_change_tasks_paths(change_id)
+                        .into_iter()
+                        .map(|(_, path)| path)
+                        .collect::<Vec<_>>()
+                        .join(" or "),
+                    change_id,
+                    revision
+                ),
+            }
+        }
+        TaskEvidence::Ambiguous { paths } => {
+            return TaskCompletion::Unestablished {
+                reason: format!(
+                    "task evidence for '{}' at {} mixes task-file formats ({}); a change speaks in exactly one",
+                    change_id,
+                    revision,
+                    paths.join(", ")
+                ),
+            }
+        }
+    };
 
     let mut total = 0u32;
     for path in &paths {
@@ -487,7 +532,17 @@ pub async fn read_task_completion(
                 }
             }
         };
-        let progress = crate::task_parser::parse_content(&content, None);
+        let progress = match crate::task_file::parse_progress(format, &content, None) {
+            Ok(progress) => progress,
+            Err(error) => {
+                return TaskCompletion::Unestablished {
+                    reason: format!(
+                        "{} is not valid task evidence at {}: {}",
+                        path, revision, error
+                    ),
+                }
+            }
+        };
         if progress.total == 0 {
             return TaskCompletion::Unestablished {
                 reason: format!("{} records no tasks at all", path),

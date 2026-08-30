@@ -81,14 +81,27 @@ impl<'a> ValidationEngine<'a> {
             .to_string();
 
         let proposal_file = change_dir.join("proposal.md");
-        let tasks_file = change_dir.join("tasks.md");
+        // The change entry owns exactly one task artifact; ambiguity is an error
+        // rather than a precedence decision.
+        let tasks_file = match crate::task_file::find_in_entry(change_dir) {
+            Ok(file) => file,
+            Err(error) => {
+                errors.push(format!("{}: {}", change_id, error));
+                None
+            }
+        };
 
         // Check required files
         if !proposal_file.exists() {
             errors.push(format!("{}: Missing proposal.md", change_id));
         }
-        if !tasks_file.exists() {
-            errors.push(format!("{}: Missing tasks.md", change_id));
+        if tasks_file.is_none() && errors.iter().all(|error| !error.contains("Ambiguous")) {
+            errors.push(format!(
+                "{}: Missing {} or {}",
+                change_id,
+                crate::task_file::MARKDOWN_FILE_NAME,
+                crate::task_file::JSON_FILE_NAME
+            ));
         }
 
         // Validate proposal structure
@@ -157,16 +170,17 @@ impl<'a> ValidationEngine<'a> {
             }
         }
 
-        // Validate tasks format
-        if tasks_file.exists() {
-            if let Ok(content) = fs::read_to_string(&tasks_file) {
+        // Validate tasks format in whichever representation the entry declares
+        if let Some(tasks_file) = tasks_file.as_ref() {
+            if let Ok(content) = fs::read_to_string(&tasks_file.path) {
                 let proposal_content = fs::read_to_string(&proposal_file).ok();
                 let change_type = proposal_content
                     .as_deref()
                     .and_then(extract_change_type)
                     .as_deref()
                     .map(str::to_string);
-                let (te, tw) = validate_tasks_content(
+                let (te, tw) = validate_task_artifact(
+                    tasks_file.format,
                     &content,
                     &change_id,
                     strict,
@@ -433,6 +447,26 @@ pub(super) fn count_tasks(content: &str) -> (u32, u32) {
     }
 
     (completed, total)
+}
+
+/// Read one change entry's task counts and body through the shared contract.
+///
+/// Returns `None` when the entry declares no readable task artifact — a missing
+/// file, two competing filenames, or a JSON body that fails validation. This is
+/// the read-only list/show projection; it never authorizes a workflow decision.
+pub(super) fn count_entry_tasks(entry_dir: &Path) -> Option<(u32, u32, String)> {
+    let file = crate::task_file::find_in_entry(entry_dir).ok().flatten()?;
+    let content = fs::read_to_string(&file.path).ok()?;
+    let (completed, total) = match file.format {
+        crate::task_file::TaskFileFormat::Markdown => count_tasks(&content),
+        crate::task_file::TaskFileFormat::Json => {
+            let progress = crate::task_file::parse_json_document(&content)
+                .ok()?
+                .progress();
+            (progress.completed, progress.total)
+        }
+    };
+    Some((completed, total, content))
 }
 
 pub(super) fn extract_change_type(proposal_content: &str) -> Option<String> {
@@ -1327,17 +1361,149 @@ pub(super) fn self_referential_final_validation_message(
     )
 }
 
-/// Deterministic task-format validation for a `tasks.md` body.
+/// Deterministic task-format validation for a task artifact body.
 ///
-/// This is the format-only subset of [`validate_tasks_content`]: it reports
-/// active-section bullets that look like tasks but lack checkboxes, checkboxes
-/// inside narrative non-task sections, and self-referential final-validation
-/// checkboxes. Evidence/verification-ownership policy is intentionally excluded
-/// so the runtime pre-accept gate stays independent of proposal metadata and
-/// evidence mode.
-pub(crate) fn validate_task_format(content: &str, change_id: &str) -> Vec<String> {
-    let (errors, _) = validate_tasks_content(content, change_id, false, "off", None, None);
+/// This is the format-only subset of [`validate_task_artifact`]: for Markdown it
+/// reports active-section bullets that look like tasks but lack checkboxes,
+/// checkboxes inside narrative non-task sections, and self-referential
+/// final-validation checkboxes; for JSON it reports the typed schema and
+/// semantic failures plus the same final-validation rule. Evidence/verification
+/// ownership policy is intentionally excluded so the runtime pre-accept gate
+/// stays independent of proposal metadata and evidence mode.
+pub(crate) fn validate_task_format(
+    format: crate::task_file::TaskFileFormat,
+    content: &str,
+    change_id: &str,
+) -> Vec<String> {
+    let (errors, _) = validate_task_artifact(format, content, change_id, false, "off", None, None);
     errors
+}
+
+/// Validate one task artifact body in its declared representation.
+///
+/// Both representations answer the same questions — active versus narrative
+/// classification, the Final Validation non-task rule, and verification
+/// linkage — so a JSON-only change is held to exactly the Markdown contract.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn validate_task_artifact(
+    format: crate::task_file::TaskFileFormat,
+    content: &str,
+    change_id: &str,
+    strict: bool,
+    evidence_mode: &str,
+    change_type: Option<&str>,
+    proposal_content: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    match format {
+        crate::task_file::TaskFileFormat::Markdown => validate_tasks_content(
+            content,
+            change_id,
+            strict,
+            evidence_mode,
+            change_type,
+            proposal_content,
+        ),
+        crate::task_file::TaskFileFormat::Json => validate_json_tasks_content(
+            content,
+            change_id,
+            strict,
+            evidence_mode,
+            change_type,
+            proposal_content,
+        ),
+    }
+}
+
+/// Strict and format validation for a `tasks.json` body.
+///
+/// Schema and semantic failures fail closed as errors; nothing here can project
+/// a valid-but-empty document out of an artifact the runtime cannot read.
+pub(super) fn validate_json_tasks_content(
+    content: &str,
+    change_id: &str,
+    strict: bool,
+    evidence_mode: &str,
+    change_type: Option<&str>,
+    proposal_content: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    let document = match crate::task_file::parse_json_document(content) {
+        Ok(document) => document,
+        Err(error) => return (vec![format!("{}: {}", change_id, error)], warnings),
+    };
+
+    let is_behavior_change = matches!(change_type, Some("implementation" | "hybrid"));
+    let linkage = (strict && is_behavior_change)
+        .then(|| VerificationLinkage::from_proposal(proposal_content))
+        .flatten();
+
+    for task in &document.tasks {
+        let location = format!("{}:{}", crate::task_file::JSON_FILE_NAME, task.pointer);
+
+        // Narrative final validation is prose; representing it as an ordinary
+        // task is the same self-completion the Markdown rule refuses.
+        if strict && is_self_referential_final_validation_task(&task.title, change_id) {
+            errors.push(format!(
+                "{}: {}/title: self-referential final OpenSpec validation checkbox detected. \
+                 Final OpenSpec validation must not be a task; move final validation to the \
+                 narrative `final_validation` field because archive validation is the authoritative gate.",
+                change_id, location
+            ));
+            continue;
+        }
+
+        if let Some(linkage) = linkage.as_ref() {
+            match task.verification_id.as_deref() {
+                Some(reference) => {
+                    if let Some(message) = linkage.evaluate_reference(reference) {
+                        errors.push(format!("{}: {}/verification_id: {}", change_id, location, message));
+                    }
+                }
+                None => errors.push(format!(
+                    "{}: {}/verification_id: active implementation task must reference a change-blocking verification",
+                    change_id, location
+                )),
+            }
+        }
+
+        if strict && evidence_mode != "off" && is_behavior_change {
+            if task.verification_kind.is_none() {
+                let message = format!(
+                    "{}: {}/verification/kind: Verification ownership missing for behavior-changing task (expected one of: unit, integration, e2e, manual, benchmark, not-testable)",
+                    change_id, location
+                );
+                push_by_evidence_mode(evidence_mode, message, &mut errors, &mut warnings);
+            }
+            let cites_evidence = task
+                .verification_command
+                .as_deref()
+                .is_some_and(has_repository_evidence_hint);
+            if !cites_evidence {
+                let message = format!(
+                    "{}: {}/verification/command: Verification note should cite repository-verifiable evidence such as source paths, tests, or runnable commands",
+                    change_id, location
+                );
+                push_by_evidence_mode(evidence_mode, message, &mut errors, &mut warnings);
+            }
+        }
+    }
+
+    (errors, warnings)
+}
+
+fn push_by_evidence_mode(
+    evidence_mode: &str,
+    message: String,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    match evidence_mode {
+        "error" => errors.push(message),
+        "warn" => warnings.push(message),
+        _ => {}
+    }
 }
 
 /// Extract a `verification-id: <id>` reference from a task or continuation line.
@@ -1384,6 +1550,27 @@ impl VerificationLinkage {
                 .into_iter()
                 .collect(),
         })
+    }
+
+    /// Location-independent verdict for one `verification-id` reference.
+    ///
+    /// `None` means the reference names a change-blocking verification. The
+    /// message is shared by both representations so a JSON-only change and a
+    /// Markdown change are refused for the same reason.
+    fn evaluate_reference(&self, reference: &str) -> Option<String> {
+        if self.change_blocking_ids.contains(reference) {
+            return None;
+        }
+        if !self.declared_ids.contains(reference) {
+            return Some(format!(
+                "verification-id '{}' is not declared in proposal.md verifications",
+                reference
+            ));
+        }
+        Some(format!(
+            "verification-id '{}' is not a change-blocking verification; move the non-local outcome to Future Work or a separate release-observation change",
+            reference
+        ))
     }
 
     fn evaluate(&self, change_id: &str, line_num: usize, reference: &str) -> Option<String> {

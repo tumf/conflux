@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
@@ -36,13 +35,22 @@ fn resolve_rejection_review_command(template: &str, prompt: &str, change_id: &st
 
 #[allow(dead_code)]
 fn rejection_review_prompt(change_id: &str) -> String {
-    rejection_review_prompt_with_skill(crate::config::defaults::DEFAULT_REJECTING_SKILL, change_id)
+    rejection_review_prompt_with_skill(
+        crate::config::defaults::DEFAULT_REJECTING_SKILL,
+        None,
+        change_id,
+    )
 }
 
-fn rejection_review_prompt_with_skill(rejecting_skill: &str, change_id: &str) -> String {
+fn rejection_review_prompt_with_skill(
+    rejecting_skill: &str,
+    workspace_path: Option<&Path>,
+    change_id: &str,
+) -> String {
     format!(
-        "{}\n\nRejecting review id:{}\n\nchange_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nrejected_path: openspec/changes/{}/REJECTED.md",
-        crate::agent::prompt::skill_prelude(rejecting_skill), change_id, change_id, change_id, change_id, change_id
+        "{}\n\nRejecting review id:{change_id}\n\nchange_id: {change_id}\nproposal_path: openspec/changes/{change_id}/proposal.md\ntasks_path: {tasks_path}\nrejected_path: openspec/changes/{change_id}/REJECTED.md",
+        crate::agent::prompt::skill_prelude(rejecting_skill),
+        tasks_path = crate::agent::prompt::selected_tasks_path(workspace_path, change_id)
     )
 }
 
@@ -73,23 +81,6 @@ fn parse_rejection_review_output(output: &str) -> Option<RejectionReviewVerdict>
     None
 }
 
-fn append_recovery_task_section(existing: &str, change_id: &str) -> String {
-    let heading = "## Rejecting Recovery Tasks";
-    let task = format!(
-        "- [ ] Capture unresolved blocker details in tasks.md (do not recreate REJECTED.md) and implement a non-rejection recovery path before rerunning apply for {}",
-        change_id
-    );
-
-    if existing.contains(heading) {
-        if existing.contains(&task) {
-            return existing.to_string();
-        }
-        return format!("{}\n{}\n", existing.trim_end(), task);
-    }
-
-    format!("{}\n\n{}\n\n{}\n", existing.trim_end(), heading, task)
-}
-
 pub async fn run_rejection_review(
     change_id: &str,
     workspace_path: &Path,
@@ -97,7 +88,11 @@ pub async fn run_rejection_review(
     ai_runner: &AiCommandRunner,
 ) -> Result<RejectionReviewVerdict> {
     let command_template = config.get_acceptance_command()?;
-    let prompt = rejection_review_prompt_with_skill(config.get_rejecting_skill(), change_id);
+    let prompt = rejection_review_prompt_with_skill(
+        config.get_rejecting_skill(),
+        Some(workspace_path),
+        change_id,
+    );
     let command = resolve_rejection_review_command(command_template, &prompt, change_id);
 
     info!(
@@ -157,109 +152,65 @@ async fn clear_rejected_proposal_marker(change_id: &str, workspace_path: &Path) 
     Ok(rejected_path)
 }
 
-fn active_tasks_path(workspace_path: &Path, change_id: &str) -> PathBuf {
-    workspace_path
-        .join("openspec")
-        .join("changes")
-        .join(change_id)
-        .join("tasks.md")
-}
-
-fn is_archive_dir_for_change(entry: &Path, change_id: &str) -> bool {
-    entry
-        .file_name()
-        .and_then(OsStr::to_str)
-        .map(|name| name == change_id || name.ends_with(&format!("-{}", change_id)))
-        .unwrap_or(false)
-}
-
-/// Resolve canonical tasks.md for rejecting recovery writes.
+/// Resolve the canonical task artifact for rejecting recovery writes.
 ///
-/// Precedence is intentionally workspace-local and deterministic:
-/// 1. active change directory (`openspec/changes/<change_id>/tasks.md`)
-/// 2. archived change directory under workspace (`openspec/changes/archive/.../tasks.md`)
-///
-/// Unlike `task_parser::parse_progress_with_fallback`, this write path does not
-/// use base-tree fallback because rejecting recovery must mutate the currently
+/// Precedence is the shared workspace-local mutation mode: the active change
+/// entry, then the archived entry under the same workspace. It never falls back
+/// to a base-tree entry, because rejecting recovery must mutate the currently
 /// resumed workspace context only.
-async fn resolve_recovery_tasks_path(change_id: &str, workspace_path: &Path) -> Result<PathBuf> {
-    let active = active_tasks_path(workspace_path, change_id);
-    if tokio::fs::metadata(&active).await.is_ok() {
-        debug!(
-            change_id = %change_id,
-            tasks_path = %active.display(),
-            "Resolved rejecting recovery tasks path to active change directory"
-        );
-        return Ok(active);
-    }
+async fn resolve_recovery_tasks_path(
+    change_id: &str,
+    workspace_path: &Path,
+) -> Result<crate::task_file::TaskFile> {
+    let workspace_path = workspace_path.to_path_buf();
+    let owned_change_id = change_id.to_string();
+    let resolved = tokio::task::spawn_blocking(move || {
+        crate::task_file::resolve_mutation(&owned_change_id, &workspace_path)
+    })
+    .await
+    .map_err(|e| {
+        OrchestratorError::AgentCommand(format!(
+            "Failed to resolve rejecting recovery task artifact for '{}': {}",
+            change_id, e
+        ))
+    })??;
 
-    let archive_root = workspace_path
-        .join("openspec")
-        .join("changes")
-        .join("archive");
-    let mut explored = vec![
-        active.display().to_string(),
-        archive_root.display().to_string(),
-    ];
+    let Some(resolved) = resolved else {
+        return Err(OrchestratorError::AgentCommand(format!(
+            "Failed to resolve the canonical task artifact for rejecting recovery '{}'. Expected {} or {} in the active or archived change entry.",
+            change_id,
+            crate::task_file::MARKDOWN_FILE_NAME,
+            crate::task_file::JSON_FILE_NAME
+        )));
+    };
 
-    let mut archived_candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(mut entries) = tokio::fs::read_dir(&archive_root).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let is_dir = entry
-                .file_type()
-                .await
-                .map(|ft| ft.is_dir())
-                .unwrap_or(false);
-            if !is_dir || !is_archive_dir_for_change(&path, change_id) {
-                continue;
-            }
-            let tasks_path = path.join("tasks.md");
-            explored.push(tasks_path.display().to_string());
-            if tokio::fs::metadata(&tasks_path).await.is_ok() {
-                archived_candidates.push(tasks_path);
-            }
-        }
-    }
-
-    archived_candidates.sort();
-    if let Some(selected) = archived_candidates.into_iter().next() {
-        debug!(
-            change_id = %change_id,
-            tasks_path = %selected.display(),
-            "Resolved rejecting recovery tasks path to archived change directory"
-        );
-        return Ok(selected);
-    }
-
-    Err(OrchestratorError::AgentCommand(format!(
-        "Failed to resolve canonical tasks.md for rejecting recovery '{}'. Explored paths: {}",
-        change_id,
-        explored.join(", ")
-    )))
+    debug!(
+        change_id = %change_id,
+        tasks_path = %resolved.file.display(),
+        location = resolved.kind.log_label(),
+        "Resolved rejecting recovery task artifact"
+    );
+    Ok(resolved.file)
 }
 
 async fn append_recovery_task(change_id: &str, workspace_path: &Path) -> Result<PathBuf> {
-    let tasks_path = resolve_recovery_tasks_path(change_id, workspace_path).await?;
-    let current = tokio::fs::read_to_string(&tasks_path).await.map_err(|e| {
+    let tasks_file = resolve_recovery_tasks_path(change_id, workspace_path).await?;
+    let owned_change_id = change_id.to_string();
+    let written = tasks_file.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::task_parser::append_rejecting_recovery_task(&written, &owned_change_id)
+    })
+    .await
+    .map_err(|e| {
         OrchestratorError::AgentCommand(format!(
-            "Failed to read tasks.md while updating rejecting recovery section for '{}' at '{}': {}",
+            "Failed to update the task artifact while recording rejecting recovery for '{}' at '{}': {}",
             change_id,
-            tasks_path.display(),
+            tasks_file.display(),
             e
         ))
-    })?;
-    let updated = append_recovery_task_section(&current, change_id);
-    tokio::fs::write(&tasks_path, updated).await.map_err(|e| {
-        OrchestratorError::AgentCommand(format!(
-            "Failed to update tasks.md while updating rejecting recovery section for '{}' at '{}': {}",
-            change_id,
-            tasks_path.display(),
-            e
-        ))
-    })?;
+    })??;
 
-    Ok(tasks_path)
+    Ok(tasks_file.path)
 }
 
 pub async fn handle_resume_apply_from_rejecting(
@@ -524,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_rejection_review_prompt_uses_custom_skill_prelude() {
-        let prompt = rejection_review_prompt_with_skill("team-rejecting", "change-a");
+        let prompt = rejection_review_prompt_with_skill("team-rejecting", None, "change-a");
         assert!(prompt.contains("$team-rejecting"));
         assert!(prompt.contains("load skills: team-rejecting"));
         assert!(!prompt.contains("$cflx-rejecting"));
@@ -578,8 +529,19 @@ mod tests {
 
     #[test]
     fn test_append_recovery_task_section_avoids_deleted_rejected_marker_reference() {
-        let existing = "## Implementation Tasks\n\n- [ ] keep going\n";
-        let updated = append_recovery_task_section(existing, "change-a");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let tasks_file = crate::task_file::TaskFile::in_entry(
+            temp_dir.path(),
+            crate::task_file::TaskFileFormat::Markdown,
+        );
+        fs::write(
+            &tasks_file.path,
+            "## Implementation Tasks\n\n- [ ] keep going\n",
+        )
+        .expect("seed tasks");
+        crate::task_parser::append_rejecting_recovery_task(&tasks_file, "change-a")
+            .expect("recovery task is recorded");
+        let updated = fs::read_to_string(&tasks_file.path).expect("read updated tasks");
         assert!(
             updated.contains("## Rejecting Recovery Tasks"),
             "recovery section should be appended"
@@ -607,7 +569,7 @@ mod tests {
             .await
             .expect("resolve path");
 
-        assert_eq!(resolved, active_dir.join("tasks.md"));
+        assert_eq!(resolved.path, active_dir.join("tasks.md"));
     }
 
     #[tokio::test]
@@ -627,7 +589,7 @@ mod tests {
             .await
             .expect("resolve path");
 
-        assert_eq!(resolved, archive_dir.join("tasks.md"));
+        assert_eq!(resolved.path, archive_dir.join("tasks.md"));
     }
 
     #[tokio::test]
@@ -647,9 +609,12 @@ mod tests {
             .expect_err("expected path resolution failure");
         let message = err.to_string();
 
-        assert!(message.contains("Explored paths:"));
-        assert!(message.contains("openspec/changes/change-a/tasks.md"));
-        assert!(message.contains("openspec/changes/archive/2026-04-29-change-a/tasks.md"));
+        assert!(
+            message.contains("rejecting recovery 'change-a'"),
+            "{message}"
+        );
+        assert!(message.contains("tasks.md"), "{message}");
+        assert!(message.contains("tasks.json"), "{message}");
     }
 
     #[tokio::test]

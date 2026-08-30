@@ -42,6 +42,7 @@ mod spec_delta;
 mod spec_test_annotations;
 mod stall;
 mod stream_json_textifier;
+mod task_file;
 mod task_parser;
 mod templates;
 mod tui;

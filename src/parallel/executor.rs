@@ -346,6 +346,7 @@ async fn run_cleanup_review_attempt(
     let user_template = config.get_acceptance_command()?;
     let prompt = crate::agent::build_cleanup_review_prompt_with_skill(
         config.get_cleanup_review_skill(),
+        Some(workspace_path),
         change_id,
         previous,
     );
@@ -958,7 +959,7 @@ pub async fn execute_archive_in_workspace(
         Ok(Some(progress)) => {
             if progress.total == 0 {
                 return Err(OrchestratorError::AgentCommand(format!(
-                    "Cannot archive '{}' in workspace '{}': tasks.md exists but contains no tasks (0 tasks found)",
+                    "Cannot archive '{}' in workspace '{}': the task artifact exists but contains no tasks (0 tasks found)",
                     change_id,
                     workspace_path.display()
                 )));
@@ -980,19 +981,20 @@ pub async fn execute_archive_in_workspace(
         }
         Ok(None) => {
             return Err(OrchestratorError::AgentCommand(format!(
-                "Cannot archive '{}' in workspace '{}': tasks.md not found at {} or in archive directory",
+                "Cannot archive '{}' in workspace '{}': no task artifact ({} or {}) found under {} or in the archive directory",
                 change_id,
                 workspace_path.display(),
+                crate::task_file::MARKDOWN_FILE_NAME,
+                crate::task_file::JSON_FILE_NAME,
                 workspace_path
                     .join("openspec/changes")
                     .join(change_id)
-                    .join("tasks.md")
                     .display()
             )));
         }
         Err(e) => {
             return Err(OrchestratorError::AgentCommand(format!(
-                "Cannot archive '{}' in workspace '{}': failed to parse tasks.md: {}",
+                "Cannot archive '{}' in workspace '{}': failed to read the task artifact: {}",
                 change_id,
                 workspace_path.display(),
                 e
@@ -1068,6 +1070,7 @@ pub async fn execute_archive_in_workspace(
     let full_prompt = crate::agent::append_optional_prompt(
         crate::agent::build_archive_prompt_with_skill(
             config.get_archive_skill(),
+            Some(workspace_path),
             change_id,
             user_prompt,
             &history_context,
@@ -1778,6 +1781,7 @@ pub async fn execute_acceptance_in_workspace(
             crate::config::AcceptancePromptMode::Full => {
                 crate::agent::build_acceptance_prompt_with_skill(
                     config.get_accept_skill(),
+                    Some(workspace_path),
                     change_id,
                     user_prompt,
                     &history_context,
@@ -1790,6 +1794,7 @@ pub async fn execute_acceptance_in_workspace(
             crate::config::AcceptancePromptMode::ContextOnly => {
                 crate::agent::build_acceptance_prompt_context_only_with_skill(
                     config.get_accept_skill(),
+                    Some(workspace_path),
                     change_id,
                     user_prompt,
                     &history_context,

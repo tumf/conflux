@@ -348,6 +348,7 @@ cargo install cflx
 | [README.ja.md](README.ja.md) | Full documentation (Japanese) |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | Usage examples |
 | [docs/guides/VERIFICATION_EVIDENCE.md](docs/guides/VERIFICATION_EVIDENCE.md) | `cflx openspec verify`, bound evidence reuse, and why a rerun is never a verdict |
+| [docs/guides/TASK_FILES.md](docs/guides/TASK_FILES.md) | `tasks.md` and `tasks.json`: one task artifact per change, the JSON v1 contract, ownership, and diagnostics |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | Development guide |
 | [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | Release guide |

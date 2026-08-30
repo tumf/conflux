@@ -75,7 +75,7 @@ fn acceptance_follow_up_recovery_survives_retry_restart_and_pass_cleanup() {
     let resolved =
         task_parser::resolve_acceptance_follow_up_tasks_path(CHANGE_ID, workspace.path())
             .expect("active tasks path resolves");
-    assert_eq!(resolved, tasks_path);
+    assert_eq!(resolved.path, tasks_path);
 
     let recovery = task_parser::replace_acceptance_follow_up_from_latest_fail(
         &resolved,
@@ -105,14 +105,14 @@ fn acceptance_follow_up_recovery_survives_retry_restart_and_pass_cleanup() {
     assert_task_counts(&tasks_path, 1, 3);
 
     // 2. Apply hydration reads the runtime findings back and reconciles progress.
-    let (attempt, findings) = task_parser::read_acceptance_follow_up(&tasks_path)
+    let (attempt, findings) = task_parser::read_acceptance_follow_up(&resolved)
         .expect("follow-up is readable")
         .expect("follow-up is present");
     assert_eq!(attempt, 2);
     assert_eq!(findings, ["[OPEN_FINDING] regression coverage is missing"]);
 
     let merge_recovery =
-        task_parser::merge_acceptance_follow_up_apply_progress(&tasks_path, attempt, &findings)
+        task_parser::merge_acceptance_follow_up_apply_progress(&resolved, attempt, &findings)
             .expect("apply reconciliation succeeds");
     assert_eq!(merge_recovery.recovered_blocks, 0);
 
@@ -138,7 +138,7 @@ fn acceptance_follow_up_recovery_survives_retry_restart_and_pass_cleanup() {
     assert_task_counts(&tasks_path, 1, 3);
 
     // 4. Repeated normalization is a fixed point.
-    task_parser::replace_acceptance_follow_up_from_latest_fail(&tasks_path, 3, &findings)
+    task_parser::replace_acceptance_follow_up_from_latest_fail(&restarted, 3, &findings)
         .expect("repeat normalization succeeds");
     assert_eq!(
         std::fs::read_to_string(&tasks_path).expect("tasks file is readable"),

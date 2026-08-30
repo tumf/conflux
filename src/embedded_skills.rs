@@ -544,6 +544,75 @@ mod tests {
         }
     }
 
+    /// The embedded skills must describe both task-file representations and the
+    /// safe update rules for each, so an agent handed a `tasks.json` change is
+    /// never instructed to toggle a checkbox that does not exist.
+    #[test]
+    fn test_embedded_skills_describe_both_task_file_formats() {
+        for required in &[
+            "A change entry owns exactly **one** task artifact",
+            "The prompt's `tasks_path` names",
+            "openspec/changes/<id>/tasks.json",
+            "\"schema_version\": 1",
+            "Only `completed` counts as done",
+            "an empty `tasks` array is never",
+            "`acceptance_follow_up` is runtime-owned",
+            "tasks.json:<JSON Pointer>",
+            "ambiguity error",
+        ] {
+            assert!(
+                CFLX_APPLY_SKILL_MD.contains(required),
+                "cflx-apply SKILL.md must document the task-file formats: {required}"
+            );
+        }
+
+        assert!(
+            CFLX_APPLY_REF.contains("A change entry owns exactly one task artifact")
+                && CFLX_APPLY_REF.contains("docs/guides/TASK_FILES.md"),
+            "the cflx-apply reference must state the one-artifact rule and point at the contract"
+        );
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains("versioned `tasks.json`")
+                && CFLX_ACCEPT_SKILL_MD.contains("`acceptance_follow_up` object in JSON"),
+            "cflx-accept SKILL.md must name the resolved task artifact in both formats"
+        );
+        assert!(
+            CFLX_REJECTING_SKILL_MD.contains("the task file named by `tasks_path`")
+                && CFLX_REJECTING_SKILL_MD.contains("in that file's own format"),
+            "cflx-rejecting SKILL.md must route recovery work through the resolved task file"
+        );
+        assert!(
+            CFLX_PROPOSAL_SKILL_MD.contains("`tasks.md` remains the proposal default")
+                && CFLX_PROPOSAL_SKILL_MD.contains("Never create both"),
+            "cflx-proposal SKILL.md must keep tasks.md the default and forbid two artifacts"
+        );
+
+        // Every embedded skill that tells an agent to read or write task state
+        // must name the resolved artifact. A skill that still mandates
+        // `tasks.md` would make an agent on a JSON-only change create the
+        // second file that resolution then refuses as ambiguous.
+        assert!(
+            CFLX_REJECTION_GUIDE_SKILL_MD.contains("named by `tasks_path`")
+                && CFLX_REJECTION_GUIDE_SKILL_MD.contains("versioned `openspec/changes/<change-id>/tasks.json`")
+                && CFLX_REJECTION_GUIDE_SKILL_MD.contains("never create the other filename")
+                && CFLX_REJECTION_GUIDE_SKILL_MD.contains("in that file's own format"),
+            "cflx-rejection-guide SKILL.md must route recovery work through the resolved task file and forbid the second filename"
+        );
+        assert!(
+            CFLX_WORKFLOW_SKILL_MD.contains("The prompt's `tasks_path` names it")
+                && CFLX_WORKFLOW_SKILL_MD.contains("versioned `tasks.json`")
+                && CFLX_WORKFLOW_SKILL_MD.contains("Never create the other filename")
+                && CFLX_WORKFLOW_SKILL_MD.contains("`\"status\"` becomes `\"completed\"`")
+                && CFLX_WORKFLOW_SKILL_MD.contains("`acceptance_follow_up` object in JSON"),
+            "cflx-workflow SKILL.md must give format-specific task rules and forbid the second filename"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("versioned `tasks.json`")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("`acceptance_follow_up` object in JSON"),
+            "cflx-accept-with-speca SKILL.md must mirror cflx-accept and name the resolved task artifact in both formats"
+        );
+    }
+
     #[test]
     fn test_cflx_accept_with_speca_skill_contract() {
         let skills = get_cflx_embedded_skills().unwrap();

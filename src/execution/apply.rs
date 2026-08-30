@@ -181,21 +181,26 @@ fn ensure_runtime_acceptance_follow_up(
 
 /// Deterministic worktree-local task-format check run before acceptance dispatch.
 ///
-/// Returns the validator diagnostics for the workspace-local `tasks.md`. An
-/// empty vector means the task-format contract holds. The result is derived
-/// purely from the workspace file, so a restart re-derives the same answer
-/// without any durable out-of-worktree workflow state.
+/// Returns the validator diagnostics for the workspace-local task artifact,
+/// whichever representation the change declares. An empty vector means the
+/// task-format contract holds. The result is derived purely from the workspace
+/// file, so a restart re-derives the same answer without any durable
+/// out-of-worktree workflow state.
 pub fn check_task_format(workspace_path: &Path, change_id: &str) -> Vec<String> {
-    let tasks_path = workspace_path
-        .join("openspec/changes")
-        .join(change_id)
-        .join("tasks.md");
-    let Ok(content) = fs::read_to_string(&tasks_path) else {
-        // A missing/unreadable tasks.md is already handled by check_task_progress;
+    let change_dir = workspace_path.join("openspec/changes").join(change_id);
+    let tasks_file = match crate::task_file::find_in_entry(&change_dir) {
+        // Two competing artifacts is itself a format failure: acceptance may not
+        // start against an entry whose task source is undecidable.
+        Err(error) => return vec![format!("{}: {}", change_id, error)],
+        Ok(None) => return Vec::new(),
+        Ok(Some(file)) => file,
+    };
+    let Ok(content) = fs::read_to_string(&tasks_file.path) else {
+        // A missing/unreadable artifact is already handled by check_task_progress;
         // the format gate stays silent rather than inventing a second diagnostic.
         return Vec::new();
     };
-    crate::openspec_cmd::validation::validate_task_format(&content, change_id)
+    crate::openspec_cmd::validation::validate_task_format(tasks_file.format, &content, change_id)
 }
 
 /// Task-format diagnostics that currently block the acceptance handoff.
@@ -986,23 +991,24 @@ impl ApplyIterationResult {
 /// * `Err(OrchestratorError)` - If tasks.md doesn't exist
 pub fn check_task_progress(workspace_path: &Path, change_id: &str) -> Result<TaskProgress> {
     let change_dir = workspace_path.join("openspec/changes").join(change_id);
-    let tasks_path = change_dir.join("tasks.md");
+    let selected = crate::task_file::find_in_entry(&change_dir)?;
 
     debug!(
         change_id = change_id,
         workspace_path = %workspace_path.display(),
-        tasks_path = %tasks_path.display(),
+        tasks_path = ?selected.as_ref().map(|file| file.path.display().to_string()),
         "Checking tasks path in workspace"
     );
 
-    if tasks_path.exists() {
-        let progress = crate::task_parser::parse_file(&tasks_path, Some(change_id))?;
+    if let Some(tasks_file) = selected {
+        let progress = crate::task_file::read_progress(&tasks_file, Some(change_id))?;
         debug!(
             "Tasks file found for {}: {}/{} complete",
             change_id, progress.completed, progress.total
         );
         return Ok(progress);
     }
+    let tasks_path = change_dir.join(crate::task_file::MARKDOWN_FILE_NAME);
 
     let archive_root = if change_dir.is_dir() {
         change_dir.join("archive")
@@ -1039,9 +1045,10 @@ pub fn check_task_progress(workspace_path: &Path, change_id: &str) -> Result<Tas
     };
 
     if let Some(latest_dir) = latest_archive_dir {
-        let archive_tasks_path = archive_root.join(latest_dir).join("tasks.md");
-        if archive_tasks_path.exists() {
-            let progress = crate::task_parser::parse_file(&archive_tasks_path, Some(change_id))?;
+        let archive_entry = archive_root.join(latest_dir);
+        if let Some(archive_tasks) = crate::task_file::find_in_entry(&archive_entry)? {
+            let archive_tasks_path = archive_tasks.path.clone();
+            let progress = crate::task_file::read_progress(&archive_tasks, Some(change_id))?;
             // Warn when using archive fallback: the active change directory is gone and we
             // are reading task progress from a previously archived copy.  In a resumed
             // workspace this can make the apply loop exit immediately ("already complete")
@@ -1752,6 +1759,7 @@ pub async fn get_workspace_revision<W: WorkspaceManager + ?Sized>(
 /// The full prompt string to use for the apply command.
 pub fn build_apply_prompt(
     config: &OrchestratorConfig,
+    workspace_path: Option<&Path>,
     change_id: &str,
     history: &str,
     acceptance_tail: &str,
@@ -1761,6 +1769,7 @@ pub fn build_apply_prompt(
     crate::agent::append_optional_prompt(
         crate::agent::build_apply_prompt_with_skill(
             config.get_apply_skill(),
+            workspace_path,
             change_id,
             user_prompt,
             history,
@@ -4573,7 +4582,14 @@ mod tests {
             ..Default::default()
         };
 
-        let prompt = build_apply_prompt(&config, "change-a", "history ctx", "acceptance ctx", "");
+        let prompt = build_apply_prompt(
+            &config,
+            None,
+            "change-a",
+            "history ctx",
+            "acceptance ctx",
+            "",
+        );
 
         assert!(prompt.contains("change_id: change-a"));
         assert!(prompt.ends_with("apply tail {change_id}"));
@@ -6251,6 +6267,87 @@ mod tests {
         std::fs::write(change_dir.join("tasks.md"), content).unwrap();
     }
 
+    fn write_json_tasks(workspace: &Path, change_id: &str, content: &str) {
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("tasks.json"), content).unwrap();
+    }
+
+    #[test]
+    fn apply_gates_read_a_json_only_change_through_the_shared_contract() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_id = "json-apply";
+        write_json_tasks(
+            workspace,
+            change_id,
+            r#"{"schema_version":1,"tasks":[
+                {"id":"a","title":"Implement","status":"completed","section":"implementation"},
+                {"id":"b","title":"Document","status":"pending","section":"specification"}
+            ]}"#,
+        );
+
+        let progress = check_task_progress(workspace, change_id).expect("JSON progress is read");
+        assert_eq!((progress.completed, progress.total), (1, 2));
+        assert!(
+            check_task_format(workspace, change_id).is_empty(),
+            "a valid JSON artifact passes the format gate"
+        );
+    }
+
+    #[test]
+    fn apply_gates_fail_closed_on_an_invalid_json_artifact() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_id = "json-invalid";
+        write_json_tasks(
+            workspace,
+            change_id,
+            r#"{"schema_version":1,"tasks":[{"id":"a","title":"A","status":"done","section":"implementation"}]}"#,
+        );
+
+        let error = check_task_progress(workspace, change_id)
+            .expect_err("an unreadable artifact must not project progress");
+        assert!(error.to_string().contains("/tasks/0/status"), "{error}");
+
+        let diagnostics = check_task_format(workspace, change_id);
+        assert!(
+            diagnostics.iter().any(|d| d.contains("/tasks/0/status")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn apply_gates_refuse_an_entry_that_declares_both_artifacts() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_id = "ambiguous";
+        write_tasks(
+            workspace,
+            change_id,
+            "## Implementation Tasks\n- [x] done\n",
+        );
+        write_json_tasks(
+            workspace,
+            change_id,
+            r#"{"schema_version":1,"tasks":[{"id":"a","title":"A","status":"completed","section":"implementation"}]}"#,
+        );
+
+        let error = check_task_progress(workspace, change_id)
+            .expect_err("ambiguity must not resolve by precedence");
+        assert!(
+            error.to_string().contains("Ambiguous task artifacts"),
+            "{error}"
+        );
+        let diagnostics = check_task_format(workspace, change_id);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("Ambiguous task artifacts")),
+            "{diagnostics:?}"
+        );
+    }
+
     /// Stand-in for the acceptance dispatch decision the callers make from
     /// `ApplyLoopResult::completed`. Counts how many acceptance attempts the
     /// apply outcome would consume.
@@ -6624,6 +6721,7 @@ mod apply_commit_recovery {
             .record_orchestration_feedback("change-a", final_commit_rejection_feedback(rejection));
         crate::agent::build_apply_prompt_with_skill(
             "cflx-apply",
+            None,
             "change-a",
             "user prompt",
             &history.format_context("change-a"),

@@ -174,6 +174,7 @@ fn test_build_apply_prompt_with_all_parts() {
     let history_context = "Previous attempt failed.";
     let acceptance_tail = "";
     let result = build_apply_prompt(
+        None,
         "my-change",
         user_prompt,
         history_context,
@@ -191,6 +192,7 @@ fn test_build_apply_prompt_with_empty_user_prompt() {
     let history_context = "Previous attempt failed.";
     let acceptance_tail = "";
     let result = build_apply_prompt(
+        None,
         "my-change",
         user_prompt,
         history_context,
@@ -207,6 +209,7 @@ fn test_build_apply_prompt_with_empty_history() {
     let history_context = "";
     let acceptance_tail = "";
     let result = build_apply_prompt(
+        None,
         "my-change",
         user_prompt,
         history_context,
@@ -223,6 +226,7 @@ fn test_build_apply_prompt_with_only_system_prompt() {
     let history_context = "";
     let acceptance_tail = "";
     let result = build_apply_prompt(
+        None,
         "my-change",
         user_prompt,
         history_context,
@@ -242,7 +246,7 @@ fn test_build_apply_prompt_with_only_system_prompt() {
 
 #[test]
 fn test_build_apply_prompt_keeps_fixed_guidance_out_of_variable_context() {
-    let result = build_apply_prompt("real-change", "", "", "", "");
+    let result = build_apply_prompt(None, "real-change", "", "", "", "");
 
     assert!(!result.contains("Modify repository source, test, or config files"));
     assert!(!result.contains("git diff --stat shows real non-OpenSpec implementation"));
@@ -256,6 +260,7 @@ fn test_build_apply_prompt_with_acceptance_tail() {
     let acceptance_tail =
         "<last_acceptance_output>\nTest failure detected\n</last_acceptance_output>";
     let result = build_apply_prompt(
+        None,
         "my-change",
         user_prompt,
         history_context,
@@ -293,7 +298,7 @@ fn test_build_apply_prompt_with_canonical_acceptance_findings() {
         "add regression test".to_string().into(),
         "missing repository coverage".to_string().into(),
     ]);
-    let result = build_apply_prompt("my-change", "", "", &context, "");
+    let result = build_apply_prompt(None, "my-change", "", "", &context, "");
 
     assert!(result.contains("<acceptance_findings_json>"));
     assert_eq!(result.matches("missing repository coverage").count(), 1);
@@ -387,7 +392,7 @@ fn test_apply_system_prompt_content() {
 fn test_build_archive_prompt_with_all_parts() {
     let user_prompt = "Please archive this change";
     let history_context = "<last_archive attempt=\"1\">\nstatus: failed\n</last_archive>";
-    let result = build_archive_prompt("my-change", user_prompt, history_context);
+    let result = build_archive_prompt(None, "my-change", user_prompt, history_context);
 
     assert!(result.contains("$cflx-archive"));
     assert!(result.contains("load skills: cflx-archive"));
@@ -401,7 +406,7 @@ fn test_build_archive_prompt_with_all_parts() {
 fn test_build_archive_prompt_with_empty_user_prompt() {
     let user_prompt = "";
     let history_context = "<last_archive attempt=\"1\">\nstatus: failed\n</last_archive>";
-    let result = build_archive_prompt("my-change", user_prompt, history_context);
+    let result = build_archive_prompt(None, "my-change", user_prompt, history_context);
 
     // Should only contain history
     assert!(result.contains("<last_archive attempt=\"1\">"));
@@ -412,7 +417,7 @@ fn test_build_archive_prompt_with_empty_user_prompt() {
 fn test_build_archive_prompt_with_empty_history() {
     let user_prompt = "Please archive this change";
     let history_context = "";
-    let result = build_archive_prompt("my-change", user_prompt, history_context);
+    let result = build_archive_prompt(None, "my-change", user_prompt, history_context);
 
     assert!(result.contains("$cflx-archive"));
     assert!(result.contains("load skills: cflx-archive"));
@@ -424,7 +429,7 @@ fn test_build_archive_prompt_with_empty_history() {
 fn test_build_archive_prompt_both_empty() {
     let user_prompt = "";
     let history_context = "";
-    let result = build_archive_prompt("my-change", user_prompt, history_context);
+    let result = build_archive_prompt(None, "my-change", user_prompt, history_context);
 
     assert!(result.contains("$cflx-archive"));
     assert!(result.contains("load skills: cflx-archive"));
@@ -489,7 +494,7 @@ fn apply_prompt_carries_task_format_repair_before_history() {
             .to_string(),
     ]);
     let history_context = "<last_apply attempt=\"1\">\nstatus: ok\n</last_apply>";
-    let result = build_apply_prompt("alpha", "", history_context, "", &task_format_context);
+    let result = build_apply_prompt(None, "alpha", "", history_context, "", &task_format_context);
 
     assert!(result.contains("<task_format_repair_required>"));
     assert!(result.contains("tasks.md:3"));
@@ -504,7 +509,7 @@ fn apply_prompt_carries_task_format_repair_before_history() {
 
 #[test]
 fn apply_prompt_omits_task_format_block_when_format_is_valid() {
-    let result = build_apply_prompt("alpha", "", "", "", "");
+    let result = build_apply_prompt(None, "alpha", "", "", "", "");
     assert!(!result.contains("<task_format_repair_required>"));
 }
 
@@ -568,7 +573,7 @@ fn repair_prompt_carries_the_complete_finding_exactly_once() {
 
     let finding = secret_value_finding();
     let context = build_acceptance_findings_context(&[finding.clone(), finding]);
-    let prompt = build_apply_prompt("my-change", "", "", &context, "");
+    let prompt = build_apply_prompt(None, "my-change", "", "", &context, "");
 
     // Present exactly once, with every actionable field intact.
     assert_eq!(prompt.matches("acceptance-secret-value-scan").count(), 1);

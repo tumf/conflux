@@ -34,7 +34,7 @@ git status --short
 Read when present:
 
 - `openspec/changes/<change-id>/proposal.md`
-- `openspec/changes/<change-id>/tasks.md`
+- the change's task file named by `tasks_path`: `openspec/changes/<change-id>/tasks.md` or versioned `openspec/changes/<change-id>/tasks.json`. A change entry owns exactly one of them; never create the other filename, because two task files in one entry is an ambiguity error that fails closed.
 - `openspec/changes/<change-id>/REJECTED.md`
 
 ## Decision Rules
@@ -42,7 +42,7 @@ Read when present:
 ### Choose `CONFIRM` when
 
 - `REJECTED.md` gives a concrete closure reason
-- `tasks.md` blocker evidence is specific and actionable
+- the task file's blocker evidence is specific and actionable
 - recovery would require changing the proposal premise itself
 - another change has made this one obsolete
 
@@ -62,8 +62,8 @@ Read when present:
 ## Recommended Next Action
 
 - `CONFIRM`: keep the durable rejection record and treat the change as closed
-- `BLOCK`: keep the change alive, make unblock/recovery work explicit in `tasks.md`
-- `RESUME`: remove worktree-local `REJECTED.md`, append recovery work to `tasks.md`, return to apply
+- `BLOCK`: keep the change alive, make unblock/recovery work explicit in the change's task file, in that file's own format
+- `RESUME`: remove worktree-local `REJECTED.md`, append recovery work to the change's task file, in that file's own format, return to apply
 
 ## Default Recovery Workflow for Rejected Changes
 
@@ -73,14 +73,14 @@ Use this sequence by default:
 
 1. Re-review the rejected change:
    - Read `openspec/changes/<change-id>/REJECTED.md`.
-   - Read `proposal.md`, `tasks.md`, `design.md` if present, and relevant spec deltas.
+   - Read `proposal.md`, the change's task file (`tasks.md` or versioned `tasks.json`), `design.md` if present, and relevant spec deltas.
    - Run `cflx openspec show <change-id>` and `cflx openspec validate <change-id> --strict` when available.
 2. Analyze the rejection cause:
    - Identify whether the blocker is a real terminal mismatch, missing implementation work, incomplete tests, environment failure, or agent mistake.
    - Cite concrete files, commands, or task entries rather than relying on the rejection summary alone.
 3. Repair the existing change:
-   - Update implementation, tests, specs, or `tasks.md` in the same `openspec/changes/<change-id>/` scope as needed.
-   - Add or update recovery tasks in `tasks.md` so the reason for resuming is durable.
+   - Update implementation, tests, specs, or the change's task file in the same `openspec/changes/<change-id>/` scope as needed.
+   - Add or update recovery tasks in that same task file, in its own format — an unchecked `- [ ]` line in `tasks.md`, a task object with `"status": "pending"` in `tasks.json` — so the reason for resuming is durable.
 4. Remove `REJECTED.md` only after the repair path is understood and the change is ready to continue.
 5. Verify:
    - Re-run strict OpenSpec validation.

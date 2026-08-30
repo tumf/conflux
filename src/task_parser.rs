@@ -1,10 +1,15 @@
-//! Native task progress parsing for tasks.md files.
+//! Native task progress parsing and runtime-owned task mutation.
 //!
-//! This module provides native parsing of task checkboxes in markdown files,
-//! supporting both bullet lists (`- [ ]`) and numbered lists (`1. [ ]`).
+//! Markdown checkbox parsing lives here — bullet lists (`- [ ]`) and numbered
+//! lists (`1. [ ]`) — and is one implementation behind the shared
+//! [`crate::task_file`] contract. Which artifact speaks for a change, and in
+//! which format, is decided there; this module never constructs a `tasks.md`
+//! path of its own.
 
-use crate::archive_layout;
 use crate::error::{OrchestratorError, Result};
+use crate::task_file::{
+    self, JsonExternalBlocker, JsonFinding, JsonFollowUp, TaskFile, TaskFileFormat,
+};
 use crate::tui::log_deduplicator;
 use regex::Regex;
 use std::fmt::Write as _;
@@ -16,7 +21,7 @@ use std::fmt::Write as _;
 #[cfg(test)]
 mod recovery_regression;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 use tracing::debug;
 
@@ -108,221 +113,47 @@ pub fn parse_content(content: &str, change_id: Option<&str>) -> TaskProgress {
     progress
 }
 
-/// Parse task progress from a file.
+/// Parse task progress from a task artifact path.
 ///
-/// Reads the file content and parses it for task checkboxes.
+/// The format is bound from the basename through [`TaskFile::from_path`], so a
+/// `tasks.json` path is never parsed with the Markdown reader. An unrecognized
+/// basename is refused rather than guessed.
 /// When change_id is provided, emits deduplicated debug logs.
-pub fn parse_file(path: &Path, change_id: Option<&str>) -> Result<TaskProgress> {
-    let content = read_tasks_file(path)?;
-    Ok(parse_content(&content, change_id))
-}
-
-fn read_tasks_file(path: &Path) -> Result<String> {
-    std::fs::read_to_string(path).map_err(|e| {
-        OrchestratorError::ConfigLoad(format!("Failed to read tasks file {:?}: {}", path, e))
-    })
-}
-
-/// Replace a tasks file in one atomic step.
 ///
-/// The complete target content is written to a temporary file in the same
-/// directory and renamed over the destination. Any failure before the rename
-/// leaves the original file byte-for-byte unchanged.
-fn write_tasks_file_atomically(path: &Path, content: &str) -> Result<()> {
-    use std::io::Write as _;
-
-    let directory = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let directory = directory.unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::Builder::new()
-        .prefix(".tasks-")
-        .suffix(".md.tmp")
-        .tempfile_in(directory)
-        .map_err(|e| {
-            OrchestratorError::ConfigLoad(format!(
-                "Failed to stage atomic tasks update near {:?}: {}",
-                path, e
-            ))
-        })?;
-    temp.write_all(content.as_bytes()).map_err(|e| {
-        OrchestratorError::ConfigLoad(format!("Failed to write tasks file {:?}: {}", path, e))
-    })?;
-    temp.as_file().sync_all().map_err(|e| {
-        OrchestratorError::ConfigLoad(format!("Failed to flush tasks file {:?}: {}", path, e))
-    })?;
-    temp.persist(path).map_err(|e| {
+/// Test-only: production callers resolve a [`TaskFile`] through
+/// [`crate::task_file`] and never bind a format from a path they built.
+#[cfg(test)]
+pub fn parse_file(path: &Path, change_id: Option<&str>) -> Result<TaskProgress> {
+    let file = TaskFile::from_path(path).ok_or_else(|| {
         OrchestratorError::ConfigLoad(format!(
-            "Failed to atomically replace tasks file {:?}: {}",
-            path, e
+            "Unsupported task artifact {:?}: expected {} or {}",
+            path,
+            task_file::MARKDOWN_FILE_NAME,
+            task_file::JSON_FILE_NAME
         ))
     })?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskProgressLocationKind {
-    WorktreeActive,
-    WorktreeArchive,
-    BaseArchive,
-    BaseActive,
-}
-
-impl TaskProgressLocationKind {
-    fn log_label(self) -> &'static str {
-        match self {
-            Self::WorktreeActive => "worktree active location",
-            Self::WorktreeArchive => "worktree archive location",
-            Self::BaseArchive => "base tree archive location",
-            Self::BaseActive => "base tree active location",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TaskProgressLocation {
-    kind: TaskProgressLocationKind,
-    tasks_path: PathBuf,
-}
-
-impl TaskProgressLocation {
-    fn new(kind: TaskProgressLocationKind, tasks_path: PathBuf) -> Self {
-        Self { kind, tasks_path }
-    }
-}
-
-fn active_tasks_path(root: Option<&Path>, change_id: &str) -> PathBuf {
-    root.unwrap_or_else(|| Path::new(""))
-        .join("openspec/changes")
-        .join(change_id)
-        .join("tasks.md")
-}
-
-fn archived_tasks_path(change_id: &str, root: Option<&Path>) -> Option<PathBuf> {
-    find_archive_directory(change_id, root)
-        .map(|archive_path| archive_path.join("tasks.md"))
-        .filter(|tasks_path| tasks_path.exists())
-}
-
-fn resolve_progress_location(
-    change_id: &str,
-    worktree_path: Option<&Path>,
-) -> Option<TaskProgressLocation> {
-    progress_location_candidates(change_id, worktree_path)
-        .into_iter()
-        .find(|candidate| candidate.tasks_path.exists())
-}
-
-fn progress_location_candidates(
-    change_id: &str,
-    worktree_path: Option<&Path>,
-) -> Vec<TaskProgressLocation> {
-    let mut candidates = Vec::new();
-
-    if let Some(wt_path) = worktree_path {
-        candidates.push(TaskProgressLocation::new(
-            TaskProgressLocationKind::WorktreeActive,
-            active_tasks_path(Some(wt_path), change_id),
-        ));
-        if let Some(tasks_path) = archived_tasks_path(change_id, Some(wt_path)) {
-            candidates.push(TaskProgressLocation::new(
-                TaskProgressLocationKind::WorktreeArchive,
-                tasks_path,
-            ));
-        }
-    }
-
-    if let Some(tasks_path) = archived_tasks_path(change_id, None) {
-        candidates.push(TaskProgressLocation::new(
-            TaskProgressLocationKind::BaseArchive,
-            tasks_path,
-        ));
-    }
-
-    candidates.push(TaskProgressLocation::new(
-        TaskProgressLocationKind::BaseActive,
-        active_tasks_path(None, change_id),
-    ));
-
-    candidates
-}
-
-fn resolve_active_progress_location(
-    change_id: &str,
-    worktree_path: Option<&Path>,
-) -> Option<TaskProgressLocation> {
-    worktree_path
-        .map(|wt_path| {
-            TaskProgressLocation::new(
-                TaskProgressLocationKind::WorktreeActive,
-                active_tasks_path(Some(wt_path), change_id),
-            )
-        })
-        .filter(|candidate| candidate.tasks_path.exists())
-        .or_else(|| {
-            let candidate = TaskProgressLocation::new(
-                TaskProgressLocationKind::BaseActive,
-                active_tasks_path(None, change_id),
-            );
-            candidate.tasks_path.exists().then_some(candidate)
-        })
-}
-
-fn resolve_archived_progress_location(
-    change_id: &str,
-    worktree_path: Option<&Path>,
-) -> Option<TaskProgressLocation> {
-    if let Some(wt_path) = worktree_path {
-        if let Some(tasks_path) = archived_tasks_path(change_id, Some(wt_path)) {
-            return Some(TaskProgressLocation::new(
-                TaskProgressLocationKind::WorktreeArchive,
-                tasks_path,
-            ));
-        }
-
-        let active_candidate = TaskProgressLocation::new(
-            TaskProgressLocationKind::WorktreeActive,
-            active_tasks_path(Some(wt_path), change_id),
-        );
-        if active_candidate.tasks_path.exists() {
-            return Some(active_candidate);
-        }
-    }
-
-    archived_tasks_path(change_id, None).map(|tasks_path| {
-        TaskProgressLocation::new(TaskProgressLocationKind::BaseArchive, tasks_path)
-    })
+    task_file::read_progress(&file, change_id)
 }
 
 /// Parse task progress for a change by its ID.
 ///
-/// Looks for tasks.md at `openspec/changes/{change_id}/tasks.md`.
-///
 /// Test-only: every execution path resolves progress against a managed
-/// workspace path through [`parse_change_with_worktree_fallback`], never against the
-/// process's current directory.
+/// workspace path through the shared resolver, never against the process's
+/// current directory.
 #[cfg(test)]
 pub fn parse_change(change_id: &str) -> Result<TaskProgress> {
-    let tasks_path = active_tasks_path(None, change_id);
-
-    if !tasks_path.exists() {
-        return Err(OrchestratorError::ConfigLoad(format!(
-            "Tasks file not found: {:?}",
-            tasks_path
-        )));
-    }
-
-    parse_file(&tasks_path, Some(change_id))
+    let resolved = task_file::resolve_active(change_id, None)?.ok_or_else(|| {
+        OrchestratorError::ConfigLoad(format!(
+            "Tasks file not found for change '{}' in openspec/changes/",
+            change_id
+        ))
+    })?;
+    task_file::read_progress(&resolved.file, Some(change_id))
 }
 
 /// Parse task progress with worktree priority and base tree fallback.
 ///
-/// Resolution order:
-/// 1. Try worktree_path/openspec/changes/{change_id}/tasks.md (uncommitted)
-/// 2. Fallback to openspec/changes/{change_id}/tasks.md (base tree)
-///
-/// This function is designed for TUI auto-refresh to read the latest progress
-/// from worktrees where AI agents update tasks.md before committing.
+/// Resolution order: worktree active entry, then base active entry.
 ///
 /// # Deprecated
 /// Use [`parse_progress_with_fallback`] instead, which provides comprehensive
@@ -336,50 +167,21 @@ pub fn parse_change_with_worktree_fallback(
     change_id: &str,
     worktree_path: Option<&Path>,
 ) -> Result<TaskProgress> {
-    if let Some(location) = resolve_active_progress_location(change_id, worktree_path) {
-        debug!(
-            "Reading tasks from {}: {:?}",
-            location.kind.log_label(),
-            location.tasks_path
-        );
-        return parse_file(&location.tasks_path, Some(change_id));
-    }
-
-    let tasks_path = active_tasks_path(None, change_id);
-    Err(OrchestratorError::ConfigLoad(format!(
-        "Tasks file not found: {:?}",
-        tasks_path
-    )))
+    let resolved = task_file::resolve_active(change_id, worktree_path)?.ok_or_else(|| {
+        OrchestratorError::ConfigLoad(format!(
+            "Tasks file not found for change '{}' in any active location",
+            change_id
+        ))
+    })?;
+    debug!(
+        "Reading tasks from {}: {:?}",
+        resolved.kind.log_label(),
+        resolved.file.path
+    );
+    task_file::read_progress(&resolved.file, Some(change_id))
 }
 
-/// Find the archive directory entry for a change.
-///
-/// Searches for an archive directory matching either:
-/// - `{change_id}` - Simple archive
-/// - `{date}-{change_id}` - Date-prefixed archive (e.g., `2024-01-15-add-feature`)
-///
-/// Returns the path to the archive directory if found.
-fn archive_root(base_path: Option<&Path>) -> PathBuf {
-    match base_path {
-        Some(base) => base.join("openspec/changes/archive"),
-        None => Path::new("openspec/changes/archive").to_path_buf(),
-    }
-}
-
-fn invalid_archive_layout_error(change_id: &str, base_path: Option<&Path>) -> Option<String> {
-    archive_layout::invalid_layout_error(change_id, &archive_root(base_path)).map(|e| e.message())
-}
-
-fn find_archive_directory(change_id: &str, base_path: Option<&Path>) -> Option<std::path::PathBuf> {
-    archive_layout::find_valid_archive_entry(change_id, &archive_root(base_path))
-}
-
-/// Parse task progress from the archive directory.
-///
-/// Looks for tasks.md at `openspec/changes/archive/{change_id}/tasks.md` or
-/// `openspec/changes/archive/{date}-{change_id}/tasks.md` (date-prefixed format).
-/// This is used to retrieve final progress for archived changes when
-/// the change is no longer in the active changes directory.
+/// Parse task progress from the archive directory of the base tree.
 ///
 /// # Deprecated
 /// Use [`parse_progress_with_fallback`] instead, which provides comprehensive
@@ -390,16 +192,16 @@ fn find_archive_directory(change_id: &str, base_path: Option<&Path>) -> Option<s
 )]
 #[allow(dead_code)]
 pub fn parse_archived_change(change_id: &str) -> Result<TaskProgress> {
-    if let Some(message) = invalid_archive_layout_error(change_id, None) {
+    if let Some(message) = task_file::invalid_archive_layout_error(change_id, None) {
         return Err(OrchestratorError::ConfigLoad(message));
     }
 
-    let location = resolve_archived_progress_location(change_id, None).ok_or_else(|| {
-        let archive_root = Path::new("openspec/changes/archive");
-        if find_archive_directory(change_id, None).is_some() {
+    let resolved = task_file::resolve_archived(change_id, None)?.ok_or_else(|| {
+        if task_file::find_archive_entry(change_id, None).is_some() {
             OrchestratorError::ConfigLoad(format!(
                 "Archived tasks file not found for change '{}' in {:?}",
-                change_id, archive_root
+                change_id,
+                Path::new("openspec/changes/archive")
             ))
         } else {
             OrchestratorError::ConfigLoad(format!(
@@ -411,24 +213,16 @@ pub fn parse_archived_change(change_id: &str) -> Result<TaskProgress> {
 
     debug!(
         "Reading tasks from {}: {:?}",
-        location.kind.log_label(),
-        location.tasks_path
+        resolved.kind.log_label(),
+        resolved.file.path
     );
-    parse_file(&location.tasks_path, Some(change_id))
+    task_file::read_progress(&resolved.file, Some(change_id))
 }
 
 /// Parse task progress with worktree priority for archived changes.
 ///
-/// Resolution order when worktree_path is provided:
-/// 1. Try worktree_path/openspec/changes/archive/{change_id}/tasks.md or date-prefixed (archived in worktree)
-/// 2. Try worktree_path/openspec/changes/{change_id}/tasks.md (not yet archived in worktree)
-/// 3. Fallback to openspec/changes/archive/{change_id}/tasks.md or date-prefixed (base tree)
-///
-/// Resolution order when worktree_path is None:
-/// 1. Try openspec/changes/archive/{change_id}/tasks.md or date-prefixed (base tree)
-///
-/// This function is designed for Archived/Merged changes in TUI auto-refresh to read
-/// the latest progress from worktrees where the archive may not yet be committed.
+/// Resolution order: worktree archive entry, worktree active entry, then base
+/// archive entry.
 ///
 /// # Deprecated
 /// Use [`parse_progress_with_fallback`] instead, which provides comprehensive
@@ -438,34 +232,32 @@ pub fn parse_archived_change(change_id: &str) -> Result<TaskProgress> {
     note = "Use parse_progress_with_fallback for comprehensive fallback order"
 )]
 #[allow(dead_code)]
-#[allow(deprecated)]
 pub fn parse_archived_change_with_worktree_fallback(
     change_id: &str,
     worktree_path: Option<&Path>,
 ) -> Result<TaskProgress> {
     if let Some(wt_path) = worktree_path {
-        if let Some(message) = invalid_archive_layout_error(change_id, Some(wt_path)) {
+        if let Some(message) = task_file::invalid_archive_layout_error(change_id, Some(wt_path)) {
             return Err(OrchestratorError::ConfigLoad(message));
         }
     }
-    if let Some(message) = invalid_archive_layout_error(change_id, None) {
+    if let Some(message) = task_file::invalid_archive_layout_error(change_id, None) {
         return Err(OrchestratorError::ConfigLoad(message));
     }
 
-    let location =
-        resolve_archived_progress_location(change_id, worktree_path).ok_or_else(|| {
-            OrchestratorError::ConfigLoad(format!(
-                "Archived directory not found for change '{}' in openspec/changes/archive/",
-                change_id
-            ))
-        })?;
+    let resolved = task_file::resolve_archived(change_id, worktree_path)?.ok_or_else(|| {
+        OrchestratorError::ConfigLoad(format!(
+            "Archived directory not found for change '{}' in openspec/changes/archive/",
+            change_id
+        ))
+    })?;
 
     debug!(
         "Reading archived tasks from {}: {:?}",
-        location.kind.log_label(),
-        location.tasks_path
+        resolved.kind.log_label(),
+        resolved.file.path
     );
-    parse_file(&location.tasks_path, Some(change_id))
+    task_file::read_progress(&resolved.file, Some(change_id))
 }
 
 /// Parse task progress with comprehensive fallback order: worktree → archive → base.
@@ -509,21 +301,21 @@ pub fn parse_progress_with_fallback(
     worktree_path: Option<&Path>,
 ) -> Result<TaskProgress> {
     if let Some(wt_path) = worktree_path {
-        if let Some(message) = invalid_archive_layout_error(change_id, Some(wt_path)) {
+        if let Some(message) = task_file::invalid_archive_layout_error(change_id, Some(wt_path)) {
             return Err(OrchestratorError::ConfigLoad(message));
         }
     }
-    if let Some(message) = invalid_archive_layout_error(change_id, None) {
+    if let Some(message) = task_file::invalid_archive_layout_error(change_id, None) {
         return Err(OrchestratorError::ConfigLoad(message));
     }
 
-    if let Some(location) = resolve_progress_location(change_id, worktree_path) {
+    if let Some(resolved) = task_file::resolve_progress(change_id, worktree_path)? {
         debug!(
             "Reading progress from {}: {:?}",
-            location.kind.log_label(),
-            location.tasks_path
+            resolved.kind.log_label(),
+            resolved.file.path
         );
-        return parse_file(&location.tasks_path, Some(change_id));
+        return task_file::read_progress(&resolved.file, Some(change_id));
     }
 
     Err(OrchestratorError::ConfigLoad(format!(
@@ -1056,56 +848,32 @@ fn upsert_acceptance_follow_up_section(
     Ok(recovery)
 }
 
+/// Resolve the workspace-local task artifact Acceptance follow-up mutates.
+///
+/// Never falls back to the base tree: follow-up state belongs to the resumed
+/// workspace only.
 pub fn resolve_acceptance_follow_up_tasks_path(
     change_id: &str,
     worktree_path: &Path,
-) -> Result<std::path::PathBuf> {
-    let active_path = worktree_path
-        .join("openspec")
-        .join("changes")
-        .join(change_id)
-        .join("tasks.md");
-
-    if active_path.exists() {
-        return Ok(active_path);
-    }
-
-    if let Some(message) = invalid_archive_layout_error(change_id, Some(worktree_path)) {
-        return Err(OrchestratorError::ConfigLoad(message));
-    }
-
-    if let Some(archive_path) = find_archive_directory(change_id, Some(worktree_path)) {
-        let archive_tasks = archive_path.join("tasks.md");
-        if archive_tasks.exists() {
-            return Ok(archive_tasks);
-        }
-    }
-
-    Err(OrchestratorError::ConfigLoad(format!(
-        "Acceptance follow-up tasks path not found for change '{}' under worktree '{}'",
-        change_id,
-        worktree_path.display()
-    )))
+) -> Result<TaskFile> {
+    task_file::resolve_mutation(change_id, worktree_path)?
+        .map(|resolved| resolved.file)
+        .ok_or_else(|| {
+            OrchestratorError::ConfigLoad(format!(
+                "Acceptance follow-up tasks path not found for change '{}' under worktree '{}'",
+                change_id,
+                worktree_path.display()
+            ))
+        })
 }
 
+/// Same resolution as [`resolve_acceptance_follow_up_tasks_path`], but a missing
+/// artifact is "nothing to clean up" rather than an error.
 pub fn resolve_acceptance_follow_up_tasks_path_for_cleanup(
     change_id: &str,
     worktree_path: &Path,
-) -> Result<Option<std::path::PathBuf>> {
-    let active_path = worktree_path
-        .join("openspec")
-        .join("changes")
-        .join(change_id)
-        .join("tasks.md");
-    if active_path.exists() {
-        return Ok(Some(active_path));
-    }
-    if let Some(message) = invalid_archive_layout_error(change_id, Some(worktree_path)) {
-        return Err(OrchestratorError::ConfigLoad(message));
-    }
-    Ok(find_archive_directory(change_id, Some(worktree_path))
-        .map(|archive_path| archive_path.join("tasks.md"))
-        .filter(|tasks_path| tasks_path.exists()))
+) -> Result<Option<TaskFile>> {
+    Ok(task_file::resolve_mutation(change_id, worktree_path)?.map(|resolved| resolved.file))
 }
 
 /// Build the replacement `tasks.md` for a latest-FAIL follow-up rewrite.
@@ -1162,38 +930,165 @@ fn plan_clear_acceptance_follow_up(content: &str) -> Result<(String, FollowUpRec
     Ok((content, recovery))
 }
 
-pub fn replace_acceptance_follow_up_from_latest_fail(
-    tasks_path: &Path,
+/// Project normalized findings into the runtime-owned JSON follow-up block.
+///
+/// Internal findings become virtual progress-gate items; external blockers stay
+/// outside the task counts, exactly as their Markdown counterparts do.
+fn build_json_follow_up(
     attempt: u32,
-    findings: &[crate::acceptance::AcceptanceFinding],
-) -> Result<FollowUpRecovery> {
-    let original = read_tasks_file(tasks_path)?;
-    let (content, recovery) = plan_replace_acceptance_follow_up(&original, attempt, findings)?;
-    write_tasks_file_atomically(tasks_path, &content)?;
-    Ok(recovery)
+    findings: &[crate::orchestration::acceptance::NormalizedFinding],
+    claimed_identities: &[String],
+    evidence_by_identity: &std::collections::HashMap<String, Vec<String>>,
+) -> JsonFollowUp {
+    JsonFollowUp {
+        attempt,
+        findings: findings
+            .iter()
+            .filter(|finding| !finding.external)
+            .map(|finding| JsonFinding {
+                identity: finding.identity.clone(),
+                text: finding.text.clone(),
+                finding: finding.finding.structured_payload().cloned(),
+                remediation_claimed: claimed_identities.contains(&finding.identity),
+                evidence: evidence_by_identity
+                    .get(&finding.identity)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect(),
+        external_blockers: findings
+            .iter()
+            .filter(|finding| finding.external)
+            .map(|finding| JsonExternalBlocker {
+                identity: finding.identity.clone(),
+                text: finding.text.clone(),
+                evidence: vec![finding.text.clone()],
+            })
+            .collect(),
+    }
 }
 
-pub fn merge_acceptance_follow_up_apply_progress(
-    tasks_path: &Path,
+/// Re-read stored JSON findings through the shared reconciliation contract.
+fn existing_json_findings(
+    document: &task_file::JsonTaskDocument,
+) -> Vec<ExistingAcceptanceFinding> {
+    document
+        .follow_up
+        .as_ref()
+        .map(|follow_up| {
+            follow_up
+                .findings
+                .iter()
+                .map(|finding| ExistingAcceptanceFinding {
+                    finding: crate::orchestration::acceptance::NormalizedFinding {
+                        identity: finding.identity.clone(),
+                        text: finding.text.clone(),
+                        external: false,
+                        finding: finding.to_acceptance_finding(),
+                    },
+                    remediation_claimed: finding.remediation_claimed,
+                    evidence: finding.evidence.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_json_follow_up(
+    tasks_file: &TaskFile,
+    follow_up: Option<JsonFollowUp>,
+) -> Result<FollowUpRecovery> {
+    let original = task_file::read_to_string(tasks_file)?;
+    let mut document = task_file::parse_json_document(&original)?;
+    document.set_follow_up(follow_up);
+    let content = document.to_content()?;
+    if content != original {
+        task_file::write_atomically(tasks_file, &content)?;
+    }
+    // Structured storage keeps unknown fields in place, so a JSON update never
+    // relocates content into recovered notes.
+    Ok(FollowUpRecovery::default())
+}
+
+/// Record the latest Acceptance FAIL as the runtime-owned follow-up.
+pub fn replace_acceptance_follow_up_from_latest_fail(
+    tasks_file: &TaskFile,
     attempt: u32,
     findings: &[crate::acceptance::AcceptanceFinding],
 ) -> Result<FollowUpRecovery> {
-    let original = read_tasks_file(tasks_path)?;
-    let (content, recovery) = plan_merge_acceptance_follow_up(&original, attempt, findings)?;
-    write_tasks_file_atomically(tasks_path, &content)?;
-    Ok(recovery)
+    match tasks_file.format {
+        TaskFileFormat::Markdown => {
+            let original = task_file::read_to_string(tasks_file)?;
+            let (content, recovery) =
+                plan_replace_acceptance_follow_up(&original, attempt, findings)?;
+            task_file::write_atomically(tasks_file, &content)?;
+            Ok(recovery)
+        }
+        TaskFileFormat::Json => {
+            let normalized = normalize_acceptance_findings(findings);
+            let follow_up =
+                build_json_follow_up(attempt, &normalized, &[], &std::collections::HashMap::new());
+            write_json_follow_up(tasks_file, Some(follow_up))
+        }
+    }
+}
+
+/// Reconcile Apply's recorded remediation claims with the latest findings.
+pub fn merge_acceptance_follow_up_apply_progress(
+    tasks_file: &TaskFile,
+    attempt: u32,
+    findings: &[crate::acceptance::AcceptanceFinding],
+) -> Result<FollowUpRecovery> {
+    match tasks_file.format {
+        TaskFileFormat::Markdown => {
+            let original = task_file::read_to_string(tasks_file)?;
+            let (content, recovery) =
+                plan_merge_acceptance_follow_up(&original, attempt, findings)?;
+            task_file::write_atomically(tasks_file, &content)?;
+            Ok(recovery)
+        }
+        TaskFileFormat::Json => {
+            let original = task_file::read_to_string(tasks_file)?;
+            let document = task_file::parse_json_document(&original)?;
+            let existing = existing_json_findings(&document);
+            let (merged, claimed, evidence) =
+                reconcile_apply_progress(normalize_acceptance_findings(findings), &existing);
+            let follow_up = build_json_follow_up(attempt, &merged, &claimed, &evidence);
+            write_json_follow_up(tasks_file, Some(follow_up))
+        }
+    }
 }
 
 /// Read the runtime-owned current follow-up as actionable findings.
 ///
-/// Structured findings are restored from their runtime-owned payload line, so an
+/// Structured findings are restored from their runtime-owned payload, so an
 /// interrupted FAIL-to-Apply handoff recovers stable IDs, evidence, required
-/// changes, and verification expectations rather than checkbox text alone. A
-/// checked box is a remediation claim only; nothing here implies closure or PASS.
+/// changes, and verification expectations rather than display text alone. A
+/// remediation claim is a claim only; nothing here implies closure or PASS.
 pub fn read_acceptance_follow_up(
-    tasks_path: &Path,
+    tasks_file: &TaskFile,
 ) -> Result<Option<(u32, Vec<crate::acceptance::AcceptanceFinding>)>> {
-    let content = read_tasks_file(tasks_path)?;
+    if tasks_file.format == TaskFileFormat::Json {
+        let document = task_file::parse_json_document(&task_file::read_to_string(tasks_file)?)?;
+        let Some(follow_up) = document.current_follow_up() else {
+            return Ok(None);
+        };
+        let mut findings = follow_up
+            .findings
+            .iter()
+            .map(JsonFinding::to_acceptance_finding)
+            .collect::<Vec<_>>();
+        findings.extend(
+            follow_up
+                .external_blockers
+                .iter()
+                .map(|blocker| crate::acceptance::AcceptanceFinding::legacy(blocker.text.clone())),
+        );
+        return Ok((!findings.is_empty()).then_some((follow_up.attempt, findings)));
+    }
+
+    let tasks_path = tasks_file.path.as_path();
+    let content = task_file::read_to_string(tasks_file)?;
     let ranges = acceptance_follow_up_ranges(&content)?;
     let Some(range) = ranges.last() else {
         return Ok(None);
@@ -1253,8 +1148,26 @@ pub fn read_acceptance_follow_up(
 ///
 /// Evidence is a remediation *claim*: it never closes a finding and never
 /// implies Acceptance PASS.
-pub fn read_acceptance_follow_up_evidence(tasks_path: &Path) -> Result<Vec<String>> {
-    let content = read_tasks_file(tasks_path)?;
+pub fn read_acceptance_follow_up_evidence(tasks_file: &TaskFile) -> Result<Vec<String>> {
+    let content = task_file::read_to_string(tasks_file)?;
+    if tasks_file.format == TaskFileFormat::Json {
+        let document = task_file::parse_json_document(&content)?;
+        let Some(follow_up) = document.current_follow_up() else {
+            return Ok(Vec::new());
+        };
+        return Ok(follow_up
+            .findings
+            .iter()
+            .flat_map(|finding| finding.evidence.iter().cloned())
+            .chain(
+                follow_up
+                    .external_blockers
+                    .iter()
+                    .flat_map(|blocker| blocker.evidence.iter().cloned()),
+            )
+            .collect());
+    }
+
     let ranges = acceptance_follow_up_ranges(&content)?;
     let Some(range) = ranges.last() else {
         return Ok(Vec::new());
@@ -1266,22 +1179,99 @@ pub fn read_acceptance_follow_up_evidence(tasks_path: &Path) -> Result<Vec<Strin
         .collect())
 }
 
-pub fn clear_acceptance_follow_up(tasks_path: &Path) -> Result<FollowUpRecovery> {
-    let original = read_tasks_file(tasks_path)?;
-    let (content, recovery) = plan_clear_acceptance_follow_up(&original)?;
+/// Stable identifier of the rejection-recovery task in JSON documents.
+const REJECTING_RECOVERY_TASK_ID: &str = "rejecting-recovery";
+
+/// Heading of the rejection-recovery section in Markdown documents.
+pub const REJECTING_RECOVERY_HEADING: &str = "## Rejecting Recovery Tasks";
+
+/// The recovery task text a rejecting handoff records for `change_id`.
+pub fn rejecting_recovery_task_text(change_id: &str) -> String {
+    format!(
+        "Capture unresolved blocker details in the task file (do not recreate REJECTED.md) and implement a non-rejection recovery path before rerunning apply for {}",
+        change_id
+    )
+}
+
+/// Insert the rejection-recovery task into an artifact, in its own format.
+///
+/// Idempotent in both representations: a repeated handoff converges on the same
+/// document rather than appending the task again.
+pub fn append_rejecting_recovery_task(tasks_file: &TaskFile, change_id: &str) -> Result<()> {
+    let original = task_file::read_to_string(tasks_file)?;
+    let content = match tasks_file.format {
+        TaskFileFormat::Markdown => {
+            append_recovery_task_section(&original, &rejecting_recovery_task_text(change_id))
+        }
+        TaskFileFormat::Json => {
+            let mut document = task_file::parse_json_document(&original)?;
+            if !document.append_pending_task(
+                REJECTING_RECOVERY_TASK_ID,
+                &rejecting_recovery_task_text(change_id),
+            ) {
+                return Ok(());
+            }
+            document.to_content()?
+        }
+    };
     if content != original {
-        write_tasks_file_atomically(tasks_path, &content)?;
+        task_file::write_atomically(tasks_file, &content)?;
     }
-    Ok(recovery)
+    Ok(())
+}
+
+/// Append the Markdown rejection-recovery section, preserving an existing one.
+fn append_recovery_task_section(existing: &str, task_text: &str) -> String {
+    let task = format!("- [ ] {task_text}");
+
+    if existing.contains(REJECTING_RECOVERY_HEADING) {
+        if existing.contains(&task) {
+            return existing.to_string();
+        }
+        return format!("{}\n{}\n", existing.trim_end(), task);
+    }
+
+    format!(
+        "{}\n\n{}\n\n{}\n",
+        existing.trim_end(),
+        REJECTING_RECOVERY_HEADING,
+        task
+    )
+}
+
+/// Remove the runtime-owned follow-up after Acceptance PASS.
+pub fn clear_acceptance_follow_up(tasks_file: &TaskFile) -> Result<FollowUpRecovery> {
+    match tasks_file.format {
+        TaskFileFormat::Markdown => {
+            let original = task_file::read_to_string(tasks_file)?;
+            let (content, recovery) = plan_clear_acceptance_follow_up(&original)?;
+            if content != original {
+                task_file::write_atomically(tasks_file, &content)?;
+            }
+            Ok(recovery)
+        }
+        TaskFileFormat::Json => write_json_follow_up(tasks_file, None),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn write_tasks(path: &Path, content: &str) {
+    fn write_tasks(path: impl AsRef<Path>, content: &str) {
+        let path = path.as_ref();
         std::fs::create_dir_all(path.parent().expect("tasks path has a parent")).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    /// Bind `<dir>/tasks.md` as an explicit Markdown artifact.
+    pub(super) fn markdown_task_file(dir: &Path) -> TaskFile {
+        TaskFile::in_entry(dir, TaskFileFormat::Markdown)
+    }
+
+    /// Bind `<dir>/tasks.json` as an explicit JSON artifact.
+    pub(super) fn json_task_file(dir: &Path) -> TaskFile {
+        TaskFile::in_entry(dir, TaskFileFormat::Json)
     }
 
     fn checked_tasks(count: u32) -> String {
@@ -1395,7 +1385,7 @@ mod tests {
     #[test]
     fn test_record_acceptance_follow_up_appends_unchecked_tasks() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
 
         replace_acceptance_follow_up_from_latest_fail(
@@ -1413,7 +1403,7 @@ mod tests {
         assert!(content.contains("- [ ] missing repository coverage"));
         assert!(content.contains("- [ ] add notification links"));
 
-        let progress = parse_file(&tasks_path, None).unwrap();
+        let progress = task_file::read_progress(&tasks_path, None).unwrap();
         assert_eq!(progress.completed, 1);
         assert_eq!(progress.total, 3);
     }
@@ -1421,7 +1411,7 @@ mod tests {
     #[test]
     fn test_record_acceptance_follow_up_replaces_existing_section() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- [x] stale\n\n## Final Validation\n- [ ] run tests\n",
@@ -1445,7 +1435,7 @@ mod tests {
     #[test]
     fn record_acceptance_follow_up_replaces_previous_attempt() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Implementation Tasks\n- [x] done\n\n## Acceptance #1 Failure Follow-up\n- [x] stale\n",
@@ -1471,7 +1461,7 @@ mod tests {
     #[test]
     fn ensure_acceptance_follow_up_restores_deleted_runtime_section() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
 
         merge_acceptance_follow_up_apply_progress(
@@ -1493,7 +1483,7 @@ mod tests {
     #[test]
     fn ensure_acceptance_follow_up_restores_deleted_finding_and_preserves_completed_finding() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- [x] add regression test\n",
@@ -1513,14 +1503,14 @@ mod tests {
         let content = std::fs::read_to_string(&tasks_path).unwrap();
         assert!(content.contains("- [x] add regression test"));
         assert!(content.contains("- [ ] latest finding"));
-        let progress = parse_file(&tasks_path, None).unwrap();
+        let progress = task_file::read_progress(&tasks_path, None).unwrap();
         assert_eq!(progress, TaskProgress::with_counts(2, 3));
     }
 
     #[test]
     fn apply_progress_preserves_completed_fallback_identity_text_and_evidence() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- attempt: 1\n- [x] Missing retry coverage at src/example.rs:10\n  evidence: cargo test retry passes\n- [ ] Incorrect implementation at src/other.rs:4\n",
@@ -1547,7 +1537,7 @@ mod tests {
         assert!(content.contains("- [ ] Incorrect implementation at src/other.rs:4"));
         assert!(!content.contains("changed detail"));
         assert_eq!(
-            parse_file(&tasks_path, None).unwrap(),
+            task_file::read_progress(&tasks_path, None).unwrap(),
             TaskProgress::with_counts(2, 3)
         );
     }
@@ -1555,7 +1545,7 @@ mod tests {
     #[test]
     fn ensure_acceptance_follow_up_preserves_completed_finding_by_code() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- [x] [SERIAL_STALLED_MARKER_MISSING] fixed and verified\n",
@@ -1574,7 +1564,7 @@ mod tests {
         let content = std::fs::read_to_string(&tasks_path).unwrap();
         assert!(content.contains("- [x] [SERIAL_STALLED_MARKER_MISSING] fixed and verified"));
         assert_eq!(
-            parse_file(&tasks_path, None).unwrap(),
+            task_file::read_progress(&tasks_path, None).unwrap(),
             TaskProgress::with_counts(2, 2)
         );
     }
@@ -1582,7 +1572,7 @@ mod tests {
     #[test]
     fn record_acceptance_follow_up_reopens_repeated_stable_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- attempt: 1\n- [x] [SERIAL_STALLED_MARKER_MISSING] fixed and verified\n",
@@ -1609,7 +1599,7 @@ mod tests {
     #[test]
     fn acceptance_follow_up_renders_external_blockers_without_checkboxes() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
 
         replace_acceptance_follow_up_from_latest_fail(
@@ -1633,7 +1623,7 @@ mod tests {
         assert!(content.contains("next action: Resolve the external prerequisite"));
         assert!(!content.contains("- [ ] external non-mockable prerequisite"));
         assert_eq!(
-            parse_file(&tasks_path, None).unwrap(),
+            task_file::read_progress(&tasks_path, None).unwrap(),
             TaskProgress::with_counts(1, 2)
         );
     }
@@ -1641,7 +1631,7 @@ mod tests {
     #[test]
     fn read_acceptance_follow_up_restores_mixed_repository_and_external_findings() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Current Acceptance Follow-up\n- attempt: 3\n- [x] fix repository regression at src/run.rs:4\n\n### External blockers\n- identity: `external||vendor approval|plain`\n  evidence: external non-mockable prerequisite: vendor approval\n  next action: Resolve the external prerequisite, then retry acceptance.\n",
@@ -1665,7 +1655,7 @@ mod tests {
     #[test]
     fn acceptance_follow_up_normalizes_multiline_findings() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
 
         replace_acceptance_follow_up_from_latest_fail(
@@ -1683,13 +1673,16 @@ mod tests {
             content.matches("## Current Acceptance Follow-up").count(),
             1
         );
-        assert_eq!(parse_file(&tasks_path, None).unwrap().total, 2);
+        assert_eq!(
+            task_file::read_progress(&tasks_path, None).unwrap().total,
+            2
+        );
     }
 
     #[test]
     fn clear_acceptance_follow_up_ignores_examples_in_code_fences() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Notes\n```md\n## Acceptance #9 Failure Follow-up\n- [ ] example\n```\n\n## Current Acceptance Follow-up\n- [x] fixed\n",
@@ -1706,7 +1699,7 @@ mod tests {
     #[test]
     fn clear_acceptance_follow_up_ignores_tilde_fence_examples() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Notes\n~~~md\n## Acceptance #9 Failure Follow-up\n- [ ] example\n~~~\n",
@@ -1722,7 +1715,7 @@ mod tests {
     #[test]
     fn clear_acceptance_follow_up_does_not_close_fence_with_info_string() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         let original =
             "## Notes\n```text\n```md\n## Acceptance #9 Failure Follow-up\n- [ ] example\n```\n";
         std::fs::write(&tasks_path, original).unwrap();
@@ -1735,7 +1728,7 @@ mod tests {
     #[test]
     fn record_acceptance_follow_up_replaces_legacy_section_with_runtime_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Implementation Tasks\n- [x] done\n\n## Acceptance #1 Failure Follow-up\n- attempt: 1\n- [x] stale finding\n  evidence: cargo test passed\n",
@@ -1758,7 +1751,7 @@ mod tests {
     #[test]
     fn clear_acceptance_follow_up_recovers_non_runtime_section_content() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         let original = "## Current Acceptance Follow-up\n- [x] fixed\n```md\n## injected\n```\n";
         std::fs::write(&tasks_path, original).unwrap();
 
@@ -1774,7 +1767,7 @@ mod tests {
     #[test]
     fn clear_acceptance_follow_up_removes_runtime_sections_only() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(
             &tasks_path,
             "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- [x] fixed\n\n## Final Validation\nvalidation passed\n",
@@ -1792,7 +1785,7 @@ mod tests {
     #[test]
     fn test_record_acceptance_follow_up_uses_default_finding_for_empty_input() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
 
         replace_acceptance_follow_up_from_latest_fail(
@@ -1810,7 +1803,7 @@ mod tests {
     #[test]
     fn test_record_acceptance_follow_up_adds_missing_trailing_newline_before_section() {
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done").unwrap();
 
         replace_acceptance_follow_up_from_latest_fail(
@@ -1837,7 +1830,8 @@ mod tests {
         std::fs::write(&active_tasks, "- [ ] active task").unwrap();
 
         let resolved = resolve_acceptance_follow_up_tasks_path(change_id, dir.path()).unwrap();
-        assert_eq!(resolved, active_tasks);
+        assert_eq!(resolved.path, active_tasks);
+        assert_eq!(resolved.format, TaskFileFormat::Markdown);
     }
 
     #[test]
@@ -1850,7 +1844,8 @@ mod tests {
         std::fs::write(&archive_tasks, "- [ ] archived task").unwrap();
 
         let resolved = resolve_acceptance_follow_up_tasks_path(change_id, dir.path()).unwrap();
-        assert_eq!(resolved, archive_tasks);
+        assert_eq!(resolved.path, archive_tasks);
+        assert_eq!(resolved.format, TaskFileFormat::Markdown);
     }
 
     #[test]
@@ -1884,6 +1879,143 @@ mod tests {
 
         let result = resolve_acceptance_follow_up_tasks_path(change_id, dir.path());
         assert!(result.is_err());
+    }
+
+    const JSON_TASKS: &str = concat!(
+        "{\n",
+        "  \"schema_version\": 1,\n",
+        "  \"vendor_extension\": {\"keep\": true},\n",
+        "  \"tasks\": [\n",
+        "    {\"id\": \"impl\", \"title\": \"Implement\", \"status\": \"completed\", \"section\": \"implementation\"},\n",
+        "    {\"id\": \"docs\", \"title\": \"Document\", \"status\": \"pending\", \"section\": \"specification\"}\n",
+        "  ]\n",
+        "}\n"
+    );
+
+    fn structured_json_finding(id: &str, summary: &str) -> crate::acceptance::AcceptanceFinding {
+        let payload = serde_json::json!({
+            "id": id,
+            "severity": "major",
+            "summary": summary,
+            "evidence": ["observed at src/run.rs:10"],
+            "required_changes": [{"file": "src/run.rs", "description": "repair the behavior"}],
+            "verification": [{"file": "tests/run.rs", "description": "cover the repair"}],
+        });
+        crate::acceptance::AcceptanceFinding::structured(
+            crate::acceptance::validate_repository_finding(&payload).expect("valid finding"),
+        )
+    }
+
+    #[test]
+    fn json_follow_up_round_trips_through_fail_apply_restart_and_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_file = json_task_file(dir.path());
+        write_tasks(&tasks_file, JSON_TASKS);
+
+        // 1. Acceptance FAIL records the runtime-owned findings.
+        let findings = vec![
+            structured_json_finding("F1", "Regression coverage is missing"),
+            crate::acceptance::AcceptanceFinding::legacy(
+                "external non-mockable prerequisite: vendor approval",
+            ),
+        ];
+        let recovery =
+            replace_acceptance_follow_up_from_latest_fail(&tasks_file, 2, &findings).unwrap();
+        assert_eq!(recovery, FollowUpRecovery::default());
+
+        // One completed ordinary task plus one unclaimed virtual finding gate.
+        assert_eq!(
+            task_file::read_progress(&tasks_file, None).unwrap(),
+            TaskProgress::with_counts(1, 3)
+        );
+
+        // 2. Apply hydration reads identity and actionable payload back.
+        let (attempt, hydrated) = read_acceptance_follow_up(&tasks_file).unwrap().unwrap();
+        assert_eq!(attempt, 2);
+        assert!(hydrated.iter().any(|finding| finding.id() == Some("F1")));
+
+        // 3. Apply claims a repair with evidence; identity survives the rewrite.
+        {
+            let content = std::fs::read_to_string(&tasks_file).unwrap();
+            let mut document = task_file::parse_json_document(&content).unwrap();
+            let mut follow_up = document.follow_up.clone().unwrap();
+            follow_up.findings[0].remediation_claimed = true;
+            follow_up.findings[0].evidence = vec!["cargo test --lib passes".to_string()];
+            document.set_follow_up(Some(follow_up));
+            std::fs::write(&tasks_file, document.to_content().unwrap()).unwrap();
+        }
+
+        // 4. A restart re-reads the file and reconciles without losing the claim.
+        merge_acceptance_follow_up_apply_progress(&tasks_file, attempt, &hydrated).unwrap();
+        let reloaded =
+            task_file::parse_json_document(&std::fs::read_to_string(&tasks_file).unwrap()).unwrap();
+        let stored = reloaded.follow_up.as_ref().unwrap();
+        assert_eq!(stored.attempt, 2);
+        assert!(stored.findings.iter().any(|finding| {
+            finding.remediation_claimed
+                && finding.evidence == ["cargo test --lib passes"]
+                && finding.finding.as_ref().map(|f| f.id.as_str()) == Some("F1")
+        }));
+        assert_eq!(stored.external_blockers.len(), 1);
+        assert_eq!(
+            read_acceptance_follow_up_evidence(&tasks_file).unwrap()[0],
+            "cargo test --lib passes"
+        );
+
+        // 5. PASS cleanup removes only the runtime-owned block.
+        clear_acceptance_follow_up(&tasks_file).unwrap();
+        let cleaned = std::fs::read_to_string(&tasks_file).unwrap();
+        assert!(!cleaned.contains("acceptance_follow_up"), "{cleaned}");
+        assert!(cleaned.contains("vendor_extension"), "{cleaned}");
+        assert_eq!(
+            task_file::read_progress(&tasks_file, None).unwrap(),
+            TaskProgress::with_counts(1, 2)
+        );
+        assert!(read_acceptance_follow_up(&tasks_file).unwrap().is_none());
+    }
+
+    #[test]
+    fn json_task_file_errors_fail_closed_instead_of_reporting_zero_of_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_file = json_task_file(dir.path());
+        write_tasks(&tasks_file, "{ not json ");
+
+        let error = task_file::read_progress(&tasks_file, None).unwrap_err();
+        assert!(error.to_string().contains("tasks.json:"), "{error}");
+        assert!(read_acceptance_follow_up(&tasks_file).is_err());
+        assert!(clear_acceptance_follow_up(&tasks_file).is_err());
+        assert!(
+            replace_acceptance_follow_up_from_latest_fail(&tasks_file, 1, &[]).is_err(),
+            "mutation must refuse an unreadable artifact"
+        );
+    }
+
+    #[test]
+    fn json_follow_up_resolution_selects_the_json_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let change_id = "json-change";
+        let change_dir = dir.path().join("openspec/changes").join(change_id);
+        write_tasks(change_dir.join("tasks.json"), JSON_TASKS);
+
+        let resolved = resolve_acceptance_follow_up_tasks_path(change_id, dir.path()).unwrap();
+        assert_eq!(resolved.format, TaskFileFormat::Json);
+        assert_eq!(resolved.path, change_dir.join("tasks.json"));
+    }
+
+    #[test]
+    fn parse_file_binds_the_format_from_the_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tasks(dir.path().join("tasks.json"), JSON_TASKS);
+        assert_eq!(
+            parse_file(&dir.path().join("tasks.json"), None).unwrap(),
+            TaskProgress::with_counts(1, 2)
+        );
+
+        let error = parse_file(&dir.path().join("tasks.yaml"), None).unwrap_err();
+        assert!(
+            error.to_string().contains("Unsupported task artifact"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2358,7 +2490,7 @@ mod tests {
         std::fs::create_dir_all(&archive_dir).unwrap();
 
         // Should return None when no match found
-        let result = find_archive_directory("nonexistent", Some(base_path));
+        let result = task_file::find_archive_entry("nonexistent", Some(base_path));
         assert!(result.is_none());
     }
 
@@ -2373,7 +2505,7 @@ mod tests {
         let exact_archive = base_path.join("openspec/changes/archive/exact-match");
         std::fs::create_dir_all(&exact_archive).unwrap();
 
-        let result = find_archive_directory("exact-match", Some(base_path));
+        let result = task_file::find_archive_entry("exact-match", Some(base_path));
         assert!(result.is_some());
         assert_eq!(result.unwrap(), exact_archive);
     }
@@ -2389,7 +2521,7 @@ mod tests {
         let date_archive = base_path.join("openspec/changes/archive/2024-01-15-my-feature");
         std::fs::create_dir_all(&date_archive).unwrap();
 
-        let result = find_archive_directory("my-feature", Some(base_path));
+        let result = task_file::find_archive_entry("my-feature", Some(base_path));
         assert!(result.is_some());
         assert_eq!(result.unwrap(), date_archive);
     }
@@ -2567,19 +2699,19 @@ mod tests {
         let worktree_path = base_path.join("worktree");
 
         write_tasks(
-            &worktree_path.join("openspec/changes/test-priority/tasks.md"),
+            worktree_path.join("openspec/changes/test-priority/tasks.md"),
             &checked_tasks(4),
         );
         write_tasks(
-            &worktree_path.join("openspec/changes/archive/test-priority/tasks.md"),
+            worktree_path.join("openspec/changes/archive/test-priority/tasks.md"),
             &checked_tasks(3),
         );
         write_tasks(
-            &base_path.join("openspec/changes/archive/test-priority/tasks.md"),
+            base_path.join("openspec/changes/archive/test-priority/tasks.md"),
             &checked_tasks(2),
         );
         write_tasks(
-            &base_path.join("openspec/changes/test-priority/tasks.md"),
+            base_path.join("openspec/changes/test-priority/tasks.md"),
             &checked_tasks(1),
         );
 
@@ -2600,25 +2732,25 @@ mod tests {
 
             if worktree_active {
                 write_tasks(
-                    &case_worktree.join("openspec/changes/test-priority/tasks.md"),
+                    case_worktree.join("openspec/changes/test-priority/tasks.md"),
                     &checked_tasks(4),
                 );
             }
             if worktree_archive {
                 write_tasks(
-                    &case_worktree.join("openspec/changes/archive/test-priority/tasks.md"),
+                    case_worktree.join("openspec/changes/archive/test-priority/tasks.md"),
                     &checked_tasks(3),
                 );
             }
             if base_archive {
                 write_tasks(
-                    &case_base.join("openspec/changes/archive/test-priority/tasks.md"),
+                    case_base.join("openspec/changes/archive/test-priority/tasks.md"),
                     &checked_tasks(2),
                 );
             }
             if base_active {
                 write_tasks(
-                    &case_base.join("openspec/changes/test-priority/tasks.md"),
+                    case_base.join("openspec/changes/test-priority/tasks.md"),
                     &checked_tasks(1),
                 );
             }
@@ -2647,11 +2779,11 @@ mod tests {
 
         let worktree_path = base_path.join("worktree");
         write_tasks(
-            &worktree_path.join("openspec/changes/compat-change/tasks.md"),
+            worktree_path.join("openspec/changes/compat-change/tasks.md"),
             "- [x] Worktree\n- [ ] Worktree pending\n",
         );
         write_tasks(
-            &base_path.join("openspec/changes/compat-change/tasks.md"),
+            base_path.join("openspec/changes/compat-change/tasks.md"),
             "- [ ] Base\n",
         );
 
@@ -2688,11 +2820,11 @@ mod tests {
         env::set_current_dir(base_path).unwrap();
 
         write_tasks(
-            &base_path.join("openspec/changes/archive/archived-compat/tasks.md"),
+            base_path.join("openspec/changes/archive/archived-compat/tasks.md"),
             "- [x] Exact archive\n",
         );
         write_tasks(
-            &base_path.join("openspec/changes/archive/2026-05-13-archived-compat/tasks.md"),
+            base_path.join("openspec/changes/archive/2026-05-13-archived-compat/tasks.md"),
             "- [ ] Date archive\n",
         );
 
@@ -2725,15 +2857,15 @@ mod tests {
 
         let worktree_path = base_path.join("worktree");
         write_tasks(
-            &worktree_path.join("openspec/changes/archive/compat-archived/tasks.md"),
+            worktree_path.join("openspec/changes/archive/compat-archived/tasks.md"),
             &checked_tasks(3),
         );
         write_tasks(
-            &worktree_path.join("openspec/changes/compat-archived/tasks.md"),
+            worktree_path.join("openspec/changes/compat-archived/tasks.md"),
             &checked_tasks(2),
         );
         write_tasks(
-            &base_path.join("openspec/changes/archive/compat-archived/tasks.md"),
+            base_path.join("openspec/changes/archive/compat-archived/tasks.md"),
             &checked_tasks(1),
         );
 
@@ -2748,11 +2880,11 @@ mod tests {
         env::set_current_dir(prearchive_base).unwrap();
         let prearchive_worktree = prearchive_base.join("worktree");
         write_tasks(
-            &prearchive_worktree.join("openspec/changes/compat-archived/tasks.md"),
+            prearchive_worktree.join("openspec/changes/compat-archived/tasks.md"),
             &checked_tasks(2),
         );
         write_tasks(
-            &prearchive_base.join("openspec/changes/archive/compat-archived/tasks.md"),
+            prearchive_base.join("openspec/changes/archive/compat-archived/tasks.md"),
             &checked_tasks(1),
         );
 
@@ -2768,7 +2900,7 @@ mod tests {
         let base_only = base_only_dir.path();
         env::set_current_dir(base_only).unwrap();
         write_tasks(
-            &base_only.join("openspec/changes/archive/compat-archived/tasks.md"),
+            base_only.join("openspec/changes/archive/compat-archived/tasks.md"),
             &checked_tasks(1),
         );
 
@@ -2836,7 +2968,7 @@ mod tests {
     #[test]
     fn follow_up_persists_structured_payload_for_interruption_recovery() {
         let temp = tempfile::tempdir().unwrap();
-        let tasks_path = temp.path().join("tasks.md");
+        let tasks_path = markdown_task_file(temp.path());
         write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
 
         replace_acceptance_follow_up_from_latest_fail(
@@ -2869,7 +3001,7 @@ mod tests {
     #[test]
     fn apply_checkbox_is_a_remediation_claim_and_cannot_close_a_finding() {
         let temp = tempfile::tempdir().unwrap();
-        let tasks_path = temp.path().join("tasks.md");
+        let tasks_path = markdown_task_file(temp.path());
         write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
         let finding = structured_finding("acceptance-secret-value-scan");
 
@@ -2911,7 +3043,7 @@ mod tests {
     #[test]
     fn apply_hydration_preserves_the_claim_but_not_the_authority_to_rewrite_a_finding() {
         let temp = tempfile::tempdir().unwrap();
-        let tasks_path = temp.path().join("tasks.md");
+        let tasks_path = markdown_task_file(temp.path());
         write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
         let finding = structured_finding("acceptance-secret-value-scan");
         replace_acceptance_follow_up_from_latest_fail(
@@ -2952,7 +3084,7 @@ mod tests {
     #[test]
     fn absent_finding_id_is_removed_only_by_a_new_canonical_result() {
         let temp = tempfile::tempdir().unwrap();
-        let tasks_path = temp.path().join("tasks.md");
+        let tasks_path = markdown_task_file(temp.path());
         write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
         replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
@@ -2978,7 +3110,7 @@ mod tests {
     #[test]
     fn invalid_finding_metadata_is_ignored_rather_than_trusted() {
         let temp = tempfile::tempdir().unwrap();
-        let tasks_path = temp.path().join("tasks.md");
+        let tasks_path = markdown_task_file(temp.path());
         write_tasks(
             &tasks_path,
             "## Implementation Tasks\n- [x] Task 1\n\n\
@@ -3000,7 +3132,7 @@ mod tests {
     #[test]
     fn legacy_string_findings_keep_their_existing_follow_up_shape() {
         let temp = tempfile::tempdir().unwrap();
-        let tasks_path = temp.path().join("tasks.md");
+        let tasks_path = markdown_task_file(temp.path());
         write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
         replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
@@ -3023,7 +3155,7 @@ mod tests {
     #[test]
     fn remediation_evidence_is_readable_for_stop_diagnostics() {
         let temp = tempfile::tempdir().unwrap();
-        let tasks_path = temp.path().join("tasks.md");
+        let tasks_path = markdown_task_file(temp.path());
         write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
         replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
@@ -3052,6 +3184,7 @@ mod tests {
 /// deduplication, and hard-error behavior are verified in isolation.
 #[cfg(test)]
 mod recovery_tests {
+    use super::tests::markdown_task_file;
     use super::*;
 
     const DRIFTED_FOLLOW_UP: &str = concat!(
@@ -3286,7 +3419,7 @@ mod recovery_tests {
         // cannot be created in a read-only directory, so no partial write or
         // truncation can reach `tasks.md`.
         let dir = tempfile::tempdir().unwrap();
-        let tasks_path = dir.path().join("tasks.md");
+        let tasks_path = markdown_task_file(dir.path());
         std::fs::write(&tasks_path, DRIFTED_FOLLOW_UP).unwrap();
 
         let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();

@@ -58,6 +58,7 @@ mod shell_command;
 mod spec_delta;
 mod stall;
 mod stream_json_textifier;
+mod task_file;
 mod task_parser;
 mod templates;
 pub mod upstream;
