@@ -14,6 +14,24 @@ Create structured change proposals for Conflux (OpenSpec-based) projects through
 - You may WRITE only under `openspec/changes/<change-id>/`.
 - After strict validation passes, stop and present the proposal for review.
 
+## From Problem to Change Contract
+
+A reported problem is investigation input, not a proposal. Write proposal artifacts only after read-only repository evidence has answered what the current behavior is and why it happens, and only when that answer requires a permanent change.
+
+1. **Establish current behavior and root cause first.** Read code, tests, specs, logs, and history within the proposal-only scope above: investigation is read-only, and it never authorizes editing product or test files. While the evidence still leaves the failing path, the root cause, the approach, or the acceptance criteria uncertain, keep investigating instead of formalizing the hypothesis as a proposal.
+2. **Decide whether a permanent change is required at all.** When the investigation shows the behavior is already correct, that a transient environment fault caused it, or that a local repair resolves it without leaving any lasting contract, create no proposal and report the finding instead.
+3. **Separate temporary work from the permanent change.** Diagnostic instrumentation, throwaway reproduction scripts, one-off data repairs, and local environment fixes are investigation artifacts. They belong in the report, never in the proposal's scope, tasks, or spec deltas. The proposal describes only the permanent transition the repository must make.
+4. **Choose the implementation approach before writing tasks, and record scope-relevant rejected alternatives.** When a rejected alternative would have changed the proposal's scope or its preserved contracts, state that alternative and its consequence. Incidental exploration detail does not belong in the proposal.
+5. **Write the change as a contract.** The proposal is implementation-ready only once it states:
+   - the observable final state — what is true after the change that is not true now;
+   - the change boundary — which files, modules, or surfaces this change may touch, and which it must leave alone;
+   - the preserved contracts — existing behavior, APIs, formats, and invariants that must keep working unchanged;
+   - the failure behavior — what the changed code does when its inputs, dependencies, or preconditions are wrong;
+   - the repository-local acceptance — the bounded command or check that proves the final state from repository evidence.
+6. **Leave no design decision to the implementation agent.** Conflux decides execution order autonomously, so every task must be executable from the proposal alone, without inferring missing required work from unstated intent. A task that would make the implementer pick an approach, name an interface, or settle a policy is unfinished: resolve that decision here and write the resolution into the task.
+
+**`investigate and fix` is not a task.** A task that bundles unfinished investigation with an unspecified repair has no boundary and no completion condition, so it is rejected outright. Investigation happens before the proposal exists, and only the resulting permanent transition becomes a task. The same rejection applies to `debug and correct`, `look into X and resolve it`, and any other task whose scope is decided only after it starts.
+
 ## Guardrails (Match Command Behavior)
 
 - If `openspec/CONSTITUTION.md` exists, read it before drafting the proposal and treat it as higher-priority project law than proposal/spec deltas.
@@ -32,7 +50,6 @@ Create structured change proposals for Conflux (OpenSpec-based) projects through
 - For behavior-changing proposals, require verification coverage planning per requirement/task so verification ownership is explicit at proposal time.
 - Write tasks around required behavior, not artifact existence. Avoid task sets that can look complete when only contracts, docs, or placeholder wiring exist.
 - Separate responsibility-definition/documentation tasks from runtime wiring/integration tasks so the proposal cannot be marked done without code paths, state changes, side effects, or externally visible behavior being connected.
-- Because Conflux decides execution order autonomously, proposal-side task decomposition must be complete enough that an implementation agent does not need to infer missing required work from unstated intent.
 - Treat every user-visible requirement, dependency, migration, verification activity, and non-goal as something that must be explicitly represented in the proposal artifacts, not left implicit.
 - Every implementation-facing task must have an explicit completion condition so a later agent can determine done/not-done from repository evidence instead of judgment calls.
 - For each major behavior-changing requirement, include at least one verification path that would fail if the implementation were stubbed, no-op, or returning dummy data.
