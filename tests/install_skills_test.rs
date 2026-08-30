@@ -476,6 +476,76 @@ fn installed_proposal_skill_keeps_heavy_gates_off_apply_checkboxes() {
     }
 }
 
+/// The bundled proposal skill must keep teaching problem-to-contract authoring.
+///
+/// Without it an agent formalizes an early hypothesis as a proposal, defers the
+/// design decisions to Apply, and produces a chain of corrective proposals. The
+/// guidance is the only thing that stops that, so both its position — read
+/// before any proposal-format detail — and its decisive behavioral markers are
+/// pinned here.
+#[test]
+fn installed_proposal_skill_teaches_problem_to_change_contract() {
+    let workdir = TempDir::new().unwrap();
+    let skills_base = install_embedded_skills(&workdir);
+    let skill = fs::read_to_string(skills_base.join("cflx-proposal/SKILL.md")).unwrap();
+
+    // The policy sits directly between the scope restrictions and the
+    // guardrails, with no other top-level section in between: an agent reading
+    // from the top meets it before any proposal-format guidance.
+    let sections: Vec<&str> = skill
+        .lines()
+        .filter(|line| line.starts_with("## "))
+        .collect();
+    let scope_index = sections
+        .iter()
+        .position(|line| *line == "## Scope Restrictions (Proposal-Only)")
+        .expect("cflx-proposal must keep the proposal-only scope section");
+    assert_eq!(
+        sections.get(scope_index + 1).copied(),
+        Some("## From Problem to Change Contract"),
+        "the problem-to-contract policy must follow `## Scope Restrictions (Proposal-Only)` directly"
+    );
+    assert_eq!(
+        sections.get(scope_index + 2).copied(),
+        Some("## Guardrails (Match Command Behavior)"),
+        "the problem-to-contract policy must precede `## Guardrails (Match Command Behavior)`"
+    );
+
+    for required in [
+        // A problem report is investigation input, not a ready proposal.
+        "A reported problem is investigation input, not a proposal.",
+        "keep investigating instead of formalizing the hypothesis as a proposal",
+        // Investigation stays inside the skill's read-only scope.
+        "investigation is read-only, and it never authorizes editing product or test files",
+        // No permanent change required means no proposal at all.
+        "create no proposal and report the finding instead",
+        // Temporary investigation work never becomes proposal scope.
+        "Separate temporary work from the permanent change.",
+        "are investigation artifacts",
+        "only the permanent transition the repository must make",
+        // Scope-relevant rejected alternatives are recorded; noise is not.
+        "record scope-relevant rejected alternatives",
+        "Incidental exploration detail does not belong in the proposal.",
+        // The contract the proposal must state before it is implementation-ready.
+        "the observable final state",
+        "the change boundary",
+        "the preserved contracts",
+        "the failure behavior",
+        "the repository-local acceptance",
+        // Nothing is left for the implementation agent to design.
+        "Leave no design decision to the implementation agent.",
+        "without inferring missing required work from unstated intent",
+        // The task shape that hides both the investigation and the repair.
+        "**`investigate and fix` is not a task.**",
+        "has no boundary and no completion condition",
+    ] {
+        assert!(
+            skill.contains(required),
+            "cflx-proposal must retain the problem-to-contract rule: {required}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Regression test: embedded skills win even when a local skills/ directory exists
 // ---------------------------------------------------------------------------
