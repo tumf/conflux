@@ -10,8 +10,9 @@ The bundled `cflx-proposal` skill SHALL treat a reported problem as investigatio
 
 - **GIVEN** the current behavior, root cause, approach, or acceptance criteria remain uncertain
 - **WHEN** an agent follows the bundled proposal guidance
-- **THEN** it investigates directly before drafting the proposal
+- **THEN** it gathers read-only repository evidence within the skill's existing proposal-only scope before drafting the proposal
 - **AND** it does not create an `investigate and fix` implementation task
+- **AND** it creates no proposal when the investigation establishes that no permanent change is required
 
 #### Scenario: Verified findings become a permanent transition
 
@@ -27,3 +28,9 @@ The bundled `cflx-proposal` skill SHALL treat a reported problem as investigatio
 - **WHEN** a rejected alternative changes the proposal scope or preserved contracts
 - **THEN** the proposal records that rejected alternative and its consequence
 - **AND** incidental exploration detail need not become proposal content
+
+#### Scenario: Policy is encountered before proposal formatting
+
+- **WHEN** an agent reads the bundled `cflx-proposal` skill from the beginning
+- **THEN** the problem-to-proposal policy appears directly after `## Scope Restrictions (Proposal-Only)`
+- **AND** it appears before `## Guardrails (Match Command Behavior)` and detailed proposal-format guidance
