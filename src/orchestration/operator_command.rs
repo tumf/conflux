@@ -1284,6 +1284,22 @@ pub type OperatorResult<T> = std::result::Result<T, OperatorCommandError>;
 pub struct ExecutionMarkStore {
     marks: Mutex<HashSet<String>>,
     settlement: Arc<MarkSettlementCoordinator>,
+    /// Targets a settled standalone operator mark interaction moved, and which
+    /// no frontend has acknowledged yet.
+    ///
+    /// This is *interaction* evidence, not mark state: the mark set above says
+    /// which changes are marked, and says nothing about whether an operator just
+    /// acted on one. A frontend that renders per-change attention — the TUI
+    /// `NEW` badge — needs the second fact, and it must be the same fact no
+    /// matter which frontend the interaction arrived through, so it is recorded
+    /// once here rather than derived from any one adapter's own key handling.
+    ///
+    /// A set, not a log: acknowledgement is idempotent, so the only thing worth
+    /// retaining is *which* targets are still unacknowledged. That also bounds
+    /// the field by the number of distinct changes rather than by how often an
+    /// operator toggles them, which matters for a headless owner that has no
+    /// frontend to drain it.
+    operator_interactions: Mutex<HashSet<String>>,
 }
 
 impl ExecutionMarkStore {
@@ -1297,13 +1313,18 @@ impl ExecutionMarkStore {
         self.settlement.clone()
     }
 
-    /// Record `changed` in the settlement batch and arm mark settlement.
+    /// Record `changed` as a settled operator interaction and arm mark settlement.
     ///
     /// Called only after an *accepted standalone operator* write actually
     /// changed the store, with exactly the targets that write flipped. A system
     /// revocation, a refused or unchanged command, and the mark writes Start
     /// admission performs deliberately do not reach here, so none of them can
     /// restart the stability deadline or create a delayed queue effect.
+    ///
+    /// That admission rule is also exactly the definition of "an operator just
+    /// interacted with this change", so the interaction record is taken here
+    /// rather than at each call site. Two conditions that must agree and are
+    /// written in two places are two conditions that eventually disagree.
     ///
     /// The batch is the whole scope of the eventual reconciliation, which is why
     /// the changed targets are passed rather than the current mark set: a mark
@@ -1312,7 +1333,30 @@ impl ExecutionMarkStore {
     ///
     /// Returns true when a deadline is now pending.
     pub fn arm_settlement(&self, changed: Vec<String>) -> bool {
+        self.interactions().extend(changed.iter().cloned());
         self.settlement.clone().notify(changed)
+    }
+
+    /// Take the settled operator mark interactions not acknowledged yet.
+    ///
+    /// Draining is the acknowledgement: attention is per-interaction, so a
+    /// target that has been handed to a frontend once must not be handed over
+    /// again the next time that frontend projects the store. Sorted so a caller
+    /// that logs or asserts on the batch sees a stable order.
+    pub fn take_operator_interactions(&self) -> Vec<String> {
+        let mut guard = self.interactions();
+        if guard.is_empty() {
+            return Vec::new();
+        }
+        let mut targets: Vec<String> = guard.drain().collect();
+        targets.sort();
+        targets
+    }
+
+    fn interactions(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.operator_interactions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// True when the change currently carries an execution mark.

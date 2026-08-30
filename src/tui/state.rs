@@ -808,6 +808,48 @@ impl AppState {
         for change in &mut self.changes {
             change.selected = self.execution_marks.is_marked(&change.id);
         }
+        self.acknowledge_operator_mark_interactions();
+    }
+
+    /// Retire the `NEW` badge of every row a settled operator mark interaction
+    /// touched, whatever frontend that interaction arrived through.
+    ///
+    /// `NEW` is attention state: it says "you have not looked at this yet". An
+    /// operator who marked or unmarked a change has looked at it, and that is
+    /// true whether they pressed Space here or drove `/api/v2`, `cflx client`,
+    /// or MCP — the same shared store settled the interaction either way. Only
+    /// reading the mark *value* is what let a change render as remotely handled
+    /// and still new at the same time.
+    ///
+    /// The store hands over interactions, never mark state, so none of the other
+    /// writers to the same field can reach this: passive synchronization drains
+    /// an empty batch, an unchanged request never records one, and neither
+    /// event-driven revocation nor Start admission arms settlement at all.
+    ///
+    /// A target with no row is dropped rather than held: the acknowledgement is
+    /// about attention that exists now, and a change this frontend is not
+    /// displaying has none to retire.
+    fn acknowledge_operator_mark_interactions(&mut self) {
+        let interacted = self.execution_marks.take_operator_interactions();
+        if interacted.is_empty() {
+            return;
+        }
+
+        let mut acknowledged = false;
+        for change in &mut self.changes {
+            if change.is_new && interacted.iter().any(|id| id == &change.id) {
+                change.is_new = false;
+                acknowledged = true;
+            }
+        }
+
+        // Recounted from the rows that survived rather than decremented per
+        // acknowledgement, for the same reason refresh recounts: the footer must
+        // describe the projection it is rendered beside, and an unrelated NEW row
+        // keeps its badge and its place in that count.
+        if acknowledged {
+            self.new_change_count = self.changes.iter().filter(|c| c.is_new).count();
+        }
     }
 
     /// Record a target-scoped mark write for the run loop to apply.

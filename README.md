@@ -158,6 +158,21 @@ unbounded — each owner request keeps the transport's per-request valve, and ev
 Git child an unbounded wait spawns is terminated and reaped at a finite
 per-invocation deadline of its own rather than reported as `timeout`.
 
+**A `timeout` says what it was waiting on.** The expiry detail carries the
+configured `timeout_ms`, the measured `wait_elapsed_ms`, the usual
+`commands_submitted: 0`, and a stable `timeout_stage` — `initial_observation`,
+`observing_owner`, `repository_certification`, or `remote_verification` — so an
+agent can tell an owner that never answered from live work, a local repository
+read, and a stalled remote lookup. `detail.last_observation` is the last coherent
+observation the wait completed *before* the deadline, projected onto the
+requested proposal alone: its `observed_at`, `state_revision`, and
+`event_sequence`, the change's own published row, and the matching execution
+facts. Nothing is read after expiry to fill it in, so a wait that never completed
+an observation reports `last_observation: null` and names no `instance_id`
+instead of inventing one. Timing out is still observation-only: no command is
+submitted, no repository state changes, and the proposal's lifecycle status is
+untouched — `timeout` describes the clock, never the change.
+
 **Read `outcome`, not prose.** `--json` prints exactly one versioned envelope on
 stdout; diagnostics go to stderr, and each outcome has its own stable exit
 status. The successes are narrow: `observed`, `marked`, `unmarked`, `unchanged`,

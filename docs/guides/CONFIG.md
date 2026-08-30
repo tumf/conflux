@@ -119,7 +119,8 @@ Command templates support these placeholders:
 | `completion_check_max_retries` | integer | No | implementation default | Completion check retries |
 | `max_iterations` | integer | No | `50` | `0` disables the limit |
 | `max_concurrent_workspaces` | integer | No | `3` | Concurrent managed-workspace limit |
-| `workspace_base_dir` | string | No | OS-specific data dir | Empty string behaves as unset |
+| `workspace_base_dir` | string | No | OS-specific data dir | Managed-worktree root. Empty string behaves as unset. See [Storage Roots](#storage-roots) |
+| `state_base_dir` | string | No | `XDG_STATE_HOME`, else `~/.local/state` | Conflux-owned persistent state root (logs). Absolute path required; empty string behaves as unset. See [Storage Roots](#storage-roots) |
 | `use_llm_analysis` | boolean | No | `true` | `false` skips dependency inference |
 | `vcs_backend` | `auto` or `git` | No | `auto` | Worktree execution backend |
 | `propose_command` | string | No | unset | Enables proposal creation command |
@@ -138,6 +139,83 @@ Command templates support these placeholders:
 | `stream_json_textify` | boolean | No | `true` | Converts Claude Code NDJSON to readable text |
 | `command_strict_process_cleanup` | boolean | No | `true` | Sweeps the full process group after completion and verifies that no members remain |
 | `lifecycle_integration` | object | No | unset | External lifecycle adapter (observability only) |
+
+## Storage Roots
+
+Conflux keeps two large-on-disk things outside the repository, and each one has
+its own key. They are independent: setting one never moves the other.
+
+| Key | What lives there | Layout |
+|---|---|---|
+| `workspace_base_dir` | Managed Git worktrees | `<workspace_base_dir>/<change-id>/` |
+| `state_base_dir` | Conflux-owned persistent state (logs) | `<state_base_dir>/cflx/logs/<project_slug>/<YYYY-MM-DD>.log` |
+
+Putting both on an external volume:
+
+```jsonc
+{
+  "workspace_base_dir": "/Volumes/BigDisk/cflx/worktrees",
+  "state_base_dir": "/Volumes/BigDisk/cflx/state"
+}
+```
+
+That writes logs to
+`/Volumes/BigDisk/cflx/state/cflx/logs/<project_slug>/<YYYY-MM-DD>.log`.
+
+### Precedence
+
+For the Conflux state root: `state_base_dir`, then `XDG_STATE_HOME`, then the
+platform default `~/.local/state`. An absent or empty `state_base_dir` preserves
+the existing XDG and platform-default behavior exactly.
+
+`state_base_dir` scopes **Conflux-owned paths only**. It is not a replacement for
+`XDG_STATE_HOME`, and Conflux never sets, changes, or injects `XDG_STATE_HOME`
+for the commands it starts: Apply, Acceptance, Archive, Resolve, and lifecycle
+child processes keep the environment they inherited, so their own unrelated XDG
+state does not move with Conflux logs. That is the whole reason this key exists
+rather than "just export `XDG_STATE_HOME`".
+
+Logging, retention cleanup, and `cflx logs` all resolve the same root, so a
+reader can never point at a directory the writers abandoned. That holds only when
+the reader is given the same configuration sources as the writer, so a
+`state_base_dir` that lives in a custom file needs the same `--config` on both
+sides:
+
+```bash
+cflx --config /path/to/custom.jsonc run --all
+cflx --config /path/to/custom.jsonc logs --last 200
+```
+
+`--config` is a top-level option, so it goes before `logs`. Without it the viewer
+merges only the global and project configuration files, exactly as the writers
+would have.
+
+### Fail-closed startup
+
+A configured `state_base_dir` must be an **absolute** path. Relative paths, shell
+expansion (`~`, `$VAR`), and unavailable volumes are not supported.
+
+At startup — before the local API listener, the lifecycle adapter, and every AI
+child process — Conflux creates `<state_base_dir>/cflx/` when it is missing and
+probes it for write access. A root that is relative, unavailable, uncreatable, or
+unwritable exits non-zero with a path diagnostic on stderr. Conflux never falls
+back to the internal disk in that case, because a silent fallback is how logs end
+up somewhere nobody looks.
+
+Configuration is loaded and validated *before* logging is initialized, so
+configuration and path diagnostics are stderr output rather than lines in a log
+file Conflux may not be allowed to open.
+
+### Migration is yours
+
+Changing either root moves only *new* files. Conflux does not migrate existing
+worktrees or logs, and it does not delete or clean up the old root — including
+its retention sweep, which only ever touches the currently resolved root. Move or
+remove old files yourself.
+
+`cflx logs` lists projects from the currently resolved root only, so logs written
+before the change stay where they were and stop appearing in the listing until
+you move them.
 
 ## `hooks`
 

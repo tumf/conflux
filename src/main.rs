@@ -180,10 +180,17 @@ async fn resolve_tui_upstream_runtime(
 async fn launch_tui(args: TuiArgs) -> Result<()> {
     let post_archive_action = tui_post_archive_action(&args);
 
-    init_logging(false)?;
+    // Configuration decides where persistent logs live, so it is loaded and its
+    // storage root proven usable before logging initialization. A configuration
+    // or path failure is therefore a stderr diagnostic rather than a line in a
+    // log file this process may not be allowed to open — and it happens before
+    // any listener, lifecycle adapter, or AI child process exists.
+    let config = OrchestratorConfig::load(args.config.as_deref())?;
+    ensure_state_root_ready(&config);
+
+    init_logging(false, config.get_state_base_dir())?;
     log_startup("tui");
 
-    let config = OrchestratorConfig::load(args.config.as_deref())?;
     tui::log_deduplicator::configure_logging(config.get_logging());
 
     // Listing changes is a local read of the workspace; it starts nothing and
@@ -461,14 +468,29 @@ async fn start_local_api(
     }
 }
 
+/// Prove a configured Conflux state root is usable before anything writes to it.
+///
+/// Runs before logging initialization, listeners, lifecycle adapters, and AI
+/// child processes, so a relative, unavailable, uncreatable, or unwritable root
+/// stops startup with an actionable diagnostic instead of silently falling back
+/// to the internal disk.
+fn ensure_state_root_ready(config: &OrchestratorConfig) {
+    if let Err(err) = config::defaults::ensure_state_root_usable(config.get_state_base_dir()) {
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    }
+}
+
 /// Initialize logging.
 ///
 /// - Always enables file logging with automatic log rotation and cleanup.
 /// - Optionally enables stdout logging (for non-TUI modes).
 ///
-/// Logs are written to XDG_STATE_HOME/cflx/logs/<project_slug>/<YYYY-MM-DD>.log.
-/// Old logs are automatically cleaned up (7-day retention).
-fn init_logging(enable_stdout: bool) -> Result<()> {
+/// Logs are written to `<state root>/logs/<project_slug>/<YYYY-MM-DD>.log`, where
+/// the state root is `state_base_dir` when configured, else `XDG_STATE_HOME`,
+/// else the platform default. Old logs are automatically cleaned up (7-day
+/// retention) from that same resolved root.
+fn init_logging(enable_stdout: bool, state_base_dir: Option<&str>) -> Result<()> {
     use config::defaults::{cleanup_old_logs, get_log_file_path};
     use std::fs::{create_dir_all, File};
     use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -477,7 +499,8 @@ fn init_logging(enable_stdout: bool) -> Result<()> {
     let repo_root = std::env::current_dir().ok();
 
     // Get log file path
-    let log_path = get_log_file_path(repo_root.as_deref());
+    let log_path = get_log_file_path(state_base_dir, repo_root.as_deref())
+        .map_err(|e| error::OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
 
     // Create parent directory if it doesn't exist
     if let Some(parent) = log_path.parent() {
@@ -491,7 +514,7 @@ fn init_logging(enable_stdout: bool) -> Result<()> {
     }
 
     // Clean up old logs (7-day retention)
-    if let Err(e) = cleanup_old_logs(repo_root.as_deref(), 7) {
+    if let Err(e) = cleanup_old_logs(state_base_dir, repo_root.as_deref(), 7) {
         tracing::warn!("Failed to clean up old logs: {}", e);
     }
 
@@ -825,7 +848,22 @@ fn run_openapi_subcommand() {
     }
 }
 
-fn run_logs_subcommand(args: LogsArgs) {
+fn run_logs_subcommand(args: LogsArgs, custom_config_path: Option<&Path>) {
+    // Viewing logs starts nothing, so configuration is read only for the storage
+    // root and required commands are deliberately not validated here. Resolving
+    // the same root the writers use is what keeps `cflx logs` pointed at the
+    // directory this installation actually writes to — which means the viewer has
+    // to merge the *same* sources the writers merged, custom `--config` file
+    // included. Dropping it here would silently point the reader at a root the
+    // writers abandoned.
+    let state_base_dir = match OrchestratorConfig::load_storage_settings(custom_config_path) {
+        Ok(config) => config.get_state_base_dir().map(str::to_string),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let options = log_viewer::LogViewerOptions {
         print_path: args.path,
         last: args.last,
@@ -833,6 +871,7 @@ fn run_logs_subcommand(args: LogsArgs) {
         today: args.today,
         project: args.project,
         repo_root: std::env::current_dir().ok(),
+        state_base_dir,
     };
 
     if let Err(e) = log_viewer::run_logs_command(&options, &mut std::io::stdout()) {
@@ -917,8 +956,15 @@ async fn main() -> Result<()> {
 
         // Run subcommand: non-interactive orchestration
         Some(Commands::Run(args)) => {
+            // Configuration selects the persistent state root, so it is loaded
+            // and validated before logging initialization — and therefore before
+            // the local API listener, the lifecycle adapter, and every AI child
+            // process. A configuration-load failure stays a stderr diagnostic.
+            let config = OrchestratorConfig::load(args.config.as_deref())?;
+            ensure_state_root_ready(&config);
+
             // Initialize logging: include stdout for run mode
-            init_logging(true)?;
+            init_logging(true, config.get_state_base_dir())?;
             log_startup("run");
 
             // The local API binds before the lifecycle adapter, any AI
@@ -982,8 +1028,6 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             };
-
-            let config = OrchestratorConfig::load(args.config.as_deref())?;
 
             // Worktree orchestration is the only execution model, so an
             // unusable Git workspace stops the run here — after the listeners
@@ -1260,7 +1304,7 @@ async fn main() -> Result<()> {
         // Logs subcommand: read-only persistent log viewer. Intentionally runs before
         // init_logging() so viewing logs never creates, appends, or cleans log files.
         Some(Commands::Logs(args)) => {
-            run_logs_subcommand(args);
+            run_logs_subcommand(args, cli.config.as_deref());
         }
 
         // Init subcommand: generate configuration file

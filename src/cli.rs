@@ -1205,6 +1205,20 @@ pub enum ClientCommands {
     /// operation deadline whose expiry is the typed `timeout` outcome. Either
     /// way each owner request and each Git subprocess keeps its own bound, so an
     /// unbounded wait never becomes an unbounded child process.
+    ///
+    /// A `timeout` reports what it was waiting on rather than only that it gave
+    /// up: `detail` carries `timeout_ms`, the measured `wait_elapsed_ms`,
+    /// `commands_submitted: 0`, and a stable `timeout_stage` —
+    /// `initial_observation`, `observing_owner`, `repository_certification`, or
+    /// `remote_verification`. `detail.last_observation` is the latest coherent
+    /// observation completed before the deadline, projected onto this proposal
+    /// alone: the observation's `observed_at`, `state_revision`, and
+    /// `event_sequence`, the change's own row, and its matching execution facts.
+    /// Nothing is read after expiry, so a wait whose first observation never
+    /// completed reports `last_observation: null` and names no `instance_id`.
+    /// Timing out is observation-only like every other release: no command is
+    /// submitted, no repository state changes, and the proposal's lifecycle
+    /// status is untouched.
     Wait(ClientWaitArgs),
 
     /// Manage explicit completion subscriptions for named proposals

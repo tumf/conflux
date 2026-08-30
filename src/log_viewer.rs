@@ -31,6 +31,10 @@ pub struct LogViewerOptions {
     pub today: bool,
     pub project: Option<String>,
     pub repo_root: Option<PathBuf>,
+    /// Configured Conflux state base directory, if any. The viewer resolves the
+    /// same root logging and retention cleanup write to, so it lists projects
+    /// only from the currently resolved root.
+    pub state_base_dir: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -44,6 +48,12 @@ pub enum LogViewerError {
         #[source]
         source: io::Error,
     },
+
+    /// The configured state root cannot be resolved, so there is no root to read
+    /// from. Reporting it is strictly better than silently reading the default
+    /// one, which is not where this installation writes.
+    #[error("{0}")]
+    StateRoot(#[from] defaults::StateRootError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +131,7 @@ pub fn run_logs_command<W: Write>(
 }
 
 pub fn resolve_log_selection(options: &LogViewerOptions) -> LogViewerResult<LogSelection> {
-    let log_root = log_root_path();
+    let log_root = log_root_path(options.state_base_dir.as_deref())?;
     let available_projects = list_available_projects_in(&log_root)?;
     let project_slug = match &options.project {
         Some(project) => project.clone(),
@@ -171,18 +181,13 @@ pub fn resolve_log_selection(options: &LogViewerOptions) -> LogViewerResult<LogS
     })
 }
 
-pub fn log_root_path() -> PathBuf {
-    if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
-        if !xdg_state_home.is_empty() {
-            return PathBuf::from(xdg_state_home).join("cflx").join("logs");
-        }
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".local").join("state").join("cflx").join("logs");
-    }
-
-    std::env::temp_dir().join("cflx-logs-fallback")
+/// The log root this viewer reads.
+///
+/// It is the shared resolver logging and retention cleanup use, so a configured
+/// `state_base_dir` moves reader and writers together and `cflx logs` can only
+/// ever list projects from the currently resolved root.
+pub fn log_root_path(state_base_dir: Option<&str>) -> LogViewerResult<PathBuf> {
+    Ok(defaults::log_root_path(state_base_dir)?)
 }
 
 pub fn list_available_projects_in(log_root: &Path) -> LogViewerResult<Vec<String>> {

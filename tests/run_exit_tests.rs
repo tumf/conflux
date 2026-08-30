@@ -397,12 +397,30 @@ fn cflx_output(cwd: &Path, args: &[&str]) -> std::process::Output {
 /// Redirecting to files instead of pipes keeps the deadline honest — a full pipe
 /// buffer cannot stall the child while the parent waits.
 fn cflx_output_bounded(cwd: &Path, args: &[&str], timeout: Duration) -> std::process::Output {
+    cflx_output_bounded_with_env(cwd, args, &[], timeout)
+}
+
+/// [`cflx_output_bounded`] with explicit environment entries.
+///
+/// A state-root refusal has to be observed against a *known* `XDG_STATE_HOME`,
+/// because "did not fall back" is only provable when the fallback root is one the
+/// test owns and can inspect afterwards.
+fn cflx_output_bounded_with_env(
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &Path)],
+    timeout: Duration,
+) -> std::process::Output {
     let capture = tempfile::tempdir().expect("capture dir");
     let out_path = capture.path().join("stdout");
     let err_path = capture.path().join("stderr");
     // A null stdin keeps a TUI invocation from ever reaching the terminal that
     // is running the test suite.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cflx"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cflx"));
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let mut child = command
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -1506,5 +1524,242 @@ impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+// ── Configurable Conflux state root ────────────────────────────────────────
+//
+// `state_base_dir` selects where Conflux writes its own persistent state. These
+// cases exercise the real startup path, because the contract is about *ordering*:
+// the root is resolved and proven usable before logging, listeners, lifecycle
+// adapters, and AI child processes exist.
+
+/// A configuration whose only variable is the storage root, so a failure here
+/// can only be about the root and never about a missing command.
+fn config_with_state_base_dir(state_base_dir: &str) -> String {
+    format!(
+        r#"{{
+  "apply_command": "echo apply",
+  "archive_command": "echo archive",
+  "analyze_command": "echo analyze",
+  "acceptance_command": "echo accept",
+  "resolve_command": "echo resolve",
+  "state_base_dir": {state_base_dir:?}
+}}
+"#
+    )
+}
+
+fn setup_project_with_state_root(dir: &Path, state_base_dir: &str) {
+    fs::write(
+        dir.join(".cflx.jsonc"),
+        config_with_state_base_dir(state_base_dir),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("openspec/changes")).unwrap();
+    init_git_repo(dir);
+}
+
+/// Every `.log` file under a log root, as `<project>/<file>` strings.
+fn log_files_under(log_root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(projects) = fs::read_dir(log_root) else {
+        return found;
+    };
+    for project in projects.flatten() {
+        let Ok(entries) = fs::read_dir(project.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("log") {
+                found.push(format!(
+                    "{}/{}",
+                    project.file_name().to_string_lossy(),
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn configurable_state_root_writes_logs_under_the_configured_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let configured = tmp.path().join("external-state");
+    let xdg_state_home = tmp.path().join("xdg-state");
+
+    setup_project_with_state_root(&workspace, &configured.to_string_lossy());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .args(["run", "--all"])
+        .current_dir(&workspace)
+        .env("XDG_STATE_HOME", &xdg_state_home)
+        .output()
+        .expect("failed to run cflx run --all");
+
+    assert!(
+        output.status.success(),
+        "run must succeed with a usable configured state root, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The configured root wins over XDG_STATE_HOME for Conflux-owned paths...
+    let configured_logs = configured.join("cflx/logs");
+    let written = log_files_under(&configured_logs);
+    assert_eq!(
+        written.len(),
+        1,
+        "expected exactly one project log under {}, found {written:?}",
+        configured_logs.display()
+    );
+    assert!(written[0].ends_with(".log"));
+
+    // ...and nothing at all is written to the XDG root it overrode.
+    assert!(
+        !xdg_state_home.exists(),
+        "a configured state root must not also write under XDG_STATE_HOME"
+    );
+}
+
+#[test]
+fn configurable_state_root_rejects_a_relative_root_before_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let xdg_state_home = tmp.path().join("xdg-state");
+
+    setup_project_with_state_root(&workspace, "relative/state");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .args(["run", "--all"])
+        .current_dir(&workspace)
+        .env("XDG_STATE_HOME", &xdg_state_home)
+        .output()
+        .expect("failed to run cflx run --all");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a relative state root must fail startup, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("state_base_dir") && stderr.contains("absolute"),
+        "the diagnostic must name the setting and the rule, got stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("Starting cflx"),
+        "startup must be refused before logging announces it, got stdout={stdout}"
+    );
+    assert!(
+        !workspace.join("relative").exists(),
+        "a rejected root must not be created"
+    );
+    assert!(
+        !xdg_state_home.exists(),
+        "a rejected root must not silently fall back to the default root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn configurable_state_root_rejects_an_unwritable_root_before_startup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let xdg_state_home = tmp.path().join("xdg-state");
+    let configured = tmp.path().join("read-only-state");
+    fs::create_dir_all(&configured).unwrap();
+    fs::set_permissions(&configured, fs::Permissions::from_mode(0o500)).unwrap();
+
+    setup_project_with_state_root(&workspace, &configured.to_string_lossy());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .args(["run", "--all"])
+        .current_dir(&workspace)
+        .env("XDG_STATE_HOME", &xdg_state_home)
+        .output()
+        .expect("failed to run cflx run --all");
+
+    // Restore write permission so the temporary directory can be removed.
+    fs::set_permissions(&configured, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "an unwritable state root must fail startup, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("state_base_dir"),
+        "the diagnostic must name the setting, got stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("Starting cflx"),
+        "startup must be refused before logging announces it, got stdout={stdout}"
+    );
+    assert!(
+        !xdg_state_home.exists(),
+        "an unusable configured root must not fall back to the default root"
+    );
+}
+
+/// Fail-closed startup is a property of *every* orchestration entrypoint, not of
+/// `cflx run` alone. The TUI loads and validates configuration before logging
+/// initialization too, so both the explicit `tui` subcommand and the default
+/// no-subcommand invocation must refuse an unusable root before a listener, a
+/// lifecycle adapter, or an AI child process exists.
+#[test]
+#[cfg(unix)]
+fn configurable_state_root_rejects_a_relative_root_at_the_tui_entrypoint() {
+    for args in [
+        vec!["tui", "--no-web-unix-socket"],
+        vec!["--no-web-unix-socket"],
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let xdg_state_home = tmp.path().join("xdg-state");
+
+        setup_project_with_state_root(&workspace, "relative/state");
+        add_change(&workspace, "a");
+
+        let output = cflx_output_bounded_with_env(
+            &workspace,
+            &args,
+            &[("XDG_STATE_HOME", xdg_state_home.as_path())],
+            Duration::from_secs(30),
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.status.success(),
+            "cflx {} must refuse a relative state root, got {:?} (stderr={stderr})",
+            args.join(" "),
+            output.status
+        );
+        assert!(
+            stderr.contains("state_base_dir") && stderr.contains("absolute"),
+            "the diagnostic must name the setting and the rule, got stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("Starting cflx"),
+            "startup must be refused before logging announces it, got stdout={stdout}"
+        );
+        assert!(
+            !workspace.join("relative").exists(),
+            "a rejected root must not be created"
+        );
+        assert!(
+            !xdg_state_home.exists(),
+            "a rejected root must not silently fall back to the default root"
+        );
     }
 }

@@ -17,6 +17,21 @@ use crate::bounded_git::{run_git, GitDeadline, GitOutcome};
 use crate::execution::state::{classify_base_completion_within, BaseCompletionEvidence};
 use crate::web::remote_control_api::dto::{OwnerExecutionContract, TerminalMode};
 
+/// Which half of certification a caller's deadline expired in.
+///
+/// The two are different waits with different remedies: a local classification
+/// reads the repository this process is already standing in, while a remote
+/// comparison talks to another host. A caller told only "the deadline passed"
+/// cannot tell a slow disk from an unreachable remote, and those are the two
+/// answers worth acting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificationStage {
+    /// Local base-completion classification: `rev-parse`, `ls-tree`.
+    Repository,
+    /// Comparison against a remote ref: `ls-remote`.
+    Remote,
+}
+
 /// What current repository state says about one change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -40,7 +55,10 @@ pub enum Verdict {
     /// Only a [`GitDeadline::Operation`] caller can see this. A per-child expiry
     /// is one attempt giving up, not the operation, so it comes back as
     /// [`Verdict::NotCompleted`] and the caller keeps observing.
-    DeadlineExpired,
+    ///
+    /// `stage` names which half of the proof was in flight, so a caller can
+    /// report where its deadline landed without parsing a message.
+    DeadlineExpired { stage: CertificationStage },
 }
 
 /// Verify one change against the owner's declared terminal mode.
@@ -85,9 +103,11 @@ pub async fn verify(
                             ),
                         },
                         Err(RemoteError::Broken(detail)) => Verdict::Broken { detail },
-                        Err(RemoteError::DeadlineExpired) => {
-                            expired(deadline, &format!("git ls-remote {remote}"))
-                        }
+                        Err(RemoteError::DeadlineExpired) => expired(
+                            deadline,
+                            CertificationStage::Remote,
+                            &format!("git ls-remote {remote}"),
+                        ),
                     }
                 }
                 other => other,
@@ -122,9 +142,11 @@ pub async fn verify(
                             ),
                         },
                         Err(RemoteError::Broken(detail)) => Verdict::Broken { detail },
-                        Err(RemoteError::DeadlineExpired) => {
-                            expired(deadline, &format!("git ls-remote {remote}"))
-                        }
+                        Err(RemoteError::DeadlineExpired) => expired(
+                            deadline,
+                            CertificationStage::Remote,
+                            &format!("git ls-remote {remote}"),
+                        ),
                     }
                 }
                 other => other,
@@ -141,9 +163,9 @@ pub async fn verify(
 /// reaped, nothing was proven either way, and an unbounded wait must keep
 /// observing rather than borrow an outcome reserved for callers who asked for a
 /// deadline.
-fn expired(deadline: GitDeadline, what: &str) -> Verdict {
+fn expired(deadline: GitDeadline, stage: CertificationStage, what: &str) -> Verdict {
     if deadline.is_operation_deadline() {
-        Verdict::DeadlineExpired
+        Verdict::DeadlineExpired { stage }
     } else {
         Verdict::NotCompleted {
             detail: format!(
@@ -168,7 +190,11 @@ async fn verify_base(
     let Some(evidence) =
         classify_base_completion_within(change_id, repo_root, branch, deadline).await
     else {
-        return expired(deadline, "local base-completion classification");
+        return expired(
+            deadline,
+            CertificationStage::Repository,
+            "local base-completion classification",
+        );
     };
     match evidence {
         BaseCompletionEvidence::Completed => Verdict::Completed {
@@ -389,9 +415,31 @@ mod tests {
         assert_eq!(
             expired(
                 GitDeadline::Operation(Instant::now() + Duration::from_secs(30)),
+                CertificationStage::Remote,
                 "git ls-remote origin"
             ),
-            Verdict::DeadlineExpired
+            Verdict::DeadlineExpired {
+                stage: CertificationStage::Remote
+            }
+        );
+    }
+
+    /// The expiry carries *where* it happened, not just that it happened.
+    ///
+    /// A caller reporting the stage has no other source for it: the two halves
+    /// run the same `Verdict`, and re-deriving "was that a remote lookup?" from
+    /// the contract would be guessing at what the deadline actually interrupted.
+    #[test]
+    fn an_operation_expiry_names_the_half_of_the_proof_it_interrupted() {
+        assert_eq!(
+            expired(
+                GitDeadline::Operation(Instant::now() + Duration::from_secs(30)),
+                CertificationStage::Repository,
+                "local base-completion classification"
+            ),
+            Verdict::DeadlineExpired {
+                stage: CertificationStage::Repository
+            }
         );
     }
 
@@ -402,6 +450,7 @@ mod tests {
         // reach the `timeout` outcome an explicit `--timeout` owns.
         let verdict = expired(
             GitDeadline::PerChild(Duration::from_secs(30)),
+            CertificationStage::Remote,
             "git ls-remote origin",
         );
         let Verdict::NotCompleted { detail } = verdict else {
@@ -414,8 +463,12 @@ mod tests {
     #[test]
     fn an_unbounded_git_deadline_never_claims_the_operation_expired() {
         assert!(!matches!(
-            expired(GitDeadline::Unbounded, "git rev-parse"),
-            Verdict::DeadlineExpired
+            expired(
+                GitDeadline::Unbounded,
+                CertificationStage::Repository,
+                "git rev-parse"
+            ),
+            Verdict::DeadlineExpired { .. }
         ));
     }
 }
