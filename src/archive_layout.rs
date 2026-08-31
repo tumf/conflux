@@ -44,6 +44,84 @@ pub(crate) fn find_valid_archive_entry(change_id: &str, archive_dir: &Path) -> O
         })
 }
 
+/// Why the archive cannot name exactly one proposal for a change.
+///
+/// Resolution fails closed: an ambiguous archive or an unrecognisable layout is
+/// reported, never resolved by `read_dir` order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArchivedProposalError {
+    /// More than one canonical entry carries a `proposal.md` for the change.
+    Ambiguous {
+        change_id: String,
+        entries: Vec<PathBuf>,
+    },
+    /// No canonical entry resolved, and a nested date layout explains why.
+    InvalidLayout(ArchiveLayoutError),
+}
+
+impl ArchivedProposalError {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Ambiguous { change_id, entries } => format!(
+                "Ambiguous archive for '{}': {} canonical archive entries contain proposal.md ({}). Keep exactly one archived entry for this change and remove or rename the others.",
+                change_id,
+                entries.len(),
+                entries
+                    .iter()
+                    .map(|entry| entry.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::InvalidLayout(error) => error.message(),
+        }
+    }
+}
+
+/// Resolve the sole canonical archived `proposal.md` for `change_id`.
+///
+/// A deliberate sibling of [`find_valid_archive_entry`] rather than a
+/// tightening of it: archive completion detection and task-file resolution
+/// depend on that function's direct-entry preference, first-match fallback, and
+/// `proposal.md`-optional contract, while a declaration source has to be both
+/// unique and readable.
+///
+/// `Ok(None)` means the archive holds no canonical entry with a proposal for
+/// this change and no nested date layout explains the absence.
+pub(crate) fn find_archived_proposal(
+    change_id: &str,
+    archive_dir: &Path,
+) -> Result<Option<PathBuf>, ArchivedProposalError> {
+    let mut entries: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = fs::read_dir(archive_dir) {
+        for entry in dir.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if is_valid_archive_entry_name(&name, change_id) && path.join("proposal.md").is_file() {
+                entries.push(path);
+            }
+        }
+    }
+    // `read_dir` order is filesystem-defined, so sorting is what makes the
+    // ambiguity diagnostic reproducible instead of arbitrarily ordered.
+    entries.sort();
+
+    match entries.len() {
+        0 => match invalid_layout_error(change_id, archive_dir) {
+            Some(error) => Err(ArchivedProposalError::InvalidLayout(error)),
+            None => Ok(None),
+        },
+        1 => Ok(Some(entries.remove(0).join("proposal.md"))),
+        _ => Err(ArchivedProposalError::Ambiguous {
+            change_id: change_id.to_string(),
+            entries,
+        }),
+    }
+}
+
 pub(crate) fn find_invalid_nested_archive_entry(
     change_id: &str,
     archive_dir: &Path,
@@ -583,6 +661,120 @@ mod tests {
         ];
         assert!(paths_contain_active_change(&paths, "my-change"));
         assert!(paths_contain_valid_archive(&paths, "my-change"));
+    }
+
+    /// Build an archive tree, creating `proposal.md` in every entry listed with
+    /// `true`, and return the archive directory.
+    fn archive_with(entries: &[(&str, bool)]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("openspec/changes/archive");
+        for (name, with_proposal) in entries {
+            let entry = archive_dir.join(name);
+            std::fs::create_dir_all(&entry).unwrap();
+            if *with_proposal {
+                std::fs::write(entry.join("proposal.md"), "# archived\n").unwrap();
+            }
+        }
+        (dir, archive_dir)
+    }
+
+    #[test]
+    fn archived_proposal_resolves_direct_and_dated_entries() {
+        let (_dir, archive_dir) = archive_with(&[("my-change", true)]);
+        assert_eq!(
+            find_archived_proposal("my-change", &archive_dir),
+            Ok(Some(archive_dir.join("my-change/proposal.md")))
+        );
+
+        let (_dir, archive_dir) = archive_with(&[("2026-07-09-my-change", true)]);
+        assert_eq!(
+            find_archived_proposal("my-change", &archive_dir),
+            Ok(Some(archive_dir.join("2026-07-09-my-change/proposal.md")))
+        );
+    }
+
+    #[test]
+    fn archived_proposal_requires_a_canonical_entry_that_holds_a_proposal() {
+        // An entry that is canonical but carries no proposal is not a
+        // declaration source, and neither is any non-canonical name.
+        let (_dir, archive_dir) = archive_with(&[
+            ("my-change", false),
+            ("prefix-my-change", true),
+            ("2026-7-9-my-change", true),
+            ("other-change", true),
+        ]);
+        assert_eq!(find_archived_proposal("my-change", &archive_dir), Ok(None));
+
+        // A missing archive directory resolves to nothing rather than erroring.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            find_archived_proposal("my-change", &empty.path().join("archive")),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn archived_proposal_fails_closed_on_competing_entries() {
+        let (_dir, archive_dir) = archive_with(&[
+            ("2026-07-09-my-change", true),
+            ("my-change", true),
+            ("2026-08-01-my-change", true),
+        ]);
+
+        let error = find_archived_proposal("my-change", &archive_dir).unwrap_err();
+        let ArchivedProposalError::Ambiguous { change_id, entries } = &error else {
+            panic!("competing entries must be ambiguous, got {error:?}");
+        };
+        assert_eq!(change_id, "my-change");
+        // Sorted, so the diagnostic never depends on read_dir order.
+        assert_eq!(
+            entries,
+            &vec![
+                archive_dir.join("2026-07-09-my-change"),
+                archive_dir.join("2026-08-01-my-change"),
+                archive_dir.join("my-change"),
+            ]
+        );
+        let message = error.message();
+        assert!(message.contains("Ambiguous archive for 'my-change'"));
+        for entry in entries {
+            assert!(message.contains(&entry.display().to_string()));
+        }
+    }
+
+    #[test]
+    fn archived_proposal_reports_the_existing_nested_layout_diagnostic() {
+        let (_dir, archive_dir) = archive_with(&[("2026-07-09/my-change", true)]);
+
+        let error = find_archived_proposal("my-change", &archive_dir).unwrap_err();
+        assert_eq!(
+            error,
+            ArchivedProposalError::InvalidLayout(
+                invalid_layout_error("my-change", &archive_dir).unwrap()
+            )
+        );
+        assert!(error.message().contains("Invalid archive layout"));
+    }
+
+    #[test]
+    fn find_valid_archive_entry_keeps_its_own_contract() {
+        // The sibling resolver must not have tightened this one: an entry
+        // without a proposal still resolves here, because archive completion
+        // and task-file resolution depend on that.
+        let (_dir, archive_dir) = archive_with(&[("2026-07-09-my-change", false)]);
+        assert_eq!(
+            find_valid_archive_entry("my-change", &archive_dir),
+            Some(archive_dir.join("2026-07-09-my-change"))
+        );
+        assert_eq!(find_archived_proposal("my-change", &archive_dir), Ok(None));
+
+        // And the direct entry still wins over a dated one without failing closed.
+        let (_dir, archive_dir) =
+            archive_with(&[("2026-07-09-my-change", true), ("my-change", true)]);
+        assert_eq!(
+            find_valid_archive_entry("my-change", &archive_dir),
+            Some(archive_dir.join("my-change"))
+        );
     }
 
     #[test]
