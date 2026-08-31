@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::archive_layout;
 use crate::openspec::VerificationDeclaration;
 use crate::orchestration::acceptance::verification_evidence::{
     decide_reuse, eligible_request, plan_reuse, CaptureOutcome, GitRepositoryFacts, ReusePolicy,
@@ -32,18 +33,36 @@ use crate::orchestration::acceptance::verification_evidence::{
 /// captured successfully.
 const EXIT_UNSATISFIED: i32 = 1;
 
-/// Read the declarations of one change from the workspace.
-fn declarations(workspace: &Path, change_id: &str) -> Result<Vec<VerificationDeclaration>, String> {
-    let proposal = workspace
-        .join("openspec/changes")
+/// Resolve the proposal that declares one change's verifications.
+///
+/// The active proposal wins unconditionally: an archive entry sharing the ID is
+/// a previously archived change of that name, never a competing declaration
+/// source for a live one. Only when no active proposal exists does the archive
+/// answer, through the repository's own archive identity rules — and it answers
+/// with exactly one entry or with a refusal.
+fn proposal_path(workspace: &Path, change_id: &str) -> Result<PathBuf, String> {
+    let active = workspace
+        .join(archive_layout::ACTIVE_CHANGES_PREFIX)
         .join(change_id)
         .join("proposal.md");
-    if !proposal.is_file() {
-        return Err(format!(
-            "Change '{change_id}' has no proposal at {}",
-            proposal.display()
-        ));
+    if active.is_file() {
+        return Ok(active);
     }
+    let archive_dir = workspace.join(archive_layout::ARCHIVE_PREFIX);
+    match archive_layout::find_archived_proposal(change_id, &archive_dir) {
+        Ok(Some(archived)) => Ok(archived),
+        Ok(None) => Err(format!(
+            "Change '{change_id}' has no proposal at {} and no archived proposal under {}",
+            active.display(),
+            archive_dir.display()
+        )),
+        Err(error) => Err(error.message()),
+    }
+}
+
+/// Read the declarations of one change from the workspace.
+fn declarations(workspace: &Path, change_id: &str) -> Result<Vec<VerificationDeclaration>, String> {
+    let proposal = proposal_path(workspace, change_id)?;
     Ok(crate::openspec::parse_proposal_metadata_from_file(&proposal).verifications)
 }
 
@@ -201,7 +220,7 @@ pub async fn cmd_verify(
 mod tests {
     use super::*;
     use crate::orchestration::acceptance::verification_evidence::{
-        EvidenceDefect, RerunReason, ReuseDecision,
+        EvidenceDefect, RepositoryFacts, RerunReason, ReuseDecision, ToolIdentity,
     };
 
     fn declaration(id: &str) -> VerificationDeclaration {
@@ -260,6 +279,170 @@ mod tests {
         let declared = declarations(workspace.path(), "example").expect("declarations");
         assert_eq!(declared.len(), 1);
         assert_eq!(declared[0].id.as_deref(), Some("local-tests"));
+    }
+
+    /// A proposal declaring one supervisable repository-local verification.
+    const PROPOSAL: &str = "---\nverifications:\n  - id: local-tests\n    phase: pre-integration\n    automation: Cargo.toml\n    rerun: cargo test --lib\n    execution_class: repository-local\n    completion_role: change-blocking\n    prerequisites: []\n---\n# Example\n";
+
+    /// Write `PROPOSAL` at a workspace-relative directory.
+    fn write_proposal(workspace: &Path, relative_dir: &str) {
+        let dir = workspace.join(relative_dir);
+        std::fs::create_dir_all(&dir).expect("create proposal dir");
+        std::fs::write(dir.join("proposal.md"), PROPOSAL).expect("write proposal");
+    }
+
+    /// Repository facts that are never consulted: every decision in these tests
+    /// is settled by the absent evidence sidecar before Git is observed at all.
+    struct UnobservedFacts;
+
+    #[async_trait::async_trait]
+    impl RepositoryFacts for UnobservedFacts {
+        async fn head_commit(&self, _workspace: &Path) -> Result<String, String> {
+            Err("repository facts must not be observed here".to_string())
+        }
+        async fn head_tree(&self, _workspace: &Path) -> Result<String, String> {
+            Err("repository facts must not be observed here".to_string())
+        }
+        async fn tracked_blob_oid(&self, _workspace: &Path, _path: &str) -> Result<String, String> {
+            Err("repository facts must not be observed here".to_string())
+        }
+        async fn hash_file(&self, _workspace: &Path, _path: &Path) -> Result<String, String> {
+            Err("repository facts must not be observed here".to_string())
+        }
+        async fn porcelain_status(&self, _workspace: &Path) -> Result<String, String> {
+            Err("repository facts must not be observed here".to_string())
+        }
+        async fn resolve_tool(
+            &self,
+            _workspace: &Path,
+            _program: &str,
+        ) -> Result<ToolIdentity, String> {
+            Err("repository facts must not be observed here".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_archived_change_keeps_its_verification_id_and_repository_level_automation() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        write_proposal(
+            workspace.path(),
+            "openspec/changes/archive/2026-07-09-example",
+        );
+
+        // The declaration source moved; the declaration itself did not.
+        assert_eq!(
+            proposal_path(workspace.path(), "example").expect("archived proposal"),
+            workspace
+                .path()
+                .join("openspec/changes/archive/2026-07-09-example/proposal.md")
+        );
+        let declared = declarations(workspace.path(), "example").expect("declarations");
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].id.as_deref(), Some("local-tests"));
+
+        // Automation stays repository-relative and runs from the workspace root,
+        // never from the archived directory.
+        let request = eligible_request(&declared[0]).expect("supervisable request");
+        assert_eq!(request.verification_id, "local-tests");
+        assert_eq!(request.automation_path, "Cargo.toml");
+        assert_eq!(request.cwd, ".");
+        assert_eq!(request.argv, vec!["cargo", "test", "--lib"]);
+
+        // And the archived declaration still plans under the same ID.
+        let plan = plan_reuse(
+            &UnobservedFacts,
+            workspace.path(),
+            &declared,
+            ReusePolicy::default(),
+        )
+        .await;
+        assert_eq!(plan.decisions.len(), 1);
+        assert_eq!(plan.decisions[0].verification_id(), "local-tests");
+    }
+
+    #[test]
+    fn an_archived_change_resolves_from_the_direct_entry_too() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        write_proposal(workspace.path(), "openspec/changes/archive/example");
+
+        assert_eq!(
+            proposal_path(workspace.path(), "example").expect("archived proposal"),
+            workspace
+                .path()
+                .join("openspec/changes/archive/example/proposal.md")
+        );
+    }
+
+    #[test]
+    fn an_active_proposal_outranks_a_same_named_archive_entry() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        write_proposal(workspace.path(), "openspec/changes/example");
+        write_proposal(
+            workspace.path(),
+            "openspec/changes/archive/2026-07-09-example",
+        );
+        write_proposal(workspace.path(), "openspec/changes/archive/example");
+
+        // Two archive entries would be ambiguous on their own; with an active
+        // proposal present they are not consulted at all.
+        assert_eq!(
+            proposal_path(workspace.path(), "example").expect("active proposal"),
+            workspace
+                .path()
+                .join("openspec/changes/example/proposal.md")
+        );
+        assert_eq!(
+            declarations(workspace.path(), "example")
+                .expect("declarations")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn competing_archive_entries_fail_closed_instead_of_picking_one() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        write_proposal(
+            workspace.path(),
+            "openspec/changes/archive/2026-07-09-example",
+        );
+        write_proposal(workspace.path(), "openspec/changes/archive/example");
+
+        let error = declarations(workspace.path(), "example").unwrap_err();
+        assert!(error.contains("Ambiguous archive for 'example'"));
+        assert!(error.contains("2026-07-09-example"));
+    }
+
+    #[test]
+    fn a_nested_archive_layout_reports_the_repository_diagnostic() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        write_proposal(
+            workspace.path(),
+            "openspec/changes/archive/2026-07-09/example",
+        );
+
+        let error = declarations(workspace.path(), "example").unwrap_err();
+        assert!(error.contains("Invalid archive layout for 'example'"));
+        assert!(error.contains("2026-07-09/example"));
+    }
+
+    #[test]
+    fn non_canonical_or_proposal_less_archive_entries_never_resolve() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        // A canonical entry without a proposal, a suffix collision, a malformed
+        // date, and another change's entry: none of them declare 'example'.
+        std::fs::create_dir_all(workspace.path().join("openspec/changes/archive/example"))
+            .expect("create empty entry");
+        write_proposal(workspace.path(), "openspec/changes/archive/prefix-example");
+        write_proposal(
+            workspace.path(),
+            "openspec/changes/archive/2026-7-9-example",
+        );
+        write_proposal(workspace.path(), "openspec/changes/archive/other-change");
+
+        let error = declarations(workspace.path(), "example").unwrap_err();
+        assert!(error.contains("has no proposal"));
+        assert!(error.contains("no archived proposal"));
     }
 
     #[test]
