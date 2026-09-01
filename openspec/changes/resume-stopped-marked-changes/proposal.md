@@ -20,7 +20,7 @@ verifications:
     owner: conflux-acceptance
     trigger: change-acceptance
     automation: src/orchestration/run_control/tests/change_error_f5_retry.rs
-    evidence: Focused Rust tests exercise the shared TUI/API Start transaction from a stopped process with preserved marks, prove terminal evidence is cleared only by explicit resume, and observe queue admission plus one scheduler boundary and dependency analysis.
+    evidence: Focused `stopped_marked_resume_*` Rust tests, initially placed in the existing run-control test module and movable to a dedicated module in the same change, exercise the shared TUI/API Start transaction from a stopped process with preserved marks, prove terminal evidence is cleared only by explicit resume, and observe queue admission plus one scheduler boundary and dependency analysis.
     rerun: cargo test --locked stopped_marked_resume
     prerequisites: []
     execution_class: repository-local
