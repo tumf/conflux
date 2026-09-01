@@ -756,6 +756,19 @@ pub enum ReducerCommand {
     /// killing a proposal outright is an operator verdict on that proposal, not
     /// a return to the queue.
     StopChange(String),
+    /// Resume a change whose only terminal evidence is an operator stop.
+    ///
+    /// The counterpart of [`Self::StopChange`], and deliberately narrow: it is
+    /// the *one* transition that may clear `TerminalState::Stopped`, and it
+    /// clears nothing else. Only explicit Start intent in process mode
+    /// `Stopped` submits it — a mark, a bulk mark, a re-mark, a refresh, or a
+    /// mark-settlement deadline never does, because "this change is selected"
+    /// is not "run this change again".
+    ///
+    /// [`Self::AddToQueue`] cannot express it: every terminal row is a no-op
+    /// there, and widening that guard would let ordinary queue intent erase
+    /// merged, pushed, rejected, or error evidence too.
+    ResumeStopped(String),
 }
 
 /// Outcome of applying a reducer command.
@@ -1891,6 +1904,70 @@ impl OrchestratorState {
             .unwrap_or(false)
     }
 
+    /// Return true when the *only* thing holding `change_id` back is an operator stop.
+    ///
+    /// Read-only, and the authority Start admission classifies a preserved mark
+    /// against. Every clause is a separate refusal rather than a spelling of
+    /// `display_status == "stopped"`:
+    ///
+    /// - the terminal outcome is `Stopped`, so Error, rejected, merged, and
+    ///   pushed evidence keeps its own explicit route and is never resumed here;
+    /// - queue intent is the `NotQueued` the stop itself produced, so a row an
+    ///   unrelated path already re-admitted is not resumed a second time;
+    /// - activity is idle and no wait, dependency hold, or stall is recorded
+    ///   underneath the stop, so the stop is the whole reason the row is parked.
+    ///
+    /// A change the reducer has never seen carries no stop evidence either, and
+    /// is not resumable.
+    pub fn is_resumable_stopped(&self, change_id: &str) -> bool {
+        self.change_runtime
+            .get(change_id)
+            .map(|rt| {
+                matches!(rt.terminal, TerminalState::Stopped)
+                    && matches!(rt.queue_intent, QueueIntent::NotQueued)
+                    && matches!(rt.activity, ActivityState::Idle)
+                    && matches!(rt.wait_state, WaitState::None)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Clear an operator stop and restore ordinary queued intent.
+    ///
+    /// The only reducer-owned transition that may turn `TerminalState::Stopped`
+    /// back into ordinary dispatch eligibility, and it moves exactly the state
+    /// the stop itself produced: the terminal classification, the dequeue guard
+    /// that keeps late events from reactivating the row, and the queue intent
+    /// the stop cleared. Any other terminal outcome is refused as a no-op, so a
+    /// resume can never erase Error, rejected, merged, or pushed evidence.
+    ///
+    /// Deliberately narrower than [`Self::retry_terminal_error`]: a stop is not
+    /// a failure, so the change's error history and its retained Apply
+    /// iteration-limit diagnostic explain something this command did not
+    /// consume and are left exactly as they were. Scheduler-owned stall
+    /// membership *is* cleared, because it is run-scoped bookkeeping that would
+    /// otherwise keep skipping a row the operator just resumed.
+    pub fn resume_stopped_change(&mut self, change_id: &str) -> ReduceOutcome {
+        if !self.is_resumable_stopped(change_id) {
+            return ReduceOutcome::NoOp;
+        }
+        {
+            let rt = self.runtime_entry(change_id);
+            rt.terminal = TerminalState::None;
+            rt.clear_activity_wait_and_blocker();
+            rt.queue_intent = QueueIntent::Queued;
+            rt.dequeued = false;
+            rt.observation = WorkspaceObservation::None;
+            rt.commit_phase_attempt = None;
+        }
+        self.clear_stalled_change(change_id);
+        self.clear_base_mutating_wait_queues(change_id);
+        self.add_dynamic_change(change_id.to_string());
+        ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
+            change_id: change_id.to_string(),
+            intent: QueueIntent::Queued,
+        })
+    }
+
     /// Clear a recoverable terminal error and restore ordinary queued retry intent.
     ///
     /// This is the only reducer-owned transition that may turn `TerminalState::Error`
@@ -2158,6 +2235,7 @@ impl OrchestratorState {
                 self.apply_dequeue_change_command(change_id)
             }
             ReducerCommand::StopChange(change_id) => self.apply_stop_change_command(change_id),
+            ReducerCommand::ResumeStopped(change_id) => self.resume_stopped_change(&change_id),
         }
     }
 

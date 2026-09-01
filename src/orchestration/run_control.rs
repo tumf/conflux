@@ -42,6 +42,9 @@ const MERGE_WAIT_STATUS: &str = "merge wait";
 /// Display status a change must carry before it can be started.
 const NOT_QUEUED_STATUS: &str = "not queued";
 
+/// Display status of a change settled into the operator-`Stopped` outcome.
+const STOPPED_STATUS: &str = "stopped";
+
 /// Why a retry-eligible mark was not routed while ordinary Start work existed.
 ///
 /// Start admits one class per request, so a retry-eligible row an operator can
@@ -602,6 +605,47 @@ impl PreparedDispatch {
     }
 }
 
+/// How one admitted ordinary Start target reaches queue intent.
+///
+/// Both spellings produce the same ordinary launch — `explicit_retry` stays
+/// false and the run carries no retry semantics — so this is not a third class
+/// of Start. It is the single reducer command each admitted target needs, and
+/// it is decided at classification time from that target's own evidence rather
+/// than re-derived at commit, so the transaction commits exactly the transition
+/// admission approved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrdinaryAdmission {
+    /// An idle `not queued` row enters through the ordinary queue addition.
+    Queue,
+    /// A preserved operator-`Stopped` row is resumed.
+    ///
+    /// The same transaction clears that stop's terminal classification and the
+    /// dequeue residue holding the row out of ordinary admission first, which
+    /// `AddToQueue` cannot do: it treats every terminal row as a no-op.
+    ResumeStopped,
+}
+
+/// One ordinary Start target and the transition that admits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrdinaryTarget {
+    /// Marked change this Start admits.
+    change_id: String,
+    /// The reducer transition classification chose for it.
+    admission: OrdinaryAdmission,
+}
+
+impl OrdinaryTarget {
+    /// The reducer command this target's admission commits.
+    fn command(&self) -> ReducerCommand {
+        match self.admission {
+            OrdinaryAdmission::Queue => ReducerCommand::AddToQueue(self.change_id.clone()),
+            OrdinaryAdmission::ResumeStopped => {
+                ReducerCommand::ResumeStopped(self.change_id.clone())
+            }
+        }
+    }
+}
+
 /// The class of work one Start request admits, chosen from marked evidence.
 ///
 /// Deliberately not a mixed variant. `explicit_retry` is a run-level launch
@@ -613,7 +657,7 @@ enum StartAdmission {
     /// Ordinary `not queued` marks enter the run.
     Ordinary {
         /// Admitted targets, in request order.
-        targets: Vec<String>,
+        targets: Vec<OrdinaryTarget>,
         /// Marked targets the classification left out.
         excluded: Vec<ExcludedTarget>,
     },
@@ -637,9 +681,18 @@ fn exhausted_start_detail(
     excluded: &[ExcludedTarget],
 ) -> String {
     let cause = match mode {
-        OperatorMode::Select | OperatorMode::Stopped => format!(
+        OperatorMode::Select => format!(
             "no marked change is startable ({marked} marked, none with status \
              '{NOT_QUEUED_STATUS}' and none carrying retryable evidence)"
+        ),
+        // Stopped names the resume route too, because it is the one mode in
+        // which a preserved `stopped` mark *would* have been startable: an
+        // operator who sees this refusal has to be able to tell that the route
+        // exists and that their marks did not qualify for it.
+        OperatorMode::Stopped => format!(
+            "no marked change is startable ({marked} marked, none with status \
+             '{NOT_QUEUED_STATUS}', none resumable from an operator '{STOPPED_STATUS}' \
+             outcome, and none carrying retryable evidence)"
         ),
         OperatorMode::Running => format!(
             "a live run admits only marked retry-eligible changes \
@@ -656,7 +709,7 @@ enum PreparedIntent {
     /// Start or resume the run over exactly these targets.
     Start {
         /// Admitted targets, in request order.
-        targets: Vec<String>,
+        targets: Vec<OrdinaryTarget>,
         /// Marked targets the classification left out, carried so the committed
         /// outcome can report them alongside the admitted subset.
         excluded: Vec<ExcludedTarget>,
@@ -816,7 +869,12 @@ impl RunControlService {
     /// store and the reducer's display status, never a frontend's row cache.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn start_targets(&self) -> Vec<String> {
-        self.classify_start_targets().await.0
+        self.classify_start_targets(false)
+            .await
+            .0
+            .into_iter()
+            .map(|target| target.change_id)
+            .collect()
     }
 
     /// Split the coherent mark snapshot into startable rows and exclusions.
@@ -825,18 +883,43 @@ impl RunControlService {
     /// non-terminal row at any time — so the whole run-target decision is made
     /// here, from current reducer facts, and every excluded target is named with
     /// the status that excluded it.
-    async fn classify_start_targets(&self) -> (Vec<String>, Vec<ExcludedTarget>) {
+    ///
+    /// `resume_stopped` widens the startable set by exactly one row shape: a
+    /// preserved mark whose only terminal evidence is an operator stop. The
+    /// caller passes it only for an explicit Start in process mode `Stopped`,
+    /// which is the one request that means "run these again". Reading the
+    /// reducer's own [`OrchestratorState::is_resumable_stopped`] rather than the
+    /// `stopped` display string is what keeps a row carrying a wait, a hold, or
+    /// re-established queue intent underneath the stop out of the resumed set.
+    async fn classify_start_targets(
+        &self,
+        resume_stopped: bool,
+    ) -> (Vec<OrdinaryTarget>, Vec<ExcludedTarget>) {
         let marked = self.operator.marks().marked_ids();
         let guard = self.state.read().await;
         let mut startable = Vec::new();
         let mut excluded = Vec::new();
         for id in marked {
             let status = guard.display_status(&id);
-            if status == NOT_QUEUED_STATUS {
-                startable.push(id);
+            let admission = if status == NOT_QUEUED_STATUS {
+                Some(OrdinaryAdmission::Queue)
+            } else if resume_stopped
+                && status == STOPPED_STATUS
+                && guard.is_resumable_stopped(&id)
+            {
+                Some(OrdinaryAdmission::ResumeStopped)
             } else {
-                let status = status.to_string();
-                excluded.push(ExcludedTarget::new(id, status));
+                None
+            };
+            match admission {
+                Some(admission) => startable.push(OrdinaryTarget {
+                    change_id: id,
+                    admission,
+                }),
+                None => {
+                    let status = status.to_string();
+                    excluded.push(ExcludedTarget::new(id, status));
+                }
             }
         }
         (startable, excluded)
@@ -1066,8 +1149,12 @@ impl RunControlService {
     pub async fn prepare_start(&self, mode: OperatorMode) -> RunControlResult<PreparedRunCommand> {
         match self.classify_start_admission(mode).await? {
             StartAdmission::Ordinary { targets, excluded } => {
+                let change_ids: Vec<String> = targets
+                    .iter()
+                    .map(|target| target.change_id.clone())
+                    .collect();
                 let dispatch = self
-                    .prepare_dispatch(RunCommandKind::Start, targets.clone(), false)
+                    .prepare_dispatch(RunCommandKind::Start, change_ids, false)
                     .await?;
                 Ok(PreparedRunCommand {
                     intent: PreparedIntent::Start { targets, excluded },
@@ -1133,9 +1220,15 @@ impl RunControlService {
         // Status classification happens here, at final admission, from current
         // reducer facts — never from an eligibility result recorded at mark
         // time. Excluded rows are named but do not block the runnable subset.
+        //
+        // Resuming a preserved stop is scoped to `Stopped` alone, because that
+        // is the mode in which an explicit Start means "run these again". In
+        // every other mode a `stopped` row keeps its terminal evidence and is
+        // reported as an exclusion exactly as before.
         let admits_ordinary = matches!(mode, OperatorMode::Select | OperatorMode::Stopped);
+        let resume_stopped = mode == OperatorMode::Stopped;
         let (ordinary, ordinary_excluded) = if admits_ordinary {
-            self.classify_start_targets().await
+            self.classify_start_targets(resume_stopped).await
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1324,14 +1417,21 @@ impl RunControlService {
         match intent {
             PreparedIntent::Start { targets, excluded } => {
                 {
+                    // One write guard for the whole admitted set: a resume that
+                    // clears stop residue and the queue additions beside it are
+                    // one indivisible transition, so no observer — and no mark
+                    // settlement pass — can see a row half-resumed.
                     let mut guard = self.state.write().await;
-                    for id in &targets {
-                        guard.apply_command(ReducerCommand::AddToQueue(id.clone()));
+                    for target in &targets {
+                        guard.apply_command(target.command());
                     }
                 }
                 Ok(CommittedRunCommand {
                     outcome: RunControlOutcome::RunDispatched {
-                        change_ids: targets,
+                        change_ids: targets
+                            .into_iter()
+                            .map(|target| target.change_id)
+                            .collect(),
                         explicit_retry: false,
                         scheduler,
                         excluded,
