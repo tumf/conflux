@@ -17,13 +17,3 @@
 ## Final Validation
 
 Archive validation is authoritative. Expected gate: `cflx openspec validate resume-stopped-marked-changes --archive-gate`.
-
-## Current Acceptance Follow-up
-- attempt: 1
-- [x] Investigate acceptance failure and apply the required fix
-  evidence: acceptance finding was `acceptance-rustfmt-gate-fails` - `cargo fmt --all -- --check` reported 5 `Diff in` sites, all introduced by this change
-  evidence: required change src/orchestration/run_control.rs - rustfmt joined the `classify_start_targets` resume condition (line 903) and the `RunDispatched { change_ids: ... }` mapping (line 1428) each onto one line
-  evidence: required change src/orchestration/run_control/tests/stopped_marked_resume.rs - rustfmt joined the `is_ordinary_queue_eligible` (line 140) and `ordinary_queue_eligible_change_ids` (line 160) assertion chains
-  evidence: required change src/tui/command_handlers/cross_adapter_tests.rs - rustfmt rewrote the new `Setup::MarkedStopped` arrange arm (line 341) into the `apply_command(...)` single-argument form
-  evidence: verification - `cargo fmt --all -- --check` now exits 0 with no `Diff in` line for any file, and `git status --porcelain` shows only the three declared source files plus this task file
-  evidence: verification - `cargo test --locked stopped_marked_resume` 16 passed / 0 failed, and `cargo test --locked --lib cross_adapter_tests` 5 passed / 0 failed after the reformat
