@@ -903,9 +903,7 @@ impl RunControlService {
             let status = guard.display_status(&id);
             let admission = if status == NOT_QUEUED_STATUS {
                 Some(OrdinaryAdmission::Queue)
-            } else if resume_stopped
-                && status == STOPPED_STATUS
-                && guard.is_resumable_stopped(&id)
+            } else if resume_stopped && status == STOPPED_STATUS && guard.is_resumable_stopped(&id)
             {
                 Some(OrdinaryAdmission::ResumeStopped)
             } else {
@@ -1428,10 +1426,7 @@ impl RunControlService {
                 }
                 Ok(CommittedRunCommand {
                     outcome: RunControlOutcome::RunDispatched {
-                        change_ids: targets
-                            .into_iter()
-                            .map(|target| target.change_id)
-                            .collect(),
+                        change_ids: targets.into_iter().map(|target| target.change_id).collect(),
                         explicit_retry: false,
                         scheduler,
                         excluded,

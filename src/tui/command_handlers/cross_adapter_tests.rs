@@ -341,13 +341,9 @@ async fn arrange(harness: &AdapterHarness, setup: Setup) {
             harness.marks.replace(["c1".to_string()]);
         }
         Setup::MarkedStopped => {
-            harness
-                .state
-                .write()
-                .await
-                .apply_command(crate::orchestration::state::ReducerCommand::StopChange(
-                    "c1".to_string(),
-                ));
+            harness.state.write().await.apply_command(
+                crate::orchestration::state::ReducerCommand::StopChange("c1".to_string()),
+            );
             harness.marks.replace(["c1".to_string()]);
         }
         Setup::LiveScheduler => harness.scheduler.set_running(true),

@@ -10,9 +10,20 @@
 - RED evidence: with `resume_stopped` forced to `false` in `classify_start_admission`, `cargo test --locked --lib stopped_marked_resume` failed 6 of 16 with `NoEligibleTarget { command: Start, ... excluded: alpha (stopped) }` — the production refusal. Restoring the transition returned 16/16 green.
 - Dependency-analysis evidence: `parallel::tests::stopped_marked_resume::stopped_marked_resume_resumed_change_reaches_a_new_dependency_analysis` observes one `AnalysisStarted` event and a `WorkspacePreparationStarted` dispatch for the resumed change through the production scheduler loop steps, with the queue debounce window re-armed first so no analysis can be attributed to an expired timer.
 - Adapter parity evidence: two new rows in `tui::command_handlers::cross_adapter_tests` (`Setup::MarkedStopped`) compare TUI `StartProcessing` against `/api/v2` `CommandSpec::Start` over one process — identical reducer, scheduler, mark, resolver, frontend, event, and revision effects in `Stopped`, and an identical `target_ineligible` refusal in `Select`.
-- Gates: `cargo clippy --locked --all-targets -- -D warnings` clean; `cargo test --locked --lib stopped_marked_resume` 16/16; the two git-backed `parallel::tests::stopped_marked_resume` cases run in 0.46s together, so neither needs the heavy tier.
+- Formatting gate (acceptance repair, attempt 1): the first apply pass never ran `cargo fmt`, so five rustfmt violations shipped in the three source files this change touches. `cargo fmt --all` was applied; the resulting diff is whitespace/line-joining only — no token, expression, or assertion changed — and it touches exactly the three files the finding declared. `cargo fmt --all -- --check` is now part of this change's recorded gates.
+- Gates: `cargo clippy --locked --all-targets -- -D warnings` clean; `cargo fmt --all -- --check` clean; `cargo test --locked --lib stopped_marked_resume` 16/16; the two git-backed `parallel::tests::stopped_marked_resume` cases run in 0.46s together, so neither needs the heavy tier.
 - Pre-existing environment flake, not caused by this change: `parallel::tests::manual_resolve::persistent_scheduler_dynamic_queue_push_after_initial_analysis_bypasses_debounce` (and sometimes `scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve`) fails with `Elapsed(())` in this worktree, which lives on a slow external volume; both assert scheduler wake-up inside 500 ms wall-clock budgets. Copying this change's exact diff into a detached `HEAD` worktree on local disk ran the same module 28/28 green in 3.23s, and the unmodified `HEAD` there was likewise 28/28 — the failure tracks the filesystem, not the diff.
 
 ## Final Validation
 
 Archive validation is authoritative. Expected gate: `cflx openspec validate resume-stopped-marked-changes --archive-gate`.
+
+## Current Acceptance Follow-up
+- attempt: 1
+- [x] Investigate acceptance failure and apply the required fix
+  evidence: acceptance finding was `acceptance-rustfmt-gate-fails` - `cargo fmt --all -- --check` reported 5 `Diff in` sites, all introduced by this change
+  evidence: required change src/orchestration/run_control.rs - rustfmt joined the `classify_start_targets` resume condition (line 903) and the `RunDispatched { change_ids: ... }` mapping (line 1428) each onto one line
+  evidence: required change src/orchestration/run_control/tests/stopped_marked_resume.rs - rustfmt joined the `is_ordinary_queue_eligible` (line 140) and `ordinary_queue_eligible_change_ids` (line 160) assertion chains
+  evidence: required change src/tui/command_handlers/cross_adapter_tests.rs - rustfmt rewrote the new `Setup::MarkedStopped` arrange arm (line 341) into the `apply_command(...)` single-argument form
+  evidence: verification - `cargo fmt --all -- --check` now exits 0 with no `Diff in` line for any file, and `git status --porcelain` shows only the three declared source files plus this task file
+  evidence: verification - `cargo test --locked stopped_marked_resume` 16 passed / 0 failed, and `cargo test --locked --lib cross_adapter_tests` 5 passed / 0 failed after the reformat

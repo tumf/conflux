@@ -140,11 +140,7 @@ async fn stopped_marked_resume_clears_the_dequeue_guard_that_blocks_admission() 
     let harness = Harness::new(&[ALPHA]);
     harness.to_stopped(ALPHA).await;
     assert!(
-        !harness
-            .state
-            .read()
-            .await
-            .is_ordinary_queue_eligible(ALPHA),
+        !harness.state.read().await.is_ordinary_queue_eligible(ALPHA),
         "the control: a stopped row is not admissible before the resume"
     );
 
@@ -160,9 +156,7 @@ async fn stopped_marked_resume_clears_the_dequeue_guard_that_blocks_admission() 
         "the resumed row must pass the scheduler's own ordinary admission gate"
     );
     assert!(
-        guard
-            .ordinary_queue_eligible_change_ids()
-            .contains(ALPHA),
+        guard.ordinary_queue_eligible_change_ids().contains(ALPHA),
         "and it must be in the set one coherent scheduler evaluation reads"
     );
 }
