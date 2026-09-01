@@ -277,6 +277,12 @@ enum Setup {
     MarkedWithFailingLaunch,
     /// `c1` is marked and terminally errored.
     MarkedError,
+    /// `c1` is marked and settled into the terminal operator `stopped` outcome.
+    ///
+    /// The preserved-mark shape a force-stop leaves behind: marked, `not
+    /// queued`, `stopped`, with nothing else marked, so the request has no
+    /// ordinary row to succeed through instead.
+    MarkedStopped,
     /// A scheduler run is alive; nothing is marked.
     LiveScheduler,
     /// `c1` is in a reducer-visible merge wait.
@@ -332,6 +338,12 @@ async fn arrange(harness: &AdapterHarness, setup: Setup) {
                     id: "c1".to_string(),
                     error: "boom".to_string(),
                 });
+            harness.marks.replace(["c1".to_string()]);
+        }
+        Setup::MarkedStopped => {
+            harness.state.write().await.apply_command(
+                crate::orchestration::state::ReducerCommand::StopChange("c1".to_string()),
+            );
             harness.marks.replace(["c1".to_string()]);
         }
         Setup::LiveScheduler => harness.scheduler.set_running(true),
@@ -576,6 +588,33 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
+            notice: None,
+        },
+        Row {
+            // The preserved-stop resume: both adapters must select the same
+            // target, commit the same reducer transition, keep the same mark,
+            // and start the same single boundary. Without the shared transition
+            // this row is a `target_ineligible` refusal on both sides, which is
+            // exactly the owner behaviour that forced a restart.
+            name: "start from a stopped run resumes a preserved stopped mark",
+            setup: Setup::MarkedStopped,
+            mode: AppExecutionMode::Stopped,
+            tui: TuiCommand::StartProcessing(Vec::new()),
+            v2: CommandSpec::Start,
+            expect: Settlement::Changed,
+            notice: None,
+        },
+        Row {
+            // The same preserved stop outside the resuming mode. `Select` admits
+            // ordinary work only, and a stopped row is not ordinary there, so
+            // both adapters must refuse identically rather than one of them
+            // quietly resuming.
+            name: "a preserved stopped mark is not resumed outside Stopped",
+            setup: Setup::MarkedStopped,
+            mode: AppExecutionMode::Select,
+            tui: TuiCommand::StartProcessing(Vec::new()),
+            v2: CommandSpec::Start,
+            expect: Settlement::Failed(ErrorCode::TargetIneligible),
             notice: None,
         },
         Row {
