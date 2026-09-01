@@ -52,7 +52,7 @@ Add one explicit resume transition to the shared Start transaction for process m
 - Atomically clear only the stop-owned terminal/runtime residue required to return those targets to ordinary queue admission, preserve their execution marks, admit them through the existing queue/scheduler path, and start one fresh scheduler boundary.
 - Keep delayed mark settlement unchanged: mark or re-mark alone must not resume stopped work or synthesize Start.
 - Do not route stopped work through terminal-error retry. Preserve Error, rejected, archived, merged, pushed, blocked/stalled, acceptance-hold, and unsupported terminal evidence under their existing explicit routes.
-- Use the same `OperatorApplication` transaction for TUI F5 and remote `/api/v2` Start so validation, reducer effects, revision, outcome, and scheduler activation stay equivalent and fail-atomic.
+- Use the same `OperatorApplication` transaction for TUI F5 and remote `/api/v2` Start so validation, reducer effects, revision, outcome, and scheduler activation stay equivalent and fail-atomic. The existing `remote-control-api` requirement already mandates parity and the complete-request worktree fence, so this change needs no separate remote API delta.
 - Make the successful outcome identify the resumed targets and exclusions. A failed preparation leaves stopped state, marks, queue intent, process mode, and scheduler unchanged.
 
 ## Acceptance Criteria
@@ -61,7 +61,7 @@ Add one explicit resume transition to the shared Start transaction for process m
 2. The accepted command preserves the execution mark, clears only stop-owned terminal state, admits the target through ordinary queue semantics, starts exactly one fresh scheduler boundary, and produces a new dependency-analysis attempt.
 3. Mark, bulk mark, re-mark, and the delayed mark-settlement deadline alone do not resume a stopped target and do not wake or start a scheduler.
 4. Select and Running behavior is unchanged. Running ordinary marks still use delayed settlement, while retry-eligible Error and resumable holds retain their explicit retry routes.
-5. Mixed marks in Stopped admit only ordinary stopped/not-queued targets. Error, rejected, archived, merged, pushed, blocked/stalled, worktree-ineligible, or otherwise unsupported targets retain evidence and receive target-specific exclusions without mutation.
+5. A worktree-ineligible marked target rejects the complete request before class selection with no mutation. Otherwise, mixed marks in Stopped admit only ordinary stopped/not-queued targets; Error, rejected, archived, merged, pushed, blocked/stalled, or otherwise unsupported targets retain evidence and receive target-specific exclusions without mutation.
 6. Scheduler preparation failure is fail-atomic: stopped terminal state, marks, queue intent, process mode, hooks, revision-visible effects, and scheduler counts equal their pre-command values.
 7. TUI F5 and remote `/api/v2` Start produce equivalent targets, exclusions, reducer transitions, scheduler effect, result revision, and diagnostics.
 8. `cargo test --locked stopped_marked_resume` exits 0 and fails against the current v0.6.310 behavior.

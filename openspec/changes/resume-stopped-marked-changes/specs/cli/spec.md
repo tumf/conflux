@@ -1,8 +1,14 @@
 ## MODIFIED Requirements
 
 ### Requirement: Interrupted Change Handling
+Changes interrupted by stop SHALL hold queued status only during execution. Force-stop SHALL reset queue intent to NotQueued while preserving execution marks. A later explicit Start/F5 in process mode Stopped SHALL restore eligible execution-marked ordinary changes to queued, clear only the operator-Stopped terminal classification and stop-produced dequeue/runtime residue that prevents ordinary admission, and start one fresh scheduler boundary so they can be reprocessed without restarting the owner. Mark mutation, bulk mark, re-mark, refresh, or delayed mark settlement alone SHALL NOT resume stopped changes. Accepting status SHALL remain an in-flight execution state and MUST reset to NotQueued when force-stopped.
 
-Changes interrupted by stop SHALL hold queued status only during execution. Force-stop SHALL reset queue intent to NotQueued while preserving execution marks. A later explicit Start/F5 in process mode Stopped SHALL restore eligible execution-marked ordinary changes to queued, clear only stop-owned terminal residue, and start one fresh scheduler boundary so they can be reprocessed without restarting the owner. Mark mutation, bulk mark, re-mark, refresh, or delayed mark settlement alone SHALL NOT resume stopped changes. Accepting status SHALL remain an in-flight execution state and MUST reset to NotQueued when force-stopped.
+#### Scenario: Force-stopped accepting change returns to not queued
+- **GIVEN** a change is in Accepting status
+- **WHEN** the user force stops with second Esc press
+- **THEN** the change status becomes not queued
+- **AND** the execution mark remains set
+
 
 #### Scenario: Force-stopped marked change resumes explicitly
 
