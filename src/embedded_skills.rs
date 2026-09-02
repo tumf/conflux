@@ -4,6 +4,8 @@ use anyhow::Result;
 
 // cflx-proposal skill files
 const CFLX_PROPOSAL_SKILL_MD: &str = include_str!("../skills/cflx-proposal/SKILL.md");
+const CFLX_PROPOSAL_UI_REF: &str =
+    include_str!("../skills/cflx-proposal/references/ui-implementation-proposals.md");
 
 // cflx-workflow skill files (compatibility router)
 const CFLX_WORKFLOW_SKILL_MD: &str = include_str!("../skills/cflx-workflow/SKILL.md");
@@ -32,7 +34,13 @@ const CFLX_RESOLVE_SKILL_MD: &str = include_str!("../skills/cflx-resolve/SKILL.m
 
 /// Return all cflx bundled skills with their auxiliary files embedded at compile time.
 pub fn get_cflx_embedded_skills() -> Result<Vec<Skill>> {
-    let proposal = register_embedded_skill(CFLX_PROPOSAL_SKILL_MD, &[])?;
+    let proposal = register_embedded_skill(
+        CFLX_PROPOSAL_SKILL_MD,
+        &[(
+            "references/ui-implementation-proposals.md",
+            CFLX_PROPOSAL_UI_REF,
+        )],
+    )?;
 
     let workflow = register_embedded_skill(CFLX_WORKFLOW_SKILL_MD, &[])?;
 
@@ -124,8 +132,14 @@ mod tests {
     fn test_embedded_skills_have_auxiliary_files() {
         let skills = get_cflx_embedded_skills().unwrap();
 
-        // cflx-proposal: no scripts/cflx.py
+        // cflx-proposal: has UI proposal reference, no scripts/cflx.py
         let proposal = skills.iter().find(|s| s.name == "cflx-proposal").unwrap();
+        assert!(
+            proposal
+                .auxiliary_files
+                .contains_key("references/ui-implementation-proposals.md"),
+            "cflx-proposal must have references/ui-implementation-proposals.md"
+        );
         assert!(
             !proposal.auxiliary_files.contains_key("scripts/cflx.py"),
             "cflx-proposal must NOT have scripts/cflx.py (replaced by native CLI)"

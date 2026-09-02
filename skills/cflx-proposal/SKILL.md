@@ -1,6 +1,6 @@
 ---
 name: cflx-proposal
-description: Create structured Conflux change proposals through interactive conversation with users. Use when users request "create a proposal", "draft a change", "propose a feature", or similar proposal creation tasks. This skill asks clarifying questions and guides users through the proposal process.
+description: Create implementation-ready Conflux proposals, including fail-closed visual contracts for UI changes. Use for any request to create, draft, review, or strengthen a proposal or product change.
 ---
 
 # Conflux Proposal Creator
@@ -61,6 +61,23 @@ A reported problem is investigation input, not a proposal. Write proposal artifa
 - If the user's request is phrased as a concrete product, UI, API, route, form, workflow, or behavior change, default to `implementation` or `hybrid`, not `spec-only`, unless the user explicitly asks for spec-only or documentation-only work.
 - If canonical specs already describe the requested behavior but the codebase still lacks implementation, do NOT create another `spec-only` proposal unless the user explicitly asks to update spec artifacts only.
 - When selecting `spec-only`, explicitly state in the user-facing response that the proposal will NOT implement the feature and will only update tracked specification artifacts.
+
+## UI Implementation Proposals
+
+When a change touches a user-visible screen, shell, component, interaction, responsive layout, or visual state, read `references/ui-implementation-proposals.md` before drafting. Apply all of its readiness checks.
+
+Apply the full contract to surfaces whose visual properties, structure, or interaction design are introduced or changed. For changes that preserve the existing visual language, use the current production revision as authority and reuse an existing deterministic render/snapshot gate when it covers the affected states; do not create a parallel authority or redundant whole-product inventory.
+
+A UI proposal is not implementation-ready until it fixes:
+
+- the exact visual authority and precedence, bound to repository path plus revision or hash;
+- a fail-closed inventory of every in-scope screen, state, transition, and viewport variant;
+- objective anatomy, geometry, typography, color, action-priority, accessibility, and responsive contracts;
+- the production renderer/component/token/command owner for every inventory row;
+- a bounded repository-local gate that would fail when labels and transitions match but the rendered UI remains the old generic design;
+- separate operational-observation ownership for Simulator, device, screen-reader, deployed, or credentialed evidence.
+
+“Follow the prototype,” “same hierarchy and copy,” source scans, typechecks, accessibility trees, route tests, and successful builds do not prove visual conformance. Existing generic components may be reused only when the proposal states and verifies the visual properties they must preserve. Require `design.md` for UI changes except one trivial component/state, and require Fable to treat a missing visual contract or unresolved design choice as a BLOCKER.
 
 ## When to Use This Skill
 
@@ -389,6 +406,8 @@ one change entry is an ambiguity error.)
 **Present to user**: "I've broken this down into X tasks. Do these cover everything?"
 
 ### 6. Design Documentation (Optional)
+
+This section is optional for non-UI changes. UI implementation and hybrid changes follow the stricter `design.md` rule in `references/ui-implementation-proposals.md`.
 
 Create `openspec/changes/<id>/design.md` when:
 
@@ -862,7 +881,7 @@ Active task sections are the mirror image: every top-level `- ` or `* ` line mus
 
 ## Reference Files
 
-No additional reference files.
+- `references/ui-implementation-proposals.md` — required reading for any UI-touching proposal.
 
 ## Example Interaction
 

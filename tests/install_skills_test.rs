@@ -252,6 +252,12 @@ fn test_embedded_install_without_skills_dir() {
 
     // Verify reference auxiliary files are present for skills that have them
     assert!(
+        skills_base
+            .join("cflx-proposal/references/ui-implementation-proposals.md")
+            .exists(),
+        "cflx-proposal must have references/ui-implementation-proposals.md"
+    );
+    assert!(
         !skills_base.join("cflx-workflow/references").exists(),
         "cflx-workflow must remain a self-contained compatibility router"
     );
