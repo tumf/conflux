@@ -1,0 +1,26 @@
+## Implementation Tasks
+
+- [x] Add optional `acceptance_escalation_command` and validated positive `acceptance_escalation.after_invalid_results` / `max_uses_per_sequence` configuration with item-wise precedence and defaults (verification: unit - `cargo test acceptance_escalation --lib`; verification-id: acceptance-escalation-tests)
+- [x] Refactor `AgentRunner` Acceptance launch to select the normal or escalation template through one prompt-construction and execution path, retaining `{change_id}`, `{prompt}`, portable skill guidance, bounded history, protocol retry, and command-recovery context (verification: unit - `cargo test acceptance_escalation --lib`; verification-id: acceptance-escalation-tests)
+- [x] Implement one shared active-run invalid-result sequence policy for `MissingVerdict`, `BareBlocker`, `MalformedFinding`, and exact generic empty-FAIL fallback, including threshold, use cap, reset, missing-command fallback, and diagnostics (verification: unit - `cargo test acceptance_escalation --lib`; verification-id: acceptance-escalation-tests)
+- [x] Wire serial and parallel managed-worktree Acceptance loops to consume the shared command-selection decision without rerunning Apply or cleanup-review (verification: unit - `cargo test acceptance_escalation --lib`; verification-id: acceptance-escalation-tests)
+- [x] Add focused regression tests proving semantic actionable FAIL exclusion, all eligible invalid classes, command selection, reset boundaries, empty-FAIL routing below threshold and across its Apply round, cap exhaustion, config merge/validation, and non-persistence across fresh runners (verification: unit - `cargo test acceptance_escalation --lib`; verification-id: acceptance-escalation-tests)
+
+## Notes
+
+- evidence: `cargo test acceptance_escalation --lib` — 25 passed, 0 failed (config merge/validation in `config::tests::*`, policy/classification/selection in `orchestration::acceptance::tests::acceptance_escalation::*`).
+- evidence: full `cargo test` exits 0 (all suites pass), with `cargo fmt --all --check` clean and `cargo clippy --all-targets -- -D warnings` exiting 0.
+- The command-selection decision, invalid-result classification, and sequence accounting all live in `src/orchestration/acceptance.rs` (`AcceptanceEscalationDriver`, `classify_invalid_acceptance_result`, `acceptance_command_template`). `AgentRunner` and `src/parallel/executor.rs` resolve the template through that one function, so neither frontend reimplements the policy.
+- Serial `orchestration::acceptance::acceptance_test_streaming` consumes the same typed `AcceptanceCommandMode`. It currently has no in-tree caller (`AGENTS.md`: serial mode is obsolete), so the live consumer of the driver is the parallel managed-worktree loop in `src/parallel/dispatch.rs`.
+- `MalformedFinding` protocol retries now set `skip_apply_once`, matching `MissingVerdict` and `BareBlocker`: a corrected verdict is asked for without rerunning Apply or cleanup-review, as the parallel-execution delta requires.
+- The empty-FAIL fallback text is now the single constant `GENERIC_ACCEPTANCE_FAIL_FINDING`, shared by both executors, `task_parser`, and the classifier, so the substitution and the eligibility test cannot drift apart.
+- The `configuration` spec delta was corrected during implementation: as a MODIFIED requirement it had dropped the canonical `apply_escalation_command`/`apply_stall_diagnose_command` paragraphs and the existing "optional escalation and diagnose commands are accepted" scenario, which `openspec_cmd::promotion::tests::every_pending_change_promotes_without_dropping_a_scenario` correctly rejected. Intent is unchanged; the canonical content is carried forward.
+- evidence (acceptance repair attempt 1): `cargo fmt --all --check` clean, `cargo clippy --all-targets -- -D warnings` exits 0, and full `cargo test` exits 0 (4348 lib tests, 0 failed; every integration suite green, including the scheduler-timing test noted below).
+- The empty-FAIL routing decision now has exactly one home: `escalates_empty_fail` in `src/orchestration/acceptance.rs` reads the `kind` already carried by `AcceptanceEscalationOutcome::Escalated`, and `src/parallel/dispatch.rs` calls it rather than re-running `classify_invalid_acceptance_result`. The frontend no longer duplicates a policy decision.
+- The two new executor tests are the first coverage of an escalation invocation on the live parallel path. They distinguish the two reviewers from outside the process — each template writes the prompt it actually received to its own marker file — so they cannot pass by re-reading the selection logic under test.
+- Pre-existing intermittent flake, not introduced by this change: `parallel::tests::manual_resolve::persistent_scheduler_dynamic_queue_push_after_initial_analysis_bypasses_debounce` is a wall-clock scheduler-timing test that fails non-deterministically on this loaded machine, at differing assertions between runs, and fails the same way on a clean detached worktree of the base commit. It passed in the final full `cargo test` run recorded above, and nothing in this change touches the scheduler or analysis debounce path.
+
+## Final Validation
+
+Archive validation itself is the authoritative final OpenSpec validation gate.
+Expected archive gate: `cflx openspec validate add-acceptance-escalation --archive-gate`
