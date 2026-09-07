@@ -165,9 +165,19 @@ pub struct ChangeState {
     pub parallel_eligibility: ParallelEligibility,
     /// Whether a worktree exists for this change
     pub has_worktree: bool,
-    /// When processing started for this change
+    /// Start boundary of the *current* active execution interval.
+    ///
+    /// `None` whenever the row is not actively executing. It is only ever the
+    /// open interval's start, never the whole run's start, so wall-clock time
+    /// spent in `error`, `stalled`, blocked, merge-wait, or any other inactive
+    /// status can never leak into the displayed duration.
     pub started_at: Option<Instant>,
-    /// Elapsed time when processing finished (for display after completion)
+    /// Accumulated net execution time from every *closed* active interval.
+    ///
+    /// Retained across inactive and terminal transitions so a completed change
+    /// keeps showing how long it actually ran. Presentation state only: it is
+    /// process-local, never persisted, and never scheduler, resume, acceptance,
+    /// archive, merge, or next-action input.
     pub elapsed_time: Option<Duration>,
     /// Current iteration number (for apply/archive/acceptance operations)
     pub iteration_number: Option<u32>,
@@ -459,7 +469,79 @@ impl ChangeState {
         (self.completed_tasks as f32 / self.total_tasks as f32) * 100.0
     }
 
+    /// Open a new active execution interval, keeping any interval already open.
+    ///
+    /// Idempotent by construction: repeated active updates — the same active
+    /// status re-applied, or one active status following another — must keep
+    /// the original start boundary rather than restarting the interval.
+    pub fn start_active_interval(&mut self) {
+        self.start_active_interval_at(Instant::now());
+    }
+
+    pub(crate) fn start_active_interval_at(&mut self, now: Instant) {
+        if self.started_at.is_none() {
+            self.started_at = Some(now);
+        }
+    }
+
+    /// Close the current active interval exactly once and add it to the total.
+    ///
+    /// Idempotent as well, and that is what makes the process-level `Stopped`
+    /// boundary order-independent: whichever of the stop event and the reducer's
+    /// `not queued` synchronization arrives second finds no open interval and
+    /// adds nothing.
+    pub fn pause_active_interval(&mut self) {
+        self.pause_active_interval_at(Instant::now());
+    }
+
+    pub(crate) fn pause_active_interval_at(&mut self, now: Instant) {
+        let Some(started) = self.started_at.take() else {
+            return;
+        };
+        let interval = now.saturating_duration_since(started);
+        self.elapsed_time = Some(self.elapsed_time.unwrap_or_default() + interval);
+    }
+
+    /// Net execution time to display: closed intervals plus the open one.
+    ///
+    /// `None` only when the row has never executed, which is what the `--`
+    /// placeholder means. An inactive or terminal row with history answers with
+    /// its retained total, which stops growing because no interval is open.
+    pub fn current_total_elapsed(&self) -> Option<Duration> {
+        self.current_total_elapsed_at(Instant::now())
+    }
+
+    pub(crate) fn current_total_elapsed_at(&self, now: Instant) -> Option<Duration> {
+        match (self.elapsed_time, self.started_at) {
+            (None, None) => None,
+            (accumulated, open) => Some(
+                accumulated.unwrap_or_default()
+                    + open
+                        .map(|started| now.saturating_duration_since(started))
+                        .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// Whether this row proves execution history — an open interval or a
+    /// retained accumulated duration.
+    ///
+    /// Catalog refresh uses this to keep a temporarily absent row alive without
+    /// introducing a separate durable flag for the same fact.
+    pub fn has_execution_history(&self) -> bool {
+        self.started_at.is_some() || self.elapsed_time.is_some()
+    }
+
     pub fn set_display_status_cache(&mut self, status: &str) {
+        // Net execution timing is centralized here so every status transition —
+        // reducer synchronization, event handler, or refresh-derived repaint —
+        // accumulates against the one shared active vocabulary instead of a
+        // second hand-written list that could fall behind it.
+        if crate::orchestration::operator_command::is_active_status(status) {
+            self.start_active_interval();
+        } else {
+            self.pause_active_interval();
+        }
         self.display_status_cache = status.to_string();
         self.display_color_cache = match status {
             "not queued" => Color::DarkGray,
@@ -2421,6 +2503,191 @@ mod tests {
             dependencies: Vec::new(),
             metadata: crate::openspec::ProposalMetadata::default(),
         }
+    }
+
+    // ========================================================================
+    // Net execution time (verification `net-execution-time-tests`)
+    //
+    // The clock is supplied explicitly to the `_at` primitives, so these stay
+    // unit-scoped: no sleeping, no real timer boundary, and every assertion is
+    // an exact duration rather than a wall-clock tolerance.
+    // ========================================================================
+
+    fn timing_row() -> ChangeState {
+        ChangeState::from_change(&create_test_change("timed", 0, 1))
+    }
+
+    /// Two active intervals separated by inactive time sum to the active time
+    /// alone; the inactive gap contributes nothing.
+    #[test]
+    fn net_execution_time_excludes_the_inactive_interval_between_two_active_ones() {
+        let base = Instant::now();
+        let mut row = timing_row();
+
+        row.start_active_interval_at(base);
+        row.pause_active_interval_at(base + Duration::from_secs(10));
+        // 100 seconds parked in `error` before an operator retries.
+        row.start_active_interval_at(base + Duration::from_secs(110));
+        row.pause_active_interval_at(base + Duration::from_secs(115));
+
+        assert_eq!(row.elapsed_time, Some(Duration::from_secs(15)));
+        assert_eq!(
+            row.current_total_elapsed_at(base + Duration::from_secs(900)),
+            Some(Duration::from_secs(15)),
+            "an inactive row's retained total must not keep growing"
+        );
+    }
+
+    /// Repeated active updates keep the original start boundary.
+    #[test]
+    fn net_execution_time_repeated_active_updates_neither_reset_nor_double_count() {
+        let base = Instant::now();
+        let mut row = timing_row();
+
+        row.start_active_interval_at(base);
+        row.start_active_interval_at(base + Duration::from_secs(3));
+        row.start_active_interval_at(base + Duration::from_secs(7));
+
+        assert_eq!(row.started_at, Some(base));
+        assert_eq!(row.elapsed_time, None);
+        assert_eq!(
+            row.current_total_elapsed_at(base + Duration::from_secs(9)),
+            Some(Duration::from_secs(9))
+        );
+    }
+
+    /// Pausing an already-closed interval adds nothing.
+    #[test]
+    fn net_execution_time_pause_is_idempotent() {
+        let base = Instant::now();
+        let mut row = timing_row();
+
+        row.start_active_interval_at(base);
+        row.pause_active_interval_at(base + Duration::from_secs(12));
+        row.pause_active_interval_at(base + Duration::from_secs(60));
+
+        assert_eq!(row.started_at, None);
+        assert_eq!(row.elapsed_time, Some(Duration::from_secs(12)));
+    }
+
+    /// While active the display is the accumulated total plus the open interval.
+    #[test]
+    fn net_execution_time_while_active_adds_the_open_interval_to_the_total() {
+        let base = Instant::now();
+        let mut row = timing_row();
+        row.elapsed_time = Some(Duration::from_secs(30));
+
+        row.start_active_interval_at(base);
+
+        assert_eq!(
+            row.current_total_elapsed_at(base + Duration::from_secs(5)),
+            Some(Duration::from_secs(35))
+        );
+    }
+
+    /// A row that never executed has nothing to display.
+    #[test]
+    fn net_execution_time_is_absent_until_a_row_executes() {
+        let row = timing_row();
+        assert_eq!(row.current_total_elapsed(), None);
+        assert!(!row.has_execution_history());
+    }
+
+    /// Every status in the shared active vocabulary opens an interval, and every
+    /// other status closes it — the classification comes from `is_active_status`
+    /// alone, never from a second hand-written list.
+    #[test]
+    fn net_execution_time_status_transitions_follow_the_shared_active_vocabulary() {
+        use crate::orchestration::operator_command::ACTIVE_STATUSES;
+
+        for status in ACTIVE_STATUSES {
+            let mut row = timing_row();
+            row.set_display_status_cache(status);
+            assert!(
+                row.started_at.is_some(),
+                "`{status}` must open an active interval"
+            );
+        }
+
+        for status in [
+            "not queued",
+            "queued",
+            "blocked",
+            "stalled",
+            "merge wait",
+            "resolve pending",
+            "archived",
+            "merged",
+            "pushed",
+            "rejected",
+            "error",
+        ] {
+            let base = Instant::now();
+            let mut row = timing_row();
+            row.start_active_interval_at(base);
+            row.set_display_status_cache(status);
+            assert_eq!(
+                row.started_at, None,
+                "`{status}` must close the active interval"
+            );
+            assert!(
+                row.elapsed_time.is_some(),
+                "`{status}` must retain the accumulated duration"
+            );
+        }
+    }
+
+    /// Terminal, error, and stalled rows retain their accumulated duration.
+    #[test]
+    fn net_execution_time_is_retained_through_terminal_and_error_transitions() {
+        for status in ["merged", "error", "stalled"] {
+            let base = Instant::now();
+            let mut row = timing_row();
+            row.set_display_status_cache("applying");
+            row.started_at = Some(base);
+
+            row.set_display_status_cache(status);
+
+            assert_eq!(row.display_status_cache, status);
+            assert!(row.has_execution_history());
+            let retained = row.elapsed_time.expect("retained duration");
+            assert_eq!(
+                row.current_total_elapsed_at(base + Duration::from_secs(600)),
+                Some(retained),
+                "`{status}` must retain a frozen duration, not a growing one"
+            );
+        }
+    }
+
+    /// Reducer status synchronization is the same centralized boundary: it must
+    /// accumulate rather than restart, across a full inactive round trip.
+    #[test]
+    fn net_execution_time_survives_a_reducer_driven_inactive_round_trip() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        let mut display_map: HashMap<String, &'static str> = HashMap::new();
+        display_map.insert("change-a".to_string(), "applying");
+        app.apply_display_statuses_from_reducer(&display_map);
+        let first_start = app.changes[0].started_at.expect("interval opened");
+
+        display_map.insert("change-a".to_string(), "error");
+        app.apply_display_statuses_from_reducer(&display_map);
+        assert_eq!(app.changes[0].started_at, None);
+        let after_first = app.changes[0].elapsed_time.expect("first interval closed");
+
+        display_map.insert("change-a".to_string(), "applying");
+        app.apply_display_statuses_from_reducer(&display_map);
+        let second_start = app.changes[0].started_at.expect("interval reopened");
+
+        assert!(
+            second_start >= first_start,
+            "a fresh interval must be opened, not the closed one restored"
+        );
+        assert_eq!(
+            app.changes[0].elapsed_time,
+            Some(after_first),
+            "resuming must not discard the duration already accumulated"
+        );
     }
 
     fn visible_filtered_messages(app: &AppState) -> Vec<String> {
@@ -4831,6 +5098,43 @@ mod tests {
         app.execution_marks().set("change-a", false);
         app.sync_execution_marks_from_store();
         assert!(!app.changes[0].selected);
+    }
+
+    /// Verification `net-execution-time-tests`: a retained accumulated duration
+    /// is execution-history evidence in its own right, so a row that already
+    /// closed its interval survives a temporary catalog absence exactly as a
+    /// still-running one does.
+    #[test]
+    fn net_execution_time_catalog_refresh_retains_an_inactive_row_with_retained_time() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 1, 1)]);
+        app.changes[0].set_display_status_cache("applying");
+        app.changes[0].set_display_status_cache("not queued");
+        let retained = app.changes[0].elapsed_time.expect("closed interval");
+        assert_eq!(app.changes[0].started_at, None);
+
+        // The change is absent from this snapshot while its worktree is
+        // refreshed; nothing else keeps the row alive.
+        app.update_changes_with_rejected_for_test(Vec::new(), Vec::new());
+
+        let row = app
+            .changes
+            .iter()
+            .find(|c| c.id == "change-a")
+            .expect("row with retained execution time must survive a temporary absence");
+        assert_eq!(row.elapsed_time, Some(retained));
+        assert!(app.known_change_ids.contains("change-a"));
+    }
+
+    /// A row that never executed still drops out of an absent snapshot: the
+    /// retention rule is execution evidence, not a blanket keep-everything.
+    #[test]
+    fn net_execution_time_catalog_refresh_still_drops_a_row_that_never_executed() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        assert!(!app.changes[0].has_execution_history());
+
+        app.update_changes_with_rejected_for_test(Vec::new(), Vec::new());
+
+        assert!(app.changes.iter().all(|c| c.id != "change-a"));
     }
 
     #[test]

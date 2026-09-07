@@ -10,9 +10,6 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             change.set_error_message_cache(error.clone());
-            if let Some(started) = change.started_at {
-                change.elapsed_time = Some(started.elapsed());
-            }
         }
         self.add_log(LogEntry::error(format!("Error in {}: {}", id, error)).with_change_id(&id));
         self.error_change_id = Some(id.clone());
@@ -23,9 +20,6 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_error_message_cache(error.clone());
-            if let Some(started) = change.started_at {
-                change.elapsed_time = Some(started.elapsed());
-            }
         }
         self.add_log(
             LogEntry::error(format!("Apply failed for {}: {}", change_id, error))
@@ -37,9 +31,6 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_error_message_cache(error.clone());
-            if let Some(started) = change.started_at {
-                change.elapsed_time = Some(started.elapsed());
-            }
         }
         self.add_log(
             LogEntry::error(format!("Archive failed for {}: {}", change_id, error))
@@ -71,9 +62,6 @@ impl AppState {
                 return;
             }
             change.set_display_status_cache("merge wait");
-            if let Some(started) = change.started_at {
-                change.elapsed_time = Some(started.elapsed());
-            }
         }
         let message = format!("Failed to resolve merge for '{}': {}", change_id, error);
         self.add_log(LogEntry::error(message).with_change_id(&change_id));
@@ -99,9 +87,6 @@ impl AppState {
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                 if change.display_status_cache != "merged" {
                     change.set_display_status_cache("merge wait");
-                    if let Some(started) = change.started_at {
-                        change.elapsed_time = Some(started.elapsed());
-                    }
                 }
             }
             let message = format!(

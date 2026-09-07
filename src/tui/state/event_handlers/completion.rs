@@ -74,9 +74,6 @@ impl AppState {
             if !matches!(change.display_status_cache.as_str(), "merged" | "resolving") {
                 change.set_display_status_cache("archived");
             }
-            if let Some(started) = change.started_at {
-                change.elapsed_time = Some(started.elapsed());
-            }
             let worktree_path = self.worktree_paths.get(&id).map(|p| p.as_path());
             if let Ok(progress) = task_parser::parse_progress_with_fallback(&id, worktree_path) {
                 if progress.total > 0 {
@@ -98,9 +95,6 @@ impl AppState {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             already_merged = change.display_status_cache == "merged";
             change.set_display_status_cache("merged");
-            if let Some(started) = change.started_at {
-                change.elapsed_time = Some(started.elapsed());
-            }
             let worktree_path = self.worktree_paths.get(&change_id).map(|p| p.as_path());
             if let Ok(progress) =
                 task_parser::parse_progress_with_fallback(&change_id, worktree_path)
@@ -128,9 +122,6 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("merged");
-            if let Some(started) = change.started_at {
-                change.elapsed_time = Some(started.elapsed());
-            }
             let worktree_path = self.worktree_paths.get(&change_id).map(|p| p.as_path());
             if let Ok(progress) =
                 task_parser::parse_progress_with_fallback(&change_id, worktree_path)
@@ -248,9 +239,6 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("not queued");
-            if let Some(started) = change.started_at {
-                change.elapsed_time = Some(started.elapsed());
-            }
         }
         self.add_log(LogEntry::info(format!("Stopped: {}", change_id)).with_change_id(&change_id));
     }

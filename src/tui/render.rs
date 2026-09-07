@@ -1257,13 +1257,12 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     Color::White
                 };
 
-                // Calculate elapsed time first
-                let elapsed_text = if let Some(elapsed) = change.elapsed_time {
-                    format_duration(elapsed)
-                } else if let Some(started) = change.started_at {
-                    format_duration(started.elapsed())
-                } else {
-                    "--".to_string()
+                // Net execution time: accumulated closed intervals plus the open
+                // one while active, the retained accumulated value otherwise.
+                let net_elapsed = change.current_total_elapsed();
+                let elapsed_text = match net_elapsed {
+                    Some(elapsed) => format_duration(elapsed),
+                    None => "--".to_string(),
                 };
 
                 // Build status text (without spinner for in-flight states)
@@ -1287,18 +1286,27 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     _ => (String::new(), format!("[{}]", change.status_badge())),
                 };
 
-                // Pre-calculate widths before moving values into Spans
-                let (spinner_elapsed_width, status_only_width) = if !spinner_prefix.is_empty() {
-                    let spinner_elapsed_text =
-                        format!(" {}{:>7} ", spinner_prefix.trim(), elapsed_text);
-                    // Display columns, not bytes: the spinner glyph is multi-byte.
-                    (
-                        display_width(&spinner_elapsed_text),
-                        display_width(&status_text),
-                    )
+                // The timing field occupies one fixed area for every row that has
+                // execution time to show. An inactive or terminal row keeps that
+                // area and the badge column that follows it, substituting a blank
+                // for the spinner rather than dropping the field: a row that goes
+                // `applying` -> `merged` must not move its own elapsed value or
+                // badge sideways. A row that never executed has nothing to place
+                // there and keeps the original right-aligned status field.
+                let timing_field = if !spinner_prefix.is_empty() {
+                    Some(format!(" {}{:>7} ", spinner_prefix.trim(), elapsed_text))
                 } else {
-                    let status_formatted = format!(" {:>18}", status_text);
-                    (0, display_width(&status_formatted))
+                    net_elapsed.map(|_| format!("  {:>7} ", elapsed_text))
+                };
+
+                // Pre-calculate widths before moving values into Spans
+                let (spinner_elapsed_width, status_only_width) = match timing_field.as_ref() {
+                    // Display columns, not bytes: the spinner glyph is multi-byte.
+                    Some(field) => (display_width(field), display_width(&status_text)),
+                    None => {
+                        let status_formatted = format!(" {:>18}", status_text);
+                        (0, display_width(&status_formatted))
+                    }
                 };
 
                 // In grouped mode show only the bare change id (no project prefix).
@@ -1333,22 +1341,22 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                     ),
                 ];
 
-                // For in-flight states: spinner → elapsed → status
-                // For other states: status only
-                if !spinner_prefix.is_empty() {
-                    spans.push(Span::styled(
-                        format!(" {}{:>7} ", spinner_prefix.trim(), elapsed_text),
-                        Style::default().fg(dim_color),
-                    ));
-                    spans.push(Span::styled(
-                        status_text,
-                        Style::default().fg(change.display_color_cache),
-                    ));
-                } else {
-                    spans.push(Span::styled(
-                        format!(" {:>18}", status_text),
-                        Style::default().fg(change.display_color_cache),
-                    ));
+                // With execution time: [spinner or blank + elapsed] → status.
+                // Without any: status only, right-aligned as before.
+                match timing_field {
+                    Some(field) => {
+                        spans.push(Span::styled(field, Style::default().fg(dim_color)));
+                        spans.push(Span::styled(
+                            status_text,
+                            Style::default().fg(change.display_color_cache),
+                        ));
+                    }
+                    None => {
+                        spans.push(Span::styled(
+                            format!(" {:>18}", status_text),
+                            Style::default().fg(change.display_color_cache),
+                        ));
+                    }
                 }
 
                 // For Applying status, show progress as "completed/total(percent%)"
@@ -3920,6 +3928,83 @@ mod tests {
                  {short_row}\n{long_row}"
             );
         }
+    }
+
+    /// Verification `net-execution-time-tests`: an inactive or terminal row keeps
+    /// its net execution time in the same field area an active row uses, so the
+    /// status badge does not slide sideways when the spinner stops.
+    #[test]
+    fn net_execution_time_render_retains_the_elapsed_field_on_inactive_rows() {
+        for status in ["merged", "error", "stalled"] {
+            let mut app = create_test_app(vec![
+                create_test_change("active-row"),
+                create_test_change("retained-row"),
+            ]);
+            app.execution_mode = AppExecutionMode::Running;
+            // A non-empty log buffer is what selects the running list, which is
+            // the layout that owns the elapsed field.
+            app.add_log(LogEntry::info("log"));
+            app.spinner_frame = 0;
+            // No open interval on either row, so the rendered duration is the
+            // retained total exactly and the assertion needs no tolerance.
+            app.changes[0].set_display_status_cache("applying");
+            app.changes[0].started_at = None;
+            app.changes[0].elapsed_time = Some(Duration::from_secs(75));
+            app.changes[1].set_display_status_cache(status);
+            app.changes[1].elapsed_time = Some(Duration::from_secs(75));
+
+            let buffer = render_buffer(&mut app, 120, 30);
+            let active_row = rendered_row(&buffer, "active-row");
+            let retained_row = rendered_row(&buffer, "retained-row");
+
+            assert!(
+                retained_row.contains("1m 15s"),
+                "a `{status}` row must keep showing its net execution time:\n{retained_row}"
+            );
+            assert!(
+                !retained_row.contains("--"),
+                "a `{status}` row with execution history must not render the placeholder:\n\
+                 {retained_row}"
+            );
+            let active_badge_column = active_row
+                .find("[applying]")
+                .map(|i| active_row[..i].chars().count());
+            let retained_badge_column = retained_row
+                .find(&format!("[{status}]"))
+                .map(|i| retained_row[..i].chars().count());
+            assert_eq!(
+                active_badge_column, retained_badge_column,
+                "`[{status}]` must start in the same column as an active badge:\n\
+                 {active_row}\n{retained_row}"
+            );
+            let elapsed_column = |row: &str| row.find("1m 15s").map(|i| row[..i].chars().count());
+            assert_eq!(
+                elapsed_column(&active_row),
+                elapsed_column(&retained_row),
+                "the elapsed field must occupy the same columns on both rows:\n\
+                 {active_row}\n{retained_row}"
+            );
+        }
+    }
+
+    /// A row that never executed keeps the original right-aligned status field:
+    /// retention adds a field where there is history, it does not re-lay out
+    /// every inactive row.
+    #[test]
+    fn net_execution_time_render_leaves_a_row_without_history_unchanged() {
+        let mut app = create_test_app(vec![create_test_change("idle-row")]);
+        app.execution_mode = AppExecutionMode::Running;
+        app.add_log(LogEntry::info("log"));
+        app.changes[0].set_display_status_cache("not queued");
+        assert!(!app.changes[0].has_execution_history());
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let row = rendered_row(&buffer, "idle-row");
+
+        assert!(
+            row.contains("       [not queued]"),
+            "a never-executed row keeps the right-aligned status field:\n{row}"
+        );
     }
 
     /// Both layouts start the ID exactly one column after the checkbox area, for
