@@ -175,7 +175,11 @@ pub(super) fn update_changes_with_rejected(
     state.changes.retain(|c| {
         active_ids.contains(&c.id)
             || rejected_ids.contains(&c.id)
-            || c.started_at.is_some()
+            // Either an open active interval or a retained accumulated
+            // duration proves this row executed, so an inactive row whose
+            // interval was already closed survives a temporary catalog absence
+            // exactly as a still-running one does — no separate durable flag.
+            || c.has_execution_history()
             || matches!(
                 c.display_status_cache.as_str(),
                 "archiving"
@@ -196,9 +200,9 @@ pub(super) fn update_changes_with_rejected(
     // above drops the row, and a known-ID entry left behind would classify the
     // change as already seen when it is observed again, so the row could never
     // be reconstructed. Conversely an ID whose row was deliberately retained
-    // through the absence (recorded start, or a terminal/wait display status)
-    // stays known, so re-observing it updates that row in place instead of
-    // pushing a duplicate NEW row.
+    // through the absence — recorded execution history, or a terminal/wait
+    // display status — stays known, so re-observing it updates that row in
+    // place instead of pushing a duplicate NEW row.
     //
     // This is observability bookkeeping only: it decides whether a row is
     // painted as newly detected and logged, never queue membership, dispatch,
