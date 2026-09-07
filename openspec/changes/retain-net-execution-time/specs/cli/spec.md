@@ -8,6 +8,8 @@ While a row is active, the displayed duration SHALL equal all completed active i
 
 Rows with retained elapsed time SHALL continue displaying that value after inactive or terminal transitions, including `merged`, `error`, and `stalled`, without changing existing status badge, spinner, iteration-label, or row-alignment contracts.
 
+The process-level `Stopped` event SHALL close every open interval through the same idempotent pause operation even when no status transition accompanies the event. Catalog refresh SHALL retain a temporarily absent row when an open interval or retained accumulated duration proves execution history.
+
 #### Scenario: Inactive interval is excluded after execution resumes
 
 - **GIVEN** a change has completed one active execution interval
@@ -29,6 +31,20 @@ Rows with retained elapsed time SHALL continue displaying that value after inact
 - **WHEN** its display status becomes `merged`, `error`, or `stalled`
 - **THEN** the Changes list continues to show the accumulated elapsed value in the row
 - **AND** the value does not increase while the row remains inactive
+
+#### Scenario: Process stop is order-independent
+
+- **GIVEN** a change has an open active interval
+- **WHEN** a process-level `Stopped` event arrives before or after reducer status synchronization
+- **THEN** the interval is closed at most once through the centralized pause operation
+- **AND** a later inactive status update does not add the interval again
+
+#### Scenario: Catalog refresh preserves inactive execution history
+
+- **GIVEN** a change has retained accumulated elapsed time and no open interval
+- **WHEN** the change is temporarily absent from a catalog snapshot during worktree processing
+- **THEN** the TUI retains the row and its elapsed value
+- **AND** no separate durable execution-history flag is required
 
 #### Scenario: Timing state remains observational
 
