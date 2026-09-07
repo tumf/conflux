@@ -22,8 +22,9 @@ use crate::execution::stage_gate::WorkspaceStageStatus;
 use crate::execution::state::{detect_workspace_state, is_merged_to_base, WorkspaceState};
 use crate::orchestration::acceptance::{
     decide_acceptance_blocker, decide_acceptance_retry, normalize_findings,
-    semantic_progress_fingerprint, AcceptanceBlockerDecision, AcceptanceProtocolDriver,
-    AcceptanceRetryDecision, MissingVerdictRetryStep, MAX_ACCEPTANCE_RETRY_CYCLES,
+    semantic_progress_fingerprint, AcceptanceBlockerDecision, AcceptanceEscalationDriver,
+    AcceptanceProtocolDriver, AcceptanceRetryDecision, MissingVerdictRetryStep,
+    MAX_ACCEPTANCE_RETRY_CYCLES,
 };
 use crate::orchestration::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
@@ -2015,6 +2016,12 @@ impl ParallelExecutor {
             // restart re-runs acceptance from workspace state instead of
             // resuming a protocol-retry sequence.
             let mut protocol = AcceptanceProtocolDriver::default();
+            // Consecutive invalid-result accounting and alternate-reviewer
+            // selection for this dispatch only. It never adds a retry: it decides
+            // which reviewer command an already-permitted Acceptance-only retry
+            // runs. Active-run memory, never persisted, so a restart runs
+            // ordinary Acceptance from workspace and Git evidence.
+            let mut escalation = AcceptanceEscalationDriver::from_config(&config);
             // Consecutive Acceptance command-failure accounting for this dispatch
             // only, shared across orchestration through the same policy API.
             // It is independent from the protocol, explicit-CONTINUE, and
@@ -2883,6 +2890,9 @@ impl ParallelExecutor {
                     let mut pending_protocol_retry: Option<
                         crate::orchestration::acceptance::AcceptanceProtocolRetry,
                     > = None;
+                    let mut pending_command_mode: Option<
+                        crate::orchestration::acceptance::AcceptanceCommandMode,
+                    > = None;
                     loop {
                         // A command that never completed left any pending protocol
                         // continuation unanswered, so the same context is carried
@@ -2890,6 +2900,14 @@ impl ParallelExecutor {
                         let protocol_retry = pending_protocol_retry
                             .take()
                             .or_else(|| protocol.take_protocol_retry());
+                        // The escalation selection is consumed here, alongside the
+                        // protocol continuation, so exactly one invocation can
+                        // claim it. A command failure below restores it with the
+                        // same pending marker, because that invocation never ran
+                        // the reviewer at all.
+                        let command_mode = pending_command_mode
+                            .take()
+                            .unwrap_or_else(|| escalation.take_command_mode());
                         agent.seed_acceptance_history(acceptance_history.lock().await.clone());
                         let outcome = execute_acceptance_in_workspace(
                             &change_id,
@@ -2903,6 +2921,7 @@ impl ParallelExecutor {
                             &acceptance_history,
                             Some(base_branch.as_str()),
                             protocol_retry,
+                            command_mode,
                         )
                         .await;
 
@@ -2943,6 +2962,7 @@ impl ParallelExecutor {
                                                 .await;
                                         }
                                         pending_protocol_retry = protocol_retry;
+                                        pending_command_mode = Some(command_mode);
                                         continue;
                                     }
                                     crate::orchestration::acceptance::AcceptanceCommandRecovery::Exhausted {
@@ -2994,6 +3014,44 @@ impl ParallelExecutor {
                     .is_ok_and(|(result, _)| result.is_canonical_verdict())
                 {
                     protocol.observe_canonical_verdict();
+                }
+
+                // Bounded invalid-result accounting runs before routing, because
+                // an empty FAIL is the one eligible class whose routing the
+                // decision changes: when escalation is selected it becomes an
+                // acceptance-only alternate review instead of a generic
+                // FAIL-to-Apply repair. Every other class keeps its existing
+                // routing and only learns which reviewer its already-permitted
+                // retry runs.
+                let mut escalate_empty_fail = false;
+                if let Ok((result, acceptance_iteration)) = acceptance_result.as_ref() {
+                    let escalation_revision =
+                        crate::vcs::git::commands::get_current_commit(&workspace.path)
+                            .await
+                            .ok();
+                    let escalation_outcome =
+                        escalation.observe(result, escalation_revision.as_deref());
+                    escalate_empty_fail =
+                        crate::orchestration::acceptance::escalates_empty_fail(&escalation_outcome);
+                    if let Some(diagnostic) = escalation_outcome.diagnostic() {
+                        info!(
+                            "Acceptance escalation policy for {} (cycle {}): {}",
+                            change_id, cycle_count, diagnostic
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::info(format!(
+                                        "{} (cycle {})",
+                                        diagnostic, cycle_count
+                                    ))
+                                    .with_change_id(&change_id)
+                                    .with_operation("acceptance")
+                                    .with_iteration(*acceptance_iteration),
+                                ))
+                                .await;
+                        }
+                    }
                 }
 
                 match acceptance_result {
@@ -3118,6 +3176,39 @@ impl ParallelExecutor {
                         crate::orchestration::AcceptanceResult::Fail { findings },
                         acceptance_iteration,
                     )) => {
+                        if escalate_empty_fail {
+                            // A FAIL reduced to the exact generic fallback names
+                            // no defect to repair, so no Apply repair is
+                            // dispatched from it: no follow-up is written to the
+                            // workspace, no per-finding repair opportunity is
+                            // consumed, and the retry budget stays reserved for
+                            // real FAIL-to-Apply cycles. The alternate reviewer
+                            // gets one bounded chance to produce an actionable
+                            // verdict instead.
+                            warn!(
+                                "Acceptance failed for {} with no actionable findings (cycle {}); \
+                                 re-running acceptance only with the escalation command",
+                                change_id, cycle_count
+                            );
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::info(format!(
+                                            "Acceptance FAIL carried no actionable finding (cycle \
+                                             {}); re-running acceptance only with \
+                                             acceptance_escalation_command instead of dispatching \
+                                             a generic repair",
+                                            cycle_count
+                                        ))
+                                        .with_change_id(&change_id)
+                                        .with_operation("acceptance")
+                                        .with_iteration(acceptance_iteration),
+                                    ))
+                                    .await;
+                            }
+                            skip_apply_once = true;
+                            continue;
+                        }
                         let blocking_gate_context = findings
                             .first()
                             .map(|finding| finding.text().to_string())
@@ -3347,6 +3438,10 @@ impl ParallelExecutor {
                                         ))
                                         .await;
                                 }
+                                // Acceptance only: the implementation did not
+                                // fail, so the corrected verdict is asked for
+                                // without rerunning Apply or cleanup-review.
+                                skip_apply_once = true;
                                 continue;
                             }
                             crate::orchestration::acceptance::MissingVerdictRetryStep::Exhausted {

@@ -346,6 +346,138 @@ mod tests {
         assert!(config.validate_required_commands().is_ok());
     }
 
+    #[test]
+    fn acceptance_escalation_command_and_policy_are_optional_and_parsed() {
+        let jsonc = r#"{
+            "apply_command": "apply {change_id}",
+            "archive_command": "archive {change_id}",
+            "analyze_command": "analyze {prompt}",
+            "acceptance_command": "accept {change_id} {prompt}",
+            "acceptance_escalation_command": "deep-accept {change_id} {prompt}",
+            "resolve_command": "resolve {prompt}",
+            "acceptance_escalation": {
+                "after_invalid_results": 2,
+                "max_uses_per_sequence": 3
+            }
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+
+        assert_eq!(
+            config.get_acceptance_command().unwrap(),
+            "accept {change_id} {prompt}"
+        );
+        assert_eq!(
+            config.get_acceptance_escalation_command(),
+            Some("deep-accept {change_id} {prompt}")
+        );
+        let policy = config.get_acceptance_escalation();
+        assert_eq!(policy.after_invalid_results(), 2);
+        assert_eq!(policy.max_uses_per_sequence(), 3);
+        assert!(config.validate_required_commands().is_ok());
+    }
+
+    /// Omitting the optional command must not warn or fail validation, and the
+    /// policy still resolves to its bounded defaults.
+    #[test]
+    fn missing_acceptance_escalation_config_is_a_silent_noop() {
+        let config = complete_required_command_config();
+
+        assert!(config.acceptance_escalation_command.is_none());
+        assert!(config.acceptance_escalation.is_none());
+        assert_eq!(config.get_acceptance_escalation_command(), None);
+        let policy = config.get_acceptance_escalation();
+        assert_eq!(policy.after_invalid_results(), 1);
+        assert_eq!(policy.max_uses_per_sequence(), 1);
+        assert!(config.validate_required_commands().is_ok());
+    }
+
+    /// The two knobs answer different questions, so a higher-priority layer that
+    /// overrides one must keep the lower-priority value of the other.
+    #[test]
+    fn acceptance_escalation_policy_values_merge_item_wise() {
+        let mut base = complete_required_command_config();
+        base.acceptance_escalation = Some(AcceptanceEscalationConfig {
+            after_invalid_results: Some(2),
+            max_uses_per_sequence: Some(4),
+        });
+
+        base.merge(OrchestratorConfig {
+            acceptance_escalation: Some(AcceptanceEscalationConfig {
+                after_invalid_results: Some(3),
+                max_uses_per_sequence: None,
+            }),
+            ..Default::default()
+        });
+
+        let policy = base.get_acceptance_escalation();
+        assert_eq!(policy.after_invalid_results(), 3);
+        assert_eq!(
+            policy.max_uses_per_sequence(),
+            4,
+            "overriding the threshold must not reset the maximum-use value"
+        );
+    }
+
+    /// A layer that configures no escalation at all preserves whatever the
+    /// lower-priority layer set, command and policy alike.
+    #[test]
+    fn acceptance_escalation_merge_preserves_unset_layers() {
+        let mut base = complete_required_command_config();
+        base.acceptance_escalation_command = Some("deep-accept {prompt}".to_string());
+        base.acceptance_escalation = Some(AcceptanceEscalationConfig {
+            after_invalid_results: Some(2),
+            max_uses_per_sequence: Some(4),
+        });
+
+        base.merge(OrchestratorConfig::default());
+
+        assert_eq!(
+            base.get_acceptance_escalation_command(),
+            Some("deep-accept {prompt}")
+        );
+        let policy = base.get_acceptance_escalation();
+        assert_eq!(policy.after_invalid_results(), 2);
+        assert_eq!(policy.max_uses_per_sequence(), 4);
+    }
+
+    /// Zero has no coherent meaning: disabling escalation is done by omitting
+    /// the command, so a zero is reported as the operator mistake it is.
+    #[test]
+    fn zero_acceptance_escalation_policy_value_is_rejected() {
+        for (field, policy) in [
+            (
+                "after_invalid_results",
+                AcceptanceEscalationConfig {
+                    after_invalid_results: Some(0),
+                    max_uses_per_sequence: Some(1),
+                },
+            ),
+            (
+                "max_uses_per_sequence",
+                AcceptanceEscalationConfig {
+                    after_invalid_results: Some(1),
+                    max_uses_per_sequence: Some(0),
+                },
+            ),
+        ] {
+            let mut config = complete_required_command_config();
+            config.acceptance_escalation = Some(policy);
+
+            let message = config
+                .validate_required_commands()
+                .expect_err("a zero policy value must fail validation")
+                .to_string();
+            assert!(
+                message.contains(&format!("acceptance_escalation.{field}")),
+                "diagnostic must name the offending field: {message}"
+            );
+            assert!(
+                message.contains("positive integer"),
+                "diagnostic must state the positive-value requirement: {message}"
+            );
+        }
+    }
+
     fn complete_required_command_config() -> OrchestratorConfig {
         OrchestratorConfig {
             apply_command: Some("apply {change_id}".to_string()),

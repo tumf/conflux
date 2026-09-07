@@ -105,6 +105,19 @@ pub const DEFAULT_APPLY_ESCALATION_AFTER_EMPTY_WIP: Option<u32> = None;
 /// Defaults to no escalation policy unless explicitly configured.
 pub const DEFAULT_APPLY_ESCALATION_MAX_USES_PER_STALL: Option<u32> = None;
 
+/// Default number of consecutive invalid Acceptance results before the next
+/// permitted Acceptance-only retry uses the escalation reviewer command.
+///
+/// Unlike the Apply escalation policy this has a usable built-in default: the
+/// optional `acceptance_escalation_command` is itself the opt-in, so an operator
+/// who configures the command gets the bounded default policy without having to
+/// spell it out.
+pub const DEFAULT_ACCEPTANCE_ESCALATION_AFTER_INVALID_RESULTS: u32 = 1;
+
+/// Default maximum Acceptance escalation-command uses within one consecutive
+/// invalid-result sequence.
+pub const DEFAULT_ACCEPTANCE_ESCALATION_MAX_USES_PER_SEQUENCE: u32 = 1;
+
 /// Default delay between command executions (milliseconds)
 pub const DEFAULT_STAGGER_DELAY_MS: u64 = 2000;
 
