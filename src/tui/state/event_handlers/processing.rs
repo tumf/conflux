@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use crate::parallel::dedup::DiagnosticDeduplicationKey;
 use crate::task_parser;
 use crate::tui::events::LogEntry;
@@ -12,9 +10,9 @@ impl AppState {
         self.reset_analysis_log_dedupe();
         self.current_change = Some(id.clone());
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
+            // The status transition itself opens the active interval; a fresh
+            // run adds to the retained total rather than discarding it.
             change.set_display_status_cache("applying");
-            change.started_at = Some(Instant::now());
-            change.elapsed_time = None;
         }
         self.add_log(LogEntry::info(format!("Processing: {}", id)).with_change_id(&id));
     }
@@ -22,11 +20,7 @@ impl AppState {
     pub(crate) fn handle_apply_started(&mut self, change_id: String, command: String) {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if change.started_at.is_none() {
-                change.started_at = Some(Instant::now());
-            }
             change.set_display_status_cache("applying");
-            change.elapsed_time = None;
             change.iteration_number = None;
         }
         self.add_log(
@@ -50,9 +44,6 @@ impl AppState {
                     "Ignoring stale ArchiveStarted event for row already displayed as merged"
                 );
             } else {
-                if change.started_at.is_none() {
-                    change.started_at = Some(Instant::now());
-                }
                 change.set_display_status_cache("archiving");
                 change.iteration_number = None;
             }
@@ -82,11 +73,7 @@ impl AppState {
         // scheduler-owned resolves never went through a reservation request.
         self.set_resolving(&change_id);
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if change.started_at.is_none() {
-                change.started_at = Some(Instant::now());
-            }
             change.set_display_status_cache("resolving");
-            change.elapsed_time = None;
             change.iteration_number = None;
         }
         self.add_log(
@@ -123,9 +110,6 @@ impl AppState {
     pub(crate) fn handle_acceptance_started(&mut self, change_id: String, command: String) {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if change.started_at.is_none() {
-                change.started_at = Some(Instant::now());
-            }
             change.set_display_status_cache("accepting");
             change.iteration_number = None;
         }
@@ -202,14 +186,16 @@ impl AppState {
             self.orchestration_elapsed = Some(started.elapsed());
         }
 
-        // Freeze the elapsed value of every run that was still timing. The
+        // Close the active interval of every run that was still timing, through
+        // the same centralized idempotent pause a status transition uses. The
         // status cache is deliberately not consulted: the reducer has already
         // moved these rows to `not queued`, so a status-keyed condition here
-        // would silently stop recording durations.
+        // would silently stop recording durations. Because the pause is
+        // idempotent, this event and the reducer's own `not queued`
+        // synchronization close the interval exactly once between them, in
+        // either order.
         for change in &mut self.changes {
-            if let (Some(started), None) = (change.started_at, change.elapsed_time) {
-                change.elapsed_time = Some(started.elapsed());
-            }
+            change.pause_active_interval();
         }
         if !already_stopped {
             self.add_log(LogEntry::warn("Processing stopped"));
@@ -236,6 +222,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
+    use std::time::{Duration, Instant};
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -441,8 +428,10 @@ mod tests {
         assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
     }
 
+    /// `Stopped` closes every open interval through the centralized pause and
+    /// leaves an already-closed one exactly as it was.
     #[test]
-    fn stopped_freezes_elapsed_time_for_runs_that_were_still_timing() {
+    fn stopped_pauses_net_execution_time_for_runs_that_were_still_timing() {
         let changes = vec![
             create_test_change("change-a", 3, 3),
             create_test_change("change-b", 2, 4),
@@ -452,25 +441,77 @@ mod tests {
         // The reducer has already reconciled this row for the stopped run, so
         // its status carries no evidence of the interrupted work any more.
         app.changes[0].display_status_cache = "not queued".to_string();
-        app.changes[0].started_at = Some(Instant::now());
+        app.changes[0].started_at = Some(Instant::now() - Duration::from_secs(30));
+        app.changes[0].elapsed_time = Some(Duration::from_secs(5));
         app.changes[0].selected = true;
+        // A finished run has no open interval left to close.
         app.changes[1].display_status_cache = "merged".to_string();
-        app.changes[1].started_at = Some(Instant::now());
-        app.changes[1].elapsed_time = Some(std::time::Duration::from_secs(7));
+        app.changes[1].elapsed_time = Some(Duration::from_secs(7));
 
         app.handle_stopped();
 
+        assert_eq!(app.changes[0].started_at, None);
+        let interrupted = app.changes[0]
+            .elapsed_time
+            .expect("interrupted run duration");
         assert!(
-            app.changes[0].elapsed_time.is_some(),
-            "an interrupted run must still report how long it ran"
+            interrupted >= Duration::from_secs(35),
+            "an interrupted run must add its open interval to the retained total, got {interrupted:?}"
         );
         assert_eq!(
             app.changes[1].elapsed_time,
-            Some(std::time::Duration::from_secs(7)),
+            Some(Duration::from_secs(7)),
             "a finished run keeps the duration it already recorded"
         );
         assert!(app.changes[0].selected);
         assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
+    }
+
+    /// Verification `net-execution-time-tests`: the process-level stop boundary
+    /// is order-independent with respect to reducer status synchronization.
+    ///
+    /// Whichever of the two arrives second finds no open interval, so the
+    /// interval is folded in exactly once either way.
+    #[test]
+    fn net_execution_time_process_stop_is_order_independent() {
+        for stop_first in [true, false] {
+            let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+            app.execution_mode = AppExecutionMode::Running;
+            app.changes[0].set_display_status_cache("applying");
+            app.changes[0].started_at = Some(Instant::now() - Duration::from_secs(20));
+
+            if stop_first {
+                app.handle_stopped();
+                app.changes[0].set_display_status_cache("not queued");
+            } else {
+                app.changes[0].set_display_status_cache("not queued");
+                app.handle_stopped();
+            }
+
+            assert_eq!(app.changes[0].started_at, None, "stop_first={stop_first}");
+            let total = app.changes[0].elapsed_time.expect("closed interval");
+            assert!(
+                (Duration::from_secs(20)..Duration::from_secs(40)).contains(&total),
+                "the single interval must be added exactly once (stop_first={stop_first}), got {total:?}"
+            );
+        }
+    }
+
+    /// A fresh active phase adds to the retained total instead of discarding it.
+    #[test]
+    fn net_execution_time_processing_started_resumes_without_clearing_the_total() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.changes[0].elapsed_time = Some(Duration::from_secs(11));
+
+        app.handle_processing_started("change-a".to_string());
+
+        assert_eq!(app.changes[0].display_status_cache, "applying");
+        assert!(app.changes[0].started_at.is_some());
+        assert_eq!(
+            app.changes[0].elapsed_time,
+            Some(Duration::from_secs(11)),
+            "resuming must not discard the duration already accumulated"
+        );
     }
 
     #[test]
