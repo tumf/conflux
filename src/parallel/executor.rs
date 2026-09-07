@@ -1642,6 +1642,7 @@ pub async fn execute_acceptance_in_workspace(
     acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
     base_branch: Option<&str>,
     protocol_retry: Option<crate::orchestration::acceptance::AcceptanceProtocolRetry>,
+    command_mode: crate::orchestration::acceptance::AcceptanceCommandMode,
 ) -> Result<(crate::orchestration::AcceptanceResult, u32)> {
     use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
 
@@ -1809,15 +1810,26 @@ pub async fn execute_acceptance_in_workspace(
     );
     let full_prompt =
         crate::agent::append_optional_prompt(full_prompt, Some(&verification_reuse_context));
+    // Trusted Conflux-owned framing, appended only for an escalation retry.
+    let full_prompt = crate::agent::append_optional_prompt(
+        full_prompt,
+        Some(&crate::agent::build_acceptance_escalation_context(
+            command_mode,
+        )),
+    );
 
-    // Expand change_id and prompt in command
-    let template = config.get_acceptance_command()?;
+    // Expand change_id and prompt in command. Only the template differs between
+    // the normal and the escalation reviewer: the placeholder contract and the
+    // generated prompt above are identical for both.
+    let template =
+        crate::orchestration::acceptance::acceptance_command_template(config, command_mode)?;
     let command = OrchestratorConfig::expand_change_id(template, change_id);
     let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
 
     debug!(
         module = module_path!(),
         command = %crate::events::command_log_summary(&command),
+        command_mode = command_mode.label(),
         cwd = ?workspace_path,
         "Executing acceptance command via AiCommandRunner"
     );
@@ -2502,7 +2514,7 @@ pub async fn execute_acceptance_in_workspace(
         ParseResult::Fail { findings } => {
             let findings_for_tasks = if findings.is_empty() {
                 crate::acceptance::legacy_findings([
-                    "Investigate acceptance failure and apply the required fix",
+                    crate::orchestration::acceptance::GENERIC_ACCEPTANCE_FAIL_FINDING,
                 ])
             } else {
                 findings

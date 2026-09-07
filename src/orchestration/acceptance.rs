@@ -637,6 +637,411 @@ impl AcceptanceProtocolDriver {
     }
 }
 
+// ── Bounded Acceptance escalation ──────────────────────────────────────────
+
+/// The exact generic finding runtime substitutes when a FAIL verdict carried no
+/// parsed findings at all.
+///
+/// It names no defect, no evidence, and no required change, so a FAIL reduced to
+/// exactly this line is reviewer output that failed to say anything actionable —
+/// which is why it is an escalation-eligible invalid result rather than repair
+/// work. A FAIL carrying any other finding is a real defect report and keeps its
+/// FAIL-to-Apply routing.
+pub const GENERIC_ACCEPTANCE_FAIL_FINDING: &str =
+    "Investigate acceptance failure and apply the required fix";
+
+/// Which reviewer command template one Acceptance invocation runs.
+///
+/// The mode is a decision the shared policy makes; `AgentRunner` only resolves
+/// the matching template. Nothing else about the invocation differs, so a
+/// frontend cannot accidentally give the alternate reviewer a different prompt
+/// contract, history window, or placeholder set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AcceptanceCommandMode {
+    /// The configured `acceptance_command`.
+    #[default]
+    Normal,
+    /// The optional `acceptance_escalation_command`.
+    Escalation,
+}
+
+impl AcceptanceCommandMode {
+    /// Whether this invocation runs the alternate reviewer.
+    pub fn is_escalation(self) -> bool {
+        matches!(self, AcceptanceCommandMode::Escalation)
+    }
+
+    /// Short label used in operator-facing diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            AcceptanceCommandMode::Normal => "acceptance_command",
+            AcceptanceCommandMode::Escalation => "acceptance_escalation_command",
+        }
+    }
+}
+
+/// Resolve the reviewer command template one Acceptance invocation runs.
+///
+/// The single resolution point every frontend uses, so "which command did this
+/// invocation actually run" has exactly one answer. Escalation is selected only
+/// by [`AcceptanceEscalationDriver`], which never selects it without a
+/// configured command; a missing template here therefore means a caller
+/// bypassed that policy, and it fails loudly rather than silently running the
+/// normal reviewer while reporting an escalation.
+pub fn acceptance_command_template(
+    config: &crate::config::OrchestratorConfig,
+    command_mode: AcceptanceCommandMode,
+) -> Result<&str> {
+    match command_mode {
+        AcceptanceCommandMode::Normal => config.get_acceptance_command(),
+        AcceptanceCommandMode::Escalation => {
+            config.get_acceptance_escalation_command().ok_or_else(|| {
+                OrchestratorError::ConfigLoad(
+                    "Missing optional config: acceptance_escalation_command. Acceptance \
+                     escalation was selected without a configured alternate reviewer command."
+                        .to_string(),
+                )
+            })
+        }
+    }
+}
+
+/// One completed Acceptance result whose reviewer output violated the verdict
+/// contract badly enough that re-running the *same* reviewer is unlikely to
+/// produce an actionable finding.
+///
+/// Deliberately closed: a canonical PASS, a FAIL with at least one actionable
+/// finding, CONTINUE, a validated external blocker, a permission hold, a
+/// command failure, a runtime limit, and a cancellation are all excluded, and
+/// each keeps its own existing routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidAcceptanceResult {
+    /// The command exited without emitting any canonical verdict.
+    MissingVerdict,
+    /// A `gated`/legacy `blocked` token arrived without a validated blocker.
+    BareBlocker,
+    /// A FAIL verdict's structured finding payload did not validate.
+    MalformedFinding,
+    /// A FAIL verdict whose finding list was empty, leaving only the exact
+    /// generic fallback.
+    EmptyFail,
+}
+
+impl InvalidAcceptanceResult {
+    /// Short label used in operator-facing diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            InvalidAcceptanceResult::MissingVerdict => "missing-verdict",
+            InvalidAcceptanceResult::BareBlocker => "bare-blocker",
+            InvalidAcceptanceResult::MalformedFinding => "malformed-finding",
+            InvalidAcceptanceResult::EmptyFail => "empty-fail",
+        }
+    }
+
+    /// Whether this class already owns an Acceptance-only protocol retry.
+    ///
+    /// The three protocol contracts do; an empty FAIL does not, which is why
+    /// its alternate-review retry is bounded solely by the escalation use cap
+    /// and why it otherwise follows the existing generic FAIL-to-Apply fallback.
+    pub fn has_protocol_retry_budget(self) -> bool {
+        !matches!(self, InvalidAcceptanceResult::EmptyFail)
+    }
+}
+
+/// Whether a FAIL verdict's finding list is the exact generic empty-FAIL
+/// fallback rather than an actionable defect report.
+///
+/// Both shapes are accepted because the substitution happens at different
+/// layers: the parser may hand up an empty list, and the executors replace an
+/// empty list with exactly one legacy finding carrying
+/// [`GENERIC_ACCEPTANCE_FAIL_FINDING`]. Anything else — a structured finding, a
+/// different legacy text, or more than one finding — is actionable repair work.
+pub fn is_generic_empty_fail(findings: &[crate::acceptance::AcceptanceFinding]) -> bool {
+    match findings {
+        [] => true,
+        [only] => {
+            only.structured_payload().is_none() && only.text() == GENERIC_ACCEPTANCE_FAIL_FINDING
+        }
+        _ => false,
+    }
+}
+
+/// Classify one completed Acceptance result for escalation eligibility.
+///
+/// Returns `None` for every result that is not an eligible invalid class,
+/// including a semantic FAIL with actionable findings.
+pub fn classify_invalid_acceptance_result(
+    result: &AcceptanceResult,
+) -> Option<InvalidAcceptanceResult> {
+    match result {
+        AcceptanceResult::MissingVerdict { .. } => Some(InvalidAcceptanceResult::MissingVerdict),
+        AcceptanceResult::BareBlocker { .. } => Some(InvalidAcceptanceResult::BareBlocker),
+        AcceptanceResult::MalformedFinding { .. } => {
+            Some(InvalidAcceptanceResult::MalformedFinding)
+        }
+        AcceptanceResult::Fail { findings } => {
+            is_generic_empty_fail(findings).then_some(InvalidAcceptanceResult::EmptyFail)
+        }
+        AcceptanceResult::Pass
+        | AcceptanceResult::Continue
+        | AcceptanceResult::Stalled { .. }
+        | AcceptanceResult::PermissionStalled { .. }
+        | AcceptanceResult::CommandFailed { .. }
+        | AcceptanceResult::RuntimeLimit { .. }
+        | AcceptanceResult::Cancelled => None,
+    }
+}
+
+/// Why an eligible invalid result did not select the escalation command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationDeclineReason {
+    /// No `acceptance_escalation_command` is configured.
+    NoCommandConfigured,
+    /// Fewer consecutive invalid results than the configured threshold.
+    BelowThreshold { after_invalid_results: u32 },
+    /// The per-sequence use budget is spent.
+    UseCapExhausted { max_uses_per_sequence: u32 },
+}
+
+impl EscalationDeclineReason {
+    fn describe(self) -> String {
+        match self {
+            EscalationDeclineReason::NoCommandConfigured => {
+                "no acceptance_escalation_command is configured".to_string()
+            }
+            EscalationDeclineReason::BelowThreshold {
+                after_invalid_results,
+            } => format!(
+                "the configured threshold of {after_invalid_results} consecutive invalid results \
+                 has not been reached"
+            ),
+            EscalationDeclineReason::UseCapExhausted {
+                max_uses_per_sequence,
+            } => format!(
+                "the escalation budget of {max_uses_per_sequence} use(s) per invalid-result \
+                 sequence is spent"
+            ),
+        }
+    }
+}
+
+/// What one observed Acceptance result did to the escalation sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptanceEscalationOutcome {
+    /// The invocation did not complete — a command failure, a runtime-limit
+    /// expiry, or a cancellation. It produced no reviewer output to judge, so it
+    /// neither consumes nor resets the sequence and any pending command mode
+    /// survives into the retry the owning budget dispatches.
+    NotObserved,
+    /// A completed non-invalid result ended the sequence and cleared any pending
+    /// escalation.
+    SequenceReset,
+    /// An eligible invalid result was recorded and the next permitted
+    /// Acceptance-only retry uses the escalation command.
+    Escalated {
+        kind: InvalidAcceptanceResult,
+        consecutive_invalid: u32,
+        use_index: u32,
+        max_uses_per_sequence: u32,
+    },
+    /// An eligible invalid result was recorded, but escalation was not selected.
+    /// Existing routing for that result class is unchanged.
+    Retained {
+        kind: InvalidAcceptanceResult,
+        consecutive_invalid: u32,
+        reason: EscalationDeclineReason,
+    },
+}
+
+impl AcceptanceEscalationOutcome {
+    /// Whether the next Acceptance-only retry runs the alternate reviewer.
+    pub fn escalation_selected(&self) -> bool {
+        matches!(self, AcceptanceEscalationOutcome::Escalated { .. })
+    }
+
+    /// Operator-facing line for this observation, or `None` when there is
+    /// nothing worth reporting.
+    ///
+    /// Reset and non-observation are deliberately silent: they are the ordinary
+    /// case and a log line per Acceptance invocation would bury the two events
+    /// an operator actually needs to see.
+    pub fn diagnostic(&self) -> Option<String> {
+        match self {
+            AcceptanceEscalationOutcome::NotObserved
+            | AcceptanceEscalationOutcome::SequenceReset => None,
+            AcceptanceEscalationOutcome::Escalated {
+                kind,
+                consecutive_invalid,
+                use_index,
+                max_uses_per_sequence,
+            } => Some(format!(
+                "Acceptance produced an invalid result ({}); the next acceptance-only retry uses \
+                 acceptance_escalation_command (invalid results: {}, escalation use \
+                 {}/{}).",
+                kind.label(),
+                consecutive_invalid,
+                use_index,
+                max_uses_per_sequence
+            )),
+            AcceptanceEscalationOutcome::Retained {
+                kind,
+                consecutive_invalid,
+                reason,
+            } => Some(format!(
+                "Acceptance produced an invalid result ({}, consecutive invalid results: {}); \
+                 keeping the normal acceptance_command because {}.",
+                kind.label(),
+                consecutive_invalid,
+                reason.describe()
+            )),
+        }
+    }
+}
+
+/// Bounded invalid-result accounting and reviewer-command selection for one
+/// change during a single active run.
+///
+/// Per `openspec/CONSTITUTION.md` this is active-run memory only. Nothing is
+/// written outside the worktree, so a restarted process runs ordinary Acceptance
+/// from workspace file and Git evidence instead of resuming an escalation
+/// sequence.
+///
+/// Escalation never creates a retry opportunity of its own for a class that
+/// already has one: it changes *which* command the existing Acceptance-only
+/// retry runs. The one class with no pre-existing Acceptance-only retry — an
+/// empty FAIL — is bounded solely by [`Self::max_uses_per_sequence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceEscalationDriver {
+    command_configured: bool,
+    after_invalid_results: u32,
+    max_uses_per_sequence: u32,
+    consecutive_invalid: u32,
+    uses_in_sequence: u32,
+    pending_escalation: bool,
+    last_revision: Option<String>,
+}
+
+impl AcceptanceEscalationDriver {
+    /// Build the driver from merged configuration.
+    pub fn from_config(config: &crate::config::OrchestratorConfig) -> Self {
+        let policy = config.get_acceptance_escalation();
+        Self {
+            command_configured: config.get_acceptance_escalation_command().is_some(),
+            after_invalid_results: policy.after_invalid_results(),
+            max_uses_per_sequence: policy.max_uses_per_sequence(),
+            consecutive_invalid: 0,
+            uses_in_sequence: 0,
+            pending_escalation: false,
+            last_revision: None,
+        }
+    }
+
+    /// Consecutive eligible invalid results observed in the current sequence.
+    pub fn consecutive_invalid(&self) -> u32 {
+        self.consecutive_invalid
+    }
+
+    /// Escalation-command uses already spent in the current sequence.
+    pub fn uses_in_sequence(&self) -> u32 {
+        self.uses_in_sequence
+    }
+
+    /// Consume the command mode for the Acceptance invocation that is about to
+    /// start.
+    ///
+    /// Every invocation reads this exactly once, so an ordinary invocation and
+    /// an escalation retry cannot both claim the same selection.
+    pub fn take_command_mode(&mut self) -> AcceptanceCommandMode {
+        if std::mem::take(&mut self.pending_escalation) {
+            AcceptanceCommandMode::Escalation
+        } else {
+            AcceptanceCommandMode::Normal
+        }
+    }
+
+    /// Observe one Acceptance result against the escalation policy.
+    ///
+    /// `revision` is the workspace revision this result was produced against.
+    /// A revision that moved since the previous observation is real repository
+    /// progress, so it starts a fresh sequence before this result is classified
+    /// — that is what keeps an empty-FAIL sequence alive across an Apply round
+    /// that changed nothing, without letting it survive one that did.
+    pub fn observe(
+        &mut self,
+        result: &AcceptanceResult,
+        revision: Option<&str>,
+    ) -> AcceptanceEscalationOutcome {
+        if let Some(revision) = revision {
+            if self
+                .last_revision
+                .as_deref()
+                .is_some_and(|previous| previous != revision)
+            {
+                self.reset_sequence();
+            }
+            self.last_revision = Some(revision.to_string());
+        }
+
+        // A deliberate termination and a command that never completed produced
+        // no reviewer output, so neither is evidence about reviewer quality.
+        // Leaving the sequence untouched is what lets a pending escalation
+        // survive into the retry the command-recovery budget dispatches.
+        if !result.permits_acceptance_retry()
+            || matches!(result, AcceptanceResult::CommandFailed { .. })
+        {
+            return AcceptanceEscalationOutcome::NotObserved;
+        }
+
+        let Some(kind) = classify_invalid_acceptance_result(result) else {
+            self.reset_sequence();
+            return AcceptanceEscalationOutcome::SequenceReset;
+        };
+
+        self.consecutive_invalid = self.consecutive_invalid.saturating_add(1);
+
+        let decline = if !self.command_configured {
+            Some(EscalationDeclineReason::NoCommandConfigured)
+        } else if self.consecutive_invalid < self.after_invalid_results {
+            Some(EscalationDeclineReason::BelowThreshold {
+                after_invalid_results: self.after_invalid_results,
+            })
+        } else if self.uses_in_sequence >= self.max_uses_per_sequence {
+            Some(EscalationDeclineReason::UseCapExhausted {
+                max_uses_per_sequence: self.max_uses_per_sequence,
+            })
+        } else {
+            None
+        };
+
+        match decline {
+            Some(reason) => AcceptanceEscalationOutcome::Retained {
+                kind,
+                consecutive_invalid: self.consecutive_invalid,
+                reason,
+            },
+            None => {
+                // The budget is consumed at selection, not at consumption: a
+                // pending escalation carried across a command-failure retry must
+                // not be counted twice.
+                self.uses_in_sequence = self.uses_in_sequence.saturating_add(1);
+                self.pending_escalation = true;
+                AcceptanceEscalationOutcome::Escalated {
+                    kind,
+                    consecutive_invalid: self.consecutive_invalid,
+                    use_index: self.uses_in_sequence,
+                    max_uses_per_sequence: self.max_uses_per_sequence,
+                }
+            }
+        }
+    }
+
+    fn reset_sequence(&mut self) {
+        self.consecutive_invalid = 0;
+        self.uses_in_sequence = 0;
+        self.pending_escalation = false;
+    }
+}
+
 /// Shared, mode-independent routing for an acceptance result that carries (or
 /// claims to carry) an external blocker.
 ///
@@ -1711,6 +2116,7 @@ pub async fn acceptance_test_streaming<O, F>(
     cancel_check: F,
     protocol_retry: Option<AcceptanceProtocolRetry>,
     previous_denial: Option<&crate::permission::PermissionDenial>,
+    command_mode: AcceptanceCommandMode,
 ) -> Result<(AcceptanceResult, u32, String)>
 where
     O: OutputHandler,
@@ -1740,6 +2146,7 @@ where
             None,
             base_branch.as_deref(),
             protocol_retry,
+            command_mode,
         )
         .await?;
 
@@ -1965,9 +2372,7 @@ where
             info!("Acceptance test failed for: {}", change.id);
             output.on_warn("Acceptance test: FAIL");
             let findings = if parsed_findings.is_empty() {
-                crate::acceptance::legacy_findings([
-                    "Investigate acceptance failure and apply the required fix",
-                ])
+                crate::acceptance::legacy_findings([GENERIC_ACCEPTANCE_FAIL_FINDING])
             } else {
                 parsed_findings
             };
@@ -4150,5 +4555,637 @@ mod tests {
             first[0].text, restated[0].text,
             "identity is stable while the payload stays free to change"
         );
+    }
+
+    // === Bounded Acceptance escalation ===
+
+    /// Every claim in this module is about a *decision*, so nothing here spawns
+    /// a process, touches a worktree, or reads a configuration file: the driver
+    /// is fed typed results and reports typed outcomes. Real reviewer execution
+    /// of those decisions is covered by the acceptance execution tests.
+    mod acceptance_escalation {
+        use super::*;
+        use crate::acceptance::{
+            AcceptanceFinding, BlockerRejection, FindingFileExpectation, FindingRejection,
+            FindingSeverity, RepositoryFinding,
+        };
+        use crate::config::{AcceptanceEscalationConfig, OrchestratorConfig};
+
+        fn config_with(command: Option<&str>, policy: Option<(u32, u32)>) -> OrchestratorConfig {
+            OrchestratorConfig {
+                acceptance_command: Some("accept {change_id} {prompt}".to_string()),
+                acceptance_escalation_command: command.map(str::to_string),
+                acceptance_escalation: policy.map(|(after, max)| AcceptanceEscalationConfig {
+                    after_invalid_results: Some(after),
+                    max_uses_per_sequence: Some(max),
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn driver(command: Option<&str>, policy: Option<(u32, u32)>) -> AcceptanceEscalationDriver {
+            AcceptanceEscalationDriver::from_config(&config_with(command, policy))
+        }
+
+        fn default_driver() -> AcceptanceEscalationDriver {
+            driver(Some("deep-accept {change_id} {prompt}"), None)
+        }
+
+        fn empty_fail() -> AcceptanceResult {
+            AcceptanceResult::Fail {
+                findings: crate::acceptance::legacy_findings([GENERIC_ACCEPTANCE_FAIL_FINDING]),
+            }
+        }
+
+        fn actionable_fail() -> AcceptanceResult {
+            AcceptanceResult::Fail {
+                findings: vec![AcceptanceFinding::structured(RepositoryFinding {
+                    id: "finding-1".to_string(),
+                    severity: FindingSeverity::Major,
+                    summary: "escalation policy is unbounded".to_string(),
+                    evidence: vec!["src/orchestration/acceptance.rs:1".to_string()],
+                    required_changes: vec![FindingFileExpectation {
+                        file: "src/orchestration/acceptance.rs".to_string(),
+                        description: "bound the sequence".to_string(),
+                    }],
+                    verification: vec![FindingFileExpectation {
+                        file: "src/orchestration/acceptance.rs".to_string(),
+                        description: "prove the bound".to_string(),
+                    }],
+                })],
+            }
+        }
+
+        fn missing_verdict() -> AcceptanceResult {
+            AcceptanceResult::MissingVerdict {
+                findings: vec!["waiting for verification".to_string()],
+            }
+        }
+
+        fn bare_blocker() -> AcceptanceResult {
+            AcceptanceResult::BareBlocker {
+                rejection: BlockerRejection::Missing,
+            }
+        }
+
+        fn malformed_finding() -> AcceptanceResult {
+            AcceptanceResult::MalformedFinding {
+                rejection: FindingRejection::MissingId,
+            }
+        }
+
+        // --- Eligibility ---
+
+        /// Every eligible invalid class is classified, and each one alone
+        /// selects the alternate reviewer under the default policy.
+        #[test]
+        fn every_eligible_invalid_class_selects_the_alternate_reviewer() {
+            for (result, expected) in [
+                (missing_verdict(), InvalidAcceptanceResult::MissingVerdict),
+                (bare_blocker(), InvalidAcceptanceResult::BareBlocker),
+                (
+                    malformed_finding(),
+                    InvalidAcceptanceResult::MalformedFinding,
+                ),
+                (empty_fail(), InvalidAcceptanceResult::EmptyFail),
+            ] {
+                assert_eq!(
+                    classify_invalid_acceptance_result(&result),
+                    Some(expected),
+                    "{expected:?} must be an eligible invalid result"
+                );
+
+                let mut escalation = default_driver();
+                let outcome = escalation.observe(&result, None);
+                assert!(
+                    outcome.escalation_selected(),
+                    "{expected:?} must select escalation under the default policy: {outcome:?}"
+                );
+                assert_eq!(
+                    escalation.take_command_mode(),
+                    AcceptanceCommandMode::Escalation
+                );
+            }
+        }
+
+        /// A semantic FAIL that reports a real defect is repair work, not
+        /// malformed reviewer output: it never counts and never escalates.
+        #[test]
+        fn actionable_fail_never_escalates_and_resets_the_sequence() {
+            assert_eq!(classify_invalid_acceptance_result(&actionable_fail()), None);
+
+            let mut escalation = default_driver();
+            assert!(escalation
+                .observe(&missing_verdict(), None)
+                .escalation_selected());
+
+            let outcome = escalation.observe(&actionable_fail(), None);
+            assert_eq!(outcome, AcceptanceEscalationOutcome::SequenceReset);
+            assert_eq!(escalation.consecutive_invalid(), 0);
+            assert_eq!(escalation.uses_in_sequence(), 0);
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Normal,
+                "a real defect report must not leave an alternate reviewer pending"
+            );
+        }
+
+        /// A FAIL keeps its normal routing as soon as it carries anything other
+        /// than the exact generic fallback.
+        #[test]
+        fn only_the_exact_generic_fallback_counts_as_an_empty_fail() {
+            assert!(is_generic_empty_fail(&[]));
+            assert!(is_generic_empty_fail(&crate::acceptance::legacy_findings(
+                [GENERIC_ACCEPTANCE_FAIL_FINDING]
+            )));
+            assert!(!is_generic_empty_fail(&crate::acceptance::legacy_findings(
+                ["Investigate acceptance failure and apply the required fix now"]
+            )));
+            assert!(!is_generic_empty_fail(&crate::acceptance::legacy_findings(
+                [
+                    GENERIC_ACCEPTANCE_FAIL_FINDING,
+                    GENERIC_ACCEPTANCE_FAIL_FINDING,
+                ]
+            )));
+        }
+
+        /// Excluded results are excluded for their own reasons, and the ones
+        /// that completed also end an active sequence.
+        #[test]
+        fn excluded_results_never_escalate() {
+            let excluded = [
+                AcceptanceResult::Pass,
+                AcceptanceResult::Continue,
+                actionable_fail(),
+                AcceptanceResult::Stalled {
+                    blocker: crate::acceptance::AcceptanceBlocker {
+                        category: "credential".to_string(),
+                        evidence: vec!["missing token".to_string()],
+                        unblock_condition: "token provisioned".to_string(),
+                        next_action: "ask the owner".to_string(),
+                        resumable: true,
+                        prerequisite_owner: None,
+                        evidence_ids: Vec::new(),
+                    },
+                },
+                AcceptanceResult::PermissionStalled {
+                    blocker: crate::events::StalledBlocker::permission_denial(
+                        "acceptance",
+                        &crate::permission::PermissionDenial {
+                            category: crate::permission::PermissionDenialCategory::ToolAccess,
+                            denied_target: "git".to_string(),
+                            evidence: "denied".to_string(),
+                        },
+                    ),
+                },
+                AcceptanceResult::CommandFailed {
+                    error: "exit 1".to_string(),
+                    findings: vec!["boom".to_string()],
+                    diagnostic: AcceptanceCommandDiagnostic::default(),
+                },
+                AcceptanceResult::RuntimeLimit {
+                    limit: AcceptanceRuntimeLimit {
+                        limit_secs: 1800,
+                        cleanup_confirmed: true,
+                        cleanup_diagnostics: String::new(),
+                    },
+                },
+                AcceptanceResult::Cancelled,
+            ];
+
+            for result in excluded {
+                assert_eq!(
+                    classify_invalid_acceptance_result(&result),
+                    None,
+                    "{result:?} must not be an eligible invalid result"
+                );
+                let mut escalation = default_driver();
+                let outcome = escalation.observe(&result, None);
+                assert!(
+                    !outcome.escalation_selected(),
+                    "{result:?} must not select escalation: {outcome:?}"
+                );
+                assert_eq!(
+                    escalation.take_command_mode(),
+                    AcceptanceCommandMode::Normal
+                );
+            }
+        }
+
+        /// A command that never completed produced no reviewer output, so it
+        /// neither consumes nor resets the sequence — and the alternate reviewer
+        /// already selected still runs once the command recovers.
+        #[test]
+        fn non_completing_invocations_preserve_the_pending_selection() {
+            for result in [
+                AcceptanceResult::CommandFailed {
+                    error: "exit 1".to_string(),
+                    findings: Vec::new(),
+                    diagnostic: AcceptanceCommandDiagnostic::default(),
+                },
+                AcceptanceResult::Cancelled,
+                AcceptanceResult::RuntimeLimit {
+                    limit: AcceptanceRuntimeLimit {
+                        limit_secs: 1800,
+                        cleanup_confirmed: true,
+                        cleanup_diagnostics: String::new(),
+                    },
+                },
+            ] {
+                let mut escalation = default_driver();
+                assert!(escalation
+                    .observe(&missing_verdict(), None)
+                    .escalation_selected());
+
+                assert_eq!(
+                    escalation.observe(&result, None),
+                    AcceptanceEscalationOutcome::NotObserved,
+                    "{result:?} must not be observed against the invalid-result sequence"
+                );
+                assert_eq!(escalation.consecutive_invalid(), 1);
+                assert_eq!(escalation.uses_in_sequence(), 1);
+                assert_eq!(
+                    escalation.take_command_mode(),
+                    AcceptanceCommandMode::Escalation,
+                    "the pending alternate reviewer must survive an invocation that never ran"
+                );
+            }
+        }
+
+        // --- Command selection ---
+
+        /// The selection is consumed exactly once, so the retry after the
+        /// escalation retry is back on the normal command.
+        #[test]
+        fn the_command_mode_is_consumed_by_exactly_one_invocation() {
+            let mut escalation = default_driver();
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Normal
+            );
+
+            assert!(escalation
+                .observe(&missing_verdict(), None)
+                .escalation_selected());
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Escalation
+            );
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Normal,
+                "one selection must not survive into a second invocation"
+            );
+        }
+
+        /// Without the optional command, eligibility is still classified and
+        /// counted, but the retry keeps using the normal reviewer.
+        #[test]
+        fn a_missing_escalation_command_preserves_normal_retry_behavior() {
+            let mut escalation = driver(None, None);
+
+            let outcome = escalation.observe(&missing_verdict(), None);
+            assert_eq!(
+                outcome,
+                AcceptanceEscalationOutcome::Retained {
+                    kind: InvalidAcceptanceResult::MissingVerdict,
+                    consecutive_invalid: 1,
+                    reason: EscalationDeclineReason::NoCommandConfigured,
+                }
+            );
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Normal
+            );
+        }
+
+        // --- Threshold, cap, and reset ---
+
+        /// A higher threshold keeps the earlier invalid results on the normal
+        /// command and escalates only once the configured count is reached.
+        #[test]
+        fn escalation_waits_for_the_configured_threshold() {
+            let mut escalation = driver(Some("deep-accept {prompt}"), Some((3, 1)));
+
+            for expected in 1..3 {
+                let outcome = escalation.observe(&missing_verdict(), None);
+                assert_eq!(
+                    outcome,
+                    AcceptanceEscalationOutcome::Retained {
+                        kind: InvalidAcceptanceResult::MissingVerdict,
+                        consecutive_invalid: expected,
+                        reason: EscalationDeclineReason::BelowThreshold {
+                            after_invalid_results: 3,
+                        },
+                    }
+                );
+                assert_eq!(
+                    escalation.take_command_mode(),
+                    AcceptanceCommandMode::Normal
+                );
+            }
+
+            assert!(escalation
+                .observe(&missing_verdict(), None)
+                .escalation_selected());
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Escalation
+            );
+        }
+
+        /// The per-sequence cap bounds escalation: once it is spent the sequence
+        /// keeps counting but every later retry is back on the normal reviewer.
+        #[test]
+        fn the_use_cap_bounds_one_invalid_result_sequence() {
+            let mut escalation = default_driver();
+
+            assert!(escalation
+                .observe(&missing_verdict(), None)
+                .escalation_selected());
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Escalation
+            );
+
+            let outcome = escalation.observe(&missing_verdict(), None);
+            assert_eq!(
+                outcome,
+                AcceptanceEscalationOutcome::Retained {
+                    kind: InvalidAcceptanceResult::MissingVerdict,
+                    consecutive_invalid: 2,
+                    reason: EscalationDeclineReason::UseCapExhausted {
+                        max_uses_per_sequence: 1,
+                    },
+                }
+            );
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Normal
+            );
+        }
+
+        /// A larger cap permits exactly that many uses in one sequence.
+        #[test]
+        fn a_larger_cap_permits_exactly_that_many_uses() {
+            let mut escalation = driver(Some("deep-accept {prompt}"), Some((1, 2)));
+
+            for expected_use in 1..=2 {
+                let outcome = escalation.observe(&bare_blocker(), None);
+                assert!(outcome.escalation_selected(), "{outcome:?}");
+                assert_eq!(escalation.uses_in_sequence(), expected_use);
+                assert_eq!(
+                    escalation.take_command_mode(),
+                    AcceptanceCommandMode::Escalation
+                );
+            }
+
+            assert!(!escalation
+                .observe(&bare_blocker(), None)
+                .escalation_selected());
+        }
+
+        /// Any completed non-invalid result ends the sequence, and a later
+        /// invalid result starts a fresh one with a fresh use budget.
+        #[test]
+        fn a_non_invalid_result_resets_the_sequence() {
+            for reset_result in [
+                AcceptanceResult::Pass,
+                AcceptanceResult::Continue,
+                actionable_fail(),
+            ] {
+                let mut escalation = default_driver();
+                assert!(escalation
+                    .observe(&missing_verdict(), None)
+                    .escalation_selected());
+                let _ = escalation.take_command_mode();
+                assert!(!escalation
+                    .observe(&malformed_finding(), None)
+                    .escalation_selected());
+
+                assert_eq!(
+                    escalation.observe(&reset_result, None),
+                    AcceptanceEscalationOutcome::SequenceReset
+                );
+                assert_eq!(escalation.consecutive_invalid(), 0);
+                assert_eq!(escalation.uses_in_sequence(), 0);
+
+                assert!(
+                    escalation
+                        .observe(&bare_blocker(), None)
+                        .escalation_selected(),
+                    "a new sequence must get a fresh escalation budget after {reset_result:?}"
+                );
+            }
+        }
+
+        // --- Empty FAIL across its Apply round ---
+
+        /// Below the threshold an empty FAIL keeps the existing generic
+        /// FAIL-to-Apply fallback, and the invalid-result count survives the
+        /// Apply round when that round changed nothing.
+        #[test]
+        fn empty_fail_below_threshold_keeps_its_sequence_across_the_apply_round() {
+            let mut escalation = driver(Some("deep-accept {prompt}"), Some((2, 1)));
+
+            let first = escalation.observe(&empty_fail(), Some("rev-a"));
+            assert_eq!(
+                first,
+                AcceptanceEscalationOutcome::Retained {
+                    kind: InvalidAcceptanceResult::EmptyFail,
+                    consecutive_invalid: 1,
+                    reason: EscalationDeclineReason::BelowThreshold {
+                        after_invalid_results: 2,
+                    },
+                },
+                "below threshold the empty FAIL follows the existing generic fallback"
+            );
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Normal
+            );
+
+            // The Apply round produced no commit, so the same revision comes back.
+            let second = escalation.observe(&empty_fail(), Some("rev-a"));
+            assert!(
+                second.escalation_selected(),
+                "the retained count must let a later invalid result reach the threshold: {second:?}"
+            );
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Escalation
+            );
+        }
+
+        /// An Apply round that moved the revision is real repository progress,
+        /// so the sequence starts over rather than accumulating across it.
+        #[test]
+        fn a_revision_change_resets_the_sequence() {
+            let mut escalation = driver(Some("deep-accept {prompt}"), Some((2, 1)));
+
+            assert!(!escalation
+                .observe(&empty_fail(), Some("rev-a"))
+                .escalation_selected());
+
+            let after_apply = escalation.observe(&empty_fail(), Some("rev-b"));
+            assert_eq!(
+                after_apply,
+                AcceptanceEscalationOutcome::Retained {
+                    kind: InvalidAcceptanceResult::EmptyFail,
+                    consecutive_invalid: 1,
+                    reason: EscalationDeclineReason::BelowThreshold {
+                        after_invalid_results: 2,
+                    },
+                },
+                "a moved revision must start a fresh sequence"
+            );
+            assert_eq!(
+                escalation.take_command_mode(),
+                AcceptanceCommandMode::Normal
+            );
+        }
+
+        // --- Non-persistence ---
+
+        /// The driver is active-run memory. A fresh one built from the same
+        /// configuration starts at zero, which is what makes a restart run
+        /// ordinary Acceptance from workspace and Git evidence.
+        #[test]
+        fn a_fresh_driver_carries_no_escalation_state() {
+            let config = config_with(Some("deep-accept {prompt}"), None);
+
+            let mut first = AcceptanceEscalationDriver::from_config(&config);
+            assert!(first
+                .observe(&missing_verdict(), Some("rev-a"))
+                .escalation_selected());
+            assert_eq!(first.consecutive_invalid(), 1);
+            assert_eq!(first.uses_in_sequence(), 1);
+
+            let mut restarted = AcceptanceEscalationDriver::from_config(&config);
+            assert_eq!(restarted.consecutive_invalid(), 0);
+            assert_eq!(restarted.uses_in_sequence(), 0);
+            assert_eq!(
+                restarted.take_command_mode(),
+                AcceptanceCommandMode::Normal,
+                "a restarted run must begin with the ordinary acceptance command"
+            );
+        }
+
+        // --- Diagnostics ---
+
+        /// Both decisions are reportable without a second read, and the ordinary
+        /// cases stay silent.
+        #[test]
+        fn only_the_two_decisions_produce_a_diagnostic() {
+            assert!(AcceptanceEscalationOutcome::NotObserved
+                .diagnostic()
+                .is_none());
+            assert!(AcceptanceEscalationOutcome::SequenceReset
+                .diagnostic()
+                .is_none());
+
+            let mut escalation = default_driver();
+            let escalated = escalation.observe(&malformed_finding(), None).diagnostic();
+            let escalated = escalated.expect("an escalation decision must be reportable");
+            assert!(escalated.contains("malformed-finding"), "{escalated}");
+            assert!(
+                escalated.contains("acceptance_escalation_command"),
+                "{escalated}"
+            );
+
+            let retained = escalation.observe(&malformed_finding(), None).diagnostic();
+            let retained = retained.expect("a declined escalation must be reportable");
+            assert!(retained.contains("acceptance_command"), "{retained}");
+            assert!(retained.contains("budget"), "{retained}");
+        }
+
+        /// The mode names the configuration key it resolves, so a diagnostic can
+        /// never claim a command the runner did not run.
+        #[test]
+        fn the_command_mode_names_its_configuration_key() {
+            assert_eq!(AcceptanceCommandMode::Normal.label(), "acceptance_command");
+            assert_eq!(
+                AcceptanceCommandMode::Escalation.label(),
+                "acceptance_escalation_command"
+            );
+            assert!(!AcceptanceCommandMode::Normal.is_escalation());
+            assert!(AcceptanceCommandMode::Escalation.is_escalation());
+        }
+
+        // --- Template selection ---
+
+        /// The command mode selects the template and nothing else: both
+        /// resolutions keep the same `{change_id}`/`{prompt}` contract.
+        #[test]
+        fn the_command_mode_resolves_exactly_one_reviewer_template() {
+            let config = config_with(Some("deep-accept {change_id} {prompt}"), None);
+
+            assert_eq!(
+                acceptance_command_template(&config, AcceptanceCommandMode::Normal)
+                    .expect("the normal reviewer is a required command"),
+                "accept {change_id} {prompt}"
+            );
+            assert_eq!(
+                acceptance_command_template(&config, AcceptanceCommandMode::Escalation)
+                    .expect("the escalation reviewer is configured"),
+                "deep-accept {change_id} {prompt}"
+            );
+        }
+
+        /// Selecting escalation without a configured command means a caller
+        /// bypassed the policy that owns the selection, so it fails loudly
+        /// instead of quietly running the normal reviewer under the wrong name.
+        #[test]
+        fn escalation_without_a_configured_command_is_a_configuration_error() {
+            let config = config_with(None, None);
+
+            assert_eq!(
+                acceptance_command_template(&config, AcceptanceCommandMode::Normal)
+                    .expect("the normal reviewer is unaffected"),
+                "accept {change_id} {prompt}"
+            );
+            let message = acceptance_command_template(&config, AcceptanceCommandMode::Escalation)
+                .expect_err("an unconfigured alternate reviewer must not silently fall back")
+                .to_string();
+            assert!(
+                message.contains("acceptance_escalation_command"),
+                "{message}"
+            );
+        }
+
+        /// The alternate reviewer gets trusted framing that it must produce one
+        /// fresh canonical verdict; the normal reviewer gets nothing extra.
+        #[test]
+        fn only_an_escalation_invocation_carries_the_alternate_reviewer_framing() {
+            assert!(
+                crate::agent::build_acceptance_escalation_context(AcceptanceCommandMode::Normal)
+                    .is_empty(),
+                "an ordinary acceptance invocation must not be told it is an alternate review"
+            );
+
+            let context = crate::agent::build_acceptance_escalation_context(
+                AcceptanceCommandMode::Escalation,
+            );
+            assert!(context.contains("<acceptance_escalation>"), "{context}");
+            assert!(
+                context.contains("alternate acceptance reviewer"),
+                "{context}"
+            );
+            assert!(
+                context.contains("one fresh canonical acceptance verdict"),
+                "{context}"
+            );
+        }
+
+        /// The three protocol contracts already own an Acceptance-only retry;
+        /// an empty FAIL does not, which is why its alternate review is bounded
+        /// by the use cap alone.
+        #[test]
+        fn only_empty_fail_lacks_a_protocol_retry_budget() {
+            assert!(InvalidAcceptanceResult::MissingVerdict.has_protocol_retry_budget());
+            assert!(InvalidAcceptanceResult::BareBlocker.has_protocol_retry_budget());
+            assert!(InvalidAcceptanceResult::MalformedFinding.has_protocol_retry_budget());
+            assert!(!InvalidAcceptanceResult::EmptyFail.has_protocol_retry_budget());
+        }
     }
 }

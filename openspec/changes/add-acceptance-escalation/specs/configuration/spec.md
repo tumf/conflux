@@ -6,9 +6,22 @@
 
 設定可能なコマンドには、通常の apply 用 `apply_command`、late empty-WIP retry 用の optional `apply_escalation_command`、final empty-WIP stall 診断用の optional `apply_stall_diagnose_command` に加えて、invalid Acceptance result retry 用の optional `acceptance_escalation_command` を含めてもよい（MAY）。
 
+`apply_escalation_command` は通常 apply の代替コマンドとして扱われ、runtime が escalation 条件を満たした retry にのみ使用しなければならない（MUST）。未設定の場合、runtime は escalation phase で静かに通常 `apply_command` の挙動を継続しなければならない（MUST）。
+
+`apply_stall_diagnose_command` は final empty-WIP stall の直前診断にのみ使用されなければならない（MUST）。未設定の場合、runtime は診断 phase を静かにスキップして従来の final stall へ進まなければならない（MUST）。
+
 `acceptance_escalation_command` は通常 Acceptance の代替 reviewer command として扱われ、runtime が Acceptance escalation 条件を満たした retry にのみ使用しなければならない（MUST）。未設定の場合、runtime は escalation eligibility が成立しても既存の通常 `acceptance_command` retry behavior を継続しなければならない（MUST）。
 
-<!-- Expected canonical result after archive: configuration accepts one optional Acceptance escalation reviewer command without making it required. -->
+<!-- Expected canonical result after archive: configuration accepts one optional Acceptance escalation reviewer command without making it required, and the existing optional apply escalation/diagnose commands keep their behavior and scenario. -->
+
+#### Scenario: optional escalation and diagnose commands are accepted
+
+- **GIVEN** `.cflx.jsonc` contains top-level `apply_command`
+- **AND** optional `apply_escalation_command`
+- **AND** optional `apply_stall_diagnose_command`
+- **WHEN** configuration is loaded
+- **THEN** the merged configuration exposes all three command templates
+- **AND** missing optional escalation/diagnose commands do not themselves cause config load failure
 
 #### Scenario: optional Acceptance escalation command is accepted
 

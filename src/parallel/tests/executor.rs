@@ -2245,6 +2245,7 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("unexpected error");
@@ -2362,6 +2363,7 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("unexpected error");
@@ -2543,6 +2545,7 @@ async fn test_acceptance_history_records_end_revision_when_head_changes() {
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("unexpected error");
@@ -2633,6 +2636,7 @@ async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("unexpected error");
@@ -2754,6 +2758,7 @@ async fn test_archive_guard_allows_archive_after_acceptance_head_change_pass() {
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("unexpected error");
@@ -12167,6 +12172,7 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
             &acceptance_history,
             Some("main"),
             None,
+            crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
         ),
     )
     .await
@@ -12275,6 +12281,7 @@ async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("unexpected error");
@@ -12369,6 +12376,7 @@ async fn test_acceptance_cancels_while_waiting_for_silent_streaming_output() {
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("acceptance cancellation should return a result");
@@ -12528,6 +12536,7 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("unexpected error");
@@ -12622,6 +12631,7 @@ async fn test_acceptance_status_only_exit_is_missing_verdict_not_continue() {
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("unexpected error");
@@ -12740,6 +12750,7 @@ async fn test_acceptance_explicit_continue_verdict_retains_continue_routing() {
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("unexpected error");
@@ -12840,6 +12851,7 @@ async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
         &acceptance_history,
         Some("main"),
         None,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
     )
     .await
     .or_fail("unexpected error");

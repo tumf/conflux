@@ -124,6 +124,74 @@ impl StallDetectionConfig {
     }
 }
 
+// ── Acceptance escalation ──────────────────────────────────────────────────
+
+/// Bounded policy for the optional Acceptance escalation reviewer command.
+///
+/// Both knobs carry a positive built-in default because the optional
+/// `acceptance_escalation_command` is itself the opt-in: configuring the command
+/// alone yields "escalate the next permitted retry after the first invalid
+/// result, once per sequence". Each field merges on its own, so a
+/// higher-priority layer that overrides only the threshold keeps the
+/// lower-priority maximum-use value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AcceptanceEscalationConfig {
+    /// Consecutive invalid Acceptance results after which the next permitted
+    /// Acceptance-only retry uses the escalation command.
+    #[serde(default)]
+    pub after_invalid_results: Option<u32>,
+    /// Maximum escalation-command uses during one consecutive invalid-result
+    /// sequence.
+    #[serde(default)]
+    pub max_uses_per_sequence: Option<u32>,
+}
+
+impl AcceptanceEscalationConfig {
+    /// Consecutive invalid results required before escalation, defaulted.
+    pub fn after_invalid_results(&self) -> u32 {
+        self.after_invalid_results
+            .unwrap_or(DEFAULT_ACCEPTANCE_ESCALATION_AFTER_INVALID_RESULTS)
+    }
+
+    /// Maximum escalation uses per invalid-result sequence, defaulted.
+    pub fn max_uses_per_sequence(&self) -> u32 {
+        self.max_uses_per_sequence
+            .unwrap_or(DEFAULT_ACCEPTANCE_ESCALATION_MAX_USES_PER_SEQUENCE)
+    }
+
+    /// Merge a higher-priority layer field by field.
+    ///
+    /// Whole-object overwrite is deliberately not used: the two knobs answer
+    /// different questions ("when does escalation start" and "how often may it
+    /// run"), so overriding one must not silently reset the other to its
+    /// built-in default.
+    fn merge(&mut self, other: Self) {
+        overwrite_if_some(&mut self.after_invalid_results, other.after_invalid_results);
+        overwrite_if_some(&mut self.max_uses_per_sequence, other.max_uses_per_sequence);
+    }
+
+    /// Validate that both configured policy values are positive.
+    ///
+    /// Zero is rejected rather than silently treated as "disabled": omitting
+    /// `acceptance_escalation_command` is how escalation is turned off, so a
+    /// zero here is an operator mistake with no coherent meaning.
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("after_invalid_results", self.after_invalid_results),
+            ("max_uses_per_sequence", self.max_uses_per_sequence),
+        ] {
+            if matches!(value, Some(0)) {
+                return Err(OrchestratorError::ConfigLoad(format!(
+                    "Configuration error: `acceptance_escalation.{field}` must be a positive \
+                     integer (at least 1); remove `acceptance_escalation_command` to disable \
+                     Acceptance escalation instead of setting 0"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── Error circuit breaker ──────────────────────────────────────────────────
 
 /// Error circuit breaker configuration for detecting repeated failures.
@@ -208,6 +276,18 @@ pub struct OrchestratorConfig {
     /// Supports `{change_id}` and `{prompt}` placeholders.
     #[serde(default)]
     pub acceptance_command: Option<String>,
+
+    /// Optional alternate reviewer command template used only by an Acceptance
+    /// retry that the bounded invalid-result escalation policy selected.
+    /// Supports the same `{change_id}` and `{prompt}` placeholders as
+    /// `acceptance_command`. When absent, escalation is a silent no-op and
+    /// eligible retries keep using the normal command.
+    #[serde(default)]
+    pub acceptance_escalation_command: Option<String>,
+
+    /// Bounded policy governing when the Acceptance escalation command is used.
+    #[serde(default)]
+    pub acceptance_escalation: Option<AcceptanceEscalationConfig>,
 
     /// System prompt for apply command.
     /// Injected into the `{prompt}` placeholder in apply_command.
@@ -600,6 +680,8 @@ impl OrchestratorConfig {
             resolve_skill,
             analyze_command,
             acceptance_command,
+            acceptance_escalation_command,
+            acceptance_escalation,
             apply_prompt,
             apply_append_prompt,
             acceptance_prompt,
@@ -659,6 +741,17 @@ impl OrchestratorConfig {
         overwrite_if_some(&mut self.resolve_skill, resolve_skill);
         overwrite_if_some(&mut self.analyze_command, analyze_command);
         overwrite_if_some(&mut self.acceptance_command, acceptance_command);
+        overwrite_if_some(
+            &mut self.acceptance_escalation_command,
+            acceptance_escalation_command,
+        );
+        // Item-wise, not whole-object: a layer that overrides only the threshold
+        // must keep the lower-priority maximum-use value.
+        match (self.acceptance_escalation.as_mut(), acceptance_escalation) {
+            (Some(target), Some(source)) => target.merge(source),
+            (None, Some(source)) => self.acceptance_escalation = Some(source),
+            (_, None) => {}
+        }
         overwrite_if_some(&mut self.resolve_command, resolve_command);
 
         overwrite_if_some(&mut self.apply_prompt, apply_prompt);
@@ -879,6 +972,27 @@ impl OrchestratorConfig {
         self.acceptance_command
             .as_deref()
             .ok_or_else(|| OrchestratorError::ConfigLoad("Missing required config: acceptance_command. Please set it in .cflx.jsonc or global config.".to_string()))
+    }
+
+    /// Get the optional Acceptance escalation reviewer command template.
+    ///
+    /// `None` is the normal, silent case: escalation eligibility still gets
+    /// classified and counted, but the retry uses `acceptance_command`.
+    pub fn get_acceptance_escalation_command(&self) -> Option<&str> {
+        self.acceptance_escalation_command.as_deref()
+    }
+
+    /// Get the bounded Acceptance escalation policy, returning defaults if not set.
+    pub fn get_acceptance_escalation(&self) -> AcceptanceEscalationConfig {
+        self.acceptance_escalation.clone().unwrap_or_default()
+    }
+
+    /// Validate the bounded Acceptance escalation policy.
+    pub fn validate_acceptance_escalation(&self) -> Result<()> {
+        match self.acceptance_escalation.as_ref() {
+            Some(policy) => policy.validate(),
+            None => Ok(()),
+        }
     }
 
     /// Get the acceptance prompt, falling back to default if not set
@@ -1133,6 +1247,7 @@ impl OrchestratorConfig {
         self.validate_operation_skills()?;
         self.validate_lifecycle_integration()?;
         self.validate_acceptance_max_runtime_secs()?;
+        self.validate_acceptance_escalation()?;
 
         let mut missing = Vec::new();
 

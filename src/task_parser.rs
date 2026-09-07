@@ -341,7 +341,7 @@ fn normalize_acceptance_findings(
     if normalized.is_empty() {
         normalized = crate::orchestration::acceptance::normalize_findings(&[
             crate::acceptance::AcceptanceFinding::legacy(
-                "Investigate acceptance failure and apply the required fix",
+                crate::orchestration::acceptance::GENERIC_ACCEPTANCE_FAIL_FINDING,
             ),
         ]);
     }

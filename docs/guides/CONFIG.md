@@ -98,6 +98,7 @@ Command templates support these placeholders:
 | `archive_command` | string | Yes | none | Supports `{change_id}` |
 | `analyze_command` | string | Yes | none | Supports `{prompt}` |
 | `acceptance_command` | string | Yes | none | Supports `{change_id}` and `{prompt}` |
+| `acceptance_escalation_command` | string | No | unset | Alternate reviewer; used only by an Acceptance retry the invalid-result policy selected |
 | `resolve_command` | string | Yes | none | Supports `{prompt}` |
 | `apply_skill` | string | No | `cflx-apply` | Operation skill loaded for apply |
 | `archive_skill` | string | No | `cflx-archive` | Operation skill loaded for archive |
@@ -114,6 +115,7 @@ Command templates support these placeholders:
 | `hooks` | object | No | empty | Hook configuration with deep merge |
 | `logging` | object | No | see below | Logging behavior |
 | `stall_detection` | object | No | see below | Empty-WIP stall detection |
+| `acceptance_escalation` | object | No | see below | Bounded Acceptance escalation policy |
 | `error_circuit_breaker` | object | No | see below | Repeated-error breaker |
 | `completion_check_delay_ms` | integer | No | implementation default | Delay between completion checks |
 | `completion_check_max_retries` | integer | No | implementation default | Completion check retries |
@@ -320,6 +322,33 @@ Hook container fields:
 
 If the optional escalation command keys are unset, Conflux silently skips escalation or diagnosis behavior instead of failing config validation.
 
+## `acceptance_escalation`
+
+Bounds when an Acceptance retry uses `acceptance_escalation_command` instead of `acceptance_command`.
+
+```jsonc
+{
+  "acceptance_escalation_command": "opencode run '/cflx-accept {change_id} {prompt}'",
+  "acceptance_escalation": {
+    "after_invalid_results": 1,
+    "max_uses_per_sequence": 1
+  }
+}
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `after_invalid_results` | integer | `1` | Consecutive invalid Acceptance results before the next permitted Acceptance-only retry escalates. Must be at least `1` |
+| `max_uses_per_sequence` | integer | `1` | Escalation-command uses allowed in one invalid-result sequence. Must be at least `1` |
+
+An *invalid result* is a completed Acceptance invocation whose reviewer output could not be used: no canonical verdict, a `gated` token with no validated blocker, a FAIL whose structured finding did not validate, or a FAIL carrying no actionable finding at all. A canonical PASS, a FAIL with at least one actionable finding, CONTINUE, a validated external blocker, a permission hold, a command failure, a runtime-limit expiry, and a cancellation are never invalid results, and each keeps its existing routing — in particular a real defect report always returns to Apply and never escalates.
+
+Escalation changes *which* reviewer command a retry runs; it never adds a retry beyond the existing per-result budget. The one exception is a FAIL with no actionable findings, which has no pre-existing Acceptance-only retry: its alternate review is bounded solely by `max_uses_per_sequence`, and below the threshold, once the cap is spent, or with no escalation command configured it follows the ordinary FAIL-to-Apply fallback instead.
+
+Any completed non-invalid result, and any change of the workspace revision, ends the current invalid-result sequence and restores the full escalation budget. All of this accounting is in-memory for the active run only: nothing is written outside the worktree, so a restart runs ordinary Acceptance from workspace and Git evidence.
+
+Unlike the `stall_detection` escalation keys, the two policy values carry positive defaults, because `acceptance_escalation_command` is itself the opt-in. Leaving that command unset keeps existing behavior with no warning and no validation failure. `0` is rejected for either key: omit the command to disable escalation.
+
 ## `error_circuit_breaker`
 
 ```jsonc
@@ -350,7 +379,7 @@ If the optional escalation command keys are unset, Conflux silently skips escala
 }
 ```
 
-Scope: `apply_command`, `apply_escalation_command`, `apply_stall_diagnose_command`, `archive_command`, `analyze_command`, `acceptance_command`, `resolve_command`, and `worktree_command`.
+Scope: `apply_command`, `apply_escalation_command`, `apply_stall_diagnose_command`, `archive_command`, `analyze_command`, `acceptance_command`, `acceptance_escalation_command`, `resolve_command`, and `worktree_command`.
 
 Values expand at command-spawn time from the Conflux parent process environment. Supported forms are `$VAR` and `${VAR}`. Unset variables expand to an empty string. Conflux does not run a shell while expanding `envs`; command substitution, backticks, globbing, and shell parameter operators such as `${VAR:-default}` are not supported.
 

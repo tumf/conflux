@@ -14,7 +14,7 @@ use crate::error::{OrchestratorError, Result};
 use crate::history::{
     AcceptanceAttempt, AcceptanceHistory, ApplyHistory, ArchiveHistory, OutputCollector,
 };
-use crate::orchestration::acceptance::AcceptanceProtocolRetry;
+use crate::orchestration::acceptance::{AcceptanceCommandMode, AcceptanceProtocolRetry};
 use crate::process_manager::{ManagedChild, StreamingChildHandle};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -768,67 +768,12 @@ impl AgentRunner {
         cwd: Option<&Path>,
         base_branch: Option<&str>,
         protocol_retry: Option<AcceptanceProtocolRetry>,
+        command_mode: AcceptanceCommandMode,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
         let start = Instant::now();
-        let template = self.config.get_acceptance_command()?;
-        let user_prompt = self.config.get_acceptance_prompt();
-        let history_context = self.acceptance_history.format_context(change_id);
-
-        // Build diff context for all attempts
-        let diff_context = self
-            .build_acceptance_diff_context(change_id, cwd, base_branch)
+        let command = self
+            .build_acceptance_command(change_id, cwd, base_branch, protocol_retry, command_mode)
             .await?;
-
-        // Build last acceptance output context for 2nd+ attempts
-        use super::prompt::build_last_acceptance_output_context;
-        let stdout_tail = self.acceptance_history.last_stdout_tail(change_id);
-        let stderr_tail = self.acceptance_history.last_stderr_tail(change_id);
-        let last_output_context =
-            build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref());
-        let protocol_retry_context = self.build_missing_verdict_continuation_context(
-            change_id,
-            protocol_retry,
-            stdout_tail.as_deref(),
-            stderr_tail.as_deref(),
-        );
-        // Latest-only command-recovery evidence, kept separate from canonical and
-        // protocol context. Empty for every invocation that is not recovering
-        // from a command failure.
-        let command_recovery_context = super::prompt::build_acceptance_command_recovery_context(
-            self.acceptance_command_recovery.get(change_id),
-        );
-
-        // Build prompt injected into `{prompt}`
-        // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
-        // The match is kept for clarity, but both branches produce the same result.
-        let full_prompt = match self.config.get_acceptance_prompt_mode() {
-            crate::config::AcceptancePromptMode::Full => build_acceptance_prompt_with_skill(
-                self.config.get_accept_skill(),
-                cwd,
-                change_id,
-                user_prompt,
-                &history_context,
-                &last_output_context,
-                &diff_context,
-                &protocol_retry_context,
-                &command_recovery_context,
-            ),
-            crate::config::AcceptancePromptMode::ContextOnly => {
-                build_acceptance_prompt_context_only_with_skill(
-                    self.config.get_accept_skill(),
-                    cwd,
-                    change_id,
-                    user_prompt,
-                    &history_context,
-                    &last_output_context,
-                    &diff_context,
-                    &protocol_retry_context,
-                    &command_recovery_context,
-                )
-            }
-        };
-
-        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
             command = %crate::events::command_log_summary(&command),
@@ -870,6 +815,7 @@ impl AgentRunner {
         cwd: Option<&Path>,
         base_branch: Option<&str>,
         protocol_retry: Option<AcceptanceProtocolRetry>,
+        command_mode: AcceptanceCommandMode,
     ) -> Result<(
         StreamingChildHandle,
         mpsc::Receiver<OutputLine>,
@@ -877,7 +823,46 @@ impl AgentRunner {
         String,
     )> {
         let start = Instant::now();
-        let template = self.config.get_acceptance_command()?;
+        let command = self
+            .build_acceptance_command(change_id, cwd, base_branch, protocol_retry, command_mode)
+            .await?;
+        info!(
+            module = module_path!(),
+            command = %crate::events::command_log_summary(&command),
+            command_mode = command_mode.label(),
+            "Running acceptance command via AiCommandRunner"
+        );
+
+        // Execute via AiCommandRunner (with shared stagger state)
+        let (child, ai_rx) = ai_runner
+            .execute_streaming_with_retry(&command, cwd, Some("acceptance"), Some(change_id))
+            .await?;
+
+        let rx = bridge_ai_output_channel(ai_rx);
+
+        Ok((child, rx, start, command))
+    }
+
+    /// Build one Acceptance invocation's expanded command line.
+    ///
+    /// The single construction path both Acceptance launch entry points share.
+    /// The command mode selects only the template: the `{change_id}`/`{prompt}`
+    /// contract, the portable skill guidance, the bounded history, diff, last
+    /// output, protocol-retry, and command-recovery context are identical for
+    /// the normal and the escalation reviewer, so an alternate reviewer can
+    /// never be handed a different prompt contract by construction.
+    async fn build_acceptance_command(
+        &self,
+        change_id: &str,
+        cwd: Option<&Path>,
+        base_branch: Option<&str>,
+        protocol_retry: Option<AcceptanceProtocolRetry>,
+        command_mode: AcceptanceCommandMode,
+    ) -> Result<String> {
+        let template = crate::orchestration::acceptance::acceptance_command_template(
+            &self.config,
+            command_mode,
+        )?;
         let user_prompt = self.config.get_acceptance_prompt();
         let history_context = self.acceptance_history.format_context(change_id);
 
@@ -934,22 +919,19 @@ impl AgentRunner {
                 )
             }
         };
-
-        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
-        info!(
-            module = module_path!(),
-            command = %crate::events::command_log_summary(&command),
-            "Running acceptance command via AiCommandRunner"
+        // Trusted Conflux-owned framing, appended only for an escalation retry.
+        let full_prompt = super::prompt::append_optional_prompt(
+            full_prompt,
+            Some(&super::prompt::build_acceptance_escalation_context(
+                command_mode,
+            )),
         );
 
-        // Execute via AiCommandRunner (with shared stagger state)
-        let (child, ai_rx) = ai_runner
-            .execute_streaming_with_retry(&command, cwd, Some("acceptance"), Some(change_id))
-            .await?;
-
-        let rx = bridge_ai_output_channel(ai_rx);
-
-        Ok((child, rx, start, command))
+        Ok(expand_command_with_prompt(
+            template,
+            Some(change_id),
+            &full_prompt,
+        ))
     }
 
     /// Build the missing-verdict continuation context for a protocol retry.
