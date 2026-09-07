@@ -2409,6 +2409,158 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
     assert_eq!(progress.total, 3);
 }
 
+// --- Reviewer command selection in the live parallel path ---
+
+const NORMAL_REVIEWER_PROMPT_FILE: &str = "normal-reviewer-prompt.txt";
+const ESCALATION_REVIEWER_PROMPT_FILE: &str = "escalation-reviewer-prompt.txt";
+
+/// Two reviewer templates that are distinguishable from outside the process:
+/// each writes the prompt it actually received into its own marker file and
+/// emits its own verdict. "Which command ran" is then answered by the workspace
+/// rather than by re-reading the selection logic under test.
+fn distinguishable_reviewer_config() -> OrchestratorConfig {
+    create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some(format!(
+            "printf '%s' {{prompt}} > {NORMAL_REVIEWER_PROMPT_FILE}; echo 'ACCEPTANCE: FAIL'; \
+             echo; echo 'FINDINGS:'; echo '- normal reviewer ran'"
+        )),
+        acceptance_escalation_command: Some(format!(
+            "printf '%s' {{prompt}} > {ESCALATION_REVIEWER_PROMPT_FILE}; echo 'ACCEPTANCE: PASS'"
+        )),
+        ..Default::default()
+    })
+}
+
+/// Run exactly one acceptance invocation in `workspace_path` under the given
+/// reviewer command mode, through the same executor entry point the parallel
+/// dispatch loop calls.
+async fn run_acceptance_with_command_mode(
+    workspace_path: &Path,
+    config: &OrchestratorConfig,
+    command_mode: crate::orchestration::acceptance::AcceptanceCommandMode,
+) -> crate::orchestration::AcceptanceResult {
+    let change_id = "change-a";
+    let tasks_dir = workspace_path.join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&tasks_dir).or_fail("unexpected error");
+    std::fs::write(
+        tasks_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] 1. done\n",
+    )
+    .or_fail("unexpected error");
+
+    let queue_config = CommandQueueConfig {
+        acceptance_max_runtime_secs: crate::config::defaults::DEFAULT_ACCEPTANCE_MAX_RUNTIME_SECS,
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+        max_runtime_secs: 0,
+    };
+
+    let ai_runner = AiCommandRunner::new(queue_config, Arc::new(Mutex::new(None)));
+    let mut agent = AgentRunner::new(config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let (result, _iteration) = execute_acceptance_in_workspace(
+        change_id,
+        workspace_path,
+        &mut agent,
+        None,
+        None,
+        &ai_runner,
+        config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        None,
+        None,
+        command_mode,
+    )
+    .await
+    .or_fail("acceptance invocation should complete");
+
+    result
+}
+
+/// The live parallel acceptance path honours an escalation selection: it runs
+/// `acceptance_escalation_command`, not `acceptance_command`, and the
+/// alternate-reviewer framing reaches that invocation's prompt.
+#[tokio::test]
+async fn acceptance_escalation_mode_runs_the_escalation_command_with_its_framing() {
+    let workspace = TempDir::new().or_fail("unexpected error");
+    let config = distinguishable_reviewer_config();
+
+    let result = run_acceptance_with_command_mode(
+        workspace.path(),
+        &config,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Escalation,
+    )
+    .await;
+
+    assert!(
+        matches!(result, crate::orchestration::AcceptanceResult::Pass),
+        "the escalation reviewer's own verdict must be the one parsed, got {result:?}"
+    );
+    assert!(
+        !workspace.path().join(NORMAL_REVIEWER_PROMPT_FILE).exists(),
+        "an escalation invocation must not run acceptance_command"
+    );
+
+    let prompt = std::fs::read_to_string(workspace.path().join(ESCALATION_REVIEWER_PROMPT_FILE))
+        .or_fail("acceptance_escalation_command should have run and captured its prompt");
+    assert!(
+        prompt.contains("<acceptance_escalation>")
+            && prompt.contains("</acceptance_escalation>")
+            && prompt.contains("You are an alternate acceptance reviewer."),
+        "the alternate-reviewer framing must reach the escalation invocation: {prompt}"
+    );
+}
+
+/// The counterpart: an ordinary invocation runs `acceptance_command` and never
+/// carries the alternate-reviewer framing, so the framing cannot leak into a
+/// normal review.
+#[tokio::test]
+async fn acceptance_normal_mode_runs_the_normal_command_without_escalation_framing() {
+    let workspace = TempDir::new().or_fail("unexpected error");
+    let config = distinguishable_reviewer_config();
+
+    let result = run_acceptance_with_command_mode(
+        workspace.path(),
+        &config,
+        crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
+    )
+    .await;
+
+    match result {
+        crate::orchestration::AcceptanceResult::Fail { findings } => assert_eq!(
+            crate::acceptance::finding_texts(&findings),
+            ["normal reviewer ran"],
+            "the normal reviewer's own verdict must be the one parsed"
+        ),
+        other => panic!("expected the normal reviewer's FAIL verdict, got {other:?}"),
+    }
+    assert!(
+        !workspace
+            .path()
+            .join(ESCALATION_REVIEWER_PROMPT_FILE)
+            .exists(),
+        "an ordinary invocation must not run acceptance_escalation_command"
+    );
+
+    let prompt = std::fs::read_to_string(workspace.path().join(NORMAL_REVIEWER_PROMPT_FILE))
+        .or_fail("acceptance_command should have run and captured its prompt");
+    assert!(
+        !prompt.contains("acceptance_escalation")
+            && !prompt.contains("You are an alternate acceptance reviewer."),
+        "the alternate-reviewer framing must be absent from a normal invocation: {prompt}"
+    );
+}
+
 /// Two independent dispatches route acceptance follow-up persistence and PASS
 /// cleanup through the shared task-parser recovery path. This asserts the two
 /// call sequences produce byte-identical files, so recovery, warning, and

@@ -898,6 +898,24 @@ impl AcceptanceEscalationOutcome {
     }
 }
 
+/// Whether this observation replaces an empty FAIL's generic repair dispatch
+/// with an acceptance-only alternate review.
+///
+/// The empty FAIL is the one eligible class whose *routing* escalation changes:
+/// every other class already owns an Acceptance-only retry and only learns which
+/// reviewer runs it. The answer is read from the kind the driver already
+/// returned, so an execution frontend never re-classifies the result to decide
+/// its own routing.
+pub fn escalates_empty_fail(outcome: &AcceptanceEscalationOutcome) -> bool {
+    matches!(
+        outcome,
+        AcceptanceEscalationOutcome::Escalated {
+            kind: InvalidAcceptanceResult::EmptyFail,
+            ..
+        }
+    )
+}
+
 /// Bounded invalid-result accounting and reviewer-command selection for one
 /// change during a single active run.
 ///
@@ -5042,6 +5060,85 @@ mod tests {
             assert_eq!(
                 escalation.take_command_mode(),
                 AcceptanceCommandMode::Normal
+            );
+        }
+
+        // --- Empty-FAIL routing decision ---
+
+        /// The one routing question an execution frontend asks is answered from
+        /// the kind the driver already returned. Only a *selected* escalation of
+        /// an empty FAIL replaces the generic FAIL-to-Apply repair; every other
+        /// escalated class keeps its own existing routing and only changes which
+        /// reviewer the already-permitted retry runs.
+        #[test]
+        fn only_a_selected_empty_fail_escalation_replaces_the_generic_repair() {
+            let escalated = |kind| AcceptanceEscalationOutcome::Escalated {
+                kind,
+                consecutive_invalid: 1,
+                use_index: 1,
+                max_uses_per_sequence: 1,
+            };
+
+            assert!(
+                escalates_empty_fail(&escalated(InvalidAcceptanceResult::EmptyFail)),
+                "an escalated empty FAIL is routed as an acceptance-only alternate review"
+            );
+
+            for kind in [
+                InvalidAcceptanceResult::MissingVerdict,
+                InvalidAcceptanceResult::BareBlocker,
+                InvalidAcceptanceResult::MalformedFinding,
+            ] {
+                assert!(
+                    !escalates_empty_fail(&escalated(kind)),
+                    "{kind:?} already owns an acceptance-only retry; its routing must not change"
+                );
+            }
+
+            for outcome in [
+                AcceptanceEscalationOutcome::NotObserved,
+                AcceptanceEscalationOutcome::SequenceReset,
+                AcceptanceEscalationOutcome::Retained {
+                    kind: InvalidAcceptanceResult::EmptyFail,
+                    consecutive_invalid: 1,
+                    reason: EscalationDeclineReason::BelowThreshold {
+                        after_invalid_results: 2,
+                    },
+                },
+            ] {
+                assert!(
+                    !escalates_empty_fail(&outcome),
+                    "{outcome:?} selected no alternate reviewer, so routing is unchanged"
+                );
+            }
+        }
+
+        /// The decision the parallel loop makes is the driver's own: a real
+        /// observation that selects escalation for an empty FAIL reroutes, and
+        /// the same observation below the threshold does not.
+        #[test]
+        fn the_routing_decision_reads_the_drivers_own_observation() {
+            let mut escalation = driver(Some("deep-accept {prompt}"), Some((2, 1)));
+
+            let below_threshold = escalation.observe(&empty_fail(), Some("rev-a"));
+            assert!(
+                !escalates_empty_fail(&below_threshold),
+                "below threshold the empty FAIL keeps the generic FAIL-to-Apply repair"
+            );
+
+            let at_threshold = escalation.observe(&empty_fail(), Some("rev-a"));
+            assert!(
+                escalates_empty_fail(&at_threshold),
+                "at the threshold the empty FAIL becomes an acceptance-only alternate review"
+            );
+
+            let mut protocol_class = driver(Some("deep-accept {prompt}"), Some((1, 1)));
+            let escalated_missing_verdict =
+                protocol_class.observe(&missing_verdict(), Some("rev-a"));
+            assert!(escalated_missing_verdict.escalation_selected());
+            assert!(
+                !escalates_empty_fail(&escalated_missing_verdict),
+                "a missing verdict escalates the reviewer, not the routing"
             );
         }
 

@@ -3031,13 +3031,8 @@ impl ParallelExecutor {
                             .ok();
                     let escalation_outcome =
                         escalation.observe(result, escalation_revision.as_deref());
-                    escalate_empty_fail = escalation_outcome.escalation_selected()
-                        && matches!(
-                            crate::orchestration::acceptance::classify_invalid_acceptance_result(
-                                result
-                            ),
-                            Some(crate::orchestration::acceptance::InvalidAcceptanceResult::EmptyFail)
-                        );
+                    escalate_empty_fail =
+                        crate::orchestration::acceptance::escalates_empty_fail(&escalation_outcome);
                     if let Some(diagnostic) = escalation_outcome.diagnostic() {
                         info!(
                             "Acceptance escalation policy for {} (cycle {}): {}",
