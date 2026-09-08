@@ -1278,6 +1278,16 @@ fn a_non_git_invocation_refuses_before_any_orchestration_side_effect() {
         stderr.contains("git repository"),
         "the error must name the missing repository, got stderr={stderr}"
     );
+    // The retired socket-choice scenarios asserted the opposite of this: that a
+    // non-Git owner invocation is answered by path-selection guidance. The
+    // preflight now decides first, so the guidance is not merely absent by
+    // accident — offering it here would mean socket resolution was reached from
+    // an owner entrypoint with no repository identity.
+    assert!(
+        !stderr.contains("--web-unix-socket") && !stderr.contains("--no-web-unix-socket"),
+        "socket path-selection guidance is unreachable for an owner entrypoint \
+         outside Git; the refusal must be the missing-repository one, got stderr={stderr}"
+    );
     assert!(
         !state_home.exists(),
         "the refusal must precede logging initialization"
@@ -1323,6 +1333,11 @@ fn outside_git_every_executable_run_is_refused_before_side_effects() {
         assert!(
             stderr.contains("git repository"),
             "the error must name the missing repository, got stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("--web-unix-socket") && !stderr.contains("--no-web-unix-socket"),
+            "no socket option turns the missing repository into a path-selection \
+             decision, got stderr={stderr}"
         );
         assert!(!applied.exists(), "no AI subprocess may run");
         assert!(!adapter_ran.exists(), "no lifecycle adapter may start");
