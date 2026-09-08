@@ -57,6 +57,7 @@ pub mod runtime;
 mod shell_command;
 mod spec_delta;
 mod stall;
+pub mod startup_preflight;
 mod stream_json_textifier;
 mod task_file;
 mod task_parser;

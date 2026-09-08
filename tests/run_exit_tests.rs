@@ -563,11 +563,62 @@ fn non_orchestration_commands_bypass_the_lock() {
     drop(owner);
 }
 
+/// Linked worktrees keep collapsing onto one canonical common directory — the
+/// identity the lock and the socket are both derived from — while the owner
+/// preflight keeps a linked worktree from ever reaching that lock.
+///
+/// The exclusion half is proven from a second *main-worktree* invocation,
+/// because starting an owner from the linked worktree is exactly what the
+/// preflight now refuses.
 #[test]
 fn linked_worktrees_share_one_repository_lock() {
     let tmp = tempfile::tempdir().unwrap();
-    let main = tmp.path().join("main");
-    let linked = tmp.path().join("linked");
+    let (main, linked) = repo_with_linked_worktree(tmp.path());
+
+    let owner = take_repository_lock(&main, InvocationMode::Run);
+    assert_eq!(
+        repo_lock::discover_common_dir(&linked),
+        repo_lock::discover_common_dir(&main),
+        "linked worktrees must resolve to one canonical git common directory"
+    );
+
+    // A competitor in the main worktree still loses to the lock, with the
+    // owner's diagnostic.
+    let competing = cflx_output(&main, &["run", "--all"]);
+    let stderr = assert_rejected_as_lock_conflict(&competing, "competing run in the main worktree");
+    assert!(
+        stderr.contains(&fs::canonicalize(&main).unwrap().display().to_string()),
+        "diagnostic must identify the owning worktree, got stderr={stderr}"
+    );
+
+    // The linked worktree never reaches the lock: it is refused earlier, by its
+    // own preflight, and is never reported as a lock conflict.
+    let from_linked = cflx_output(&linked, &["run", "--all"]);
+    let refusal = assert_linked_worktree_refusal(&from_linked, &main, &linked, "run from linked");
+    assert!(
+        !refusal.contains(CONFLICT_HEADLINE),
+        "a linked worktree must not be reported as a lock conflict, got stderr={refusal}"
+    );
+
+    drop(owner);
+}
+
+// ── Linked-worktree owner-startup preflight ────────────────────────────────
+//
+// Bare `cflx`, `cflx tui`, and `cflx run` own local orchestration for the
+// repository, and ownership is scoped to the shared Git common directory. These
+// cases drive real `cflx` processes against a real repository plus a real linked
+// worktree, because the contract is about *ordering*: the refusal has to land
+// before the repository lock, the logs, the listener, the lifecycle adapter, the
+// AI subprocess, and any managed worktree.
+
+const LINKED_WORKTREE_HEADLINE: &str =
+    "cannot start local orchestration from a linked git worktree";
+
+/// A repository with one registered linked worktree, both usable as projects.
+fn repo_with_linked_worktree(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let main = tmp.join("main");
+    let linked = tmp.join("linked");
     fs::create_dir_all(&main).unwrap();
     setup_empty_project(&main);
     init_git_repo(&main);
@@ -584,22 +635,214 @@ fn linked_worktrees_share_one_repository_lock() {
         ],
     );
     setup_empty_project(&linked);
+    (main, linked)
+}
 
-    let owner = take_repository_lock(&main, InvocationMode::Run);
-    assert_eq!(
-        repo_lock::discover_common_dir(&linked),
-        repo_lock::discover_common_dir(&main),
-        "linked worktrees must resolve to one canonical git common directory"
-    );
-
-    let output = cflx_output(&linked, &["run", "--all"]);
-    let stderr = assert_rejected_as_lock_conflict(&output, "run from linked worktree");
+/// Assert the actionable linked-worktree refusal, and return its stderr.
+fn assert_linked_worktree_refusal(
+    output: &std::process::Output,
+    main: &Path,
+    linked: &Path,
+    context: &str,
+) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains(&fs::canonicalize(&main).unwrap().display().to_string()),
-        "diagnostic must identify the owning worktree, got stderr={stderr}"
+        !output.status.success(),
+        "{context}: expected non-zero exit, got {:?} (stderr={stderr})",
+        output.status
+    );
+    assert!(
+        stderr.contains(LINKED_WORKTREE_HEADLINE),
+        "{context}: expected the linked-worktree diagnostic, got stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(&fs::canonicalize(linked).unwrap().display().to_string()),
+        "{context}: the refusal must name the current linked worktree, got stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(&fs::canonicalize(main).unwrap().display().to_string()),
+        "{context}: the refusal must name the main worktree, got stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Start Conflux from the main worktree"),
+        "{context}: the refusal must say where to start instead, got stderr={stderr}"
+    );
+    // Logging, listeners, and orchestration all start after the preflight, so a
+    // refused invocation must not have announced a startup.
+    assert!(
+        !stdout.contains("Starting cflx"),
+        "{context}: orchestration startup must not run, got stdout={stdout}"
+    );
+    stderr
+}
+
+/// Every owner entrypoint refuses a linked worktree, and none of them leaves a
+/// lock file, owner metadata, a socket, a log, a lifecycle adapter, or an AI
+/// subprocess behind.
+///
+/// The linked worktree carries a pending change and a real apply command, so a
+/// regression would orchestrate rather than exit — which the bounded runner
+/// turns into a failure instead of a hang.
+#[test]
+#[cfg(all(unix, feature = "web-monitoring"))]
+fn linked_worktree_startup_is_refused_for_every_owner_entrypoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (main, linked) = repo_with_linked_worktree(tmp.path());
+    let (applied, adapter_ran) = setup_observable_project(&linked);
+    add_change(&linked, "a");
+
+    let common_dir = repo_lock::discover_common_dir(&linked).expect("git common dir");
+    let socket = default_socket_path(&linked);
+    let state_home = tmp.path().join("state");
+
+    // Default TUI (no subcommand), explicit local TUI, and run.
+    let guarded: [Vec<&str>; 3] = [vec![], vec!["tui"], vec!["run", "--all"]];
+    for args in guarded {
+        let output = cflx_output_bounded_with_env(
+            &linked,
+            &args,
+            &[("XDG_STATE_HOME", &state_home)],
+            Duration::from_secs(30),
+        );
+        assert_linked_worktree_refusal(
+            &output,
+            &main,
+            &linked,
+            &format!("cflx {}", args.join(" ")),
+        );
+    }
+
+    assert!(
+        !common_dir.join(repo_lock::LOCK_FILE_NAME).exists(),
+        "a refused owner must not create the repository lock file"
+    );
+    assert!(
+        !common_dir.join(repo_lock::OWNER_FILE_NAME).exists(),
+        "a refused owner must not publish owner metadata"
+    );
+    assert!(!socket.exists(), "a refused owner must bind no API socket");
+    assert!(
+        !state_home.exists(),
+        "a refused owner must be rejected before any log file is written"
+    );
+    assert!(!applied.exists(), "no AI subprocess may run");
+    assert!(!adapter_ran.exists(), "no lifecycle adapter may start");
+    // The refusal reports; it never repairs. Both worktrees survive untouched.
+    assert!(main.join(".git").is_dir(), "the main worktree must survive");
+    assert!(
+        linked.join(".git").is_file(),
+        "the linked worktree registration must survive"
+    );
+}
+
+/// The same repository's main worktree stays eligible: the preflight rejects a
+/// worktree role, not the repository.
+#[test]
+fn linked_worktree_startup_leaves_the_main_worktree_eligible() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (main, _linked) = repo_with_linked_worktree(tmp.path());
+
+    let output = cflx_output(&main, &["run", "--all"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the main worktree must still start, got {:?} (stderr={stderr})",
+        output.status
+    );
+    assert!(
+        !stderr.contains(LINKED_WORKTREE_HEADLINE),
+        "the main worktree must not be classified as linked, got stderr={stderr}"
+    );
+}
+
+/// A `.git` pointer file is not evidence of a linked worktree. A repository
+/// using a separate Git directory resolves both identities to the same path and
+/// stays eligible.
+#[test]
+fn linked_worktree_startup_admits_a_separate_git_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    let git_dir = tmp.path().join("elsewhere.git");
+    fs::create_dir_all(&work).unwrap();
+    setup_empty_project(&work);
+    git(
+        &work,
+        &[
+            "init",
+            "--quiet",
+            "--separate-git-dir",
+            git_dir.to_str().unwrap(),
+        ],
     );
 
-    drop(owner);
+    assert!(
+        work.join(".git").is_file(),
+        "the fixture must use a .git pointer file for the test to mean anything"
+    );
+    assert_eq!(
+        repo_lock::discover_common_dir(&work),
+        Some(fs::canonicalize(&git_dir).unwrap()),
+        "a separate Git directory is its own common directory"
+    );
+
+    let output = cflx_output(&work, &["run", "--all"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a separate-Git-directory workspace must start, got {:?} (stderr={stderr})",
+        output.status
+    );
+    assert!(
+        !stderr.contains(LINKED_WORKTREE_HEADLINE),
+        "a .git pointer file alone must not be read as a linked worktree, got stderr={stderr}"
+    );
+}
+
+/// Non-owner commands bypass the preflight entirely and keep their existing
+/// linked-worktree routing.
+#[test]
+fn linked_worktree_startup_bypasses_non_owner_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (main, linked) = repo_with_linked_worktree(tmp.path());
+
+    for args in [vec!["completion", "bash"], vec!["openspec", "list"]] {
+        let output = cflx_output(&linked, &args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "cflx {} must stay usable from a linked worktree (stderr={stderr})",
+            args.join(" ")
+        );
+        assert!(
+            !stderr.contains(LINKED_WORKTREE_HEADLINE),
+            "cflx {} must bypass the owner preflight (stderr={stderr})",
+            args.join(" ")
+        );
+    }
+
+    // `cflx client` is the delegation boundary: it must keep resolving the
+    // repository from a linked worktree and answer with its own envelope rather
+    // than the owner refusal. No owner is running, so the envelope is a typed
+    // refusal — which is still the client contract, not the preflight.
+    let client = cflx_output(&linked, &["client", "status", "--json"]);
+    let stdout = String::from_utf8_lossy(&client.stdout);
+    let stderr = String::from_utf8_lossy(&client.stderr);
+    assert!(
+        !stdout.contains(LINKED_WORKTREE_HEADLINE) && !stderr.contains(LINKED_WORKTREE_HEADLINE),
+        "cflx client must bypass the owner preflight (stdout={stdout} stderr={stderr})"
+    );
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("client envelope: {e} ({stdout})"));
+    assert_eq!(envelope["operation"], "status", "envelope={envelope}");
+    assert_eq!(
+        envelope["outcome"], "owner_not_running",
+        "a linked worktree must still route to the repository's owner socket, envelope={envelope}"
+    );
+
+    // The main worktree of the same repository is what an owner would use, and
+    // the preflight left it alone.
+    assert!(main.join(".git").is_dir());
 }
 
 #[test]
@@ -999,8 +1242,14 @@ fn socket_health_ok(socket: &Path) -> bool {
     raw.starts_with("HTTP/1.1 200")
 }
 
-/// Outside Git there is no repository identity to derive a socket from, so the
-/// operator has to choose — and the refusal happens before any work starts.
+/// Outside Git there is no repository to orchestrate, and the shared owner
+/// preflight says so before the listener the socket options configure ever
+/// exists — so no log file and no lock are produced either.
+///
+/// The socket-choice guidance is unreachable for an owner entrypoint now: a
+/// workspace with no repository identity cannot own orchestration whatever the
+/// socket options say. `src/web/unix_socket.rs` keeps that message under test
+/// where it is still decidable.
 #[test]
 #[cfg(all(unix, feature = "web-monitoring"))]
 fn a_non_git_invocation_refuses_before_any_orchestration_side_effect() {
@@ -1012,7 +1261,13 @@ fn a_non_git_invocation_refuses_before_any_orchestration_side_effect() {
         "this workspace must be outside Git for the test to mean anything"
     );
 
-    let output = cflx_output_bounded(tmp.path(), &["run", "--all"], Duration::from_secs(30));
+    let state_home = tmp.path().join("state");
+    let output = cflx_output_bounded_with_env(
+        tmp.path(),
+        &["run", "--all"],
+        &[("XDG_STATE_HOME", &state_home)],
+        Duration::from_secs(30),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
@@ -1020,8 +1275,22 @@ fn a_non_git_invocation_refuses_before_any_orchestration_side_effect() {
         output.status
     );
     assert!(
-        stderr.contains("--web-unix-socket") && stderr.contains("--no-web-unix-socket"),
-        "the error must explain both explicit choices, got stderr={stderr}"
+        stderr.contains("git repository"),
+        "the error must name the missing repository, got stderr={stderr}"
+    );
+    // The retired socket-choice scenarios asserted the opposite of this: that a
+    // non-Git owner invocation is answered by path-selection guidance. The
+    // preflight now decides first, so the guidance is not merely absent by
+    // accident — offering it here would mean socket resolution was reached from
+    // an owner entrypoint with no repository identity.
+    assert!(
+        !stderr.contains("--web-unix-socket") && !stderr.contains("--no-web-unix-socket"),
+        "socket path-selection guidance is unreachable for an owner entrypoint \
+         outside Git; the refusal must be the missing-repository one, got stderr={stderr}"
+    );
+    assert!(
+        !state_home.exists(),
+        "the refusal must precede logging initialization"
     );
     assert!(!applied.exists(), "no AI subprocess may run");
     assert!(!adapter_ran.exists(), "no lifecycle adapter may start");
@@ -1064,6 +1333,11 @@ fn outside_git_every_executable_run_is_refused_before_side_effects() {
         assert!(
             stderr.contains("git repository"),
             "the error must name the missing repository, got stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("--web-unix-socket") && !stderr.contains("--no-web-unix-socket"),
+            "no socket option turns the missing repository into a path-selection \
+             decision, got stderr={stderr}"
         );
         assert!(!applied.exists(), "no AI subprocess may run");
         assert!(!adapter_ran.exists(), "no lifecycle adapter may start");
@@ -1436,43 +1710,46 @@ fn a_stale_socket_is_replaced_by_the_next_run() {
     assert!(!socket.exists(), "the replacement is cleaned up in turn");
 }
 
-/// Linked worktrees are one repository, so they advertise one socket — and the
-/// repository lock is what keeps two owners from racing for it.
+/// Linked worktrees are one repository, so they resolve one socket path — the
+/// identity a client uses from either worktree. Only the main worktree may bind
+/// it: the owner preflight refuses a linked-worktree owner before any listener.
 #[test]
 #[cfg(all(unix, feature = "web-monitoring"))]
 fn linked_worktrees_advertise_one_socket() {
     let tmp = tempfile::tempdir().unwrap();
-    let main = tmp.path().join("main");
-    let linked = tmp.path().join("linked");
-    fs::create_dir_all(&main).unwrap();
-    setup_empty_project(&main);
-    init_git_repo(&main);
-    git(&main, &["commit", "--allow-empty", "--quiet", "-m", "init"]);
-    git(
-        &main,
-        &[
-            "worktree",
-            "add",
-            "--quiet",
-            "-b",
-            "linked",
-            linked.to_str().unwrap(),
-        ],
+    let (main, linked) = repo_with_linked_worktree(tmp.path());
+
+    let socket = default_socket_path(&main);
+    assert_eq!(
+        socket,
+        default_socket_path(&linked),
+        "both worktrees must resolve the one repository socket"
     );
-    setup_empty_project(&linked);
 
-    assert_eq!(default_socket_path(&main), default_socket_path(&linked));
-
-    let from_linked = cflx_output(&linked, &["run", "--all"]);
+    // The owner binds it from the main worktree and cleans it up on completion.
+    let from_main = cflx_output(&main, &["run", "--all"]);
     assert!(
-        from_linked.status.success(),
+        from_main.status.success(),
         "stderr={}",
-        String::from_utf8_lossy(&from_linked.stderr)
+        String::from_utf8_lossy(&from_main.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&from_linked.stdout)
-            .contains(&format!("unix://{}", default_socket_path(&main).display())),
-        "a linked worktree must advertise the shared repository socket"
+        String::from_utf8_lossy(&from_main.stdout)
+            .contains(&format!("unix://{}", socket.display())),
+        "the main worktree must advertise the shared repository socket"
+    );
+    assert!(
+        !socket.exists(),
+        "terminal completion must remove the socket"
+    );
+
+    // An owner started from the linked worktree is refused before any listener
+    // exists, so the shared socket is never bound from there.
+    let from_linked = cflx_output(&linked, &["run", "--all"]);
+    assert_linked_worktree_refusal(&from_linked, &main, &linked, "run from linked worktree");
+    assert!(
+        !socket.exists(),
+        "a refused linked-worktree owner must bind no socket"
     );
 }
 

@@ -41,6 +41,8 @@ mod spec_delta;
 #[cfg(test)]
 mod spec_test_annotations;
 mod stall;
+#[allow(dead_code)]
+mod startup_preflight;
 mod stream_json_textifier;
 mod task_file;
 mod task_parser;
@@ -91,32 +93,6 @@ fn lifecycle_process_context() -> LifecycleContext {
         Ok(dir) => LifecycleContext::workspace(dir.display().to_string()),
         Err(_) => LifecycleContext::default(),
     }
-}
-
-/// Reject an executable orchestration entrypoint that has no usable Git
-/// repository, before any observable side effect.
-///
-/// Cumulative Git-worktree orchestration is the only execution model: there is
-/// no serial fallback to degrade to, so this is a hard startup requirement for
-/// `cflx run` and the local TUI alike. Read-only commands never reach it.
-///
-/// Returns `None` when the workspace is usable.
-fn git_preflight_error() -> Option<String> {
-    if !cli::check_git_directory() {
-        return Some(
-            "conflux requires a git repository (.git directory not found): worktree \
-             orchestration is the only execution model, so run cflx from inside a git \
-             repository"
-                .to_string(),
-        );
-    }
-    if !cli::check_git_available() {
-        return Some(
-            "conflux requires the git command: install git, or make it available on PATH"
-                .to_string(),
-        );
-    }
-    None
 }
 
 /// Validate and construct the local TUI's upstream runtime before any TUI or
@@ -207,16 +183,11 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
     #[cfg(feature = "web-monitoring")]
     let started = start_local_api(LocalApiOptions::from(&args), &changes).await;
 
-    // Worktree orchestration is the only execution model, so a usable Git
-    // repository is a startup requirement rather than a capability that decides
-    // between two modes. This runs before the upstream fetch, the lifecycle
-    // adapter, any AI subprocess, and any workspace mutation, so a workspace
-    // that cannot be orchestrated leaves nothing behind.
+    // Repository usability and main-worktree eligibility were both settled by
+    // the shared owner preflight, before the lock, this process's logging, and
+    // the listeners above. What remains here is the upstream contract.
     let startup: std::result::Result<Option<upstream::UpstreamRuntime>, String> =
-        match git_preflight_error() {
-            Some(err) => Err(err),
-            None => resolve_tui_upstream_runtime(&args).await,
-        };
+        resolve_tui_upstream_runtime(&args).await;
 
     // Startup validation runs before the terminal is taken over, so a rejected
     // invocation reports plainly and leaves no orchestration state behind. The
@@ -574,6 +545,24 @@ fn repository_lock_invocation(cli: &Cli) -> repo_lock::InvocationKind {
     }
 }
 
+/// Refuse an orchestration-owning invocation whose workspace cannot own
+/// orchestration, before any observable side effect.
+///
+/// This is the whole startup boundary for owner entrypoints: a usable Git
+/// repository, the `git` command, and the repository's *main* worktree. It runs
+/// before the repository lock — so a linked worktree is answered with its own
+/// diagnostic rather than being reported as a lock conflict with whichever owner
+/// happens to be running — and therefore before logging initialization, listener
+/// binding, lifecycle adapters, AI subprocesses, hooks, and workspace mutation.
+/// Non-owner commands, `cflx client` included, bypass it entirely.
+fn enforce_owner_startup_preflight(cli: &Cli) {
+    let kind = repository_lock_invocation(cli);
+    if let Some(message) = startup_preflight::owner_startup_error(kind) {
+        eprintln!("Error: {message}");
+        std::process::exit(1);
+    }
+}
+
 /// Take the repository orchestration lock before any startup side effect.
 ///
 /// Runs before logging adapters, listeners, AI subprocesses, and orchestration
@@ -902,6 +891,11 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
 
+    // Workspace eligibility is decided first: a repository that cannot be
+    // orchestrated, or a linked worktree that may not own orchestration, is
+    // refused before this process contends for the repository lock.
+    enforce_owner_startup_preflight(&cli);
+
     // Repository exclusion is decided before anything observable happens.
     acquire_repository_lock(&cli);
 
@@ -1030,18 +1024,10 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Worktree orchestration is the only execution model, so an
-            // unusable Git workspace stops the run here — after the listeners
-            // bound, and before any hook, lifecycle adapter, AI subprocess, or
-            // managed-worktree mutation exists.
-            if let Some(message) = git_preflight_error() {
-                eprintln!("Error: {}", message);
-                #[cfg(feature = "web-monitoring")]
-                if let Some((handle, _)) = started_api {
-                    handle.shutdown().await;
-                }
-                std::process::exit(1);
-            }
+            // Worktree orchestration is the only execution model, and a linked
+            // worktree may not own it. Both facts were settled by the shared
+            // owner preflight before the repository lock, this process's
+            // logging, and the listeners above, so nothing here re-checks them.
 
             // Opt-in upstream integration. When the option is absent no upstream
             // object is constructed, so the existing execution path performs no

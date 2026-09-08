@@ -8,6 +8,7 @@ references:
   - tests/run_exit_tests.rs
   - openspec/specs/cli/spec.md
   - openspec/specs/tui-editor/spec.md
+  - openspec/specs/web-monitoring/spec.md
 verifications:
   - id: linked-worktree-startup-tests
     requirement: Local orchestration owners refuse startup from a linked Git worktree before acquiring the repository lock or producing orchestration side effects
@@ -74,3 +75,16 @@ A repository using a separate Git directory is not a linked worktree when its re
 - Changing client/MCP project routing from linked worktrees.
 - Changing repository lock identity or owner socket placement.
 - Repairing the already-stale `file-drag-folder-move` registration in another repository.
+
+## Retired Scenarios
+
+- cli: Repository-Scoped Orchestration Lock / Linked worktrees share one lock
+
+That scenario asserted that starting local orchestration from a linked worktree is rejected *as a repository lock conflict*. This change rejects it earlier, by the main-worktree preflight, so the outcome it described can no longer occur. `Linked worktree is rejected before lock contention` replaces it and keeps the shared-common-directory identity under test.
+
+- cli: Web Monitoring Flags / Non-Git invocation requires a decision
+- web-monitoring: Configuration Options / Non-Git default path is unavailable
+
+Both scenarios required an owner entrypoint outside Git to fail with a *socket path-selection* error naming `--web-unix-socket` and `--no-web-unix-socket`. Moving the Git refusal into the shared owner startup preflight puts it ahead of listener setup, so socket resolution is never reached from an owner entrypoint and neither outcome can occur.
+
+Their outcomes are retired in place: a MODIFIED requirement merges into the canonical block rather than replacing it, so dropping a scenario header is not expressible in a delta. Each header is therefore kept and its body rewritten to what is now decidable — the missing-repository refusal precedes socket selection whatever the socket options say, and no path-selection guidance is offered. The resolver's own path-selection message survives in `src/web/unix_socket.rs` for callers that resolve a path without that preflight, and stays covered by that module's unit tests. `tests/run_exit_tests.rs` proves the retirement with a negative assertion rather than a comment.

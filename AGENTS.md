@@ -383,9 +383,11 @@ other.
 
 `cflx`, `cflx tui`, and `cflx run` serve the versioned `/api/v2` API on
 `${GIT_COMMON_DIR}/cflx-api.sock` by default in `web-monitoring` builds — no
-TCP port and no flag required. Linked worktrees of one repository share that
-single socket because it is derived from the same canonical Git common directory
-the repository lock uses, and the lock is what prevents two default owners.
+TCP port and no flag required. Linked worktrees of one repository resolve that
+same single socket because it is derived from the same canonical Git common
+directory the repository lock uses — but only the main worktree may *own*
+orchestration: the startup preflight refuses an owner entrypoint launched from a
+linked worktree before the lock is even contended for.
 
 ```bash
 curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" \
@@ -394,8 +396,10 @@ curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" \
 
 - `--web-unix-socket PATH` overrides the path; `--no-web-unix-socket` disables
   the listener. The two are mutually exclusive.
-- Outside a Git repository the default has no identity to derive, so startup
-  fails unless one of those two options is supplied.
+- Outside a Git repository neither option makes an owner startable: the startup
+  preflight refuses `cflx`, `cflx tui`, and `cflx run` with a missing-repository
+  error before any socket path is selected, so there is no path-selection
+  decision left to make.
 - The socket is mode `0600`. A configured bearer token applies to UDS and TCP
   alike (`/api/v2/health` stays public); without one, UDS is token-free local
   access, protected by filesystem permissions.

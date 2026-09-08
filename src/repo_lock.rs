@@ -274,11 +274,33 @@ pub fn resolve_common_dir(git_dir: &Path, commondir_contents: Option<&str>) -> P
     }
 }
 
-/// Find the canonical Git common directory for `workspace`, if any.
+/// The repository identities a workspace resolves to.
 ///
-/// Returns `None` when the path is not inside a Git repository; callers treat
-/// that as "no repository identity to lock" rather than an error.
-pub fn discover_common_dir(workspace: &Path) -> Option<PathBuf> {
+/// `git_dir` and `common_dir` are equal for a main worktree — including one
+/// whose `.git` is a pointer file to a separate Git directory — and differ only
+/// for a linked worktree, whose Git directory lives under the shared
+/// `worktrees/` registry. That difference is the repository evidence the
+/// orchestration-owner preflight classifies on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDirectories {
+    /// The working tree root: the directory holding the `.git` entry.
+    pub worktree_root: PathBuf,
+    /// This working tree's own resolved Git directory.
+    pub git_dir: PathBuf,
+    /// The Git common directory shared by every worktree of the repository.
+    pub common_dir: PathBuf,
+}
+
+/// Canonicalize when the path exists, otherwise normalize it lexically.
+fn canonical_or_normalized(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+}
+
+/// Resolve both Git identities for `workspace` from repository evidence.
+///
+/// Returns `None` when the path is not inside a Git working tree; callers treat
+/// that as "no repository identity" rather than an error.
+pub fn discover_git_directories(workspace: &Path) -> Option<GitDirectories> {
     let start = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     for dir in start.ancestors() {
         let dot_git = dir.join(".git");
@@ -293,9 +315,21 @@ pub fn discover_common_dir(workspace: &Path) -> Option<PathBuf> {
         };
         let commondir = std::fs::read_to_string(git_dir.join("commondir")).ok();
         let common_dir = resolve_common_dir(&git_dir, commondir.as_deref());
-        return Some(std::fs::canonicalize(&common_dir).unwrap_or(common_dir));
+        return Some(GitDirectories {
+            worktree_root: dir.to_path_buf(),
+            git_dir: canonical_or_normalized(&git_dir),
+            common_dir: canonical_or_normalized(&common_dir),
+        });
     }
     None
+}
+
+/// Find the canonical Git common directory for `workspace`, if any.
+///
+/// Returns `None` when the path is not inside a Git repository; callers treat
+/// that as "no repository identity to lock" rather than an error.
+pub fn discover_common_dir(workspace: &Path) -> Option<PathBuf> {
+    discover_git_directories(workspace).map(|dirs| dirs.common_dir)
 }
 
 /// The repository and, when readable, the owner a conflict was lost to.

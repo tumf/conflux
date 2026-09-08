@@ -44,7 +44,7 @@ Executable CLI orchestration SHALL require a usable Git repository and Git comma
 
 Conflux MUST allow at most one eligible local orchestration-owning process for a Git repository at a time. Repository identity MUST remain based on the canonical Git common directory. Only the main worktree is eligible to acquire this lock; linked-worktree owner startup MUST be rejected by the earlier main-worktree preflight. Ownership MUST use an OS-managed, non-blocking process lock retained for the process lifetime; diagnostic file contents MUST NOT determine lock ownership or workflow state.
 
-#### Scenario: Competing eligible process in the same repository is rejected
+#### Scenario: Competing process in the same repository is rejected
 
 - **GIVEN** an eligible local `cflx run` or local TUI process owns the repository lock from the main worktree
 - **WHEN** another eligible local orchestration-owning invocation targets the same canonical Git common directory
@@ -76,3 +76,50 @@ Conflux MUST allow at most one eligible local orchestration-owning process for a
 - **GIVEN** a process owns a repository lock
 - **WHEN** another invocation runs a non-orchestration command or uses TUI remote-client mode from any worktree
 - **THEN** that invocation does not attempt to acquire the local orchestration lock
+
+### Requirement: Web Monitoring Flags
+
+The CLI SHALL expose the browser-facing `--web` TCP listener and the default local Unix API listener as distinct controls. In web-enabled builds, default TUI, `tui`, and `run` SHALL use `${GIT_COMMON_DIR}/cflx-api.sock` unless `--web-unix-socket PATH` overrides it or `--no-web-unix-socket` disables it. The override and opt-out SHALL be mutually exclusive. `--web` SHALL add the retained TCP/Web UI listener without disabling UDS. Unix socket selection SHALL happen only after the owner startup preflight admits the workspace, so socket options SHALL NOT make an ineligible workspace startable.
+
+#### Scenario: Default UDS starts without web flag
+
+- **GIVEN** a web-enabled build inside a Git repository
+- **WHEN** the user starts default TUI, `cflx tui`, or `cflx run` without Unix socket flags
+- **THEN** the API binds `${GIT_COMMON_DIR}/cflx-api.sock`
+- **AND** no TCP Web UI listener starts unless `--web` is supplied
+
+#### Scenario: Override default Unix path
+
+- **WHEN** the user supplies `--web-unix-socket /run/user/1000/custom.sock`
+- **THEN** the API binds that path instead of the Git common-directory default
+
+#### Scenario: Disable default Unix listener
+
+- **WHEN** the user supplies `--no-web-unix-socket`
+- **THEN** no UDS listener starts
+- **AND** local orchestration may continue
+
+#### Scenario: Unix options are mutually exclusive
+
+- **WHEN** the user supplies both `--web-unix-socket PATH` and `--no-web-unix-socket`
+- **THEN** CLI parsing fails with an actionable conflict error
+
+#### Scenario: Enable web monitoring alongside UDS
+
+- **WHEN** the user runs with `--web`
+- **THEN** the retained TCP server starts on the configured bind and actual port
+- **AND** the default or explicit UDS remains active
+- **AND** the TUI displays and encodes only the TCP Web UI URL as QR
+
+#### Scenario: Configure TCP listener
+
+- **WHEN** the user runs with `--web --web-bind 0.0.0.0 --web-port 3000` and valid required authentication
+- **THEN** the TCP server accepts connections on port 3000 from the configured interface
+- **AND** the UDS path remains controlled only by its default, override, or opt-out
+
+#### Scenario: Non-Git invocation requires a decision
+
+- **GIVEN** a web-enabled local orchestration-owning invocation outside a Git repository
+- **WHEN** the user starts bare `cflx`, `cflx tui`, or `cflx run`, with or without a Unix socket option
+- **THEN** startup exits non-zero with the owner preflight's missing-repository error before any socket path is selected
+- **AND** the decision the error asks for is where to run Conflux, not which socket option to pass, so no socket path-selection guidance is offered
