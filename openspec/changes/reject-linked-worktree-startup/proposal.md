@@ -74,3 +74,9 @@ A repository using a separate Git directory is not a linked worktree when its re
 - Changing client/MCP project routing from linked worktrees.
 - Changing repository lock identity or owner socket placement.
 - Repairing the already-stale `file-drag-folder-move` registration in another repository.
+
+## Retired Scenarios
+
+- cli: Repository-Scoped Orchestration Lock / Linked worktrees share one lock
+
+That scenario asserted that starting local orchestration from a linked worktree is rejected *as a repository lock conflict*. This change rejects it earlier, by the main-worktree preflight, so the outcome it described can no longer occur. `Linked worktree is rejected before lock contention` replaces it and keeps the shared-common-directory identity under test.

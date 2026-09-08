@@ -44,7 +44,7 @@ Executable CLI orchestration SHALL require a usable Git repository and Git comma
 
 Conflux MUST allow at most one eligible local orchestration-owning process for a Git repository at a time. Repository identity MUST remain based on the canonical Git common directory. Only the main worktree is eligible to acquire this lock; linked-worktree owner startup MUST be rejected by the earlier main-worktree preflight. Ownership MUST use an OS-managed, non-blocking process lock retained for the process lifetime; diagnostic file contents MUST NOT determine lock ownership or workflow state.
 
-#### Scenario: Competing eligible process in the same repository is rejected
+#### Scenario: Competing process in the same repository is rejected
 
 - **GIVEN** an eligible local `cflx run` or local TUI process owns the repository lock from the main worktree
 - **WHEN** another eligible local orchestration-owning invocation targets the same canonical Git common directory
