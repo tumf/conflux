@@ -43,7 +43,8 @@ impl Converged {
         web.set_execution_marks(harness.marks.clone()).await;
         web.set_parallel_runtime(harness.parallel.clone()).await;
         let changes: Vec<_> = change_ids.iter().map(|id| create_test_change(id)).collect();
-        web.update_with_mode(&changes, "select").await;
+        web.seed_workspace_observation_for_tests(&changes, "select")
+            .await;
         web.sync_remote_control_projection().await;
 
         // The Web frontend joins the boundary the TUI is already on. Two owners
@@ -111,7 +112,9 @@ impl Converged {
             .iter()
             .map(|change| create_test_change(&change.id))
             .collect();
-        self.web.update_with_mode(&changes, "running").await;
+        self.web
+            .seed_workspace_observation_for_tests(&changes, "running")
+            .await;
         self.web.sync_remote_control_projection().await;
     }
 }

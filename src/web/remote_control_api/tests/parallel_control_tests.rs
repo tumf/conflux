@@ -158,7 +158,9 @@ impl Wired {
         self.web_state
             .apply_execution_event(&changes_refreshed(changes.clone(), committed, uncommitted))
             .await;
-        self.web_state.update_with_mode(&changes, app_mode).await;
+        self.web_state
+            .seed_workspace_observation_for_tests(&changes, app_mode)
+            .await;
         // Command admission validates against Core, not against the published
         // snapshot, so an arrangement that moved only the snapshot would be
         // describing a process that cannot exist.
