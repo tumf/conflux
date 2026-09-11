@@ -35,6 +35,7 @@ use tracing::{error, info, warn};
 #[cfg(test)]
 mod execution_mark_tests;
 pub(crate) mod log_logic;
+pub(crate) mod merged_row_dismissal;
 pub(crate) mod modal_logic;
 mod processing_logic;
 mod selection_logic;
@@ -389,6 +390,18 @@ pub struct AppState {
     /// used as scheduler dispatch, resume routing, acceptance, archive, or
     /// next-action input.
     workspace_dirty: WorkspaceDirtyState,
+    /// Change IDs the operator dismissed from this process's Changes projection.
+    ///
+    /// Presentation-only, process-local state, in the same class as `modal` and
+    /// `selected_proposal_log_filter`: it is never serialized, never sent through
+    /// `TuiCommand`, never copied into `OrchestratorState`, and never exposed
+    /// through `/api/v2`. A restarted process starts empty and re-derives every
+    /// row from the workspace, so it is not durable workflow state.
+    ///
+    /// It suppresses *retained terminal* presentation only. Catalog processing
+    /// clears an ID from this set the moment it re-observes it as an active
+    /// non-terminal change, so an ID that comes back to life is never hidden.
+    dismissed_merged_ids: HashSet<String>,
     /// Target-scoped mark writes an operator interaction requested but that the
     /// shared service has not applied yet.
     ///
@@ -707,6 +720,7 @@ impl AppState {
                 crate::orchestration::operator_command::ParallelRuntime::new(),
             ),
             workspace_dirty: WorkspaceDirtyState::default(),
+            dismissed_merged_ids: HashSet::new(),
             pending_mark_writes: Vec::new(),
         }
     }
@@ -1643,6 +1657,61 @@ impl AppState {
             self.modal = None;
             self.add_log(LogEntry::info("Force-kill canceled".to_string()));
         }
+    }
+
+    /// Open the confirmation for dismissing the focused `merged` row.
+    ///
+    /// Presentation only: it hides a reviewed row from this process's Changes
+    /// projection and records nothing outside it. Returns true when the
+    /// confirmation opened; a non-`merged` focused row is a silent no-op.
+    pub fn request_dismiss_merged_row(&mut self) -> bool {
+        merged_row_dismissal::request_individual(self)
+    }
+
+    /// Open the confirmation for dismissing every projected `merged` row.
+    ///
+    /// Returns true when the confirmation opened; an empty target set is a
+    /// silent no-op.
+    pub fn request_dismiss_all_merged_rows(&mut self) -> bool {
+        merged_row_dismissal::request_bulk(self)
+    }
+
+    /// Confirm the open merged-row dismissal, rechecking each bound target first.
+    ///
+    /// Returns true when a dismissal confirmation was the overlay that closed.
+    pub fn confirm_dismiss_merged_rows(&mut self) -> bool {
+        merged_row_dismissal::confirm(self)
+    }
+
+    /// Close a merged-row dismissal confirmation without changing any row.
+    ///
+    /// Returns true when a dismissal confirmation was the overlay that closed.
+    pub fn cancel_dismiss_merged_rows(&mut self) -> bool {
+        merged_row_dismissal::cancel(self)
+    }
+
+    /// Whether the focused row can be dismissed right now.
+    ///
+    /// Drives the `d: dismiss` hint, so the key is never advertised for a row it
+    /// would do nothing to.
+    pub fn focused_row_is_dismissable(&self) -> bool {
+        merged_row_dismissal::focused_row_is_dismissable(self)
+    }
+
+    /// Whether the current Changes-list projection holds a dismissable row.
+    ///
+    /// Scroll position is deliberately not part of it: the bulk hint and the
+    /// bulk action target the same projection.
+    pub fn has_dismissable_merged_rows(&self) -> bool {
+        merged_row_dismissal::has_dismissable_rows(self)
+    }
+
+    /// Rows this process has dismissed, as the catalog boundary sees them.
+    ///
+    /// Assertion and suppression helper only; nothing outside this process reads
+    /// it, and it is discarded on restart.
+    pub(crate) fn dismissed_merged_ids(&self) -> &HashSet<String> {
+        &self.dismissed_merged_ids
     }
 
     /// Request to merge worktree branch into base branch.
