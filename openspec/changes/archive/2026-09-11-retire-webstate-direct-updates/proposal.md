@@ -11,8 +11,8 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: src/web/state.rs
-    evidence: cargo test web::state tui::command_handlers::cross_adapter_tests --lib && cargo test --test client_cli_tests --test client_completion_sink
-    rerun: cargo test web::state tui::command_handlers::cross_adapter_tests --lib && cargo test --test client_cli_tests --test client_completion_sink
+    evidence: cargo test --lib -- web::state tui::command_handlers::cross_adapter_tests && cargo test --test client_cli_tests --test client_completion_sink
+    rerun: cargo test --lib -- web::state tui::command_handlers::cross_adapter_tests && cargo test --test client_cli_tests --test client_completion_sink
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking

@@ -840,7 +840,7 @@ async fn processing_error_preserves_process_snapshot() {
     let (web_state, reducer, marks) = wired_web_state(&["alpha", "beta"]).await;
     let web_state = Arc::new(web_state);
     web_state
-        .update_with_mode(&[change("alpha"), change("beta")], "running")
+        .seed_workspace_observation_for_tests(&[change("alpha"), change("beta")], "running")
         .await;
     marks.set("alpha", true);
     marks.set("beta", true);

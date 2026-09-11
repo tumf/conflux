@@ -165,7 +165,9 @@ impl Wired {
         web_state.set_shared_state(reducer.clone()).await;
         web_state.set_execution_marks(marks.clone()).await;
         let changes: Vec<_> = change_ids.iter().map(|id| change(id)).collect();
-        web_state.update_with_mode(&changes, "select").await;
+        web_state
+            .seed_workspace_observation_for_tests(&changes, "select")
+            .await;
         web_state.sync_remote_control_projection().await;
 
         let core_mode = Arc::new(CoreMode::new());

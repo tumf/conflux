@@ -279,7 +279,7 @@ async fn running(setup: Setup, scheduler_live: bool) -> Wired {
     web.set_parallel_runtime(harness.parallel.clone()).await;
     web.set_repo_root(std::path::PathBuf::from("/repo")).await;
     let changes: Vec<_> = CHANGES.iter().map(|id| create_test_change(id)).collect();
-    web.update_with_mode(&changes, AppExecutionMode::Running.app_mode_token())
+    web.seed_workspace_observation_for_tests(&changes, AppExecutionMode::Running.app_mode_token())
         .await;
     web.sync_remote_control_projection().await;
 

@@ -88,7 +88,9 @@ impl Owner {
         };
         // Publish the monitoring snapshot so the v2 projection tracks these
         // changes; the execution-status resource joins per-change facts onto it.
-        state.update_with_mode(&changes, "select").await;
+        state
+            .seed_workspace_observation_for_tests(&changes, "select")
+            .await;
 
         let handle = conflux::web::start_listeners(
             config,
@@ -150,7 +152,9 @@ impl Owner {
                 metadata: ProposalMetadata::default(),
             })
             .collect();
-        self.state.update_with_mode(&changes, "select").await;
+        self.state
+            .seed_workspace_observation_for_tests(&changes, "select")
+            .await;
     }
 
     /// Admit a change the way every admission source ultimately does.
