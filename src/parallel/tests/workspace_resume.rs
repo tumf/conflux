@@ -27,6 +27,8 @@ use tokio::sync::mpsc;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Local Git setup: these tests need a bare identity-only repository with no
+/// base commit, which is not byte-equivalent to `support::init_git_repo`.
 fn init_git_repo(repo_root: &Path) {
     StdCommand::new("git")
         .args(["init", "-b", "main"])

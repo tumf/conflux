@@ -1,6 +1,6 @@
 //! Tests for automatic resolve counter integration with parallel execution.
 
-use crate::config::OrchestratorConfig;
+use super::support::{create_test_config, TestWorkspaceManager};
 use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
 use crate::orchestration::state::{OrchestratorState, ReducerCommand, WaitState};
@@ -19,18 +19,8 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-/// Helper function to create a test config with all required commands
-fn create_test_config() -> OrchestratorConfig {
-    OrchestratorConfig {
-        apply_command: Some("echo apply {change_id}".to_string()),
-        archive_command: Some("echo archive {change_id}".to_string()),
-        analyze_command: Some("echo analyze".to_string()),
-        acceptance_command: Some("echo acceptance".to_string()),
-        resolve_command: Some("echo resolve".to_string()),
-        ..Default::default()
-    }
-}
-
+/// Local Git setup: this module's fixtures need an `initial` base commit, which
+/// is not byte-equivalent to the shared `support::init_git_repo` base.
 async fn init_git_repo(repo_root: &std::path::Path) {
     Command::new("git")
         .args(["init", "-b", "main"])
@@ -382,7 +372,7 @@ async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action()
     let mut executor =
         ParallelExecutor::new(temp_dir.path().to_path_buf(), create_test_config(), None);
     executor.workspace_manager = Box::new(
-        super::executor::TestWorkspaceManager::new(Arc::new(AtomicUsize::new(1)))
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(1)))
             .with_existing_workspace("change-a", workspace_dir.clone()),
     );
     let (merge_result_tx, mut merge_result_rx) = tokio::sync::mpsc::channel(8);

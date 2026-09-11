@@ -16,6 +16,7 @@
 //! assertions deterministic, lets probe counts be observed directly, and lets proposal-read and
 //! revision-resolution failures be injected without depending on real VCS or filesystem state.
 
+use super::support::create_test_config;
 use crate::analyzer::{AnalysisOutcome, AnalysisProvenance, AnalysisResult};
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
@@ -43,17 +44,6 @@ const SCHEDULER_TIMER: Duration = Duration::from_millis(500);
 
 /// The existing queue-coalescing debounce window, which also bounds probe cadence.
 const QUEUE_DEBOUNCE: Duration = Duration::from_secs(10);
-
-fn create_test_config() -> OrchestratorConfig {
-    OrchestratorConfig {
-        apply_command: Some("echo apply {change_id}".to_string()),
-        archive_command: Some("echo archive {change_id}".to_string()),
-        analyze_command: Some("echo analyze".to_string()),
-        acceptance_command: Some("echo acceptance".to_string()),
-        resolve_command: Some("echo resolve".to_string()),
-        ..Default::default()
-    }
-}
 
 fn test_change(id: &str) -> Change {
     Change {

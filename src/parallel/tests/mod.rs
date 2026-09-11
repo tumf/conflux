@@ -39,6 +39,8 @@ mod running_mark_reanalysis;
 #[cfg(test)]
 mod stopped_marked_resume;
 #[cfg(test)]
+mod support;
+#[cfg(test)]
 mod unchanged_analysis_input;
 #[cfg(test)]
 mod upstream_integration;

@@ -1,6 +1,6 @@
 //! Tests for manual resolve counter integration with parallel execution.
 
-use crate::config::OrchestratorConfig;
+use super::support::{create_test_config, TestWorkspaceManager};
 use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
@@ -35,18 +35,6 @@ fn shared_state_with_queue_intent(
         state.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
     }
     Arc::new(tokio::sync::RwLock::new(state))
-}
-
-/// Helper function to create a test config with all required commands
-fn create_test_config() -> OrchestratorConfig {
-    OrchestratorConfig {
-        apply_command: Some("echo apply {change_id}".to_string()),
-        archive_command: Some("echo archive {change_id}".to_string()),
-        analyze_command: Some("echo analyze".to_string()),
-        acceptance_command: Some("echo acceptance".to_string()),
-        resolve_command: Some("echo resolve".to_string()),
-        ..Default::default()
-    }
 }
 
 #[tokio::test]
@@ -1040,8 +1028,7 @@ async fn undetermined_repair_evidence_defers_instead_of_settling_queue_intent() 
     // Detached HEAD with no recorded original branch: base identity is
     // unreadable, so the archived-dirty repair probe has no base to compare to.
     executor.set_workspace_manager(Box::new(
-        crate::parallel::tests::executor::TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
-            .with_failing_original_branch(),
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))).with_failing_original_branch(),
     ));
     let shared = shared_state_with_queue_intent(&[change_id]);
     executor.set_shared_orchestrator_state(shared.clone());
@@ -1126,7 +1113,7 @@ async fn a_failed_workspace_lookup_defers_instead_of_settling_queue_intent() {
     );
     // Base identity resolves; only workspace discovery fails.
     executor.set_workspace_manager(Box::new(
-        crate::parallel::tests::executor::TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
             .with_failing_existing_workspace_lookup(),
     ));
     let shared = shared_state_with_queue_intent(&[change_id]);
