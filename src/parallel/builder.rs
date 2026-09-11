@@ -345,6 +345,16 @@ impl ParallelExecutor {
         self.post_archive_action = action;
     }
 
+    /// The terminal action this executor takes after a successful archive.
+    ///
+    /// Read-only observation so coverage can prove a frontend's configured
+    /// action actually reached the executor that frontend built, instead of
+    /// inferring it from a downstream side effect.
+    #[cfg(test)]
+    pub(crate) fn post_archive_action_for_test(&self) -> &PostArchiveAction {
+        &self.post_archive_action
+    }
+
     /// Set the dynamic queue for runtime change additions (TUI mode).
     pub fn set_dynamic_queue(&mut self, dynamic_queue: Arc<crate::tui::queue::DynamicQueue>) {
         self.dynamic_queue = Some(dynamic_queue);
@@ -360,6 +370,16 @@ impl ParallelExecutor {
         self.set_scheduler_lifetime(SchedulerLifetime::Persistent);
     }
 
+    /// The lifetime policy this executor was configured with.
+    ///
+    /// A finite CLI run and a persistent loop-based frontend differ only by
+    /// this field, so coverage reads it directly rather than waiting on a
+    /// scheduler that would never return.
+    #[cfg(test)]
+    pub(crate) fn scheduler_lifetime_for_test(&self) -> SchedulerLifetime {
+        self.scheduler_lifetime
+    }
+
     /// Bind the run owner's pending graceful-stop request.
     ///
     /// The same flag shared run control writes through the scheduler port, so a
@@ -368,6 +388,18 @@ impl ParallelExecutor {
     /// read, never written.
     pub fn set_graceful_stop_flag(&mut self, graceful_stop: Arc<std::sync::atomic::AtomicBool>) {
         self.graceful_stop = Some(graceful_stop);
+    }
+
+    /// The run owner's pending graceful-stop request bound to this executor.
+    ///
+    /// Coverage compares the returned handle by pointer identity, which is the
+    /// only way to prove the executor observes the *same* flag the run owner
+    /// writes through rather than an equal-valued copy.
+    #[cfg(test)]
+    pub(crate) fn graceful_stop_flag_for_test(
+        &self,
+    ) -> Option<&Arc<std::sync::atomic::AtomicBool>> {
+        self.graceful_stop.as_ref()
     }
 
     /// Set the manual resolve counter for tracking active manual resolve operations (TUI mode).
