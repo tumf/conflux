@@ -224,6 +224,27 @@ pub enum ModalState {
         /// The change ID being confirmed for force-kill
         change_id: String,
     },
+    /// Confirmation for hiding one `merged` row from this TUI process.
+    ///
+    /// Presentation-only: confirming it removes a row from the local Changes
+    /// projection and records the ID as dismissed for this process lifetime. No
+    /// repository file, archive, branch, worktree, reducer record, queue entry,
+    /// execution mark, or API projection is touched.
+    ConfirmDismissMergedRow {
+        /// Change ID bound when the confirmation was opened.
+        change_id: String,
+    },
+    /// Confirmation for hiding every projected `merged` row from this TUI process.
+    ///
+    /// The target IDs are bound at open time rather than recomputed at
+    /// confirmation time, so a row that *became* `merged` while the overlay was
+    /// open can never be swept up by a decision the operator never saw. The
+    /// opposite direction is handled at confirmation: a bound row that stopped
+    /// being `merged` is rechecked and skipped.
+    ConfirmDismissAllMergedRows {
+        /// Projected merged change IDs bound when the confirmation was opened.
+        change_ids: Vec<String>,
+    },
 }
 
 impl ModalState {
@@ -235,6 +256,8 @@ impl ModalState {
             ModalState::ConfirmDirtyDiscard { .. } => "Discard Changes",
             ModalState::ConfirmAheadDiscard { .. } => "Discard Commits",
             ModalState::ConfirmForceKill { .. } => "Confirm Kill",
+            ModalState::ConfirmDismissMergedRow { .. } => "Dismiss Merged",
+            ModalState::ConfirmDismissAllMergedRows { .. } => "Dismiss All Merged",
         }
     }
 
@@ -401,6 +424,42 @@ mod tests {
                 change_id: "change-b".to_string(),
             }
         );
+
+        // Dismissal binds its targets the same way: the overlay and the rows it
+        // would hide are one value, so they cannot drift apart.
+        let dismiss = ModalState::ConfirmDismissMergedRow {
+            change_id: "alpha".to_string(),
+        };
+        assert_ne!(
+            dismiss,
+            ModalState::ConfirmDismissMergedRow {
+                change_id: "gamma".to_string(),
+            }
+        );
+        let bulk = ModalState::ConfirmDismissAllMergedRows {
+            change_ids: vec!["alpha".to_string(), "gamma".to_string()],
+        };
+        assert_ne!(
+            bulk,
+            ModalState::ConfirmDismissAllMergedRows {
+                change_ids: vec!["alpha".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn merged_row_dismissal_confirmations_are_user_decisions_with_their_own_labels() {
+        let individual = ModalState::ConfirmDismissMergedRow {
+            change_id: "alpha".to_string(),
+        };
+        let bulk = ModalState::ConfirmDismissAllMergedRows {
+            change_ids: vec!["alpha".to_string(), "gamma".to_string()],
+        };
+
+        assert!(individual.is_user_decision());
+        assert!(bulk.is_user_decision());
+        assert_eq!(individual.title_label(), "Dismiss Merged");
+        assert_eq!(bulk.title_label(), "Dismiss All Merged");
     }
 
     #[test]
