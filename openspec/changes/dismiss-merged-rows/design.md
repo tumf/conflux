@@ -2,7 +2,7 @@
 
 ## Authority and precedence
 
-The visual authority is the existing production Changes view and confirmation-overlay language at Git revision `47821e12d80ed6afd2488fbcbe3855ef54c4df26`.
+The visual authority is the existing production Changes view at Git revision `47821e12d80ed6afd2488fbcbe3855ef54c4df26`.
 
 Precedence:
 
@@ -16,32 +16,28 @@ No new visual system, color, row anatomy, or navigation surface is introduced.
 
 | ID | State | Trigger | Expected rendering/transition | Production owner | Verification |
 |---|---|---|---|---|---|
-| MRD-01 | Focused merged row | Changes view, no overlay | Existing merged row plus `d: dismiss`; bulk hint also appears when any merged row exists | `src/tui/render.rs` | deterministic render test |
-| MRD-02 | Focused non-merged row with other merged rows | Changes view, no overlay | No individual hint; `D: dismiss all merged` appears | `src/tui/render.rs` | deterministic render test |
-| MRD-03 | No visible merged rows | Changes view, no overlay | Neither dismissal hint appears | `src/tui/render.rs` | deterministic render test |
-| MRD-04 | Individual confirmation | `d` on merged row | Centered bordered confirmation names exact ID and shows `Y: confirm`, `N/Esc: cancel`; underlying execution mode remains current | `src/tui/types.rs`, `src/tui/render.rs`, `src/tui/key_handlers.rs` | modal/key tests and render test |
-| MRD-05 | Bulk confirmation | `D` with one or more projected merged rows | Centered bordered confirmation names exact count and shows `Y: confirm`, `N/Esc: cancel`; all merged IDs in the Changes-list projection are bound at open time regardless of scroll position | same | modal/key tests and render test |
-| MRD-06 | Cancelled confirmation | `N` or `Esc` | Overlay closes; rows, cursor, marks, filter, and dismissed set unchanged | `src/tui/key_handlers.rs`, AppState modal logic | unit test |
-| MRD-07 | Confirmed individual dismissal | `Y` | Bound merged row disappears; nearest surviving row receives focus | AppState presentation logic | unit test |
-| MRD-08 | Confirmed bulk dismissal | `y` or `Y` | All bound IDs still merged disappear; non-merged rows retain order and state. If status recheck leaves no eligible IDs, the overlay closes without changing rows, dismissed state, or logs | AppState presentation logic | unit test |
-| MRD-09 | Empty result | Confirm dismissal of only/all rows | Changes pane remains valid and unselected with existing empty presentation | AppState selection logic and renderer | unit/render test |
-| MRD-10 | Refresh after dismissal | Catalog or reducer refresh | Retained terminal/merged state for dismissed IDs remains absent; an active non-terminal catalog row with the same ID clears dismissal and is rendered; no workflow authority is changed | `src/tui/state/processing_logic.rs`, reducer cache synchronization boundary | unit test |
-| MRD-11 | Overlay input ownership | Any dismissal confirmation open | Unrelated row, run, edit, bulk-toggle, and navigation keys do nothing; only case-insensitive `y`/`n` or `Esc` act | `src/tui/key_handlers.rs` | key-routing test |
-| MRD-12 | Worktrees view | `d` or `D` | Existing worktree-delete flow remains unchanged | `src/tui/key_handlers.rs`, existing worktree confirmation renderer | existing and regression tests |
+| MRD-01 | Focused merged row | Changes view | Existing merged row plus `d: dismiss`; bulk hint also appears when any merged row exists | `src/tui/render.rs` | deterministic render test |
+| MRD-02 | Focused non-merged row with other merged rows | Changes view | No individual hint; `D: dismiss all merged` appears | `src/tui/render.rs` | deterministic render test |
+| MRD-03 | No visible merged rows | Changes view | Neither dismissal hint appears | `src/tui/render.rs` | deterministic render test |
+| MRD-04 | Immediate individual dismissal | `d` on merged row | Focused merged row disappears immediately; nearest surviving row receives focus; no modal opens | AppState presentation logic and `src/tui/key_handlers.rs` | unit/key test |
+| MRD-05 | Immediate bulk dismissal | `D` with one or more projected merged rows | Every projected merged row disappears immediately regardless of scroll position; non-merged rows retain order and state; no modal opens | same | unit/key test |
+| MRD-06 | Empty result | Immediate dismissal removes the only/all rows | Changes pane remains valid and unselected with existing empty presentation | AppState selection logic and renderer | unit/render test |
+| MRD-07 | Refresh after dismissal | Catalog or reducer refresh | Retained terminal/merged state for dismissed IDs remains absent; an active non-terminal catalog row with the same ID clears dismissal and is rendered; no workflow authority is changed | `src/tui/state/processing_logic.rs`, reducer cache synchronization boundary | unit test |
+| MRD-08 | Worktrees view | `d` or `D` | Existing worktree-delete flow remains unchanged | `src/tui/key_handlers.rs`, existing worktree confirmation renderer | existing and regression tests |
 
-Terminal width does not create a new interaction variant. Existing title clipping/layout behavior remains authoritative; tests use a width sufficient to render complete new hints and overlay copy.
+Terminal width does not create a new interaction variant. Existing title clipping/layout behavior remains authoritative; tests use a width sufficient to render the complete new hints.
 
 ## State ownership
 
-`dismissed_merged_ids` is a `HashSet<String>` on `AppState`. It is presentation-only and empty at startup. It is not serialized, sent through `TuiCommand`, copied into `OrchestratorState`, or exposed through `/api/v2`.
+`dismissed_merged_ids` is a `HashSet<String>` on `AppState`. It is presentation-only and empty at startup. It is not serialized, sent through `TuiCommand`, copied into `OrchestratorState`, or exposed through `/api/v2`. No merged-row dismissal variant is added to `ModalState`.
 
-"Visible" means present in the current Changes-list projection regardless of scroll position. The individual modal binds one ID. The bulk modal binds every projected merged ID captured when `D` is pressed, not a count-only or later recomputed target. Confirmation rechecks each bound row's current display status and dismisses only IDs still `merged`; this prevents a stale overlay from hiding a row whose status changed while the modal was open. If none remains eligible, confirmation is a mutation-free no-op and produces no informational log.
+"Visible" means present in the current Changes-list projection regardless of scroll position. Each key handler derives its targets from the current projection and current display statuses in the same input-handling turn, then applies dismissal immediately. There is no confirmation interval or stale target snapshot.
 
 ## Projection and cursor behavior
 
-Confirmed dismissal performs one local projection update:
+Dismissal performs one local projection update:
 
-1. Add eligible confirmed IDs to `dismissed_merged_ids`.
+1. Add eligible target IDs to `dismissed_merged_ids`.
 2. Remove those rows from `changes`.
 3. Remove their IDs from `known_change_ids` and recompute `new_change_count`.
 4. If the selected-proposal log filter targets a removed row, disable that filter without deleting buffered logs.
@@ -51,7 +47,7 @@ Refresh suppresses fetched and retained rows against `dismissed_merged_ids` only
 
 ## Accessibility and interaction
 
-Meaning remains textual. Hints name the keys and actions; confirmations name the destructive-looking presentation action and make clear that only TUI rows are hidden. Confirmation uses the existing keyboard-only modal pattern. Color is not required to identify state or available action.
+Meaning remains textual. Hints name the keys and actions. Color is not required to identify state or available action. Because dismissal changes presentation state only and is restored by restarting the TUI, no confirmation UI is shown.
 
 ## Preserved boundaries
 
