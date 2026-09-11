@@ -337,10 +337,11 @@ mod dismissal_tests {
         app.changes.iter().map(|c| c.id.clone()).collect()
     }
 
-    /// Dismiss the focused row through the confirmation the operator uses.
+    /// Dismiss the focused row through the same single key action the operator
+    /// takes: one call, no confirmation.
     fn dismiss_focused(app: &mut AppState) {
-        assert!(app.request_dismiss_merged_row());
-        assert!(app.confirm_dismiss_merged_rows());
+        assert!(app.dismiss_merged_row());
+        assert_eq!(app.modal, None, "dismissal must not open an overlay");
     }
 
     #[test]

@@ -793,20 +793,6 @@ pub(crate) async fn handle_modal_key(key: KeyEvent, ctx: &mut KeyEventContext<'_
             }
             _ => {}
         },
-        // Hiding a reviewed row is presentation only, so it takes the ordinary
-        // case-insensitive confirmation keys rather than the destructive `X`.
-        // No command is sent in either direction: nothing outside this process
-        // learns that a row was dismissed.
-        ModalState::ConfirmDismissMergedRow { .. }
-        | ModalState::ConfirmDismissAllMergedRows { .. } => match (key.code, key.modifiers) {
-            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
-                ctx.app.confirm_dismiss_merged_rows();
-            }
-            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
-                ctx.app.cancel_dismiss_merged_rows();
-            }
-            _ => {}
-        },
     }
 
     true
@@ -904,10 +890,11 @@ pub async fn handle_key_event(
                 ViewMode::Worktrees => {
                     ctx.app.request_worktree_delete_from_list();
                 }
-                // Changes view: request dismissal of the focused `merged` row.
-                // A non-merged row is a silent no-op.
+                // Changes view: hide the focused `merged` row immediately. No
+                // confirmation — this is presentation-only and a restart brings
+                // the row back. A non-merged row is a silent no-op.
                 ViewMode::Changes => {
-                    ctx.app.request_dismiss_merged_row();
+                    ctx.app.dismiss_merged_row();
                 }
             }
         }
@@ -917,10 +904,10 @@ pub async fn handle_key_event(
                 ViewMode::Worktrees => {
                     ctx.app.request_worktree_delete_from_list();
                 }
-                // Changes view: request dismissal of every projected `merged`
-                // row. An empty target set is a silent no-op.
+                // Changes view: hide every projected `merged` row immediately.
+                // An empty target set is a silent no-op.
                 ViewMode::Changes => {
-                    ctx.app.request_dismiss_all_merged_rows();
+                    ctx.app.dismiss_all_merged_rows();
                 }
             }
         }
@@ -3108,19 +3095,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changes_view_d_opens_the_individual_dismissal_confirmation() {
+    async fn changes_view_d_dismisses_the_focused_row_in_one_key_event() {
         let mut app = dismissal_routing_app();
 
         let commands = route_key(&mut app, KeyCode::Char('d')).await;
 
         assert!(commands.is_empty(), "dismissal dispatches no command");
-        assert_eq!(
-            app.modal,
-            Some(ModalState::ConfirmDismissMergedRow {
-                change_id: "merged-a".to_string()
-            })
-        );
-        assert_eq!(row_ids(&app), vec!["merged-a", "change-b", "merged-c"]);
+        assert_eq!(app.modal, None, "no confirmation may open");
+        assert_eq!(row_ids(&app), vec!["change-b", "merged-c"]);
+        assert!(app.dismissed_merged_ids().contains("merged-a"));
+        assert!(!app.dismissed_merged_ids().contains("merged-c"));
     }
 
     #[tokio::test]
@@ -3133,10 +3117,11 @@ mod tests {
         assert!(commands.is_empty());
         assert_eq!(app.modal, None);
         assert_eq!(row_ids(&app), vec!["merged-a", "change-b", "merged-c"]);
+        assert!(app.dismissed_merged_ids().is_empty());
     }
 
     #[tokio::test]
-    async fn changes_view_shift_d_binds_every_projected_merged_row() {
+    async fn changes_view_shift_d_dismisses_every_projected_merged_row_in_one_key_event() {
         let mut app = dismissal_routing_app();
         // Cursor position is irrelevant to the bulk target set.
         app.cursor_index = 1;
@@ -3144,12 +3129,10 @@ mod tests {
         let commands = route_key(&mut app, KeyCode::Char('D')).await;
 
         assert!(commands.is_empty());
-        assert_eq!(
-            app.modal,
-            Some(ModalState::ConfirmDismissAllMergedRows {
-                change_ids: vec!["merged-a".to_string(), "merged-c".to_string()]
-            })
-        );
+        assert_eq!(app.modal, None, "no confirmation may open");
+        assert_eq!(row_ids(&app), vec!["change-b"]);
+        assert!(app.dismissed_merged_ids().contains("merged-a"));
+        assert!(app.dismissed_merged_ids().contains("merged-c"));
     }
 
     #[tokio::test]
@@ -3162,96 +3145,77 @@ mod tests {
 
         assert!(commands.is_empty());
         assert_eq!(app.modal, None);
+        assert_eq!(row_ids(&app), vec!["merged-a", "change-b", "merged-c"]);
+        assert!(app.dismissed_merged_ids().is_empty());
     }
 
     #[tokio::test]
-    async fn case_insensitive_y_confirms_a_dismissal_without_dispatching_anything() {
-        for code in [KeyCode::Char('y'), KeyCode::Char('Y')] {
-            let mut app = dismissal_routing_app();
-            route_key(&mut app, KeyCode::Char('d')).await;
-
-            let commands = route_key(&mut app, code).await;
-
-            assert!(
-                commands.is_empty(),
-                "{code:?} must not send a command: nothing outside this process is told"
-            );
-            assert_eq!(app.modal, None);
-            assert_eq!(row_ids(&app), vec!["change-b", "merged-c"]);
-        }
-    }
-
-    #[tokio::test]
-    async fn case_insensitive_n_and_esc_cancel_a_dismissal() {
-        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
-            for open in [KeyCode::Char('d'), KeyCode::Char('D')] {
-                let mut app = dismissal_routing_app();
-                route_key(&mut app, open).await;
-                assert!(app.modal.is_some(), "{open:?} must open a confirmation");
-
-                let commands = route_key(&mut app, code).await;
-
-                assert!(commands.is_empty(), "{code:?} must dispatch nothing");
-                assert_eq!(app.modal, None, "{code:?} must close the confirmation");
-                assert_eq!(row_ids(&app), vec!["merged-a", "change-b", "merged-c"]);
-                assert!(app.dismissed_merged_ids().is_empty());
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn an_open_dismissal_confirmation_owns_every_other_key() {
-        // Navigation, marks, run control, editing, and the worktree keys all
-        // belong to the view underneath. While this overlay is up, none of them
-        // may reach it.
+    async fn y_n_and_esc_no_longer_carry_any_dismissal_meaning() {
+        // With the confirmation gone there is no dismissal overlay for these
+        // keys to answer, so a stray press must leave the rows alone. Esc keeps
+        // its own stop semantics, which are not this module's business.
         for code in [
-            KeyCode::Char(' '),
-            KeyCode::Char('x'),
-            KeyCode::Char('X'),
-            KeyCode::Char('e'),
-            KeyCode::Char('K'),
-            KeyCode::Char('l'),
-            KeyCode::Char('w'),
-            KeyCode::Char('s'),
-            KeyCode::Char('S'),
-            KeyCode::Char('d'),
-            KeyCode::Char('D'),
-            KeyCode::Char('j'),
-            KeyCode::Char('k'),
-            KeyCode::Down,
-            KeyCode::Up,
-            KeyCode::Enter,
-            KeyCode::Tab,
-            KeyCode::F(5),
+            KeyCode::Char('y'),
+            KeyCode::Char('Y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Esc,
         ] {
             let mut app = dismissal_routing_app();
-            route_key(&mut app, KeyCode::Char('d')).await;
-            let before = app.modal.clone();
-            let marks_before: Vec<bool> = app.changes.iter().map(|c| c.selected).collect();
+
+            route_key(&mut app, code).await;
+
+            assert_eq!(app.modal, None, "{code:?} must open no overlay");
+            assert_eq!(row_ids(&app), vec!["merged-a", "change-b", "merged-c"]);
+            assert!(
+                app.dismissed_merged_ids().is_empty(),
+                "{code:?} must not dismiss anything"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_overlay_that_owns_input_keeps_d_and_shift_d_away_from_the_rows() {
+        // Another overlay already claims keys, so the view action underneath
+        // must not run even though a merged row is focused.
+        for code in [KeyCode::Char('d'), KeyCode::Char('D')] {
+            let mut app = dismissal_routing_app();
+            let overlay = ModalState::ConfirmForceKill {
+                change_id: "change-b".to_string(),
+            };
+            app.modal = Some(overlay.clone());
 
             let commands = route_key(&mut app, code).await;
 
-            assert!(
-                commands.is_empty(),
-                "{code:?} must not dispatch anything from the dismissal confirmation"
-            );
-            assert_eq!(
-                app.modal, before,
-                "{code:?} must leave the dismissal confirmation exactly as it was"
-            );
-            assert_eq!(app.cursor_index, 0, "{code:?} must not move the cursor");
-            assert_eq!(
-                app.view_mode,
-                ViewMode::Changes,
-                "{code:?} must not switch views"
-            );
-            assert_eq!(
-                app.changes.iter().map(|c| c.selected).collect::<Vec<_>>(),
-                marks_before,
-                "{code:?} must not change execution marks"
-            );
+            assert!(commands.is_empty(), "{code:?} must dispatch nothing");
+            assert_eq!(app.modal, Some(overlay), "{code:?}");
             assert_eq!(row_ids(&app), vec!["merged-a", "change-b", "merged-c"]);
+            assert!(app.dismissed_merged_ids().is_empty(), "{code:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn dismissal_leaves_every_other_changes_view_control_intact() {
+        let mut app = dismissal_routing_app();
+        let marks_before: Vec<bool> = app.changes.iter().map(|c| c.selected).collect();
+
+        route_key(&mut app, KeyCode::Char('d')).await;
+
+        assert_eq!(
+            app.view_mode,
+            ViewMode::Changes,
+            "dismissal must not switch views"
+        );
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Running,
+            "dismissal must not touch the execution axis"
+        );
+        assert_eq!(
+            app.changes.iter().map(|c| c.selected).collect::<Vec<_>>(),
+            marks_before[1..].to_vec(),
+            "surviving rows keep their execution marks"
+        );
     }
 
     #[tokio::test]

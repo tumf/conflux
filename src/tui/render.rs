@@ -478,10 +478,6 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
         Some(ModalState::ConfirmAheadDiscard { .. }) => {
             worktree_view::render_ahead_discard_confirm(frame, app, area)
         }
-        Some(ModalState::ConfirmDismissMergedRow { .. })
-        | Some(ModalState::ConfirmDismissAllMergedRows { .. }) => {
-            popups::render_dismiss_merged_confirm(frame, app, area)
-        }
         // Force-kill confirmation keeps its existing in-list presentation (the
         // `Y: confirm kill` / `N: cancel` hints and the header label); it has no
         // separate popup widget, and this change does not add one.
@@ -667,10 +663,6 @@ mod popups {
     pub(super) fn render_error_details(frame: &mut Frame, app: &AppState, area: Rect) {
         super::render_error_details_popup(frame, app, area);
     }
-
-    pub(super) fn render_dismiss_merged_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
-        super::render_dismiss_merged_confirm(frame, app, area);
-    }
 }
 
 /// Render header
@@ -709,13 +701,6 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         Some(modal @ ModalState::ConfirmForceKill { .. }) => {
             (modal.title_label().to_string(), Color::Red, true)
         }
-        // Yellow, not red: this confirmation hides rows from one TUI process and
-        // destroys nothing, so it must not borrow the visual weight the discard
-        // confirmations use to announce unrecoverable loss.
-        Some(
-            modal @ (ModalState::ConfirmDismissMergedRow { .. }
-            | ModalState::ConfirmDismissAllMergedRows { .. }),
-        ) => (modal.title_label().to_string(), Color::Yellow, true),
         None => match app.execution_mode {
             AppExecutionMode::Select | AppExecutionMode::Stopped => {
                 ("Ready".to_string(), Color::Cyan, true)
@@ -2148,77 +2133,6 @@ fn render_worktree_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect)
         Line::from(""),
         Line::from(Span::styled(
             "Y: run teardown and delete   S: skip teardown and delete",
-            Style::default().fg(Color::White),
-        )),
-        Line::from(Span::styled(
-            "N or Esc: cancel",
-            Style::default().fg(Color::White),
-        )),
-    ];
-
-    let body = Paragraph::new(lines);
-    frame.render_widget(body, inner_area);
-}
-
-/// Render the merged-row dismissal confirmation.
-///
-/// One widget for both variants, because they are one decision at two scopes and
-/// must read identically: the same border, the same key line, and a first line
-/// that names the exact target — a change ID, or a count. It borrows the
-/// existing confirmation anatomy rather than introducing a visual system of its
-/// own.
-///
-/// The body states the boundary out loud. An operator reading "dismiss" on a row
-/// that took real work to produce needs to know, without leaving the overlay,
-/// that nothing on disk and no workflow state goes with it.
-fn render_dismiss_merged_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
-    let headline = match &app.modal {
-        Some(ModalState::ConfirmDismissMergedRow { change_id }) => {
-            format!("Dismiss merged row '{}'?", change_id)
-        }
-        Some(ModalState::ConfirmDismissAllMergedRows { change_ids }) => {
-            let count = change_ids.len();
-            format!(
-                "Dismiss {} merged row{}?",
-                count,
-                if count == 1 { "" } else { "s" }
-            )
-        }
-        _ => return,
-    };
-
-    let modal_width = (area.width * 60 / 100).clamp(40, 90);
-    // Seven body lines plus borders, sized like the delete confirmation so the
-    // key line is never the thing a short terminal clips.
-    let modal_height = (area.height * 30 / 100).clamp(9, 12).min(area.height);
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
-    frame.render_widget(Clear, modal_area);
-
-    let block = Block::default()
-        .title(" Dismiss Merged Rows ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
-
-    let inner_area = block.inner(modal_area);
-    frame.render_widget(block, modal_area);
-
-    let lines = vec![
-        Line::from(Span::styled(headline, Style::default().fg(Color::Yellow))),
-        Line::from(""),
-        Line::from(Span::styled(
-            "This hides the row in this TUI session only. Archives, branches,",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "worktrees, logs, and workflow state are left untouched.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Y: confirm",
             Style::default().fg(Color::White),
         )),
         Line::from(Span::styled(
@@ -7742,70 +7656,55 @@ mod tests {
     }
 
     #[test]
-    fn the_individual_confirmation_names_the_exact_change_id_and_its_keys() {
+    fn an_individual_dismissal_paints_no_overlay_at_all() {
         let mut app = dismissal_app(&[("alpha", "merged"), ("beta", "not queued")]);
-        assert!(app.request_dismiss_merged_row());
+        assert!(app.dismiss_merged_row());
+        app.logs.clear();
 
         let content = buffer_to_string(&render_buffer(&mut app, DISMISSAL_WIDTH, 30));
 
-        assert!(content.contains("Dismiss Merged Rows"), "{content}");
-        assert!(content.contains("Dismiss merged row 'alpha'?"), "{content}");
-        assert!(content.contains("Y: confirm"), "{content}");
-        assert!(content.contains("N or Esc: cancel"), "{content}");
-        // The boundary is stated inside the overlay, not only in the proposal.
-        assert!(content.contains("this TUI session only"), "{content}");
-        // The header relabels without changing the execution axis underneath.
-        assert!(content.contains("Dismiss Merged"), "{content}");
+        assert_eq!(app.modal, None, "{content}");
+        // Nothing from the removed confirmation survives on screen.
+        assert!(!content.contains("Dismiss Merged Rows"), "{content}");
+        assert!(!content.contains("Y: confirm"), "{content}");
+        assert!(!content.contains("N or Esc: cancel"), "{content}");
+        assert!(!content.contains("this TUI session only"), "{content}");
     }
 
     #[test]
-    fn the_bulk_confirmation_names_the_exact_count() {
+    fn a_bulk_dismissal_paints_no_overlay_at_all() {
         let mut app = dismissal_app(&[
             ("alpha", "merged"),
             ("beta", "not queued"),
             ("gamma", "merged"),
         ]);
-        assert!(app.request_dismiss_all_merged_rows());
+        assert!(app.dismiss_all_merged_rows());
+        app.logs.clear();
 
         let content = buffer_to_string(&render_buffer(&mut app, DISMISSAL_WIDTH, 30));
 
-        assert!(content.contains("Dismiss 2 merged rows?"), "{content}");
-        assert!(content.contains("Y: confirm"), "{content}");
-        assert!(content.contains("N or Esc: cancel"), "{content}");
+        assert_eq!(app.modal, None, "{content}");
+        assert!(!content.contains("Dismiss 2 merged rows?"), "{content}");
+        assert!(!content.contains("Dismiss Merged Rows"), "{content}");
+        assert!(!content.contains("Y: confirm"), "{content}");
     }
 
     #[test]
-    fn a_single_bulk_target_is_named_in_the_singular() {
-        let mut app = dismissal_app(&[("alpha", "merged"), ("beta", "not queued")]);
-        assert!(app.request_dismiss_all_merged_rows());
-
-        let content = buffer_to_string(&render_buffer(&mut app, DISMISSAL_WIDTH, 30));
-
-        assert!(content.contains("Dismiss 1 merged row?"), "{content}");
-    }
-
-    #[test]
-    fn a_cancelled_confirmation_leaves_the_rows_and_the_hints_as_they_were() {
-        let mut app = dismissal_app(&[("alpha", "merged"), ("beta", "not queued")]);
+    fn an_ineligible_dismissal_repaints_the_very_same_screen() {
+        let mut app = dismissal_app(&[("alpha", "archived"), ("beta", "pushed")]);
         let before = buffer_to_string(&render_buffer(&mut app, DISMISSAL_WIDTH, 24));
 
-        assert!(app.request_dismiss_merged_row());
-        assert!(app.cancel_dismiss_merged_rows());
-        // The overlay logs its own opening and closing; the Logs panel is a
-        // different surface from the one under test, so compare the screen the
-        // operator started from.
-        app.logs.clear();
+        assert!(!app.dismiss_merged_row());
+        assert!(!app.dismiss_all_merged_rows());
         let after = buffer_to_string(&render_buffer(&mut app, DISMISSAL_WIDTH, 24));
 
-        assert!(!after.contains("Dismiss Merged Rows"), "{after}");
-        assert_eq!(before, after, "cancelling must repaint the same screen");
+        assert_eq!(before, after, "an inert key must change nothing on screen");
     }
 
     #[test]
-    fn a_confirmed_dismissal_removes_the_row_and_retires_its_hints() {
+    fn an_immediate_dismissal_removes_the_row_and_retires_its_hints() {
         let mut app = dismissal_app(&[("alpha", "merged"), ("beta", "not queued")]);
-        assert!(app.request_dismiss_merged_row());
-        assert!(app.confirm_dismiss_merged_rows());
+        assert!(app.dismiss_merged_row());
         app.logs.clear();
 
         let content = buffer_to_string(&render_buffer(&mut app, DISMISSAL_WIDTH, 24));
@@ -7819,8 +7718,7 @@ mod tests {
     #[test]
     fn dismissing_every_row_still_renders_a_valid_empty_changes_pane() {
         let mut app = dismissal_app(&[("alpha", "merged"), ("gamma", "merged")]);
-        assert!(app.request_dismiss_all_merged_rows());
-        assert!(app.confirm_dismiss_merged_rows());
+        assert!(app.dismiss_all_merged_rows());
         app.logs.clear();
 
         let content = buffer_to_string(&render_buffer(&mut app, DISMISSAL_WIDTH, 24));
@@ -7829,6 +7727,29 @@ mod tests {
         assert!(!content.contains("alpha"), "{content}");
         assert!(!content.contains("gamma"), "{content}");
         assert!(!content.contains("dismiss"), "{content}");
+    }
+
+    #[test]
+    fn bulk_dismissal_reaches_a_merged_row_the_viewport_never_showed() {
+        // Twenty rows into a pane this short, `omega` is below the fold. The
+        // bulk action targets the projection, so it goes anyway.
+        let filler: Vec<String> = (0..20).map(|n| format!("filler-{n:02}")).collect();
+        let mut rows: Vec<(&str, &str)> = vec![("alpha", "merged")];
+        rows.extend(filler.iter().map(|id| (id.as_str(), "not queued")));
+        rows.push(("omega", "merged"));
+        let mut app = dismissal_app(&rows);
+
+        let before = buffer_to_string(&render_buffer(&mut app, DISMISSAL_WIDTH, 16));
+        assert!(
+            !before.contains("omega"),
+            "the fixture must keep omega off the viewport: {before}"
+        );
+
+        assert!(app.dismiss_all_merged_rows());
+
+        assert!(app.dismissed_merged_ids().contains("omega"));
+        assert!(!app.changes.iter().any(|c| c.id == "omega"));
+        assert!(!app.changes.iter().any(|c| c.id == "alpha"));
     }
 
     #[test]
