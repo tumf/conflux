@@ -4,21 +4,20 @@
 //! catalog, which is how completed work accumulates in the Changes view. This
 //! module is the whole decision surface for hiding those rows again, and every
 //! function in it moves presentation state only: rows, cursor, known-ID
-//! bookkeeping, the NEW badge, the selected-proposal log filter, and the modal
-//! axis. No repository file, archive, branch, worktree, reducer record, queue
-//! entry, execution mark, or API projection is touched, and nothing here is
-//! written outside this process.
+//! bookkeeping, the NEW badge, and the selected-proposal log filter. No
+//! repository file, archive, branch, worktree, reducer record, queue entry,
+//! execution mark, or API projection is touched, and nothing here is written
+//! outside this process.
 //!
-//! Two rules give the overlay its safety:
-//!
-//! * targets are **bound when the confirmation opens**, so a row that *becomes*
-//!   `merged` while the operator is reading the overlay can never be swept up by
-//!   a decision they never saw; and
-//! * targets are **rechecked when it is confirmed**, so a bound row that stopped
-//!   being `merged` is skipped rather than hidden.
+//! Dismissal is immediate: `d` and `D` act in the same input-handling turn that
+//! delivered them, with no confirmation overlay and no second key press. That is
+//! safe because the action hides local rows and nothing else — restarting the
+//! TUI restores every dismissed row — and because targets are derived from
+//! *current* display status in that same turn, so there is no window in which a
+//! bound target can go stale.
 
 use crate::tui::events::LogEntry;
-use crate::tui::types::{ModalState, ViewMode};
+use crate::tui::types::ViewMode;
 
 use super::{AppState, ChangeState};
 
@@ -73,17 +72,19 @@ fn projected_dismissable_ids(state: &AppState) -> Vec<String> {
 
 /// Whether an overlay already owns operator input.
 ///
-/// Requesting a confirmation is an ordinary Changes-view interaction, so it
-/// yields to anything that is already claiming keys instead of replacing it.
+/// Dismissal is an ordinary Changes-view interaction, so it yields to anything
+/// that is already claiming keys. Normal key routing already sends keys to the
+/// active overlay before the view sees them; this is defense in depth for any
+/// caller that reaches the action directly.
 fn overlay_owns_input(state: &AppState) -> bool {
     state.has_overlay() || state.error_details_popup.is_some()
 }
 
-/// Open the individual dismissal confirmation for the cursor row.
+/// Dismiss the cursor row immediately, when it is currently `merged`.
 ///
-/// Returns true when the confirmation was opened. A non-`merged` row is a silent
-/// no-op: nothing opens, nothing is logged, and no hint advertised the key.
-pub(crate) fn request_individual(state: &mut AppState) -> bool {
+/// Returns true when a row was dismissed. A non-`merged` row is a silent no-op:
+/// nothing is hidden, nothing is logged, and no hint advertised the key.
+pub(crate) fn dismiss_focused(state: &mut AppState) -> bool {
     if overlay_owns_input(state) {
         return false;
     }
@@ -92,24 +93,15 @@ pub(crate) fn request_individual(state: &mut AppState) -> bool {
         return false;
     };
 
-    state.modal = Some(ModalState::ConfirmDismissMergedRow {
-        change_id: change_id.clone(),
-    });
-    state.add_log(
-        LogEntry::info(format!(
-            "Confirm dismissing merged row '{}': press Y to confirm, N/Esc to cancel",
-            change_id
-        ))
-        .with_change_id(&change_id),
-    );
+    dismiss(state, vec![change_id]);
     true
 }
 
-/// Open the bulk dismissal confirmation over every projected `merged` row.
+/// Dismiss every projected `merged` row immediately.
 ///
-/// Returns true when the confirmation was opened. An empty target set is a
+/// Returns true when at least one row was dismissed. An empty target set is a
 /// silent no-op.
-pub(crate) fn request_bulk(state: &mut AppState) -> bool {
+pub(crate) fn dismiss_all_projected(state: &mut AppState) -> bool {
     if overlay_owns_input(state) || state.view_mode != ViewMode::Changes {
         return false;
     }
@@ -119,68 +111,7 @@ pub(crate) fn request_bulk(state: &mut AppState) -> bool {
         return false;
     }
 
-    let count = change_ids.len();
-    state.modal = Some(ModalState::ConfirmDismissAllMergedRows { change_ids });
-    state.add_log(LogEntry::info(format!(
-        "Confirm dismissing {} merged row{}: press Y to confirm, N/Esc to cancel",
-        count,
-        if count == 1 { "" } else { "s" }
-    )));
-    true
-}
-
-/// Close a dismissal confirmation without changing anything it targeted.
-///
-/// Returns true when a dismissal confirmation was the overlay that closed.
-pub(crate) fn cancel(state: &mut AppState) -> bool {
-    if !matches!(
-        state.modal,
-        Some(
-            ModalState::ConfirmDismissMergedRow { .. }
-                | ModalState::ConfirmDismissAllMergedRows { .. }
-        )
-    ) {
-        return false;
-    }
-
-    state.modal = None;
-    state.add_log(LogEntry::info("Merged-row dismissal canceled".to_string()));
-    true
-}
-
-/// Confirm the open dismissal confirmation.
-///
-/// The bound targets are rechecked against their *current* display status, so a
-/// stale overlay can only ever dismiss fewer rows than it named, never a row
-/// that changed underneath it. When nothing remains eligible the overlay closes
-/// as a mutation-free no-op: no row moves, the dismissed set is untouched, and
-/// no informational entry is logged.
-///
-/// Returns true when a dismissal confirmation was the overlay that closed.
-pub(crate) fn confirm(state: &mut AppState) -> bool {
-    let bound: Vec<String> = match state.modal.clone() {
-        Some(ModalState::ConfirmDismissMergedRow { change_id }) => vec![change_id],
-        Some(ModalState::ConfirmDismissAllMergedRows { change_ids }) => change_ids,
-        _ => return false,
-    };
-
-    state.modal = None;
-
-    let eligible: Vec<String> = bound
-        .into_iter()
-        .filter(|id| {
-            state
-                .changes
-                .iter()
-                .any(|change| &change.id == id && is_dismissable(change))
-        })
-        .collect();
-
-    if eligible.is_empty() {
-        return true;
-    }
-
-    dismiss(state, eligible);
+    dismiss(state, change_ids);
     true
 }
 
@@ -253,6 +184,7 @@ fn repair_cursor(state: &mut AppState) {
 mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
+    use crate::tui::types::ModalState;
 
     fn change(id: &str) -> Change {
         Change {
@@ -280,23 +212,16 @@ mod tests {
     }
 
     #[test]
-    fn individual_dismissal_removes_only_the_confirmed_row() {
+    fn individual_dismissal_removes_only_the_focused_row_and_opens_no_modal() {
         let mut app = app(&[
             ("alpha", "merged"),
             ("beta", "not queued"),
             ("gamma", "merged"),
         ]);
 
-        assert!(request_individual(&mut app));
-        assert_eq!(
-            app.modal,
-            Some(ModalState::ConfirmDismissMergedRow {
-                change_id: "alpha".to_string()
-            })
-        );
+        assert!(dismiss_focused(&mut app));
 
-        assert!(confirm(&mut app));
-        assert_eq!(app.modal, None);
+        assert_eq!(app.modal, None, "dismissal must not open an overlay");
         assert_eq!(row_ids(&app), vec!["beta", "gamma"]);
         assert!(app.dismissed_merged_ids().contains("alpha"));
         assert!(!app.dismissed_merged_ids().contains("gamma"));
@@ -307,106 +232,72 @@ mod tests {
     fn individual_dismissal_is_inert_on_a_non_merged_row() {
         let mut app = app(&[("alpha", "applying"), ("beta", "merged")]);
 
-        assert!(!request_individual(&mut app));
+        assert!(!dismiss_focused(&mut app));
         assert_eq!(app.modal, None);
         assert!(app.logs.is_empty());
+        assert!(app.dismissed_merged_ids().is_empty());
         assert_eq!(row_ids(&app), vec!["alpha", "beta"]);
     }
 
     #[test]
-    fn bulk_dismissal_removes_every_bound_merged_row_and_nothing_else() {
+    fn bulk_dismissal_removes_every_projected_merged_row_and_nothing_else() {
         let mut app = app(&[
             ("alpha", "merged"),
             ("beta", "not queued"),
             ("gamma", "merged"),
         ]);
 
-        assert!(request_bulk(&mut app));
-        assert_eq!(
-            app.modal,
-            Some(ModalState::ConfirmDismissAllMergedRows {
-                change_ids: vec!["alpha".to_string(), "gamma".to_string()]
-            })
-        );
+        assert!(dismiss_all_projected(&mut app));
 
-        assert!(confirm(&mut app));
+        assert_eq!(app.modal, None);
         assert_eq!(row_ids(&app), vec!["beta"]);
         assert_eq!(app.changes[0].display_status_cache, "not queued");
+        assert!(app.dismissed_merged_ids().contains("alpha"));
+        assert!(app.dismissed_merged_ids().contains("gamma"));
     }
 
     #[test]
-    fn bulk_dismissal_binds_targets_at_open_time() {
-        let mut app = app(&[("alpha", "merged"), ("beta", "not queued")]);
-        assert!(request_bulk(&mut app));
+    fn bulk_dismissal_targets_the_whole_projection_regardless_of_the_cursor() {
+        let mut app = app(&[
+            ("alpha", "merged"),
+            ("beta", "not queued"),
+            ("gamma", "merged"),
+        ]);
+        // The cursor sits on the one row that must survive; the bulk target set
+        // is derived from the projection, never from the focused row.
+        app.cursor_index = 1;
 
-        // `beta` becomes merged only *after* the operator saw the overlay, so
-        // the decision they took cannot grow to include it.
-        app.changes[1].set_display_status_cache("merged");
+        assert!(dismiss_all_projected(&mut app));
 
-        assert!(confirm(&mut app));
         assert_eq!(row_ids(&app), vec!["beta"]);
-        assert!(!app.dismissed_merged_ids().contains("beta"));
     }
 
     #[test]
     fn bulk_dismissal_has_no_target_when_no_row_is_merged() {
         let mut app = app(&[("alpha", "applying"), ("beta", "not queued")]);
 
-        assert!(!request_bulk(&mut app));
+        assert!(!dismiss_all_projected(&mut app));
         assert_eq!(app.modal, None);
         assert!(app.logs.is_empty());
+        assert!(app.dismissed_merged_ids().is_empty());
     }
 
     #[test]
-    fn cancellation_changes_no_row_and_no_dismissed_state() {
-        for open in [
-            request_individual as fn(&mut AppState) -> bool,
-            request_bulk as fn(&mut AppState) -> bool,
-        ] {
-            let mut app = app(&[("alpha", "merged"), ("beta", "not queued")]);
-            assert!(open(&mut app));
-
-            assert!(cancel(&mut app));
-            assert_eq!(app.modal, None);
-            assert_eq!(row_ids(&app), vec!["alpha", "beta"]);
-            assert!(app.dismissed_merged_ids().is_empty());
-        }
-    }
-
-    #[test]
-    fn a_bound_row_that_stopped_being_merged_is_not_hidden() {
+    fn a_row_that_stopped_being_merged_is_not_hidden() {
+        // Status is read in the same turn the key is handled, so there is no
+        // bound-target window at all: a row that left `merged` simply is not a
+        // target when the action runs.
         let mut app = app(&[("alpha", "merged"), ("beta", "not queued")]);
-        assert!(request_individual(&mut app));
-
         app.changes[0].set_display_status_cache("resolving");
-        let logs_before = app.logs.len();
 
-        assert!(confirm(&mut app));
-        assert_eq!(app.modal, None);
+        assert!(!dismiss_focused(&mut app));
+        assert!(!dismiss_all_projected(&mut app));
         assert_eq!(row_ids(&app), vec!["alpha", "beta"]);
         assert!(app.dismissed_merged_ids().is_empty());
-        assert_eq!(
-            app.logs.len(),
-            logs_before,
-            "a no-op confirmation must not log a dismissal that did not happen"
+        assert!(
+            app.logs.is_empty(),
+            "a no-op dismissal must not log a dismissal that did not happen"
         );
-    }
-
-    #[test]
-    fn bulk_confirmation_dismisses_only_the_rows_still_merged() {
-        let mut app = app(&[
-            ("alpha", "merged"),
-            ("beta", "merged"),
-            ("gamma", "not queued"),
-        ]);
-        assert!(request_bulk(&mut app));
-
-        app.changes[1].set_display_status_cache("archiving");
-
-        assert!(confirm(&mut app));
-        assert_eq!(row_ids(&app), vec!["beta", "gamma"]);
-        assert!(app.dismissed_merged_ids().contains("alpha"));
-        assert!(!app.dismissed_merged_ids().contains("beta"));
     }
 
     #[test]
@@ -418,11 +309,8 @@ mod tests {
             ("beta", "not queued"),
             ("gamma", "not queued"),
         ]);
-        first.cursor_index = 1;
-        first.list_state.select(Some(1));
         first.cursor_index = 0;
-        assert!(request_individual(&mut first));
-        assert!(confirm(&mut first));
+        assert!(dismiss_focused(&mut first));
         assert_eq!(first.cursor_index, 0);
         assert_eq!(first.list_state.selected(), Some(0));
         assert_eq!(row_ids(&first), vec!["beta", "gamma"]);
@@ -434,23 +322,20 @@ mod tests {
             ("gamma", "not queued"),
         ]);
         middle.cursor_index = 1;
-        assert!(request_individual(&mut middle));
-        assert!(confirm(&mut middle));
+        assert!(dismiss_focused(&mut middle));
         assert_eq!(middle.cursor_index, 1);
         assert_eq!(row_ids(&middle), vec!["alpha", "gamma"]);
 
         // Last row: the index no longer exists, so it clamps to the final row.
         let mut last = app(&[("alpha", "not queued"), ("beta", "merged")]);
         last.cursor_index = 1;
-        assert!(request_individual(&mut last));
-        assert!(confirm(&mut last));
+        assert!(dismiss_focused(&mut last));
         assert_eq!(last.cursor_index, 0);
         assert_eq!(last.list_state.selected(), Some(0));
 
         // Only row: nothing survives, so nothing is selected.
         let mut only = app(&[("alpha", "merged")]);
-        assert!(request_individual(&mut only));
-        assert!(confirm(&mut only));
+        assert!(dismiss_focused(&mut only));
         assert!(only.changes.is_empty());
         assert_eq!(only.cursor_index, 0);
         assert_eq!(only.list_state.selected(), None);
@@ -459,8 +344,7 @@ mod tests {
     #[test]
     fn dismissing_every_row_leaves_an_empty_but_valid_projection() {
         let mut app = app(&[("alpha", "merged"), ("beta", "merged")]);
-        assert!(request_bulk(&mut app));
-        assert!(confirm(&mut app));
+        assert!(dismiss_all_projected(&mut app));
 
         assert!(app.changes.is_empty());
         assert_eq!(app.list_state.selected(), None);
@@ -478,8 +362,7 @@ mod tests {
         assert!(app.selected_proposal_log_filter);
         assert_eq!(app.selected_proposal_log_filter_target(), Some("alpha"));
 
-        assert!(request_individual(&mut app));
-        assert!(confirm(&mut app));
+        assert!(dismiss_focused(&mut app));
 
         assert!(!app.selected_proposal_log_filter);
         assert!(
@@ -498,34 +381,36 @@ mod tests {
         app.toggle_selected_proposal_log_filter();
         assert!(app.selected_proposal_log_filter);
 
-        app.cursor_index = 1;
-        assert!(request_individual(&mut app));
-        app.cursor_index = 0;
-        assert!(confirm(&mut app));
+        // Bulk dismissal sweeps `beta` while the filter still targets the
+        // cursor's own surviving row.
+        assert!(dismiss_all_projected(&mut app));
 
         assert!(app.selected_proposal_log_filter);
         assert_eq!(app.selected_proposal_log_filter_target(), Some("alpha"));
     }
 
     #[test]
-    fn an_overlay_that_already_owns_input_refuses_a_new_dismissal_request() {
+    fn an_overlay_that_already_owns_input_refuses_a_dismissal() {
         let mut app = app(&[("alpha", "merged")]);
         app.modal = Some(ModalState::QrPopup);
 
-        assert!(!request_individual(&mut app));
-        assert!(!request_bulk(&mut app));
+        assert!(!dismiss_focused(&mut app));
+        assert!(!dismiss_all_projected(&mut app));
         assert_eq!(app.modal, Some(ModalState::QrPopup));
+        assert_eq!(row_ids(&app), vec!["alpha"]);
+        assert!(app.dismissed_merged_ids().is_empty());
     }
 
     #[test]
-    fn dismissal_requests_are_changes_view_only() {
+    fn dismissal_is_changes_view_only() {
         let mut app = app(&[("alpha", "merged")]);
         app.view_mode = ViewMode::Worktrees;
 
-        assert!(!request_individual(&mut app));
-        assert!(!request_bulk(&mut app));
+        assert!(!dismiss_focused(&mut app));
+        assert!(!dismiss_all_projected(&mut app));
         assert!(!has_dismissable_rows(&app));
         assert_eq!(app.modal, None);
+        assert_eq!(row_ids(&app), vec!["alpha"]);
     }
 
     #[test]
@@ -539,22 +424,5 @@ mod tests {
 
         app.cursor_index = 1;
         assert!(focused_row_is_dismissable(&app));
-    }
-
-    #[test]
-    fn confirm_and_cancel_ignore_every_other_overlay() {
-        let mut app = app(&[("alpha", "merged")]);
-        app.modal = Some(ModalState::ConfirmForceKill {
-            change_id: "alpha".to_string(),
-        });
-
-        assert!(!confirm(&mut app));
-        assert!(!cancel(&mut app));
-        assert_eq!(
-            app.modal,
-            Some(ModalState::ConfirmForceKill {
-                change_id: "alpha".to_string()
-            })
-        );
     }
 }

@@ -1659,35 +1659,21 @@ impl AppState {
         }
     }
 
-    /// Open the confirmation for dismissing the focused `merged` row.
+    /// Dismiss the focused `merged` row immediately, with no confirmation.
     ///
     /// Presentation only: it hides a reviewed row from this process's Changes
-    /// projection and records nothing outside it. Returns true when the
-    /// confirmation opened; a non-`merged` focused row is a silent no-op.
-    pub fn request_dismiss_merged_row(&mut self) -> bool {
-        merged_row_dismissal::request_individual(self)
+    /// projection and records nothing outside it. Returns true when a row was
+    /// dismissed; a non-`merged` focused row is a silent no-op.
+    pub fn dismiss_merged_row(&mut self) -> bool {
+        merged_row_dismissal::dismiss_focused(self)
     }
 
-    /// Open the confirmation for dismissing every projected `merged` row.
+    /// Dismiss every projected `merged` row immediately, with no confirmation.
     ///
-    /// Returns true when the confirmation opened; an empty target set is a
-    /// silent no-op.
-    pub fn request_dismiss_all_merged_rows(&mut self) -> bool {
-        merged_row_dismissal::request_bulk(self)
-    }
-
-    /// Confirm the open merged-row dismissal, rechecking each bound target first.
-    ///
-    /// Returns true when a dismissal confirmation was the overlay that closed.
-    pub fn confirm_dismiss_merged_rows(&mut self) -> bool {
-        merged_row_dismissal::confirm(self)
-    }
-
-    /// Close a merged-row dismissal confirmation without changing any row.
-    ///
-    /// Returns true when a dismissal confirmation was the overlay that closed.
-    pub fn cancel_dismiss_merged_rows(&mut self) -> bool {
-        merged_row_dismissal::cancel(self)
+    /// Returns true when at least one row was dismissed; an empty target set is
+    /// a silent no-op.
+    pub fn dismiss_all_merged_rows(&mut self) -> bool {
+        merged_row_dismissal::dismiss_all_projected(self)
     }
 
     /// Whether the focused row can be dismissed right now.
@@ -1708,8 +1694,11 @@ impl AppState {
 
     /// Rows this process has dismissed, as the catalog boundary sees them.
     ///
-    /// Assertion and suppression helper only; nothing outside this process reads
-    /// it, and it is discarded on restart.
+    /// Assertion helper only — production code reads the field directly, so this
+    /// accessor exists purely so tests can observe suppression without reaching
+    /// into private state. Nothing outside this process reads it, and it is
+    /// discarded on restart.
+    #[cfg(test)]
     pub(crate) fn dismissed_merged_ids(&self) -> &HashSet<String> {
         &self.dismissed_merged_ids
     }

@@ -57,8 +57,6 @@ pub(crate) enum ModalInvalidation {
     ForceKillTargetNotActive,
     /// Global execution state no longer admits stop-and-dequeue.
     ForceKillExecutionInvalid,
-    /// No row a dismissal confirmation bound is listed any more.
-    DismissTargetsAbsent,
 }
 
 impl ModalInvalidation {
@@ -80,7 +78,6 @@ impl ModalInvalidation {
             ModalInvalidation::ForceKillExecutionInvalid => {
                 "no run is active to stop and dequeue from"
             }
-            ModalInvalidation::DismissTargetsAbsent => "no dismissable row is listed any more",
         }
     }
 }
@@ -195,28 +192,6 @@ pub(crate) fn evaluate_force_kill(
     Ok(())
 }
 
-/// Whether a merged-row dismissal confirmation still has a row to act on.
-///
-/// Presence is the whole policy here, and status deliberately is not: a bound
-/// row that stopped being `merged` is rechecked and skipped at confirmation
-/// time, which is what keeps a stale overlay from hiding a row that changed
-/// underneath it. Only losing *every* bound row leaves the overlay describing
-/// nothing at all.
-pub(crate) fn evaluate_dismiss_merged(
-    change_ids: &[String],
-    ctx: &ModalValidityContext<'_>,
-) -> Result<(), ModalInvalidation> {
-    let any_listed = change_ids
-        .iter()
-        .any(|id| ctx.changes.iter().any(|change| &change.id == id));
-
-    if any_listed {
-        Ok(())
-    } else {
-        Err(ModalInvalidation::DismissTargetsAbsent)
-    }
-}
-
 /// Whether the active modal still describes an actionable target.
 pub(crate) fn evaluate(
     modal: &ModalState,
@@ -240,12 +215,6 @@ pub(crate) fn evaluate(
             path, branch, head, ..
         } => evaluate_discard(path, branch, head, ctx),
         ModalState::ConfirmForceKill { change_id } => evaluate_force_kill(change_id, ctx),
-        ModalState::ConfirmDismissMergedRow { change_id } => {
-            evaluate_dismiss_merged(std::slice::from_ref(change_id), ctx)
-        }
-        ModalState::ConfirmDismissAllMergedRows { change_ids } => {
-            evaluate_dismiss_merged(change_ids, ctx)
-        }
     }
 }
 
@@ -598,65 +567,6 @@ mod tests {
     }
 
     #[test]
-    fn dismissal_confirmations_survive_a_bound_row_leaving_merged() {
-        // The recheck at confirmation time owns status. Invalidating here would
-        // close the overlay before the operator could learn their decision no
-        // longer applies to that row.
-        let mut fixture = Fixture::new();
-        fixture.changes = vec![
-            change("change-a", "merged"),
-            change("change-b", "resolving"),
-        ];
-
-        for modal in [
-            ModalState::ConfirmDismissMergedRow {
-                change_id: "change-b".to_string(),
-            },
-            ModalState::ConfirmDismissAllMergedRows {
-                change_ids: vec!["change-a".to_string(), "change-b".to_string()],
-            },
-        ] {
-            assert_eq!(evaluate(&modal, &fixture.ctx()), Ok(()));
-        }
-    }
-
-    #[test]
-    fn dismissal_confirmations_invalidate_when_every_bound_row_is_gone() {
-        let mut fixture = Fixture::new();
-        fixture.changes.clear();
-
-        for modal in [
-            ModalState::ConfirmDismissMergedRow {
-                change_id: "change-a".to_string(),
-            },
-            ModalState::ConfirmDismissAllMergedRows {
-                change_ids: vec!["change-a".to_string(), "change-b".to_string()],
-            },
-        ] {
-            assert_eq!(
-                evaluate(&modal, &fixture.ctx()),
-                Err(ModalInvalidation::DismissTargetsAbsent)
-            );
-        }
-    }
-
-    #[test]
-    fn a_bulk_dismissal_keeps_its_overlay_while_one_bound_row_survives() {
-        let mut fixture = Fixture::new();
-        fixture.changes = vec![change("change-a", "merged")];
-
-        assert_eq!(
-            evaluate(
-                &ModalState::ConfirmDismissAllMergedRows {
-                    change_ids: vec!["change-a".to_string(), "change-gone".to_string()],
-                },
-                &fixture.ctx()
-            ),
-            Ok(())
-        );
-    }
-
-    #[test]
     fn every_invalidation_reason_is_reportable() {
         for reason in [
             ModalInvalidation::WebUrlUnavailable,
@@ -670,7 +580,6 @@ mod tests {
             ModalInvalidation::ForceKillTargetFinal,
             ModalInvalidation::ForceKillTargetNotActive,
             ModalInvalidation::ForceKillExecutionInvalid,
-            ModalInvalidation::DismissTargetsAbsent,
         ] {
             assert!(!reason.reason().is_empty());
         }
