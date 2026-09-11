@@ -10,6 +10,7 @@
 //! transition step that `execute_with_order_based_reanalysis` calls, so the trigger
 //! lifetime under test is the production code path rather than a test-only copy.
 
+use super::support::create_test_config;
 use crate::analyzer::{AnalysisOutcome, AnalysisResult};
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
@@ -34,17 +35,6 @@ use tokio::task::JoinSet;
 
 /// The scheduler's ordinary debounce timer branch duration.
 const SCHEDULER_TIMER: std::time::Duration = std::time::Duration::from_millis(500);
-
-fn create_test_config() -> OrchestratorConfig {
-    OrchestratorConfig {
-        apply_command: Some("echo apply {change_id}".to_string()),
-        archive_command: Some("echo archive {change_id}".to_string()),
-        analyze_command: Some("echo analyze".to_string()),
-        acceptance_command: Some("echo acceptance".to_string()),
-        resolve_command: Some("echo resolve".to_string()),
-        ..Default::default()
-    }
-}
 
 fn test_change(id: &str) -> Change {
     Change {
