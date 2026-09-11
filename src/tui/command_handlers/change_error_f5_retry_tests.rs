@@ -252,7 +252,8 @@ async fn arranged(setup: Setup, mode: AppExecutionMode, scheduler_running: bool)
     web.set_parallel_runtime(harness.parallel.clone()).await;
     web.set_repo_root(std::path::PathBuf::from("/repo")).await;
     let changes: Vec<_> = CHANGES.iter().map(|id| create_test_change(id)).collect();
-    web.update_with_mode(&changes, mode.app_mode_token()).await;
+    web.seed_workspace_observation_for_tests(&changes, mode.app_mode_token())
+        .await;
     // All three halves of the arranged process carry the same idle-episode
     // qualifier: leaving this one behind would stage a split state the process
     // cannot be in, and the comparison would then report an arrangement gap as

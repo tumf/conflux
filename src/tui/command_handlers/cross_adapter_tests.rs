@@ -80,7 +80,8 @@ async fn wired(
     web.set_parallel_runtime(harness.parallel.clone()).await;
     web.set_repo_root(std::path::PathBuf::from("/repo")).await;
     let changes: Vec<_> = change_ids.iter().map(|id| create_test_change(id)).collect();
-    web.update_with_mode(&changes, app_mode_string(&mode)).await;
+    web.seed_workspace_observation_for_tests(&changes, app_mode_string(&mode))
+        .await;
     web.sync_remote_control_projection().await;
 
     // The Web frontend joins the boundary the TUI is already on, and the same

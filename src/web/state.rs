@@ -872,12 +872,45 @@ impl WebState {
     ///
     /// Production has no caller left: a workspace observation reaches the
     /// snapshot as a dispatched `ChangesRefreshed` (see [`WebState::apply_dispatch`]),
-    /// and Run mode publishes its own execution mode through
-    /// [`WebState::update_with_mode`]. Kept behind `cfg(test)` because the
-    /// projection tests need a starting change set whose `app_mode` is whatever
-    /// the run already had, which neither of those two entry points offers.
+    /// and the periodic disk refresh publishes the run's own execution mode
+    /// through [`WebState::refresh_from_disk_at`]. Kept behind `cfg(test)`
+    /// because the projection tests need a starting change set whose `app_mode`
+    /// is whatever the run already had, which neither of those two entry points
+    /// offers.
     #[cfg(test)]
     pub(crate) async fn update(&self, changes: &[Change]) {
+        self.merge_workspace_observation(changes, None).await;
+    }
+
+    /// Seed the monitoring snapshot with an explicit execution mode, test-only.
+    ///
+    /// This is the single entry point unit and integration tests use to arrange
+    /// a workspace observation whose `app_mode` is chosen rather than inherited.
+    /// It is `#[doc(hidden)] pub` rather than `cfg(test)` because the
+    /// integration-test crates under `tests/` link this library as an external
+    /// consumer and cannot see `cfg(test)` items. Production
+    /// workspace-observation replacement is owned by
+    /// [`WebState::refresh_from_disk_at`] alone; event-driven projection writes
+    /// stay with [`WebState::apply_dispatch`].
+    // Having no production caller is the point, so the binary target — which
+    // compiles this module without the test crates that do call it — would
+    // otherwise report it as dead.
+    #[allow(dead_code)]
+    #[doc(hidden)]
+    pub async fn seed_workspace_observation_for_tests(&self, changes: &[Change], app_mode: &str) {
+        self.merge_workspace_observation(changes, Some(app_mode))
+            .await;
+    }
+
+    /// Merge one workspace observation into the projected snapshot.
+    ///
+    /// A workspace listing carries neither the run's execution mode nor the
+    /// runtime facts the reducer owns, so everything the listing cannot see is
+    /// carried over from the snapshot being replaced. `app_mode` names the mode
+    /// the observation publishes: `Some(mode)` is a caller that knows the run's
+    /// current mode and republishes it, `None` keeps whatever mode the
+    /// projection already holds.
+    async fn merge_workspace_observation(&self, changes: &[Change], app_mode: Option<&str>) {
         // Query shared state if available for enriched metadata
         let shared_state_opt = self.shared_orchestrator_state.read().await;
         let shared_state_data = if let Some(ref shared_arc) = *shared_state_opt {
@@ -904,82 +937,25 @@ impl WebState {
             )
         };
 
-        // Preserve app_mode and is_resolving to prevent overwriting runtime state during refresh.
-        // The idle-episode fact travels with the mode it qualifies: a workspace
-        // refresh is not evidence that the scheduler stopped being idle.
-        new_state.app_mode = old_app_mode.clone();
-        new_state.persistent_scheduler_idle = old_persistent_idle;
+        // Preserve is_resolving to prevent overwriting runtime state during a
+        // workspace observation.
         new_state.is_resolving = old_is_resolving;
-
-        for new_change in &mut new_state.changes {
-            if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
-                // Preserve queue_status ONLY if shared state didn't provide it
-                if new_change.queue_status.is_none() {
-                    new_change.queue_status = existing.queue_status.clone();
-                }
-
-                // Preserve iteration_number ONLY if shared state didn't provide it
-                if new_change.iteration_number.is_none() {
-                    new_change.iteration_number = existing.iteration_number;
-                }
-
-                // Preserve existing progress if retrieval failed (new data is 0/0)
-                // This prevents resetting progress to 0 on retrieval failure
-                if new_change.total_tasks == 0
-                    && (existing.completed_tasks > 0 || existing.total_tasks > 0)
-                {
-                    new_change.completed_tasks = existing.completed_tasks;
-                    new_change.total_tasks = existing.total_tasks;
-                    new_change.progress_percent = existing.progress_percent;
-                    new_change.status = existing.status.clone();
-                }
+        match app_mode {
+            // The idle-episode fact is only meaningful under `select`, so an
+            // observation that publishes a different execution mode clears it
+            // with the mode.
+            Some(mode) => {
+                new_state.app_mode = mode.to_string();
+                new_state.persistent_scheduler_idle = old_persistent_idle && mode == "select";
+            }
+            // The idle-episode fact travels with the mode it qualifies: an
+            // observation that publishes no mode is not evidence that the
+            // scheduler stopped being idle.
+            None => {
+                new_state.app_mode = old_app_mode;
+                new_state.persistent_scheduler_idle = old_persistent_idle;
             }
         }
-
-        {
-            let mut state = self.state.write().await;
-            *state = new_state;
-        }
-
-        self.observe_changes_for_attention(changes).await;
-        self.sync_remote_control_projection().await;
-    }
-
-    /// Update the state with new changes and explicit app_mode (for Run mode)
-    pub async fn update_with_mode(&self, changes: &[Change], app_mode: &str) {
-        // Query shared state if available for enriched metadata
-        let shared_state_opt = self.shared_orchestrator_state.read().await;
-        let shared_state_data = if let Some(ref shared_arc) = *shared_state_opt {
-            shared_arc.try_read().ok()
-        } else {
-            None
-        };
-
-        let mut new_state = OrchestratorStateSnapshot::from_changes_with_shared_state(
-            changes,
-            shared_state_data.as_deref(),
-        );
-        drop(shared_state_data); // Drop guard before awaiting
-        drop(shared_state_opt); // Drop read lock
-
-        // Override app_mode from orchestrator execution state
-        new_state.app_mode = app_mode.to_string();
-
-        // Preserve progress, queue_status, and is_resolving from existing state
-        let (old_changes, old_persistent_idle, old_is_resolving) = {
-            let old_state = self.state.read().await;
-            (
-                old_state.changes.clone(),
-                old_state.persistent_scheduler_idle,
-                old_state.is_resolving,
-            )
-        };
-
-        // Preserve is_resolving to prevent overwriting runtime state. The
-        // idle-episode fact is only meaningful under `select`, so a caller that
-        // publishes a different execution mode clears it with the mode.
-        new_state.is_resolving = old_is_resolving;
-        new_state.persistent_scheduler_idle = old_persistent_idle && app_mode == "select";
 
         for new_change in &mut new_state.changes {
             if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
@@ -988,8 +964,12 @@ impl WebState {
                     new_change.queue_status = existing.queue_status.clone();
                 }
 
-                // Preserve iteration_number
-                new_change.iteration_number = existing.iteration_number;
+                // An observation that republishes the run's mode republishes the
+                // iteration identity with it; a mode-preserving one only fills
+                // the gap shared reducer state left.
+                if app_mode.is_some() || new_change.iteration_number.is_none() {
+                    new_change.iteration_number = existing.iteration_number;
+                }
 
                 // Preserve existing progress if retrieval failed (new data is 0/0)
                 // This prevents resetting progress to 0 on retrieval failure
@@ -1625,7 +1605,8 @@ impl WebState {
         }
 
         // Update state with refreshed changes, preserving app_mode
-        self.update_with_mode(&changes, &current_app_mode).await;
+        self.merge_workspace_observation(&changes, Some(&current_app_mode))
+            .await;
 
         {
             let mut state = self.state.write().await;

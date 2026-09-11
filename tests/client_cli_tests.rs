@@ -5710,7 +5710,9 @@ mod enabled {
         let web_state = Arc::new(WebState::new(std::slice::from_ref(&listing)));
         web_state.set_shared_state(reducer.clone()).await;
         web_state.set_execution_marks(marks.clone()).await;
-        web_state.update_with_mode(&[listing], "select").await;
+        web_state
+            .seed_workspace_observation_for_tests(&[listing], "select")
+            .await;
         web_state.sync_remote_control_projection().await;
 
         let core_mode = Arc::new(CoreMode::new());
