@@ -413,11 +413,6 @@ impl ParallelRunService {
             }
         }
 
-        info!(
-            "Starting parallel execution with re-analysis for {} changes",
-            changes.len()
-        );
-
         // Spawn event forwarding task
         let forward_handle = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
@@ -430,71 +425,34 @@ impl ParallelRunService {
             }
         });
 
-        // Create and run executor with re-analysis (same as TUI), passing shared stagger state
-        // and reducer state so CLI/server paths make rejection-review lane decisions synchronously.
-        let mut executor = ParallelExecutor::with_backend_and_queue_and_stagger(
-            self.repo_root.clone(),
-            self.config.clone(),
+        // One construction path for every frontend. The CLI used to assemble its
+        // own executor here, and that duplicate omitted `post_archive_action`
+        // and the run owner's graceful-stop request — which is how a headless
+        // `--push` run degraded to the default merge action. No dynamic queue is
+        // supplied, so the shared builder leaves the finite lifetime a CLI run
+        // depends on untouched.
+        let executor = self.create_executor_with_queue_state(
             Some(event_tx.clone()),
-            self.config.get_vcs_backend(),
+            cancel_token,
             None,
-            Some(self.shared_stagger_state.clone()),
+            None,
+            None,
+            Some(self.shared_orchestrator_state.clone()),
         );
-        executor.set_run_command_scope(self.run_command_scope.clone());
-        executor.set_no_resume(self.no_resume);
-        executor.set_shared_orchestrator_state(self.shared_orchestrator_state.clone());
-        self.install_upstream_integration(&mut executor);
 
-        // Set hooks from config
-        let hooks =
-            HookRunner::with_event_tx(self.config.get_hooks(), &self.repo_root, event_tx.clone());
-        executor.set_hooks(hooks);
-
-        // Set cancel token if provided
-        if let Some(token) = cancel_token {
-            executor.set_cancel_token(token);
-        }
-
-        // Clone config and shared stagger state for the analyzer closure
-        let config = self.config.clone();
-        let repo_root = self.repo_root.clone();
-        let shared_stagger_state = self.shared_stagger_state.clone();
-
-        // Use order-based execution (aligned with spec)
-        let result = executor
-            .execute_with_order_based_reanalysis(
-                changes,
-                move |remaining, in_flight_ids, iteration| {
-                    let config = config.clone();
-                    let repo_root = repo_root.clone();
-                    let event_tx = event_tx.clone();
-                    let shared_stagger_state = shared_stagger_state.clone();
-                    Box::pin(async move {
-                        let service = ParallelRunService::new_with_shared_state(
-                            repo_root,
-                            config,
-                            shared_stagger_state,
-                        );
-                        service
-                            .analyze_order_with_sender(
-                                remaining,
-                                in_flight_ids,
-                                Some(&event_tx),
-                                iteration,
-                            )
-                            .await
-                    })
-                },
-            )
+        // Delegate to the shared order-based run rather than repeating its
+        // analyzer closure. Its `prepare_parallel_execution` runs a second time
+        // over an already-filtered list, which is a no-op: nothing is skipped
+        // twice, so no duplicate warning or rejection event is emitted.
+        //
+        // `event_tx` is moved in, leaving no sender clone here. That is what
+        // closes the channel — and releases the forwarder — when the delegate
+        // drops the executor and the analyzer closure, including on the terminal
+        // paths that never emit `AllCompleted` (a scheduler failure, or a
+        // blocked/stalled exit).
+        let result = self
+            .run_parallel_order_based_with_executor(executor, changes, event_tx)
             .await;
-
-        // Close the event channel before joining the forwarder. The forwarder
-        // also breaks on a terminal event, but not every terminal path emits
-        // one: a scheduler failure and a blocked/stalled exit both return
-        // without `AllCompleted`, and a forwarder still holding a live sender
-        // would wait forever. The analyzer closure owned the only other clone
-        // and was consumed by the call above, so this closes the channel.
-        drop(executor);
 
         // Wait for event forwarding to complete
         let _ = forward_handle.await;
@@ -1145,6 +1103,115 @@ mod tests {
             &PostArchiveAction::PushToRemote {
                 remote: "upstream".to_string()
             }
+        );
+    }
+
+    /// Build an executor through the shared path with nothing optional supplied,
+    /// which is exactly the shape a headless CLI run asks for.
+    fn headless_executor(service: &ParallelRunService) -> crate::parallel::ParallelExecutor {
+        service.create_executor_with_queue_state(None, None, None, None, None, None)
+    }
+
+    /// Regression: the CLI used to assemble its own executor and never copied
+    /// `post_archive_action` onto it, so a headless `--push` run silently
+    /// degraded to the default merge action. The shared builder is now the only
+    /// construction path, so the configured action has to arrive on the
+    /// executor itself — not merely on the service that configured it.
+    #[test]
+    fn create_executor_with_queue_state_carries_configured_post_archive_action() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
+        service.set_post_archive_action(PostArchiveAction::PushToRemote {
+            remote: "origin".to_string(),
+        });
+
+        let executor = headless_executor(&service);
+
+        assert_eq!(
+            executor.post_archive_action_for_test(),
+            &PostArchiveAction::PushToRemote {
+                remote: "origin".to_string()
+            },
+            "a headless run's configured push action must reach the executor"
+        );
+    }
+
+    /// The default stays the default: an unconfigured service must not acquire
+    /// a push action just because construction moved.
+    #[test]
+    fn create_executor_with_queue_state_defaults_to_merge_to_base() {
+        let temp_dir = TempDir::new().unwrap();
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
+
+        assert_eq!(
+            headless_executor(&service).post_archive_action_for_test(),
+            &PostArchiveAction::MergeToBase
+        );
+    }
+
+    /// Regression: the duplicated CLI assembly also dropped the run owner's
+    /// graceful-stop request. The scheduler loop only honours a stop it can read
+    /// through the *same* flag run control writes, so identity — not value — is
+    /// the contract.
+    #[test]
+    fn create_executor_with_queue_state_binds_run_owner_graceful_stop_flag() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
+        let graceful_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        service.set_graceful_stop_flag(graceful_stop.clone());
+
+        let executor = headless_executor(&service);
+
+        let bound = executor
+            .graceful_stop_flag_for_test()
+            .expect("a bound graceful-stop request must reach the executor");
+        assert!(
+            Arc::ptr_eq(bound, &graceful_stop),
+            "the executor must observe the owner's own flag, not a copy"
+        );
+    }
+
+    /// A service no owner bound a flag to builds an executor that observes none.
+    #[test]
+    fn create_executor_with_queue_state_binds_no_graceful_stop_flag_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
+
+        assert!(headless_executor(&service)
+            .graceful_stop_flag_for_test()
+            .is_none());
+    }
+
+    /// Routing the CLI through the shared builder must not make a finite run
+    /// persistent: only a dynamic queue — which a CLI run never supplies —
+    /// keeps the scheduler alive when idle.
+    #[test]
+    fn create_executor_with_queue_state_keeps_finite_lifetime_without_dynamic_queue() {
+        use crate::parallel::SchedulerLifetime;
+
+        let temp_dir = TempDir::new().unwrap();
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
+
+        assert_eq!(
+            headless_executor(&service).scheduler_lifetime_for_test(),
+            SchedulerLifetime::Finite,
+            "a CLI run supplies no dynamic queue and must stay finite"
+        );
+
+        let loop_based = service.create_executor_with_queue_state(
+            None,
+            None,
+            None,
+            Some(Arc::new(crate::tui::queue::DynamicQueue::new())),
+            None,
+            None,
+        );
+        assert_eq!(
+            loop_based.scheduler_lifetime_for_test(),
+            SchedulerLifetime::Persistent,
+            "a loop-based frontend still gets the persistent lifetime"
         );
     }
 

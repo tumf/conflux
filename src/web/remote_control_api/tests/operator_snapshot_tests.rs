@@ -1983,3 +1983,82 @@ async fn dependency_blocker_projection_keeps_the_actionable_workspace_reason() {
         "committing the proposal is the action the operator can take; a dependency clears itself"
     );
 }
+
+// ============================================================================
+// Summary totals — one classifier behind every construction path
+// ============================================================================
+
+/// `pushed` is completed and `rejecting` is in progress, in *both* paths that
+/// build a summary.
+///
+/// The initial construction and the refresh both delegate to the same
+/// classifier now, so the two can no longer publish different totals for the
+/// same reducer state — which is exactly how `pushed` used to vanish from the
+/// completed total and `rejecting` from the in-progress one after a refresh.
+#[tokio::test]
+async fn summary_totals_classify_pushed_and_rejecting_the_same_in_both_construction_paths() {
+    use crate::vcs::WorkspaceStatus;
+
+    let (web_state, reducer, _) = wired_web_state(&["push-d", "reject-r", "idle-i"]).await;
+    let changes = vec![change("push-d"), change("reject-r"), change("idle-i")];
+    web_state.update(&changes).await;
+    observe(
+        &web_state,
+        &reducer,
+        changes_refreshed(changes.clone(), &[], &[], HashMap::new()),
+    )
+    .await;
+    observe(
+        &web_state,
+        &reducer,
+        ExecutionEvent::PushCompleted {
+            change_id: "push-d".to_string(),
+            remote: "origin".to_string(),
+            branch: "push-d".to_string(),
+        },
+    )
+    .await;
+    observe(
+        &web_state,
+        &reducer,
+        ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "reject-r".to_string(),
+            workspace_name: "ws-r".to_string(),
+            status: WorkspaceStatus::Rejecting,
+        },
+    )
+    .await;
+
+    let refreshed = web_state.get_state().await;
+    let status = |id: &str| {
+        refreshed
+            .changes
+            .iter()
+            .find(|c| c.id == id)
+            .and_then(|c| c.queue_status.as_deref())
+            .unwrap_or("not queued")
+    };
+    assert_eq!(status("push-d"), "pushed", "fixture must reach `pushed`");
+    assert_eq!(
+        status("reject-r"),
+        "rejecting",
+        "fixture must reach `rejecting`"
+    );
+
+    let initial = OrchestratorStateSnapshot::from_changes_with_shared_state(
+        &changes,
+        Some(&*reducer.read().await),
+    );
+
+    for (path, snapshot) in [("refreshed", &refreshed), ("initial", &initial)] {
+        assert_eq!(
+            snapshot.completed_changes, 1,
+            "{path}: `pushed` is a completed change"
+        );
+        assert_eq!(
+            snapshot.in_progress_changes, 1,
+            "{path}: `rejecting` is a change in progress"
+        );
+        assert_eq!(snapshot.total_changes, 3, "{path}: every row is counted");
+    }
+}

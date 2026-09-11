@@ -93,3 +93,20 @@ The initial three-level runtime state change remains an additive migration miles
 **When**: runtime state chooses the next action
 **Then**: it enters the configured merge, resolve, or push handling
 **And**: no `ExecutionMode::Serial` branch treats archive as terminal
+
+### Requirement: Centralize lifecycle status predicates
+
+The repository MUST implement centralize lifecycle status predicates within the declared boundary while preserving existing external contracts.
+
+#### Scenario: Focused refactoring preserves behavior
+
+**Given**: the current repository behavior and focused regression fixtures
+**When**: the implementation is refactored according to this change
+**Then**: `pushed` contributes to completed totals in every Web snapshot construction path.
+**And**: the declared focused verification passes without external credentials or deployment
+
+#### Scenario: Unrelated behavior remains unchanged
+
+**Given**: code and contracts outside the declared change boundary
+**When**: this change is implemented and archived
+**Then**: public formats and unrelated lifecycle behavior remain unchanged
