@@ -11,7 +11,9 @@ use ratatui::{
 };
 use std::time::Duration;
 
-use crate::orchestration::operator_command::{is_active_status, is_markable_status};
+use crate::orchestration::operator_command::{
+    is_active_status, is_completed_status, is_markable_status,
+};
 
 use super::state::{
     guards, log_logic, AppState, ChangeState, CopyFeedback, ErrorDetailsPopup,
@@ -260,8 +262,11 @@ fn char_display_width(ch: char) -> usize {
 /// same fact, and none of them can carry next-run intent. This is the status-only
 /// fallback: it holds on a startup or refresh frame where no reducer
 /// archive-completion snapshot has been observed yet.
+///
+/// The vocabulary is the shared one, not a TUI-local list, so the rendered row
+/// and a Web snapshot's completed total can never disagree about a status.
 fn is_post_archive_status(display_status: &str) -> bool {
-    matches!(display_status, "archived" | "merged" | "pushed")
+    is_completed_status(display_status)
 }
 
 /// True when the row must render no checkbox text at all.
@@ -341,10 +346,7 @@ fn render_change_id_field(display_id: &str) -> String {
 /// killable.
 fn push_change_row_hints(keys: &mut Vec<String>, app: &AppState, item: &ChangeState) {
     let status = item.display_status_cache.as_str();
-    if matches!(
-        status,
-        "preparing" | "applying" | "accepting" | "archiving" | "resolving"
-    ) {
+    if is_active_status(status) {
         if let Some(ModalState::ConfirmForceKill { .. }) = app.modal {
             keys.push("Y: confirm kill".to_string());
             keys.push("N: cancel".to_string());
@@ -657,15 +659,12 @@ mod popups {
 
 /// Render header
 fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
+    // The shared active vocabulary, not a header-local phase list: a row the
+    // header counts as running is exactly a row Core is executing.
     let active_count = app
         .changes
         .iter()
-        .filter(|c| {
-            matches!(
-                c.display_status_cache.as_str(),
-                "preparing" | "applying" | "accepting" | "archiving" | "resolving"
-            )
-        })
+        .filter(|c| is_active_status(&c.display_status_cache))
         .count();
 
     // Per spec (show-ready-header-after-stop):
@@ -1497,13 +1496,6 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-/// Render status panel
-/// Display statuses that mean the change reached final success.
-///
-/// Narrower than the shared final-status vocabulary on purpose: `rejected` is
-/// also final, but it is a non-success outcome and never an execution target.
-const OVERALL_PROGRESS_SUCCESS_STATUSES: [&str; 3] = ["archived", "merged", "pushed"];
-
 /// Whether a row contributes its stored task counts to the Status aggregate.
 ///
 /// The aggregate target set is the unique union of successful completed work,
@@ -1524,8 +1516,10 @@ fn contributes_to_overall_progress(change: &ChangeState) -> bool {
 
     // Completed: the reducer-observed archive milestone covers post-archive
     // `resolving` / `resolve pending` / `merge wait`, none of which is terminal.
+    // The status fallback is the shared completed vocabulary, which excludes
+    // `rejected` because that is final but unsuccessful.
     change.archive_complete_cache
-        || OVERALL_PROGRESS_SUCCESS_STATUSES.contains(&change.display_status_cache.as_str())
+        || is_completed_status(&change.display_status_cache)
         // In progress: the shared vocabulary, not a TUI-local phase list.
         || is_active_status(&change.display_status_cache)
         // Marked for execution: idle, queued, waiting, or retryable error.
@@ -4165,15 +4159,13 @@ mod tests {
     }
 
     /// An active row advertises kill *and* mark: two independent controls.
+    ///
+    /// Iterating the shared vocabulary rather than a local list is the point:
+    /// `rejecting` is active execution, so the hint policy that reaches it is
+    /// the classifier's, not a hand-written phase list that omitted it.
     #[test]
     fn run_mark_intent_active_row_keeps_kill_alongside_the_mark_hint() {
-        for status in [
-            "preparing",
-            "applying",
-            "accepting",
-            "archiving",
-            "resolving",
-        ] {
+        for status in crate::orchestration::operator_command::ACTIVE_STATUSES {
             let mut app = create_test_app(vec![create_test_change("change-a")]);
             app.execution_mode = AppExecutionMode::Running;
             app.changes[0].display_status_cache = status.to_string();
@@ -5469,6 +5461,53 @@ mod tests {
             "header should not count queued rows in addition to active row, but got:\n{}",
             content
         );
+    }
+
+    /// The header counts exactly the shared active vocabulary — `rejecting`
+    /// included, which the header's own phase list used to miss.
+    #[test]
+    fn running_header_counts_every_shared_active_status() {
+        for status in crate::orchestration::operator_command::ACTIVE_STATUSES {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            app.execution_mode = AppExecutionMode::Running;
+            app.changes[0].display_status_cache = status.to_string();
+
+            let content = buffer_to_string(&render_buffer(&mut app, 80, 24));
+            assert!(
+                content.contains("[Running 1]"),
+                "{status}: an actively executing row is a running row:\n{content}"
+            );
+        }
+    }
+
+    /// …and counts nothing that the classifier calls inactive.
+    #[test]
+    fn running_header_counts_no_inactive_status() {
+        for status in [
+            "not queued",
+            "queued",
+            "blocked",
+            "stalled",
+            "merge wait",
+            "resolve pending",
+            "reject pending",
+            "archived",
+            "merged",
+            "pushed",
+            "rejected",
+            "error",
+            "stopped",
+        ] {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            app.execution_mode = AppExecutionMode::Running;
+            app.changes[0].display_status_cache = status.to_string();
+
+            let content = buffer_to_string(&render_buffer(&mut app, 80, 24));
+            assert!(
+                !content.contains("[Running 1]"),
+                "{status}: nothing is executing, so the header carries no count:\n{content}"
+            );
+        }
     }
 
     #[test]

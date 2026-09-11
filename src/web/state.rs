@@ -4,6 +4,7 @@
 
 use crate::events::{EventDispatch, EventOwnership, EventSink, ExecutionEvent, LogEntry};
 use crate::openspec::Change;
+use crate::orchestration::operator_command::{is_active_status, is_completed_status};
 use crate::tui::types::WorktreeInfo;
 use crate::web::operator_facts::OperatorFactsStore;
 use crate::web::remote_control_api::dto::{
@@ -196,39 +197,16 @@ impl OrchestratorStateSnapshot {
             }
         }
 
-        let completed = change_statuses
-            .iter()
-            .filter(|c| {
-                c.queue_status
-                    .as_ref()
-                    .is_some_and(|s| s == "archived" || s == "merged" || s == "pushed")
-            })
-            .count();
-        let in_progress = change_statuses
-            .iter()
-            .filter(|c| {
-                c.queue_status.as_ref().is_some_and(|s| {
-                    s == "preparing"
-                        || s == "applying"
-                        || s == "accepting"
-                        || s == "archiving"
-                        || s == "resolving"
-                        || s == "rejecting"
-                })
-            })
-            .count();
-        let pending = change_statuses
-            .iter()
-            .filter(|c| c.queue_status.as_ref().is_some_and(|s| s == "queued"))
-            .count();
-
-        Self {
-            total_changes: change_statuses.len(),
-            completed_changes: completed,
-            in_progress_changes: in_progress,
-            pending_changes: pending,
+        // Totals are never computed here: `refresh_summary` is the one
+        // implementation, so an initial snapshot and a refreshed one can never
+        // classify the same row differently.
+        let mut snapshot = Self {
+            total_changes: 0,
+            completed_changes: 0,
+            in_progress_changes: 0,
+            pending_changes: 0,
             changes: change_statuses,
-            last_updated: chrono::Utc::now().to_rfc3339(),
+            last_updated: String::new(),
             logs: Vec::new(),
             worktrees: Vec::new(),
             app_mode: "select".to_string(),
@@ -236,7 +214,9 @@ impl OrchestratorStateSnapshot {
             is_resolving: false,
             process_error: None,
             parallel: ParallelRuntimeState::default(),
-        }
+        };
+        refresh_summary(&mut snapshot);
+        snapshot
     }
 }
 
@@ -365,6 +345,12 @@ fn fold_dependency_wait_into_eligibility(
     }
 }
 
+/// Recompute the snapshot totals from the rows' own display statuses.
+///
+/// The single implementation behind every summary, initial construction
+/// included. Classification is the shared lifecycle vocabulary rather than a
+/// Web-local status list, so `pushed` always counts as completed and
+/// `rejecting` always counts as in progress.
 fn refresh_summary(state: &mut OrchestratorStateSnapshot) {
     state.total_changes = state.changes.len();
     state.completed_changes = state
@@ -373,22 +359,14 @@ fn refresh_summary(state: &mut OrchestratorStateSnapshot) {
         .filter(|change| {
             change
                 .queue_status
-                .as_ref()
-                .is_some_and(|s| s == "archived" || s == "merged")
+                .as_deref()
+                .is_some_and(is_completed_status)
         })
         .count();
     state.in_progress_changes = state
         .changes
         .iter()
-        .filter(|change| {
-            change.queue_status.as_ref().is_some_and(|s| {
-                s == "preparing"
-                    || s == "applying"
-                    || s == "accepting"
-                    || s == "archiving"
-                    || s == "resolving"
-            })
-        })
+        .filter(|change| change.queue_status.as_deref().is_some_and(is_active_status))
         .count();
     state.pending_changes = state
         .changes
@@ -1712,6 +1690,65 @@ mod tests {
         assert_eq!(state.pending_changes, 1);
         assert_eq!(state.in_progress_changes, 1);
         assert_eq!(state.completed_changes, 1);
+    }
+
+    /// Every canonical display status lands in exactly one summary bucket.
+    ///
+    /// This is the sole classifier both construction paths delegate to, so
+    /// asserting the whole vocabulary here covers both: `pushed` is the
+    /// completed status the refresh used to drop, `rejecting` the in-progress
+    /// one the initial construction counted alone.
+    #[test]
+    fn summary_totals_classify_every_canonical_status() {
+        // The reducer's full display-status vocabulary.
+        const CANONICAL_STATUSES: [&str; 18] = [
+            "not queued",
+            "queued",
+            "blocked",
+            "stalled",
+            "applying",
+            "accepting",
+            "rejecting",
+            "archiving",
+            "resolving",
+            "merge wait",
+            "resolve pending",
+            "reject pending",
+            "archived",
+            "merged",
+            "pushed",
+            "rejected",
+            "error",
+            "stopped",
+        ];
+
+        for status in CANONICAL_STATUSES {
+            let expected_completed =
+                usize::from(matches!(status, "archived" | "merged" | "pushed"));
+            let expected_in_progress = usize::from(matches!(
+                status,
+                "preparing" | "applying" | "accepting" | "rejecting" | "archiving" | "resolving"
+            ));
+            let expected_pending = usize::from(status == "queued");
+
+            let mut snapshot =
+                OrchestratorStateSnapshot::from_changes(&[create_test_change("change-a", 0, 1)]);
+            snapshot.changes[0].queue_status = Some(status.to_string());
+            refresh_summary(&mut snapshot);
+
+            assert_eq!(
+                snapshot.completed_changes, expected_completed,
+                "{status}: completed total"
+            );
+            assert_eq!(
+                snapshot.in_progress_changes, expected_in_progress,
+                "{status}: in-progress total"
+            );
+            assert_eq!(
+                snapshot.pending_changes, expected_pending,
+                "{status}: pending total"
+            );
+        }
     }
 
     #[tokio::test]

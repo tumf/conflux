@@ -66,6 +66,14 @@ pub const ACTIVE_STATUSES: [&str; 6] = [
     "resolving",
 ];
 
+/// Display statuses that are post-archive presentations of a completed change.
+///
+/// `archived`, `merged`, and `pushed` are three presentations of the same fact:
+/// the change reached final success. Narrower than [`FINAL_STATUSES`] on
+/// purpose — `rejected` is also final, but it is a non-success outcome and never
+/// counts as completed work.
+pub const COMPLETED_STATUSES: [&str; 3] = ["archived", "merged", "pushed"];
+
 /// Display statuses that are final and cannot be mutated by operator intent.
 const FINAL_STATUSES: [&str; 4] = ["archived", "merged", "pushed", "rejected"];
 
@@ -73,8 +81,21 @@ const FINAL_STATUSES: [&str; 4] = ["archived", "merged", "pushed", "rejected"];
 const MARK_ONLY_WAIT_STATUSES: [&str; 2] = ["merge wait", "resolve pending"];
 
 /// Returns true when the display status means Core is actively executing the change.
+///
+/// This is also the in-progress predicate every aggregate total and operator
+/// hint classifies with: a row Core is executing is a row in progress, and the
+/// two must never be spelled as separate hand-written status lists.
 pub fn is_active_status(display_status: &str) -> bool {
     ACTIVE_STATUSES.contains(&display_status)
+}
+
+/// Returns true when the display status means the change completed successfully.
+///
+/// The completed counterpart of [`is_active_status`]: one vocabulary for every
+/// completed total, post-archive presentation check, and success aggregate, so
+/// no caller can silently omit `pushed`.
+pub fn is_completed_status(display_status: &str) -> bool {
+    COMPLETED_STATUSES.contains(&display_status)
 }
 
 /// Returns true when the display status is a final outcome.
