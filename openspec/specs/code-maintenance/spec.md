@@ -479,8 +479,6 @@ ResolveWait retry helper naming and comments SHALL reflect the full set of outco
 - **WHEN** 単一のサブモジュールのみを変更する
 - **THEN** 他のサブモジュールへの影響は最小限であり、`cargo build` が成功する
 
-## Requirements
-
 ### Requirement: resolve_command ログの一貫した生成
 システムは `resolve_command` 実行時のサーバーログについて、開始・標準出力・標準エラー・終了を既存どおりの意味と順序で記録しなければならない。
 
