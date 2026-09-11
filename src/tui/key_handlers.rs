@@ -793,6 +793,20 @@ pub(crate) async fn handle_modal_key(key: KeyEvent, ctx: &mut KeyEventContext<'_
             }
             _ => {}
         },
+        // Hiding a reviewed row is presentation only, so it takes the ordinary
+        // case-insensitive confirmation keys rather than the destructive `X`.
+        // No command is sent in either direction: nothing outside this process
+        // learns that a row was dismissed.
+        ModalState::ConfirmDismissMergedRow { .. }
+        | ModalState::ConfirmDismissAllMergedRows { .. } => match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+                ctx.app.confirm_dismiss_merged_rows();
+            }
+            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
+                ctx.app.cancel_dismiss_merged_rows();
+            }
+            _ => {}
+        },
     }
 
     true
@@ -882,13 +896,33 @@ pub async fn handle_key_event(
         (KeyCode::Char('m'), _) | (KeyCode::Char('M'), _) => {
             handle_merge_key(ctx).await?;
         }
-        (KeyCode::Char('d'), _) | (KeyCode::Char('D'), _) => {
+        (KeyCode::Char('d'), _) => {
             use crate::tui::types::ViewMode;
-            if ctx.app.view_mode == ViewMode::Worktrees {
-                // Worktree view: delete selected worktree
-                ctx.app.request_worktree_delete_from_list();
+            match ctx.app.view_mode {
+                // Worktree view: delete selected worktree. Unchanged, and the
+                // only `d` that touches the repository.
+                ViewMode::Worktrees => {
+                    ctx.app.request_worktree_delete_from_list();
+                }
+                // Changes view: request dismissal of the focused `merged` row.
+                // A non-merged row is a silent no-op.
+                ViewMode::Changes => {
+                    ctx.app.request_dismiss_merged_row();
+                }
             }
-            // Note: D key removed from Changes view as per spec
+        }
+        (KeyCode::Char('D'), _) => {
+            use crate::tui::types::ViewMode;
+            match ctx.app.view_mode {
+                ViewMode::Worktrees => {
+                    ctx.app.request_worktree_delete_from_list();
+                }
+                // Changes view: request dismissal of every projected `merged`
+                // row. An empty target set is a silent no-op.
+                ViewMode::Changes => {
+                    ctx.app.request_dismiss_all_merged_rows();
+                }
+            }
         }
         (KeyCode::Esc, _) => {
             handle_esc_key(ctx).await;
@@ -3043,6 +3077,204 @@ mod tests {
                 !handle_error_details_popup_key(&mut app, key(code)),
                 "{code:?} must fall through when the popup is closed"
             );
+        }
+    }
+
+    // ========================================================================
+    // Merged-row dismissal routing
+    // ========================================================================
+
+    /// A Changes-view app with two merged rows around one active row.
+    ///
+    /// The cursor starts on `merged-a`, so `d` has a target and `D` has three
+    /// of them minus the active one.
+    fn dismissal_routing_app() -> AppState {
+        let mut app = AppState::new(vec![
+            create_test_change("merged-a"),
+            create_test_change("change-b"),
+            create_test_change("merged-c"),
+        ]);
+        app.view_mode = ViewMode::Changes;
+        app.execution_mode = AppExecutionMode::Running;
+        app.changes[0].set_display_status_cache("merged");
+        app.changes[1].set_display_status_cache("applying");
+        app.changes[2].set_display_status_cache("merged");
+        app.web_url = Some("http://127.0.0.1:8080".to_string());
+        app
+    }
+
+    fn row_ids(app: &AppState) -> Vec<String> {
+        app.changes.iter().map(|c| c.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn changes_view_d_opens_the_individual_dismissal_confirmation() {
+        let mut app = dismissal_routing_app();
+
+        let commands = route_key(&mut app, KeyCode::Char('d')).await;
+
+        assert!(commands.is_empty(), "dismissal dispatches no command");
+        assert_eq!(
+            app.modal,
+            Some(ModalState::ConfirmDismissMergedRow {
+                change_id: "merged-a".to_string()
+            })
+        );
+        assert_eq!(row_ids(&app), vec!["merged-a", "change-b", "merged-c"]);
+    }
+
+    #[tokio::test]
+    async fn changes_view_d_is_silent_on_a_non_merged_row() {
+        let mut app = dismissal_routing_app();
+        app.cursor_index = 1;
+
+        let commands = route_key(&mut app, KeyCode::Char('d')).await;
+
+        assert!(commands.is_empty());
+        assert_eq!(app.modal, None);
+        assert_eq!(row_ids(&app), vec!["merged-a", "change-b", "merged-c"]);
+    }
+
+    #[tokio::test]
+    async fn changes_view_shift_d_binds_every_projected_merged_row() {
+        let mut app = dismissal_routing_app();
+        // Cursor position is irrelevant to the bulk target set.
+        app.cursor_index = 1;
+
+        let commands = route_key(&mut app, KeyCode::Char('D')).await;
+
+        assert!(commands.is_empty());
+        assert_eq!(
+            app.modal,
+            Some(ModalState::ConfirmDismissAllMergedRows {
+                change_ids: vec!["merged-a".to_string(), "merged-c".to_string()]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_view_shift_d_is_silent_without_a_merged_row() {
+        let mut app = dismissal_routing_app();
+        app.changes[0].set_display_status_cache("archived");
+        app.changes[2].set_display_status_cache("pushed");
+
+        let commands = route_key(&mut app, KeyCode::Char('D')).await;
+
+        assert!(commands.is_empty());
+        assert_eq!(app.modal, None);
+    }
+
+    #[tokio::test]
+    async fn case_insensitive_y_confirms_a_dismissal_without_dispatching_anything() {
+        for code in [KeyCode::Char('y'), KeyCode::Char('Y')] {
+            let mut app = dismissal_routing_app();
+            route_key(&mut app, KeyCode::Char('d')).await;
+
+            let commands = route_key(&mut app, code).await;
+
+            assert!(
+                commands.is_empty(),
+                "{code:?} must not send a command: nothing outside this process is told"
+            );
+            assert_eq!(app.modal, None);
+            assert_eq!(row_ids(&app), vec!["change-b", "merged-c"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn case_insensitive_n_and_esc_cancel_a_dismissal() {
+        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            for open in [KeyCode::Char('d'), KeyCode::Char('D')] {
+                let mut app = dismissal_routing_app();
+                route_key(&mut app, open).await;
+                assert!(app.modal.is_some(), "{open:?} must open a confirmation");
+
+                let commands = route_key(&mut app, code).await;
+
+                assert!(commands.is_empty(), "{code:?} must dispatch nothing");
+                assert_eq!(app.modal, None, "{code:?} must close the confirmation");
+                assert_eq!(row_ids(&app), vec!["merged-a", "change-b", "merged-c"]);
+                assert!(app.dismissed_merged_ids().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_dismissal_confirmation_owns_every_other_key() {
+        // Navigation, marks, run control, editing, and the worktree keys all
+        // belong to the view underneath. While this overlay is up, none of them
+        // may reach it.
+        for code in [
+            KeyCode::Char(' '),
+            KeyCode::Char('x'),
+            KeyCode::Char('X'),
+            KeyCode::Char('e'),
+            KeyCode::Char('K'),
+            KeyCode::Char('l'),
+            KeyCode::Char('w'),
+            KeyCode::Char('s'),
+            KeyCode::Char('S'),
+            KeyCode::Char('d'),
+            KeyCode::Char('D'),
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::F(5),
+        ] {
+            let mut app = dismissal_routing_app();
+            route_key(&mut app, KeyCode::Char('d')).await;
+            let before = app.modal.clone();
+            let marks_before: Vec<bool> = app.changes.iter().map(|c| c.selected).collect();
+
+            let commands = route_key(&mut app, code).await;
+
+            assert!(
+                commands.is_empty(),
+                "{code:?} must not dispatch anything from the dismissal confirmation"
+            );
+            assert_eq!(
+                app.modal, before,
+                "{code:?} must leave the dismissal confirmation exactly as it was"
+            );
+            assert_eq!(app.cursor_index, 0, "{code:?} must not move the cursor");
+            assert_eq!(
+                app.view_mode,
+                ViewMode::Changes,
+                "{code:?} must not switch views"
+            );
+            assert_eq!(
+                app.changes.iter().map(|c| c.selected).collect::<Vec<_>>(),
+                marks_before,
+                "{code:?} must not change execution marks"
+            );
+            assert_eq!(row_ids(&app), vec!["merged-a", "change-b", "merged-c"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn worktrees_view_keeps_d_and_shift_d_as_worktree_deletion() {
+        for code in [KeyCode::Char('d'), KeyCode::Char('D')] {
+            let mut app = tui_dirty_worktree_delete_app(false);
+            app.modal = None;
+            // A merged row exists in the Changes projection; the Worktrees view
+            // must still be the one that answers for these keys.
+            app.changes[1].set_display_status_cache("merged");
+
+            let commands = route_key(&mut app, code).await;
+
+            assert!(commands.is_empty());
+            assert_eq!(
+                app.modal,
+                Some(ModalState::ConfirmWorktreeDelete {
+                    path: PathBuf::from("/tmp/wt-a"),
+                    branch: "change-b".to_string(),
+                }),
+                "{code:?} must keep opening the worktree delete confirmation"
+            );
+            assert!(app.dismissed_merged_ids().is_empty());
         }
     }
 }
