@@ -63,14 +63,26 @@
 //! - Workspace task completion: `join_set.join_next()` in [`Self::wait_for_scheduler_event`]
 //!   removes the change from `in_flight` via `handle_workspace_completion` and sets
 //!   `ResolveCompletion` (or `Completion` while a manual resolve is still active).
+//!   Note that this releases the change's *lifecycle slot* only when nothing
+//!   follows: an archived change transfers its slot to background merge, so the
+//!   recovered capacity that wake announces is the in-flight membership, not the
+//!   slot.
 //! - Manual resolve completion: the TUI decrements the shared manual-resolve counter and
 //!   calls `DynamicQueue::notify_scheduler`, which wakes the queue-notification branch.
 //! - Automatic conflict/merge resolution: `conflict::AutoResolveGuard` decrements
 //!   `auto_resolve_count` on success, failure, and early return, and the owning
 //!   background merge task always reports a `MergeResult` afterwards.
 //! - Background merge results (merged / deferred / failed): `handle_merge_result_with_tx`
-//!   decrements `pending_merge_count` for every outcome; merged additionally arms a
-//!   `ResolveCompletion` edge and promotes deferred base-lane waiters.
+//!   decrements `pending_merge_count` for every outcome; merged additionally releases the
+//!   change's lifecycle slot, arms a `ResolveCompletion` edge, and promotes deferred
+//!   base-lane waiters. A non-merged outcome deliberately keeps the slot — a retained
+//!   `merge wait` applies admission backpressure until an operator settles it — and its
+//!   release edge is the reducer reconciliation described below.
+//! - Retained-wait settlement: `reconcile_retained_lifecycle_slots` runs once per pass over
+//!   the evaluation's coherent reducer view, reconstructs occupancy for waits this process
+//!   never dispatched, and releases a retained slot on terminal settlement. The pass that
+//!   releases it computes capacity immediately afterwards, so the recovery needs no separate
+//!   wake.
 //! - Deferred resolve/reject wait retries: `maybe_dispatch_resolve_wait_retry_with_tx`
 //!   spawns through the same merge-result channel, so its completion is a wake edge too.
 //! - Zero-to-positive slot transitions observed by `calculate_available_slots` /
@@ -94,8 +106,6 @@ use crate::error::Result;
 use crate::events::LogEntry;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
@@ -630,7 +640,10 @@ impl ParallelExecutor {
 
         // Initialize scheduler state
         let max_parallelism = self.workspace_manager.max_concurrent();
-        let semaphore = Arc::new(Semaphore::new(max_parallelism));
+        // One permit source for the whole run: the lifecycle slots this executor
+        // owns. A second semaphore for merge or resolve would recreate exactly
+        // the transfer race this accounting removes.
+        self.lifecycle_slots.ensure_capacity(max_parallelism);
         let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
         let (merge_result_tx, mut merge_result_rx) = self.take_merge_result_channel();
         let mut in_flight: HashSet<String> = HashSet::new();
@@ -696,6 +709,10 @@ impl ParallelExecutor {
                 self.clear_preparation_for_aborted_changes(&in_flight).await;
                 in_flight.clear();
                 queued.clear();
+                // Aborted tasks never reach the completion handler that would
+                // transfer or release their lifecycle slots. The drain below
+                // still needs the merge results those slots are waiting for, so
+                // the slots are dropped after it, with the run.
                 self.drain_pending_merge_results_after_cancellation(
                     &merge_result_tx,
                     &mut merge_result_rx,
@@ -706,6 +723,7 @@ impl ParallelExecutor {
                     ),
                 )
                 .await;
+                self.lifecycle_slots.clear();
                 break;
             }
 
@@ -763,6 +781,10 @@ impl ParallelExecutor {
                     ),
                 )
                 .await;
+                // The run owns no admitted lifecycle any more: every task was
+                // aborted and every reachable background result has been handled,
+                // so the slots they were holding go with the run.
+                self.lifecycle_slots.clear();
                 break;
             }
 
@@ -807,6 +829,11 @@ impl ParallelExecutor {
             // Step 3: Sync reducer-owned ResolveWait intent before scheduler drain/idle checks.
             // This keeps manual resolve dispatch reducer-owned while making scheduler work detection truthful.
             self.sync_resolve_wait_from_snapshot(&work_snapshot);
+            // Retained base-lane waits keep their lifecycle slot, and a wait this
+            // process never dispatched — a restart's preserved `merge wait`, or
+            // one settled by an operator elsewhere — is reconstructed from the
+            // same coherent reducer view before capacity is computed below.
+            self.reconcile_retained_lifecycle_slots(&work_snapshot);
             self.maybe_dispatch_resolve_wait_retry_with_tx(&merge_result_tx)
                 .await;
 
@@ -863,7 +890,6 @@ impl ParallelExecutor {
                         iteration,
                         reanalysis_reason,
                         analyzer: &analyzer,
-                        semaphore: semaphore.clone(),
                         join_set: &mut join_set,
                         cleanup_guard: &mut cleanup_guard,
                         work_snapshot: Some(&work_snapshot),

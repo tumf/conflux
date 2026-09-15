@@ -6,6 +6,7 @@ use crate::openspec::{Change, ProposalMetadata};
 use crate::orchestration::state::{OrchestratorState, ReducerCommand, WaitState};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
 use crate::parallel::dynamic_queue::ReanalysisReason;
+use crate::parallel::lifecycle_slots::SlotPhase;
 use crate::parallel::queue_state::ReanalysisDispatchContext;
 use crate::parallel::{
     MergeResult, MergeResultOrigin, MergeTaskOutcome, ParallelExecutor, WorkspaceResult,
@@ -16,7 +17,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::process::Command;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 /// Local Git setup: this module's fixtures need an `initial` base commit, which
@@ -56,7 +56,7 @@ async fn init_git_repo(repo_root: &std::path::Path) {
 }
 
 #[tokio::test]
-async fn test_auto_resolve_counter_reduces_available_slots() {
+async fn test_auto_resolve_counter_tracks_active_resolves() {
     // Create a temporary directory for the test repository
     let temp_dir = TempDir::new().unwrap();
     let repo_root = temp_dir.path().to_path_buf();
@@ -87,9 +87,10 @@ async fn test_auto_resolve_counter_reduces_available_slots() {
         "Auto resolve counter should be 1 after increment"
     );
 
-    // The available_slots calculation in execute_with_order_based_reanalysis should now be:
-    // max_parallelism (4) - in_flight (0) - manual_resolve_count (0) - auto_resolve_count (1) = 3
-    // This is tested implicitly by the slot calculation logic in the executor
+    // The counter is observability and base-lane serialization only. Dispatch
+    // capacity comes from lifecycle-slot membership, and the resolving change
+    // already owns its slot — see
+    // `parallel::tests::lifecycle_slot_ownership` for the accounting itself.
 
     // Simulate resolve completing
     auto_resolve_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -103,7 +104,7 @@ async fn test_auto_resolve_counter_reduces_available_slots() {
 }
 
 #[tokio::test]
-async fn test_multiple_auto_resolves_consume_multiple_slots() {
+async fn test_multiple_auto_resolves_are_tracked_independently() {
     // Create a temporary directory for the test repository
     let temp_dir = TempDir::new().unwrap();
     let repo_root = temp_dir.path().to_path_buf();
@@ -125,8 +126,8 @@ async fn test_multiple_auto_resolves_consume_multiple_slots() {
         "Auto resolve counter should be 2 for concurrent resolves"
     );
 
-    // If max_parallelism is 4, available_slots should now be:
-    // 4 - 0 (in_flight) - 0 (manual_resolve_count) - 2 (auto_resolve_count) = 2
+    // Two resolves means two admitted changes, each already counted once by the
+    // lifecycle slot it owns; the counter itself subtracts no capacity.
 
     // Simulate first resolve completing
     auto_resolve_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -185,7 +186,7 @@ fn test_auto_resolve_counter_is_thread_safe() {
 }
 
 #[tokio::test]
-async fn test_combined_manual_and_auto_resolve_slots() {
+async fn test_combined_manual_and_auto_resolve_counters() {
     // Create a temporary directory for the test repository
     let temp_dir = TempDir::new().unwrap();
     let repo_root = temp_dir.path().to_path_buf();
@@ -218,8 +219,8 @@ async fn test_combined_manual_and_auto_resolve_slots() {
         "Auto resolve counter should be 1"
     );
 
-    // If max_parallelism is 4, available_slots should now be:
-    // 4 - 0 (in_flight) - 1 (manual_resolve_count) - 1 (auto_resolve_count) = 2
+    // Both resolves run inside lifecycle slots their changes already own, so
+    // neither counter subtracts capacity a second time.
 
     // Simulate manual resolve completing
     manual_resolve_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -284,13 +285,19 @@ async fn test_auto_resolve_zero_capacity_gates_analysis_and_apply_dispatch() {
         create_test_config(),
         Some(tx),
     );
+    // An automatic resolve runs inside the background merge of a change that
+    // already owns its lifecycle slot, so that slot — not the resolve counter —
+    // is what occupies the only unit of capacity here.
     executor
         .get_auto_resolve_counter()
         .store(1, std::sync::atomic::Ordering::SeqCst);
+    executor
+        .lifecycle_slots
+        .occupy_now("resolving-change", SlotPhase::Merge)
+        .await;
 
     let mut queued = vec![test_change("queued-auto-apply")];
     let mut in_flight = HashSet::new();
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard =
         WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
@@ -303,7 +310,6 @@ async fn test_auto_resolve_zero_capacity_gates_analysis_and_apply_dispatch() {
             iteration: 1,
             reanalysis_reason: ReanalysisReason::ResolveCompletion,
             analyzer: &analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,

@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -247,7 +247,6 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
         make_test_change("unrelated"),
     ];
     let mut in_flight = HashSet::new();
-    let semaphore = Arc::new(Semaphore::new(2));
     let mut join_set = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -261,7 +260,6 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
             iteration: 1,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &dependent_ready_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -315,7 +313,6 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
             iteration: 2,
             reanalysis_reason: ReanalysisReason::ResolveCompletion,
             analyzer: &dependent_ready_analysis_result,
-            semaphore: Arc::new(Semaphore::new(2)),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -783,6 +780,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         apply_budget: crate::execution::apply::ApplyBudget::new(),
+        lifecycle_slots: crate::parallel::lifecycle_slots::LifecycleSlots::new(4),
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -946,6 +944,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         apply_budget: crate::execution::apply::ApplyBudget::new(),
+        lifecycle_slots: crate::parallel::lifecycle_slots::LifecycleSlots::new(4),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1126,6 +1125,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         apply_budget: crate::execution::apply::ApplyBudget::new(),
+        lifecycle_slots: crate::parallel::lifecycle_slots::LifecycleSlots::new(4),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1361,6 +1361,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         apply_budget: crate::execution::apply::ApplyBudget::new(),
+        lifecycle_slots: crate::parallel::lifecycle_slots::LifecycleSlots::new(4),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1588,6 +1589,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         apply_budget: crate::execution::apply::ApplyBudget::new(),
+        lifecycle_slots: crate::parallel::lifecycle_slots::LifecycleSlots::new(4),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1821,6 +1823,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         apply_budget: crate::execution::apply::ApplyBudget::new(),
+        lifecycle_slots: crate::parallel::lifecycle_slots::LifecycleSlots::new(4),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2699,7 +2702,7 @@ async fn test_queue_notification_with_fresh_debounce_starts_analysis_after_initi
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
     use std::time::Instant;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -2719,7 +2722,6 @@ async fn test_queue_notification_with_fresh_debounce_starts_analysis_after_initi
 
     let mut queued = vec![make_test_change("fresh-queue-notification")];
     let mut in_flight = HashSet::new();
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -2734,7 +2736,6 @@ async fn test_queue_notification_with_fresh_debounce_starts_analysis_after_initi
             iteration: 2,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &ready_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -3132,7 +3133,6 @@ async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal
     use crate::parallel::dynamic_queue::ReanalysisReason;
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
-    use tokio::sync::Semaphore;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -3187,7 +3187,6 @@ async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal
         make_test_change("terminal-error"),
     ];
     let mut in_flight = HashSet::new();
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -3202,7 +3201,6 @@ async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal
             iteration: 1,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &should_not_call_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -3228,7 +3226,7 @@ async fn test_resolve_wait_completion_unblocks_dependents() {
     use crate::parallel::{MergeResult, MergeResultOrigin, MergeTaskOutcome, WorkspaceResult};
     use crate::vcs::VcsBackend;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -3275,7 +3273,6 @@ async fn test_resolve_wait_completion_unblocks_dependents() {
     beta.dependencies = vec!["alpha".to_string()];
     let mut queued = vec![beta];
     let mut in_flight = HashSet::new();
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -3296,7 +3293,6 @@ async fn test_resolve_wait_completion_unblocks_dependents() {
             iteration: 1,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &beta_depends_on_alpha_analysis_result,
-            semaphore: semaphore.clone(),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -3339,7 +3335,6 @@ async fn test_resolve_wait_completion_unblocks_dependents() {
             iteration,
             reanalysis_reason: ReanalysisReason::ResolveCompletion,
             analyzer: &beta_depends_on_alpha_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -3488,7 +3483,7 @@ fn dependency_on_inflight_analysis_result<'a>(
 async fn test_apply_time_rejected_handoff_enters_rejecting_review_and_emits_change_rejected() {
     use crate::events::ExecutionEvent;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -3538,7 +3533,6 @@ async fn test_apply_time_rejected_handoff_enters_rejecting_review_and_emits_chan
 
     let (tx, mut rx) = mpsc::channel(128);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -3554,7 +3548,6 @@ async fn test_apply_time_rejected_handoff_enters_rejecting_review_and_emits_chan
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -3658,7 +3651,7 @@ async fn dynamic_queue_ingestion_skips_final_terminal_merged_change() {
 #[tokio::test]
 async fn final_terminal_dispatch_preflight_skips_before_workspace_execution() {
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -3682,7 +3675,6 @@ async fn final_terminal_dispatch_preflight_skips_before_workspace_execution() {
         Some(tx),
     );
     executor.set_shared_orchestrator_state(shared);
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -3694,7 +3686,6 @@ async fn final_terminal_dispatch_preflight_skips_before_workspace_execution() {
         .dispatch_change_to_workspace(
             "alpha".to_string(),
             "base".to_string(),
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -3725,7 +3716,7 @@ async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -3739,7 +3730,6 @@ async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
     let (tx, mut rx) = mpsc::channel(64);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
 
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -3756,7 +3746,6 @@ async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
             iteration: 1,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &selective_dependency_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -4095,7 +4084,7 @@ async fn test_single_queued_active_dependency_does_not_emit_apply_started() {
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -4113,7 +4102,6 @@ async fn test_single_queued_active_dependency_does_not_emit_apply_started() {
     let (tx, mut rx) = mpsc::channel(32);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
 
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -4130,7 +4118,6 @@ async fn test_single_queued_active_dependency_does_not_emit_apply_started() {
             iteration: 1,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &single_queued_route_depends_on_policy_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -4162,7 +4149,7 @@ async fn test_inflight_dependency_blocks_dispatch_until_resolved() {
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -4176,7 +4163,6 @@ async fn test_inflight_dependency_blocks_dispatch_until_resolved() {
     let (tx, mut rx) = mpsc::channel(32);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
 
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -4193,7 +4179,6 @@ async fn test_inflight_dependency_blocks_dispatch_until_resolved() {
             iteration: 1,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &dependency_on_inflight_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -4606,7 +4591,7 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -4619,15 +4604,21 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
     });
     let (tx, _rx) = mpsc::channel(32);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
-    let manual_resolve_counter = Arc::new(AtomicUsize::new(1));
-    executor.set_manual_resolve_counter(manual_resolve_counter.clone());
+    // The resolving change holds the lifecycle slot it was admitted with; that
+    // membership, not a phase counter, is what admission is computed from.
+    executor
+        .lifecycle_slots
+        .occupy_now(
+            "resolving-change",
+            crate::parallel::lifecycle_slots::SlotPhase::Merge,
+        )
+        .await;
 
     {
         let mut last_change = executor.last_queue_change_at.lock().await;
         *last_change = Some(std::time::Instant::now());
     }
 
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -4647,7 +4638,6 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
             iteration: 2,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &ready_analysis_result,
-            semaphore: semaphore.clone(),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -4673,7 +4663,8 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
         "nothing should dispatch before the slot is released"
     );
 
-    manual_resolve_counter.store(0, Ordering::SeqCst);
+    // The resolve settles, releasing the slot its change owned.
+    executor.lifecycle_slots.release("resolving-change");
 
     let (should_break, iteration) = executor
         .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
@@ -4683,7 +4674,6 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
             iteration,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &ready_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -4719,7 +4709,7 @@ async fn test_resolve_wait_does_not_block_queue_reanalysis_dispatch() {
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -4737,7 +4727,6 @@ async fn test_resolve_wait_does_not_block_queue_reanalysis_dispatch() {
         .resolve_wait_changes
         .insert("still-resolving".to_string());
 
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -4754,7 +4743,6 @@ async fn test_resolve_wait_does_not_block_queue_reanalysis_dispatch() {
             iteration: 1,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &ready_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -4776,7 +4764,7 @@ async fn test_resolving_with_free_slot_still_dispatches_queued_change() {
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -4795,7 +4783,6 @@ async fn test_resolving_with_free_slot_still_dispatches_queued_change() {
         .resolve_wait_changes
         .insert("gamma-merge-wait".to_string());
 
-    let semaphore = Arc::new(Semaphore::new(2));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -4812,7 +4799,6 @@ async fn test_resolving_with_free_slot_still_dispatches_queued_change() {
             iteration: 1,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &ready_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -4842,7 +4828,7 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -4856,7 +4842,6 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
     let (tx, _rx) = mpsc::channel(32);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
 
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -4873,7 +4858,6 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
             iteration: 1,
             reanalysis_reason: ReanalysisReason::QueueNotification,
             analyzer: &blocked_analysis_result,
-            semaphore: semaphore.clone(),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -4894,7 +4878,6 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
             iteration,
             reanalysis_reason: ReanalysisReason::ResolveCompletion,
             analyzer: &ready_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -4919,7 +4902,7 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -4938,7 +4921,6 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
         *last_change = Some(std::time::Instant::now());
     }
 
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -4955,7 +4937,6 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
             iteration: 2,
             reanalysis_reason: ReanalysisReason::ResolveCompletion,
             analyzer: &ready_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -4990,7 +4971,7 @@ async fn test_repair_candidate_reanalysis_bypasses_debounce_and_dispatches_work(
     use crate::parallel::WorkspaceResult;
     use crate::vcs::VcsBackend;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("unexpected error");
@@ -5009,7 +4990,6 @@ async fn test_repair_candidate_reanalysis_bypasses_debounce_and_dispatches_work(
         *last_change = Some(std::time::Instant::now());
     }
 
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -5026,7 +5006,6 @@ async fn test_repair_candidate_reanalysis_bypasses_debounce_and_dispatches_work(
             iteration: 2,
             reanalysis_reason: ReanalysisReason::RepairCandidate,
             analyzer: &ready_analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -8160,7 +8139,6 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
     });
     let (tx, mut rx) = mpsc::channel(128);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -8172,7 +8150,6 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision.clone(),
-            semaphore.clone(),
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -8377,7 +8354,6 @@ async fn dispatch_gated_run(
     let mut executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
     executor.set_shared_orchestrator_state(shared_state.clone());
     executor.set_explicit_retry(explicit_retry);
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -8389,7 +8365,6 @@ async fn dispatch_gated_run(
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -9073,7 +9048,6 @@ async fn dispatch_missing_verdict_run(
 
     let (tx, mut rx) = mpsc::channel(256);
     let mut executor = ParallelExecutor::new(repo_dir.to_path_buf(), config, Some(tx));
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -9085,7 +9059,6 @@ async fn dispatch_missing_verdict_run(
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -9447,7 +9420,6 @@ async fn parallel_pass_to_archive_to_merge_never_creates_or_cleans_an_acceptance
     });
     let (tx, mut rx) = mpsc::channel(128);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -9459,7 +9431,6 @@ async fn parallel_pass_to_archive_to_merge_never_creates_or_cleans_an_acceptance
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -9619,7 +9590,6 @@ async fn test_resumed_workspace_marker_stops_parallel_dispatch_before_apply_acce
     });
     let (tx, mut rx) = mpsc::channel(128);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -9631,7 +9601,6 @@ async fn test_resumed_workspace_marker_stops_parallel_dispatch_before_apply_acce
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -9678,7 +9647,7 @@ async fn test_resumed_workspace_marker_stops_parallel_dispatch_before_apply_acce
 async fn test_resumed_merged_leftover_worktree_does_not_emit_apply_or_acceptance_started() {
     use crate::events::ExecutionEvent;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, Semaphore};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("create temp repo");
@@ -9778,7 +9747,6 @@ async fn test_resumed_merged_leftover_worktree_does_not_emit_apply_or_acceptance
     });
     let (tx, mut rx) = mpsc::channel(128);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -9790,7 +9758,6 @@ async fn test_resumed_merged_leftover_worktree_does_not_emit_apply_or_acceptance
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -10355,7 +10322,6 @@ async fn test_resumed_archived_dispatch_clears_reducer_queue_intent() {
     let (tx, mut rx) = mpsc::channel(128);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
     executor.set_shared_orchestrator_state(shared.clone());
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -10367,7 +10333,6 @@ async fn test_resumed_archived_dispatch_clears_reducer_queue_intent() {
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -13178,7 +13143,6 @@ async fn dispatch_scripted_repair_cycle(
 
     let (tx, mut rx) = mpsc::channel(256);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -13190,7 +13154,6 @@ async fn dispatch_scripted_repair_cycle(
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -13334,7 +13297,6 @@ async fn dispatch_scripted_acceptance_failure_cycle(
 
     let (tx, mut rx) = mpsc::channel(256);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -13346,7 +13308,6 @@ async fn dispatch_scripted_acceptance_failure_cycle(
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -13772,7 +13733,6 @@ async fn dispatch_runtime_limited_acceptance(change_id: &str) -> RuntimeLimitDis
 
     let (tx, mut rx) = mpsc::channel(256);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -13784,7 +13744,6 @@ async fn dispatch_runtime_limited_acceptance(change_id: &str) -> RuntimeLimitDis
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -13971,7 +13930,6 @@ async fn dispatch_with_hooks(
     )));
     executor.set_shared_orchestrator_state(shared_state.clone());
 
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
         VcsBackend::Git,
@@ -13983,7 +13941,6 @@ async fn dispatch_with_hooks(
         .dispatch_change_to_workspace(
             change_id.to_string(),
             base_revision,
-            semaphore,
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -14401,7 +14358,6 @@ async fn unselected_archived_dirty_worktree_never_reaches_analysis_execution_or_
             iteration: 1,
             reanalysis_reason: ReanalysisReason::Initial,
             analyzer: &analyzer,
-            semaphore: Arc::new(Semaphore::new(1)),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -14780,7 +14736,6 @@ async fn revoked_queue_intent_stops_an_already_added_candidate_before_analysis_a
             iteration: 1,
             reanalysis_reason: ReanalysisReason::Initial,
             analyzer: &analyzer,
-            semaphore: Arc::new(Semaphore::new(1)),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -14950,7 +14905,6 @@ async fn reducer_unknown_dynamic_hint_never_enters_analysis_or_dispatch() {
             iteration: 1,
             reanalysis_reason: ReanalysisReason::Initial,
             analyzer: &analyzer,
-            semaphore: Arc::new(Semaphore::new(1)),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -15424,7 +15378,6 @@ async fn preparing_is_visible_during_setup_and_a_retained_stop_prevents_agent_st
     let base_revision = get_current_commit(repo_dir.path())
         .await
         .or_fail("base revision");
-    let semaphore = Arc::new(Semaphore::new(1));
     let repo_root = repo_dir.path().to_path_buf();
 
     let dispatch = tokio::spawn(async move {
@@ -15436,7 +15389,6 @@ async fn preparing_is_visible_during_setup_and_a_retained_stop_prevents_agent_st
             .dispatch_change_to_workspace(
                 "admitted".to_string(),
                 base_revision,
-                semaphore,
                 &mut join_set,
                 &mut in_flight,
                 &mut cleanup_guard,
@@ -15558,7 +15510,6 @@ async fn preparing_is_not_announced_for_a_change_stopped_before_dispatch() {
         .dispatch_change_to_workspace(
             "stopped-early".to_string(),
             base_revision,
-            Arc::new(Semaphore::new(1)),
             &mut join_set,
             &mut in_flight,
             &mut cleanup_guard,
@@ -15651,13 +15602,17 @@ where
     let base_revision = get_current_commit(repo_dir.path())
         .await
         .or_fail("base revision");
-    let semaphore = Arc::new(Semaphore::new(1));
-    // The one slot is occupied, so dispatch parks on `acquire_owned`.
-    let held = semaphore
-        .clone()
-        .acquire_owned()
+    // Every lifecycle slot is occupied, so dispatch parks on `acquire_owned`.
+    // The permits come from the executor's own slot owner: that single semaphore
+    // is the whole concurrency limit, so holding it all is what a full scheduler
+    // looks like to the change waiting behind it.
+    let capacity = executor.configured_max_concurrent() as u32;
+    let held = executor
+        .lifecycle_slots
+        .semaphore()
+        .acquire_many_owned(capacity)
         .await
-        .or_fail("hold the only execution slot");
+        .or_fail("hold every execution slot");
 
     let repo_root = repo_dir.path().to_path_buf();
     let owned_id = change_id.to_string();
@@ -15670,7 +15625,6 @@ where
             .dispatch_change_to_workspace(
                 owned_id,
                 base_revision,
-                semaphore,
                 &mut join_set,
                 &mut in_flight,
                 &mut cleanup_guard,

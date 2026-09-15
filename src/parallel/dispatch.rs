@@ -2,7 +2,7 @@
 //!
 //! This module handles spawning individual change execution tasks into worktrees:
 //! - Pre-flight checks (stopped changes, duplicate dispatch prevention)
-//! - Workspace acquisition (semaphore-gated)
+//! - Workspace acquisition (lifecycle-slot gated)
 //! - Apply + Acceptance + Archive pipeline execution
 //! - Per-change cancellation monitoring
 
@@ -10,7 +10,6 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -42,6 +41,7 @@ use super::executor::{
     execute_acceptance_in_workspace, execute_apply_in_workspace,
     execute_archive_finalization_in_workspace, execute_archive_in_workspace, ParallelHookContext,
 };
+use super::lifecycle_slots::SlotPhase as LifecycleSlotPhase;
 use super::types::WorkspaceResult;
 use super::workspace;
 use super::ParallelEvent;
@@ -1532,8 +1532,8 @@ impl ParallelExecutor {
     /// Dispatch a single change to a workspace for apply + acceptance + archive.
     ///
     /// This method:
-    /// - Checks if the change has been stopped or is already in-flight
-    /// - Acquires a semaphore permit (to enforce concurrency limits)
+    /// - Checks if the change has been stopped or already owns a lifecycle slot
+    /// - Acquires the change's one lifecycle slot (enforcing the concurrency limit)
     /// - Creates or resumes a workspace
     /// - Spawns an async task for apply + acceptance + archive pipeline
     ///
@@ -1542,12 +1542,16 @@ impl ParallelExecutor {
     /// - Execute acceptance test (with retry loop)
     /// - Execute archive command (only if acceptance passes)
     /// - Return WorkspaceResult
+    ///
+    /// The acquired permit is *not* moved into the spawned task. It is recorded
+    /// as this change's lifecycle slot so the slot survives the task boundary
+    /// and is transferred to post-archive merge handling rather than dropped
+    /// when the task returns.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn dispatch_change_to_workspace(
         &mut self,
         change_id: String,
         base_revision: String,
-        semaphore: Arc<Semaphore>,
         join_set: &mut JoinSet<WorkspaceResult>,
         in_flight: &mut HashSet<String>,
         cleanup_guard: &mut WorkspaceCleanupGuard,
@@ -1578,7 +1582,22 @@ impl ParallelExecutor {
             return Ok(());
         }
 
-        // Acquire semaphore permit, but wake promptly if global cancellation arrives while waiting.
+        // A change that still owns a lifecycle slot is admitted work — merging,
+        // resolving, or waiting for operator settlement — even though its
+        // workspace task has already returned. Dispatching it again would give
+        // one change two slots, which is exactly the double-count this
+        // accounting exists to prevent.
+        if self.lifecycle_slots.contains(&change_id) {
+            warn!(
+                change_id = %change_id,
+                "Change already owns a lifecycle slot, skipping dispatch"
+            );
+            return Ok(());
+        }
+
+        // Acquire the lifecycle permit, but wake promptly if global cancellation
+        // arrives while waiting.
+        let semaphore = self.lifecycle_slots.semaphore();
         let permit = if let Some(token) = &self.cancel_token {
             tokio::select! {
                 _ = token.cancelled() => {
@@ -1684,6 +1703,24 @@ impl ParallelExecutor {
         // Add to in-flight set
         in_flight.insert(change_id.clone());
 
+        // Record the owned permit as this change's lifecycle slot. From here the
+        // slot belongs to the change, not to the task below: it is transferred
+        // to background merge handling when the task returns and released only
+        // at repository-visible settlement.
+        if !self
+            .lifecycle_slots
+            .occupy(&change_id, permit, LifecycleSlotPhase::Workspace)
+        {
+            // Unreachable given the guard above, which runs before the permit is
+            // acquired. Refusing here rather than dropping the duplicate
+            // silently keeps "one change, one slot" observable if a future
+            // caller reorders the gates.
+            warn!(
+                change_id = %change_id,
+                "Refusing to record a second lifecycle slot for an already admitted change"
+            );
+        }
+
         let shared_orchestrator_state = self.shared_orchestrator_state.clone();
         let explicit_retry = self.explicit_retry;
         let dynamic_queue_for_requeue = self.dynamic_queue.clone();
@@ -1712,10 +1749,12 @@ impl ParallelExecutor {
         let hooks = self.hooks.clone();
         let workspace = workspace_val;
 
-        // Spawn apply + acceptance + archive task
+        // Spawn apply + acceptance + archive task.
+        //
+        // The task holds no permit: the change's lifecycle slot is owned by the
+        // scheduler above and outlives this task on purpose, because background
+        // merge and resolve continue after it returns.
         join_set.spawn(async move {
-            let _permit = permit; // Hold permit until task completes
-
             // Detect workspace state for resumed workspaces and route accordingly.
             // A new workspace always starts fresh (Created state).
             // A resumed workspace may be in any state; we must not blindly run the full
@@ -3989,7 +4028,9 @@ impl ParallelExecutor {
                     }
                 }
             }
-            // _permit is dropped here, releasing semaphore
+            // The lifecycle slot is *not* released here: returning this result
+            // hands the change to post-archive merge handling, which owns the
+            // next transfer or the release.
         });
 
         Ok(())

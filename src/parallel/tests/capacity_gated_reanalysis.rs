@@ -28,6 +28,7 @@ use crate::openspec::{Change, ProposalMetadata};
 use crate::orchestration::state::{OrchestratorState, ReducerCommand};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
 use crate::parallel::dynamic_queue::ReanalysisReason;
+use crate::parallel::lifecycle_slots::SlotPhase;
 use crate::parallel::queue_state::ReanalysisDispatchContext;
 use crate::parallel::{ParallelExecutor, WorkspaceResult};
 use crate::tui::queue::DynamicQueue;
@@ -39,7 +40,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 
 /// The scheduler's ordinary timer branch duration.
@@ -122,14 +123,13 @@ struct Harness {
     in_flight: HashSet<String>,
     join_set: JoinSet<WorkspaceResult>,
     cleanup_guard: WorkspaceCleanupGuard,
-    semaphore: Arc<Semaphore>,
     reanalysis_reason: ReanalysisReason,
     iteration: u32,
     max_parallelism: usize,
     analyses: Arc<AtomicUsize>,
     events: mpsc::Receiver<ExecutionEvent>,
-    /// Slots held by an active resolve, as the base-mutating lane holds them.
-    resolve_slots: Arc<AtomicUsize>,
+    /// Synthetic change IDs currently holding a resolve's lifecycle slot.
+    resolve_slot_holders: Vec<String>,
     _repo_dir: TempDir,
     _workspace_base: TempDir,
 }
@@ -154,8 +154,7 @@ impl Harness {
             10,
         )));
         executor.set_shared_orchestrator_state(state.clone());
-        let resolve_slots = Arc::new(AtomicUsize::new(0));
-        executor.set_manual_resolve_counter(resolve_slots.clone());
+        executor.set_manual_resolve_counter(Arc::new(AtomicUsize::new(0)));
 
         Self {
             executor,
@@ -168,7 +167,6 @@ impl Harness {
                 VcsBackend::Git,
                 repo_dir.path().to_path_buf(),
             ),
-            semaphore: Arc::new(Semaphore::new(max_parallelism)),
             reanalysis_reason: ReanalysisReason::Initial,
             // Iteration 1 unconditionally skips debounce; start where a live
             // scheduler has already run its first analysis.
@@ -176,7 +174,7 @@ impl Harness {
             max_parallelism,
             analyses: Arc::new(AtomicUsize::new(0)),
             events,
-            resolve_slots,
+            resolve_slot_holders: Vec::new(),
             _repo_dir: repo_dir,
             _workspace_base: workspace_base,
         }
@@ -188,9 +186,28 @@ impl Harness {
         *last_change = Some(std::time::Instant::now());
     }
 
-    /// Occupy `count` dispatch slots, as an active resolve does.
-    fn hold_resolve_slots(&self, count: usize) {
-        self.resolve_slots.store(count, Ordering::SeqCst);
+    /// Occupy `count` dispatch slots, as changes resolving on the base-mutating
+    /// lane do.
+    ///
+    /// A resolve holds the lifecycle slot of the change it belongs to, so the
+    /// occupancy is expressed as admitted changes rather than as a bare counter:
+    /// that is the same membership admission is computed from.
+    async fn hold_resolve_slots(&mut self, count: usize) {
+        while self.resolve_slot_holders.len() > count {
+            let change_id = self
+                .resolve_slot_holders
+                .pop()
+                .expect("a holder to release");
+            self.executor.lifecycle_slots.release(&change_id);
+        }
+        while self.resolve_slot_holders.len() < count {
+            let change_id = format!("resolving-{}", self.resolve_slot_holders.len());
+            self.executor
+                .lifecycle_slots
+                .occupy_now(&change_id, SlotPhase::Merge)
+                .await;
+            self.resolve_slot_holders.push(change_id);
+        }
     }
 
     /// Publish reducer queue intent and the matching runtime hint.
@@ -229,7 +246,6 @@ impl Harness {
                     iteration: self.iteration,
                     reanalysis_reason: self.reanalysis_reason,
                     analyzer,
-                    semaphore: self.semaphore.clone(),
                     join_set: &mut self.join_set,
                     cleanup_guard: &mut self.cleanup_guard,
                     work_snapshot: None,
@@ -287,7 +303,7 @@ async fn reanalysis_zero_capacity_gates_analyzer() {
     let mut harness = Harness::new(&["beta"], 1);
     let analyzer = counting_analyzer(harness.analyses.clone());
     harness.arm_queue_debounce().await;
-    harness.hold_resolve_slots(1);
+    harness.hold_resolve_slots(1).await;
 
     harness.queue_change("beta").await;
     harness.run_loop_iteration(&analyzer).await;
@@ -329,7 +345,7 @@ async fn reanalysis_zero_capacity_preserves_edge_and_signature() {
     let mut harness = Harness::new(&["beta"], 1);
     let analyzer = counting_analyzer(harness.analyses.clone());
     harness.arm_queue_debounce().await;
-    harness.hold_resolve_slots(1);
+    harness.hold_resolve_slots(1).await;
 
     // Ingest first, so the queue hint is already drained and the one-shot edge
     // below is the only trigger the gated evaluation is carrying.
@@ -385,7 +401,7 @@ async fn reanalysis_slot_recovery_after_capacity_gate_resumes_from_the_preserved
     let mut harness = Harness::new(&["beta"], 1);
     let analyzer = counting_analyzer(harness.analyses.clone());
     harness.arm_queue_debounce().await;
-    harness.hold_resolve_slots(1);
+    harness.hold_resolve_slots(1).await;
 
     harness.queue_change("beta").await;
     harness.run_loop_iteration(&analyzer).await;
@@ -395,7 +411,7 @@ async fn reanalysis_slot_recovery_after_capacity_gate_resumes_from_the_preserved
 
     // The resolve finishes. No new queue mutation and no second operator action:
     // the edge preserved by the gate is the whole liveness signal.
-    harness.hold_resolve_slots(0);
+    harness.hold_resolve_slots(0).await;
     let outcome = harness
         .run_loop_iteration(&analyzer)
         .await

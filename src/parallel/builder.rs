@@ -146,6 +146,9 @@ impl ParallelExecutor {
             acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
             acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
             apply_budget: crate::execution::apply::ApplyBudget::new(),
+            // Sized from the same configured limit the workspace manager
+            // enforces, so admission and worktree capacity can never disagree.
+            lifecycle_slots: super::lifecycle_slots::LifecycleSlots::new(max_concurrent),
             manual_resolve_count: None,
             auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -412,6 +415,15 @@ impl ParallelExecutor {
     #[cfg(test)]
     pub fn get_auto_resolve_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.auto_resolve_count.clone()
+    }
+
+    /// The configured concurrency limit this executor's scheduler will enforce.
+    ///
+    /// The same value the run loop passes as `max_parallelism`, so a test can
+    /// occupy exactly as many lifecycle slots as the run has.
+    #[cfg(test)]
+    pub fn configured_max_concurrent(&self) -> usize {
+        self.workspace_manager.max_concurrent()
     }
 
     /// Get the VCS backend type

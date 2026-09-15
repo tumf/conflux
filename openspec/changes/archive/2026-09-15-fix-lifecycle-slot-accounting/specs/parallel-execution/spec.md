@@ -8,6 +8,14 @@ change は workspace preparation の直前に lifecycle slot を取得し、phas
 
 slot は `merged`、terminal `error`、`rejected`、明示的 dequeue/not-queued、または設定された push/publication terminal settlement の repository-visible evidence が確定した時点で解放しなければならない（MUST）。process restart 後の occupancy は workspace、Git、および reducer evidence から再構成しなければならず（MUST）、out-of-worktree durable slot state を workflow authority として導入してはならない（MUST NOT）。
 
+#### Scenario: worktree 作成も同時数上限の対象になる
+
+- **GIVEN** `max_concurrent_workspaces` が 3 に設定されている
+- **AND** parallel 実行で 10 件の change が対象である
+- **WHEN** worktree の作成と apply が進行する
+- **THEN** 同時に作成・実行される worktree は最大 3 件までに制限される
+- **AND** 残りの change はスロットが空くまで待機する
+
 #### Scenario: archive completion transfers rather than releases the slot
 
 - **GIVEN** `max_concurrent_workspaces` が 3 であり、3件の change が admitted lifecycle slot を所有している
@@ -58,6 +66,31 @@ slot occupancy は workspace preparation、apply、acceptance、archive、backgr
 空きスロット数は `max_concurrent_workspaces - unique_lifecycle_occupancy_count` で算出し、0未満にならないように扱わなければならない（MUST）。
 
 re-analysis の `order` は依存関係の制約として扱い、依存解決済みの change だけを空きスロット数分 dispatch しなければならない（MUST）。
+
+#### Scenario: 空きスロット数に応じてdispatchする
+
+- **GIVEN** `max_concurrent_workspaces` が 3 である
+- **AND** lifecycle slot を所有する change が 2 件である
+- **AND** queued に依存解決済みの change が 2 件ある
+- **WHEN** re-analysis が dispatch を行う
+- **THEN** 1 件のみ dispatch される
+
+#### Scenario: in-flight に非アクティブ状態が含まれない
+
+- **GIVEN** `merged`、terminal `error`、`rejected`、明示的 dequeue/not queued、および設定された push/publication terminal settlement の change が存在する
+- **WHEN** 並列実行が lifecycle occupancy を算出する
+- **THEN** それらの change は occupancy として数えられない
+- **AND** 未settleの `merge_wait` は非アクティブでも occupancy として数えられる
+
+#### Scenario: 手動 resolve は in-flight に含まれる
+
+- **GIVEN** `max_concurrent_workspaces` が 3 である
+- **AND** apply/acceptance/archive で lifecycle slot を所有する change が 2 件である
+- **AND** TUI から3件目の admitted change に対する手動 resolve が開始される
+- **WHEN** 並列実行が空きスロット数を算出する
+- **THEN** unique lifecycle occupancy は 3 件として扱われる
+- **AND** 手動 resolve は対象 change が既に所有する slot の内側で実行され二重計上されない
+- **AND** queued の change はスロットが空くまで dispatch されない
 
 #### Scenario: available slots use unique lifecycle occupancy
 

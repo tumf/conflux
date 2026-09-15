@@ -47,6 +47,13 @@ pub(super) struct ReducerWorkSnapshot {
     reject_wait_ids: HashSet<String>,
     acceptance_stalled_ids: HashSet<String>,
     externally_blocked_ids: HashSet<String>,
+    /// Change IDs whose admitted lifecycle has settled.
+    ///
+    /// Positive terminal evidence — merged, pushed, rejected, error, stopped —
+    /// and nothing else. Lifecycle-slot release reads this rather than the
+    /// *absence* of wait evidence, because a background result can reach the
+    /// scheduler before the reducer applies the event that explains it.
+    settled_ids: HashSet<String>,
     /// Terminal-error IDs among the run's initial changes.
     ///
     /// Dependency classification has always scoped terminal-error evidence to
@@ -81,6 +88,7 @@ impl ReducerWorkSnapshot {
             reject_wait_ids: state.reject_wait_change_ids().into_iter().collect(),
             acceptance_stalled_ids: state.acceptance_stalled_change_ids(),
             externally_blocked_ids: state.externally_blocked_change_ids(),
+            settled_ids: state.settled_lifecycle_change_ids(),
             terminal_error_ids,
         }
     }
@@ -109,6 +117,7 @@ impl ReducerWorkSnapshot {
             reject_wait_ids: HashSet::new(),
             acceptance_stalled_ids: HashSet::new(),
             externally_blocked_ids: HashSet::new(),
+            settled_ids: HashSet::new(),
             terminal_error_ids: HashSet::new(),
         }
     }
@@ -149,6 +158,11 @@ impl ReducerWorkSnapshot {
 
     pub(super) fn reject_wait_ids(&self) -> &HashSet<String> {
         &self.reject_wait_ids
+    }
+
+    /// Change IDs whose admitted lifecycle reached terminal settlement.
+    pub(super) fn settled_ids(&self) -> &HashSet<String> {
+        &self.settled_ids
     }
 
     pub(super) fn terminal_error_ids(&self) -> &HashSet<String> {

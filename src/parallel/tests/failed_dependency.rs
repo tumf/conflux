@@ -22,6 +22,7 @@ use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
 use crate::orchestration::operator_command::RetryEdgeAuthority;
 use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+use crate::parallel::lifecycle_slots::SlotPhase;
 use crate::parallel::queue_state::{QueuedWorkClass, RetryEdgeConsumption};
 use crate::parallel::{ParallelEvent, ParallelExecutor, SchedulerLifetime, SchedulerRunReport};
 use crate::tui::queue::DynamicQueue;
@@ -362,7 +363,6 @@ impl EpochProbe {
                     iteration,
                     reanalysis_reason,
                     analyzer: &analyzer,
-                    semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
                     join_set: &mut join_set,
                     cleanup_guard: &mut cleanup_guard,
                     work_snapshot: None,
@@ -839,7 +839,16 @@ where
     executor.set_scheduler_lifetime(lifetime);
     executor.set_cancel_token(cancel_token.clone());
     if occupy_dispatch_capacity {
+        // Every configured slot is held by an admitted change resolving on the
+        // base-mutating lane. Occupancy is the lifecycle membership admission is
+        // computed from; the resolve counter is observability beside it.
         executor.auto_resolve_count.store(64, Ordering::SeqCst);
+        for index in 0..executor.configured_max_concurrent() {
+            executor
+                .lifecycle_slots
+                .occupy_now(&format!("resolving-{index}"), SlotPhase::Merge)
+                .await;
+        }
     }
     seed_failed_blocker(&mut executor, "b", "a");
 
