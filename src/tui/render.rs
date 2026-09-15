@@ -7603,8 +7603,9 @@ mod tests {
         app
     }
 
-    /// Wide enough that the Changes title renders every hint it composed.
-    const DISMISSAL_WIDTH: u16 = 180;
+    /// An ordinary terminal width: the hints must survive clipping here, not
+    /// only on an unusually wide screen.
+    const DISMISSAL_WIDTH: u16 = 120;
 
     #[test]
     fn a_focused_merged_row_advertises_both_dismissal_hints() {

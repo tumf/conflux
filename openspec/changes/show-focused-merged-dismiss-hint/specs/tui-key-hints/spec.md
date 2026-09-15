@@ -6,7 +6,7 @@ The local TUI Changes panel SHALL render `d: dismiss` only when the focused row'
 
 The hints SHALL use the existing Changes-panel title composition, text styling, border, and clipping behavior. They MUST remain distinct from the Worktrees-view `d`/`D` delete action and MUST NOT alter existing mark, run, resolve, kill, edit, log, QR, or app-level controls.
 
-#### Scenario: focused merged row advertises visible individual dismissal
+#### Scenario: focused merged row advertises individual dismissal
 
 - **GIVEN** the cursor is on a visible `merged` row in the Changes view
 - **WHEN** key hints are rendered at a 120-column terminal width
