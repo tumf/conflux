@@ -377,15 +377,16 @@ The Changes panel SHALL display an `Enter: details` key hint when the cursor is 
 
 ### Requirement: Merged-row dismissal hints are context-aware
 
-The local TUI Changes panel SHALL render `d: dismiss` only when the focused row's current display status is exactly `merged`. It SHALL render `D: dismiss all merged` whenever at least one row in the current Changes-list projection has display status exactly `merged`, regardless of the focused row's status or scroll position. In this requirement, "visible" means present in the current Changes-list projection, not limited to the terminal viewport. The TUI SHALL NOT advertise either action when its corresponding target set is empty.
+The local TUI Changes panel SHALL render `d: dismiss` only when the focused row's current display status is exactly `merged`. The focused-row hint SHALL remain visible in the rendered Changes title at an ordinary 120-column terminal width in both Select and Running modes. It SHALL render `D: dismiss all merged` whenever at least one row in the current Changes-list projection has display status exactly `merged`, regardless of the focused row's status or scroll position. In this requirement, "visible row" means present in the current Changes-list projection, not limited to the terminal viewport. The TUI SHALL NOT advertise either action when its corresponding target set is empty.
 
 The hints SHALL use the existing Changes-panel title composition, text styling, border, and clipping behavior. They MUST remain distinct from the Worktrees-view `d`/`D` delete action and MUST NOT alter existing mark, run, resolve, kill, edit, log, QR, or app-level controls.
 
 #### Scenario: focused merged row advertises individual dismissal
 
 - **GIVEN** the cursor is on a visible `merged` row in the Changes view
-- **WHEN** key hints are rendered
-- **THEN** the Changes panel shows `d: dismiss`
+- **WHEN** key hints are rendered at a 120-column terminal width
+- **THEN** the rendered Changes title visibly contains `d: dismiss`
+- **AND** the result is the same in Select and Running modes
 
 #### Scenario: any visible merged row advertises bulk dismissal
 
@@ -405,6 +406,7 @@ The hints SHALL use the existing Changes-panel title composition, text styling, 
 - **GIVEN** the TUI is in Running mode with at least one visible `merged` row
 - **WHEN** dismissal hints are rendered
 - **THEN** the same target-dependent hints are shown as in Select mode
+- **AND** the eligible focused-row `d: dismiss` hint remains visible at 120 columns
 - **AND** existing app-level run and stop controls are unchanged
 
 #### Scenario: worktree deletion remains distinct
