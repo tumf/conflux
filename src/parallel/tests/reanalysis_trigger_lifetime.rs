@@ -17,6 +17,7 @@ use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
 use crate::parallel::dynamic_queue::ReanalysisReason;
+use crate::parallel::lifecycle_slots::SlotPhase;
 use crate::parallel::queue_state::ReanalysisDispatchContext;
 use crate::parallel::{
     MergeResult, MergeResultOrigin, MergeTaskOutcome, ParallelExecutor, WorkspaceResult,
@@ -30,7 +31,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 /// The scheduler's ordinary debounce timer branch duration.
@@ -120,7 +120,6 @@ struct SchedulerLoopHarness {
     in_flight: HashSet<String>,
     join_set: JoinSet<WorkspaceResult>,
     cleanup_guard: WorkspaceCleanupGuard,
-    semaphore: Arc<Semaphore>,
     reanalysis_reason: ReanalysisReason,
     iteration: u32,
     max_parallelism: usize,
@@ -148,7 +147,6 @@ impl SchedulerLoopHarness {
             in_flight: HashSet::new(),
             join_set: JoinSet::new(),
             cleanup_guard: WorkspaceCleanupGuard::new(VcsBackend::Git, repo_root),
-            semaphore: Arc::new(Semaphore::new(1)),
             reanalysis_reason: ReanalysisReason::Initial,
             // Iteration 1 unconditionally skips debounce, so trigger-lifetime tests
             // start where the live scheduler already ran its first analysis.
@@ -199,14 +197,31 @@ impl SchedulerLoopHarness {
         self.dispatch_blocked.store(false, Ordering::SeqCst);
     }
 
-    /// Occupy every dispatch slot, as an active manual resolve does.
+    /// Occupy every dispatch slot, as admitted changes resolving on the
+    /// base-mutating lane do.
     ///
     /// Genuine zero capacity, which now gates the analyzer too — use it only
     /// where that gate is the subject, not as a way to keep dispatch quiet.
-    fn occupy_all_capacity(&mut self) -> Arc<AtomicUsize> {
-        let counter = Arc::new(AtomicUsize::new(self.max_parallelism));
-        self.executor.set_manual_resolve_counter(counter.clone());
-        counter
+    /// Occupancy is expressed as admitted changes because that membership, not
+    /// a bare phase counter, is what admission is computed from.
+    async fn occupy_all_capacity(&mut self) -> Vec<String> {
+        let mut occupants = Vec::new();
+        for index in 0..self.max_parallelism {
+            let change_id = format!("resolving-{index}");
+            self.executor
+                .lifecycle_slots
+                .occupy_now(&change_id, SlotPhase::Merge)
+                .await;
+            occupants.push(change_id);
+        }
+        occupants
+    }
+
+    /// Settle the occupying changes, as a completed merge does.
+    fn release_capacity(&mut self, occupants: &[String]) {
+        for change_id in occupants {
+            self.executor.lifecycle_slots.release(change_id);
+        }
     }
 
     /// One scheduler loop iteration's queued re-analysis/dispatch evaluation, including
@@ -225,7 +240,6 @@ impl SchedulerLoopHarness {
                     iteration: self.iteration,
                     reanalysis_reason: self.reanalysis_reason,
                     analyzer,
-                    semaphore: self.semaphore.clone(),
                     join_set: &mut self.join_set,
                     cleanup_guard: &mut self.cleanup_guard,
                     work_snapshot: None,
@@ -486,7 +500,7 @@ async fn second_completion_edge_rearms_analysis_and_capacity_recovery_dispatches
     );
     let analyzer = harness.analyzer();
     harness.arm_queue_debounce().await;
-    let resolve_counter = harness.occupy_all_capacity();
+    let occupants = harness.occupy_all_capacity().await;
 
     harness.deliver_edge(ReanalysisReason::ResolveCompletion);
     harness.run_loop_iteration(&analyzer).await;
@@ -511,7 +525,7 @@ async fn second_completion_edge_rearms_analysis_and_capacity_recovery_dispatches
 
     // A later completion releases the occupied slot and wakes the scheduler with a new
     // edge; no queue addition or user action is involved.
-    resolve_counter.store(0, Ordering::SeqCst);
+    harness.release_capacity(&occupants);
     harness.deliver_edge(ReanalysisReason::ResolveCompletion);
     let (should_break, iteration) = harness
         .run_loop_iteration(&analyzer)

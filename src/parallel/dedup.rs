@@ -24,6 +24,14 @@ pub(crate) enum DiagnosticDeduplicationKey {
         order: Vec<String>,
         queued_len: usize,
         in_flight_len: usize,
+        /// Change IDs owning a lifecycle slot when capacity was zero.
+        ///
+        /// Part of the key, not only of the message: a change that finished
+        /// archive and is now merging leaves the in-flight set without freeing
+        /// its slot, so without this an operator would see one stale "dispatch
+        /// suppressed" line and no later one naming who actually holds the
+        /// capacity.
+        lifecycle_occupancy: Vec<String>,
         max_parallelism: usize,
         reason: String,
     },

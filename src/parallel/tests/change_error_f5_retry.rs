@@ -40,7 +40,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 
 /// The change the runtime limit terminated.
@@ -139,7 +139,6 @@ struct Harness {
     in_flight: HashSet<String>,
     join_set: JoinSet<WorkspaceResult>,
     cleanup_guard: WorkspaceCleanupGuard,
-    semaphore: Arc<Semaphore>,
     reanalysis_reason: ReanalysisReason,
     iteration: u32,
     max_parallelism: usize,
@@ -205,7 +204,6 @@ impl Harness {
                 VcsBackend::Git,
                 repo_dir.path().to_path_buf(),
             ),
-            semaphore: Arc::new(Semaphore::new(max_parallelism)),
             reanalysis_reason: ReanalysisReason::Initial,
             // Iteration 1 unconditionally skips debounce; start where a live
             // scheduler has already run its first analysis.
@@ -327,7 +325,6 @@ impl Harness {
                     iteration: self.iteration,
                     reanalysis_reason: self.reanalysis_reason,
                     analyzer,
-                    semaphore: self.semaphore.clone(),
                     join_set: &mut self.join_set,
                     cleanup_guard: &mut self.cleanup_guard,
                     work_snapshot: None,
@@ -384,6 +381,12 @@ impl Harness {
         self.join_set.abort_all();
         while self.join_set.join_next().await.is_some() {}
         self.in_flight.remove(change_id);
+        // An invocation that returns with nothing left to integrate ends the
+        // admitted lifecycle, so `handle_workspace_completion` releases its
+        // slot. This harness settles the task by hand and must release the same
+        // capacity, or the change would keep occupying the slot it was admitted
+        // with while sitting in the queue.
+        self.executor.lifecycle_slots.release(change_id);
         if !self.queued.iter().any(|change| change.id == change_id) {
             let candidate = self.catalog_candidate(change_id);
             self.queued.push(candidate);

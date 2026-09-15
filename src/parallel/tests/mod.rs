@@ -23,6 +23,8 @@ mod failed_dependency;
 #[cfg(test)]
 mod idle_parallel_stop;
 #[cfg(test)]
+mod lifecycle_slot_ownership;
+#[cfg(test)]
 mod manual_resolve;
 #[cfg(test)]
 mod manual_resolve_continuation;

@@ -5,18 +5,15 @@ use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
 use crate::parallel::dynamic_queue::ReanalysisReason;
+use crate::parallel::lifecycle_slots::SlotPhase;
 use crate::parallel::queue_state::ReanalysisDispatchContext;
 use crate::parallel::{ParallelExecutor, SchedulerLifetime, WorkspaceResult};
 use crate::tui::queue::DynamicQueue;
 use crate::vcs::VcsBackend;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::{atomic::AtomicUsize, Arc};
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 /// Wire the reducer the way production does before a dynamic queue push.
@@ -38,7 +35,7 @@ fn shared_state_with_queue_intent(
 }
 
 #[tokio::test]
-async fn test_manual_resolve_counter_reduces_available_slots() {
+async fn test_manual_resolve_counter_tracks_active_resolves() {
     // Create a temporary directory for the test repository
     let temp_dir = TempDir::new().unwrap();
     let repo_root = temp_dir.path().to_path_buf();
@@ -72,9 +69,9 @@ async fn test_manual_resolve_counter_reduces_available_slots() {
         "Manual resolve counter should be 1 after increment"
     );
 
-    // The available_slots calculation in execute_with_order_based_reanalysis should now be:
-    // max_parallelism (4) - in_flight (0) - manual_resolve_count (1) = 3
-    // This is tested implicitly by the slot calculation logic in the executor
+    // The counter is observability only. Dispatch capacity comes from
+    // lifecycle-slot membership, and a manual resolve runs inside the slot its
+    // change already owns — see `parallel::tests::lifecycle_slot_ownership`.
 
     // Simulate resolve completing
     manual_resolve_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -88,7 +85,7 @@ async fn test_manual_resolve_counter_reduces_available_slots() {
 }
 
 #[tokio::test]
-async fn test_multiple_manual_resolves_consume_multiple_slots() {
+async fn test_multiple_manual_resolves_are_tracked_independently() {
     // Create a temporary directory for the test repository
     let temp_dir = TempDir::new().unwrap();
     let repo_root = temp_dir.path().to_path_buf();
@@ -113,8 +110,8 @@ async fn test_multiple_manual_resolves_consume_multiple_slots() {
         "Manual resolve counter should be 2 for concurrent resolves"
     );
 
-    // If max_parallelism is 4, available_slots should now be:
-    // 4 - 0 (in_flight) - 2 (manual_resolve_count) = 2
+    // Two resolves means two admitted changes, each already counted once by the
+    // lifecycle slot it owns; the counter itself subtracts no capacity.
 
     // Simulate first resolve completing
     manual_resolve_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -267,12 +264,17 @@ async fn test_manual_resolve_zero_capacity_gates_analysis_and_apply_dispatch() {
         create_test_config(),
         Some(tx),
     );
+    // A manual resolve runs inside the lifecycle slot its change already owns,
+    // so the occupancy that gates this pass is that admitted change.
     let manual_resolve_counter = Arc::new(AtomicUsize::new(1));
     executor.set_manual_resolve_counter(manual_resolve_counter);
+    executor
+        .lifecycle_slots
+        .occupy_now("resolving-change", SlotPhase::Retained)
+        .await;
 
     let mut queued = vec![test_change("queued-apply")];
     let mut in_flight = HashSet::new();
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard =
         WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
@@ -285,7 +287,6 @@ async fn test_manual_resolve_zero_capacity_gates_analysis_and_apply_dispatch() {
             iteration: 1,
             reanalysis_reason: ReanalysisReason::ResolveCompletion,
             analyzer: &analysis_result,
-            semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
             work_snapshot: None,
@@ -345,7 +346,6 @@ async fn repeated_capacity_zero_never_starts_analysis() {
 
     let mut queued = vec![test_change("queued-apply")];
     let mut in_flight = HashSet::from(["active-apply".to_string()]);
-    let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
     let mut cleanup_guard =
         WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
@@ -359,7 +359,6 @@ async fn repeated_capacity_zero_never_starts_analysis() {
                 iteration,
                 reanalysis_reason: ReanalysisReason::ResolveCompletion,
                 analyzer: &analysis_result,
-                semaphore: semaphore.clone(),
                 join_set: &mut join_set,
                 cleanup_guard: &mut cleanup_guard,
                 work_snapshot: None,
@@ -422,7 +421,6 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
     let dynamic_queue = Arc::new(DynamicQueue::new());
 
     let cancel_token = tokio_util::sync::CancellationToken::new();
-    let gated_resolve_counter = Arc::new(AtomicUsize::new(4));
 
     let mut executor = ParallelExecutor::new(
         temp_dir.path().to_path_buf(),
@@ -432,7 +430,16 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
     executor.set_cancel_token(cancel_token.clone());
     executor.set_dynamic_queue(dynamic_queue.clone());
     executor.set_scheduler_lifetime(SchedulerLifetime::Persistent);
-    executor.set_manual_resolve_counter(gated_resolve_counter.clone());
+    executor.set_manual_resolve_counter(Arc::new(AtomicUsize::new(1)));
+    // The gate is admitted-change occupancy, held for the whole run: every
+    // configured slot belongs to a change parked in manual resolution, so no
+    // capacity can appear while the loop runs.
+    for index in 0..executor.configured_max_concurrent() {
+        executor
+            .lifecycle_slots
+            .occupy_now(&format!("gated-resolve-{index}"), SlotPhase::Retained)
+            .await;
+    }
     executor.set_shared_orchestrator_state(shared_state_with_queue_intent(&[
         seed_change_id,
         synthetic_change_id,
@@ -479,12 +486,6 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
     .await
     .expect("scheduler loop should ingest and analyze bounded dynamic work");
 
-    assert!(
-        gated_resolve_counter.load(Ordering::SeqCst) > 0,
-        "controllable resolve gate must still be held when the capacity diagnostic fires"
-    );
-
-    gated_resolve_counter.store(0, Ordering::SeqCst);
     cancel_token.cancel();
     let _ = tokio::time::timeout(std::time::Duration::from_millis(500), scheduler)
         .await

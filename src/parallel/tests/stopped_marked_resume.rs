@@ -45,7 +45,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 
 /// The force-stopped change whose mark the operator preserved.
@@ -137,7 +137,6 @@ struct Harness {
     in_flight: HashSet<String>,
     join_set: JoinSet<WorkspaceResult>,
     cleanup_guard: WorkspaceCleanupGuard,
-    semaphore: Arc<Semaphore>,
     reanalysis_reason: ReanalysisReason,
     iteration: u32,
     max_parallelism: usize,
@@ -200,7 +199,6 @@ impl Harness {
                 VcsBackend::Git,
                 repo_dir.path().to_path_buf(),
             ),
-            semaphore: Arc::new(Semaphore::new(max_parallelism)),
             reanalysis_reason: ReanalysisReason::Initial,
             // Iteration 1 unconditionally skips debounce; start where a live
             // scheduler has already run its first analysis, so every analysis
@@ -275,7 +273,6 @@ impl Harness {
                     iteration: self.iteration,
                     reanalysis_reason: self.reanalysis_reason,
                     analyzer,
-                    semaphore: self.semaphore.clone(),
                     join_set: &mut self.join_set,
                     cleanup_guard: &mut self.cleanup_guard,
                     work_snapshot: None,

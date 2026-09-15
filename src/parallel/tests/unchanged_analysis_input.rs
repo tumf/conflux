@@ -36,7 +36,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 /// The scheduler's ordinary debounce timer branch duration.
@@ -333,7 +332,6 @@ struct SuppressionHarness {
     in_flight: HashSet<String>,
     join_set: JoinSet<WorkspaceResult>,
     cleanup_guard: WorkspaceCleanupGuard,
-    semaphore: Arc<Semaphore>,
     reanalysis_reason: ReanalysisReason,
     iteration: u32,
     max_parallelism: usize,
@@ -365,7 +363,6 @@ impl SuppressionHarness {
             in_flight: HashSet::new(),
             join_set: JoinSet::new(),
             cleanup_guard: WorkspaceCleanupGuard::new(VcsBackend::Git, repo_root),
-            semaphore: Arc::new(Semaphore::new(max_parallelism)),
             reanalysis_reason: ReanalysisReason::Initial,
             // Iteration 1 unconditionally skips debounce, so these tests start where the live
             // scheduler already ran its first analysis.
@@ -443,7 +440,6 @@ impl SuppressionHarness {
                     iteration: self.iteration,
                     reanalysis_reason: self.reanalysis_reason,
                     analyzer,
-                    semaphore: self.semaphore.clone(),
                     join_set: &mut self.join_set,
                     cleanup_guard: &mut self.cleanup_guard,
                     work_snapshot: None,

@@ -1879,6 +1879,25 @@ impl OrchestratorState {
             .collect()
     }
 
+    /// Change IDs whose admitted lifecycle has settled.
+    ///
+    /// The scheduler's concurrency accounting gives one admitted change one slot
+    /// from workspace admission through merge and resolve settlement, so it needs
+    /// a single vocabulary for "this lifecycle is over": merged, pushed,
+    /// rejected, a terminal error awaiting explicit retry, and an explicit
+    /// stop/dequeue are all settlements that release the slot.
+    ///
+    /// Deliberately positive evidence only. Absence of wait or queue intent is
+    /// not settlement — a change between archive and background merge carries
+    /// neither — so nothing here is derived from what a row is *not*.
+    pub fn settled_lifecycle_change_ids(&self) -> HashSet<String> {
+        self.change_runtime
+            .iter()
+            .filter(|(_, rt)| rt.is_terminal())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Set form of [`Self::is_terminal_error_change`].
     pub fn terminal_error_change_ids(&self) -> HashSet<String> {
         self.change_runtime

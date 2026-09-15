@@ -23,6 +23,7 @@ mod dispatch;
 mod dynamic_queue;
 mod events;
 mod executor;
+mod lifecycle_slots;
 mod manual_continuation;
 mod merge;
 mod orchestration;
@@ -266,9 +267,33 @@ pub struct ParallelExecutor {
     /// Active-run memory only: a restart starts from zero and re-derives routing
     /// from workspace and Git evidence.
     apply_budget: crate::execution::apply::ApplyBudget,
+    /// The authoritative lifecycle-slot membership for this scheduler.
+    ///
+    /// One admitted change owns one slot continuously, from just before
+    /// workspace preparation until repository-visible settlement — merged,
+    /// terminal error, rejected, explicit dequeue, or the configured
+    /// push/publication terminal settlement. Apply/acceptance/archive
+    /// completion, spawning a background merge, detecting a conflict, starting
+    /// a resolve, and entering `merge wait` all *transfer* the slot rather than
+    /// release it, which is what keeps a queued change from taking capacity that
+    /// is still owned.
+    ///
+    /// Ephemeral process-local state: nothing is persisted, and a restart
+    /// reconstructs occupancy from workspace, Git, and reducer evidence
+    /// (`openspec/CONSTITUTION.md`, law 1).
+    lifecycle_slots: lifecycle_slots::LifecycleSlots,
     /// Counter for active manual resolve operations (TUI mode)
+    ///
+    /// Observability and base-lane serialization only. It must never subtract
+    /// dispatch capacity: a manual resolve runs inside the lifecycle slot its
+    /// change already owns, so subtracting it as well would double-count one
+    /// admitted change.
     manual_resolve_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Counter for active automatic resolve operations
+    ///
+    /// Observability and base-lane serialization only, for the same reason as
+    /// `manual_resolve_count`: an automatic resolve runs inside the background
+    /// merge of a change that already owns its lifecycle slot.
     auto_resolve_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Counter for background merge tasks that have been spawned but not yet handled by scheduler.
     pending_merge_count: Arc<std::sync::atomic::AtomicUsize>,

@@ -21,7 +21,7 @@ use crate::parallel::analysis_signature::{
     AnalysisInputSignature, BoundedAnalysisRetry, BoundedRetryCause, CompletedAnalysisInput,
 };
 use crate::parallel::dedup::DiagnosticDeduplicationKey;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
@@ -238,6 +238,7 @@ use super::dependency::{DependencyContext, EffectiveDependencyBaseEvidence};
 use super::dispatch::archived_dirty_repair_candidate_from_workspace;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
+use super::lifecycle_slots::{merge_result_transition, workspace_completion_transition};
 use super::manual_continuation::ManualContinuationAuthorization;
 use super::merge::base_dirty_reason;
 use super::work_snapshot::ReducerWorkSnapshot;
@@ -260,7 +261,6 @@ pub(super) struct ReanalysisDispatchContext<'a, F> {
     pub iteration: u32,
     pub reanalysis_reason: ReanalysisReason,
     pub analyzer: &'a F,
-    pub semaphore: Arc<Semaphore>,
     pub join_set: &'a mut JoinSet<WorkspaceResult>,
     pub cleanup_guard: &'a mut WorkspaceCleanupGuard,
 }
@@ -388,7 +388,6 @@ struct DispatchSelectedCandidatesContext<'a> {
     iteration: u32,
     analysis_result: &'a AnalysisResult,
     available_slots: usize,
-    semaphore: Arc<Semaphore>,
     join_set: &'a mut JoinSet<WorkspaceResult>,
     cleanup_guard: &'a mut WorkspaceCleanupGuard,
 }
@@ -872,14 +871,10 @@ impl ParallelExecutor {
             .await
     }
 
-    /// Calculate available execution slots accounting for in-flight changes and resolves.
+    /// Number of manual resolve operations a frontend reports as running.
     ///
-    /// # Arguments
-    /// * `max_parallelism` - Maximum number of concurrent slots
-    /// * `in_flight` - Set of currently executing changes
-    ///
-    /// # Returns
-    /// Number of available slots for new dispatches
+    /// Observability and drain evidence only. It is deliberately *not* a
+    /// capacity input: see [`Self::calculate_available_slots`].
     pub(super) fn manual_resolve_active(&self) -> usize {
         self.manual_resolve_count
             .as_ref()
@@ -887,20 +882,89 @@ impl ParallelExecutor {
             .unwrap_or(0)
     }
 
+    /// Calculate available execution slots from unique lifecycle occupancy.
+    ///
+    /// Occupancy is the union of the caller's in-flight set and the lifecycle
+    /// membership, deduplicated by change ID, so one admitted change counts
+    /// exactly once no matter how many of its phases are observable at the same
+    /// instant. That union — not the two sets separately — is why apply,
+    /// acceptance, archive, background merge, automatic resolve, manual resolve,
+    /// and a retained `merge wait` cannot add up to more than
+    /// `max_concurrent_workspaces`.
+    ///
+    /// The resolve counters are *not* subtracted any more. A resolve runs inside
+    /// the lifecycle slot its change already owns, so subtracting it as well
+    /// double-counted one admitted change and, worse, reserved nothing at all
+    /// for the conflict-free background merge that owns most of the interval.
+    ///
+    /// Retained occupancy the scheduler could not reserve a permit for fails
+    /// closed: capacity is reported as zero until the ambiguity is resolved,
+    /// because admitting on unproven occupancy is exactly the overrun this
+    /// accounting exists to prevent.
     pub(super) fn calculate_available_slots(
         &self,
         max_parallelism: usize,
         in_flight: &HashSet<String>,
     ) -> usize {
-        let manual_resolve_count = self.manual_resolve_active();
-        let auto_resolve_count = self
-            .auto_resolve_count
-            .load(std::sync::atomic::Ordering::Relaxed);
+        self.lifecycle_slots.available(max_parallelism, in_flight)
+    }
 
-        max_parallelism
-            .saturating_sub(in_flight.len())
-            .saturating_sub(manual_resolve_count)
-            .saturating_sub(auto_resolve_count)
+    /// Reconstruct and settle lifecycle occupancy for reducer-visible waits.
+    ///
+    /// Two directions, both driven by evidence rather than by a durable lease:
+    ///
+    /// - a change the reducer reports in `merge wait`, `resolve pending`, or
+    ///   `reject pending` that owns no slot takes one now. This is what makes a
+    ///   process restart reconstruct retained occupancy from workspace, Git, and
+    ///   reducer evidence, and what stops a wait this process never dispatched
+    ///   from being admitted around;
+    /// - a retained slot whose change reached terminal settlement, or which has
+    ///   demonstrably left the wait it was confirmed in, is released once.
+    ///
+    /// Only retained-phase slots are released here. A workspace task and
+    /// a background merge each own their own release edge and always reach it,
+    /// so reconciliation must never race them for a change that is still
+    /// executing.
+    ///
+    /// An incomplete reducer view is no evidence at all and changes nothing.
+    pub(super) fn reconcile_retained_lifecycle_slots(&mut self, snapshot: &ReducerWorkSnapshot) {
+        if !snapshot.reducer_present() || !snapshot.is_complete() {
+            return;
+        }
+
+        let retained: HashSet<String> = snapshot
+            .merge_wait_ids()
+            .iter()
+            .chain(snapshot.resolve_wait_ids())
+            .chain(snapshot.reject_wait_ids())
+            .cloned()
+            .collect();
+
+        let report = self.lifecycle_slots.reconcile_retained(
+            &retained,
+            snapshot.active_ids(),
+            snapshot.settled_ids(),
+        );
+
+        if !report.reserved.is_empty() {
+            info!(
+                changes = ?report.reserved,
+                "Reconstructed lifecycle slot occupancy for retained base-lane waits"
+            );
+        }
+        if !report.unavailable.is_empty() {
+            warn!(
+                changes = ?report.unavailable,
+                "Retained base-lane waits could not reserve a lifecycle slot; \
+                 suppressing new dispatch until occupancy is provable"
+            );
+        }
+        if !report.released.is_empty() {
+            info!(
+                changes = ?report.released,
+                "Released the lifecycle slots of settled retained changes"
+            );
+        }
     }
 
     /// Classify queued candidates against the ephemeral failed-change tracker.
@@ -1194,6 +1258,16 @@ impl ParallelExecutor {
     ///
     /// This processes success/failure, attempts merge if archived, and triggers cleanup.
     ///
+    /// # Lifecycle slot
+    ///
+    /// The returning task does not end the change's admitted lifecycle, so its
+    /// slot is *transferred* here rather than released: a successful archive
+    /// hands it to background merge handling, and only a terminal error, a
+    /// rejection, or a completion with nothing left to merge releases it. The
+    /// transfer happens before `in_flight` membership is dropped and before the
+    /// merge task is spawned, so no interleaving leaves the change owning zero
+    /// slots.
+    ///
     /// # Arguments
     /// * `workspace_result` - Result from completed workspace task
     /// * `max_parallelism` - Maximum parallelism for logging
@@ -1206,6 +1280,18 @@ impl ParallelExecutor {
         in_flight: &mut HashSet<String>,
         merge_result_tx: &mpsc::Sender<MergeResult>,
     ) {
+        // Decide the slot's next owner *before* the change leaves `in_flight`,
+        // so capacity is never computed from a moment where neither the
+        // in-flight set nor the lifecycle phase accounts for this change.
+        self.lifecycle_slots.apply_transition(
+            &workspace_result.change_id,
+            workspace_completion_transition(
+                workspace_result.error.is_some(),
+                workspace_result.rejected.is_some(),
+                workspace_result.final_revision.is_some(),
+            ),
+        );
+
         // Remove from in-flight
         in_flight.remove(&workspace_result.change_id);
 
@@ -1231,10 +1317,11 @@ impl ParallelExecutor {
         }
 
         info!(
-            "Task completed: change='{}', in_flight={}, available_slots={}, error={:?}",
+            "Task completed: change='{}', in_flight={}, available_slots={}, lifecycle_slots={}, error={:?}",
             workspace_result.change_id,
             in_flight.len(),
-            max_parallelism.saturating_sub(in_flight.len()),
+            self.calculate_available_slots(max_parallelism, in_flight),
+            self.lifecycle_slots.len(),
             workspace_result.error
         );
 
@@ -1432,6 +1519,29 @@ impl ParallelExecutor {
         self.pending_merge_count.fetch_sub(1, Ordering::Relaxed);
 
         let disposition = merge_result.outcome.disposition();
+
+        // Lifecycle-slot settlement, decided by the same outcome the disposition
+        // is: a completed merge ends the admitted lifecycle and releases the
+        // slot once, while every non-merged outcome leaves the change admitted —
+        // deferred for scheduler-owned retry, exhausted into `merge wait`, or
+        // waiting for an operator. Retaining there is the backpressure that
+        // stops a newer, more divergent worktree from taking the slot of work
+        // that has not settled.
+        //
+        // A run-fatal outcome is the exception: the loop is about to drain and
+        // fail, and its exit clears every slot this run owned.
+        if self.lifecycle_slots.apply_transition(
+            &merge_result.change_id,
+            merge_result_transition(
+                disposition.is_merged(),
+                matches!(merge_result.outcome, MergeTaskOutcome::RunFatal { .. }),
+            ),
+        ) {
+            info!(
+                change_id = %merge_result.change_id,
+                "Released the lifecycle slot after merge settlement"
+            );
+        }
 
         // Lane release for spawned retries happens for every non-merged outcome,
         // ahead of the disposition-specific handling below. The merged path
@@ -3586,6 +3696,7 @@ impl ParallelExecutor {
     fn capacity_zero_dispatch_diagnostic(
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
+        lifecycle_occupancy: &HashSet<String>,
         max_parallelism: usize,
         analysis_order: &[String],
     ) -> (DiagnosticDeduplicationKey, LogEntry) {
@@ -3602,16 +3713,23 @@ impl ParallelExecutor {
         };
         let queued_len = queued.len();
         let in_flight_len = in_flight.len();
+        let mut occupancy: Vec<String> = lifecycle_occupancy.iter().cloned().collect();
+        occupancy.sort();
         let key = DiagnosticDeduplicationKey::DispatchCapacityZero {
             order,
             queued_len,
             in_flight_len,
+            lifecycle_occupancy: occupancy.clone(),
             max_parallelism,
             reason: REASON.to_string(),
         };
+        // The occupancy list is the answer to the operator's actual question at
+        // zero capacity: which admitted changes own the slots. A change that is
+        // merging or waiting for manual resolution is not in flight, so
+        // `in_flight` alone reads as "nothing is running, yet nothing starts".
         let log_entry = LogEntry::info(format!(
-            "Dispatch suppressed after dependency analysis: reason={}, local_queued={}, in_flight={}, max_parallelism={}",
-            REASON, queued_len, in_flight_len, max_parallelism
+            "Dispatch suppressed after dependency analysis: reason={}, local_queued={}, in_flight={}, lifecycle_slots={:?}, max_parallelism={}",
+            REASON, queued_len, in_flight_len, occupancy, max_parallelism
         ));
         (key, log_entry)
     }
@@ -3659,9 +3777,16 @@ impl ParallelExecutor {
         max_parallelism: usize,
         analysis_order: &[String],
     ) {
+        let occupancy: HashSet<String> = self
+            .lifecycle_slots
+            .members()
+            .union(in_flight)
+            .cloned()
+            .collect();
         let (key, log_entry) = Self::capacity_zero_dispatch_diagnostic(
             queued,
             in_flight,
+            &occupancy,
             max_parallelism,
             analysis_order,
         );
@@ -4413,7 +4538,6 @@ impl ParallelExecutor {
             iteration,
             analysis_result,
             available_slots,
-            semaphore,
             join_set,
             cleanup_guard,
         } = ctx;
@@ -4450,7 +4574,6 @@ impl ParallelExecutor {
                 .dispatch_change_to_workspace(
                     change_id.clone(),
                     base_revision.clone(),
-                    semaphore.clone(),
                     join_set,
                     in_flight,
                     cleanup_guard,
@@ -4642,11 +4765,15 @@ impl ParallelExecutor {
             iteration,
             reanalysis_reason,
             analyzer,
-            semaphore,
             join_set,
             cleanup_guard,
             work_snapshot,
         } = ctx;
+
+        // The evaluation's own limit is the ceiling admission must enforce, so a
+        // scheduler configured above this executor's construction-time limit
+        // grows the slot ceiling rather than silently capping dispatch.
+        self.lifecycle_slots.ensure_capacity(max_parallelism);
 
         // Per-pass, and cleared before anything can set it: a stale flag from an
         // earlier evaluation would preserve an edge this pass really did consume.
@@ -4725,7 +4852,6 @@ impl ParallelExecutor {
                 iteration,
                 analysis_result: &analysis_result,
                 available_slots,
-                semaphore,
                 join_set,
                 cleanup_guard,
             })
