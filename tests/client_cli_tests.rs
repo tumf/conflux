@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Process-boundary tests for the `cflx client` namespace.
 //!
 //! Everything here drives the **compiled binary** against a **real `/api/v2`

@@ -56,19 +56,19 @@ use clap::CommandFactory;
 
 #[cfg(feature = "web-monitoring")]
 pub mod completion;
-#[cfg(feature = "web-monitoring")]
+#[cfg(all(unix, feature = "web-monitoring"))]
 pub mod control;
-#[cfg(feature = "web-monitoring")]
+#[cfg(all(unix, feature = "web-monitoring"))]
 pub mod mcp;
 #[cfg(feature = "web-monitoring")]
 pub mod repo;
-#[cfg(feature = "web-monitoring")]
+#[cfg(all(unix, feature = "web-monitoring"))]
 mod session;
-#[cfg(feature = "web-monitoring")]
+#[cfg(all(unix, feature = "web-monitoring"))]
 pub mod subscribe;
-#[cfg(feature = "web-monitoring")]
+#[cfg(all(unix, feature = "web-monitoring"))]
 mod transport;
-#[cfg(feature = "web-monitoring")]
+#[cfg(all(unix, feature = "web-monitoring"))]
 mod wait;
 
 use envelope::{Operation, Outcome, ResultEnvelope};
@@ -194,7 +194,7 @@ impl RouteSelector {
 /// socket from one repository and the completion evidence from another would
 /// certify project A's archive as project B's success, which is the exact
 /// failure truthful `wait` exists to prevent.
-#[cfg(feature = "web-monitoring")]
+#[cfg(all(unix, feature = "web-monitoring"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRoute {
     /// `<git-common-dir>/cflx-api.sock` for the selected project.
@@ -213,7 +213,7 @@ pub struct ProjectRoute {
 /// working-tree root all resolve, because the common directory is derived the
 /// same way the repository lock derives it — and the lock is what guarantees
 /// there is only one default owner to reach.
-#[cfg(feature = "web-monitoring")]
+#[cfg(all(unix, feature = "web-monitoring"))]
 pub fn resolve_project(project_dir: &Path) -> Result<ProjectRoute, RouteError> {
     if !project_dir.is_absolute() {
         return Err(RouteError::new(format!(
@@ -547,11 +547,11 @@ pub async fn run(args: ClientArgs) -> i32 {
 /// no workspace write. A build that cannot speak the local API has nothing
 /// useful to attempt, and attempting anyway would leave state behind for an
 /// operation that was never going to work.
-#[cfg(not(feature = "web-monitoring"))]
+#[cfg(not(all(unix, feature = "web-monitoring")))]
 async fn execute(_args: ClientArgs, operation: Operation) -> ResultEnvelope {
     ResultEnvelope::new(operation, Outcome::FeatureUnavailable).with_message(
-        "this build has no local /api/v2 support, so it cannot reach an existing owner. \
-         Rebuild with `--features web-monitoring`",
+        "this build has no Unix-domain local /api/v2 client support, so it cannot reach an \
+         existing owner. Use a Unix build with `--features web-monitoring`",
     )
 }
 
@@ -560,7 +560,7 @@ async fn execute(_args: ClientArgs, operation: Operation) -> ResultEnvelope {
 /// The refusal is written to stderr rather than to the protocol stream: a host
 /// parsing stdout as JSON-RPC must not be handed prose, and a server that cannot
 /// serve has no frame it could honestly send.
-#[cfg(feature = "web-monitoring")]
+#[cfg(all(unix, feature = "web-monitoring"))]
 async fn serve_mcp(args: ClientArgs) -> i32 {
     // Clap already refused the two-selector conflict, so this cannot fail for
     // ambiguity; a relative `--project-dir` is still worth refusing before a
@@ -578,16 +578,16 @@ async fn serve_mcp(args: ClientArgs) -> i32 {
     mcp::run(default_route, args.auth_token_env).await
 }
 
-#[cfg(not(feature = "web-monitoring"))]
+#[cfg(not(all(unix, feature = "web-monitoring")))]
 async fn serve_mcp(_args: ClientArgs) -> i32 {
     eprintln!(
-        "cflx client mcp: this build has no local /api/v2 support, so it cannot reach an \
-         existing owner. Rebuild with `--features web-monitoring`"
+        "cflx client mcp: this build has no Unix-domain local /api/v2 client support, so it \
+         cannot reach an existing owner. Use a Unix build with `--features web-monitoring`"
     );
     Outcome::FeatureUnavailable.exit_code()
 }
 
-#[cfg(feature = "web-monitoring")]
+#[cfg(all(unix, feature = "web-monitoring"))]
 async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
     // One selector, built once, before anything is contacted. Clap enforces the
     // mutual exclusion at parse time, so reaching here with both is impossible;
