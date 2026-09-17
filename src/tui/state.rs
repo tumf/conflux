@@ -309,6 +309,23 @@ pub struct AppState {
     /// used as scheduler dispatch, resume routing, acceptance, archive, or
     /// next-action input.
     project_path: PathBuf,
+    /// Attached base branch captured once at TUI startup, as header identity.
+    ///
+    /// Private for the same reason as [`AppState::project_path`]: the header
+    /// reports the branch this process was started on, so the only way in is
+    /// [`AppState::set_base_branch`], which the runner calls with the branch it
+    /// resolved from the same `repo_root`. Rendering never re-reads Git, so a
+    /// later checkout cannot retarget the header.
+    ///
+    /// `None` when startup could not resolve an attached branch — a detached
+    /// HEAD or an unavailable branch lookup — in which case the header renders
+    /// no branch segment rather than inventing one.
+    ///
+    /// Presentation-only, process-local state. It is never persisted and never
+    /// used as scheduler dispatch, resume routing, acceptance, archive, or
+    /// next-action input; the integration base branch stays whatever the
+    /// workspace's own Git state says at the moment work runs.
+    base_branch: Option<String>,
     /// When orchestration started (for overall elapsed time)
     pub orchestration_started_at: Option<Instant>,
     /// Total elapsed time when orchestration finished
@@ -698,6 +715,7 @@ impl AppState {
             vcs_backend: "git".to_string(),
             max_concurrent: 4, // Default value, can be overridden from config
             project_path: PathBuf::new(),
+            base_branch: None,
             orchestration_started_at: None,
             orchestration_elapsed: None,
             web_url: None,
@@ -740,6 +758,29 @@ impl AppState {
     /// that case rather than inventing one.
     pub fn project_path(&self) -> &Path {
         &self.project_path
+    }
+
+    /// Adopt the startup-resolved attached branch as header identity.
+    ///
+    /// Called once by the local TUI runner with the branch it read from the
+    /// captured `repo_root`. A missing, detached, or blank result is stored as
+    /// `None`, so a whitespace-only branch name can never become an empty
+    /// `[]` segment. Nothing re-reads Git afterwards, so a later checkout in
+    /// the repository cannot retarget the header.
+    pub fn set_base_branch(&mut self, branch: Option<impl Into<String>>) {
+        self.base_branch = branch
+            .map(Into::into)
+            .map(|branch| branch.trim().to_string())
+            .filter(|branch| !branch.is_empty());
+    }
+
+    /// The captured base branch, for the header.
+    ///
+    /// `None` until the runner sets it, and `None` whenever startup could not
+    /// resolve an attached branch; the header renders no branch segment in
+    /// that case rather than inventing one.
+    pub fn base_branch(&self) -> Option<&str> {
+        self.base_branch.as_deref()
     }
 
     /// Latest workspace dirty observation, for the header badge.
@@ -2561,6 +2602,63 @@ mod tests {
             dependencies: Vec::new(),
             metadata: crate::openspec::ProposalMetadata::default(),
         }
+    }
+
+    // ========================================================================
+    // Header base branch capture (verification `tui-header-base-branch-tests`)
+    //
+    // Unit-scoped on purpose: the capture is a plain presentation field, so the
+    // runner's Git read is the only part that touches a repository and these
+    // assertions supply the resolved value directly.
+    // ========================================================================
+
+    /// Nothing is captured until the runner captures it, and what it captures
+    /// is exactly what the header reads back.
+    #[test]
+    fn header_base_branch_capture_defaults_to_unset_and_keeps_what_the_runner_supplied() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        assert_eq!(
+            app.base_branch(),
+            None,
+            "a fresh app has no branch identity to show"
+        );
+
+        app.set_base_branch(Some("main"));
+        assert_eq!(app.base_branch(), Some("main"));
+
+        // The startup capture is a value, not a live Git read: re-reading it any
+        // number of times answers the same branch.
+        assert_eq!(app.base_branch(), Some("main"));
+    }
+
+    /// An unresolved, detached, or blank startup lookup leaves the identity
+    /// unset rather than producing an empty `[]` segment.
+    #[test]
+    fn header_base_branch_capture_treats_missing_and_blank_lookups_as_unset() {
+        for blank in ["", "   ", "\n", "\t "] {
+            let mut app = AppState::new(vec![]);
+            app.set_base_branch(Some(blank));
+            assert_eq!(
+                app.base_branch(),
+                None,
+                "{blank:?} must not become a rendered branch segment"
+            );
+        }
+
+        let mut detached = AppState::new(vec![]);
+        detached.set_base_branch(Some("main"));
+        detached.set_base_branch(None::<String>);
+        assert_eq!(
+            detached.base_branch(),
+            None,
+            "an unresolved lookup clears the segment instead of guessing"
+        );
+
+        // Surrounding whitespace from a command read is presentation noise, not
+        // part of the branch name.
+        let mut padded = AppState::new(vec![]);
+        padded.set_base_branch(Some("  feature/base  "));
+        assert_eq!(padded.base_branch(), Some("feature/base"));
     }
 
     // ========================================================================

@@ -739,6 +739,13 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
     } else {
         ""
     };
+    // The startup-captured base branch, reserved as a fixed segment so the
+    // path's budget yields to it rather than the other way round. An
+    // unresolved branch contributes no segment and no reservation.
+    let branch_segment = match app.base_branch() {
+        Some(branch) => format!(" [{}]", branch),
+        None => String::new(),
+    };
 
     // Build header spans
     let mut header_spans = vec![Span::styled("Conflux", Style::default().fg(Color::White))];
@@ -767,6 +774,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         let reserved = display_width("Conflux")
             + display_width(&status_segment)
             + display_width(" ")
+            + display_width(&branch_segment)
             + display_width(dirty_segment);
         let path_budget = left_interior.saturating_sub(reserved);
         if path_budget > 0 {
@@ -778,6 +786,20 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+    }
+
+    // The base branch sits with the project path it belongs to: together they
+    // are the startup identity an operator with several instances open reads to
+    // know which repository and branch is in front of them. It is drawn from the
+    // startup capture, never from a render-time Git read.
+    if let Some(branch) = app.base_branch() {
+        header_spans.push(Span::raw(" "));
+        header_spans.push(Span::styled(
+            format!("[{}]", branch),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
 
     // Workspace dirty observation from the existing auto-refresh. Only a known
@@ -2995,6 +3017,335 @@ mod tests {
                 header.matches(MIDDLE_ELLIPSIS).count() <= 1,
                 "width {width}: at most one elision gap belongs in the header:\n{header}"
             );
+        }
+    }
+
+    // ========================================================================
+    // Header base branch (verification `tui-header-base-branch-tests`)
+    //
+    // Final-buffer assertions against a `TestBackend`: no Git, no process
+    // current directory, and no clock — the captured branch is supplied
+    // directly, exactly as the runner supplies it once at startup.
+    // ========================================================================
+
+    /// The branch every base-branch header test starts from.
+    const TEST_BASE_BRANCH: &str = "main";
+
+    /// The header row as text, with the extra cell a wide grapheme occupies
+    /// collapsed away.
+    ///
+    /// A double-width grapheme owns two buffer cells, and the backend resets
+    /// the second one to a blank placeholder. Joining raw symbols would read
+    /// `日 本 語` for a branch rendered as `日本語`, so the placeholder is
+    /// skipped by advancing over the grapheme's own column width. The result is
+    /// the text a terminal shows, and its display width is the row's width.
+    fn header_text(buffer: &Buffer) -> String {
+        let mut text = String::new();
+        let mut x = 0u16;
+        while x < buffer.area.width {
+            let symbol = buffer[(x, 1)].symbol().to_string();
+            x += display_width(&symbol).max(1) as u16;
+            text.push_str(&symbol);
+        }
+        text
+    }
+
+    /// The path segment the header actually rendered, measured between the
+    /// status label and `following_segment` — the header segment that comes
+    /// directly after the path in the case under test.
+    fn header_path_segment(header: &str, status_label: &str, following_segment: &str) -> String {
+        let after_status = header
+            .split_once(status_label)
+            .unwrap_or_else(|| panic!("{status_label:?} must render in {header:?}"))
+            .1;
+        after_status
+            .split_once(following_segment)
+            .unwrap_or_else(|| panic!("{following_segment:?} must follow the path in {header:?}"))
+            .0
+            .trim()
+            .to_string()
+    }
+
+    /// A rendered path is either the captured path in full, or a middle elision
+    /// that kept real columns from both of its ends.
+    fn assert_rendered_path_represents(source: &str, rendered: &str) {
+        if rendered == source {
+            return;
+        }
+        assert_elision_retains_source_sides(source, rendered);
+    }
+
+    /// The column the right-aligned version area starts at.
+    fn version_start_column(header: &str) -> usize {
+        header
+            .find(&crate::tui::utils::get_version_string())
+            .expect("the version area renders")
+    }
+
+    /// The captured branch follows the project path and precedes the dirty
+    /// badge, which is the order the header identity reads in.
+    #[test]
+    fn header_base_branch_renders_after_the_project_path_and_before_the_dirty_badge() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.set_base_branch(Some(TEST_BASE_BRANCH));
+        observe_workspace_dirty(&mut app, true);
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let header = header_line(&buffer);
+
+        assert!(
+            header.contains(&format!("{TEST_PROJECT_PATH} [{TEST_BASE_BRANCH}]")),
+            "the branch must follow the project path directly:\n{header}"
+        );
+
+        let branch_at = header
+            .find(&format!("[{TEST_BASE_BRANCH}]"))
+            .expect("branch segment");
+        let dirty_at = header.find("[dirty]").expect("dirty badge");
+        assert!(
+            branch_at < dirty_at,
+            "the branch must precede the dirty badge:\n{header}"
+        );
+        assert!(
+            !header.contains("[workspaces:"),
+            "the retired concurrency/backend badge must not return:\n{header}"
+        );
+
+        // Identity styling, so the branch reads as identity rather than as a
+        // warning like the dirty badge.
+        let cell = buffer
+            .cell((branch_at as u16, 1))
+            .expect("branch segment cell exists");
+        assert_eq!(cell.style().fg, Some(Color::Cyan));
+        assert!(
+            cell.style().add_modifier.contains(Modifier::BOLD),
+            "the branch segment must render bold"
+        );
+    }
+
+    /// Header branch identity is a function of the captured startup branch
+    /// alone. Rendering reads `AppState::base_branch`, whose only writer is
+    /// `set_base_branch`, so two otherwise identical apps differ in the header
+    /// by exactly their captured branches — and a later checkout, which no
+    /// render-time code path reads, cannot retarget either of them.
+    #[test]
+    fn header_base_branch_identity_comes_only_from_the_captured_startup_branch() {
+        let mut owned = create_test_app(vec![create_test_change("change-a")]);
+        owned.set_base_branch(Some("main"));
+        let mut elsewhere = create_test_app(vec![create_test_change("change-a")]);
+        elsewhere.set_base_branch(Some("release/2.0"));
+
+        let owned_header = header_line(&render_buffer(&mut owned, 120, 30));
+        let elsewhere_header = header_line(&render_buffer(&mut elsewhere, 120, 30));
+
+        assert!(
+            owned_header.contains("[main]") && !owned_header.contains("release/2.0"),
+            "only the captured branch may appear:\n{owned_header}"
+        );
+        assert!(
+            elsewhere_header.contains("[release/2.0]") && !elsewhere_header.contains("[main]"),
+            "the other app shows its own captured branch:\n{elsewhere_header}"
+        );
+
+        // Rendering is a read: repeated frames leave the capture untouched.
+        let repeated = header_line(&render_buffer(&mut owned, 120, 30));
+        assert_eq!(owned.base_branch(), Some("main"));
+        assert_eq!(
+            repeated, owned_header,
+            "a redraw must reproduce the same captured identity"
+        );
+    }
+
+    /// An unresolved startup branch renders no segment at all, and costs the
+    /// header none of its existing content.
+    #[test]
+    fn header_base_branch_absent_capture_preserves_existing_header_behavior() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        assert_eq!(app.base_branch(), None);
+        observe_workspace_dirty(&mut app, true);
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let header = header_line(&buffer);
+
+        assert!(
+            !header.contains("[]"),
+            "an unresolved branch must not render an empty segment:\n{header}"
+        );
+        assert!(
+            header.contains(TEST_PROJECT_PATH),
+            "the project path must remain visible:\n{header}"
+        );
+        assert!(
+            header.contains("[Ready]") && header.contains("[dirty]"),
+            "the existing header signals must survive:\n{header}"
+        );
+        assert!(
+            header.contains(&crate::tui::utils::get_version_string()),
+            "the right-aligned version must survive:\n{header}"
+        );
+
+        // An absent branch reserves nothing, so the elided path keeps exactly
+        // the columns the segment would otherwise have cost.
+        let long_path = "/Users/operator/very/deeply/nested/checkouts/organization/conflux";
+        let mut with_branch = create_test_app(vec![create_test_change("change-a")]);
+        with_branch.set_project_path(long_path);
+        with_branch.set_base_branch(Some("main"));
+        observe_workspace_dirty(&mut with_branch, true);
+        let mut without_branch = create_test_app(vec![create_test_change("change-a")]);
+        without_branch.set_project_path(long_path);
+        observe_workspace_dirty(&mut without_branch, true);
+
+        let with_header = header_line(&render_buffer(&mut with_branch, 80, 30));
+        let without_header = header_line(&render_buffer(&mut without_branch, 80, 30));
+        let with_path = header_path_segment(&with_header, "[Ready]", " [main]");
+        let without_path = header_path_segment(&without_header, "[Ready]", " [dirty]");
+        assert_rendered_path_represents(long_path, &with_path);
+        assert_rendered_path_represents(long_path, &without_path);
+        assert_eq!(
+            display_width(&without_path) - display_width(&with_path),
+            display_width(" [main]"),
+            "the reclaimed columns must be exactly the absent branch segment:\n\
+             with: {with_path:?}\nwithout: {without_path:?}"
+        );
+    }
+
+    /// A path wider than its budget yields columns to the branch rather than
+    /// the other way round, and the accounting is in terminal columns.
+    #[test]
+    fn header_base_branch_is_reserved_in_display_columns_before_the_path_elides() {
+        let long_path =
+            "/Users/operator/very/deeply/nested/checkouts/organization/conflux-worktrees/show-base-branch-in-tui-header";
+
+        // A one-column branch and a six-column one differ by exactly the five
+        // columns the wide segment costs. Scalar counting would report two.
+        let narrow_branch = "m";
+        let wide_branch = "日本語";
+        let mut narrow = create_test_app(vec![create_test_change("change-a")]);
+        narrow.set_project_path(long_path);
+        narrow.set_base_branch(Some(narrow_branch));
+        let mut wide = create_test_app(vec![create_test_change("change-a")]);
+        wide.set_project_path(long_path);
+        wide.set_base_branch(Some(wide_branch));
+
+        let narrow_header = header_text(&render_buffer(&mut narrow, 80, 30));
+        let wide_header = header_text(&render_buffer(&mut wide, 80, 30));
+
+        for (label, header, branch) in [
+            ("narrow", &narrow_header, narrow_branch),
+            ("wide", &wide_header, wide_branch),
+        ] {
+            assert!(
+                header.contains(&format!("[{branch}]")),
+                "{label}: the branch must stay visible while the path elides:\n{header}"
+            );
+            assert!(
+                header.contains(MIDDLE_ELLIPSIS),
+                "{label}: an over-wide path must be elided:\n{header}"
+            );
+            assert!(
+                header.contains("[Ready]")
+                    && header.contains(&crate::tui::utils::get_version_string()),
+                "{label}: the status label and version area must survive:\n{header}"
+            );
+            // Column accounting, not byte offsets: the branch segment has to
+            // end at or before the first column the version area owns.
+            let branch_start = header
+                .find(&format!("[{branch}]"))
+                .expect("branch segment offset");
+            let branch_end_column =
+                display_width(&header[..branch_start]) + display_width(&format!("[{branch}]"));
+            let version_column = display_width(&header[..version_start_column(header)]);
+            assert!(
+                branch_end_column <= version_column,
+                "{label}: the branch must not run into the version area:\n{header}"
+            );
+        }
+
+        let narrow_path =
+            header_path_segment(&narrow_header, "[Ready]", &format!(" [{narrow_branch}]"));
+        let wide_path = header_path_segment(&wide_header, "[Ready]", &format!(" [{wide_branch}]"));
+        assert_rendered_path_represents(long_path, &narrow_path);
+        assert_rendered_path_represents(long_path, &wide_path);
+        assert_eq!(
+            display_width(&narrow_path) - display_width(&wide_path),
+            display_width(wide_branch) - display_width(narrow_branch),
+            "the path budget must shrink by the branch segment's column width:\n\
+             narrow: {narrow_path:?}\nwide: {wide_path:?}"
+        );
+    }
+
+    /// The branch coexists with the running count, a modal relabel, the dirty
+    /// badge, and the right-aligned version, at narrow and wide terminals.
+    #[test]
+    fn header_base_branch_coexists_with_status_dirty_and_version_content() {
+        for width in [80, 120, 200] {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            app.set_base_branch(Some(TEST_BASE_BRANCH));
+            app.execution_mode = AppExecutionMode::Running;
+            app.changes[0].set_display_status_cache("applying");
+            observe_workspace_dirty(&mut app, true);
+
+            let buffer = render_buffer(&mut app, width, 30);
+            let header = header_line(&buffer);
+            assert!(
+                header.contains("[Running 1]"),
+                "width {width}: the running status must survive:\n{header}"
+            );
+            // Order, not literal text: a narrow terminal with the longer
+            // `Running` label elides the path, and the branch still belongs
+            // directly after whatever the path rendered as.
+            let path =
+                header_path_segment(&header, "[Running 1]", &format!(" [{TEST_BASE_BRANCH}]"));
+            assert_rendered_path_represents(TEST_PROJECT_PATH, &path);
+            assert!(
+                header.contains(&format!("[{TEST_BASE_BRANCH}] [dirty]")),
+                "width {width}: path, branch, and dirty badge must render in order:\n{header}"
+            );
+            assert!(
+                header.contains(&crate::tui::utils::get_version_string()),
+                "width {width}: the version area must still render:\n{header}"
+            );
+
+            // An overlay relabels the status; it does not take the branch away.
+            app.modal = Some(ModalState::QrPopup);
+            let header = header_line(&render_buffer(&mut app, width, 30));
+            assert!(
+                header.contains(&format!("[{TEST_BASE_BRANCH}]")),
+                "width {width}: a modal must not suppress the branch:\n{header}"
+            );
+        }
+    }
+
+    /// Narrow terminals and wide or combining-mark branch names stay bounded:
+    /// the header row fills exactly its width, keeps at most one elision gap,
+    /// and nothing panics down to a single column.
+    #[test]
+    fn header_base_branch_rendering_stays_bounded_at_narrow_widths() {
+        for branch in ["main", "日本語-branch", "ma\u{301}in"] {
+            for width in [1u16, 2, 4, 8, 12, 20, 24, 30, 40, 60] {
+                let mut app = create_test_app(vec![create_test_change("change-a")]);
+                app.set_project_path("/Users/operator/checkouts/conflux");
+                app.set_base_branch(Some(branch));
+                observe_workspace_dirty(&mut app, true);
+
+                let buffer = render_buffer(&mut app, width, 20);
+                // `header_text`, not `header_line`: a double-width grapheme
+                // leaves a blank placeholder cell behind it, and counting that
+                // placeholder would measure the row wider than the terminal it
+                // fits in.
+                let header = header_text(&buffer);
+                assert_eq!(
+                    display_width(&header),
+                    width as usize,
+                    "branch {branch:?} at width {width}: the header row must fill exactly \
+                     its terminal width:\n{header}"
+                );
+                assert!(
+                    header.matches(MIDDLE_ELLIPSIS).count() <= 1,
+                    "branch {branch:?} at width {width}: at most one elision gap belongs \
+                     in the header:\n{header}"
+                );
+            }
         }
     }
 

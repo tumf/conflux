@@ -58,6 +58,26 @@ The current production header at base revision `e0a2c8eef868aa31bc0a37d6cc77c700
 - `cargo test header_base_branch --lib` passes.
 - Archive promotion updates the canonical `TUI Header Project Identity` requirement.
 
+## Retired Scenarios
+
+- tui-architecture: TUI Header Project Identity / Header identifies the owned project
+- tui-architecture: TUI Header Project Identity / Later current-directory changes do not retarget the header
+- tui-architecture: TUI Header Project Identity / Existing header signals survive project identity replacement
+- tui-architecture: TUI Header Project Identity / Long project path is middle-elided by display width
+
+Each is retitled rather than removed: the header identity these four describe now
+includes the base branch, so the same behavior is asserted under the widened
+titles in this change's delta. `Header identifies the owned project and base
+branch` keeps the visible path and the absent concurrency/backend badge; `Later
+repository identity changes do not retarget the header` keeps the captured path
+against a later current-directory change and adds the branch; `Existing header
+signals survive branch identity addition` keeps lifecycle status, the dirty
+badge, right-aligned version, and narrow-width safety; and `Long project path
+yields width to the branch segment` keeps the single `…` between retained
+prefix and suffix, the assigned column bound, and the suffix-favoring odd-budget
+split. `Unicode and tiny budgets remain safe` keeps its title. No coverage is
+dropped.
+
 ## Out of Scope
 
 - Changing the base branch during a running TUI.
