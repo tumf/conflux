@@ -330,9 +330,41 @@ fn resolve_listener_plan(
             tcp,
         })
     }
-    // Unix-domain sockets are the only default local API surface, so a
-    // non-Unix build keeps exactly the retained `--web` behavior.
-    #[cfg(not(unix))]
+    // Windows derives its endpoint from the same canonical common directory,
+    // digested with the current user's SID because the pipe namespace is
+    // machine-global rather than filesystem-scoped.
+    #[cfg(windows)]
+    {
+        if unix_socket.is_some() {
+            return Err(
+                "--web-unix-socket names a Unix-domain socket, which Windows cannot bind. \
+                 The local API endpoint is derived from this repository; opt out with \
+                 --no-web-unix-socket if you want no local listener at all"
+                    .to_string(),
+            );
+        }
+        if no_unix_socket {
+            return Ok(web::ListenerPlan {
+                named_pipe: None,
+                tcp,
+            });
+        }
+        let workspace = std::env::current_dir()
+            .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
+        let common_dir = repo_lock::discover_common_dir(&workspace).ok_or_else(|| {
+            "the default local API endpoint needs a Git repository: run inside one, or opt out \
+             with --no-web-unix-socket"
+                .to_string()
+        })?;
+        Ok(web::ListenerPlan {
+            named_pipe: Some(web::named_pipe::default_pipe_name(&common_dir)?),
+            tcp,
+        })
+    }
+
+    // Neither local transport exists here, so the build keeps exactly the
+    // retained `--web` behavior.
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (unix_socket, no_unix_socket);
         Ok(web::ListenerPlan { tcp })

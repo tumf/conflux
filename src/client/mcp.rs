@@ -92,6 +92,33 @@ struct ConnectionArgs {
     auth_token_env: Option<String>,
 }
 
+impl ConnectionArgs {
+    /// The explicit Unix socket this call selected, where the platform has one.
+    ///
+    /// The field is deserialized everywhere because `#[serde(flatten)]` cannot
+    /// enforce `deny_unknown_fields`, so a Windows host that sent `unix_socket`
+    /// anyway would otherwise have it silently *ignored* and be routed somewhere
+    /// it did not ask for. Refusing it here makes the platform contract the
+    /// schema publishes and the platform contract the adapter enforces the same
+    /// contract.
+    #[cfg(unix)]
+    fn unix_socket_route(&self) -> Result<Option<&std::path::Path>, ToolError> {
+        Ok(self.unix_socket.as_deref())
+    }
+
+    #[cfg(not(unix))]
+    fn unix_socket_route(&self) -> Result<Option<&std::path::Path>, ToolError> {
+        match &self.unix_socket {
+            None => Ok(None),
+            Some(_) => Err(ToolError::new(
+                "unix_socket is a Unix-only low-level override and is not part of this \
+                 platform's tool contract. Name the project with an absolute project_dir \
+                 instead",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusArgs {
@@ -201,7 +228,7 @@ impl ClientToolHost {
     /// replacing it, so a namespace default survives a call that overrode it.
     fn route(&self, args: &ConnectionArgs) -> Result<RouteSelector, ToolError> {
         let selector =
-            RouteSelector::from_inputs(args.project_dir.as_deref(), args.unix_socket.as_deref())
+            RouteSelector::from_inputs(args.project_dir.as_deref(), args.unix_socket_route()?)
                 .map_err(|error| ToolError::new(error.message))?;
         let selector = selector.or_default(&self.default_route);
         // Resolved eagerly so an unusable project is a bounded validation
@@ -382,20 +409,34 @@ fn validated_change_ids(values: &[String]) -> Result<Vec<String>, ToolError> {
 
 /// The published `tools/list` payload.
 pub fn tool_descriptors() -> serde_json::Value {
-    let connection_properties = serde_json::json!({
-        "project_dir": {
-            "type": "string",
-            "description": "Absolute directory inside the project whose owner to talk to. The normal selector: it names the project rather than one owner incarnation's transport, so a single server process can serve several projects by passing a different directory per call. A linked worktree, a submodule, or any directory below the working-tree root resolves. The owner socket and the repository that certifies completion both come from this project. Mutually exclusive with unix_socket in one call."
-        },
-        "unix_socket": {
-            "type": "string",
-            "description": "Low-level override: path to the owner's /api/v2 Unix socket, for diagnostics, tests, and non-repository transports. Prefer project_dir. Defaults to ${GIT_COMMON_DIR}/cflx-api.sock. Mutually exclusive with project_dir in one call."
-        },
-        "auth_token_env": {
-            "type": "string",
-            "description": "Name of an environment variable holding the bearer token. A token value is never accepted."
+    // `unix_socket` is published only where the platform has one. A Windows
+    // host reading this schema sees exactly the selectors it may use, and the
+    // adapter refuses the other one through the same validation channel.
+    let connection_properties = {
+        // `mut` is used only by the Unix-only insertion below.
+        #[allow(unused_mut)]
+        let mut properties = serde_json::json!({
+            "project_dir": {
+                "type": "string",
+                "description": "Absolute directory inside the project whose owner to talk to. The normal selector on every platform: it names the project rather than one owner incarnation's transport, so a single server process can serve several projects by passing a different directory per call. A linked worktree, a submodule, or any directory below the working-tree root resolves. The owner endpoint — a Unix-domain socket on Unix, a current-user Named Pipe on Windows — and the repository that certifies completion both come from this project."
+            },
+            "auth_token_env": {
+                "type": "string",
+                "description": "Name of an environment variable holding the bearer token. A token value is never accepted."
+            }
+        });
+        #[cfg(unix)]
+        if let Some(object) = properties.as_object_mut() {
+            object.insert(
+                "unix_socket".to_string(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Low-level override: path to the owner's /api/v2 Unix socket, for diagnostics, tests, and non-repository transports. Prefer project_dir. Defaults to ${GIT_COMMON_DIR}/cflx-api.sock. Mutually exclusive with project_dir in one call."
+                }),
+            );
         }
-    });
+        properties
+    };
     let with_connection = |mut properties: serde_json::Value| {
         if let (Some(target), Some(source)) = (
             properties.as_object_mut(),
@@ -470,7 +511,7 @@ pub fn tool_descriptors() -> serde_json::Value {
                         "command": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Callback argv, required by 'set' and refused by 'get' and 'clear'. Element 0 is the program; no shell interpretation is applied. Accepted only over the owner's Unix socket."
+                            "description": "Callback argv, required by 'set' and refused by 'get' and 'clear'. Element 0 is the program; no shell interpretation is applied. Accepted only over the owner's own local transport — its Unix socket, or its Windows Named Pipe — and never over TCP."
                         },
                         "notify_blocked": {
                             "type": "boolean",

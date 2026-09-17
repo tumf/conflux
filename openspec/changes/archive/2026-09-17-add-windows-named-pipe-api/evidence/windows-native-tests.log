@@ -1,0 +1,217 @@
+# Native Windows evidence — add-windows-named-pipe-api
+#
+# Produced by running the change's Windows integration suite on the project's
+# Windows builder against the exact working tree this change ships. The
+# `#![cfg(all(windows, feature = "web-monitoring"))]` gate means a run on any
+# other host reports zero tests, so the executed-test count below is the fact
+# that distinguishes "the Named Pipe transport works" from "the suite compiled
+# itself out".
+
+HOSTNAME: HX90
+GIT_COMMIT: b0d40eb819508a4081205d143cbd7cc7ac5f01a1
+RUSTC_HOST: x86_64-pc-windows-msvc
+TEST_EXIT_CODE: 0
+TEST_COUNT: 16
+
+# What GIT_COMMIT names.
+#
+# The tested tree is b0d40eb819508a4081205d143cbd7cc7ac5f01a1 plus this change's uncommitted working tree:
+# Conflux owns the Apply commit, so the commit that contains this
+# implementation did not exist when the tests ran. The tree that did run is
+# pinned by content instead. TESTED_TREE_SHA256 is the SHA-256 of a manifest
+# holding one "<sha256>  <repo-relative-path>" line per tracked-or-new regular
+# file, C-collated by path; it was computed independently on both hosts and
+# compared line by line.
+UNCOMMITTED_WORKING_TREE: true
+TESTED_TREE_FILE_COUNT: 4063
+TESTED_TREE_SHA256: cd31d4225421161ce010d9d74ec035b9d247f7b69825ac308c4ab4e27c1c04cb
+
+# Builder
+COMMAND: cargo test --locked --test client_windows_tests
+WORKDIR: C:\cflx-src
+OS: Microsoft Windows [Version 10.0.26200.9457]
+
+RUSTC_VERSION:
+  rustc 1.98.1 (48a229cea 2026-09-01)
+  binary: rustc
+  commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985
+  commit-date: 2026-09-01
+  host: x86_64-pc-windows-msvc
+  release: 1.98.1
+  LLVM version: 22.1.8
+  cargo 1.98.1 (797e8a9bc 2026-08-05)
+
+# Two other Explicit Completion Conditions were run on the same host and the
+# same tree, and both exited 0:
+#
+#   cargo check --locked --all-targets   -> Finished `dev` profile in 1m 57s
+#   cargo build --release --locked       -> Finished `release` profile in 4m 00s
+
+# ---------------------------------------------------------------------------
+# cargo test --locked --test client_windows_tests
+# ---------------------------------------------------------------------------
+
+warning: unused import: `HANDLE`
+   --> src\process_manager.rs:461:51
+    |
+461 |     use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    |                                                   ^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused `std::result::Result` that must be used
+   --> src\process_manager.rs:488:13
+    |
+488 |             CloseHandle(process_handle);
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this `Result` may be an `Err` variant, which should be handled
+    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+    |
+488 |             let _ = CloseHandle(process_handle);
+    |             +++++++
+
+warning: unused `std::result::Result` that must be used
+   --> src\process_manager.rs:489:13
+    |
+489 |             CloseHandle(job);
+    |             ^^^^^^^^^^^^^^^^
+    |
+    = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+    |
+489 |             let _ = CloseHandle(job);
+    |             +++++++
+
+warning: unused `std::result::Result` that must be used
+   --> src\process_manager.rs:494:9
+    |
+494 |         CloseHandle(process_handle);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+    |
+494 |         let _ = CloseHandle(process_handle);
+    |         +++++++
+
+warning: `cflx` (lib) generated 4 warnings (run `cargo fix --lib -p cflx` to apply 1 suggestion)
+warning: field `job` is never read
+  --> src\process_manager.rs:22:5
+   |
+21 | pub struct ProcessHandle {
+   |            ------------- field in this struct
+22 |     job: Option<JobObjectGuard>,
+   |     ^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `configure_process_group` is never used
+   --> src\process_manager.rs:503:8
+    |
+503 | pub fn configure_process_group(_cmd: &mut tokio::process::Command) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `PROCESS_GROUP_PROBE_INTERVAL_MS` is never used
+   --> src\process_manager.rs:541:7
+    |
+541 | const PROCESS_GROUP_PROBE_INTERVAL_MS: u64 = 20;
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `MembersRemain` is never constructed
+   --> src\process_manager.rs:557:5
+    |
+549 | pub enum ProcessGroupQuiescence {
+    |          ---------------------- variant in this enum
+...
+557 |     MembersRemain,
+    |     ^^^^^^^^^^^^^
+    |
+    = note: `ProcessGroupQuiescence` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: enum `SignalResult` is never used
+   --> src\process_manager.rs:689:17
+    |
+689 | pub(crate) enum SignalResult {
+    |                 ^^^^^^^^^^^^
+
+warning: enum `ProbeResult` is never used
+   --> src\process_manager.rs:700:17
+    |
+700 | pub(crate) enum ProbeResult {
+    |                 ^^^^^^^^^^^
+
+warning: trait `ProcessGroupControl` is never used
+   --> src\process_manager.rs:713:18
+    |
+713 | pub(crate) trait ProcessGroupControl {
+    |                  ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `CleanupBudget` is never constructed
+   --> src\process_manager.rs:722:19
+    |
+722 | pub(crate) struct CleanupBudget {
+    |                   ^^^^^^^^^^^^^
+
+warning: associated function `from_millis` is never used
+   --> src\process_manager.rs:732:12
+    |
+731 | impl CleanupBudget {
+    | ------------------ associated function in this implementation
+732 |     pub fn from_millis(sigterm_grace_ms: u64, total_ms: u64) -> Self {
+    |            ^^^^^^^^^^^
+
+warning: function `poll_until_empty` is never used
+   --> src\process_manager.rs:749:10
+    |
+749 | async fn poll_until_empty<C: ProcessGroupControl>(
+    |          ^^^^^^^^^^^^^^^^
+
+warning: function `unconfirmed_from` is never used
+   --> src\process_manager.rs:770:4
+    |
+770 | fn unconfirmed_from(observation: ProbeResult, phase: &str) -> (ProcessGroupQuiescence, String) {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `drive_process_group_cleanup` is never used
+   --> src\process_manager.rs:793:21
+    |
+793 | pub(crate) async fn drive_process_group_cleanup<C: ProcessGroupControl>(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `drive_immediate_process_group_kill` is never used
+   --> src\process_manager.rs:889:21
+    |
+889 | pub(crate) async fn drive_immediate_process_group_kill<C: ProcessGroupControl>(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `join_detail` is never used
+    --> src\process_manager.rs:1001:4
+     |
+1001 | fn join_detail(base: &str, notes: &[String]) -> String {
+     |    ^^^^^^^^^^^
+
+warning: `cflx` (bin "cflx") generated 18 warnings (4 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.42s
+     Running tests\client_windows_tests.rs (target\debug\deps\client_windows_tests-0ebadd2a64b36f92.exe)
+
+running 16 tests
+test client_mcp_publishes_no_unix_only_selector ... ok
+test identity_a_repository_derives_one_name_for_this_user ... ok
+test transport_a_foreign_endpoint_is_refused_without_sending_a_request ... ok
+test identity_a_different_user_derives_a_different_name ... ok
+test identity_distinct_repositories_derive_distinct_names ... ok
+test identity_a_linked_worktree_reaches_the_repository_owner ... ok
+test transport_the_connected_pipe_owner_is_this_process_user ... ok
+test listener_serves_the_shared_api_without_a_web_flag ... ok
+test listener_keeps_answering_after_each_connection ... ok
+test client_the_unix_only_override_is_absent_from_this_platform ... ok
+test client_mcp_is_available_on_this_platform ... ok
+test listener_refuses_a_second_owner_of_one_endpoint ... ok
+test shutdown_a_failed_tcp_bind_releases_the_pipe_it_already_acquired ... ok
+test shutdown_stops_accepting_and_gives_the_name_back ... ok
+test client_status_reaches_the_repository_route_rather_than_refusing_the_platform ... ok
+test transport_named_pipe_may_register_callback_argv_and_tcp_may_not ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.06s

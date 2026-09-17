@@ -1,6 +1,6 @@
 # Web UI Guide
 
-This guide covers the default local API socket, the optional web monitoring UI
+This guide covers the default local API endpoint, the optional web monitoring UI
 (`--web`), and the versioned `/api/v2` remote-control API.
 
 Conflux is a single-workspace tool: `cflx`, `cflx tui`, and `cflx run` all
@@ -12,10 +12,14 @@ multi-project server.
 > `cflx project`, `cflx service`, and the remote-client TUI `--server` options)
 > no longer exists. See [Migrating from server mode](#migrating-from-server-mode).
 
-## The default local API socket
+## The default local API endpoint
 
-`cflx`, `cflx tui`, and `cflx run` serve `/api/v2` on a Unix domain socket by
-default. No flag enables it and no TCP port is consumed:
+`cflx`, `cflx tui`, and `cflx run` serve `/api/v2` on an owner-only local
+endpoint by default. No flag enables it and no TCP port is consumed. Which
+endpoint it is depends on the platform; everything above the byte stream — the
+router, DTOs, revisions, commands, authentication — is identical.
+
+**Unix — a Unix domain socket:**
 
 ```
 ${GIT_COMMON_DIR}/cflx-api.sock
@@ -35,49 +39,79 @@ curl --unix-socket "$SOCK" -H "Authorization: Bearer $CFLX_WEB_TOKEN" \
 The host part of those URLs is ignored by the server; `curl` needs *some*
 authority, so `localhost` is conventional.
 
-The path comes from the canonical Git *common* directory — the same repository
-identity the orchestration lock uses. Every linked worktree of one repository
-therefore resolves the same socket, unrelated repositories resolve different
-ones, and the lock is what keeps two default owners from racing for it.
+**Windows — a Named Pipe:**
+
+```
+\\.\pipe\cflx-v2-<64 lowercase hex characters>
+```
+
+The digest covers your user SID and the normalized canonical Git common
+directory, separated by a NUL. Neither input appears in the name: the pipe
+namespace is machine-global, so anything that can enumerate `\\.\pipe\` would
+otherwise read a local account's SID and a developer's directory layout straight
+off the endpoint. There is no public override for the name — route by repository
+with `--project-dir` — and nothing is persisted to remember it.
+
+The identity comes from the canonical Git *common* directory on both platforms —
+the same repository identity the orchestration lock uses. Every linked worktree
+of one repository therefore resolves the same endpoint, unrelated repositories
+resolve different ones, two local Windows users resolve different ones, and the
+lock is what keeps two default owners from racing for it.
 
 | Option | Effect |
 |--------|--------|
-| *(none)* | Bind `${GIT_COMMON_DIR}/cflx-api.sock` |
-| `--web-unix-socket PATH` | Bind `PATH` instead |
-| `--no-web-unix-socket` | Bind no Unix socket at all |
+| *(none)* | Bind this repository's platform-local endpoint |
+| `--web-unix-socket PATH` | Bind `PATH` instead (Unix only) |
+| `--no-web-unix-socket` | Bind no local endpoint at all |
 
-The two options are mutually exclusive. Outside a Git repository there is no
-identity to derive a deterministic path from, so startup fails with an error
-naming both explicit choices rather than guessing a location.
+The two options are mutually exclusive, and `--web-unix-socket` is refused on
+Windows, which has no Unix socket to bind. Outside a Git repository there is no
+identity to derive a deterministic endpoint from, so startup fails with an error
+naming the explicit choices rather than guessing a location.
 
-**Permissions and authentication.** The socket is created with mode `0600`, so
-filesystem permissions are the access boundary. Token-free access is permitted
-there exactly as it is on loopback TCP. When a bearer token *is* configured, one
-policy applies to every active listener: `/api/v2/health` stays public and every
-other v2 HTTP, SSE, and WebSocket resource requires it.
+**Permissions and authentication.** On Unix the socket is created with mode
+`0600`, so filesystem permissions are the access boundary. On Windows every pipe
+instance is created — at handle creation, never tightened afterwards — with a
+protected DACL granting generic-all access to your SID alone, and with remote
+clients rejected by the kernel. Token-free access is permitted on either exactly
+as it is on loopback TCP. When a bearer token *is* configured, one policy applies
+to every active listener: `/api/v2/health` stays public and every other v2 HTTP,
+SSE, and WebSocket resource requires it.
+
+Because the pipe namespace is machine-global, deriving the right *name* is not by
+itself proof of who answered. A Windows client therefore opens the pipe with
+identification-only security quality of service and compares the connected
+handle's owner SID with its own process token before writing a single request
+byte; a mismatch is a typed transport refusal, with no request sent, no retry,
+and no fallback to TCP.
 
 **Startup and shutdown.** The listener binds before lifecycle adapters, AI
-subprocesses, or orchestration begin. A bind, permission, or path-safety failure
-exits non-zero with none of that started. A live socket or a non-socket entry at
-the target path is never removed — startup fails and leaves it alone — while an
-unreachable socket left by a dead process is replaced. A finite `cflx run` and a
-graceful TUI exit both remove the socket they created, and never a replacement
-that appeared at the path during the run.
+subprocesses, or orchestration begin. A bind, permission, path-safety, or
+first-instance failure exits non-zero with none of that started, and startup is
+all-or-nothing across listeners: a failed TCP bind stops and awaits the local
+listener task it already started. A live socket or a non-socket entry at the
+target path is never removed — startup fails and leaves it alone — while an
+unreachable socket left by a dead process is replaced. A Named Pipe has no
+filesystem entry to go stale: the first instance is claimed exclusively, so an
+occupied name means a live owner and startup refuses rather than joining it. A
+finite `cflx run` and a graceful TUI exit both release the endpoint they created,
+and never a replacement that appeared at the path during the run.
 
-**Browsers and QR codes.** A `unix://` endpoint is discovery information for
-local clients and reverse proxies. Browsers cannot open it, and the TUI QR popup
-still encodes the TCP Web UI URL only. To expose the API over HTTP, front the
-socket with a reverse proxy (nginx `proxy_pass http://unix:/path/to/cflx-api.sock:/`,
-Caddy `reverse_proxy unix//path/to/cflx-api.sock`) or use `--web`.
+**Browsers and QR codes.** A `unix://` or `pipe://` endpoint is discovery
+information for local clients and reverse proxies. Browsers cannot open either,
+and the TUI QR popup still encodes the TCP Web UI URL only. To expose the API
+over HTTP, front the socket with a reverse proxy (nginx
+`proxy_pass http://unix:/path/to/cflx-api.sock:/`, Caddy
+`reverse_proxy unix//path/to/cflx-api.sock`) or use `--web`.
 
 ## Enabling the Web UI
 
 `--web` *adds* the browser-facing TCP listener; it does not replace or disable
-the Unix socket. Both listeners serve the same router and the same process
-state.
+the platform-local endpoint. Both listeners serve the same router and the same
+process state.
 
 ```bash
-# TUI + Web UI (plus the default Unix socket)
+# TUI + Web UI (plus the default local endpoint)
 cflx --web
 
 # Headless run + Web UI
@@ -87,7 +121,7 @@ cflx run --web
 export CFLX_WEB_TOKEN="$(openssl rand -hex 32)"
 cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKEN
 
-# TCP only, with no Unix socket
+# TCP only, with no local endpoint
 cflx run --web --no-web-unix-socket
 ```
 
@@ -100,8 +134,8 @@ remote-control API, and the process refuses to start without one. Use
 mutually exclusive. See [USAGE.md](USAGE.md#remote-control-api-apiv2).
 
 `--web-port`, `--web-bind`, and the allowed-origin options configure the TCP
-listener only; the Unix socket is controlled solely by its default, override, or
-opt-out.
+listener only; the platform-local endpoint is controlled solely by its default,
+override, or opt-out.
 
 ## Dashboard Features
 

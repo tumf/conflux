@@ -1565,11 +1565,12 @@ pub struct ExecutionSinkResponse {
     /// Currently attached sink, argv included.
     ///
     /// `null` when none is attached — *and* when the request did not arrive on
-    /// the owner's Unix socket. Reaching that socket already means local
-    /// filesystem access to the owner's repository; a bearer token over TCP is a
-    /// weaker claim than that, and the argv is a command this process will
-    /// execute. Read [`ExecutionSinkResponse::sink_registered`] to tell "no sink"
-    /// apart from "not disclosed here".
+    /// an owner-only local transport. Reaching the owner's Unix socket or its
+    /// secured Named Pipe already means being the owner's user on the owner's
+    /// machine; a bearer token over TCP is a weaker claim than that, and the argv
+    /// is a command this process will execute. Read
+    /// [`ExecutionSinkResponse::sink_registered`] to tell "no sink" apart from
+    /// "not disclosed here".
     pub sink: Option<ExecutionSinkSpec>,
     /// Whether a sink is attached at all.
     ///
@@ -1640,8 +1641,9 @@ pub struct ProposalSubscriptionResponse {
     /// Currently registered callback, argv included.
     ///
     /// `null` when none is registered — *and* when the request did not arrive
-    /// on the owner's Unix socket. Read [`ProposalSubscriptionResponse::subscribed`]
-    /// to tell "no subscription" apart from "not disclosed here".
+    /// on an owner-only local transport (the owner's Unix socket, or its secured
+    /// Named Pipe). Read [`ProposalSubscriptionResponse::subscribed`] to tell
+    /// "no subscription" apart from "not disclosed here".
     pub sink: Option<ExecutionSinkSpec>,
     /// Whether a subscription is registered at all.
     ///

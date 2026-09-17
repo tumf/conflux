@@ -114,8 +114,9 @@ bounded argv the owner runs once when that admitted execution reaches a typed
 terminal classification. It is not a command: it creates no command record, needs
 no `expected_revision` or `idempotency_key`, and advances no revision. Because it
 stores an argv this process will execute, `PUT` and `DELETE` are accepted only
-over the owner's Unix socket and are refused over TCP with
-`transport_not_permitted`, even when bearer authentication succeeds.
+over an owner-only local transport — the owner's Unix socket, or its secured
+Windows Named Pipe — and are refused over TCP with `transport_not_permitted`,
+even when bearer authentication succeeds.
 `GET /api/v2/capabilities` reports whether the surface exists at all.
 
 **Proposal subscriptions.** `PUT /api/v2/proposals/{change_id}/subscription`

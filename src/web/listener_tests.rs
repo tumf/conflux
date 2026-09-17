@@ -404,12 +404,12 @@ async fn an_opted_out_plan_requests_no_listener() {
     assert!(plan.is_empty());
     assert!(!ListenerPlan {
         unix_socket: None,
-        tcp: true
+        tcp: true,
     }
     .is_empty());
     assert!(!ListenerPlan {
         unix_socket: Some("/tmp/x.sock".into()),
-        tcp: false
+        tcp: false,
     }
     .is_empty());
 }

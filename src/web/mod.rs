@@ -10,6 +10,12 @@ mod url;
 
 #[cfg(feature = "web-monitoring")]
 pub mod completion_sink;
+/// Compiled on every platform even though only Windows binds one: the endpoint
+/// *identity* rules — which worktrees converge, which users diverge, what is
+/// never published — are the part that decides whether a client reaches its own
+/// owner, and proving them should not require a Windows builder.
+#[cfg(feature = "web-monitoring")]
+pub mod named_pipe;
 #[cfg(feature = "web-monitoring")]
 pub mod openapi;
 #[cfg(feature = "web-monitoring")]
@@ -301,16 +307,20 @@ pub(crate) fn build_app_for_test(config: &WebConfig, state: Arc<WebState>) -> Ro
 
 /// Which listeners a local orchestration-owning process must start.
 ///
-/// The Unix listener is the default local API surface; TCP is the browser-facing
-/// opt-in. Both are described up front so startup can be all-or-nothing: a
-/// process that advertised one endpoint and silently failed the other would be
-/// worse than one that refused to start.
+/// The platform-local listener — a Unix-domain socket on Unix, a Named Pipe on
+/// Windows — is the default local API surface; TCP is the browser-facing opt-in.
+/// Both are described up front so startup can be all-or-nothing: a process that
+/// advertised one endpoint and silently failed the other would be worse than one
+/// that refused to start.
 #[cfg(feature = "web-monitoring")]
 #[derive(Debug, Clone, Default)]
 pub struct ListenerPlan {
     /// Path for the Unix-domain listener, or `None` when it is opted out.
     #[cfg(unix)]
     pub unix_socket: Option<std::path::PathBuf>,
+    /// Name of the Windows Named Pipe, or `None` when it is opted out.
+    #[cfg(windows)]
+    pub named_pipe: Option<String>,
     /// Whether `--web` asked for the retained TCP/Web UI listener.
     pub tcp: bool,
 }
@@ -320,10 +330,12 @@ impl ListenerPlan {
     /// True when no listener was requested at all.
     pub fn is_empty(&self) -> bool {
         #[cfg(unix)]
-        let unix = self.unix_socket.is_none();
-        #[cfg(not(unix))]
-        let unix = true;
-        unix && !self.tcp
+        let local = self.unix_socket.is_none();
+        #[cfg(windows)]
+        let local = self.named_pipe.is_none();
+        #[cfg(not(any(unix, windows)))]
+        let local = true;
+        local && !self.tcp
     }
 }
 
@@ -449,8 +461,8 @@ pub async fn start_listeners(
         );
 
         // The transport marker is per listener because the router is shared:
-        // once a request is inside a handler the two listeners look identical,
-        // and sink mutation has to be able to tell them apart.
+        // once a request is inside a handler the listeners look identical, and
+        // sink mutation has to be able to tell them apart.
         let app = app
             .clone()
             .layer(axum::Extension(remote_control_api::ApiTransport::Unix));
@@ -461,6 +473,35 @@ pub async fn start_listeners(
                 .await
             {
                 debug!("Unix API listener stopped: {}", e);
+            }
+        }));
+    }
+
+    // The Windows half of the same contract: the first instance is acquired
+    // before this function returns, so "the endpoint exists" and "startup
+    // succeeded" stay the same fact on both platforms.
+    #[cfg(windows)]
+    if let Some(name) = plan.named_pipe.as_deref() {
+        let listener = match named_pipe::NamedPipeAcceptor::bind(name, shutdown.clone()) {
+            Ok(listener) => listener,
+            Err(error) => {
+                abort_started_listeners(&shutdown, tasks).await;
+                return Err(error.into());
+            }
+        };
+        endpoints.push(named_pipe::pipe_endpoint(name));
+        info!("Local API listening on {}", named_pipe::pipe_endpoint(name));
+
+        let app = app
+            .clone()
+            .layer(axum::Extension(remote_control_api::ApiTransport::NamedPipe));
+        let token = shutdown.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app)
+                .with_graceful_shutdown(async move { token.cancelled().await })
+                .await
+            {
+                debug!("Named Pipe API listener stopped: {}", e);
             }
         }));
     }

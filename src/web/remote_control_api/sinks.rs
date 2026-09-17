@@ -8,19 +8,26 @@
 //! would have put an executable argv inside the one surface whose whole job is
 //! to mutate orchestration state.
 //!
-//! # Why mutation is Unix-socket only
+//! # Why mutation is owner-only-local
 //!
-//! A sink is an argv this process will execute. The Unix socket is mode `0600`
-//! and derived from the repository's own Git common directory, so reaching it
-//! already means local filesystem access to the owner's repository. A bearer
-//! token over TCP is a weaker claim than that, and it is exactly the claim an
-//! exposed reverse proxy hands out. Reads are fine over either transport;
-//! `PUT` and `DELETE` are refused on anything but the socket, with their own
-//! error code so a client can tell "wrong channel" from "wrong credentials".
+//! A sink is an argv this process will execute. Reaching the owner's own local
+//! endpoint already means being the owner's user on the owner's machine: on Unix
+//! the socket is mode `0600` under the repository's own Git common directory, and
+//! on Windows the Named Pipe carries a protected DACL naming that one user and
+//! rejects remote clients outright. A bearer token over TCP is a weaker claim
+//! than either, and it is exactly the claim an exposed reverse proxy hands out.
+//! Reads are fine over any transport; `PUT` and `DELETE` are refused on anything
+//! but an owner-only local one, with their own error code so a client can tell
+//! "wrong channel" from "wrong credentials".
+//!
+//! The classification lives in one predicate — [`super::is_owner_only_local`] —
+//! shared with the proposal-subscription resource, because two spellings of
+//! "trusted enough" is how one argv surface ends up trusting a channel the other
+//! refuses.
 //!
 //! # Why reading is not simply "reads are fine"
 //!
-//! The *argv* is disclosed only over that same socket. A TCP reader learns that
+//! The *argv* is disclosed only over that same channel. A TCP reader learns that
 //! a subscription exists, what state the execution is in, and which events have
 //! been delivered — everything it needs to decide whether it still owes a
 //! resume — but not the command line the owner will run. A registration it may
@@ -57,7 +64,7 @@ use crate::web::completion_sink::{SinkRefusal, SinkView};
         ("change_id" = String, Query, description = "Change the caller believes the execution belongs to. Required: inspection asserts the same complete binding a registration does"),
     ),
     responses(
-        (status = 200, description = "Current subscription for this execution. The registered argv is returned only to a request that arrived on the owner Unix socket; `sink_registered` reports presence on either transport", body = ExecutionSinkResponse),
+        (status = 200, description = "Current subscription for this execution. The registered argv is returned only to a request that arrived on an owner-only local transport (the Unix socket, or the Windows Named Pipe); `sink_registered` reports presence on either transport", body = ExecutionSinkResponse),
         (status = 404, description = "No such execution in this incarnation", body = ApiError),
         (status = 409, description = "The presented instance/change binding is not this execution's", body = ApiError),
         (status = 422, description = "The request omitted part of the execution binding", body = ApiError),
@@ -188,34 +195,35 @@ fn incomplete_binding(operation: &str, correlation: &str) -> Response {
 
 /// Whether this transport may be told the registered argv.
 ///
-/// Absence of the marker is read as "not the socket", the same way mutation
-/// reads it: a router assembled without the per-listener extension has no proof
-/// of transport, and no evidence is not evidence of the safer channel.
+/// The same predicate mutation uses, so a channel that may not register a
+/// command may not read one back either.
 fn discloses_argv(transport: &Option<Extension<ApiTransport>>) -> bool {
-    matches!(transport, Some(Extension(ApiTransport::Unix)))
+    super::is_owner_only_local(transport)
 }
 
-/// Refuse a mutation that did not arrive on the owner's Unix socket.
+/// Refuse a mutation that did not arrive on an owner-only local transport.
 ///
-/// Absence of the marker is treated as "not the socket": a router assembled
-/// without the per-listener extension has no proof of transport, and failing
-/// closed is the only safe reading of no evidence.
+/// Shares [`super::is_owner_only_local`] with the proposal-subscription
+/// resource: both store an argv this owner will execute, and two independent
+/// spellings of "trusted enough" is how one of them ends up trusting a channel
+/// the other refuses.
 fn require_owner_socket(
     transport: Option<Extension<ApiTransport>>,
     correlation: &str,
 ) -> Option<Response> {
-    match transport.map(|Extension(transport)| transport) {
-        Some(ApiTransport::Unix) => None,
-        _ => Some(
-            ApiError::new(
-                ErrorCode::TransportNotPermitted,
-                "an execution sink stores an argv this owner will execute, so it may be set or \
-                 cleared only over the owner's Unix socket",
-                correlation,
-            )
-            .into_response(),
-        ),
+    if super::is_owner_only_local(&transport) {
+        return None;
     }
+    Some(
+        ApiError::new(
+            ErrorCode::TransportNotPermitted,
+            "an execution sink stores an argv this owner will execute, so it may be set or \
+             cleared only over the owner's local transport — its Unix socket or its Windows \
+             Named Pipe",
+            correlation,
+        )
+        .into_response(),
+    )
 }
 
 /// Render one subscription, disclosing the argv only where that is permitted.

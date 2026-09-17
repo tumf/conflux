@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
-use crate::client::transport::{TransportError, UnixApiClient};
+use crate::client::transport::{LocalApiClient, TransportError};
 use crate::client::RouteSelector;
 use crate::web::remote_control_api::dto::{
     ApiError, CapabilitiesResponse, ChangeResource, ExecutionContractResponse,
@@ -60,7 +60,7 @@ impl ConnectionRefusal {
 /// hand-written `Debug`, so no rendering of a connection can leak one.
 #[derive(Debug)]
 pub struct Connection {
-    client: UnixApiClient,
+    client: LocalApiClient,
     /// Repository root, when the client is inside one.
     ///
     /// `wait` needs it to verify completion from repository evidence. An
@@ -73,23 +73,24 @@ pub struct Connection {
 impl Connection {
     /// Resolve one already-selected route into a connection.
     ///
-    /// Nothing is contacted here: the socket path and the bearer token are
-    /// derived, and that is all.
+    /// Nothing is contacted here: the platform-local endpoint and the bearer
+    /// token are derived, and that is all.
     ///
-    /// The socket and the repository-evidence root are decided *together* here,
-    /// from one selector, so no operation can mix one project's owner with
+    /// The endpoint and the repository-evidence root are decided *together*
+    /// here, from one selector, so no operation can mix one project's owner with
     /// another project's evidence:
     ///
     /// * [`RouteSelector::Project`] takes both from the named project.
     /// * [`RouteSelector::Socket`] takes the socket verbatim and keeps the
     ///   process's own repository as evidence, which is the pre-existing
-    ///   low-level behavior an explicit socket has always had.
+    ///   low-level behavior an explicit socket has always had. It exists only on
+    ///   Unix; a Windows build never constructs one.
     /// * [`RouteSelector::Default`] derives both from the current directory.
     pub fn resolve_route(
         selector: &RouteSelector,
         auth_token_env: Option<&str>,
     ) -> Result<Self, ConnectionRefusal> {
-        let (socket, repo_root) = match selector {
+        let (endpoint, repo_root) = match selector {
             RouteSelector::Project(project_dir) => {
                 let route = crate::client::resolve_project(project_dir).map_err(|error| {
                     ConnectionRefusal {
@@ -97,28 +98,48 @@ impl Connection {
                         message: error.message,
                     }
                 })?;
-                (route.socket, Some(route.repo_root))
+                (route.endpoint, Some(route.repo_root))
             }
+            #[cfg(unix)]
             RouteSelector::Socket(path) => {
                 let workspace = current_workspace()?;
-                (path.to_path_buf(), discover_repo_root(&workspace))
+                (
+                    crate::client::transport::LocalEndpoint::Unix(path.to_path_buf()),
+                    discover_repo_root(&workspace),
+                )
+            }
+            // Unreachable by construction: the Windows CLI and MCP surfaces do
+            // not offer the selector at all. Refusing rather than guessing keeps
+            // "a Unix socket path" from being silently reinterpreted as a pipe.
+            #[cfg(not(unix))]
+            RouteSelector::Socket(path) => {
+                return Err(ConnectionRefusal {
+                    outcome: Outcome::UsageError,
+                    message: format!(
+                        "an explicit Unix socket route ('{}') is not available on this platform; \
+                         select the project with --project-dir PATH instead",
+                        path.display()
+                    ),
+                })
             }
             RouteSelector::Default => {
                 let workspace = current_workspace()?;
                 let repo_root = discover_repo_root(&workspace);
-                let socket = match crate::repo_lock::discover_common_dir(&workspace) {
-                    Some(common_dir) => crate::web::unix_socket::default_socket_path(&common_dir),
-                    None => {
-                        return Err(ConnectionRefusal {
-                            outcome: Outcome::NotInRepository,
-                            message: "the default owner socket needs a Git repository: run \
-                                      inside one, name the project with --project-dir PATH, or \
-                                      name the socket with --unix-socket PATH"
-                                .to_string(),
-                        })
-                    }
-                };
-                (socket, repo_root)
+                let endpoint =
+                    match crate::repo_lock::discover_common_dir(&workspace) {
+                        Some(common_dir) => crate::client::local_endpoint_for(&common_dir)
+                            .map_err(|error| ConnectionRefusal {
+                                outcome: Outcome::NotInRepository,
+                                message: error.message,
+                            })?,
+                        None => {
+                            return Err(ConnectionRefusal {
+                                outcome: Outcome::NotInRepository,
+                                message: DEFAULT_ROUTE_NEEDS_A_REPOSITORY.to_string(),
+                            })
+                        }
+                    };
+                (endpoint, repo_root)
             }
         };
 
@@ -146,25 +167,26 @@ impl Connection {
         // opened and before any request bytes exist. The diagnostic names the
         // variable and the byte class only: echoing the value would leak the
         // credential, and echoing an injection attempt would leak it into a log.
-        let client = UnixApiClient::new(socket, token).map_err(|rejection| ConnectionRefusal {
-            outcome: Outcome::AuthenticationFailed,
-            message: match auth_token_env {
-                Some(name) => format!(
-                    "the bearer token in environment variable '{name}' contains {rejection}, \
+        let client =
+            LocalApiClient::new(endpoint, token).map_err(|rejection| ConnectionRefusal {
+                outcome: Outcome::AuthenticationFailed,
+                message: match auth_token_env {
+                    Some(name) => format!(
+                        "the bearer token in environment variable '{name}' contains {rejection}, \
                      which cannot be sent as an HTTP header value. The value is not shown"
-                ),
-                None => format!(
+                    ),
+                    None => format!(
                     "the configured bearer token contains {rejection}, which cannot be sent as \
                      an HTTP header value. The value is not shown"
                 ),
-            },
-        })?;
+                },
+            })?;
 
         Ok(Self { client, repo_root })
     }
 
     /// The underlying transport.
-    pub fn client(&self) -> &UnixApiClient {
+    pub fn client(&self) -> &LocalApiClient {
         &self.client
     }
 
@@ -173,6 +195,20 @@ impl Connection {
         self.repo_root.as_deref()
     }
 }
+
+/// What to do when the current directory has no repository identity.
+///
+/// Platform-specific because the *choices* are: `--unix-socket` exists only on
+/// a Unix build, and naming it on Windows would send an operator looking for an
+/// option their binary does not have.
+#[cfg(unix)]
+const DEFAULT_ROUTE_NEEDS_A_REPOSITORY: &str =
+    "the default owner socket needs a Git repository: run inside one, name the project with \
+     --project-dir PATH, or name the socket with --unix-socket PATH";
+#[cfg(not(unix))]
+const DEFAULT_ROUTE_NEEDS_A_REPOSITORY: &str =
+    "the default owner endpoint needs a Git repository: run inside one, or name the project \
+     with --project-dir ABSOLUTE_PATH";
 
 /// The process's own working directory, or the refusal that replaces it.
 ///
@@ -401,7 +437,7 @@ impl From<TransportError> for ObserveError {
 
 /// Read one resource, mapping the owner's typed refusals onto client outcomes.
 async fn read<T: serde::de::DeserializeOwned>(
-    client: &UnixApiClient,
+    client: &LocalApiClient,
     path_and_query: &str,
 ) -> Result<T, ObserveError> {
     let response = client.get(path_and_query).await?;
@@ -594,7 +630,7 @@ pub async fn status(connection: &Connection) -> ResultEnvelope {
         .collect();
 
     let detail = serde_json::json!({
-        "socket": connection.client().socket().display().to_string(),
+        "endpoint": connection.client().endpoint().label(),
         "state_revision": observation.state_revision,
         "event_sequence": observation.event_sequence,
         "owner": {
@@ -630,7 +666,7 @@ mod tests {
     use crate::web::remote_control_api::dto::ErrorCode;
 
     #[test]
-    fn an_absent_socket_outside_a_repository_names_both_choices() {
+    fn an_absent_endpoint_outside_a_repository_names_the_available_choices() {
         let tmp = tempfile::tempdir().unwrap();
         let previous = std::env::current_dir().unwrap();
         // A temporary directory outside any repository is the only way to
@@ -644,10 +680,18 @@ mod tests {
         // would resolve; only assert the refusal shape when it did refuse.
         if let Err(refusal) = resolved {
             assert_eq!(refusal.outcome, Outcome::NotInRepository);
-            assert!(refusal.message.contains("--unix-socket"), "{refusal:?}");
+            // `--project-dir` is portable and always offered; the Unix socket
+            // override is named only where the binary actually has it.
+            assert!(refusal.message.contains("--project-dir"), "{refusal:?}");
+            assert_eq!(
+                refusal.message.contains("--unix-socket"),
+                cfg!(unix),
+                "{refusal:?}"
+            );
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unset_token_variable_fails_closed_instead_of_connecting_anonymously() {
         let refusal = Connection::resolve_route(
@@ -659,6 +703,7 @@ mod tests {
         assert!(refusal.message.contains("unset or empty"), "{refusal:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_explicit_socket_needs_no_repository_identity() {
         let connection = Connection::resolve_route(
@@ -667,10 +712,24 @@ mod tests {
         )
         .expect("an explicit socket always resolves");
         assert_eq!(
-            connection.client().socket(),
-            Path::new("/tmp/explicit.sock")
+            connection.client().endpoint(),
+            &crate::client::transport::LocalEndpoint::Unix(PathBuf::from("/tmp/explicit.sock"))
         );
         assert!(!connection.client().has_token());
+    }
+
+    /// The low-level override does not quietly become "some other endpoint" on
+    /// a platform that has no Unix sockets.
+    #[cfg(not(unix))]
+    #[test]
+    fn an_explicit_socket_is_refused_where_the_platform_has_none() {
+        let refusal = Connection::resolve_route(
+            &RouteSelector::Socket(PathBuf::from(r"C:\tmp\explicit.sock")),
+            None,
+        )
+        .expect_err("a Unix socket route cannot resolve here");
+        assert_eq!(refusal.outcome, Outcome::UsageError);
+        assert!(refusal.message.contains("--project-dir"), "{refusal:?}");
     }
 
     #[test]

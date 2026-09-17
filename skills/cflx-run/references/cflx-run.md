@@ -68,7 +68,7 @@ Hermes processes may be killed after 30 minutes. Do not bridge a longer Conflux 
 Use an explicit proposal subscription instead. Nothing registers one for you:
 
 1. Read the owner's incarnation with `cflx client status --json` (or `cflx_status`) and keep its `instance_id`.
-2. Register the callback with `cflx client subscribe set <change-id> --instance-id <id> -- <argv>`, or `cflx_subscribe` with action `set`. It is keyed by the proposal, so it may be registered before the owner has admitted anything, and it is accepted only over the owner's Unix socket.
+2. Register the callback with `cflx client subscribe set <change-id> --instance-id <id> -- <argv>`, or `cflx_subscribe` with action `set`. It is keyed by the proposal, so it may be registered before the owner has admitted anything, and it is accepted only over the owner's own local transport — its mode-`0600` Unix socket, or its secured Windows Named Pipe. An authenticated TCP client is refused with `transport_not_permitted`.
 3. Control the work explicitly: `cflx client mark <change-id>` then `cflx client start`, or `cflx_control` with action `mark` then action `start`. Marking is selection and preserves unrelated marks; Start consumes the owner's authoritative mark set.
 4. Use an existing callback adapter that starts a new Hermes turn through durable gateway, webhook, or API ingress. Conflux executes the argv and resumes nothing itself.
 5. End the current Hermes turn after registration succeeds. The resident Conflux owner, not Hermes, owns the callback until delivery.
