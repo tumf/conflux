@@ -386,6 +386,7 @@ pub async fn run_tui(
     post_archive_action: PostArchiveAction,
     upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
     lifecycle: LifecycleHandle,
+    listener_failure: Option<CancellationToken>,
 ) -> Result<()> {
     // Set up panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
@@ -410,6 +411,7 @@ pub async fn run_tui(
         post_archive_action,
         upstream_runtime,
         lifecycle,
+        listener_failure,
     )
     .await;
 
@@ -430,6 +432,7 @@ async fn run_tui_loop(
     post_archive_action: PostArchiveAction,
     upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
     lifecycle: LifecycleHandle,
+    listener_failure: Option<CancellationToken>,
 ) -> Result<()> {
     let repo_root = std::env::current_dir()?;
 
@@ -1049,6 +1052,13 @@ async fn run_tui_loop(
     publish_lifecycle_state(&app);
 
     loop {
+        if listener_failure
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            break;
+        }
+
         // Increment spinner frame for animation (updates every 100ms)
         app.spinner_frame = (app.spinner_frame + 1) % SPINNER_CHARS.len();
 
@@ -1200,7 +1210,18 @@ async fn run_tui_loop(
     supervisor
         .shutdown_run(LOCAL_ORCHESTRATOR_SHUTDOWN_GRACE)
         .await
-        .into_exit_result()
+        .into_exit_result()?;
+
+    if listener_failure
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Err(crate::error::OrchestratorError::AgentCommand(
+            "the local API listener failed; the owner is shutting down".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

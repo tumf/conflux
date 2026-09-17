@@ -712,7 +712,6 @@ async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
 /// A multi-target request deliberately names none: `change_id` is a scalar, and
 /// picking the first of several would tell a caller its request was about one
 /// proposal when it was about five.
-#[cfg(feature = "web-monitoring")]
 fn single(change_ids: &[String]) -> Option<String> {
     match change_ids {
         [only] => Some(only.clone()),

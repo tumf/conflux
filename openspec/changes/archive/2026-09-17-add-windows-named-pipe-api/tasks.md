@@ -31,13 +31,12 @@
   reserves 1 MiB where POSIX gives 8 MiB, and `#[tokio::main]` drives the whole
   command future there; before this, `cflx client status` on Windows exited with
   `STATUS_STACK_OVERFLOW` (`0xC00000FD`) and no diagnostic.
-- Divergence from design.md worth acceptance review: a replacement-instance
+- Acceptance review closed the initial runtime divergence: a replacement-instance
   failure cancels the listener plan's shared cancellation token, drops the
-  just-connected stream unserved, and logs one bounded error — but it cannot
-  itself begin *process* shutdown, because `ServerHandle` exposes no failure
-  channel to its owner. The endpoint becomes unavailable and no TCP fallback
-  occurs, which are the security-relevant halves; the process keeps running
-  without a local control endpoint until its operator stops it.
+  just-connected stream unserved, and logs one bounded error. `ServerHandle`
+  now exposes that failure token to both TUI and run owner loops, which cancel
+  orchestration, perform ordinary listener/lifecycle cleanup, and return an
+  error instead of leaving the owner alive without its local control endpoint.
 - Task 2's planned verification is `unit`. The shared framing is proven over an
   in-memory `tokio::io::duplex` in `src/client/transport.rs`, so no socket, pipe,
   or owner is involved. The Windows-only half of that task — identification-only

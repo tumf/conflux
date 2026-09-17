@@ -387,6 +387,19 @@ impl ServerHandle {
         self.tcp_url.as_deref()
     }
 
+    /// A listener-plan failure that requires the owning process to stop.
+    ///
+    /// Normal shutdown is initiated by consuming this handle, so cancellation
+    /// observed while the owner loop is still running is a listener failure.
+    pub fn failure_token(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_listener_failure(&self) {
+        self.shutdown.cancel();
+    }
+
     /// Stop every listener and refresh task, then remove the owned socket.
     ///
     /// Finite `run` completion and graceful TUI termination both call this, so

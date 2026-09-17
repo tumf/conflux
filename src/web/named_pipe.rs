@@ -174,7 +174,11 @@ mod windows_impl {
             if needed == 0 {
                 return Err("the access token reported no TokenUser size".to_string());
             }
-            let mut buffer = vec![0u8; needed as usize];
+            // `GetTokenInformation` writes a `TOKEN_USER` followed by SID data.
+            // A byte vector is not sufficiently aligned for the typed header, so
+            // reserve the same byte count in pointer-aligned machine words.
+            let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+            let mut buffer = vec![0usize; words];
             GetTokenInformation(
                 token.0,
                 TokenUser,

@@ -117,6 +117,23 @@ fn instance_id(body: &str) -> String {
 }
 
 #[tokio::test]
+async fn listener_failure_is_observable_by_the_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("cflx-api.sock");
+    let handle = start(WebConfig::default(), Some(&socket), false)
+        .await
+        .expect("UDS-only startup");
+    let failure = handle.failure_token();
+
+    handle.simulate_listener_failure();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), failure.cancelled())
+        .await
+        .expect("owner must observe listener-plan cancellation");
+    handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_unix_listener_serves_real_http_without_a_web_flag() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("cflx-api.sock");

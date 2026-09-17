@@ -254,6 +254,10 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
         post_archive_action,
         upstream_runtime,
         lifecycle.handle(),
+        #[cfg(feature = "web-monitoring")]
+        started.as_ref().map(|(handle, _)| handle.failure_token()),
+        #[cfg(not(feature = "web-monitoring"))]
+        None,
     )
     .await;
 
@@ -1146,6 +1150,8 @@ async fn main() -> Result<()> {
 
             // Signal handler flags (shared across all iterations)
             let signal_stop = Arc::new(AtomicBool::new(false));
+            #[cfg(feature = "web-monitoring")]
+            let local_api_failed = Arc::new(AtomicBool::new(false));
 
             // Spawn signal handler tasks
             #[cfg(unix)]
@@ -1229,9 +1235,27 @@ async fn main() -> Result<()> {
                 let monitor_token = cancel_token.clone();
                 let monitor_force = force_stop_flag.clone();
                 let monitor_signal = signal_stop.clone();
+                #[cfg(feature = "web-monitoring")]
+                let monitor_api_failure = local_api_failed.clone();
+                #[cfg(feature = "web-monitoring")]
+                let api_failure_token = started_api
+                    .as_ref()
+                    .map(|(handle, _)| handle.failure_token());
+                #[cfg(feature = "web-monitoring")]
+                let monitor_api_token = api_failure_token.clone();
                 let monitor_handle = tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        #[cfg(feature = "web-monitoring")]
+                        if monitor_api_token
+                            .as_ref()
+                            .is_some_and(|token| token.is_cancelled())
+                        {
+                            error!("Local API listener failed, cancelling orchestrator");
+                            monitor_api_failure.store(true, Ordering::SeqCst);
+                            monitor_token.cancel();
+                            break;
+                        }
                         if monitor_signal.load(Ordering::SeqCst)
                             || monitor_force.load(Ordering::SeqCst)
                         {
@@ -1253,6 +1277,18 @@ async fn main() -> Result<()> {
                 // Cancel monitor task
                 monitor_handle.abort();
 
+                #[cfg(feature = "web-monitoring")]
+                if api_failure_token
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+                {
+                    local_api_failed.store(true, Ordering::SeqCst);
+                }
+                #[cfg(feature = "web-monitoring")]
+                if local_api_failed.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 // After orchestrator completes, update state
                 run_state.store(0, Ordering::SeqCst); // Stopped
 
@@ -1267,6 +1303,15 @@ async fn main() -> Result<()> {
                         // Wait for retry request in error state
                         // Keep checking restart_requested flag until user requests retry or signals stop
                         loop {
+                            #[cfg(feature = "web-monitoring")]
+                            if api_failure_token
+                                .as_ref()
+                                .is_some_and(|token| token.is_cancelled())
+                            {
+                                local_api_failed.store(true, Ordering::SeqCst);
+                                break;
+                            }
+
                             // Check if restart was requested
                             if restart_requested.load(Ordering::SeqCst) {
                                 info!("Retry requested after error, will restart orchestrator");
@@ -1294,6 +1339,11 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                #[cfg(feature = "web-monitoring")]
+                if local_api_failed.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 // Check if restart was requested (Start/Retry from web UI or post-error/stop retry)
                 if restart_requested.swap(false, Ordering::SeqCst) {
                     info!("Restarting orchestrator due to web control request");
@@ -1317,6 +1367,12 @@ async fn main() -> Result<()> {
             #[cfg(feature = "web-monitoring")]
             if let Some((handle, _)) = started_api {
                 handle.shutdown().await;
+            }
+            #[cfg(feature = "web-monitoring")]
+            if local_api_failed.load(Ordering::SeqCst) {
+                return Err(error::OrchestratorError::AgentCommand(
+                    "the local API listener failed; the owner shut down".to_string(),
+                ));
             }
         }
 
