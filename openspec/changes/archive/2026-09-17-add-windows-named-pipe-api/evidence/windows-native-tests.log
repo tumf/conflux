@@ -215,4 +215,3 @@ test client_status_reaches_the_repository_route_rather_than_refusing_the_platfor
 test transport_named_pipe_may_register_callback_argv_and_tcp_may_not ... ok
 
 test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.06s
-

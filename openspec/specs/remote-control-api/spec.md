@@ -818,11 +818,11 @@ This compatibility surface MUST include a minimal typed owner execution contract
 
 ### Requirement: Client observation does not alter API semantics
 
-Serving the local client MUST reuse the existing `/api/v2` router, DTOs, optimistic revision rules, idempotent command records, and shared operator application transaction. The API MUST NOT add a second orchestration path, client-specific hidden mutation, or durable run record solely for `cflx client`.
+Serving the local client over Unix-domain socket or Windows Named Pipe MUST reuse the existing `/api/v2` router, DTOs, optimistic revision rules, idempotent command records, shared operator application transaction, authentication, response bounds, and event stream. The API MUST NOT add a second orchestration path, platform-specific command semantics, client-specific hidden mutation, or durable run record solely for `cflx client`.
 
 #### Scenario: Client controls use ordinary typed commands
 
-**Given**: the client changes marks or explicitly requests Start, Stop, or ForceStop
+**Given**: the client changes marks or explicitly requests Start, Stop, or ForceStop over either supported platform-local transport
 **When**: it submits a mutation to the owner
 **Then**: every mutation appears as an ordinary v2 command record
 **And**: each command uses the same shared operator intent as the equivalent TUI control
@@ -831,17 +831,19 @@ Serving the local client MUST reuse the existing `/api/v2` router, DTOs, optimis
 
 #### Scenario: Status and wait are read only
 
-**Given**: a client invokes client status or wait
+**Given**: a client invokes client status or wait over Unix-domain socket or Windows Named Pipe
 **When**: it reads snapshots, execution status, events, and repository evidence
 **Then**: no v2 command record is created by those operations
 **And**: no process-local mark, queue, scheduler, resolver, cancellation, or mode state changes because of observation
 
 #### Scenario: Proposal subscriptions are observability only
 
-**Given**: a client sets, reads, or clears proposal subscriptions
+**Given**: a client sets, reads, or clears proposal subscriptions over an owner-only local transport
 **When**: the subscription operation settles
 **Then**: no workflow command record is created
 **And**: state revision, marks, queue intent, scheduler state, mode, and workflow routing remain unchanged
+
+<!-- Expected canonical result after archive: Unix and Windows local clients share one /api/v2 semantic contract; only endpoint creation and stream connection vary by platform. -->
 
 ### Requirement: Owner-scoped execution identity
 
@@ -883,14 +885,14 @@ Execution identity is observability-only. It MUST NOT authorize commands or affe
 
 ### Requirement: Execution-sink remote resources
 
-The owner MUST expose authenticated `GET`, `PUT`, and `DELETE /api/v2/executions/{execution_id}/sink` resources outside the closed workflow command registry. Every request, including inspection, MUST require and validate the exact `(instance_id, execution_id, change_id)` binding. These identifiers are readable through authenticated resources, so the binding is a coherence check rather than access control. Registered argv MUST be returned only to a request that arrived on the owner Unix socket. Sink operations MUST create no workflow command record, require no `expected_revision` or idempotency key, and MUST NOT advance `state_revision` or mutate orchestration state.
+The owner MUST expose authenticated `GET`, `PUT`, and `DELETE /api/v2/executions/{execution_id}/sink` resources outside the closed workflow command registry. Every request, including inspection, MUST require and validate the exact `(instance_id, execution_id, change_id)` binding. These identifiers are readable through authenticated resources, so the binding is a coherence check rather than access control. Registered argv MUST be returned only to a request that arrived on the owner-only local transport. Sink operations MUST create no workflow command record, require no `expected_revision` or idempotency key, and MUST NOT advance `state_revision` or mutate orchestration state.
 
-Capabilities MUST advertise execution-sink support, execution status MUST expose the current execution ID, and the generated OpenAPI contract MUST describe these resources and schemas. Clients that reach an older owner without this capability MUST fail with a typed unsupported-owner outcome. Sink mutation MUST be accepted only over the owner Unix socket; TCP mutation MUST fail with a typed refusal even when bearer authentication succeeds.
+Capabilities MUST advertise execution-sink support, execution status MUST expose the current execution ID, and the generated OpenAPI contract MUST describe these resources and schemas. Clients that reach an older owner without this capability MUST fail with a typed unsupported-owner outcome. Sink mutation MUST be accepted only over the owner-only local transport; TCP mutation MUST fail with a typed refusal even when bearer authentication succeeds.
 
 #### Scenario: Sink registration is not a workflow command
 
 - **GIVEN** an admitted execution and a coherent owner revision
-- **WHEN** a local Unix-socket client registers a sink with its exact binding
+- **WHEN** an owner-only local client registers a sink with its exact binding
 - **THEN** the sink is attached without creating a command record
 - **AND** `state_revision`, queue intent, scheduler state, execution marks, and workflow routing are unchanged
 
@@ -1029,7 +1031,7 @@ A subscription MAY be registered before a proposal is admitted. Whenever that pr
 
 Replacing a subscription MUST apply the new argv and blocked setting to the current undelivered live or terminal episode and to future episodes. Clearing MUST cancel pending delivery for named proposals but MUST NOT terminate a callback process already started. Delivery dedupe is keyed by execution episode and event edge, not subscription generation: replacing, clearing, or clearing then setting MUST NOT redeliver a terminal event already delivered by this owner for that execution. Setting after typed terminal settlement MUST immediately attempt the latest terminal event only when this owner has not already delivered that event. The owner MUST retain at most the latest terminal episode and its delivery history per proposal and discard them on owner exit. Registration before any execution MUST NOT synthesize an execution ID, start work, mutate marks or queue intent, or promise admission. Owner restart invalidates all proposal subscriptions and does not promise delivery from the lost process.
 
-The owner MUST expose authenticated `GET`, `PUT`, and `DELETE /api/v2/proposals/{change_id}/subscription` outside the closed workflow command registry. Every request, inspection included, MUST carry and validate the complete `(instance_id, change_id)` binding; partial binding is refused and a mismatched instance returns typed `owner_restarted`. Capabilities MUST advertise proposal-subscription support, clients reaching an older owner MUST return typed `unsupported_owner`, and generated OpenAPI MUST describe the resources and schemas. Set and clear are accepted only over the owner Unix socket. Get over TCP MAY report presence, current execution state, and delivery history but MUST omit argv; argv is returned only over the Unix socket. Subscription operations create no workflow command record and do not advance `state_revision`.
+The owner MUST expose authenticated `GET`, `PUT`, and `DELETE /api/v2/proposals/{change_id}/subscription` outside the closed workflow command registry. Every request, inspection included, MUST carry and validate the complete `(instance_id, change_id)` binding; partial binding is refused and a mismatched instance returns typed `owner_restarted`. Capabilities MUST advertise proposal-subscription support, clients reaching an older owner MUST return typed `unsupported_owner`, and generated OpenAPI MUST describe the resources and schemas. Set and clear are accepted only over the owner-only local transport. Get over TCP MAY report presence, current execution state, and delivery history but MUST omit argv; argv is returned only over an owner-only local transport. Subscription operations create no workflow command record and do not advance `state_revision`.
 
 Callback argv MUST be executed directly without shell interpretation and MUST retain existing completion-sink limits, scrubbed environment, private artifact ownership, bounded output and duration, delivery dedupe, failure isolation, and secret-free diagnostics. Callback success or failure MUST NOT alter workflow outcome.
 
@@ -1160,3 +1162,60 @@ The CLI MUST expose `cflx client force-stop-change <change-id> --json` with oper
 - **THEN** its process-wide semantics and target-list refusal remain unchanged
 - **AND** `force_stop_change` remains the only target-scoped control that bypasses the graceful SIGTERM escalation window
 - **AND** `stop_and_dequeue` retains its existing cancel-confirm-dequeue contract
+
+### Requirement: Owner-only Windows Named Pipe transport
+
+On Windows, a web-monitoring-enabled owner MUST serve the existing HTTP `/api/v2` router over a repository-scoped Named Pipe by default, without requiring the browser-facing TCP listener. The pipe name MUST be derived deterministically from the current user identity and normalized canonical Git common directory without embedding the raw SID or repository path. Linked worktrees of one repository MUST derive the same name, while distinct repositories or users MUST derive different names.
+
+Every pipe instance MUST be created with an owner-only DACL at creation time and MUST reject remote clients. The initial server instance MUST request exclusive first-instance ownership and fail owner startup when the name is already owned. Named Pipe startup and shutdown MUST participate in the same all-or-nothing listener lifecycle as Unix and TCP listeners.
+
+#### Scenario: Windows owner serves the shared API without TCP
+
+**Given**: a Windows owner starts in a Git repository with web monitoring support and without `--web`
+**When**: local API listeners are created
+**Then**: the owner binds its deterministic Named Pipe
+**And**: the pipe serves the same `/api/v2` router, DTOs, state, commands, subscriptions, authentication, and revision rules as the Unix listener
+**And**: no TCP listener is required or inferred
+
+#### Scenario: Repository identity determines one endpoint
+
+**Given**: a repository has a main worktree and linked worktrees on Windows
+**When**: each worktree resolves the default local API endpoint for the same current user
+**Then**: every worktree derives the same pipe name
+**And**: a different repository or current user derives a different pipe name
+**And**: no durable endpoint registry is written
+
+#### Scenario: Pipe creation is owner-only and race-free
+
+**Given**: a Windows owner prepares its first Named Pipe instance
+**When**: it creates the pipe
+**Then**: a DACL granting access only to the current user is supplied at handle creation
+**And**: remote clients are rejected
+**And**: first-instance ownership is requested before orchestration starts
+**And**: an existing owner or endpoint collision causes hard startup refusal instead of replacement or TCP fallback
+
+#### Scenario: Graceful shutdown closes the Windows listener
+
+**Given**: a Windows owner has a pending accept and connected local API requests
+**When**: its local API handle is shut down
+**Then**: new accepts stop
+**And**: pending and active listener-owned tasks are awaited or cancelled under the existing shutdown contract
+**And**: a later owner may acquire the first pipe instance cleanly
+
+### Requirement: Owner-only local transport equivalence
+
+The owner MUST classify both its mode-`0600` Unix-domain socket and its owner-only Windows Named Pipe as trusted local API transports. Any `/api/v2` operation whose security contract requires the owner-only local transport, including proposal-subscription or completion-sink argv storage and disclosure, MUST permit either trusted local transport and MUST continue refusing TCP. The classification MUST be centralized so security-sensitive handlers cannot diverge by matching one platform directly.
+
+#### Scenario: Sensitive callback argv is allowed over Named Pipe
+
+**Given**: a request arrives over the owner's secured Windows Named Pipe
+**When**: a client sets, gets, or clears a proposal subscription or completion sink whose contract permits owner-only local access
+**Then**: the handler applies the same authorization and disclosure behavior as over the Unix socket
+**And**: it uses the same DTO, revision, validation, and settlement logic
+
+#### Scenario: TCP remains untrusted
+
+**Given**: the same request arrives over TCP, including loopback TCP with valid bearer authentication
+**When**: it attempts an operation restricted to owner-only local transport
+**Then**: it is refused with `transport_not_permitted`
+**And**: no stored callback argv is disclosed or mutated
