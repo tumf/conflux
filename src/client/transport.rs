@@ -1,4 +1,4 @@
-//! Bounded HTTP/1.1 over a Unix domain socket, and nothing else.
+//! Bounded HTTP/1.1 over the owner's platform-local transport, and nothing else.
 //!
 //! `/api/v2` is served by axum over a plain byte stream, so speaking to it needs
 //! a request line, a few headers, and a response parser — not a general HTTP
@@ -7,21 +7,34 @@
 //! ceiling before deserialization, and no redirect, proxy, cookie, or retry
 //! behavior at all.
 //!
+//! # One framing, two endpoints
+//!
+//! A Unix-domain socket and a Windows Named Pipe are both owner-only local byte
+//! streams, and the bytes the client writes onto them are identical. So only
+//! [`LocalApiClient::connect`] is platform-specific: request construction, token
+//! validation, the timeout budget, the bounded read, HTTP parsing, chunk
+//! decoding, event-marker detection, and error mapping are one implementation
+//! over `AsyncRead + AsyncWrite`. Two copies of that would be two chances to
+//! disagree about the response ceiling.
+//!
 //! Security posture:
 //!
-//! * the socket path and every query value are data, never shell fragments;
+//! * the endpoint and every query value are data, never shell fragments;
 //! * the bearer token is read from a named environment variable, is validated as
 //!   an HTTP header value *before* a connection is opened, is sent only in the
 //!   `Authorization` header, and is never placed in a message;
 //! * a response is refused once it exceeds [`MAX_RESPONSE_BYTES`], before any
 //!   parse, so a hostile or broken peer cannot make the client allocate without
-//!   bound.
+//!   bound;
+//! * on Windows the pipe namespace is machine-global, so deriving the right name
+//!   proves nothing about who answered. The connected handle's owner SID is
+//!   checked against this process's own before a single request byte is written.
 
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Hard ceiling on one response, headers included.
 ///
@@ -36,15 +49,68 @@ pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// deadline on top of this.
 pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Where one owner's local `/api/v2` listener is.
+///
+/// A compile-time enum rather than a runtime one: a build has exactly one local
+/// transport, and a variant the platform cannot connect to would be a branch
+/// that exists only to be unreachable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalEndpoint {
+    /// `${GIT_COMMON_DIR}/cflx-api.sock`, or an explicit `--unix-socket` path.
+    #[cfg(unix)]
+    Unix(PathBuf),
+    /// `\\.\pipe\cflx-v2-<digest>` for this user and this repository.
+    #[cfg(windows)]
+    NamedPipe(String),
+}
+
+impl LocalEndpoint {
+    /// How this endpoint is named in diagnostics and in `status` detail.
+    ///
+    /// Safe to print: a socket path is a filesystem location, and a pipe name is
+    /// a digest that publishes neither the user's SID nor the repository path.
+    pub fn label(&self) -> String {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(path) => path.display().to_string(),
+            #[cfg(windows)]
+            Self::NamedPipe(name) => name.clone(),
+        }
+    }
+
+    /// The socket path, when this build's endpoint is a Unix socket.
+    #[cfg(unix)]
+    pub fn socket_path(&self) -> &Path {
+        match self {
+            Self::Unix(path) => path,
+        }
+    }
+}
+
+/// The connected stream type for this platform's local transport.
+#[cfg(unix)]
+type LocalStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type LocalStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
 /// Why a request could not be completed.
 ///
-/// Split by *what a caller should do*: `NotListening` means no owner, `Timeout`
+/// Split by *what a caller should do*: `NotListening` means no owner,
+/// `UntrustedPeer` means something answered and it is not this owner, `Timeout`
 /// and `Io` mean the exchange failed, and `Protocol`/`TooLarge` mean the peer
 /// answered something this client refuses to interpret.
 #[derive(Debug)]
 pub enum TransportError {
-    /// Nothing is listening at the path, or the entry is not a socket.
-    NotListening { path: PathBuf, detail: String },
+    /// Nothing is listening at the endpoint, or the entry is not one.
+    NotListening { endpoint: String, detail: String },
+    /// Something answered the endpoint, but it is not this user's owner.
+    ///
+    /// Never collapsed into `NotListening`: "no owner is running" invites a
+    /// caller to start one, and "another principal owns this name" must not.
+    /// Only the Named Pipe transport can raise it — a Unix socket's access
+    /// control is the filesystem's, decided before `connect` returns.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    UntrustedPeer(String),
     /// The exchange exceeded [`EXCHANGE_TIMEOUT`].
     Timeout,
     /// The connection failed mid-exchange.
@@ -58,11 +124,10 @@ pub enum TransportError {
 impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotListening { path, detail } => write!(
-                f,
-                "no Conflux owner is listening at '{}': {detail}",
-                path.display()
-            ),
+            Self::NotListening { endpoint, detail } => {
+                write!(f, "no Conflux owner is listening at '{endpoint}': {detail}")
+            }
+            Self::UntrustedPeer(detail) => write!(f, "{detail}"),
             Self::Timeout => write!(f, "the owner did not answer within {EXCHANGE_TIMEOUT:?}"),
             Self::Io(detail) => write!(f, "the connection to the owner failed: {detail}"),
             Self::Protocol(detail) => write!(f, "the owner's response was not usable: {detail}"),
@@ -153,10 +218,10 @@ pub fn validate_token(value: &str) -> Result<(), TokenRejection> {
     Ok(())
 }
 
-/// A client bound to one owner's socket and one credential source.
+/// A client bound to one owner's local endpoint and one credential source.
 #[derive(Clone)]
-pub struct UnixApiClient {
-    socket: PathBuf,
+pub struct LocalApiClient {
+    endpoint: LocalEndpoint,
     /// Bearer token, resolved once from the named environment variable.
     ///
     /// Held rather than re-read so a mid-run environment change cannot make two
@@ -169,10 +234,10 @@ pub struct UnixApiClient {
 /// A derived one would print the bearer token, and "never emitted" has to hold
 /// for a panic message and a stray `{:?}` too, not only for the paths someone
 /// remembered to check.
-impl std::fmt::Debug for UnixApiClient {
+impl std::fmt::Debug for LocalApiClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnixApiClient")
-            .field("socket", &self.socket)
+        f.debug_struct("LocalApiClient")
+            .field("endpoint", &self.endpoint.label())
             .field(
                 "token",
                 &if self.token.is_some() {
@@ -185,23 +250,23 @@ impl std::fmt::Debug for UnixApiClient {
     }
 }
 
-impl UnixApiClient {
-    /// Bind a client to a socket path and an optional bearer token.
+impl LocalApiClient {
+    /// Bind a client to a local endpoint and an optional bearer token.
     ///
     /// Fallible because the token is validated here rather than at the write:
     /// a client that exists is a client whose credential can be framed, so no
     /// caller can reach [`Self::encode_request`] with a value that would inject
     /// a header.
-    pub fn new(socket: PathBuf, token: Option<String>) -> Result<Self, TokenRejection> {
+    pub fn new(endpoint: LocalEndpoint, token: Option<String>) -> Result<Self, TokenRejection> {
         if let Some(token) = &token {
             validate_token(token)?;
         }
-        Ok(Self { socket, token })
+        Ok(Self { endpoint, token })
     }
 
-    /// The socket this client talks to.
-    pub fn socket(&self) -> &Path {
-        &self.socket
+    /// The endpoint this client talks to.
+    pub fn endpoint(&self) -> &LocalEndpoint {
+        &self.endpoint
     }
 
     /// Whether a bearer token will be presented.
@@ -261,13 +326,26 @@ impl UnixApiClient {
         path_and_query: &str,
         body: Option<&str>,
     ) -> Result<HttpResponse, TransportError> {
-        let mut stream = UnixStream::connect(&self.socket).await.map_err(|error| {
-            TransportError::NotListening {
-                path: self.socket.clone(),
-                detail: error.to_string(),
-            }
-        })?;
+        let mut stream = self.connect().await?;
+        self.exchange_over(&mut stream, method, path_and_query, body)
+            .await
+    }
 
+    /// Write one request and read one bounded response, over any byte stream.
+    ///
+    /// Generic on purpose: this is the whole wire behavior both platforms share,
+    /// and making it independent of the connection type is what lets it be
+    /// proven over an in-memory duplex rather than only against a live owner.
+    async fn exchange_over<S>(
+        &self,
+        stream: &mut S,
+        method: &str,
+        path_and_query: &str,
+        body: Option<&str>,
+    ) -> Result<HttpResponse, TransportError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let request = self.encode_request(method, path_and_query, body);
         stream
             .write_all(request.as_bytes())
@@ -299,11 +377,120 @@ impl UnixApiClient {
         parse_response(&raw)
     }
 
+    /// Open one connection to the owner's Unix socket.
+    #[cfg(unix)]
+    async fn connect(&self) -> Result<LocalStream, TransportError> {
+        let path = self.endpoint.socket_path();
+        tokio::net::UnixStream::connect(path)
+            .await
+            .map_err(|error| TransportError::NotListening {
+                endpoint: path.display().to_string(),
+                detail: error.to_string(),
+            })
+    }
+
+    /// Open one connection to the owner's Named Pipe, and prove it is the owner.
+    ///
+    /// Two things happen here that have no Unix counterpart, because the pipe
+    /// namespace is machine-global rather than filesystem-scoped:
+    ///
+    /// * the pipe is opened with identification-only security quality of
+    ///   service, so a hostile server that did win the name cannot impersonate
+    ///   this process beyond reading its identity;
+    /// * the connected handle's owner SID is compared with this process's token
+    ///   user SID *before* any request byte is written, so a credential and a
+    ///   command never reach a peer that is not this user's owner.
+    ///
+    /// `ERROR_PIPE_BUSY` is the one retryable error: every instance is momentarily
+    /// connected while the accept loop creates its replacement. The retry is
+    /// bounded by the caller's own budget — [`EXCHANGE_TIMEOUT`] for a request,
+    /// the caller's budget for an event stream — rather than by a second clock
+    /// here, so no transport wait can outlive the operation that asked for it.
+    #[cfg(windows)]
+    async fn connect(&self) -> Result<LocalStream, TransportError> {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        /// `SECURITY_IDENTIFICATION` from `winnt.h`: the server may learn who
+        /// this client is and may not act as it. Tokio adds
+        /// `SECURITY_SQOS_PRESENT` itself.
+        const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+        /// The Win32 errors that mean "no owner here", as opposed to "an owner
+        /// is here and something went wrong".
+        const ERROR_FILE_NOT_FOUND: i32 = 2;
+        const ERROR_PATH_NOT_FOUND: i32 = 3;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_PIPE_BUSY: i32 = 231;
+        /// How long to wait before re-opening a momentarily busy pipe.
+        const BUSY_RETRY: Duration = Duration::from_millis(20);
+
+        let LocalEndpoint::NamedPipe(name) = &self.endpoint;
+        loop {
+            let opened = ClientOptions::new()
+                .security_qos_flags(SECURITY_IDENTIFICATION)
+                .open(name.as_str());
+            return match opened {
+                Ok(client) => {
+                    self.verify_server_owner(&client)?;
+                    Ok(client)
+                }
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    tokio::time::sleep(BUSY_RETRY).await;
+                    continue;
+                }
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(ERROR_FILE_NOT_FOUND) | Some(ERROR_PATH_NOT_FOUND)
+                    ) =>
+                {
+                    Err(TransportError::NotListening {
+                        endpoint: name.clone(),
+                        detail: error.to_string(),
+                    })
+                }
+                Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                    Err(TransportError::UntrustedPeer(format!(
+                        "the Named Pipe '{name}' exists but refused this process: it belongs to \
+                         another principal, so no request was sent"
+                    )))
+                }
+                Err(error) => Err(TransportError::Io(error.to_string())),
+            };
+        }
+    }
+
+    /// Refuse a connected pipe whose owner is not this process's user.
+    #[cfg(windows)]
+    fn verify_server_owner(
+        &self,
+        client: &tokio::net::windows::named_pipe::NamedPipeClient,
+    ) -> Result<(), TransportError> {
+        let expected = crate::web::named_pipe::current_user_sid().map_err(|error| {
+            TransportError::UntrustedPeer(format!(
+                "the connected Named Pipe owner could not be checked against this process: {error}"
+            ))
+        })?;
+        let observed = crate::web::named_pipe::handle_owner_sid(client).map_err(|error| {
+            TransportError::UntrustedPeer(format!(
+                "the connected Named Pipe's owner could not be read, so it was not trusted: \
+                 {error}"
+            ))
+        })?;
+        if expected != observed {
+            return Err(TransportError::UntrustedPeer(format!(
+                "the Named Pipe '{}' is owned by '{observed}', not by this process's user \
+                 '{expected}'. No request was sent, and no other transport was tried",
+                self.endpoint.label()
+            )));
+        }
+        Ok(())
+    }
+
     /// Build the request bytes.
     ///
     /// Separate from the I/O so the exact wire form — including the fact that
     /// the token appears only in `Authorization` — is assertable without a
-    /// socket.
+    /// connection.
     pub fn encode_request(&self, method: &str, path_and_query: &str, body: Option<&str>) -> String {
         let mut request = format!(
             "{method} {path_and_query} HTTP/1.1\r\n\
@@ -466,7 +653,7 @@ pub enum Wake {
 const STATE_MARKER: &str = "\"category\":\"state\"";
 const GAP_MARKER: &str = "\"category\":\"gap\"";
 
-impl UnixApiClient {
+impl LocalApiClient {
     /// Wait for the owner to publish activity, up to `budget`.
     ///
     /// Opens the ordered event stream at the caller's cursor and closes it as
@@ -500,13 +687,25 @@ impl UnixApiClient {
             "/api/v2/events?after_sequence={after_sequence}&instance_id={}",
             encode_query_value(instance_id)
         );
-        let mut stream = UnixStream::connect(&self.socket).await.map_err(|error| {
-            TransportError::NotListening {
-                path: self.socket.clone(),
-                detail: error.to_string(),
-            }
-        })?;
-        let request = self.encode_request("GET", &path, None);
+        let mut stream = self.connect().await?;
+        self.watch_stream(&mut stream, &path).await
+    }
+
+    /// Read the event stream until a marker appears, over any byte stream.
+    ///
+    /// Shared with the request path for the same reason the exchange is: the
+    /// wake markers, the retained-tail bound, and the "EOF means idle" rule are
+    /// transport-independent, and a second copy for Windows would be a second
+    /// place for them to drift.
+    async fn watch_stream<S>(
+        &self,
+        stream: &mut S,
+        path_and_query: &str,
+    ) -> Result<Wake, TransportError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let request = self.encode_request("GET", path_and_query, None);
         stream
             .write_all(request.as_bytes())
             .await
@@ -560,8 +759,23 @@ pub fn encode_query_value(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn client() -> UnixApiClient {
-        UnixApiClient::new(PathBuf::from("/tmp/cflx.sock"), Some("s3cret".to_string()))
+    /// An endpoint of whichever kind this build actually connects to.
+    ///
+    /// The assertions below are about request framing and response parsing,
+    /// which are the same on both platforms; only the label differs.
+    fn endpoint() -> LocalEndpoint {
+        #[cfg(unix)]
+        {
+            LocalEndpoint::Unix(PathBuf::from("/tmp/cflx.sock"))
+        }
+        #[cfg(windows)]
+        {
+            LocalEndpoint::NamedPipe(r"\\.\pipe\cflx-v2-test".to_string())
+        }
+    }
+
+    fn client() -> LocalApiClient {
+        LocalApiClient::new(endpoint(), Some("s3cret".to_string()))
             .expect("a plain token is a valid header value")
     }
 
@@ -586,15 +800,14 @@ mod tests {
         assert!(rendered.contains("<redacted>"), "{rendered}");
         let anonymous = format!(
             "{:?}",
-            UnixApiClient::new(PathBuf::from("/tmp/cflx.sock"), None).expect("no token")
+            LocalApiClient::new(endpoint(), None).expect("no token")
         );
         assert!(anonymous.contains("<none>"), "{anonymous}");
     }
 
     #[test]
     fn a_tokenless_client_sends_no_authorization_header() {
-        let anonymous =
-            UnixApiClient::new(PathBuf::from("/tmp/cflx.sock"), None).expect("no token");
+        let anonymous = LocalApiClient::new(endpoint(), None).expect("no token");
         let request = anonymous.encode_request("GET", "/api/v2/health", None);
         assert!(!request.contains("Authorization"));
         assert!(!anonymous.has_token());
@@ -606,6 +819,13 @@ mod tests {
         assert!(request.contains("Content-Type: application/json\r\n"));
         assert!(request.contains("Content-Length: 7\r\n"));
         assert!(request.ends_with("\r\n\r\n{\"a\":1}"));
+    }
+
+    #[test]
+    fn an_endpoint_labels_itself_without_disclosing_a_credential() {
+        let label = endpoint().label();
+        assert!(!label.is_empty());
+        assert!(!label.contains("s3cret"));
     }
 
     #[test]
@@ -666,12 +886,153 @@ mod tests {
         assert_eq!(encode_query_value("../etc"), "..%2Fetc");
     }
 
+    // ------------------------------------------------------------------
+    // The shared framing, proven without a socket or a pipe.
+    //
+    // `exchange_over` and `watch_stream` are the whole wire behavior both
+    // platforms share, so an in-memory duplex is the honest unit boundary:
+    // what these assert is that one stream of bytes in produces one bounded
+    // result out, which is exactly what must not vary by transport.
+    // ------------------------------------------------------------------
+
+    /// Serve `response` to whatever is written, and return what was written.
+    async fn round_trip(
+        client: &LocalApiClient,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        response: &'static [u8],
+    ) -> (String, Result<HttpResponse, TransportError>) {
+        let (mut ours, mut theirs) = tokio::io::duplex(8 * 1024);
+        let peer = tokio::spawn(async move {
+            let mut request = Vec::new();
+            // The client writes its whole request, then waits, so reading a
+            // bounded amount and answering is enough to complete the exchange.
+            let mut chunk = [0u8; 4096];
+            let read = theirs.read(&mut chunk).await.expect("request bytes");
+            request.extend_from_slice(&chunk[..read]);
+            theirs.write_all(response).await.expect("response bytes");
+            theirs
+                .shutdown()
+                .await
+                .expect("close like Connection: close");
+            String::from_utf8(request).expect("UTF-8 request")
+        });
+        let result = client.exchange_over(&mut ours, method, path, body).await;
+        (peer.await.expect("peer task"), result)
+    }
+
+    #[tokio::test]
+    async fn one_framing_serves_any_local_byte_stream() {
+        let (request, result) = round_trip(
+            &client(),
+            "POST",
+            "/api/v2/commands",
+            Some(r#"{"a":1}"#),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n{\"b\"",
+        )
+        .await;
+
+        assert!(
+            request.starts_with("POST /api/v2/commands HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(request.contains("Connection: close\r\n"), "{request}");
+        assert!(
+            request.contains("Authorization: Bearer s3cret\r\n"),
+            "{request}"
+        );
+        assert!(request.ends_with(r#"{"a":1}"#), "{request}");
+
+        let response = result.expect("the duplex peer answered");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"{\"b\"");
+    }
+
+    #[tokio::test]
+    async fn the_response_ceiling_applies_to_every_local_transport() {
+        // Declared far above the ceiling and delivered incrementally: the
+        // refusal has to happen while reading, not after allocating.
+        static HUGE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n";
+        let (mut ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let peer = tokio::spawn(async move {
+            let mut chunk = [0u8; 4096];
+            let _ = theirs.read(&mut chunk).await;
+            theirs.write_all(HUGE).await.expect("head");
+            let filler = vec![b'x'; 64 * 1024];
+            // More than the ceiling, written until the client gives up.
+            for _ in 0..(MAX_RESPONSE_BYTES / filler.len() + 2) {
+                if theirs.write_all(&filler).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let result = client()
+            .exchange_over(&mut ours, "GET", "/api/v2/state", None)
+            .await;
+        assert!(
+            matches!(result, Err(TransportError::TooLarge)),
+            "{result:?}"
+        );
+        peer.abort();
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_wakes_on_the_same_markers_over_any_stream() {
+        for (frame, expected) in [
+            (
+                &b"HTTP/1.1 200 OK\r\n\r\ndata: {\"category\":\"state\"}\n\n"[..],
+                Wake::Activity,
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\n\r\ndata: {\"category\":\"gap\"}\n\n"[..],
+                Wake::Gap,
+            ),
+            (&b"HTTP/1.1 200 OK\r\n\r\n: keep-alive\n\n"[..], Wake::Idle),
+        ] {
+            let (mut ours, mut theirs) = tokio::io::duplex(8 * 1024);
+            let frame = frame.to_vec();
+            let peer = tokio::spawn(async move {
+                let mut chunk = [0u8; 4096];
+                let _ = theirs.read(&mut chunk).await;
+                let _ = theirs.write_all(&frame).await;
+                let _ = theirs.shutdown().await;
+            });
+            let wake = client()
+                .watch_stream(&mut ours, "/api/v2/events?after_sequence=0")
+                .await
+                .expect("the duplex peer answered");
+            assert_eq!(wake, expected);
+            let _ = peer.await;
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_absent_socket_reports_no_owner_rather_than_an_io_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let client = UnixApiClient::new(tmp.path().join("missing.sock"), None).expect("no token");
+        let client =
+            LocalApiClient::new(LocalEndpoint::Unix(tmp.path().join("missing.sock")), None)
+                .expect("no token");
         let error = client.get("/api/v2/health").await.expect_err("no owner");
         assert!(matches!(error, TransportError::NotListening { .. }));
+        assert!(error.to_string().contains("no Conflux owner is listening"));
+    }
+
+    /// An absent pipe is "no owner", exactly as an absent socket is.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_absent_pipe_reports_no_owner_rather_than_an_io_error() {
+        let client = LocalApiClient::new(
+            LocalEndpoint::NamedPipe(r"\\.\pipe\cflx-v2-nothing-is-here".to_string()),
+            None,
+        )
+        .expect("no token");
+        let error = client.get("/api/v2/health").await.expect_err("no owner");
+        assert!(
+            matches!(error, TransportError::NotListening { .. }),
+            "{error:?}"
+        );
         assert!(error.to_string().contains("no Conflux owner is listening"));
     }
 }

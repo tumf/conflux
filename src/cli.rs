@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
@@ -1030,9 +1030,15 @@ pub fn parse_process_local_id(value: &str) -> std::result::Result<String, String
     about = "Operate an existing Conflux owner without becoming one",
     long_about = "Client-only namespace for one existing repository owner.
 
-Connects to the owner's local /api/v2 Unix socket, which defaults to
-${GIT_COMMON_DIR}/cflx-api.sock — the same repository identity the orchestration
-lock uses, so every linked worktree of one repository reaches one owner.
+Connects to the owner's platform-local /api/v2 endpoint, derived from the same
+repository identity the orchestration lock uses, so every linked worktree of one
+repository reaches one owner:
+
+  Unix     ${GIT_COMMON_DIR}/cflx-api.sock, mode 0600
+  Windows  a Named Pipe scoped to the current user and this repository
+
+--project-dir is the portable selector on both. --unix-socket is a Unix-only
+low-level override and is absent from a Windows build's arguments.
 
 No client command acquires the repository lock, binds a listener, starts an
 orchestration run, launches a lifecycle adapter or an AI subprocess, or writes
@@ -1057,23 +1063,38 @@ EXAMPLES:
   cflx client subscribe get alpha --instance-id <owner-instance> --json
   cflx client subscribe clear alpha beta --instance-id <owner-instance> --json
   cflx client mcp
-  cflx client --unix-socket /tmp/cflx-api.sock status"
+  cflx client --project-dir /absolute/path/to/repo status
+  cflx client --unix-socket /tmp/cflx-api.sock status   # Unix only"
 )]
 pub struct ClientArgs {
     /// Absolute directory inside the project whose owner to talk to
     ///
-    /// The normal explicit route. Conflux resolves the directory's Git working
-    /// tree, then uses that project's canonical repository root as completion
-    /// evidence and `<git-common-dir>/cflx-api.sock` as the owner socket — so
-    /// one client invocation can name any project without knowing where its
-    /// socket lives. A linked worktree, a submodule, or a directory below the
+    /// The normal explicit route, and the portable one. Conflux resolves the
+    /// directory's Git working tree, then uses that project's canonical
+    /// repository root as completion evidence and its canonical Git common
+    /// directory to derive the owner endpoint — `<git-common-dir>/cflx-api.sock`
+    /// on Unix, this repository's current-user Named Pipe on Windows — so one
+    /// client invocation can name any project without knowing where its endpoint
+    /// lives. A linked worktree, a submodule, or a directory below the
     /// working-tree root all resolve. Conflicts with `--unix-socket`.
+    #[cfg(unix)]
     #[arg(
         long,
         value_name = "ABSOLUTE_PATH",
         global = true,
         conflicts_with = "unix_socket"
     )]
+    pub project_dir: Option<PathBuf>,
+
+    /// Absolute directory inside the project whose owner to talk to
+    ///
+    /// The normal explicit route. Conflux resolves the directory's Git working
+    /// tree, then uses that project's canonical repository root as completion
+    /// evidence and derives this repository's current-user Named Pipe from its
+    /// canonical Git common directory. A linked worktree, a submodule, or a
+    /// directory below the working-tree root all resolve.
+    #[cfg(not(unix))]
+    #[arg(long, value_name = "ABSOLUTE_PATH", global = true)]
     pub project_dir: Option<PathBuf>,
 
     /// Path to the owner's `/api/v2` Unix socket
@@ -1085,6 +1106,11 @@ pub struct ClientArgs {
     /// transport. Required when the working directory is not inside a Git
     /// repository and no `--project-dir` is given, because there is no
     /// repository identity to derive a default from.
+    ///
+    /// Unix only: a build for a platform without Unix-domain sockets does not
+    /// offer this option at all, so naming it is refused at parse time rather
+    /// than reinterpreted as some other endpoint.
+    #[cfg(unix)]
     #[arg(long, value_name = "PATH", global = true)]
     pub unix_socket: Option<PathBuf>,
 
@@ -1097,6 +1123,24 @@ pub struct ClientArgs {
 
     #[command(subcommand)]
     pub command: ClientCommands,
+}
+
+impl ClientArgs {
+    /// The explicit Unix socket route, where the platform has one.
+    ///
+    /// A method rather than a field read, so every caller of
+    /// `RouteSelector::from_inputs` stays one line of platform-independent code
+    /// instead of growing its own `#[cfg]`.
+    pub fn unix_socket_route(&self) -> Option<&Path> {
+        #[cfg(unix)]
+        {
+            self.unix_socket.as_deref()
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
 }
 
 /// Subcommands for `cflx client`.
@@ -1255,7 +1299,8 @@ pub enum ClientCommands {
     /// CFLX_CHANGE_ID, and CFLX_INSTANCE_ID.
     ///
     /// Setting and clearing store or remove an argv this owner will execute, so
-    /// they are accepted only over the owner's Unix socket; a TCP client is
+    /// they are accepted only over the owner's own local transport — its
+    /// mode-0600 Unix socket, or its secured Windows Named Pipe. A TCP client is
     /// refused with `transport_not_permitted` and is not told a registered argv
     /// on a read either.
     ///

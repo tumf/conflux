@@ -56,19 +56,19 @@ use clap::CommandFactory;
 
 #[cfg(feature = "web-monitoring")]
 pub mod completion;
-#[cfg(all(unix, feature = "web-monitoring"))]
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
 pub mod control;
-#[cfg(all(unix, feature = "web-monitoring"))]
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
 pub mod mcp;
 #[cfg(feature = "web-monitoring")]
 pub mod repo;
-#[cfg(all(unix, feature = "web-monitoring"))]
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
 mod session;
-#[cfg(all(unix, feature = "web-monitoring"))]
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
 pub mod subscribe;
-#[cfg(all(unix, feature = "web-monitoring"))]
-mod transport;
-#[cfg(all(unix, feature = "web-monitoring"))]
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
+pub mod transport;
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
 mod wait;
 
 use envelope::{Operation, Outcome, ResultEnvelope};
@@ -105,8 +105,16 @@ pub enum RouteSelector {
     #[default]
     Default,
     /// An absolute directory inside the project's Git working tree.
+    ///
+    /// The portable selector: it resolves on every platform, and only the last
+    /// step of the derivation — socket path or pipe name — differs.
     Project(PathBuf),
     /// An explicit owner `/api/v2` Unix socket.
+    ///
+    /// Unix-only in practice. The CLI omits `--unix-socket` from a Windows
+    /// build's argument surface and the MCP tools omit it from a Windows
+    /// build's schema, so nothing can construct this there; the variant stays
+    /// platform-independent data so the selector type itself does not fork.
     Socket(PathBuf),
 }
 
@@ -188,17 +196,19 @@ impl RouteSelector {
     }
 }
 
-/// One project's owner socket and the repository that proves completion.
+/// One project's owner endpoint and the repository that proves completion.
 ///
 /// Both come from the *same* selected project on purpose. A route that took the
-/// socket from one repository and the completion evidence from another would
+/// endpoint from one repository and the completion evidence from another would
 /// certify project A's archive as project B's success, which is the exact
 /// failure truthful `wait` exists to prevent.
-#[cfg(all(unix, feature = "web-monitoring"))]
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRoute {
-    /// `<git-common-dir>/cflx-api.sock` for the selected project.
-    pub socket: PathBuf,
+    /// The platform-local owner endpoint for the selected project:
+    /// `<git-common-dir>/cflx-api.sock` on Unix, the current-user/repository
+    /// scoped Named Pipe on Windows.
+    pub endpoint: transport::LocalEndpoint,
     /// The selected project's canonical working-tree root.
     pub repo_root: PathBuf,
 }
@@ -206,14 +216,17 @@ pub struct ProjectRoute {
 /// Resolve one absolute project directory into an owner route.
 ///
 /// Read-only by construction: it stats a path, asks Git where the working tree
-/// and the common directory are, and derives a socket path. It creates nothing,
-/// starts no owner, and never infers a project from a change ID.
+/// and the common directory are, and derives the platform-local endpoint. It
+/// creates nothing, starts no owner, and never infers a project from a change
+/// ID.
 ///
 /// A linked worktree, a submodule, a symlinked path, and a directory below the
 /// working-tree root all resolve, because the common directory is derived the
 /// same way the repository lock derives it — and the lock is what guarantees
-/// there is only one default owner to reach.
-#[cfg(all(unix, feature = "web-monitoring"))]
+/// there is only one default owner to reach. That is what makes `--project-dir`
+/// the portable selector: the *derivation* is one rule on both platforms, and
+/// only its last step differs.
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
 pub fn resolve_project(project_dir: &Path) -> Result<ProjectRoute, RouteError> {
     if !project_dir.is_absolute() {
         return Err(RouteError::new(format!(
@@ -253,9 +266,30 @@ pub fn resolve_project(project_dir: &Path) -> Result<ProjectRoute, RouteError> {
         ))
     })?;
     Ok(ProjectRoute {
-        socket: crate::web::unix_socket::default_socket_path(&common_dir),
+        endpoint: local_endpoint_for(&common_dir)?,
         repo_root,
     })
+}
+
+/// The platform-local owner endpoint for one canonical Git common directory.
+///
+/// The single place either platform's default route is constructed, so
+/// `--project-dir`, current-directory discovery, and the MCP tools cannot drift
+/// into three derivations of "this repository's owner".
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
+pub fn local_endpoint_for(common_dir: &Path) -> Result<transport::LocalEndpoint, RouteError> {
+    #[cfg(unix)]
+    {
+        Ok(transport::LocalEndpoint::Unix(
+            crate::web::unix_socket::default_socket_path(common_dir),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        crate::web::named_pipe::default_pipe_name(common_dir)
+            .map(transport::LocalEndpoint::NamedPipe)
+            .map_err(RouteError::new)
+    }
 }
 
 /// How the caller asked for output.
@@ -547,60 +581,63 @@ pub async fn run(args: ClientArgs) -> i32 {
 /// no workspace write. A build that cannot speak the local API has nothing
 /// useful to attempt, and attempting anyway would leave state behind for an
 /// operation that was never going to work.
-#[cfg(not(all(unix, feature = "web-monitoring")))]
+#[cfg(not(all(any(unix, windows), feature = "web-monitoring")))]
 async fn execute(_args: ClientArgs, operation: Operation) -> ResultEnvelope {
-    ResultEnvelope::new(operation, Outcome::FeatureUnavailable).with_message(
-        "this build has no Unix-domain local /api/v2 client support, so it cannot reach an \
-         existing owner. Use a Unix build with `--features web-monitoring`",
-    )
+    ResultEnvelope::new(operation, Outcome::FeatureUnavailable).with_message(FEATURE_UNAVAILABLE)
 }
+
+/// Why a build cannot reach an owner at all.
+///
+/// Only two things remove the namespace now: a missing `web-monitoring` feature,
+/// or a platform with neither of the owner-only local transports. It is
+/// deliberately not phrased as "Unix only" any more — a Windows build with the
+/// feature has a Named Pipe and reaches owners exactly as a Unix build does.
+#[cfg(not(all(any(unix, windows), feature = "web-monitoring")))]
+const FEATURE_UNAVAILABLE: &str =
+    "this build has no local /api/v2 client support, so it cannot reach an existing owner. \
+     Build with `--features web-monitoring` on a platform that has an owner-only local \
+     transport (a Unix-domain socket, or a Windows Named Pipe)";
 
 /// Serve one stdio MCP session, or refuse in a build that cannot reach an owner.
 ///
 /// The refusal is written to stderr rather than to the protocol stream: a host
 /// parsing stdout as JSON-RPC must not be handed prose, and a server that cannot
 /// serve has no frame it could honestly send.
-#[cfg(all(unix, feature = "web-monitoring"))]
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
 async fn serve_mcp(args: ClientArgs) -> i32 {
     // Clap already refused the two-selector conflict, so this cannot fail for
     // ambiguity; a relative `--project-dir` is still worth refusing before a
     // long-lived protocol session starts advertising tools it cannot route.
-    let default_route = match RouteSelector::from_inputs(
-        args.project_dir.as_deref(),
-        args.unix_socket.as_deref(),
-    ) {
-        Ok(selector) => selector,
-        Err(error) => {
-            eprintln!("cflx client mcp: {error}");
-            return Outcome::UsageError.exit_code();
-        }
-    };
+    let default_route =
+        match RouteSelector::from_inputs(args.project_dir.as_deref(), args.unix_socket_route()) {
+            Ok(selector) => selector,
+            Err(error) => {
+                eprintln!("cflx client mcp: {error}");
+                return Outcome::UsageError.exit_code();
+            }
+        };
     mcp::run(default_route, args.auth_token_env).await
 }
 
-#[cfg(not(all(unix, feature = "web-monitoring")))]
+#[cfg(not(all(any(unix, windows), feature = "web-monitoring")))]
 async fn serve_mcp(_args: ClientArgs) -> i32 {
-    eprintln!(
-        "cflx client mcp: this build has no Unix-domain local /api/v2 client support, so it \
-         cannot reach an existing owner. Use a Unix build with `--features web-monitoring`"
-    );
+    eprintln!("cflx client mcp: {FEATURE_UNAVAILABLE}");
     Outcome::FeatureUnavailable.exit_code()
 }
 
-#[cfg(all(unix, feature = "web-monitoring"))]
+#[cfg(all(any(unix, windows), feature = "web-monitoring"))]
 async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
     // One selector, built once, before anything is contacted. Clap enforces the
     // mutual exclusion at parse time, so reaching here with both is impossible;
     // the refusal below covers the remaining shape rules.
-    let selector = match RouteSelector::from_inputs(
-        args.project_dir.as_deref(),
-        args.unix_socket.as_deref(),
-    ) {
-        Ok(selector) => selector,
-        Err(error) => {
-            return ResultEnvelope::new(operation, Outcome::UsageError).with_message(error.message)
-        }
-    };
+    let selector =
+        match RouteSelector::from_inputs(args.project_dir.as_deref(), args.unix_socket_route()) {
+            Ok(selector) => selector,
+            Err(error) => {
+                return ResultEnvelope::new(operation, Outcome::UsageError)
+                    .with_message(error.message)
+            }
+        };
     let connection =
         match session::Connection::resolve_route(&selector, args.auth_token_env.as_deref()) {
             Ok(connection) => connection,

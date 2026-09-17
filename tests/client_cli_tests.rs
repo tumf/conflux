@@ -5574,6 +5574,107 @@ mod enabled {
         assert_eq!(spy.call_count(), 0);
         owner.stop().await;
     }
+
+    /// The Windows Named Pipe is the *second* owner-only local transport, so the
+    /// argv-bearing resources must treat it exactly as they treat the Unix
+    /// socket — register, and disclose what they registered.
+    ///
+    /// Run here rather than only on a Windows builder on purpose. What is under
+    /// test is the handler's *classification* of the marker production attaches
+    /// per listener, and that decision is platform-independent code: pinning it
+    /// where the suite always runs is what stops the two argv surfaces from
+    /// drifting apart between Windows runs. The native suite proves the other
+    /// half — that a real pipe listener really attaches this marker.
+    #[tokio::test]
+    async fn client_subscribe_mutation_is_permitted_on_the_other_owner_only_transport() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start_with(
+            Some(spy.clone()),
+            None,
+            OwnerExtras {
+                sinks: true,
+                transport: Some(conflux::web::remote_control_api::ApiTransport::NamedPipe),
+            },
+        )
+        .await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+        owner.contract(merged_contract("main"));
+        let instance = owner.instance_id();
+        let tmp = neutral_cwd();
+        let socket = owner.socket();
+
+        let set = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "subscribe",
+                "set",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+                "--",
+                "/bin/true",
+            ],
+        )
+        .await;
+        let parsed = envelope(&set);
+        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&set));
+        assert_eq!(set.status.code(), Some(0));
+        assert_eq!(
+            parsed["detail"]["subscriptions"][0]["sink"]["command"][0],
+            "/bin/true"
+        );
+
+        // A channel that may register a command is told one back.
+        let read = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "subscribe",
+                "get",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+            ],
+        )
+        .await;
+        let parsed = envelope(&read);
+        assert_eq!(parsed["outcome"], "subscribed", "{}", stderr_of(&read));
+        assert_eq!(parsed["detail"]["subscriptions"][0]["subscribed"], true);
+        assert_eq!(
+            parsed["detail"]["subscriptions"][0]["sink"]["command"][0],
+            "/bin/true"
+        );
+
+        let cleared = run_client(
+            &socket,
+            tmp.path(),
+            &[
+                "subscribe",
+                "clear",
+                "alpha",
+                "--instance-id",
+                &instance,
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(
+            envelope(&cleared)["outcome"],
+            "cleared",
+            "{}",
+            stderr_of(&cleared)
+        );
+
+        // Observability only: nothing here is a workflow command.
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
+    }
     // ========================================================================
     // production_owner_smoke
     // ========================================================================

@@ -38,7 +38,7 @@ use axum::http::header;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Extension, Router};
 
 use async_trait::async_trait;
 use utoipa_swagger_ui::SwaggerUi;
@@ -58,15 +58,55 @@ pub const HEALTH_PATH: &str = "/api/v2/health";
 /// Which listener a request arrived on.
 ///
 /// Injected per listener rather than derived inside a handler, because by the
-/// time a request reaches a route the two listeners are indistinguishable: they
+/// time a request reaches a route the listeners are indistinguishable: they
 /// share one router, one `WebState`, and one auth policy. Only the code that
-/// bound the socket knows which channel it is.
+/// bound the endpoint knows which channel it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiTransport {
     /// The owner-only Unix socket, mode `0600` under the Git common directory.
+    ///
+    /// Present on every platform for the same reason [`Self::NamedPipe`] is.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Unix,
+    /// The owner-only Windows Named Pipe, DACL-restricted to the current user.
+    ///
+    /// Present in the enum on every platform so the trusted-local policy is one
+    /// exhaustive match rather than a `#[cfg]` fork of a security decision.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    NamedPipe,
     /// The browser-facing TCP listener `--web` adds.
     Tcp,
+}
+
+impl ApiTransport {
+    /// Whether this channel is an owner-only *local* transport.
+    ///
+    /// One predicate rather than a `matches!(…, Unix)` at each call site: the
+    /// two security-sensitive surfaces that depend on this — proposal
+    /// subscriptions and completion sinks — both store and disclose an argv this
+    /// owner will execute, and a platform added to one of them but not the other
+    /// is exactly the drift that turns a policy into two policies.
+    ///
+    /// The Unix socket earns it from mode `0600` under the Git common
+    /// directory; the Named Pipe from a protected DACL granting the current user
+    /// alone, plus kernel-level rejection of remote clients. TCP never does,
+    /// loopback included: a bearer token proves a caller read a secret, not that
+    /// it is this machine's owner.
+    pub fn is_owner_only_local(self) -> bool {
+        match self {
+            Self::Unix | Self::NamedPipe => true,
+            Self::Tcp => false,
+        }
+    }
+}
+
+/// Whether a request's transport marker permits owner-only local access.
+///
+/// Absence of the marker is read as "not a trusted local transport": a router
+/// assembled without the per-listener extension has no proof of transport, and
+/// no evidence is not evidence of the safer channel.
+pub fn is_owner_only_local(transport: &Option<Extension<ApiTransport>>) -> bool {
+    matches!(transport, Some(Extension(transport)) if transport.is_owner_only_local())
 }
 
 /// This build's canonical contract, byte-for-byte the same document that
@@ -125,11 +165,12 @@ pub struct RemoteControlRuntime {
 ///
 /// The three sink resources it serves are transport-aware in both directions.
 /// `PUT` and `DELETE` store or remove an argv this process will execute, so they
-/// are accepted only on the owner Unix socket. `GET` is served on either
-/// transport, but the registered argv is disclosed only on that same socket —
-/// a channel that may not register a command may not read one back — while
-/// subscription presence, execution state, and delivery history are answered
-/// everywhere. Every one of the three asserts the complete
+/// are accepted only on an owner-only local transport — see
+/// [`ApiTransport::is_owner_only_local`]. `GET` is served on every transport, but
+/// the registered argv is disclosed only on that same channel — a channel that
+/// may not register a command may not read one back — while subscription
+/// presence, execution state, and delivery history are answered everywhere.
+/// Every one of the three asserts the complete
 /// `(instance_id, execution_id, change_id)` binding.
 #[derive(Default)]
 pub struct CompletionSinkHandle {

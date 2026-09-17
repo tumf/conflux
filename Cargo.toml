@@ -57,6 +57,10 @@ unicode-width = "0.2"
 unicode-normalization = "0.1"
 regex = "1.12.2"
 md5 = "0.8"
+# Endpoint identity for the Windows Named Pipe transport: the pipe name is a
+# digest of the current user SID and the canonical Git common directory, so
+# neither input is published in a machine-global namespace.
+sha2 = "0.10"
 tempfile = "3.20"
 async-trait = "0.1"
 shlex = "1.3"
@@ -87,7 +91,7 @@ utoipa-swagger-ui = { version = "9", features = ["axum"], optional = true }
 nix = { version = "0.27", features = ["signal", "process"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_System_JobObjects", "Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
+windows = { version = "0.58", features = ["Win32_System_JobObjects", "Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_Security_Authorization"] }
 
 [dev-dependencies]
 # `test-util` enables paused-clock tests for the scheduler loop's timer behavior.

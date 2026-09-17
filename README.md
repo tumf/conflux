@@ -52,15 +52,20 @@ Useful TUI keys:
 | `F5` | Start, resume, retry, or continue processing |
 | `x` | Queue eligible `not queued` changes while processing is running |
 
-`cflx`, `cflx tui`, and `cflx run` serve `/api/v2` on a repository-scoped Unix
-socket at `${GIT_COMMON_DIR}/cflx-api.sock` by default — no TCP port, no flag:
+`cflx`, `cflx tui`, and `cflx run` serve `/api/v2` on a repository-scoped local
+endpoint by default — no TCP port, no flag. On Unix that is a mode-`0600` Unix
+socket at `${GIT_COMMON_DIR}/cflx-api.sock`; on Windows it is a Named Pipe whose
+name is derived from your user SID and this repository's canonical Git common
+directory, with a DACL granting only you:
 
 ```bash
 curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" http://localhost/api/v2/state
 ```
 
-Use `--web-unix-socket PATH` to move it, `--no-web-unix-socket` to turn it off,
-and `--web` to additionally start the browser-facing TCP Web UI. For the web
+Either way one repository has one endpoint, every linked worktree resolves it,
+and nothing is written to disk to remember it. Use `--web-unix-socket PATH` to
+move the Unix socket, `--no-web-unix-socket` to turn the local listener off, and
+`--web` to additionally start the browser-facing TCP Web UI. For the web
 monitoring UI, REST API, and `/api/v2`, see the
 [Web UI Guide (English)](docs/guides/WEBUI.md).
 
@@ -114,11 +119,14 @@ The verbs are the operator's own: `status`, `mark`, `unmark`, `start`, `stop`,
 `force-stop`, `force-stop-change`, `wait`, and the `subscribe` group, plus `mcp`
 for hosts that speak
 the protocol instead of a shell. `--project-dir ABSOLUTE_PATH` names any
-directory inside the project's Git working tree and is the normal explicit route;
-`--unix-socket PATH` is the low-level override of the default
-`${GIT_COMMON_DIR}/cflx-api.sock`. The two conflict at parse time, and
-`--auth-token-env NAME` names an environment variable holding the bearer token —
-a token value is never accepted in argv and never printed.
+directory inside the project's Git working tree and is the normal explicit
+route — and the portable one: it derives the owner endpoint the same way on both
+platforms, and only the last step of that derivation (socket path or pipe name)
+differs. `--unix-socket PATH` is the Unix-only low-level override of the default
+`${GIT_COMMON_DIR}/cflx-api.sock`; a Windows build does not offer it at all, and
+naming it there is a parse-time usage error rather than a route. The two conflict
+at parse time, and `--auth-token-env NAME` names an environment variable holding
+the bearer token — a token value is never accepted in argv and never printed.
 
 **A mark is selection, not admission.** `mark` and `unmark` are target-scoped
 desired-state writes: they set exactly the named proposals' execution marks,
@@ -282,11 +290,12 @@ finishes, so process exit was never a completion signal.
   and its environment is *replaced* with exactly `CFLX_EVENT_PATH`,
   `CFLX_EVENT_TYPE`, `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and
   `CFLX_INSTANCE_ID`. No owner token or configuration reaches it.
-- Registration is accepted **only over the owner's Unix socket**. An
-  authenticated TCP client is refused with `transport_not_permitted`, and it is
-  not told the registered argv on a read either — it sees presence, execution
-  state, and delivery history instead. Every request, inspection included,
-  carries the complete `(instance_id, change_id)` binding.
+- Registration is accepted **only over an owner-only local transport** — the
+  mode-`0600` Unix socket or the secured Windows Named Pipe. An authenticated TCP
+  client is refused with `transport_not_permitted`, and it is not told the
+  registered argv on a read either — it sees presence, execution state, and
+  delivery history instead. Every request, inspection included, carries the
+  complete `(instance_id, change_id)` binding.
 - The event payload is created `0400` inside a `0700` owner-private directory, so
   a callback cannot open `CFLX_EVENT_PATH` for writing by default. That is
   default mutation refusal, not an integrity guarantee against a same-UID

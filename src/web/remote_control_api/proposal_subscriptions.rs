@@ -18,15 +18,20 @@
 //! and cannot move a proposal. It is observability: registering one promises
 //! nothing about admission, and delivering one authorizes nothing.
 //!
-//! # Why mutation is Unix-socket only
+//! # Why mutation is owner-only-local
 //!
-//! A subscription stores an argv this process will execute. Reaching the mode
-//! `0600` socket derived from the repository's own Git common directory already
-//! means local filesystem access to the owner's repository; a bearer token over
-//! TCP is a weaker claim than that, and it is exactly the claim an exposed
-//! reverse proxy hands out. Reads work on either transport, but the registered
-//! *argv* comes back only over that socket: a channel that may not register a
-//! command may not read one back.
+//! A subscription stores an argv this process will execute. Reaching the owner's
+//! own local endpoint already means being the owner's user on the owner's
+//! machine — the mode-`0600` socket under the repository's Git common directory
+//! on Unix, or the DACL-restricted, remote-rejecting Named Pipe on Windows. A
+//! bearer token over TCP is a weaker claim than either, and it is exactly the
+//! claim an exposed reverse proxy hands out. Reads work on any transport, but the
+//! registered *argv* comes back only over an owner-only local one: a channel that
+//! may not register a command may not read one back.
+//!
+//! Both halves ask [`super::is_owner_only_local`], which is also what the
+//! execution-scoped sink asks, so the two argv-bearing surfaces cannot come to
+//! disagree about which platforms are trusted.
 //!
 //! Every request, inspection included, carries the complete
 //! `(instance_id, change_id)` binding. That is a coherence check rather than
@@ -58,7 +63,7 @@ use crate::web::completion_sink::{ProposalSubscriptionView, SinkRefusal};
         ("instance_id" = String, Query, description = "Owner incarnation the caller believes it is addressing. Required: inspection asserts the same complete binding a registration does"),
     ),
     responses(
-        (status = 200, description = "Current subscription for this proposal. The registered argv is returned only to a request that arrived on the owner Unix socket; `subscribed` reports presence on either transport", body = ProposalSubscriptionResponse),
+        (status = 200, description = "Current subscription for this proposal. The registered argv is returned only to a request that arrived on an owner-only local transport (the Unix socket, or the Windows Named Pipe); `subscribed` reports presence on either transport", body = ProposalSubscriptionResponse),
         (status = 409, description = "The presented instance binding is not this owner incarnation", body = ApiError),
         (status = 422, description = "The request omitted part of the binding", body = ApiError),
     )
@@ -174,30 +179,31 @@ fn incomplete_binding(operation: &str, correlation: &str) -> Response {
 
 /// Whether this transport may be told the registered argv.
 ///
-/// Absence of the marker is read as "not the socket", the same way mutation
-/// reads it: a router assembled without the per-listener extension has no proof
-/// of transport, and no evidence is not evidence of the safer channel.
+/// The same predicate mutation uses, so a channel that may not register a
+/// command may not read one back either — and a platform can never be trusted
+/// by one half of this resource and not the other.
 fn discloses_argv(transport: &Option<Extension<ApiTransport>>) -> bool {
-    matches!(transport, Some(Extension(ApiTransport::Unix)))
+    super::is_owner_only_local(transport)
 }
 
-/// Refuse a mutation that did not arrive on the owner's Unix socket.
+/// Refuse a mutation that did not arrive on an owner-only local transport.
 fn require_owner_socket(
     transport: Option<Extension<ApiTransport>>,
     correlation: &str,
 ) -> Option<Response> {
-    match transport.map(|Extension(transport)| transport) {
-        Some(ApiTransport::Unix) => None,
-        _ => Some(
-            ApiError::new(
-                ErrorCode::TransportNotPermitted,
-                "a proposal subscription stores an argv this owner will execute, so it may be \
-                 set or cleared only over the owner's Unix socket",
-                correlation,
-            )
-            .into_response(),
-        ),
+    if super::is_owner_only_local(&transport) {
+        return None;
     }
+    Some(
+        ApiError::new(
+            ErrorCode::TransportNotPermitted,
+            "a proposal subscription stores an argv this owner will execute, so it may be set \
+             or cleared only over the owner's local transport — its Unix socket or its Windows \
+             Named Pipe",
+            correlation,
+        )
+        .into_response(),
+    )
 }
 
 /// Render one subscription, disclosing the argv only where that is permitted.

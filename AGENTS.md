@@ -48,17 +48,23 @@ The verbs are the operator's own — `status`, `mark`, `unmark`, `start`, `stop`
 `force-stop`, `force-stop-change`, `wait`, and the `subscribe` group — plus `mcp`
 for hosts that speak the protocol instead. Connection options belong to the
 namespace.
-`--project-dir ABSOLUTE_PATH` is the normal explicit route: it names any
-directory inside the project's Git working tree — the root, a subdirectory, a
-linked worktree, a submodule — and Conflux derives *both* the owner socket
-(`<git-common-dir>/cflx-api.sock`) and the repository that certifies completion
-from that one project, so `wait` can never pair one project's owner with another
-project's evidence. `--unix-socket PATH` is the low-level override for
-diagnostics, tests, and owners that are not reachable through a repository; it
-overrides the same default. The two conflict at parse time, and
-`--auth-token-env NAME` names an environment variable holding the bearer token —
-a token value is never accepted in argv and never printed. With neither route
-option, the current working directory's repository is used.
+`--project-dir ABSOLUTE_PATH` is the normal explicit route, and the portable
+one: it names any directory inside the project's Git working tree — the root, a
+subdirectory, a linked worktree, a submodule — and Conflux derives *both* the
+owner endpoint and the repository that certifies completion from that one
+project, so `wait` can never pair one project's owner with another project's
+evidence. The endpoint is `<git-common-dir>/cflx-api.sock` on Unix and this
+repository's current-user Named Pipe on Windows; the derivation is one rule and
+only its last step is platform-specific, which is why `--project-dir` is the
+selector to reach for in anything that has to run on both.
+`--unix-socket PATH` is the Unix-only low-level override for diagnostics, tests,
+and owners that are not reachable through a repository; it overrides the same
+default. A Windows build does not offer it at all — argument parsing refuses it
+before any owner is contacted rather than reinterpreting it as a pipe. The two
+conflict at parse time, and `--auth-token-env NAME` names an environment variable
+holding the bearer token — a token value is never accepted in argv and never
+printed. With neither route option, the current working directory's repository is
+used.
 
 **The three ideas are kept apart on purpose.**
 
@@ -240,9 +246,11 @@ the normal validation error before any owner is contacted. `cflx_subscribe` take
 through 64 distinct `change_ids`.
 
 Every tool accepts an optional absolute `project_dir` — the normal per-call
-selector — and an optional `unix_socket` low-level override, so **register the
-server once, globally, with no route option at all** and let each call name its
-project:
+selector on every platform — and, on Unix only, an optional `unix_socket`
+low-level override. A Windows server publishes no `unix_socket` property in its
+tool schema and refuses one through the normal validation error if a host sends
+it anyway, so **register the server once, globally, with no route option at all**
+and let each call name its project:
 
 ```json
 {"name": "cflx_control",
@@ -323,14 +331,17 @@ Constraints worth knowing before you wire one up:
   delivered. Registering *after* the latest episode settled delivers that event
   immediately, once — which is what stops a start/registration race from losing a
   notification. Re-admission after a retry is a new episode and a new delivery.
-- **UDS only for mutation, and for argv.** A subscription stores an argv the
-  owner will execute, so `set` and `clear` are accepted only over the owner's
-  Unix socket; an authenticated TCP client is refused with
-  `transport_not_permitted`. Reads work on either transport, but the *registered
-  argv* comes back only over that same socket: a channel that may not register a
-  command may not read one back. Presence, execution state, and delivery history
-  are answered on both. Every request, inspection included, carries the complete
-  `(instance_id, change_id)` binding.
+- **Owner-only local transport for mutation, and for argv.** A subscription
+  stores an argv the owner will execute, so `set` and `clear` are accepted only
+  over the owner's own local endpoint — the mode-`0600` Unix socket or the
+  DACL-restricted Windows Named Pipe. Both are one classification applied by one
+  predicate, so the two argv-bearing surfaces cannot come to trust different
+  channels. An authenticated TCP client is refused with
+  `transport_not_permitted`, loopback included. Reads work on either transport,
+  but the *registered argv* comes back only over the local one: a channel that
+  may not register a command may not read one back. Presence, execution state,
+  and delivery history are answered on both. Every request, inspection included,
+  carries the complete `(instance_id, change_id)` binding.
 - **argv, not shell.** No `sh -c`, no quoting, no expansion. The environment is
   *replaced* with exactly `CFLX_EVENT_PATH`, `CFLX_EVENT_TYPE`,
   `CFLX_EXECUTION_ID`, `CFLX_CHANGE_ID`, and `CFLX_INSTANCE_ID` — no owner token,
@@ -379,30 +390,46 @@ presentation, and fires once — so it needs no long-lived child, no stream
 framing, and no reconnection. Configuring or delivering either never requires the
 other.
 
-## Local API socket
+## Local API endpoint
 
-`cflx`, `cflx tui`, and `cflx run` serve the versioned `/api/v2` API on
-`${GIT_COMMON_DIR}/cflx-api.sock` by default in `web-monitoring` builds — no
-TCP port and no flag required. Linked worktrees of one repository resolve that
-same single socket because it is derived from the same canonical Git common
+`cflx`, `cflx tui`, and `cflx run` serve the versioned `/api/v2` API on a
+repository-scoped local endpoint by default in `web-monitoring` builds — no TCP
+port and no flag required. Linked worktrees of one repository resolve that same
+single endpoint because it is derived from the same canonical Git common
 directory the repository lock uses — but only the main worktree may *own*
 orchestration: the startup preflight refuses an owner entrypoint launched from a
 linked worktree before the lock is even contended for.
+
+**Unix:** `${GIT_COMMON_DIR}/cflx-api.sock`, mode `0600`.
 
 ```bash
 curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" \
   http://localhost/api/v2/state
 ```
 
-- `--web-unix-socket PATH` overrides the path; `--no-web-unix-socket` disables
-  the listener. The two are mutually exclusive.
+**Windows:** `\\.\pipe\cflx-v2-<sha256>`, where the digest covers the current
+user's SID and the normalized canonical Git common directory. Neither input is
+published in the name, because the pipe namespace is machine-global. The pipe is
+created with a protected DACL granting only the current user, rejects remote
+clients in the kernel, and takes exclusive first-instance ownership, so a second
+owner of one repository fails startup rather than quietly sharing the endpoint.
+A client verifies the connected pipe's owner SID against its own process token
+*before* sending any request byte and returns a typed transport refusal — never
+`owner_not_running`, never a TCP fallback — when they differ. There is no public
+arbitrary-pipe override: route by repository with `--project-dir`.
+
+- `--web-unix-socket PATH` overrides the Unix path; `--no-web-unix-socket`
+  disables the local listener on either platform. The two are mutually exclusive,
+  and `--web-unix-socket` is refused on Windows, which has no Unix socket to
+  bind.
 - Outside a Git repository neither option makes an owner startable: the startup
   preflight refuses `cflx`, `cflx tui`, and `cflx run` with a missing-repository
   error before any socket path is selected, so there is no path-selection
   decision left to make.
-- The socket is mode `0600`. A configured bearer token applies to UDS and TCP
-  alike (`/api/v2/health` stays public); without one, UDS is token-free local
-  access, protected by filesystem permissions.
+- A configured bearer token applies to the local endpoint and TCP alike
+  (`/api/v2/health` stays public); without one, the local endpoint is token-free
+  local access, protected by filesystem permissions on Unix and by the pipe's
+  DACL on Windows.
 - `PUT`/`DELETE /api/v2/executions/{execution_id}/sink` and
   `PUT`/`DELETE /api/v2/proposals/{change_id}/subscription` are accepted only
   here. They store an argv this process will execute, so TCP is refused with
@@ -414,12 +441,15 @@ curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" \
   proposal-scoped one requires `(instance_id, change_id)`, with the change in the
   path. `GET /api/v2/capabilities` reports whether each surface exists at all.
 - The listener must be bound before lifecycle adapters, AI subprocesses, or
-  orchestration start. A bind, permission, or path-safety failure exits non-zero
-  with nothing started; a finite run removes its own socket on completion.
+  orchestration start. A bind, permission, path-safety, or first-instance failure
+  exits non-zero with nothing started; a finite run removes its own socket on
+  completion. Startup is all-or-nothing across both listeners on both platforms:
+  a failed TCP bind stops and awaits the local listener task it already started.
 - A live socket or non-socket entry at the target path is never removed; only an
-  unreachable stale socket is replaced.
-- Browsers cannot open a `unix://` endpoint. It is for local clients and reverse
-  proxies; the QR popup still encodes the TCP URL only.
+  unreachable stale socket is replaced. A Named Pipe has no filesystem entry to
+  go stale — an occupied name is a live owner by definition, and startup refuses.
+- Browsers cannot open a `unix://` or `pipe://` endpoint. Both are for local
+  clients and reverse proxies; the QR popup still encodes the TCP URL only.
 
 ### Before intervening in a live run
 
@@ -445,8 +475,9 @@ guess is exactly the failure this contract exists to prevent.
 
 The WebUI is an optional local monitoring dashboard enabled with `--web` on
 `cflx`, `cflx tui`, or `cflx run`. `--web` *adds* the TCP listener alongside the
-Unix socket; it never replaces it, and both listeners serve the same router and
-`WebState`. There is no standalone server daemon and no multi-project mode.
+platform-local endpoint; it never replaces it, and both listeners serve the same
+router and `WebState`. There is no standalone server daemon and no multi-project
+mode.
 
 The operator console consists of `web/index.html`, `web/style.css`, and
 `web/app.js`, embedded via `include_str!` in `src/web/mod.rs`. No build step and
