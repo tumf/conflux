@@ -513,6 +513,19 @@ async fn run_tui_loop(
     // refresh task and the dirty predicate, so a later process `chdir` moves
     // none of the three.
     app.set_project_path(repo_root.clone());
+    // The branch that identity is read against, resolved once here and never
+    // again. A detached HEAD or a failed lookup leaves it unset: the header
+    // simply omits the segment, because an operator reading a guessed branch is
+    // worse off than one reading none, and neither outcome may stop startup.
+    app.set_base_branch(
+        match crate::vcs::git::commands::get_current_branch(&repo_root).await {
+            Ok(branch) => branch,
+            Err(err) => {
+                debug!("Failed to resolve the startup base branch for the header: {err}");
+                None
+            }
+        },
+    );
     app.publish_parallel_runtime();
     app.apply_parallel_eligibility(&committed_change_ids, &uncommitted_file_change_ids);
     app.apply_worktree_status(&worktree_change_ids);
