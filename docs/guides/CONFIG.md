@@ -508,7 +508,13 @@ tool needs no new configuration key. The first supported purpose is
       "timeout_ms": 30000,
       "max_input_bytes": 1048576,
       "max_output_bytes": 1048576,
-      "yes_threshold": 0.85
+      "yes_threshold": 0.85,
+      "mode": "shadow",
+      "evaluation": {
+        "enabled": false,
+        "retention_days": 30,
+        "max_total_bytes": 104857600
+      }
     }
   }
 }
@@ -522,6 +528,8 @@ tool needs no new configuration key. The first supported purpose is
 | `max_input_bytes` | integer | `1048576` | Serialized request limit; `1`–`16777216` |
 | `max_output_bytes` | integer | `1048576` | Collected stdout/stderr limit, applied to each; `1`–`16777216` |
 | `yes_threshold` | number | `0.85` | Probability at or above which a judgment counts as a `yes` edge; finite and within `0.5`–`1.0` |
+| `mode` | string | `"shadow"` | Only `"shadow"` is accepted. Omitting it means `"shadow"`, so every configuration written before this key existed keeps its exact meaning |
+| `evaluation` | object | unset | Opt-in durable evaluation recording; see [Evaluation records](#evaluation-records-are-opt-in-and-isolated) |
 
 Omitting `judge_commands` is the normal case: no judge process is started and
 dependency analysis behaves exactly as before, with no warning and no validation
@@ -552,8 +560,120 @@ authority for execution order and dependency routing:
   text, request state, credentials, raw stdout/stderr, or a judgment tied to a
   named change.
 
-There is no `mode` field. A `prefer`, fail-closed, or judge-authoritative mode
-would be a separate reviewed change.
+`mode` accepts only `"shadow"`. A `prefer`, fail-closed, or judge-authoritative
+mode would be a separate reviewed change, so any other value fails configuration
+loading rather than being ignored.
+
+### Evaluation records are opt-in and isolated
+
+The aggregate comparison counts above prove an observation happened. They cannot
+answer whether the judge is good enough to promote — that needs *pair-level*
+probabilities and the authoritative analyzer's labels, kept long enough to
+aggregate. `evaluation` turns that recording on.
+
+```jsonc
+{
+  "judge_commands": {
+    "parallel_dependency": {
+      "command": ["jev", "run", "-"],
+      "model": "jev-1.13.0",
+      "evaluation": {
+        "enabled": true,
+        "retention_days": 30,
+        "max_total_bytes": 104857600
+      }
+    }
+  }
+}
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Nothing is recorded unless this is explicitly `true` |
+| `retention_days` | integer | — | Required and positive when enabled; `1`–`3650`. Counts the retained window inclusive of today |
+| `max_total_bytes` | integer | — | Required and positive when enabled; `1`–`10737418240` (10 GiB). A **global** budget across every project under the evaluation root |
+
+Omitting `evaluation`, or setting `enabled: false`, creates no directory, no
+salt, and no record. Bounds supplied while disabled are still validated, so a
+typo fails configuration loading now rather than on the day someone flips the
+switch. An enabled policy must carry both bounds: evaluation storage is never
+unbounded.
+
+**Storage is separate from logs, deliberately.** Records live beneath
+`<state-root>/evaluations`, a *sibling* of `logs` and never a descendant:
+
+```text
+<state-root>/
+  logs/                                      # ordinary operational logs
+  evaluations/
+    .pair-id-salt                            # 32 random bytes, mode 0600
+    parallel_dependency/
+      <project-slug>/
+        <YYYY-MM-DD>.jsonl                   # mode 0600
+```
+
+That separation is the whole point. `cflx logs`, the TUI log pane, and the Web
+log endpoints are scoped to `logs`, so no evaluation record can surface through
+them; the seven-day operational-log retention cannot delete an evaluation
+record; and evaluation retention cannot delete a log. Directories use mode
+`0700` and files `0600` where the platform supports it.
+
+**Records are non-authoritative.** Absence, deletion, corruption, a write
+failure, a cleanup failure, or a read failure never changes analysis,
+provenance, routing, blockers, Acceptance, Archive, lifecycle state, or process
+success. A recorder problem produces one bounded path-free warning and is then
+swallowed. Deleting the entire evaluation root is always safe.
+
+**Records name no change.** A pair is identified only by
+`sha256:<hex>` over a locally generated installation salt plus the
+project-scoped, length-framed, directed pair identity. There is no field that
+could hold a change ID, proposal text, a request or response body, a command
+string, an environment value, a repository path, a credential, or a provider
+error body. A successful record keeps the validated model, duration, token
+usage, configured threshold, and — per directed pair — the raw judge
+probability, the thresholded judge label, and the analyzer label, which is
+exactly enough to recompute confusion metrics and sweep alternate thresholds
+later. Failure records keep only the typed outcome token, duration, and question
+count.
+
+Because the salt is per installation, deleting it (or the root) makes later
+records incomparable with earlier ones. That costs comparability, not
+correctness.
+
+**Retention applies two independent bounds** at startup and before the current
+daily file is opened, in that order: files past `retention_days` go first, then
+non-active files are evicted oldest-first until the global byte budget fits.
+Eviction is deterministic (ascending filename date, then relative path), never
+follows symlinks, only ever removes files it positively recognized as
+`parallel_dependency/<project-slug>/<YYYY-MM-DD>.jsonl`, and always protects the
+file being written — so today's file may temporarily exceed the budget.
+
+**Reading the evidence:**
+
+```bash
+cflx judge-eval summary --purpose parallel_dependency
+cflx judge-eval summary --purpose parallel_dependency --json
+cflx judge-eval summary --purpose parallel_dependency --since-days 7
+cflx judge-eval summary --purpose parallel_dependency --project conflux-a1b2c3d4
+```
+
+The command is strictly read-only: it creates no root, salt, or record file,
+initializes no operational logging, and runs no retention. It reports files and
+lines examined; valid observation and failure counts; malformed and unsupported
+records skipped; outcome counts and rates; TP/FP/FN/TN pair totals; precision,
+recall, and specificity; nearest-rank p50/p95 duration; token totals; and counts
+grouped by validated model and Conflux version. `--since-days` defaults to the
+configured `retention_days` when one is set, otherwise 30.
+
+Precision, recall, and specificity are **null** (`n/a` in human output) when
+their denominator is empty, because "the judge was wrong" and "the question was
+never asked" are different findings. Malformed lines and unsupported schema
+versions are counted as skipped and excluded from every metric rather than
+silently dropped. Raw pair identifiers never appear in summary output.
+
+Nothing in the evaluation store feeds routing, retry, blockers, Acceptance,
+Archive, or automatic promotion. Promotion remains an operator decision made
+from this evidence.
 
 ### Precedence is atomic per purpose
 
@@ -562,6 +682,11 @@ supplies it replaces the **complete** lower-priority entry; fields are never
 merged. Omitting it inherits the lower-priority entry unchanged. That prevents a
 project layer from replacing only the executable while silently inheriting
 another layer's model, threshold, or byte limits.
+
+`mode` and `evaluation` are inside that same boundary. A project layer that
+names the judge but omits `evaluation` therefore has recording **off** — it does
+not inherit a global opt-in. Recording where you did not ask for it is exactly
+the surprise atomic replacement exists to prevent.
 
 ### Protocol
 

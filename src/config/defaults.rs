@@ -253,6 +253,53 @@ pub const MIN_JUDGE_YES_THRESHOLD: f64 = 0.5;
 /// Largest configurable judge yes-threshold.
 pub const MAX_JUDGE_YES_THRESHOLD: f64 = 1.0;
 
+/// The only judge mode this release accepts.
+///
+/// An omitted `mode` normalizes to this value, so every existing configuration
+/// keeps working. `prefer`, fail-closed, and judge-authoritative modes stay
+/// unspecified until a separate reviewed change defines them.
+pub const JUDGE_MODE_SHADOW: &str = "shadow";
+
+// ── Judge evaluation-record defaults ───────────────────────────────────────
+
+/// Largest configurable evaluation retention window (days).
+///
+/// Ten years. Evaluation records are disposable observability, so the ceiling
+/// exists to make a typo fail configuration loading rather than to express a
+/// retention policy.
+pub const MAX_JUDGE_EVALUATION_RETENTION_DAYS: u32 = 3_650;
+
+/// Largest configurable global evaluation byte budget (10 GiB).
+pub const MAX_JUDGE_EVALUATION_TOTAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Directory name Conflux owns for evaluation records inside the state root.
+///
+/// Deliberately a sibling of `logs`, never a descendant: ordinary log retention
+/// and the log viewer are scoped to `logs` alone, so evaluation records can be
+/// neither read nor deleted by them.
+pub const EVALUATION_DIR_NAME: &str = "evaluations";
+
+/// The single evaluation purpose this change records.
+pub const EVALUATION_PURPOSE_PARALLEL_DEPENDENCY: &str = "parallel_dependency";
+
+/// File name of the installation-scoped pair-identifier salt.
+pub const EVALUATION_SALT_FILE_NAME: &str = ".pair-id-salt";
+
+/// The evaluation root shared by the recorder, retention, and the summary reader.
+///
+/// Format: `<state root>/evaluations`. When no state root can be derived at all
+/// it keeps the same temp-directory fallback shape logging uses, so a machine
+/// without a home directory still gets an isolated evaluation root rather than
+/// silently writing beside the logs.
+pub fn evaluation_root_path(
+    configured: Option<&str>,
+) -> std::result::Result<PathBuf, StateRootError> {
+    Ok(match conflux_state_root(configured)? {
+        Some(root) => root.join(EVALUATION_DIR_NAME),
+        None => std::env::temp_dir().join("cflx-evaluations-fallback"),
+    })
+}
+
 /// Generates a project slug from the repository root path.
 /// Format: `{repo_basename}-{hash8}` where hash8 is the first 8 chars of the SHA256 hash
 /// of the absolute repository path.

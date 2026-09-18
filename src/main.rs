@@ -23,6 +23,8 @@ mod history;
 mod hooks;
 mod ids;
 mod judge_command;
+#[allow(dead_code, unused_imports)]
+mod judge_evaluation;
 mod lifecycle_integration;
 mod log_viewer;
 mod openspec;
@@ -871,6 +873,51 @@ fn run_logs_subcommand(args: LogsArgs, custom_config_path: Option<&Path>) {
     }
 }
 
+/// Run `cflx judge-eval`, which reads the dedicated evaluation store and
+/// nothing else.
+///
+/// Like `cflx logs`, only *storage* settings are loaded: required agent
+/// commands are not validated, because summarizing records starts no agent. The
+/// same `--config` the writers merged has to be merged here too — otherwise the
+/// reader would point at a state root this installation abandoned.
+fn run_judge_eval_subcommand(args: cli::JudgeEvalArgs, custom_config_path: Option<&Path>) {
+    use cli::JudgeEvalCommands;
+
+    let config = match OrchestratorConfig::load_storage_settings(custom_config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match args.command {
+        JudgeEvalCommands::Summary(summary_args) => {
+            // `--purpose` is a closed enum whose only member is the purpose
+            // this store records, so parsing already settled which root to
+            // read; it is carried into output rather than re-decided here.
+            let command = match judge_evaluation::SummaryCommand::resolve(
+                &config,
+                summary_args.purpose.as_str(),
+                summary_args.since_days,
+                summary_args.project,
+                summary_args.json,
+            ) {
+                Ok(command) => command,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let code = command.run(&mut std::io::stdout());
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // `try_parse` rather than `parse`, so a rejected invocation is answered here
@@ -1293,6 +1340,14 @@ async fn main() -> Result<()> {
         // init_logging() so viewing logs never creates, appends, or cleans log files.
         Some(Commands::Logs(args)) => {
             run_logs_subcommand(args, cli.config.as_deref());
+        }
+
+        // judge-eval subcommand: read-only evaluation-record reader. Placed
+        // beside `logs` and before init_logging() for the same reason — reading
+        // the store must not create a log file, an evaluation directory, an
+        // installation salt, or trigger retention.
+        Some(Commands::JudgeEval(args)) => {
+            run_judge_eval_subcommand(args, cli.config.as_deref());
         }
 
         // Init subcommand: generate configuration file

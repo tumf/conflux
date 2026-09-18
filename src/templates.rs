@@ -87,6 +87,27 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // command_max_runtime_secs is a positive value the shorter of the two applies.
   // "acceptance_max_runtime_secs": 1800,
 
+  // Optional purpose-scoped judge command (non-authoritative shadow observer).
+  // Omitting judge_commands is the normal case: no judge process starts and
+  // dependency analysis behaves exactly as before. `mode` accepts only
+  // "shadow". `evaluation` is separately opt-in durable evidence, written to
+  // <state_base_dir>/cflx/evaluations — a sibling of logs, never visible to
+  // `cflx logs`, and always safe to delete. Read it with
+  // `cflx judge-eval summary --purpose parallel_dependency`.
+  // "judge_commands": {
+  //   "parallel_dependency": {
+  //     "command": ["jev", "run", "-"],
+  //     "model": "jev-1.13.0",
+  //     "yes_threshold": 0.85,
+  //     "mode": "shadow",
+  //     "evaluation": {
+  //       "enabled": false,
+  //       "retention_days": 30,
+  //       "max_total_bytes": 104857600
+  //     }
+  //   }
+  // },
+
   // Logging configuration for TUI debug output
   // "logging": {
   //   "suppress_repetitive_debug": true,
@@ -207,6 +228,27 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // command_max_runtime_secs is a positive value the shorter of the two applies.
   // "acceptance_max_runtime_secs": 1800,
 
+  // Optional purpose-scoped judge command (non-authoritative shadow observer).
+  // Omitting judge_commands is the normal case: no judge process starts and
+  // dependency analysis behaves exactly as before. `mode` accepts only
+  // "shadow". `evaluation` is separately opt-in durable evidence, written to
+  // <state_base_dir>/cflx/evaluations — a sibling of logs, never visible to
+  // `cflx logs`, and always safe to delete. Read it with
+  // `cflx judge-eval summary --purpose parallel_dependency`.
+  // "judge_commands": {
+  //   "parallel_dependency": {
+  //     "command": ["jev", "run", "-"],
+  //     "model": "jev-1.13.0",
+  //     "yes_threshold": 0.85,
+  //     "mode": "shadow",
+  //     "evaluation": {
+  //       "enabled": false,
+  //       "retention_days": 30,
+  //       "max_total_bytes": 104857600
+  //     }
+  //   }
+  // },
+
   // Logging configuration for TUI debug output
   // "logging": {
   //   "suppress_repetitive_debug": true,
@@ -326,6 +368,27 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // because acceptance cannot disable its wall-clock guard. When
   // command_max_runtime_secs is a positive value the shorter of the two applies.
   // "acceptance_max_runtime_secs": 1800,
+
+  // Optional purpose-scoped judge command (non-authoritative shadow observer).
+  // Omitting judge_commands is the normal case: no judge process starts and
+  // dependency analysis behaves exactly as before. `mode` accepts only
+  // "shadow". `evaluation` is separately opt-in durable evidence, written to
+  // <state_base_dir>/cflx/evaluations — a sibling of logs, never visible to
+  // `cflx logs`, and always safe to delete. Read it with
+  // `cflx judge-eval summary --purpose parallel_dependency`.
+  // "judge_commands": {
+  //   "parallel_dependency": {
+  //     "command": ["jev", "run", "-"],
+  //     "model": "jev-1.13.0",
+  //     "yes_threshold": 0.85,
+  //     "mode": "shadow",
+  //     "evaluation": {
+  //       "enabled": false,
+  //       "retention_days": 30,
+  //       "max_total_bytes": 104857600
+  //     }
+  //   }
+  // },
 
   // Logging configuration for TUI debug output
   // "logging": {

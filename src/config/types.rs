@@ -701,6 +701,96 @@ pub struct ParallelDependencyJudgeConfig {
     /// Probability at or above which a shadow judgment counts as a `yes` edge.
     #[serde(default)]
     pub yes_threshold: Option<f64>,
+
+    /// Judge mode. Only `shadow` is accepted; omission normalizes to `shadow`.
+    #[serde(default)]
+    pub mode: Option<String>,
+
+    /// Opt-in durable evaluation recording.
+    ///
+    /// Omitted means disabled. It is part of the atomically replaced entry, so a
+    /// higher-priority layer that supplies the judge also supplies (or omits,
+    /// and thereby disables) its evaluation policy.
+    #[serde(default)]
+    pub evaluation: Option<JudgeEvaluationConfig>,
+}
+
+/// Opt-in bounded evaluation persistence for one judge purpose.
+///
+/// Evaluation data is non-authoritative observability. Nothing here can enable a
+/// non-shadow judge mode, change routing, or gate completion; it only decides
+/// whether a disposable JSONL record is written and how much of it is kept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct JudgeEvaluationConfig {
+    /// Whether durable evaluation recording happens at all.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Age bound in days. Required and positive when `enabled` is true.
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+
+    /// Global byte budget across every project under the evaluation root.
+    /// Required and positive when `enabled` is true.
+    #[serde(default)]
+    pub max_total_bytes: Option<u64>,
+}
+
+impl JudgeEvaluationConfig {
+    /// Validate the evaluation object with diagnostics naming the offending field.
+    ///
+    /// Bounds are validated even while disabled: a value that would fail once
+    /// someone flips `enabled` should fail now, not on the day recording is
+    /// turned on.
+    fn validate(&self, parent_field: &str) -> Result<()> {
+        let field = format!("{parent_field}.evaluation");
+
+        if let Some(retention_days) = self.retention_days {
+            if retention_days == 0 || retention_days > MAX_JUDGE_EVALUATION_RETENTION_DAYS {
+                return Err(OrchestratorError::ConfigLoad(format!(
+                    "Configuration error: `{field}.retention_days` must be between 1 and \
+                     {MAX_JUDGE_EVALUATION_RETENTION_DAYS} (got {retention_days})"
+                )));
+            }
+        }
+
+        if let Some(max_total_bytes) = self.max_total_bytes {
+            if max_total_bytes == 0 || max_total_bytes > MAX_JUDGE_EVALUATION_TOTAL_BYTES {
+                return Err(OrchestratorError::ConfigLoad(format!(
+                    "Configuration error: `{field}.max_total_bytes` must be between 1 and \
+                     {MAX_JUDGE_EVALUATION_TOTAL_BYTES} (got {max_total_bytes})"
+                )));
+            }
+        }
+
+        if !self.enabled {
+            return Ok(());
+        }
+
+        for (name, present) in [
+            ("retention_days", self.retention_days.is_some()),
+            ("max_total_bytes", self.max_total_bytes.is_some()),
+        ] {
+            if !present {
+                return Err(OrchestratorError::ConfigLoad(format!(
+                    "Configuration error: `{field}.{name}` is required when \
+                     `{field}.enabled` is true; evaluation storage is never unbounded"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Bounds usable by the recorder, present only for an enabled *and* valid
+    /// policy. Returns `None` while disabled, so a caller cannot accidentally
+    /// treat leftover bounds as an opt-in.
+    pub fn bounds(&self) -> Option<(u32, u64)> {
+        if !self.enabled {
+            return None;
+        }
+        Some((self.retention_days?, self.max_total_bytes?))
+    }
 }
 
 impl ParallelDependencyJudgeConfig {
@@ -724,6 +814,16 @@ impl ParallelDependencyJudgeConfig {
     /// Shadow `yes` threshold, falling back to the built-in default.
     pub fn yes_threshold(&self) -> f64 {
         self.yes_threshold.unwrap_or(DEFAULT_JUDGE_YES_THRESHOLD)
+    }
+
+    /// Normalized judge mode. An omitted mode is `shadow`.
+    pub fn mode(&self) -> &str {
+        self.mode.as_deref().unwrap_or(JUDGE_MODE_SHADOW)
+    }
+
+    /// The evaluation bounds to record with, or `None` when recording is off.
+    pub fn evaluation_bounds(&self) -> Option<(u32, u64)> {
+        self.evaluation.as_ref().and_then(|e| e.bounds())
     }
 
     /// Validate the entry with diagnostics naming the offending field.
@@ -796,6 +896,20 @@ impl ParallelDependencyJudgeConfig {
                      (got {threshold})"
                 )));
             }
+        }
+
+        if let Some(mode) = self.mode.as_deref() {
+            if mode != JUDGE_MODE_SHADOW {
+                return Err(OrchestratorError::ConfigLoad(format!(
+                    "Configuration error: `{FIELD}.mode` accepts only \
+                     `{JUDGE_MODE_SHADOW}` (got `{mode}`); a judge-authoritative or \
+                     fail-closed mode is not specified yet"
+                )));
+            }
+        }
+
+        if let Some(evaluation) = self.evaluation.as_ref() {
+            evaluation.validate(FIELD)?;
         }
 
         Ok(())
@@ -1676,6 +1790,8 @@ mod judge_commands_config_tests {
             max_input_bytes: None,
             max_output_bytes: None,
             yes_threshold: None,
+            mode: None,
+            evaluation: None,
         }
     }
 
@@ -1875,6 +1991,12 @@ mod judge_commands_config_tests {
             max_input_bytes: Some(2_048),
             max_output_bytes: Some(4_096),
             yes_threshold: Some(0.95),
+            mode: Some(JUDGE_MODE_SHADOW.to_string()),
+            evaluation: Some(JudgeEvaluationConfig {
+                enabled: true,
+                retention_days: Some(90),
+                max_total_bytes: Some(1_048_576),
+            }),
         });
 
         lower.merge(judge_config(ParallelDependencyJudgeConfig {
@@ -1884,6 +2006,8 @@ mod judge_commands_config_tests {
             max_input_bytes: None,
             max_output_bytes: None,
             yes_threshold: None,
+            mode: None,
+            evaluation: None,
         }));
 
         let merged = lower
@@ -1898,6 +2022,15 @@ mod judge_commands_config_tests {
         assert_eq!(merged.max_input_bytes(), DEFAULT_JUDGE_MAX_INPUT_BYTES);
         assert_eq!(merged.max_output_bytes(), DEFAULT_JUDGE_MAX_OUTPUT_BYTES);
         assert_eq!(merged.yes_threshold(), DEFAULT_JUDGE_YES_THRESHOLD);
+        // Mode and evaluation are part of the same trust boundary. A project
+        // layer that omits evaluation must *disable* recording, never inherit
+        // an enabled global policy: silently recording because some other
+        // layer once opted in is exactly the surprise the atomic replacement
+        // exists to prevent.
+        assert_eq!(merged.mode, None);
+        assert_eq!(merged.mode(), JUDGE_MODE_SHADOW);
+        assert_eq!(merged.evaluation, None);
+        assert_eq!(merged.evaluation_bounds(), None);
     }
 
     #[test]
@@ -1937,6 +2070,249 @@ mod judge_commands_config_tests {
                 .map(|j| j.command.clone()),
             Some(vec!["jev".to_string(), "run".to_string(), "-".to_string()])
         );
+    }
+
+    /// Mode normalization and the opt-in evaluation policy.
+    ///
+    /// Named so `cargo test judge_evaluation` selects them alongside the
+    /// evaluation module's own tests: the configuration that turns recording on
+    /// is part of the same contract as the recording.
+    mod judge_evaluation_config {
+        use super::*;
+
+        fn parse(json: &str) -> OrchestratorConfig {
+            serde_json::from_str(json).expect("configuration must parse")
+        }
+
+        fn judge_from(json: &str) -> ParallelDependencyJudgeConfig {
+            parse(json)
+                .get_parallel_dependency_judge()
+                .expect("judge entry must be present")
+                .clone()
+        }
+
+        fn with_evaluation(evaluation: &str) -> String {
+            format!(
+                r#"{{"judge_commands": {{"parallel_dependency": {{
+                    "command": ["jev", "run", "-"], "model": "jev-1.13.0",
+                    "evaluation": {evaluation}}}}}}}"#
+            )
+        }
+
+        #[test]
+        fn an_omitted_mode_normalizes_to_shadow() {
+            // Backward compatibility: every configuration written before `mode`
+            // existed keeps its exact meaning.
+            let judge = judge_from(
+                r#"{"judge_commands": {"parallel_dependency": {"command": ["jev"], "model": "m-1"}}}"#,
+            );
+            assert_eq!(judge.mode, None);
+            assert_eq!(judge.mode(), JUDGE_MODE_SHADOW);
+            assert!(judge.validate().is_ok());
+        }
+
+        #[test]
+        fn shadow_is_the_only_accepted_mode() {
+            let judge = judge_from(
+                r#"{"judge_commands": {"parallel_dependency": {"command": ["jev"], "model": "m-1", "mode": "shadow"}}}"#,
+            );
+            assert_eq!(judge.mode(), JUDGE_MODE_SHADOW);
+            assert!(judge.validate().is_ok());
+
+            for rejected in ["prefer", "only", "authoritative", "Shadow", ""] {
+                let judge = ParallelDependencyJudgeConfig {
+                    mode: Some(rejected.to_string()),
+                    ..valid_judge()
+                };
+                let message = judge
+                    .validate()
+                    .expect_err(&format!("`{rejected}` must not be an accepted mode"))
+                    .to_string();
+                assert!(
+                    message.contains("judge_commands.parallel_dependency.mode"),
+                    "the diagnostic must name the field: {message}"
+                );
+            }
+        }
+
+        #[test]
+        fn evaluation_is_absent_by_default_and_records_nothing() {
+            let judge = judge_from(
+                r#"{"judge_commands": {"parallel_dependency": {"command": ["jev"], "model": "m-1"}}}"#,
+            );
+            assert_eq!(judge.evaluation, None);
+            assert_eq!(judge.evaluation_bounds(), None);
+            assert!(judge.validate().is_ok());
+        }
+
+        #[test]
+        fn an_enabled_policy_exposes_its_bounds() {
+            let judge = judge_from(&with_evaluation(
+                r#"{"enabled": true, "retention_days": 30, "max_total_bytes": 104857600}"#,
+            ));
+            assert!(judge.validate().is_ok());
+            assert_eq!(judge.evaluation_bounds(), Some((30, 104_857_600)));
+        }
+
+        #[test]
+        fn a_disabled_policy_exposes_no_bounds_even_when_it_carries_them() {
+            // Leftover bounds must never read as an opt-in: turning recording
+            // off has to mean off, not "off but configured".
+            let judge = judge_from(&with_evaluation(
+                r#"{"enabled": false, "retention_days": 30, "max_total_bytes": 1024}"#,
+            ));
+            assert!(judge.validate().is_ok(), "the bounds are still validated");
+            assert_eq!(judge.evaluation_bounds(), None);
+
+            let omitted_enabled = judge_from(&with_evaluation(
+                r#"{"retention_days": 30, "max_total_bytes": 1024}"#,
+            ));
+            assert_eq!(
+                omitted_enabled.evaluation_bounds(),
+                None,
+                "an omitted `enabled` is disabled"
+            );
+        }
+
+        #[test]
+        fn an_enabled_policy_requires_both_bounds() {
+            for (label, evaluation) in [
+                ("neither bound", r#"{"enabled": true}"#),
+                (
+                    "only retention",
+                    r#"{"enabled": true, "retention_days": 30}"#,
+                ),
+                (
+                    "only bytes",
+                    r#"{"enabled": true, "max_total_bytes": 1024}"#,
+                ),
+            ] {
+                let message = parse(&with_evaluation(evaluation))
+                    .validate_judge_commands()
+                    .expect_err(&format!("{label} must fail configuration loading"))
+                    .to_string();
+                assert!(
+                    message.contains("judge_commands.parallel_dependency.evaluation"),
+                    "the diagnostic must name the field for {label}: {message}"
+                );
+                assert!(
+                    message.contains("required"),
+                    "and say what is missing for {label}: {message}"
+                );
+            }
+        }
+
+        #[test]
+        fn bounds_are_rejected_at_zero_and_above_their_maximums() {
+            let cases = [
+                ("retention_days", "0", "retention_days"),
+                ("retention_days", "3651", "retention_days"),
+                ("max_total_bytes", "0", "max_total_bytes"),
+                ("max_total_bytes", "10737418241", "max_total_bytes"),
+            ];
+            for (field, value, expected_field) in cases {
+                let other = if field == "retention_days" {
+                    r#""max_total_bytes": 1024"#
+                } else {
+                    r#""retention_days": 30"#
+                };
+                let message = parse(&with_evaluation(&format!(
+                    r#"{{"enabled": true, "{field}": {value}, {other}}}"#
+                )))
+                .validate_judge_commands()
+                .expect_err(&format!("{field} = {value} must be rejected"))
+                .to_string();
+                assert!(
+                    message.contains(expected_field),
+                    "the diagnostic must name `{expected_field}`: {message}"
+                );
+            }
+
+            // Exactly at the maximums is accepted: the ceiling is inclusive.
+            let judge = judge_from(&with_evaluation(
+                r#"{"enabled": true, "retention_days": 3650, "max_total_bytes": 10737418240}"#,
+            ));
+            assert!(judge.validate().is_ok());
+            assert_eq!(
+                judge.evaluation_bounds(),
+                Some((
+                    MAX_JUDGE_EVALUATION_RETENTION_DAYS,
+                    MAX_JUDGE_EVALUATION_TOTAL_BYTES
+                ))
+            );
+        }
+
+        #[test]
+        fn out_of_range_bounds_are_rejected_even_while_disabled() {
+            // Validating only when enabled would hide the defect until the day
+            // an operator flips the switch, which is the worst possible moment
+            // to discover it.
+            let message = parse(&with_evaluation(
+                r#"{"enabled": false, "retention_days": 99999, "max_total_bytes": 1024}"#,
+            ))
+            .validate_judge_commands()
+            .expect_err("an out-of-range bound must fail even while disabled")
+            .to_string();
+            assert!(message.contains("retention_days"), "{message}");
+        }
+
+        #[test]
+        fn a_project_layer_cannot_form_a_hybrid_evaluation_policy() {
+            let mut lower = judge_config(ParallelDependencyJudgeConfig {
+                mode: Some(JUDGE_MODE_SHADOW.to_string()),
+                evaluation: Some(JudgeEvaluationConfig {
+                    enabled: true,
+                    retention_days: Some(365),
+                    max_total_bytes: Some(1_048_576),
+                }),
+                ..valid_judge()
+            });
+
+            // The project layer names the judge but says nothing about
+            // evaluation. That is a complete entry with recording off, not an
+            // inheritance of the global opt-in.
+            lower.merge(judge_config(ParallelDependencyJudgeConfig {
+                command: vec!["project-judge".to_string()],
+                model: "project-2.0.0".to_string(),
+                ..valid_judge()
+            }));
+
+            let merged = lower
+                .get_parallel_dependency_judge()
+                .expect("entry must be present");
+            assert_eq!(merged.model, "project-2.0.0");
+            assert_eq!(merged.evaluation, None);
+            assert_eq!(
+                merged.evaluation_bounds(),
+                None,
+                "recording must not be inherited across a replaced entry"
+            );
+
+            // The reverse direction too: a project layer may opt in where the
+            // global layer did not.
+            let mut lower = judge_config(valid_judge());
+            lower.merge(judge_config(ParallelDependencyJudgeConfig {
+                evaluation: Some(JudgeEvaluationConfig {
+                    enabled: true,
+                    retention_days: Some(7),
+                    max_total_bytes: Some(2048),
+                }),
+                ..valid_judge()
+            }));
+            assert_eq!(
+                lower
+                    .get_parallel_dependency_judge()
+                    .and_then(|j| j.evaluation_bounds()),
+                Some((7, 2048))
+            );
+        }
+
+        #[test]
+        fn a_configuration_without_judge_commands_still_has_no_evaluation_policy() {
+            let config = parse(r#"{"apply_command": "echo apply"}"#);
+            assert!(config.get_parallel_dependency_judge().is_none());
+            assert!(config.validate_judge_commands().is_ok());
+        }
     }
 }
 
