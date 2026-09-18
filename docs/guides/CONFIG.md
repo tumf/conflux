@@ -141,6 +141,7 @@ Command templates support these placeholders:
 | `stream_json_textify` | boolean | No | `true` | Converts Claude Code NDJSON to readable text |
 | `command_strict_process_cleanup` | boolean | No | `true` | Sweeps the full process group after completion and verifies that no members remain |
 | `lifecycle_integration` | object | No | unset | External lifecycle adapter (observability only) |
+| `judge_commands` | object | No | unset | Purpose-scoped judge commands (shadow observers only) |
 
 ## Storage Roots
 
@@ -491,6 +492,125 @@ Because the adapter no-ops outside Herdr, the same configuration is safe in ever
 
 Herdr process detection is a **separate dependency** and is out of scope for Conflux: Herdr must recognize the foreground `cflx` process in order to create and remove the Agent entry. Until it does, the lifecycle stream reports state for an Agent entry that Herdr still has to own. The field names in the reference adapter are the integration *shape*, not a certified Herdr wire format — match them to the Herdr version you run.
 
+## `judge_commands`
+
+Optional commands that answer one *typed judgment question* each. Entries are
+named after the question, never after a vendor or a model, so an equivalent later
+tool needs no new configuration key. The first supported purpose is
+`parallel_dependency`.
+
+```jsonc
+{
+  "judge_commands": {
+    "parallel_dependency": {
+      "command": ["jev", "run", "-"],
+      "model": "jev-1.13.0",
+      "timeout_ms": 30000,
+      "max_input_bytes": 1048576,
+      "max_output_bytes": 1048576,
+      "yes_threshold": 0.85
+    }
+  }
+}
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `command` | string[] | required | Judge argv; first element is the executable. Not a shell template: there is no `{placeholder}` and no shell parsing |
+| `model` | string | required | Pinned concrete request model. An alias ending in `-latest` is rejected, because the response is accepted only when the returned model equals the requested one |
+| `timeout_ms` | integer | `30000` | Bounded wall-clock timeout for one invocation; `1`–`300000` |
+| `max_input_bytes` | integer | `1048576` | Serialized request limit; `1`–`16777216` |
+| `max_output_bytes` | integer | `1048576` | Collected stdout/stderr limit, applied to each; `1`–`16777216` |
+| `yes_threshold` | number | `0.85` | Probability at or above which a judgment counts as a `yes` edge; finite and within `0.5`–`1.0` |
+
+Omitting `judge_commands` is the normal case: no judge process is started and
+dependency analysis behaves exactly as before, with no warning and no validation
+error. An invalid entry fails configuration loading before orchestration starts,
+with a diagnostic naming the offending field.
+
+### `parallel_dependency` is shadow-only
+
+This judge is a **non-authoritative observer** of dependency analysis. It runs
+concurrently with `analyze_command`, and the conventional analyzer stays the sole
+authority for execution order and dependency routing:
+
+- proposal metadata dependencies remain authoritative; a judgment never adds,
+  removes, or changes a dependency or an order;
+- conventional analyzer completion is the judge's deadline. A judge still
+  running is cancelled, its process group is terminated (TERM, a fixed 100 ms
+  grace, then KILL) and reaped by a detached task, and the conventional result
+  returns without waiting for any of it — so enabling a slow or unavailable
+  judge adds no latency;
+- a missing executable, spawn failure, non-zero exit, timeout, oversized input
+  or output, malformed JSON, schema mismatch, or missing answer is a bounded
+  shadow failure. None of them makes a change `blocked`, `stalled`, or `failed`;
+- the judge is skipped entirely when `use_llm_analysis` is `false`, when there
+  are zero or one queued changes, when no candidate pair exists, or when a
+  proposal file cannot be read;
+- diagnostics carry only purpose, outcome category, duration, answer counts, the
+  validated model identity, and aggregate edge-comparison counts. Never proposal
+  text, request state, credentials, raw stdout/stderr, or a judgment tied to a
+  named change.
+
+There is no `mode` field. A `prefer`, fail-closed, or judge-authoritative mode
+would be a separate reviewed change.
+
+### Precedence is atomic per purpose
+
+`parallel_dependency` is one trust boundary. A higher-priority layer that
+supplies it replaces the **complete** lower-priority entry; fields are never
+merged. Omitting it inherits the lower-priority entry unchanged. That prevents a
+project layer from replacing only the executable while silently inheriting
+another layer's model, threshold, or byte limits.
+
+### Protocol
+
+Conflux writes exactly one TypeSafe System One request object to the command's
+stdin, closes stdin, and accepts exactly one System One response object on
+stdout:
+
+```json
+{"model":"jev-1.13.0","answers":{"q_0000_0001":{"type":"noul","noul":0.93}},"usage":{"input_tokens":123,"output_tokens":8}}
+```
+
+The request carries structured queued/in-flight change state — including each
+complete `proposal.md` — and one `noul` question per candidate dependency pair.
+Question IDs are `q_{dependent_index:04}_{dependency_index:04}`: change IDs are
+never used as JSON object keys. A response is accepted only when stdout is
+exactly one JSON value followed by whitespace, the returned model equals the
+requested model, the answer IDs match the request exactly, every answer is
+`type: "noul"` with a finite value in `[0, 1]`, and usage counters are
+non-negative integers. Anything else is a shadow failure.
+
+Because the request grows quadratically in question count and linearly in
+included proposal bytes, a large queue may exceed `max_input_bytes`. Conflux then
+skips shadow collection with an `input_too_large` diagnostic and continues the
+conventional analysis; proposal text is never truncated and pairs are never
+silently dropped. Raise the limit after observing your own proposal sizes.
+
+### Compatibility baseline
+
+The compatibility baseline is
+[`jev-cli v0.4.1`](https://github.com/tumf/jev-cli/releases/tag/v0.4.1), tag
+commit `50488f35d705051b5d621d1d10e69d1503783e7d`. That immutable tag — not
+repository `main` — defines the accepted command contract: `jev run -` passing
+complete request JSON through unchanged, one JSON object on stdout with
+structured errors on stderr, and exit `2` for CLI/input errors, `3` for
+credential errors, `4` for transient API/network errors, and `1` for other
+failures.
+
+Configuration stays product-neutral: any command conforming to that contract
+works, Conflux never inspects `jev --version`, and `jev` does not need to be
+installed.
+
+### Credentials belong to the command
+
+The command owns provider communication and credentials — for `jev`, that is
+`TYPESAFE_API_KEY` or its own private credential store. Conflux passes no
+provider API key, injects no provider-specific environment variable, and never
+logs the request, the response, or a provider error body. The child inherits the
+`cflx` process environment plus any configured [`envs`](#envs), and nothing else.
+
 ## Complete Example
 
 ```jsonc
@@ -520,6 +640,16 @@ Herdr process detection is a **separate dependency** and is out of scope for Con
       "command": "cargo test -q",
       "continue_on_failure": false,
       "timeout": 120
+    }
+  },
+  "judge_commands": {
+    "parallel_dependency": {
+      "command": ["jev", "run", "-"],
+      "model": "jev-1.13.0",
+      "timeout_ms": 30000,
+      "max_input_bytes": 1048576,
+      "max_output_bytes": 1048576,
+      "yes_threshold": 0.85
     }
   }
 }

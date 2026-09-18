@@ -40,6 +40,7 @@ mod error_history;
 mod execution;
 mod history;
 mod hooks;
+pub mod judge_command;
 // Public so `tests/client_cli_tests.rs` can build the same monitoring snapshot a
 // real owner publishes when it wires a production coordinator.
 pub mod openspec;

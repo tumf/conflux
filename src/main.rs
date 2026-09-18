@@ -22,6 +22,7 @@ mod execution;
 mod history;
 mod hooks;
 mod ids;
+mod judge_command;
 mod lifecycle_integration;
 mod log_viewer;
 mod openspec;
