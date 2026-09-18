@@ -187,6 +187,7 @@ impl Cli {
             Commands::CheckConflicts(_) => Some("check-conflicts"),
             Commands::InstallSkills(_) => Some("install-skills"),
             Commands::Logs(_) => Some("logs"),
+            Commands::JudgeEval(_) => Some("judge-eval"),
             Commands::Openspec(_) => Some("openspec"),
             Commands::Client(_) => Some("client"),
             Commands::Openapi => Some("openapi"),
@@ -254,6 +255,27 @@ pub enum Commands {
     ///   cflx logs --follow                  # Print recent lines, then stream appended lines
     ///   cflx logs --today --project my-slug # Select today's log for an explicit project
     Logs(LogsArgs),
+
+    /// Inspect opt-in shadow judge evaluation records, read-only
+    ///
+    /// Reads only the dedicated `<state-root>/evaluations` store — never the
+    /// ordinary log root — and mutates nothing: it creates no directory, no
+    /// installation salt, and no record file, initializes no operational
+    /// logging, and runs no retention. Records exist only where
+    /// `judge_commands.parallel_dependency.evaluation.enabled` was explicitly
+    /// turned on; everywhere else this reports an empty summary.
+    ///
+    /// The metrics are promotion evidence — precision, recall, specificity,
+    /// outcome rates, latency percentiles, and token totals — and nothing here
+    /// feeds routing, Acceptance, Archive, or any lifecycle decision.
+    ///
+    /// EXAMPLES:
+    ///   cflx judge-eval summary --purpose parallel_dependency
+    ///   cflx judge-eval summary --purpose parallel_dependency --json
+    ///   cflx judge-eval summary --purpose parallel_dependency --since-days 7
+    ///   cflx judge-eval summary --purpose parallel_dependency --project my-slug
+    #[command(name = "judge-eval")]
+    JudgeEval(JudgeEvalArgs),
 
     /// OpenSpec utility commands for repository-scoped operations
     ///
@@ -418,6 +440,107 @@ pub struct LogsArgs {
     /// Select an explicit log project slug under the Conflux log root
     #[arg(long, value_name = "SLUG")]
     pub project: Option<String>,
+}
+
+// ============================================================================
+// Judge evaluation records
+// ============================================================================
+
+/// Largest accepted `--since-days`, matching the configuration's own retention
+/// ceiling. A parse bound, not a policy: it turns a typo into a usage error
+/// rather than an arithmetic surprise deep inside a date computation.
+const MAX_JUDGE_EVAL_SINCE_DAYS: u32 = 3_650;
+
+fn parse_since_days(value: &str) -> std::result::Result<u32, String> {
+    let days: u32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a whole number of days"))?;
+    if days == 0 {
+        // Zero is not "no window" here: an empty window would report an empty
+        // summary that looks exactly like "nothing was ever recorded".
+        return Err("--since-days must be at least 1".to_string());
+    }
+    if days > MAX_JUDGE_EVAL_SINCE_DAYS {
+        return Err(format!(
+            "--since-days must be at most {MAX_JUDGE_EVAL_SINCE_DAYS}"
+        ));
+    }
+    Ok(days)
+}
+
+/// Judgment purposes that have an evaluation store.
+///
+/// A closed enum rather than a free string: naming a purpose that records
+/// nothing should be a usage error, not an empty summary indistinguishable
+/// from an unused judge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum JudgeEvalPurpose {
+    #[value(name = "parallel_dependency")]
+    ParallelDependency,
+}
+
+impl JudgeEvalPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParallelDependency => "parallel_dependency",
+        }
+    }
+}
+
+/// Arguments for the `judge-eval` subcommand namespace.
+#[derive(Parser, Debug)]
+pub struct JudgeEvalArgs {
+    #[command(subcommand)]
+    pub command: JudgeEvalCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum JudgeEvalCommands {
+    /// Summarize recorded evaluation evidence without modifying anything
+    ///
+    /// This change exposes the read-only summary alone. Export and purge are
+    /// separate reviewable commands, so nothing here can delete a record.
+    Summary(JudgeEvalSummaryArgs),
+}
+
+/// Arguments for `cflx judge-eval summary`.
+#[derive(Parser, Debug)]
+#[command(long_about = "Summarize opt-in shadow judge evaluation records.
+
+Reads only <state-root>/evaluations. It creates no directory, salt, or record,
+initializes no operational logging, and runs no retention, so inspecting the
+store never changes it.
+
+Malformed lines and records carrying an unsupported schema version are counted
+as skipped and excluded from every metric, rather than silently dropped or
+guessed at. Precision, recall, and specificity are null — not zero — when their
+denominator is empty, because \"never right\" and \"never asked\" are different
+findings.
+
+EXAMPLES:
+  cflx judge-eval summary --purpose parallel_dependency
+  cflx judge-eval summary --purpose parallel_dependency --json
+  cflx judge-eval summary --purpose parallel_dependency --since-days 7
+  cflx judge-eval summary --purpose parallel_dependency --project conflux-a1b2c3d4")]
+pub struct JudgeEvalSummaryArgs {
+    /// Judgment purpose whose evaluation store is summarized
+    #[arg(long, value_enum)]
+    pub purpose: JudgeEvalPurpose,
+
+    /// Include only records dated within the last N days, today inclusive
+    ///
+    /// Defaults to the configured retention window when one is available,
+    /// otherwise 30 days.
+    #[arg(long, value_name = "N", value_parser = parse_since_days)]
+    pub since_days: Option<u32>,
+
+    /// Select one exact project slug under the evaluation root
+    #[arg(long, value_name = "SLUG")]
+    pub project: Option<String>,
+
+    /// Emit exactly one versioned JSON object instead of human-readable text
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for the run subcommand
@@ -3594,5 +3717,142 @@ mod remote_control_api_cli_tests {
             resolve_unix_socket(explicit.as_deref(), opt_out, None).unwrap(),
             UnixSocketSelection::Disabled
         );
+    }
+
+    /// Parsing of the read-only `judge-eval` namespace.
+    mod judge_evaluation_cli {
+        use super::*;
+
+        fn summary(argv: &[&str]) -> JudgeEvalSummaryArgs {
+            match Cli::parse_from(argv).command {
+                Some(Commands::JudgeEval(args)) => match args.command {
+                    JudgeEvalCommands::Summary(summary) => summary,
+                },
+                other => panic!("expected judge-eval summary, got {other:?} for {argv:?}"),
+            }
+        }
+
+        #[test]
+        fn summary_parses_its_selectors() {
+            let args = summary(&[
+                "cflx",
+                "judge-eval",
+                "summary",
+                "--purpose",
+                "parallel_dependency",
+                "--since-days",
+                "7",
+                "--project",
+                "conflux-a1b2c3d4",
+                "--json",
+            ]);
+
+            assert_eq!(args.purpose, JudgeEvalPurpose::ParallelDependency);
+            assert_eq!(args.purpose.as_str(), "parallel_dependency");
+            assert_eq!(args.since_days, Some(7));
+            assert_eq!(args.project.as_deref(), Some("conflux-a1b2c3d4"));
+            assert!(args.json);
+        }
+
+        #[test]
+        fn every_selector_except_purpose_is_optional() {
+            let args = summary(&[
+                "cflx",
+                "judge-eval",
+                "summary",
+                "--purpose",
+                "parallel_dependency",
+            ]);
+
+            assert_eq!(args.since_days, None, "the window is defaulted downstream");
+            assert_eq!(args.project, None);
+            assert!(!args.json, "human output is the default");
+        }
+
+        #[test]
+        fn purpose_is_required_and_closed() {
+            // Required: a store cannot be chosen without naming one.
+            assert!(
+                Cli::try_parse_from(["cflx", "judge-eval", "summary"]).is_err(),
+                "--purpose must be required"
+            );
+            // Closed: an unrecorded purpose is a usage error rather than an
+            // empty summary indistinguishable from an unused judge.
+            assert!(
+                Cli::try_parse_from([
+                    "cflx",
+                    "judge-eval",
+                    "summary",
+                    "--purpose",
+                    "some_other_purpose",
+                ])
+                .is_err(),
+                "an unknown purpose must not parse"
+            );
+        }
+
+        #[test]
+        fn since_days_rejects_zero_negative_and_oversized_windows() {
+            for bad in ["0", "-1", "3651", "seven", "1.5", ""] {
+                assert!(
+                    Cli::try_parse_from([
+                        "cflx",
+                        "judge-eval",
+                        "summary",
+                        "--purpose",
+                        "parallel_dependency",
+                        "--since-days",
+                        bad,
+                    ])
+                    .is_err(),
+                    "--since-days {bad} must be a usage error"
+                );
+            }
+
+            for good in ["1", "30", "3650"] {
+                let args = summary(&[
+                    "cflx",
+                    "judge-eval",
+                    "summary",
+                    "--purpose",
+                    "parallel_dependency",
+                    "--since-days",
+                    good,
+                ]);
+                assert_eq!(args.since_days, Some(good.parse().expect("bound")));
+            }
+        }
+
+        #[test]
+        fn the_namespace_exposes_only_the_read_only_summary() {
+            // Export, purge, and any other mutation are separate reviewable
+            // changes; none of them may be reachable from this build.
+            for verb in ["export", "purge", "delete", "clear", "prune"] {
+                assert!(
+                    Cli::try_parse_from(["cflx", "judge-eval", verb]).is_err(),
+                    "`judge-eval {verb}` must not exist"
+                );
+            }
+            assert!(
+                Cli::try_parse_from(["cflx", "judge-eval"]).is_err(),
+                "a subcommand is required"
+            );
+        }
+
+        #[test]
+        fn judge_eval_is_named_for_diagnostics_like_every_other_subcommand() {
+            let cli = Cli::parse_from([
+                "cflx",
+                "judge-eval",
+                "summary",
+                "--purpose",
+                "parallel_dependency",
+            ]);
+            assert_eq!(cli.subcommand_name(), Some("judge-eval"));
+            // And it is a real subcommand rather than a hidden one.
+            assert!(Cli::command()
+                .get_subcommands()
+                .any(|sub| sub.get_name() == "judge-eval" && !sub.is_hide_set()));
+        }
     }
 }

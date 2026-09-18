@@ -1605,6 +1605,8 @@ mod tests {
                 max_input_bytes: None,
                 max_output_bytes: None,
                 yes_threshold: None,
+                mode: None,
+                evaluation: None,
             }),
         };
 

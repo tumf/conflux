@@ -10,6 +10,8 @@ use crate::dependency_targets::{
     collect_rejected_change_ids, union_metadata_dependencies, DependencyTargetClass,
 };
 use crate::error::{OrchestratorError, Result};
+use crate::judge_evaluation::{EvaluationRecorder, ObservationInput, ObservedPair};
+
 use crate::judge_command::{
     parse_system_one_response, spawn_judge, JudgeChangeNode, JudgeCollection, JudgeCommandSpec,
     JudgeFailureCategory, JudgeHandle, JudgeRequestState, JudgeUsage, NoulCriteria, NoulQuestion,
@@ -162,6 +164,13 @@ struct DependencyJudgeObservation {
     duration: Duration,
     /// Threshold used to project probabilities onto comparison edges.
     yes_threshold: f64,
+    /// Pairs the request asked about.
+    ///
+    /// Held separately from `values.len()` because the two are not the same
+    /// claim: a response that answered every question makes them equal, and
+    /// reporting the answered count as the asked count would hide the case
+    /// where they are not.
+    expected_answers: usize,
 }
 
 /// Stable lowercase token for a proposal priority.
@@ -437,7 +446,7 @@ impl ParallelizationAnalyzer {
                 Ok(Some(built)) => built,
                 Ok(None) => return None,
                 Err(category) => {
-                    Self::trace_judge_failure(category, Duration::ZERO, 0);
+                    self.trace_judge_failure(category, Duration::ZERO, 0);
                     return None;
                 }
             };
@@ -445,14 +454,14 @@ impl ParallelizationAnalyzer {
         let serialized = match serde_json::to_string(&request) {
             Ok(serialized) => serialized,
             Err(_) => {
-                Self::trace_judge_failure(JudgeFailureCategory::Io, Duration::ZERO, pairs.len());
+                self.trace_judge_failure(JudgeFailureCategory::Io, Duration::ZERO, pairs.len());
                 return None;
             }
         };
         // Checked before spawn: an oversized request is never truncated and
         // never partially judged.
         if serialized.len() > judge.max_input_bytes() {
-            Self::trace_judge_failure(
+            self.trace_judge_failure(
                 JudgeFailureCategory::InputTooLarge,
                 Duration::ZERO,
                 pairs.len(),
@@ -653,7 +662,7 @@ impl ParallelizationAnalyzer {
         let output = match handle.collect_or_cancel().await {
             JudgeCollection::Completed(Ok(output)) => output,
             JudgeCollection::Completed(Err(failure)) => {
-                Self::trace_judge_failure(failure.category, failure.duration, expected_ids.len());
+                self.trace_judge_failure(failure.category, failure.duration, expected_ids.len());
                 return None;
             }
             JudgeCollection::Cancelled(cleanup) => {
@@ -661,7 +670,7 @@ impl ParallelizationAnalyzer {
                 // TERM, waits the fixed grace, escalates to KILL if needed, and
                 // reaps the child without the authoritative path waiting for it.
                 drop(cleanup);
-                Self::trace_judge_failure(
+                self.trace_judge_failure(
                     JudgeFailureCategory::Cancelled,
                     Duration::ZERO,
                     expected_ids.len(),
@@ -686,10 +695,11 @@ impl ParallelizationAnalyzer {
                     usage: response.usage,
                     duration: output.duration,
                     yes_threshold,
+                    expected_answers: expected_ids.len(),
                 })
             }
             Err(category) => {
-                Self::trace_judge_failure(category, output.duration, expected_ids.len());
+                self.trace_judge_failure(category, output.duration, expected_ids.len());
                 None
             }
         }
@@ -718,8 +728,14 @@ impl ParallelizationAnalyzer {
         let mut analyzer_only_positive = 0usize;
         let mut matching_negative = 0usize;
 
-        for ((dependent, dependency), value) in &observation.values {
-            let judge_yes = *value >= observation.yes_threshold;
+        // Sorted rather than iterated in hash order, so a recorded pair list is
+        // reproducible across runs of the same observation.
+        let mut pairs: Vec<(&(String, String), &f64)> = observation.values.iter().collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut observed_pairs = Vec::with_capacity(pairs.len());
+        for ((dependent, dependency), value) in &pairs {
+            let judge_yes = **value >= observation.yes_threshold;
             let analyzer_yes = authoritative.contains(&(dependent.as_str(), dependency.as_str()));
             match (judge_yes, analyzer_yes) {
                 (true, true) => matching_positive += 1,
@@ -727,6 +743,12 @@ impl ParallelizationAnalyzer {
                 (false, true) => analyzer_only_positive += 1,
                 (false, false) => matching_negative += 1,
             }
+            observed_pairs.push(ObservedPair {
+                dependent,
+                dependency,
+                judge_probability: **value,
+                analyzer_dependency: analyzer_yes,
+            });
         }
 
         // Allowed fields only: purpose, outcome, duration, answer counts, the
@@ -737,7 +759,7 @@ impl ParallelizationAnalyzer {
             purpose = PARALLEL_DEPENDENCY_PURPOSE,
             outcome = "observed",
             duration_ms = observation.duration.as_millis() as u64,
-            expected_answers = observation.values.len(),
+            expected_answers = observation.expected_answers,
             returned_answers = observation.values.len(),
             model = %observation.model,
             input_tokens = observation.usage.input_tokens,
@@ -749,13 +771,30 @@ impl ParallelizationAnalyzer {
             total_pairs = observation.values.len(),
             "Shadow dependency judge observation compared with authoritative analysis"
         );
+
+        // Durable evidence, only when explicitly opted into. The authoritative
+        // `result` above is already final and is borrowed read-only here; this
+        // call cannot reach it, and its failure is swallowed.
+        if let Some(recorder) = self.evaluation_recorder() {
+            Self::swallow_evaluation_error(recorder.record_observation(&ObservationInput {
+                model: &observation.model,
+                duration_ms: observation.duration.as_millis() as u64,
+                expected_answers: observation.expected_answers,
+                input_tokens: observation.usage.input_tokens,
+                output_tokens: observation.usage.output_tokens,
+                yes_threshold: observation.yes_threshold,
+                pairs: observed_pairs,
+            }));
+        }
     }
 
-    /// Emit the one bounded diagnostic a judge failure is allowed to produce.
+    /// Emit the one bounded diagnostic a judge failure is allowed to produce,
+    /// and persist it as an evaluation record when recording is enabled.
     ///
     /// The model identity is deliberately absent: it is only trustworthy after
     /// schema validation, which by definition did not complete here.
     fn trace_judge_failure(
+        &self,
         category: JudgeFailureCategory,
         duration: Duration,
         expected_answers: usize,
@@ -767,6 +806,42 @@ impl ParallelizationAnalyzer {
             expected_answers,
             "Shadow dependency judge produced no usable observation; authoritative analysis is unaffected"
         );
+
+        if let Some(recorder) = self.evaluation_recorder() {
+            Self::swallow_evaluation_error(recorder.record_failure(
+                category.as_str(),
+                duration.as_millis() as u64,
+                expected_answers,
+            ));
+        }
+    }
+
+    /// The evaluation recorder, or `None` whenever recording is not opted into.
+    ///
+    /// Built per use rather than held on the analyzer so a configuration that
+    /// never enables evaluation costs exactly one `Option` check and touches no
+    /// filesystem path at all.
+    fn evaluation_recorder(&self) -> Option<EvaluationRecorder> {
+        EvaluationRecorder::from_config(&self.config, &self.repo_root)
+    }
+
+    /// Swallow an evaluation failure after one bounded warning.
+    ///
+    /// This is the boundary the whole feature rests on: evaluation data is
+    /// disposable observability, so a recorder, salt, cleanup, or append
+    /// failure must not alter `AnalysisResult`, provenance, routing, blockers,
+    /// Acceptance, Archive, lifecycle state, or process success. The warning
+    /// text is typed and path-free, so nothing about the record — or where it
+    /// would have gone — is copied into the ordinary log.
+    fn swallow_evaluation_error(result: crate::judge_evaluation::EvaluationResult<()>) {
+        if let Err(error) = result {
+            warn!(
+                purpose = PARALLEL_DEPENDENCY_PURPOSE,
+                outcome = "evaluation_record_skipped",
+                reason = %error,
+                "Judge evaluation record was not persisted; analysis and its result are unaffected"
+            );
+        }
     }
 
     /// Parse and validate the analysis output.
@@ -2244,6 +2319,8 @@ That's all."#;
                 max_input_bytes: None,
                 max_output_bytes: None,
                 yes_threshold: None,
+                mode: None,
+                evaluation: None,
             }
         }
 
@@ -3135,6 +3212,339 @@ That's all."#;
                     _subscriber: subscriber,
                 },
             )
+        }
+    }
+
+    /// Wiring between the shadow judge and the durable evaluation recorder.
+    ///
+    /// Integration-scoped on purpose: these drive the analyzer's real reporting
+    /// methods against a real temporary state root and real path resolvers,
+    /// because the properties under test — that a record lands where it should,
+    /// and that failing to write one changes nothing — are properties of that
+    /// boundary rather than of a pure function.
+    mod judge_evaluation_wiring {
+        use super::shadow_judge_request::judge_entry;
+        use super::*;
+        use crate::config::{
+            JudgeCommandsConfig, JudgeEvaluationConfig, OrchestratorConfig,
+            ParallelDependencyJudgeConfig,
+        };
+        use crate::judge_evaluation::record::EvaluationRecord;
+
+        /// Distinctive change IDs, so a leak into a record or a path is obvious.
+        const DEPENDENT: &str = "add-EVAL-SECRET-dependent";
+        const DEPENDENCY: &str = "add-EVAL-SECRET-dependency";
+
+        struct Fixture {
+            _state: tempfile::TempDir,
+            repo: tempfile::TempDir,
+            config: OrchestratorConfig,
+            evaluation_root: PathBuf,
+        }
+
+        /// A configuration whose judge records evaluations into a fresh state root.
+        fn fixture(evaluation: Option<JudgeEvaluationConfig>) -> Fixture {
+            let state = tempfile::TempDir::new().expect("state root");
+            let state_base_dir = state.path().display().to_string();
+            let config = OrchestratorConfig {
+                analyze_command: Some("echo unused".to_string()),
+                state_base_dir: Some(state_base_dir.clone()),
+                judge_commands: Some(JudgeCommandsConfig {
+                    parallel_dependency: Some(ParallelDependencyJudgeConfig {
+                        evaluation,
+                        ..judge_entry()
+                    }),
+                }),
+                ..Default::default()
+            };
+            Fixture {
+                evaluation_root: crate::config::defaults::evaluation_root_path(Some(
+                    &state_base_dir,
+                ))
+                .expect("evaluation root"),
+                repo: tempfile::TempDir::new().expect("repo root"),
+                config,
+                _state: state,
+            }
+        }
+
+        fn enabled() -> JudgeEvaluationConfig {
+            JudgeEvaluationConfig {
+                enabled: true,
+                retention_days: Some(30),
+                max_total_bytes: Some(1_048_576),
+            }
+        }
+
+        fn analyzer(fixture: &Fixture) -> ParallelizationAnalyzer {
+            create_test_analyzer_with(fixture.config.clone(), fixture.repo.path().to_path_buf())
+        }
+
+        /// One observation whose pairs disagree in both directions, so the
+        /// recorded labels cannot accidentally match by being uniform.
+        fn observation() -> DependencyJudgeObservation {
+            let mut values = HashMap::new();
+            values.insert((DEPENDENT.to_string(), DEPENDENCY.to_string()), 0.97);
+            values.insert((DEPENDENCY.to_string(), DEPENDENT.to_string()), 0.10);
+            DependencyJudgeObservation {
+                model: "test-judge-1.0.0".to_string(),
+                values,
+                usage: JudgeUsage {
+                    input_tokens: 1_038,
+                    output_tokens: 56,
+                },
+                duration: Duration::from_millis(892),
+                yes_threshold: 0.85,
+                expected_answers: 2,
+            }
+        }
+
+        /// The authoritative result: exactly one of the two directions is a
+        /// real dependency.
+        fn authoritative_result() -> AnalysisResult {
+            let mut dependencies = HashMap::new();
+            dependencies.insert(DEPENDENT.to_string(), vec![DEPENDENCY.to_string()]);
+            AnalysisResult {
+                order: vec![DEPENDENCY.to_string(), DEPENDENT.to_string()],
+                dependencies,
+                groups: None,
+            }
+        }
+
+        /// Every record beneath an evaluation root, in file order.
+        fn records(root: &Path) -> Vec<EvaluationRecord> {
+            let purpose = root.join("parallel_dependency");
+            let Ok(projects) = std::fs::read_dir(&purpose) else {
+                return Vec::new();
+            };
+            let mut files: Vec<PathBuf> = Vec::new();
+            for project in projects.flatten() {
+                for file in std::fs::read_dir(project.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    files.push(file.path());
+                }
+            }
+            files.sort();
+            files
+                .iter()
+                .flat_map(|path| {
+                    std::fs::read_to_string(path)
+                        .expect("record file must be readable")
+                        .lines()
+                        .map(|line| serde_json::from_str(line).expect("one record per line"))
+                        .collect::<Vec<EvaluationRecord>>()
+                })
+                .collect()
+        }
+
+        fn snapshot(result: &AnalysisResult) -> String {
+            serde_json::to_string(result).expect("result must serialize")
+        }
+
+        #[test]
+        fn an_observation_is_recorded_with_both_labels_per_pair() {
+            let fixture = fixture(Some(enabled()));
+            let analyzer = analyzer(&fixture);
+            let result = authoritative_result();
+
+            analyzer.report_shadow_dependency_comparison(&observation(), &result);
+
+            let records = records(&fixture.evaluation_root);
+            assert_eq!(records.len(), 1);
+            let record = &records[0];
+            assert!(record.is_observed());
+            assert_eq!(record.model.as_deref(), Some("test-judge-1.0.0"));
+            assert_eq!(record.duration_ms, 892);
+            assert_eq!(record.expected_answers, 2);
+            assert_eq!(record.returned_answers, Some(2));
+            assert_eq!(record.input_tokens, Some(1_038));
+            assert_eq!(record.output_tokens, Some(56));
+            assert_eq!(record.yes_threshold, Some(0.85));
+
+            // Pairs are emitted in sorted `(dependent, dependency)` order, so
+            // `…-dependency → …-dependent` (the reverse, negative direction)
+            // comes first and the real dependency second.
+            let pairs = record.pairs.as_ref().expect("pairs must be present");
+            assert_eq!(pairs.len(), 2);
+            assert!(
+                !pairs[0].judge_dependency && !pairs[0].analyzer_dependency,
+                "the reverse direction is a true negative"
+            );
+            assert!(
+                pairs[1].judge_dependency && pairs[1].analyzer_dependency,
+                "and the real direction is a true positive"
+            );
+            assert_ne!(
+                pairs[0].pair_id, pairs[1].pair_id,
+                "a reversed pair is a different identity"
+            );
+        }
+
+        #[test]
+        fn a_bounded_failure_is_recorded_without_model_or_pairs() {
+            let fixture = fixture(Some(enabled()));
+            let analyzer = analyzer(&fixture);
+
+            analyzer.trace_judge_failure(JudgeFailureCategory::Timeout, Duration::from_secs(30), 6);
+
+            let records = records(&fixture.evaluation_root);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].outcome, "timeout");
+            assert_eq!(records[0].duration_ms, 30_000);
+            assert_eq!(records[0].expected_answers, 6);
+            assert!(records[0].model.is_none());
+            assert!(records[0].pairs.is_none());
+        }
+
+        #[test]
+        fn no_change_id_survives_into_a_record_or_any_evaluation_path() {
+            let fixture = fixture(Some(enabled()));
+            let analyzer = analyzer(&fixture);
+            analyzer.report_shadow_dependency_comparison(&observation(), &authoritative_result());
+
+            let mut inspected = 0;
+            let mut stack = vec![fixture.evaluation_root.clone()];
+            while let Some(path) = stack.pop() {
+                assert!(
+                    !path.display().to_string().contains("EVAL-SECRET"),
+                    "a change ID must never name a file or directory: {}",
+                    path.display()
+                );
+                if path.is_dir() {
+                    for entry in std::fs::read_dir(&path).expect("readable").flatten() {
+                        stack.push(entry.path());
+                    }
+                } else {
+                    let bytes = std::fs::read(&path).expect("readable");
+                    assert!(
+                        !String::from_utf8_lossy(&bytes).contains("EVAL-SECRET"),
+                        "a change ID must never survive into record bytes"
+                    );
+                    inspected += 1;
+                }
+            }
+            assert!(
+                inspected >= 2,
+                "the salt and the record were both inspected"
+            );
+        }
+
+        #[test]
+        fn a_disabled_policy_records_nothing_and_creates_no_state() {
+            for evaluation in [
+                None,
+                Some(JudgeEvaluationConfig {
+                    enabled: false,
+                    ..enabled()
+                }),
+            ] {
+                let fixture = fixture(evaluation);
+                let analyzer = analyzer(&fixture);
+
+                analyzer
+                    .report_shadow_dependency_comparison(&observation(), &authoritative_result());
+                analyzer.trace_judge_failure(JudgeFailureCategory::Spawn, Duration::ZERO, 2);
+
+                assert!(
+                    !fixture.evaluation_root.exists(),
+                    "a disabled policy must not create the evaluation root"
+                );
+            }
+        }
+
+        #[test]
+        fn an_unwritable_evaluation_root_leaves_the_result_untouched() {
+            let fixture = fixture(Some(enabled()));
+
+            // The state root itself is replaced by a regular file, so every
+            // evaluation write fails at the first directory operation.
+            std::fs::remove_dir_all(fixture._state.path()).expect("clear state root");
+            std::fs::write(fixture._state.path(), b"not a directory").expect("block the root");
+
+            let analyzer = analyzer(&fixture);
+            let result = authoritative_result();
+            let before = snapshot(&result);
+
+            // Neither call may panic, propagate, or mutate: they are the whole
+            // non-authority contract in two lines.
+            analyzer.report_shadow_dependency_comparison(&observation(), &result);
+            analyzer.trace_judge_failure(JudgeFailureCategory::Io, Duration::ZERO, 2);
+
+            assert_eq!(
+                snapshot(&result),
+                before,
+                "the analysis result is unchanged"
+            );
+            assert!(!fixture.evaluation_root.exists());
+
+            std::fs::remove_file(fixture._state.path()).expect("unblock for cleanup");
+        }
+
+        #[test]
+        fn deleting_the_evaluation_root_mid_flight_changes_no_analysis_output() {
+            let fixture = fixture(Some(enabled()));
+            let analyzer = analyzer(&fixture);
+            let result = authoritative_result();
+            let before = snapshot(&result);
+
+            analyzer.report_shadow_dependency_comparison(&observation(), &result);
+            assert_eq!(records(&fixture.evaluation_root).len(), 1);
+
+            // An operator reclaiming disk is always allowed to do this.
+            std::fs::remove_dir_all(&fixture.evaluation_root).expect("root must be removable");
+
+            analyzer.report_shadow_dependency_comparison(&observation(), &result);
+            assert_eq!(
+                snapshot(&result),
+                before,
+                "the analysis result is unchanged"
+            );
+            // Recording resumes on its own — with a *new* salt, which is why a
+            // deleted root loses comparability rather than correctness.
+            assert_eq!(records(&fixture.evaluation_root).len(), 1);
+        }
+
+        #[test]
+        fn recorded_labels_agree_with_the_aggregate_comparison_counts() {
+            // The durable record and the existing aggregate log line are two
+            // views of one comparison; if they could disagree, the evidence
+            // would be worthless.
+            let fixture = fixture(Some(enabled()));
+            let analyzer = analyzer(&fixture);
+            let observation = observation();
+            let result = authoritative_result();
+
+            analyzer.report_shadow_dependency_comparison(&observation, &result);
+
+            let authoritative: HashSet<(&str, &str)> = result
+                .dependencies
+                .iter()
+                .flat_map(|(id, deps)| deps.iter().map(move |dep| (id.as_str(), dep.as_str())))
+                .collect();
+            let expected_positive = observation
+                .values
+                .iter()
+                .filter(|((dependent, dependency), value)| {
+                    **value >= observation.yes_threshold
+                        && authoritative.contains(&(dependent.as_str(), dependency.as_str()))
+                })
+                .count();
+
+            let pairs = records(&fixture.evaluation_root)[0]
+                .pairs
+                .clone()
+                .expect("pairs");
+            assert_eq!(
+                pairs
+                    .iter()
+                    .filter(|p| p.judge_dependency && p.analyzer_dependency)
+                    .count(),
+                expected_positive
+            );
+            assert_eq!(pairs.len(), observation.values.len());
         }
     }
 }
