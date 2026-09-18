@@ -8,6 +8,7 @@ references:
   - src/parallel_run_service.rs
   - openspec/specs/configuration/spec.md
   - openspec/specs/parallel-analysis/spec.md
+  - https://github.com/tumf/jev-cli/releases/tag/v0.4.1
 verifications:
   - id: shadow-dependency-judge-tests
     requirement: Optional purpose-scoped judge commands are configuration-compatible and cannot alter or delay authoritative parallel analysis
@@ -30,7 +31,7 @@ verifications:
 
 `ParallelizationAnalyzer` currently relies on `analyze_command` to produce the authoritative execution order and inferred dependency graph, then unions proposal metadata dependencies and validates the result. Conflux has no narrow command boundary for a fast typed judgment service.
 
-A local `jev` CLI can accept a complete TypeSafe System One request on stdin and return the native System One response on stdout. Conflux should be able to invoke that CLI for dependency judgments without naming Jev or TypeSafe in configuration or source contracts. Equivalent future products are expected to implement the same request and response schema.
+The baseline command implementation is [`jev-cli v0.4.1`](https://github.com/tumf/jev-cli/releases/tag/v0.4.1), tag commit `50488f35d705051b5d621d1d10e69d1503783e7d`. Its `jev run -` command accepts a complete TypeSafe System One request on stdin and returns the native System One response on stdout. Conflux should be able to invoke that CLI for dependency judgments without naming Jev or TypeSafe in configuration or source contracts. Equivalent future products are expected to conform to the same request, response, stdout/stderr, and exit-code behavior.
 
 The judge must remain optional and non-authoritative. Existing configuration, existing `analyze_command` behavior, metadata dependency authority, validation, scheduler routing, and recoverable analyzer fallback must remain unchanged when the judge is absent or fails.
 
@@ -54,6 +55,7 @@ The command owns provider communication and credentials. Conflux passes no provi
 - `judge_commands.parallel_dependency` accepts a non-empty argv command, a pinned non-alias request model, a bounded positive timeout, bounded positive input/output byte limits, and a probability threshold in `[0.5, 1.0]`.
 - Higher-priority configuration replaces the complete `parallel_dependency` entry; it does not merge individual command fields across trust boundaries.
 - The judge receives one TypeSafe System One request containing structured queued/in-flight change state and one `noul` question for each ordered candidate dependency pair.
+- Compatibility fixtures and command-behavior tests are derived from `jev-cli v0.4.1` at commit `50488f35d705051b5d621d1d10e69d1503783e7d`; floating repository `main` is not a baseline.
 - Question IDs are deterministic indexes whose pair mapping is retained locally; untrusted change IDs are not embedded in question IDs.
 - The response parser requires the configured model field, the exact expected answer ID set, `type: "noul"`, finite `noul` values in `[0, 1]`, and bounded stdout. Extra answer IDs, missing answer IDs, multiple top-level JSON values, prose, and trailing non-whitespace are rejected as shadow failures.
 - Proposal metadata dependencies remain authoritative. Judge output never removes, adds, or changes an `AnalysisResult` dependency or order.

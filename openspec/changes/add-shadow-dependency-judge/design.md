@@ -11,6 +11,19 @@
 
 The design does not create a general plugin framework. It does not make judge output authoritative, add provider credentials to Conflux, or replace `analyze_command`.
 
+## Compatibility baseline
+
+The executable baseline is [`tumf/jev-cli v0.4.1`](https://github.com/tumf/jev-cli/releases/tag/v0.4.1), resolved to commit `50488f35d705051b5d621d1d10e69d1503783e7d`. Tests and documentation SHALL use that immutable tag, not repository `main`, as the reference for:
+
+- executable name and version output: `jev` / `jev 0.4.1`;
+- batched invocation: `jev run -`;
+- complete JSON request pass-through with default model insertion only when omitted;
+- one JSON response object on stdout and structured errors on stderr;
+- exit `2` for CLI/input errors, `3` for credential/authentication errors, `4` for transient API/network errors, and `1` for other API/response failures;
+- credential ownership by the command through `TYPESAFE_API_KEY` or its private XDG credential store.
+
+Conflux does not need to inspect `jev --version` at runtime and does not reject another command implementation. The immutable baseline defines compatibility fixtures and expected command behavior; equivalent products conform to it.
+
 ## Configuration
 
 Add these serializable types in `src/config/types.rs`:
@@ -279,6 +292,7 @@ Parser tests:
 - NaN, infinity, negative, and greater-than-one values;
 - invalid usage values;
 - oversized stdout/stderr.
+- fixture requests, responses, structured stderr, and exit-code behavior derived from the immutable `jev-cli v0.4.1` tag rather than a live API or floating branch.
 
 Runtime tests:
 

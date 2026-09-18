@@ -6,6 +6,8 @@ Conflux SHALL support the optional product-neutral `judge_commands.parallel_depe
 
 The configured command SHALL receive one TypeSafe System One request object on stdin and SHALL return one TypeSafe System One response object on stdout. Conflux SHALL invoke the argv directly without shell interpolation and SHALL NOT manage or inject provider-specific credentials. Runtime judge semantics SHALL remain governed by this capability; field validation and precedence SHALL remain governed by `configuration`.
 
+Compatibility tests and examples SHALL use `jev-cli v0.4.1`, tag commit `50488f35d705051b5d621d1d10e69d1503783e7d`, as the immutable baseline for `jev run -`, stdout/stderr separation, and exit codes. Runtime configuration SHALL remain product-neutral and MAY use any command conforming to that contract.
+
 <!-- Expected canonical result after archive: configuration exposes one optional, product-neutral, atomically overridden System One-compatible dependency judge command. -->
 
 #### Scenario: Existing configuration has no judge command
@@ -23,6 +25,13 @@ The configured command SHALL receive one TypeSafe System One request object on s
 **When**: configuration is loaded
 **Then**: Conflux retains the command as an argv array without shell parsing
 **And**: every request uses `jev-1.13.0`
+
+#### Scenario: Baseline does not float with repository main
+
+**Given**: compatibility fixtures are generated or reviewed
+**When**: the reference command behavior is selected
+**Then**: the source is the immutable `jev-cli v0.4.1` tag commit `50488f35d705051b5d621d1d10e69d1503783e7d`
+**And**: later changes on `jev-cli` repository `main` do not silently change Conflux's accepted command contract
 
 #### Scenario: Higher-priority entry replaces the complete trust boundary
 
