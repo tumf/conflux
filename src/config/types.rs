@@ -512,6 +512,13 @@ pub struct OrchestratorConfig {
     /// Absent by default: no adapter process is started and behavior is unchanged.
     #[serde(default)]
     pub lifecycle_integration: Option<LifecycleIntegrationConfig>,
+
+    /// Optional purpose-scoped judge commands (non-authoritative shadow observers).
+    ///
+    /// Absent by default: no judge process is started and analysis behavior is
+    /// unchanged.
+    #[serde(default)]
+    pub judge_commands: Option<JudgeCommandsConfig>,
 }
 
 // ── LifecycleIntegrationConfig ─────────────────────────────────────────────
@@ -624,6 +631,177 @@ impl LifecycleIntegrationConfig {
     }
 }
 
+// ── Purpose-scoped judge commands ──────────────────────────────────────────
+
+/// Optional product-neutral judge commands, keyed by judgment purpose.
+///
+/// Purposes are named after the question being asked, never after a vendor or a
+/// model, so an equivalent later tool needs no new configuration key. Entries
+/// are independent: omitting one never affects another.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct JudgeCommandsConfig {
+    /// Judge consulted for parallel dependency analysis.
+    #[serde(default)]
+    pub parallel_dependency: Option<ParallelDependencyJudgeConfig>,
+}
+
+impl JudgeCommandsConfig {
+    /// Merge a higher-priority layer.
+    ///
+    /// Each purpose entry is one atomic trust boundary: a supplied entry
+    /// replaces the complete lower-priority entry, and an omitted one inherits
+    /// it unchanged. Field-by-field merging is deliberately not used — it would
+    /// let one layer replace only the executable while silently inheriting
+    /// another layer's model, threshold, or byte limits.
+    fn merge(&mut self, other: Self) {
+        let Self {
+            parallel_dependency,
+        } = other;
+        overwrite_if_some(&mut self.parallel_dependency, parallel_dependency);
+    }
+
+    /// Validate every configured purpose entry.
+    pub fn validate(&self) -> Result<()> {
+        match self.parallel_dependency.as_ref() {
+            Some(judge) => judge.validate(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// One bounded judge command for parallel dependency judgments.
+///
+/// The command owns provider communication and credentials. Conflux invokes the
+/// argv directly — never through a shell and never with placeholder expansion —
+/// writes one request object to its stdin, and reads one response object from
+/// its stdout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParallelDependencyJudgeConfig {
+    /// Judge argv. The first element is the executable; the rest are arguments.
+    pub command: Vec<String>,
+
+    /// Pinned concrete request model.
+    ///
+    /// Aliases are rejected: the response parser requires the returned model to
+    /// equal the requested one, which is only meaningful for a pinned identity.
+    pub model: String,
+
+    /// Bounded wall-clock timeout for one invocation (milliseconds).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+
+    /// Bounded serialized request-size limit (bytes).
+    #[serde(default)]
+    pub max_input_bytes: Option<usize>,
+
+    /// Bounded collected-output limit (bytes), applied to stdout and stderr.
+    #[serde(default)]
+    pub max_output_bytes: Option<usize>,
+
+    /// Probability at or above which a shadow judgment counts as a `yes` edge.
+    #[serde(default)]
+    pub yes_threshold: Option<f64>,
+}
+
+impl ParallelDependencyJudgeConfig {
+    /// Bounded invocation timeout, falling back to the built-in default.
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms.unwrap_or(DEFAULT_JUDGE_TIMEOUT_MS)
+    }
+
+    /// Bounded request-size limit, falling back to the built-in default.
+    pub fn max_input_bytes(&self) -> usize {
+        self.max_input_bytes
+            .unwrap_or(DEFAULT_JUDGE_MAX_INPUT_BYTES)
+    }
+
+    /// Bounded collected-output limit, falling back to the built-in default.
+    pub fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes
+            .unwrap_or(DEFAULT_JUDGE_MAX_OUTPUT_BYTES)
+    }
+
+    /// Shadow `yes` threshold, falling back to the built-in default.
+    pub fn yes_threshold(&self) -> f64 {
+        self.yes_threshold.unwrap_or(DEFAULT_JUDGE_YES_THRESHOLD)
+    }
+
+    /// Validate the entry with diagnostics naming the offending field.
+    pub fn validate(&self) -> Result<()> {
+        const FIELD: &str = "judge_commands.parallel_dependency";
+
+        if self.command.is_empty() {
+            return Err(OrchestratorError::ConfigLoad(format!(
+                "Configuration error: `{FIELD}.command` must be a non-empty argv array, for \
+                 example [\"jev\", \"run\", \"-\"]"
+            )));
+        }
+        for (index, element) in self.command.iter().enumerate() {
+            if element.trim().is_empty() {
+                return Err(OrchestratorError::ConfigLoad(format!(
+                    "Configuration error: `{FIELD}.command[{index}]` must not be empty"
+                )));
+            }
+            if element.contains('\0') {
+                return Err(OrchestratorError::ConfigLoad(format!(
+                    "Configuration error: `{FIELD}.command[{index}]` must not contain a NUL byte"
+                )));
+            }
+        }
+
+        let model = self.model.trim();
+        if model.is_empty() {
+            return Err(OrchestratorError::ConfigLoad(format!(
+                "Configuration error: `{FIELD}.model` must be a non-empty pinned model identity"
+            )));
+        }
+        if model.ends_with("-latest") {
+            return Err(OrchestratorError::ConfigLoad(format!(
+                "Configuration error: `{FIELD}.model` must be a pinned concrete model, not the \
+                 alias `{model}`; the response parser requires the returned model to equal the \
+                 requested one"
+            )));
+        }
+
+        if let Some(timeout_ms) = self.timeout_ms {
+            if !(MIN_JUDGE_TIMEOUT_MS..=MAX_JUDGE_TIMEOUT_MS).contains(&timeout_ms) {
+                return Err(OrchestratorError::ConfigLoad(format!(
+                    "Configuration error: `{FIELD}.timeout_ms` must be between \
+                     {MIN_JUDGE_TIMEOUT_MS} and {MAX_JUDGE_TIMEOUT_MS} (got {timeout_ms})"
+                )));
+            }
+        }
+
+        for (field, value) in [
+            ("max_input_bytes", self.max_input_bytes),
+            ("max_output_bytes", self.max_output_bytes),
+        ] {
+            if let Some(value) = value {
+                if !(MIN_JUDGE_BYTE_LIMIT..=MAX_JUDGE_BYTE_LIMIT).contains(&value) {
+                    return Err(OrchestratorError::ConfigLoad(format!(
+                        "Configuration error: `{FIELD}.{field}` must be between \
+                         {MIN_JUDGE_BYTE_LIMIT} and {MAX_JUDGE_BYTE_LIMIT} (got {value})"
+                    )));
+                }
+            }
+        }
+
+        if let Some(threshold) = self.yes_threshold {
+            if !threshold.is_finite()
+                || !(MIN_JUDGE_YES_THRESHOLD..=MAX_JUDGE_YES_THRESHOLD).contains(&threshold)
+            {
+                return Err(OrchestratorError::ConfigLoad(format!(
+                    "Configuration error: `{FIELD}.yes_threshold` must be a finite probability \
+                     between {MIN_JUDGE_YES_THRESHOLD} and {MAX_JUDGE_YES_THRESHOLD} \
+                     (got {threshold})"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 // ── AcceptancePromptMode ───────────────────────────────────────────────────
 
 /// Acceptance prompt mode.
@@ -721,6 +899,7 @@ impl OrchestratorConfig {
             stream_json_textify,
             command_strict_process_cleanup,
             lifecycle_integration,
+            judge_commands,
         } = other;
 
         // Plain Option fields use the standard config precedence rule:
@@ -841,6 +1020,33 @@ impl OrchestratorConfig {
             command_strict_process_cleanup,
         );
         overwrite_if_some(&mut self.lifecycle_integration, lifecycle_integration);
+
+        // Purpose-wise, not whole-object: a layer that supplies one judge purpose
+        // must not delete another purpose it never mentioned. Each purpose entry
+        // itself replaces atomically inside `JudgeCommandsConfig::merge`.
+        match (self.judge_commands.as_mut(), judge_commands) {
+            (Some(target), Some(source)) => target.merge(source),
+            (None, Some(source)) => self.judge_commands = Some(source),
+            (_, None) => {}
+        }
+    }
+
+    /// Get the optional parallel-dependency judge command.
+    ///
+    /// Returns `None` when unconfigured so the analyzer keeps its existing
+    /// behavior without extra branching.
+    pub fn get_parallel_dependency_judge(&self) -> Option<&ParallelDependencyJudgeConfig> {
+        self.judge_commands
+            .as_ref()
+            .and_then(|judges| judges.parallel_dependency.as_ref())
+    }
+
+    /// Validate every configured purpose-scoped judge command.
+    pub fn validate_judge_commands(&self) -> Result<()> {
+        match self.judge_commands.as_ref() {
+            Some(judges) => judges.validate(),
+            None => Ok(()),
+        }
     }
 
     /// Get the configured external lifecycle integration, if any.
@@ -1248,6 +1454,7 @@ impl OrchestratorConfig {
         self.validate_lifecycle_integration()?;
         self.validate_acceptance_max_runtime_secs()?;
         self.validate_acceptance_escalation()?;
+        self.validate_judge_commands()?;
 
         let mut missing = Vec::new();
 
@@ -1454,6 +1661,282 @@ mod lifecycle_integration_config_tests {
         assert!(integration.is_enabled());
         assert_eq!(integration.command, vec!["adapter", "--pane"]);
         assert_eq!(integration.shutdown_timeout_ms(), 500);
+    }
+}
+
+#[cfg(test)]
+mod judge_commands_config_tests {
+    use super::*;
+
+    fn valid_judge() -> ParallelDependencyJudgeConfig {
+        ParallelDependencyJudgeConfig {
+            command: vec!["jev".to_string(), "run".to_string(), "-".to_string()],
+            model: "jev-1.13.0".to_string(),
+            timeout_ms: None,
+            max_input_bytes: None,
+            max_output_bytes: None,
+            yes_threshold: None,
+        }
+    }
+
+    fn judge_config(judge: ParallelDependencyJudgeConfig) -> OrchestratorConfig {
+        OrchestratorConfig {
+            judge_commands: Some(JudgeCommandsConfig {
+                parallel_dependency: Some(judge),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn judge_commands_are_absent_by_default() {
+        let config = OrchestratorConfig::default();
+
+        assert!(config.judge_commands.is_none());
+        assert!(config.get_parallel_dependency_judge().is_none());
+        assert!(config.validate_judge_commands().is_ok());
+    }
+
+    #[test]
+    fn existing_configuration_without_judge_commands_still_parses() {
+        let parsed: OrchestratorConfig = serde_json::from_str(
+            r#"{"apply_command": "apply", "archive_command": "archive", "analyze_command": "analyze", "acceptance_command": "accept", "resolve_command": "resolve"}"#,
+        )
+        .expect("configuration without judge_commands must remain parseable");
+
+        assert!(parsed.get_parallel_dependency_judge().is_none());
+        assert!(parsed.validate_required_commands().is_ok());
+    }
+
+    #[test]
+    fn valid_argv_model_and_bounds_load_with_defaults() {
+        let parsed: OrchestratorConfig = serde_json::from_str(
+            r#"{"judge_commands": {"parallel_dependency": {"command": ["jev", "run", "-"], "model": "jev-1.13.0"}}}"#,
+        )
+        .expect("judge command must parse");
+
+        let judge = parsed
+            .get_parallel_dependency_judge()
+            .expect("entry should be present");
+        assert_eq!(judge.command, vec!["jev", "run", "-"]);
+        assert_eq!(judge.model, "jev-1.13.0");
+        assert_eq!(judge.timeout_ms(), DEFAULT_JUDGE_TIMEOUT_MS);
+        assert_eq!(judge.max_input_bytes(), DEFAULT_JUDGE_MAX_INPUT_BYTES);
+        assert_eq!(judge.max_output_bytes(), DEFAULT_JUDGE_MAX_OUTPUT_BYTES);
+        assert_eq!(judge.yes_threshold(), DEFAULT_JUDGE_YES_THRESHOLD);
+        assert!(judge.validate().is_ok());
+    }
+
+    #[test]
+    fn explicit_bounds_override_defaults() {
+        let judge = ParallelDependencyJudgeConfig {
+            timeout_ms: Some(5_000),
+            max_input_bytes: Some(2_048),
+            max_output_bytes: Some(4_096),
+            yes_threshold: Some(0.6),
+            ..valid_judge()
+        };
+
+        assert!(judge.validate().is_ok());
+        assert_eq!(judge.timeout_ms(), 5_000);
+        assert_eq!(judge.max_input_bytes(), 2_048);
+        assert_eq!(judge.max_output_bytes(), 4_096);
+        assert_eq!(judge.yes_threshold(), 0.6);
+    }
+
+    #[test]
+    fn invalid_entries_are_rejected_naming_the_field() {
+        let cases: Vec<(ParallelDependencyJudgeConfig, &str)> = vec![
+            (
+                ParallelDependencyJudgeConfig {
+                    command: Vec::new(),
+                    ..valid_judge()
+                },
+                "parallel_dependency.command",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    command: vec!["jev".to_string(), "   ".to_string()],
+                    ..valid_judge()
+                },
+                "parallel_dependency.command[1]",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    command: vec!["je\0v".to_string()],
+                    ..valid_judge()
+                },
+                "parallel_dependency.command[0]",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    model: "  ".to_string(),
+                    ..valid_judge()
+                },
+                "parallel_dependency.model",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    model: "jev-latest".to_string(),
+                    ..valid_judge()
+                },
+                "parallel_dependency.model",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    timeout_ms: Some(0),
+                    ..valid_judge()
+                },
+                "parallel_dependency.timeout_ms",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    timeout_ms: Some(MAX_JUDGE_TIMEOUT_MS + 1),
+                    ..valid_judge()
+                },
+                "parallel_dependency.timeout_ms",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    max_input_bytes: Some(0),
+                    ..valid_judge()
+                },
+                "parallel_dependency.max_input_bytes",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    max_output_bytes: Some(MAX_JUDGE_BYTE_LIMIT + 1),
+                    ..valid_judge()
+                },
+                "parallel_dependency.max_output_bytes",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    yes_threshold: Some(f64::NAN),
+                    ..valid_judge()
+                },
+                "parallel_dependency.yes_threshold",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    yes_threshold: Some(0.4),
+                    ..valid_judge()
+                },
+                "parallel_dependency.yes_threshold",
+            ),
+            (
+                ParallelDependencyJudgeConfig {
+                    yes_threshold: Some(1.5),
+                    ..valid_judge()
+                },
+                "parallel_dependency.yes_threshold",
+            ),
+        ];
+
+        for (judge, expected_field) in cases {
+            let message = judge
+                .validate()
+                .expect_err("invalid judge entry must be rejected")
+                .to_string();
+            assert!(
+                message.contains(expected_field),
+                "diagnostic must name `{expected_field}`: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_command_validation_surfaces_judge_errors() {
+        let config = OrchestratorConfig {
+            apply_command: Some("apply".to_string()),
+            archive_command: Some("archive".to_string()),
+            analyze_command: Some("analyze".to_string()),
+            acceptance_command: Some("accept".to_string()),
+            resolve_command: Some("resolve".to_string()),
+            ..judge_config(ParallelDependencyJudgeConfig {
+                command: Vec::new(),
+                ..valid_judge()
+            })
+        };
+
+        let message = config
+            .validate_required_commands()
+            .expect_err("an invalid judge entry must fail startup validation")
+            .to_string();
+        assert!(message.contains("judge_commands.parallel_dependency.command"));
+    }
+
+    #[test]
+    fn higher_priority_entry_replaces_the_complete_trust_boundary() {
+        let mut lower = judge_config(ParallelDependencyJudgeConfig {
+            command: vec!["global-judge".to_string()],
+            model: "global-1.0.0".to_string(),
+            timeout_ms: Some(1_000),
+            max_input_bytes: Some(2_048),
+            max_output_bytes: Some(4_096),
+            yes_threshold: Some(0.95),
+        });
+
+        lower.merge(judge_config(ParallelDependencyJudgeConfig {
+            command: vec!["project-judge".to_string()],
+            model: "project-2.0.0".to_string(),
+            timeout_ms: None,
+            max_input_bytes: None,
+            max_output_bytes: None,
+            yes_threshold: None,
+        }));
+
+        let merged = lower
+            .get_parallel_dependency_judge()
+            .expect("entry should be present");
+        assert_eq!(merged.command, vec!["project-judge".to_string()]);
+        assert_eq!(merged.model, "project-2.0.0");
+        // No field is inherited from the replaced entry: each omitted bound falls
+        // back to its built-in default, not the lower-priority value.
+        assert_eq!(merged.timeout_ms, None);
+        assert_eq!(merged.timeout_ms(), DEFAULT_JUDGE_TIMEOUT_MS);
+        assert_eq!(merged.max_input_bytes(), DEFAULT_JUDGE_MAX_INPUT_BYTES);
+        assert_eq!(merged.max_output_bytes(), DEFAULT_JUDGE_MAX_OUTPUT_BYTES);
+        assert_eq!(merged.yes_threshold(), DEFAULT_JUDGE_YES_THRESHOLD);
+    }
+
+    #[test]
+    fn omitted_entry_inherits_the_lower_priority_entry() {
+        let mut lower = judge_config(valid_judge());
+
+        lower.merge(OrchestratorConfig::default());
+        assert_eq!(
+            lower
+                .get_parallel_dependency_judge()
+                .map(|j| j.model.clone()),
+            Some("jev-1.13.0".to_string())
+        );
+
+        // An explicitly present but empty `judge_commands` object also inherits.
+        lower.merge(OrchestratorConfig {
+            judge_commands: Some(JudgeCommandsConfig::default()),
+            ..Default::default()
+        });
+        assert_eq!(
+            lower
+                .get_parallel_dependency_judge()
+                .map(|j| j.model.clone()),
+            Some("jev-1.13.0".to_string())
+        );
+    }
+
+    #[test]
+    fn judge_entry_is_inherited_when_no_lower_priority_entry_exists() {
+        let mut lower = OrchestratorConfig::default();
+
+        lower.merge(judge_config(valid_judge()));
+
+        assert_eq!(
+            lower
+                .get_parallel_dependency_judge()
+                .map(|j| j.command.clone()),
+            Some(vec!["jev".to_string(), "run".to_string(), "-".to_string()])
+        );
     }
 }
 

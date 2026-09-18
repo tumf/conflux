@@ -1,0 +1,36 @@
+{
+  "state": {
+    "schema_version": 1,
+    "queued_changes": [
+      {
+        "index": 0,
+        "id": "change-a",
+        "proposal": "complete proposal.md text",
+        "metadata_dependencies": [],
+        "priority": "medium",
+        "references": []
+      }
+    ],
+    "in_flight_changes": [
+      {
+        "index": 1,
+        "id": "change-b",
+        "proposal": "complete proposal.md text",
+        "metadata_dependencies": [],
+        "priority": null,
+        "references": []
+      }
+    ]
+  },
+  "model": "jev-1.13.0",
+  "questions": {
+    "q_0000_0001": {
+      "type": "noul",
+      "instructions": "Does queued change `state.queued_changes[0]` require repository output produced by in-flight change `state.in_flight_changes[0]` before it can be implemented or verified correctly?",
+      "criteria": {
+        "true": "The source change, contract, schema, migration, configuration, test surface, specification, or generated artifact produced by the candidate dependency is required.",
+        "false": "The changes are independent, merely related, ordered only by preference or priority, or connected only by a reference."
+      }
+    }
+  }
+}

@@ -215,6 +215,44 @@ pub const DEFAULT_LIFECYCLE_WRITE_TIMEOUT_MS: u64 = 2_000;
 /// Default bounded shutdown deadline for the lifecycle adapter (milliseconds).
 pub const DEFAULT_LIFECYCLE_SHUTDOWN_TIMEOUT_MS: u64 = 2_000;
 
+// ── Purpose-scoped judge command defaults ──────────────────────────────────
+
+/// Default bounded wall-clock timeout for one judge invocation (milliseconds).
+pub const DEFAULT_JUDGE_TIMEOUT_MS: u64 = 30_000;
+
+/// Smallest configurable judge timeout (milliseconds).
+pub const MIN_JUDGE_TIMEOUT_MS: u64 = 1;
+
+/// Largest configurable judge timeout (milliseconds).
+///
+/// A judge is a bounded shadow observer, never an implementation worker, so its
+/// ceiling is far below the agent-command budget.
+pub const MAX_JUDGE_TIMEOUT_MS: u64 = 300_000;
+
+/// Default maximum serialized request size accepted for one judge invocation (bytes).
+pub const DEFAULT_JUDGE_MAX_INPUT_BYTES: usize = 1_048_576;
+
+/// Default maximum stdout/stderr size collected from one judge invocation (bytes).
+pub const DEFAULT_JUDGE_MAX_OUTPUT_BYTES: usize = 1_048_576;
+
+/// Smallest configurable judge input/output byte limit.
+pub const MIN_JUDGE_BYTE_LIMIT: usize = 1;
+
+/// Largest configurable judge input/output byte limit.
+pub const MAX_JUDGE_BYTE_LIMIT: usize = 16_777_216;
+
+/// Default probability at or above which a shadow judgment counts as a `yes` edge.
+pub const DEFAULT_JUDGE_YES_THRESHOLD: f64 = 0.85;
+
+/// Smallest configurable judge yes-threshold.
+///
+/// Below `0.5` a "yes" would be less likely than its negation, which is not a
+/// judgment a comparison metric can use.
+pub const MIN_JUDGE_YES_THRESHOLD: f64 = 0.5;
+
+/// Largest configurable judge yes-threshold.
+pub const MAX_JUDGE_YES_THRESHOLD: f64 = 1.0;
+
 /// Generates a project slug from the repository root path.
 /// Format: `{repo_basename}-{hash8}` where hash8 is the first 8 chars of the SHA256 hash
 /// of the absolute repository path.

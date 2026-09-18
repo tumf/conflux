@@ -4,17 +4,24 @@
 //! in parallel and what dependencies exist between them.
 
 use crate::ai_command_runner::OutputLine as AiOutputLine;
+use crate::config::ParallelDependencyJudgeConfig;
 use crate::dependency_targets::{
     classify_dependency_target, collect_active_change_ids, collect_archived_change_ids,
     collect_rejected_change_ids, union_metadata_dependencies, DependencyTargetClass,
 };
 use crate::error::{OrchestratorError, Result};
+use crate::judge_command::{
+    parse_system_one_response, spawn_judge, JudgeChangeNode, JudgeCollection, JudgeCommandSpec,
+    JudgeFailureCategory, JudgeHandle, JudgeRequestState, JudgeUsage, NoulCriteria, NoulQuestion,
+    SystemOneRequest, JUDGE_STATE_SCHEMA_VERSION, NOUL_QUESTION_TYPE, PARALLEL_DEPENDENCY_PURPOSE,
+};
 use crate::openspec::{Change, ProposalFrontmatterMetadata};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// A group of changes that can be executed in parallel
@@ -107,10 +114,91 @@ impl From<AnalysisResult> for AnalysisOutcome {
     }
 }
 
+// ── Shadow dependency judge ────────────────────────────────────────────────
+
+/// Noul `criteria.true` for every dependency question.
+const JUDGE_TRUE_CRITERIA: &str = "The source change, contract, schema, migration, configuration, \
+     test surface, specification, or generated artifact produced by the candidate dependency is \
+     required.";
+
+/// Noul `criteria.false` for every dependency question.
+///
+/// Priority, references, and mere topical relation are named explicitly so they
+/// are excluded as dependency evidence, exactly as the conventional analyzer
+/// prompt excludes them.
+const JUDGE_FALSE_CRITERIA: &str = "The changes are independent, merely related, ordered only by \
+     preference or priority, or connected only by a reference.";
+
+/// Question ID → `(dependent, dependency)` change pair.
+///
+/// This map stays in memory and is the only parser authority: change IDs never
+/// become JSON object keys, so nothing a proposal author writes can alter the
+/// protocol's structure.
+type JudgePairMap = BTreeMap<String, (String, String)>;
+
+/// A built shadow request together with its trusted local pair map.
+type ShadowJudgeRequest = (SystemOneRequest, JudgePairMap);
+
+/// One in-flight shadow judge invocation and the trusted local state needed to
+/// interpret its answer.
+struct ShadowDependencyJudgeRun {
+    handle: JudgeHandle,
+    pairs: JudgePairMap,
+    model: String,
+    yes_threshold: f64,
+}
+
+/// A completed, strictly validated, *non-authoritative* judge observation.
+///
+/// Process-local and ephemeral: it is never serialized, persisted, or consumed
+/// by [`AnalysisProvenance`], dispatch, retry debounce, blocker classification,
+/// acceptance, or archive decisions.
+struct DependencyJudgeObservation {
+    /// Model identity, already proven equal to the requested model.
+    model: String,
+    /// Noul probability per `(dependent, dependency)` pair.
+    values: HashMap<(String, String), f64>,
+    usage: JudgeUsage,
+    duration: Duration,
+    /// Threshold used to project probabilities onto comparison edges.
+    yes_threshold: f64,
+}
+
+/// Stable lowercase token for a proposal priority.
+fn priority_token(priority: crate::openspec::ProposalPriority) -> &'static str {
+    match priority {
+        crate::openspec::ProposalPriority::High => "high",
+        crate::openspec::ProposalPriority::Medium => "medium",
+        crate::openspec::ProposalPriority::Low => "low",
+    }
+}
+
+/// Whether a change ID may be used to build a proposal path for the judge.
+///
+/// Conservative on purpose: only an ID that cannot traverse, escape, or name a
+/// hidden entry is accepted, so an untrusted ID can never widen the single
+/// `repo_root/openspec/changes/<id>/proposal.md` layout the judge reads from.
+fn is_judge_safe_change_id(change_id: &str) -> bool {
+    !change_id.is_empty()
+        && change_id.len() <= 200
+        && !change_id.starts_with('.')
+        && change_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !change_id.contains("..")
+}
+
 /// Analyzer for determining parallel execution groups
 pub struct ParallelizationAnalyzer {
     ai_runner: crate::ai_command_runner::AiCommandRunner,
     config: crate::config::OrchestratorConfig,
+    /// Repository root this analyzer reads proposal files from.
+    ///
+    /// Held explicitly rather than inferred from the process working directory
+    /// or a `git rev-parse` during analysis: the caller already knows which
+    /// repository it is analyzing, and a shadow judge must never be able to
+    /// read a proposal from somewhere else.
+    repo_root: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,12 +223,18 @@ impl AnalyzePromptMetadata {
 }
 
 impl ParallelizationAnalyzer {
-    /// Create a new analyzer with the given AI command runner and configuration
+    /// Create a new analyzer with the given AI command runner, configuration,
+    /// and the repository root whose proposals it may read.
     pub fn new(
         ai_runner: crate::ai_command_runner::AiCommandRunner,
         config: crate::config::OrchestratorConfig,
+        repo_root: PathBuf,
     ) -> Self {
-        Self { ai_runner, config }
+        Self {
+            ai_runner,
+            config,
+            repo_root,
+        }
     }
 
     /// Analyze changes and return the raw analysis result with order and dependencies.
@@ -219,14 +313,35 @@ impl ParallelizationAnalyzer {
         }
         debug!("Analysis prompt: {}", prompt);
 
+        // Start the optional non-authoritative dependency judge *beside* the
+        // conventional analyzer. It runs in its own task, so it makes progress
+        // concurrently and can never become a step the conventional path waits
+        // for.
+        let shadow = self.start_dependency_judge(changes, in_flight_ids);
+
         // Execute analysis command and collect output
-        let (full_output, status) = self
+        let command_outcome = self
             .execute_analysis_command(&prompt, changes, &mut on_output)
-            .await?;
+            .await;
+
+        // Conventional completion is the judge's return deadline, whether the
+        // conventional path produced a result or an error: a judge that has not
+        // finished by now is cancelled and cleaned up by a detached task, and
+        // only an already completed valid observation is retained.
+        let observation = match shadow {
+            Some(run) => self.collect_dependency_judge(run).await,
+            None => None,
+        };
+
+        let (full_output, status) = command_outcome?;
 
         // Parse and validate the output
         let result =
             self.parse_and_validate_output(&full_output, &status, changes, in_flight_ids)?;
+
+        if let Some(observation) = observation {
+            self.report_shadow_dependency_comparison(&observation, &result);
+        }
 
         info!("Analysis complete: {} changes in order", result.order.len());
         Ok(result)
@@ -279,6 +394,379 @@ impl ParallelizationAnalyzer {
         })?;
 
         Ok((full_output, status))
+    }
+
+    // ── Optional shadow dependency judge ───────────────────────────────────
+    //
+    // Everything below is non-authoritative. It never contributes an order, a
+    // dependency, a provenance, or an error to the analysis it observes.
+
+    /// Start the configured parallel-dependency judge when one applies.
+    ///
+    /// Returns `None` — with a bounded redacted diagnostic where something was
+    /// actually attempted — for every skip reason: no configuration, an invalid
+    /// entry, LLM analysis disabled, fewer than two nodes, no permitted pair, an
+    /// unreadable proposal, or an oversized request.
+    fn start_dependency_judge(
+        &self,
+        changes: &[Change],
+        in_flight_ids: &[String],
+    ) -> Option<ShadowDependencyJudgeRun> {
+        let judge = self.config.get_parallel_dependency_judge()?;
+
+        // A metadata-only result is the configured authority when LLM analysis
+        // is disabled, so there is nothing to shadow.
+        if !self.config.use_llm_analysis() {
+            return None;
+        }
+
+        // Configuration is validated at load; an analyzer handed an unvalidated
+        // configuration still refuses to spawn rather than sending a request
+        // whose bounds nobody checked.
+        if let Err(error) = judge.validate() {
+            debug!(
+                purpose = PARALLEL_DEPENDENCY_PURPOSE,
+                outcome = "invalid_configuration",
+                "Skipping dependency judge: {error}"
+            );
+            return None;
+        }
+
+        let (request, pairs) =
+            match self.build_dependency_judge_request(judge, changes, in_flight_ids) {
+                Ok(Some(built)) => built,
+                Ok(None) => return None,
+                Err(category) => {
+                    Self::trace_judge_failure(category, Duration::ZERO, 0);
+                    return None;
+                }
+            };
+
+        let serialized = match serde_json::to_string(&request) {
+            Ok(serialized) => serialized,
+            Err(_) => {
+                Self::trace_judge_failure(JudgeFailureCategory::Io, Duration::ZERO, pairs.len());
+                return None;
+            }
+        };
+        // Checked before spawn: an oversized request is never truncated and
+        // never partially judged.
+        if serialized.len() > judge.max_input_bytes() {
+            Self::trace_judge_failure(
+                JudgeFailureCategory::InputTooLarge,
+                Duration::ZERO,
+                pairs.len(),
+            );
+            return None;
+        }
+
+        let spec = JudgeCommandSpec {
+            argv: judge.command.clone(),
+            working_dir: self.repo_root.clone(),
+            envs: self.config.get_command_envs(),
+            timeout: Duration::from_millis(judge.timeout_ms()),
+            max_output_bytes: judge.max_output_bytes(),
+        };
+
+        Some(ShadowDependencyJudgeRun {
+            handle: spawn_judge(spec, serialized),
+            pairs,
+            model: judge.model.clone(),
+            yes_threshold: judge.yes_threshold(),
+        })
+    }
+
+    /// Build the deterministic batched request and its trusted local pair map.
+    ///
+    /// `Ok(None)` means "nothing to ask" (fewer than two nodes, or no permitted
+    /// pair); `Err` means the complete request is skipped.
+    fn build_dependency_judge_request(
+        &self,
+        judge: &ParallelDependencyJudgeConfig,
+        changes: &[Change],
+        in_flight_ids: &[String],
+    ) -> std::result::Result<Option<ShadowJudgeRequest>, JudgeFailureCategory> {
+        // One deterministic node list: queued changes in input order, then the
+        // explicitly supplied in-flight changes in their supplied order. Each
+        // node's index is the only thing a question ID is derived from.
+        let mut queued = Vec::with_capacity(changes.len());
+        let mut in_flight = Vec::new();
+        let mut paths: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+
+        for change in changes {
+            if !seen.insert(change.id.as_str()) {
+                continue;
+            }
+            let index = paths.len();
+            paths.push(format!("state.queued_changes[{}]", queued.len()));
+            queued.push(JudgeChangeNode {
+                index,
+                id: change.id.clone(),
+                proposal: self.read_judge_proposal(&change.id, judge)?,
+                metadata_dependencies: change.dependencies.clone(),
+                priority: change
+                    .metadata
+                    .priority
+                    .map(priority_token)
+                    .map(String::from),
+                references: change.metadata.references.clone(),
+            });
+        }
+        let queued_count = queued.len();
+
+        for id in in_flight_ids {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            let index = paths.len();
+            paths.push(format!("state.in_flight_changes[{}]", in_flight.len()));
+            in_flight.push(JudgeChangeNode {
+                index,
+                id: id.clone(),
+                proposal: self.read_judge_proposal(id, judge)?,
+                // An in-flight change is supplied to the analyzer as an ID
+                // only; Conflux does not re-derive its metadata for a shadow
+                // request, and its authoritative metadata is unaffected either
+                // way.
+                metadata_dependencies: Vec::new(),
+                priority: None,
+                references: Vec::new(),
+            });
+        }
+
+        let node_ids: Vec<&str> = queued
+            .iter()
+            .chain(in_flight.iter())
+            .map(|node| node.id.as_str())
+            .collect();
+        if node_ids.len() < 2 || queued_count == 0 {
+            return Ok(None);
+        }
+
+        let mut questions = BTreeMap::new();
+        let mut pairs = BTreeMap::new();
+        for dependent in 0..queued_count {
+            for candidate in 0..node_ids.len() {
+                // The dependent is always queued; the candidate dependency is
+                // any other queued or explicitly supplied in-flight change.
+                if dependent == candidate {
+                    continue;
+                }
+                let question_id = format!("q_{dependent:04}_{candidate:04}");
+                let candidate_kind = if candidate < queued_count {
+                    "queued"
+                } else {
+                    "in-flight"
+                };
+                questions.insert(
+                    question_id.clone(),
+                    NoulQuestion {
+                        question_type: NOUL_QUESTION_TYPE.to_string(),
+                        instructions: format!(
+                            "Does queued change `{}` require repository output produced by \
+                             {candidate_kind} change `{}` before it can be implemented or \
+                             verified correctly?",
+                            paths[dependent], paths[candidate]
+                        ),
+                        criteria: NoulCriteria {
+                            when_true: JUDGE_TRUE_CRITERIA.to_string(),
+                            when_false: JUDGE_FALSE_CRITERIA.to_string(),
+                        },
+                    },
+                );
+                pairs.insert(
+                    question_id,
+                    (
+                        node_ids[dependent].to_string(),
+                        node_ids[candidate].to_string(),
+                    ),
+                );
+            }
+        }
+
+        if pairs.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some((
+            SystemOneRequest {
+                state: JudgeRequestState {
+                    schema_version: JUDGE_STATE_SCHEMA_VERSION,
+                    queued_changes: queued,
+                    in_flight_changes: in_flight,
+                },
+                model: judge.model.clone(),
+                questions,
+            },
+            pairs,
+        )))
+    }
+
+    /// Read one complete `proposal.md` for the shadow request.
+    ///
+    /// The path is always `repo_root/openspec/changes/<validated-id>/proposal.md`.
+    /// An untrusted change ID can neither escape that layout nor name a file
+    /// outside it, and any absent, unreadable, non-regular, or oversized
+    /// proposal skips the complete request rather than substituting `null` or
+    /// judging part of the working set.
+    fn read_judge_proposal(
+        &self,
+        change_id: &str,
+        judge: &ParallelDependencyJudgeConfig,
+    ) -> std::result::Result<String, JudgeFailureCategory> {
+        if !is_judge_safe_change_id(change_id) {
+            return Err(JudgeFailureCategory::Io);
+        }
+
+        let path = self
+            .repo_root
+            .join("openspec")
+            .join("changes")
+            .join(change_id)
+            .join("proposal.md");
+
+        let metadata = std::fs::metadata(&path).map_err(|_| JudgeFailureCategory::Io)?;
+        if !metadata.is_file() {
+            return Err(JudgeFailureCategory::Io);
+        }
+        if metadata.len() > judge.max_input_bytes() as u64 {
+            return Err(JudgeFailureCategory::InputTooLarge);
+        }
+
+        std::fs::read_to_string(&path).map_err(|_| JudgeFailureCategory::Io)
+    }
+
+    /// Stop racing the judge and keep only a completed, strictly valid response.
+    async fn collect_dependency_judge(
+        &self,
+        run: ShadowDependencyJudgeRun,
+    ) -> Option<DependencyJudgeObservation> {
+        let ShadowDependencyJudgeRun {
+            handle,
+            pairs,
+            model,
+            yes_threshold,
+        } = run;
+        let expected_ids: BTreeSet<String> = pairs.keys().cloned().collect();
+
+        let output = match handle.collect_or_cancel().await {
+            JudgeCollection::Completed(Ok(output)) => output,
+            JudgeCollection::Completed(Err(failure)) => {
+                Self::trace_judge_failure(failure.category, failure.duration, expected_ids.len());
+                return None;
+            }
+            JudgeCollection::Cancelled(cleanup) => {
+                // Dropping the join handle detaches the cleanup task: it sends
+                // TERM, waits the fixed grace, escalates to KILL if needed, and
+                // reaps the child without the authoritative path waiting for it.
+                drop(cleanup);
+                Self::trace_judge_failure(
+                    JudgeFailureCategory::Cancelled,
+                    Duration::ZERO,
+                    expected_ids.len(),
+                );
+                return None;
+            }
+        };
+
+        match parse_system_one_response(&output.stdout, &model, &expected_ids) {
+            Ok(response) => {
+                let mut values = HashMap::with_capacity(response.values.len());
+                for (question_id, value) in response.values {
+                    // The local pair map is the only parser authority: an answer
+                    // ID is never trusted to describe its own change pair.
+                    if let Some(pair) = pairs.get(&question_id) {
+                        values.insert(pair.clone(), value);
+                    }
+                }
+                Some(DependencyJudgeObservation {
+                    model: response.model,
+                    values,
+                    usage: response.usage,
+                    duration: output.duration,
+                    yes_threshold,
+                })
+            }
+            Err(category) => {
+                Self::trace_judge_failure(category, output.duration, expected_ids.len());
+                None
+            }
+        }
+    }
+
+    /// Compare the retained shadow observation with the authoritative result.
+    ///
+    /// Counting only. The normalized [`AnalysisResult`] is already final at this
+    /// point and is not touched.
+    fn report_shadow_dependency_comparison(
+        &self,
+        observation: &DependencyJudgeObservation,
+        result: &AnalysisResult,
+    ) {
+        let authoritative: HashSet<(&str, &str)> = result
+            .dependencies
+            .iter()
+            .flat_map(|(change_id, deps)| {
+                deps.iter()
+                    .map(move |dep| (change_id.as_str(), dep.as_str()))
+            })
+            .collect();
+
+        let mut matching_positive = 0usize;
+        let mut judge_only_positive = 0usize;
+        let mut analyzer_only_positive = 0usize;
+        let mut matching_negative = 0usize;
+
+        for ((dependent, dependency), value) in &observation.values {
+            let judge_yes = *value >= observation.yes_threshold;
+            let analyzer_yes = authoritative.contains(&(dependent.as_str(), dependency.as_str()));
+            match (judge_yes, analyzer_yes) {
+                (true, true) => matching_positive += 1,
+                (true, false) => judge_only_positive += 1,
+                (false, true) => analyzer_only_positive += 1,
+                (false, false) => matching_negative += 1,
+            }
+        }
+
+        // Allowed fields only: purpose, outcome, duration, answer counts, the
+        // validated model identity, and aggregate comparison counts. No request
+        // state, proposal text, process output, credentials, or per-pair
+        // judgment tied to a named change is ever recorded.
+        info!(
+            purpose = PARALLEL_DEPENDENCY_PURPOSE,
+            outcome = "observed",
+            duration_ms = observation.duration.as_millis() as u64,
+            expected_answers = observation.values.len(),
+            returned_answers = observation.values.len(),
+            model = %observation.model,
+            input_tokens = observation.usage.input_tokens,
+            output_tokens = observation.usage.output_tokens,
+            matching_positive_edges = matching_positive,
+            judge_only_positive_edges = judge_only_positive,
+            analyzer_only_positive_edges = analyzer_only_positive,
+            matching_negative_pairs = matching_negative,
+            total_pairs = observation.values.len(),
+            "Shadow dependency judge observation compared with authoritative analysis"
+        );
+    }
+
+    /// Emit the one bounded diagnostic a judge failure is allowed to produce.
+    ///
+    /// The model identity is deliberately absent: it is only trustworthy after
+    /// schema validation, which by definition did not complete here.
+    fn trace_judge_failure(
+        category: JudgeFailureCategory,
+        duration: Duration,
+        expected_answers: usize,
+    ) {
+        warn!(
+            purpose = PARALLEL_DEPENDENCY_PURPOSE,
+            outcome = category.as_str(),
+            duration_ms = duration.as_millis() as u64,
+            expected_answers,
+            "Shadow dependency judge produced no usable observation; authoritative analysis is unaffected"
+        );
     }
 
     /// Parse and validate the analysis output.
@@ -1067,7 +1555,16 @@ mod tests {
     }
 
     fn create_test_analyzer() -> ParallelizationAnalyzer {
-        let config = crate::config::OrchestratorConfig::default();
+        create_test_analyzer_with(
+            crate::config::OrchestratorConfig::default(),
+            PathBuf::from("."),
+        )
+    }
+
+    fn create_test_analyzer_with(
+        config: crate::config::OrchestratorConfig,
+        repo_root: PathBuf,
+    ) -> ParallelizationAnalyzer {
         let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
         let queue_config = CommandQueueConfig {
             acceptance_max_runtime_secs:
@@ -1098,7 +1595,7 @@ mod tests {
         let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
         ai_runner.set_stream_json_textify(stream_json_textify);
         ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
-        ParallelizationAnalyzer::new(ai_runner, config)
+        ParallelizationAnalyzer::new(ai_runner, config, repo_root)
     }
 
     #[test]
@@ -1729,5 +2226,915 @@ That's all."#;
 
         // Verify no executing section when in_flight_ids is empty
         assert!(!prompt.contains("Currently executing changes"));
+    }
+
+    /// Deterministic request construction for the optional shadow judge.
+    ///
+    /// These exercise the pure request/pair-mapping decisions plus the bounded
+    /// proposal-read failure paths. No judge process is involved.
+    mod shadow_judge_request {
+        use super::*;
+        use crate::config::{JudgeCommandsConfig, ParallelDependencyJudgeConfig};
+
+        pub(super) fn judge_entry() -> ParallelDependencyJudgeConfig {
+            ParallelDependencyJudgeConfig {
+                command: vec!["unused-in-request-tests".to_string()],
+                model: "test-judge-1.0.0".to_string(),
+                timeout_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: None,
+                yes_threshold: None,
+            }
+        }
+
+        pub(super) fn judge_config(
+            judge: ParallelDependencyJudgeConfig,
+        ) -> crate::config::OrchestratorConfig {
+            crate::config::OrchestratorConfig {
+                analyze_command: Some("echo unused".to_string()),
+                judge_commands: Some(JudgeCommandsConfig {
+                    parallel_dependency: Some(judge),
+                }),
+                ..Default::default()
+            }
+        }
+
+        /// Create `openspec/changes/<id>/proposal.md` under `repo` with `body`.
+        pub(super) fn write_proposal(repo: &Path, change_id: &str, body: &str) {
+            let dir = repo.join("openspec").join("changes").join(change_id);
+            std::fs::create_dir_all(&dir).expect("create change dir");
+            std::fs::write(dir.join("proposal.md"), body).expect("write proposal");
+        }
+
+        fn change_with_metadata(
+            id: &str,
+            dependencies: Vec<&str>,
+            priority: Option<crate::openspec::ProposalPriority>,
+            references: Vec<&str>,
+        ) -> Change {
+            Change {
+                id: id.to_string(),
+                completed_tasks: 0,
+                total_tasks: 5,
+                last_modified: "now".to_string(),
+                dependencies: dependencies.iter().map(|d| d.to_string()).collect(),
+                metadata: ProposalMetadata {
+                    priority,
+                    references: references.iter().map(|r| r.to_string()).collect(),
+                    ..Default::default()
+                },
+            }
+        }
+
+        #[test]
+        fn request_asks_every_permitted_directed_pair_with_indexed_ids() {
+            let repo = tempfile::TempDir::new().expect("tempdir");
+            write_proposal(repo.path(), "queued-a", "proposal a");
+            write_proposal(repo.path(), "queued-b", "proposal b");
+            write_proposal(repo.path(), "inflight-c", "proposal c");
+            let analyzer =
+                create_test_analyzer_with(judge_config(judge_entry()), repo.path().to_path_buf());
+            let changes = vec![
+                change_with_metadata(
+                    "queued-a",
+                    vec!["queued-b"],
+                    Some(crate::openspec::ProposalPriority::High),
+                    vec!["src/analyzer.rs"],
+                ),
+                change_with_metadata("queued-b", vec![], None, vec![]),
+            ];
+
+            let (request, pairs) = analyzer
+                .build_dependency_judge_request(
+                    &judge_entry(),
+                    &changes,
+                    &["inflight-c".to_string()],
+                )
+                .expect("request construction must succeed")
+                .expect("a permitted pair exists");
+
+            // Dependent is always queued; the candidate is any other queued or
+            // explicitly supplied in-flight node.
+            let ids: Vec<&String> = request.questions.keys().collect();
+            assert_eq!(
+                ids,
+                vec!["q_0000_0001", "q_0000_0002", "q_0001_0000", "q_0001_0002"],
+                "in-flight nodes are dependency candidates only, never dependents"
+            );
+            assert_eq!(
+                pairs.get("q_0000_0002"),
+                Some(&("queued-a".to_string(), "inflight-c".to_string()))
+            );
+            assert_eq!(
+                pairs.get("q_0001_0000"),
+                Some(&("queued-b".to_string(), "queued-a".to_string()))
+            );
+
+            // Deterministic node ordering: queued in input order, then in-flight.
+            assert_eq!(request.state.schema_version, 1);
+            assert_eq!(
+                request
+                    .state
+                    .queued_changes
+                    .iter()
+                    .map(|node| (node.index, node.id.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![(0, "queued-a"), (1, "queued-b")]
+            );
+            assert_eq!(
+                request
+                    .state
+                    .in_flight_changes
+                    .iter()
+                    .map(|node| (node.index, node.id.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![(2, "inflight-c")]
+            );
+
+            // Structured state: complete proposal text plus separately carried,
+            // still-authoritative metadata.
+            assert_eq!(request.state.queued_changes[0].proposal, "proposal a");
+            assert_eq!(
+                request.state.queued_changes[0].metadata_dependencies,
+                vec!["queued-b".to_string()]
+            );
+            assert_eq!(
+                request.state.queued_changes[0].priority.as_deref(),
+                Some("high")
+            );
+            assert_eq!(
+                request.state.queued_changes[0].references,
+                vec!["src/analyzer.rs".to_string()]
+            );
+            assert_eq!(request.state.in_flight_changes[0].proposal, "proposal c");
+
+            // Pinned configured model, Noul type, and the official optional
+            // true/false criteria.
+            assert_eq!(request.model, "test-judge-1.0.0");
+            let question = &request.questions["q_0000_0002"];
+            assert_eq!(question.question_type, "noul");
+            assert!(question.instructions.contains("`state.queued_changes[0]`"));
+            assert!(question
+                .instructions
+                .contains("in-flight change `state.in_flight_changes[0]`"));
+            assert!(question.instructions.contains("require repository output"));
+            assert!(question.criteria.when_true.contains("contract"));
+            assert!(
+                question.criteria.when_false.contains("priority")
+                    && question.criteria.when_false.contains("reference"),
+                "priority and references must be excluded as dependency evidence"
+            );
+
+            // Byte-identical serialization for the same working set.
+            let once = serde_json::to_string(&request).expect("serialize");
+            let twice = serde_json::to_string(&request).expect("serialize");
+            assert_eq!(once, twice);
+        }
+
+        #[test]
+        fn untrusted_change_ids_cannot_reach_question_keys() {
+            let repo = tempfile::TempDir::new().expect("tempdir");
+            // Adversarial but path-safe IDs: one imitates a question key, the
+            // other a protocol token.
+            write_proposal(repo.path(), "q_0000_0001", "proposal one");
+            write_proposal(repo.path(), "noul", "proposal two");
+            let analyzer =
+                create_test_analyzer_with(judge_config(judge_entry()), repo.path().to_path_buf());
+            let changes = vec![
+                create_test_change("q_0000_0001"),
+                create_test_change("noul"),
+            ];
+
+            let (request, pairs) = analyzer
+                .build_dependency_judge_request(&judge_entry(), &changes, &[])
+                .expect("request construction must succeed")
+                .expect("a permitted pair exists");
+
+            assert_eq!(
+                request.questions.keys().collect::<Vec<_>>(),
+                vec!["q_0000_0001", "q_0001_0000"],
+                "question keys are derived from trusted indexes only"
+            );
+            assert_eq!(
+                pairs.get("q_0000_0001"),
+                Some(&("q_0000_0001".to_string(), "noul".to_string())),
+                "the pair map, not the key text, decides which pair a question is about"
+            );
+            let serialized = serde_json::to_value(&request).expect("serialize");
+            assert_eq!(
+                serialized["state"]["queued_changes"][0]["id"],
+                "q_0000_0001"
+            );
+        }
+
+        #[test]
+        fn a_traversing_change_id_skips_the_complete_request() {
+            let repo = tempfile::TempDir::new().expect("tempdir");
+            write_proposal(repo.path(), "queued-a", "proposal a");
+            let analyzer =
+                create_test_analyzer_with(judge_config(judge_entry()), repo.path().to_path_buf());
+            let changes = vec![
+                create_test_change("queued-a"),
+                create_test_change("../outside"),
+            ];
+
+            assert_eq!(
+                analyzer
+                    .build_dependency_judge_request(&judge_entry(), &changes, &[])
+                    .err(),
+                Some(JudgeFailureCategory::Io),
+                "an ID that could leave the change layout is never read"
+            );
+        }
+
+        #[test]
+        fn unreadable_or_non_regular_proposals_skip_the_complete_request() {
+            let repo = tempfile::TempDir::new().expect("tempdir");
+            write_proposal(repo.path(), "queued-a", "proposal a");
+            // `queued-b` has a change directory but no proposal file.
+            std::fs::create_dir_all(repo.path().join("openspec/changes/queued-b"))
+                .expect("create change dir");
+            // `queued-c`'s proposal path is a directory, not a regular file.
+            std::fs::create_dir_all(repo.path().join("openspec/changes/queued-c/proposal.md"))
+                .expect("create non-regular proposal");
+            let analyzer =
+                create_test_analyzer_with(judge_config(judge_entry()), repo.path().to_path_buf());
+
+            for missing in ["queued-b", "queued-c"] {
+                let changes = vec![create_test_change("queued-a"), create_test_change(missing)];
+                assert_eq!(
+                    analyzer
+                        .build_dependency_judge_request(&judge_entry(), &changes, &[])
+                        .err(),
+                    Some(JudgeFailureCategory::Io),
+                    "{missing} must skip the request instead of being judged partially"
+                );
+            }
+        }
+
+        #[test]
+        fn an_oversized_proposal_skips_the_complete_request() {
+            let repo = tempfile::TempDir::new().expect("tempdir");
+            write_proposal(repo.path(), "queued-a", "proposal a");
+            write_proposal(repo.path(), "queued-b", &"x".repeat(64));
+            let judge = ParallelDependencyJudgeConfig {
+                max_input_bytes: Some(16),
+                ..judge_entry()
+            };
+            let analyzer =
+                create_test_analyzer_with(judge_config(judge.clone()), repo.path().to_path_buf());
+            let changes = vec![
+                create_test_change("queued-a"),
+                create_test_change("queued-b"),
+            ];
+
+            assert_eq!(
+                analyzer
+                    .build_dependency_judge_request(&judge, &changes, &[])
+                    .err(),
+                Some(JudgeFailureCategory::InputTooLarge)
+            );
+        }
+
+        #[test]
+        fn a_single_node_has_no_permitted_pair() {
+            let repo = tempfile::TempDir::new().expect("tempdir");
+            write_proposal(repo.path(), "queued-a", "proposal a");
+            let analyzer =
+                create_test_analyzer_with(judge_config(judge_entry()), repo.path().to_path_buf());
+
+            let built = analyzer
+                .build_dependency_judge_request(
+                    &judge_entry(),
+                    &[create_test_change("queued-a")],
+                    &[],
+                )
+                .expect("a working set with nothing to compare is not a failure");
+
+            assert!(built.is_none(), "one node cannot form a directed pair");
+        }
+
+        #[test]
+        fn judge_is_not_started_without_configuration_or_with_llm_analysis_disabled() {
+            let repo = tempfile::TempDir::new().expect("tempdir");
+            write_proposal(repo.path(), "queued-a", "proposal a");
+            write_proposal(repo.path(), "queued-b", "proposal b");
+            let changes = vec![
+                create_test_change("queued-a"),
+                create_test_change("queued-b"),
+            ];
+
+            let without_config = create_test_analyzer_with(
+                crate::config::OrchestratorConfig::default(),
+                repo.path().to_path_buf(),
+            );
+            assert!(
+                without_config
+                    .start_dependency_judge(&changes, &[])
+                    .is_none(),
+                "an absent judge configuration starts nothing"
+            );
+
+            let llm_disabled = create_test_analyzer_with(
+                crate::config::OrchestratorConfig {
+                    use_llm_analysis: Some(false),
+                    ..judge_config(judge_entry())
+                },
+                repo.path().to_path_buf(),
+            );
+            assert!(
+                llm_disabled.start_dependency_judge(&changes, &[]).is_none(),
+                "a configured metadata-only result has nothing to shadow"
+            );
+
+            let invalid_entry = create_test_analyzer_with(
+                judge_config(ParallelDependencyJudgeConfig {
+                    command: Vec::new(),
+                    ..judge_entry()
+                }),
+                repo.path().to_path_buf(),
+            );
+            assert!(
+                invalid_entry
+                    .start_dependency_judge(&changes, &[])
+                    .is_none(),
+                "an entry whose bounds were never validated is never spawned"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_oversized_serialized_request_skips_the_spawn() {
+            let repo = tempfile::TempDir::new().expect("tempdir");
+            write_proposal(repo.path(), "queued-a", "proposal a");
+            write_proposal(repo.path(), "queued-b", "proposal b");
+            let judge = ParallelDependencyJudgeConfig {
+                // Large enough for each proposal file, far too small for the
+                // serialized request.
+                max_input_bytes: Some(64),
+                ..judge_entry()
+            };
+            let analyzer =
+                create_test_analyzer_with(judge_config(judge), repo.path().to_path_buf());
+            let changes = vec![
+                create_test_change("queued-a"),
+                create_test_change("queued-b"),
+            ];
+
+            assert!(
+                analyzer.start_dependency_judge(&changes, &[]).is_none(),
+                "the input limit is checked before any child is spawned"
+            );
+        }
+    }
+
+    /// Runtime behavior of the shadow judge beside the conventional analyzer.
+    ///
+    /// These drive a real child process through fake judge executables on
+    /// purpose: concurrency, cancellation, reaping, and exit-code handling are
+    /// properties of the process boundary. The pure decision logic they surround
+    /// is covered by [`shadow_judge_request`] and the
+    /// `crate::judge_command` unit doubles.
+    #[cfg(unix)]
+    mod shadow_judge_runtime {
+        use super::shadow_judge_request::{judge_config, judge_entry, write_proposal};
+        use super::*;
+        use crate::config::{OrchestratorConfig, ParallelDependencyJudgeConfig};
+        use std::os::unix::fs::PermissionsExt;
+
+        const MODEL: &str = "test-judge-1.0.0";
+        const ANALYZE_JSON: &str = r#"{"order":["queued-a","queued-b"],"dependencies":{}}"#;
+        /// Marker planted in proposal text and judge stdout; diagnostics must
+        /// never contain it.
+        const SECRET: &str = "PROPOSAL-CONTENT-MUST-NOT-BE-LOGGED";
+
+        fn valid_response() -> String {
+            format!(
+                r#"{{"model":"{MODEL}","answers":{{"q_0000_0001":{{"type":"noul","noul":0.9}},"q_0001_0000":{{"type":"noul","noul":0.1}}}},"usage":{{"input_tokens":11,"output_tokens":2}}}}"#
+            )
+        }
+
+        /// Write an executable fake judge into the temporary repository.
+        ///
+        /// Every script first copies its stdin to `<repo>/<name>.request`, which
+        /// is what makes "the judge ran" and "the judge received exactly this
+        /// request" observable rather than assumed.
+        fn write_fake_judge(repo: &Path, name: &str, body: &str) -> PathBuf {
+            let path = repo.join(name);
+            let script = format!(
+                "#!/bin/sh\ncat > '{}'\n{body}\n",
+                repo.join(format!("{name}.request")).display()
+            );
+            std::fs::write(&path, script).expect("write fake judge");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake judge");
+            path
+        }
+
+        fn judge_ran(repo: &Path, name: &str) -> bool {
+            repo.join(format!("{name}.request")).exists()
+        }
+
+        /// A fake judge that publishes its response, then a completion marker.
+        ///
+        /// The conventional analyze command waits for that marker, so "the judge
+        /// completed first" is a causal barrier rather than a timing hope.
+        fn barrier_judge(repo: &Path, response: &str) -> PathBuf {
+            write_fake_judge(
+                repo,
+                "barrier-judge",
+                &format!(
+                    "printf '%s' '{response}'\n: > '{}'",
+                    repo.join("judge-done").display()
+                ),
+            )
+        }
+
+        fn analyze_after_judge(repo: &Path) -> String {
+            analyze_after_marker(&repo.join("judge-done"))
+        }
+
+        /// A conventional analyze command that waits for `marker`, then answers.
+        ///
+        /// Used to make judge/analyzer ordering causal instead of timing-based.
+        fn analyze_after_marker(marker: &Path) -> String {
+            format!(
+                "while [ ! -f '{}' ]; do sleep 0.01; done; printf '%s' '{ANALYZE_JSON}'",
+                marker.display()
+            )
+        }
+
+        fn runtime_config(analyze_command: String, judge_argv: Vec<String>) -> OrchestratorConfig {
+            OrchestratorConfig {
+                analyze_command: Some(analyze_command),
+                // Keep the analyzer's own command path fast and single-shot: the
+                // judge contract is what these tests are about.
+                command_queue_stagger_delay_ms: Some(0),
+                command_queue_max_retries: Some(0),
+                ..judge_config(ParallelDependencyJudgeConfig {
+                    command: judge_argv,
+                    model: MODEL.to_string(),
+                    // Far longer than any test: a caller that waited for the
+                    // judge would hang instead of returning.
+                    timeout_ms: Some(300_000),
+                    ..judge_entry()
+                })
+            }
+        }
+
+        fn queued_pair() -> Vec<Change> {
+            vec![
+                create_test_change("queued-a"),
+                create_test_change("queued-b"),
+            ]
+        }
+
+        fn prepare_repo() -> tempfile::TempDir {
+            let repo = tempfile::TempDir::new().expect("tempdir");
+            write_proposal(repo.path(), "queued-a", &format!("proposal a {SECRET}"));
+            write_proposal(repo.path(), "queued-b", &format!("proposal b {SECRET}"));
+            repo
+        }
+
+        /// Fail fast instead of hanging if a judge ever became a blocking step.
+        async fn analyze(analyzer: &ParallelizationAnalyzer, changes: &[Change]) -> AnalysisResult {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                analyzer.analyze_with_inflight(changes, &[]),
+            )
+            .await
+            .expect("analysis must not wait for the judge's own timeout")
+            .expect("conventional analysis must succeed")
+        }
+
+        #[tokio::test]
+        async fn a_valid_judge_leaves_the_authoritative_result_unchanged() {
+            let repo = prepare_repo();
+            let judge = barrier_judge(repo.path(), &valid_response());
+            let with_judge = create_test_analyzer_with(
+                runtime_config(
+                    analyze_after_judge(repo.path()),
+                    vec![judge.display().to_string()],
+                ),
+                repo.path().to_path_buf(),
+            );
+            let without_judge = create_test_analyzer_with(
+                OrchestratorConfig {
+                    analyze_command: Some(format!("printf '%s' '{ANALYZE_JSON}'")),
+                    command_queue_stagger_delay_ms: Some(0),
+                    command_queue_max_retries: Some(0),
+                    ..Default::default()
+                },
+                repo.path().to_path_buf(),
+            );
+
+            let observed = analyze(&with_judge, &queued_pair()).await;
+            let baseline = analyze(&without_judge, &queued_pair()).await;
+
+            assert!(
+                judge_ran(repo.path(), "barrier-judge"),
+                "the judge must really have run for this comparison to mean anything"
+            );
+            assert_eq!(observed.order, baseline.order);
+            assert_eq!(observed.dependencies, baseline.dependencies);
+            assert!(
+                observed.dependencies.is_empty(),
+                "a judge `yes` never adds an authoritative dependency"
+            );
+            // The judge received the complete request on stdin.
+            let request = std::fs::read_to_string(repo.path().join("barrier-judge.request"))
+                .expect("captured request");
+            let request: serde_json::Value =
+                serde_json::from_str(&request).expect("request is one JSON object");
+            assert_eq!(request["model"], MODEL);
+            assert!(request["questions"]["q_0000_0001"].is_object());
+        }
+
+        #[tokio::test]
+        async fn metadata_dependencies_survive_a_negative_judgment() {
+            let repo = prepare_repo();
+            // The judge says "no" for both directions, including the declared
+            // metadata dependency queued-a → queued-b.
+            let response = format!(
+                r#"{{"model":"{MODEL}","answers":{{"q_0000_0001":{{"type":"noul","noul":0.0}},"q_0001_0000":{{"type":"noul","noul":0.0}}}},"usage":{{"input_tokens":1,"output_tokens":1}}}}"#
+            );
+            let judge = barrier_judge(repo.path(), &response);
+            let analyzer = create_test_analyzer_with(
+                runtime_config(
+                    analyze_after_judge(repo.path()),
+                    vec![judge.display().to_string()],
+                ),
+                repo.path().to_path_buf(),
+            );
+            let mut changes = queued_pair();
+            changes[0].dependencies = vec!["queued-b".to_string()];
+
+            let result = analyze(&analyzer, &changes).await;
+
+            assert_eq!(
+                result.dependencies.get("queued-a"),
+                Some(&vec!["queued-b".to_string()]),
+                "proposal metadata stays authoritative regardless of the judge"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unhealthy_judge_returns_the_conventional_result() {
+            let repo = prepare_repo();
+            let cases = vec![
+                (
+                    "missing-executable",
+                    vec![repo.path().join("not-installed").display().to_string()],
+                ),
+                (
+                    "nonzero-exit",
+                    vec![write_fake_judge(repo.path(), "exit-judge", "exit 1")
+                        .display()
+                        .to_string()],
+                ),
+                (
+                    "auth-failure",
+                    vec![write_fake_judge(
+                        repo.path(),
+                        "auth-judge",
+                        "echo 'credentials missing' >&2\nexit 3",
+                    )
+                    .display()
+                    .to_string()],
+                ),
+                (
+                    "malformed-output",
+                    vec![write_fake_judge(
+                        repo.path(),
+                        "prose-judge",
+                        "printf '%s' 'I think they are independent.'",
+                    )
+                    .display()
+                    .to_string()],
+                ),
+                (
+                    "wrong-model",
+                    vec![write_fake_judge(
+                        repo.path(),
+                        "model-judge",
+                        r#"printf '%s' '{"model":"other-9.9.9","answers":{},"usage":{"input_tokens":1,"output_tokens":1}}'"#,
+                    )
+                    .display()
+                    .to_string()],
+                ),
+                (
+                    "oversized-output",
+                    vec![write_fake_judge(
+                        repo.path(),
+                        "loud-judge",
+                        "i=0\nwhile [ $i -lt 500 ]; do printf '0123456789'; i=$((i+1)); done",
+                    )
+                    .display()
+                    .to_string()],
+                ),
+            ];
+
+            for (label, argv) in cases {
+                let analyzer = create_test_analyzer_with(
+                    OrchestratorConfig {
+                        judge_commands: Some(crate::config::JudgeCommandsConfig {
+                            parallel_dependency: Some(ParallelDependencyJudgeConfig {
+                                command: argv,
+                                model: MODEL.to_string(),
+                                max_output_bytes: Some(64),
+                                timeout_ms: Some(300_000),
+                                ..judge_entry()
+                            }),
+                        }),
+                        ..runtime_config(
+                            format!("printf '%s' '{ANALYZE_JSON}'"),
+                            vec!["unused".to_string()],
+                        )
+                    },
+                    repo.path().to_path_buf(),
+                );
+
+                let result = analyze(&analyzer, &queued_pair()).await;
+
+                assert_eq!(
+                    result.order,
+                    vec!["queued-a".to_string(), "queued-b".to_string()],
+                    "{label} must leave the conventional result intact"
+                );
+                assert!(result.dependencies.is_empty(), "{label}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_slow_judge_never_delays_the_conventional_result() {
+            let repo = prepare_repo();
+            // Ignores TERM, so cleanup has to escalate to KILL after the fixed
+            // grace — and the caller must not be waiting for any of it.
+            let judge = write_fake_judge(repo.path(), "slow-judge", "trap '' TERM\nsleep 300");
+            // The conventional command waits for the judge to be really running,
+            // so the cancellation path is exercised rather than a spawn race.
+            let analyzer = create_test_analyzer_with(
+                runtime_config(
+                    analyze_after_marker(&repo.path().join("slow-judge.request")),
+                    vec![judge.display().to_string()],
+                ),
+                repo.path().to_path_buf(),
+            );
+
+            let result = analyze(&analyzer, &queued_pair()).await;
+
+            assert!(
+                judge_ran(repo.path(), "slow-judge"),
+                "the slow judge must really have started"
+            );
+            assert_eq!(
+                result.order,
+                vec!["queued-a".to_string(), "queued-b".to_string()],
+                "returning at all is the assertion: waiting for this judge would \
+                 have blocked on its 5-minute timeout"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_conventional_error_is_returned_unchanged_while_a_judge_runs() {
+            let repo = prepare_repo();
+            let judge = write_fake_judge(repo.path(), "running-judge", "sleep 300");
+            let analyzer = create_test_analyzer_with(
+                runtime_config(
+                    format!(
+                        "while [ ! -f '{}' ]; do sleep 0.01; done; printf '%s' 'not json at all'",
+                        repo.path().join("running-judge.request").display()
+                    ),
+                    vec![judge.display().to_string()],
+                ),
+                repo.path().to_path_buf(),
+            );
+
+            let error = tokio::time::timeout(
+                Duration::from_secs(60),
+                analyzer.analyze_with_inflight(&queued_pair(), &[]),
+            )
+            .await
+            .expect("an analyzer error must not wait for the judge")
+            .expect_err("invalid conventional output must still fail");
+
+            assert!(
+                judge_ran(repo.path(), "running-judge"),
+                "the judge must have been running when the analyzer failed"
+            );
+            assert!(
+                error.to_string().contains("Analysis returned invalid JSON"),
+                "the existing analyzer error must be returned unchanged: {error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn early_return_paths_never_spawn_the_judge() {
+            let repo = prepare_repo();
+            let judge = write_fake_judge(repo.path(), "never-judge", "printf '%s' '{}'");
+            let analyzer = create_test_analyzer_with(
+                runtime_config(
+                    format!("printf '%s' '{ANALYZE_JSON}'"),
+                    vec![judge.display().to_string()],
+                ),
+                repo.path().to_path_buf(),
+            );
+
+            let empty = analyzer
+                .analyze_with_inflight(&[], &[])
+                .await
+                .expect("zero changes");
+            assert!(empty.order.is_empty());
+
+            let single = analyzer
+                .analyze_with_inflight(&[create_test_change("queued-a")], &[])
+                .await
+                .expect("single change");
+            assert_eq!(single.order, vec!["queued-a".to_string()]);
+
+            assert!(
+                !judge_ran(repo.path(), "never-judge"),
+                "the zero-change and single-change fast paths must start no judge"
+            );
+        }
+
+        #[tokio::test]
+        async fn diagnostics_are_aggregate_and_redacted() {
+            let repo = prepare_repo();
+            // The judge echoes the secret marker on stdout as well, so a leak
+            // through raw process output would also be caught.
+            let judge = barrier_judge(repo.path(), &valid_response());
+            let analyzer = create_test_analyzer_with(
+                runtime_config(
+                    analyze_after_judge(repo.path()),
+                    vec![judge.display().to_string()],
+                ),
+                repo.path().to_path_buf(),
+            );
+
+            let (capture, _guard) = capture_analyzer_tracing().await;
+            let result = analyze(&analyzer, &queued_pair()).await;
+            let records = capture.records();
+
+            assert!(result.dependencies.is_empty());
+            let observation = records
+                .iter()
+                .find(|(_, fields)| fields.contains("outcome=\"observed\""))
+                .map(|(_, fields)| fields.clone())
+                .expect("a completed judge must emit exactly one observation record");
+
+            for allowed in [
+                "purpose=\"parallel_dependency\"",
+                "duration_ms=",
+                "expected_answers=2",
+                "returned_answers=2",
+                "matching_positive_edges=0",
+                "judge_only_positive_edges=1",
+                "analyzer_only_positive_edges=0",
+                "matching_negative_pairs=1",
+                "total_pairs=2",
+            ] {
+                assert!(
+                    observation.contains(allowed),
+                    "the observation must carry {allowed}: {observation}"
+                );
+            }
+            assert!(
+                observation.contains(MODEL),
+                "the validated model identity is allowed: {observation}"
+            );
+
+            for (_, fields) in &records {
+                assert!(
+                    !fields.contains(SECRET),
+                    "no diagnostic may carry proposal text or raw judge output: {fields}"
+                );
+                assert!(
+                    !fields.contains("queued-a") || !fields.contains("noul"),
+                    "no diagnostic may tie a judgment value to a named change: {fields}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_bounded_judge_failure_emits_one_redacted_category() {
+            let repo = prepare_repo();
+            let judge = write_fake_judge(
+                repo.path(),
+                "prose-judge",
+                &format!("printf '%s' 'they are independent because {SECRET}'"),
+            );
+            let analyzer = create_test_analyzer_with(
+                runtime_config(
+                    format!(
+                        "while [ ! -f '{}' ]; do sleep 0.01; done; printf '%s' '{ANALYZE_JSON}'",
+                        repo.path().join("prose-judge.request").display()
+                    ),
+                    vec![judge.display().to_string()],
+                ),
+                repo.path().to_path_buf(),
+            );
+
+            let (capture, _guard) = capture_analyzer_tracing().await;
+            let result = analyze(&analyzer, &queued_pair()).await;
+            let records = capture.records();
+
+            assert_eq!(
+                result.order,
+                vec!["queued-a".to_string(), "queued-b".to_string()]
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|(level, fields)| *level == tracing::Level::WARN
+                        && fields.contains("outcome=\"invalid_json\"")
+                        && fields.contains("expected_answers=2")),
+                "a malformed response is reported as one bounded category: {records:?}"
+            );
+            for (_, fields) in &records {
+                assert!(
+                    !fields.contains(SECRET),
+                    "a failure diagnostic may not carry raw stdout: {fields}"
+                );
+                assert!(
+                    !fields.contains("model="),
+                    "an unvalidated model identity is not published: {fields}"
+                );
+            }
+        }
+
+        /// Collects tracing records so the judge's observability surface can be
+        /// asserted on, including what it must never contain.
+        #[derive(Clone, Default)]
+        pub(super) struct CaptureLayer(
+            std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+        );
+
+        impl CaptureLayer {
+            fn records(&self) -> Vec<(tracing::Level, String)> {
+                self.0.lock().expect("capture layer mutex").clone()
+            }
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor {
+                    fields: String,
+                }
+
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.fields
+                            .push_str(&format!("{}={:?};", field.name(), value));
+                    }
+                }
+
+                let mut visitor = Visitor {
+                    fields: String::new(),
+                };
+                event.record(&mut visitor);
+                self.0
+                    .lock()
+                    .expect("capture layer mutex")
+                    .push((*event.metadata().level(), visitor.fields));
+            }
+        }
+
+        /// Everything that must stay alive while a capture is collected.
+        pub(super) struct TracingCapture {
+            _exclusive: tokio::sync::MutexGuard<'static, ()>,
+            _subscriber: tracing::subscriber::DefaultGuard,
+        }
+
+        /// Install an INFO-scoped capturing subscriber for the current test.
+        async fn capture_analyzer_tracing() -> (CaptureLayer, TracingCapture) {
+            use tracing_subscriber::filter::LevelFilter;
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::Layer;
+
+            let exclusive = crate::test_support::tracing_capture_lock().lock().await;
+            let capture = CaptureLayer::default();
+            let subscriber =
+                tracing_subscriber::registry().with(capture.clone().with_filter(LevelFilter::INFO));
+            let subscriber = tracing::subscriber::set_default(subscriber);
+            crate::test_support::refresh_tracing_interest();
+            (
+                capture,
+                TracingCapture {
+                    _exclusive: exclusive,
+                    _subscriber: subscriber,
+                },
+            )
+        }
     }
 }

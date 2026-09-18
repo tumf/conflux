@@ -815,7 +815,11 @@ impl ParallelRunService {
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
         iteration: u32,
     ) -> Result<crate::analyzer::AnalysisResult> {
-        let analyzer = ParallelizationAnalyzer::new(self.ai_runner.clone(), self.config.clone());
+        let analyzer = ParallelizationAnalyzer::new(
+            self.ai_runner.clone(),
+            self.config.clone(),
+            self.repo_root.clone(),
+        );
 
         if let Some(tx) = event_tx {
             let tx = tx.clone();
@@ -844,7 +848,11 @@ impl ParallelRunService {
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
         iteration: u32,
     ) -> Result<Vec<ParallelGroup>> {
-        let analyzer = ParallelizationAnalyzer::new(self.ai_runner.clone(), self.config.clone());
+        let analyzer = ParallelizationAnalyzer::new(
+            self.ai_runner.clone(),
+            self.config.clone(),
+            self.repo_root.clone(),
+        );
 
         if let Some(tx) = event_tx {
             let tx = tx.clone();
@@ -1552,6 +1560,111 @@ mod tests {
             !outcome.provenance.is_degraded(),
             "intentional metadata-only analysis must not be suppressed on a degraded interval"
         );
+    }
+
+    /// A shadow dependency judge is invisible to analysis provenance.
+    ///
+    /// Provenance is what decides whether the scheduler treats a result as
+    /// healthy or degraded, so a judge that fails, or one that answers
+    /// perfectly, must both leave it exactly where the conventional analyzer put
+    /// it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn judge_outcomes_never_change_analysis_provenance() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const MODEL: &str = "test-judge-1.0.0";
+        let temp_dir = TempDir::new().expect("tempdir");
+        let repo = temp_dir.path();
+        for change_id in ["route", "policy"] {
+            let dir = repo.join("openspec/changes").join(change_id);
+            std::fs::create_dir_all(&dir).expect("create change dir");
+            std::fs::write(dir.join("proposal.md"), "proposal body").expect("write proposal");
+        }
+
+        // A judge that answers validly, then publishes a marker the conventional
+        // analyze command waits for: "the judge completed first" is causal here,
+        // not timing-dependent.
+        let judge_path = repo.join("fake-judge");
+        std::fs::write(
+            &judge_path,
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s' '{{\"model\":\"{MODEL}\",\"answers\":{{\"q_0000_0001\":{{\"type\":\"noul\",\"noul\":0.99}},\"q_0001_0000\":{{\"type\":\"noul\",\"noul\":0.99}}}},\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n: > '{}'\n",
+                repo.join("judge-done").display()
+            ),
+        )
+        .expect("write fake judge");
+        std::fs::set_permissions(&judge_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake judge");
+
+        let judge_entry = |command: Vec<String>| crate::config::JudgeCommandsConfig {
+            parallel_dependency: Some(crate::config::ParallelDependencyJudgeConfig {
+                command,
+                model: MODEL.to_string(),
+                timeout_ms: Some(300_000),
+                max_input_bytes: None,
+                max_output_bytes: None,
+                yes_threshold: None,
+            }),
+        };
+
+        let cases = vec![
+            (
+                "valid judge",
+                judge_entry(vec![judge_path.display().to_string()]),
+                format!(
+                    "while [ ! -f '{}' ]; do sleep 0.01; done; printf '%s' '{{\"order\":[\"route\",\"policy\"],\"dependencies\":{{}}}}'",
+                    repo.join("judge-done").display()
+                ),
+            ),
+            (
+                "unavailable judge",
+                judge_entry(vec![repo.join("not-installed").display().to_string()]),
+                r#"printf '%s' '{"order":["route","policy"],"dependencies":{}}'"#.to_string(),
+            ),
+        ];
+
+        for (label, judge_commands, analyze_command) in cases {
+            let config = OrchestratorConfig {
+                use_llm_analysis: Some(true),
+                analyze_command: Some(analyze_command),
+                judge_commands: Some(judge_commands),
+                command_queue_stagger_delay_ms: Some(0),
+                command_queue_max_retries: Some(0),
+                ..create_test_config()
+            };
+            let service = ParallelRunService::new(repo.to_path_buf(), config);
+            let changes = vec![
+                create_test_change("route", vec![]),
+                create_test_change("policy", vec![]),
+            ];
+
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                service.analyze_order_with_sender(&changes, &[], None, 1),
+            )
+            .await
+            .expect("analysis must not wait for the judge's own timeout");
+
+            assert_eq!(
+                outcome.provenance,
+                crate::analyzer::AnalysisProvenance::HealthyLlm,
+                "{label} must leave the conventional analyzer's provenance untouched"
+            );
+            assert!(
+                !outcome.provenance.is_degraded(),
+                "{label} must not degrade the analysis"
+            );
+            assert_eq!(
+                outcome.result.order,
+                vec!["route".to_string(), "policy".to_string()],
+                "{label} must not reorder the authoritative result"
+            );
+            assert!(
+                outcome.result.dependencies.is_empty(),
+                "{label}: a judge `yes` never adds an authoritative dependency"
+            );
+        }
     }
 
     #[tokio::test]
