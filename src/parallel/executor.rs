@@ -1577,56 +1577,284 @@ where
     VERDICT_GRACE_OVERRIDE_SECS.scope(secs, fut).await
 }
 
-/// Per-verification reuse plan for the acceptance invocation about to start.
+tokio::task_local! {
+    /// Test-only task-local override for the semantic review budget, in
+    /// milliseconds.
+    ///
+    /// The production partition is whole seconds, because `acceptance_max_runtime_secs`
+    /// is, and its smallest positive work budget is therefore one second. That
+    /// is a perfectly good bound for an operator and a poor one for a test suite
+    /// with a one-second total runtime target: proving "the review deadline
+    /// fires, terminates, reaps, and settles as a typed hold" does not need a
+    /// real second of waiting. Scoped to the calling task like the verdict-grace
+    /// override, so concurrent tests keep the real partition.
+    pub(crate) static REVIEW_BUDGET_OVERRIDE_MS: u64;
+}
+
+/// Run `fut` with the semantic review budget overridden to `millis`. Test-only.
+#[cfg(test)]
+pub(crate) async fn scoped_review_budget_millis_for_test<F, R>(millis: u64, fut: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    REVIEW_BUDGET_OVERRIDE_MS.scope(millis, fut).await
+}
+
+/// The semantic review budget actually applied to this invocation.
+///
+/// Returns the runtime-derived remainder of the shared budget, unless a test has
+/// scoped an explicit override onto the current task.
+fn effective_review_budget(derived: Option<std::time::Duration>) -> Option<std::time::Duration> {
+    REVIEW_BUDGET_OVERRIDE_MS
+        .try_with(|millis| *millis)
+        .ok()
+        .filter(|millis| *millis > 0)
+        .map(std::time::Duration::from_millis)
+        .or(derived)
+}
+
+/// The runtime-owned boundary phase, completed before any reviewer starts.
 ///
 /// Everything here is derived from the workspace: the proposal's own
-/// declarations, the runtime-written sidecar, and live Git state. Nothing is
+/// declarations, the runtime-written sidecars, and live Git state. Nothing is
 /// remembered across invocations, so a restart in the middle of a change
-/// recomputes the same plan from the same files.
+/// recomputes the same manifest, the same fingerprint, and the same reuse
+/// decisions from the same files.
 ///
-/// A plan is observability plus context. It never decides whether acceptance
-/// runs, never suppresses a command, and never turns into a verdict: an empty
-/// or all-`rerun` plan leaves the acceptance invocation exactly as it was before
-/// this feature existed.
-async fn build_verification_reuse_context_for_workspace(
+/// What changed from the advisory predecessor is ownership. The plan used to be
+/// observation handed to a reviewer that decided for itself what to run. Here
+/// Conflux runs — or exactly reuses — every declared change-blocking gate first,
+/// and the reviewer receives immutable results plus a closed boundary.
+pub(crate) struct AcceptanceBoundary {
+    pub manifest: crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionManifest,
+    pub gates: crate::orchestration::acceptance::execution_manifest::GateResults,
+    pub verdict: crate::orchestration::acceptance::gate_execution::GateVerdict,
+    /// Work budget left for semantic review after the gates spent theirs.
+    pub review_budget: Option<std::time::Duration>,
+}
+
+/// Build the manifest and run its declared gates.
+///
+/// Three outcomes, and the difference between them matters:
+///
+/// * `Ok(Some(_))` — a boundary exists. The reviewer gets a closed allowlist and
+///   immutable gate results.
+/// * `Ok(None)` — this workspace is not a Git working tree, so there is no
+///   candidate revision to freeze and no evidence to bind. No manifest is
+///   supplied and Acceptance runs exactly as it did before this feature existed,
+///   which is what the skill's "if no manifest is supplied" clause describes.
+/// * `Err(hold)` — the workspace *is* a repository and the runtime still could
+///   not read it. That is a runtime defect rather than a verdict: not being able
+///   to read Git says nothing about whether the change is correct.
+pub(crate) async fn run_acceptance_boundary(
     change_id: &str,
     workspace_path: &Path,
-) -> String {
+    skill_name: &str,
+    review_base: Option<&str>,
+    absolute_deadline_secs: u64,
+) -> std::result::Result<
+    Option<AcceptanceBoundary>,
+    crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionHold,
+> {
+    use crate::orchestration::acceptance::execution_manifest::{
+        partition_deadline, AcceptanceExecutionHold, AcceptanceHoldCategory, ManifestStore,
+    };
+    use crate::orchestration::acceptance::gate_execution::{
+        classify_gate_results, execute_declared_gates, plan_manifest_reuse, GateBudget,
+    };
+    use crate::orchestration::acceptance::manifest_builder::build_manifest_for_workspace;
     use crate::orchestration::acceptance::verification_evidence::{
-        plan_reuse, GitRepositoryFacts, ReusePolicy,
+        DirectCommandSupervisor, GitRepositoryFacts, ReusePolicy, RuntimeVerificationExecutor,
+        SystemClock,
     };
 
-    let proposal_path = workspace_path
-        .join("openspec/changes")
-        .join(change_id)
-        .join("proposal.md");
-    if !proposal_path.is_file() {
-        return String::new();
+    let partition = partition_deadline(absolute_deadline_secs);
+    // A directory that was never a repository has no candidate to freeze. It is
+    // not broken, so it gets no manifest rather than a hold, and Acceptance runs
+    // there exactly as it did before this boundary existed.
+    if !crate::orchestration::acceptance::manifest_builder::workspace_is_repository(workspace_path)
+        .await
+    {
+        debug!(
+            change_id = change_id,
+            workspace = %workspace_path.display(),
+            "Acceptance boundary skipped: the workspace is not a Git working tree"
+        );
+        return Ok(None);
     }
-    let metadata = crate::openspec::parse_proposal_metadata_from_file(&proposal_path);
-    if metadata.verifications.is_empty() {
-        return String::new();
-    }
-    let plan = plan_reuse(
+    let manifest = match build_manifest_for_workspace(
         &GitRepositoryFacts,
         workspace_path,
-        &metadata.verifications,
+        change_id,
+        skill_name,
+        review_base,
+        absolute_deadline_secs,
+    )
+    .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(AcceptanceExecutionHold {
+                category: AcceptanceHoldCategory::ManifestMalformed,
+                budget_secs: partition.absolute_secs,
+                cleanup_confirmed: true,
+                cleanup_diagnostics: "no reviewer was started".to_string(),
+                // No manifest means no fingerprint to bind the refusal to, so
+                // the hold carries an all-zero one: the admission guard then
+                // cannot match it against any real input and the next attempt
+                // is admitted rather than stranded on an unreadable repository.
+                fingerprint: "0".repeat(64),
+                evidence: vec![error.detail()],
+            });
+        }
+    };
+    let fingerprint = manifest.fingerprint();
+
+    // The authoritative unchanged-input guard, derived from the workspace alone.
+    //
+    // Shared admission refuses earlier and more cheaply, but it depends on
+    // process-local reducer state that a restart discards. This one does not: it
+    // reads the same repository-local manifest a previous invocation wrote, so a
+    // restarted Conflux facing the same worktree makes the same decision rather
+    // than re-dispatching the review the deadline already stopped.
+    let admission =
+        crate::orchestration::acceptance::execution_manifest::classify_admission_from_store(
+            workspace_path,
+            change_id,
+            &fingerprint,
+        );
+    if let crate::orchestration::acceptance::execution_manifest::AcceptanceAdmission::Refuse {
+        category,
+        ..
+    } = &admission
+    {
+        warn!(
+            change_id = change_id,
+            category = category.as_str(),
+            "Acceptance not dispatched: input is unchanged since a non-resumable hold"
+        );
+        return Err(AcceptanceExecutionHold {
+            category: *category,
+            budget_secs: partition.absolute_secs,
+            cleanup_confirmed: true,
+            cleanup_diagnostics: "no reviewer was started".to_string(),
+            fingerprint,
+            evidence: admission.detail().into_iter().collect(),
+        });
+    }
+
+    // Persist before running anything: a manifest that exists only after the
+    // gates finish could not explain an invocation the gates themselves killed.
+    let store = ManifestStore::new(workspace_path.to_path_buf());
+    if let Err(error) = store.store(&manifest) {
+        warn!(
+            change_id = change_id,
+            "Acceptance manifest could not be persisted: {}", error
+        );
+    }
+
+    let reuse_decisions = plan_manifest_reuse(
+        &GitRepositoryFacts,
+        workspace_path,
+        &manifest,
         ReusePolicy::default(),
     )
     .await;
-    if plan.is_empty() {
-        return String::new();
-    }
-    for decision in &plan.decisions {
+    let gate_budget = match partition.work_duration() {
+        Some(work) => GateBudget::bounded(work),
+        None => GateBudget::unbounded(),
+    };
+    let gate_start = std::time::Instant::now();
+    let executor = RuntimeVerificationExecutor::new(
+        workspace_path.to_path_buf(),
+        GitRepositoryFacts,
+        DirectCommandSupervisor,
+        SystemClock,
+    );
+    let gates = execute_declared_gates(&executor, &manifest, &reuse_decisions, gate_budget).await;
+    for outcome in &gates.outcomes {
         info!(
             change_id = change_id,
-            verification_id = decision.verification_id(),
-            outcome = decision.outcome(),
-            "Verification evidence: {}",
-            decision.summary()
+            verification_id = outcome.verification_id(),
+            status = outcome.status(),
+            "Declared Acceptance gate: {}",
+            outcome.summary()
         );
     }
-    crate::agent::build_verification_reuse_context(&plan)
+    let review_budget = partition
+        .work_duration()
+        .map(|work| work.saturating_sub(gate_start.elapsed()));
+
+    debug!(
+        change_id = change_id,
+        fingerprint = %fingerprint,
+        "Acceptance execution manifest frozen"
+    );
+    Ok(Some(AcceptanceBoundary {
+        verdict: classify_gate_results(&gates),
+        manifest,
+        gates,
+        review_budget,
+    }))
+}
+
+/// Persist the terminal record that refuses an unchanged retry.
+///
+/// Written to the same repository-local manifest the invocation ran under, so
+/// the refusal survives a restart with no out-of-worktree state — and so
+/// deleting `~/.local/state/cflx/**` cannot turn a refused retry into an
+/// admitted one.
+pub(crate) fn record_acceptance_terminal_manifest(
+    workspace_path: &Path,
+    manifest: &crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionManifest,
+    hold: &crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionHold,
+) {
+    use crate::orchestration::acceptance::execution_manifest::{ManifestStore, ManifestTerminal};
+
+    let store = ManifestStore::new(workspace_path.to_path_buf());
+    if let Err(error) = store.record_terminal(
+        manifest,
+        ManifestTerminal {
+            hold_category: Some(hold.category),
+            fingerprint: hold.fingerprint.clone(),
+            cleanup_confirmed: hold.cleanup_confirmed,
+            cleanup_diagnostics: hold.cleanup_diagnostics.clone(),
+            recorded_at: chrono::Utc::now(),
+        },
+    ) {
+        warn!(
+            change_id = %manifest.change_id,
+            "Acceptance terminal manifest could not be persisted: {}", error
+        );
+    }
+}
+
+/// Emit the operator-facing log and completion events for an execution hold.
+///
+/// Deliberately does *not* record an `AcceptanceAttempt`: a bounded hold is not
+/// a verdict, so it consumes no attempt number and leaves no history a later
+/// invocation could replay as previous findings.
+pub(crate) async fn emit_acceptance_execution_hold(
+    change_id: &str,
+    hold: &crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionHold,
+    event_tx: Option<&mpsc::Sender<ParallelEvent>>,
+    iteration: u32,
+) {
+    if let Some(tx) = event_tx {
+        let _ = tx
+            .send(ParallelEvent::Log(
+                crate::events::LogEntry::error(hold.summary(change_id))
+                    .with_change_id(change_id)
+                    .with_operation("acceptance")
+                    .with_iteration(iteration),
+            ))
+            .await;
+        let _ = tx
+            .send(ParallelEvent::AcceptanceCompleted {
+                change_id: change_id.to_string(),
+            })
+            .await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1651,6 +1879,22 @@ pub async fn execute_acceptance_in_workspace(
     }
 
     info!("Running acceptance test for {} in workspace", change_id);
+
+    // Declared gates and semantic review share one budget, so the invocation is
+    // timed from here — before the gates — rather than from the moment the
+    // reviewer starts.
+    let start_time_for_gate_phase = std::time::Instant::now();
+
+    // Acceptance reviews an implementation rather than producing one, so it runs
+    // under its own dedicated absolute deadline instead of Apply's much larger
+    // `command_max_runtime_secs`. A positive common limit still caps it; a
+    // disabled (`0`) common limit does not unbound it. The runner selects that
+    // bound from the `"acceptance"` operation type below, so this reads the same
+    // resolution the runner enforces rather than a second copy of the rule: the
+    // diagnostic can never name a limit other than the one that expired.
+    let acceptance_runtime_limit_secs = ai_runner
+        .queue_config()
+        .effective_max_runtime_secs(Some(crate::command_queue::ACCEPTANCE_OPERATION_TYPE));
 
     // Capture current commit hash for diff tracking
     let commit_hash = crate::vcs::git::commands::get_current_commit(workspace_path)
@@ -1770,11 +2014,142 @@ pub async fn execute_acceptance_in_workspace(
         agent.acceptance_command_recovery(change_id),
     );
 
-    // Per-verification reuse decisions, derived from the worktree alone. This
-    // is observation, not control: a verification with no surviving binding is
-    // reported as `rerun` and the acceptance agent runs it exactly as before.
-    let verification_reuse_context =
-        build_verification_reuse_context_for_workspace(change_id, workspace_path).await;
+    // The runtime-owned boundary. Gates run *here*, before any reviewer exists,
+    // inside the same budget review will spend. What reaches the prompt below is
+    // an immutable result set and a closed allowlist, not a suggestion.
+    let boundary = match run_acceptance_boundary(
+        change_id,
+        workspace_path,
+        config.get_accept_skill(),
+        base_branch,
+        acceptance_runtime_limit_secs,
+    )
+    .await
+    {
+        Ok(boundary) => boundary,
+        Err(hold) => {
+            warn!(
+                change_id = %change_id,
+                category = hold.category.as_str(),
+                "Acceptance boundary could not be derived: {}",
+                hold.summary(change_id)
+            );
+            emit_acceptance_execution_hold(change_id, &hold, event_tx.as_ref(), 0).await;
+            return Ok((
+                crate::orchestration::AcceptanceResult::ExecutionHold { hold },
+                0,
+            ));
+        }
+    };
+
+    // Route the gate phase before spending anything on a reviewer. A failing
+    // declared gate already determines the verdict; a missing prerequisite or a
+    // runtime defect already determines the hold. In all three cases starting a
+    // reviewer would only consume budget to rediscover what the runtime knows.
+    if let Some(boundary) = boundary.as_ref() {
+        use crate::orchestration::acceptance::gate_execution::GateVerdict;
+        match &boundary.verdict {
+            GateVerdict::Proceed => {}
+            GateVerdict::Failed { evidence } => {
+                let attempt_number = agent.next_acceptance_attempt_number(change_id);
+                let mut findings = vec![format!(
+                    "Declared change-blocking verification failed under runtime supervision \
+                     against candidate {}.",
+                    &boundary.manifest.candidate_commit_oid
+                        [..12.min(boundary.manifest.candidate_commit_oid.len())]
+                )];
+                findings.extend(evidence.iter().cloned());
+                let findings = crate::acceptance::legacy_findings(findings);
+                let attempt = crate::history::AcceptanceAttempt {
+                    attempt: attempt_number,
+                    passed: false,
+                    duration: start_time_for_gate_phase.elapsed(),
+                    findings: Some(findings.clone()),
+                    exit_code: None,
+                    stdout_tail: None,
+                    stderr_tail: None,
+                    commit_hash: Some(boundary.manifest.candidate_commit_oid.clone()),
+                };
+                agent.record_acceptance_attempt(change_id, attempt.clone());
+                acceptance_history.lock().await.record(change_id, attempt);
+                acceptance_tail_injected.lock().await.remove(change_id);
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::Log(
+                            crate::events::LogEntry::error(format!(
+                                "Acceptance failed on a declared change-blocking verification: {}",
+                                evidence.join(" | ")
+                            ))
+                            .with_change_id(change_id)
+                            .with_operation("acceptance")
+                            .with_iteration(attempt_number),
+                        ))
+                        .await;
+                    let _ = tx
+                        .send(ParallelEvent::AcceptanceCompleted {
+                            change_id: change_id.to_string(),
+                        })
+                        .await;
+                }
+                return Ok((
+                    crate::orchestration::AcceptanceResult::Fail { findings },
+                    attempt_number,
+                ));
+            }
+            GateVerdict::ExternalPrerequisite { blocker } => {
+                let attempt_number = agent.next_acceptance_attempt_number(change_id);
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::Log(
+                            crate::events::LogEntry::warn(format!(
+                                "Acceptance blocked on an external prerequisite for a declared \
+                                 verification ({}): {}",
+                                blocker.category, blocker.next_action
+                            ))
+                            .with_change_id(change_id)
+                            .with_operation("acceptance")
+                            .with_iteration(attempt_number),
+                        ))
+                        .await;
+                    let _ = tx
+                        .send(ParallelEvent::AcceptanceCompleted {
+                            change_id: change_id.to_string(),
+                        })
+                        .await;
+                }
+                return Ok((
+                    crate::orchestration::AcceptanceResult::Stalled {
+                        blocker: blocker.clone(),
+                    },
+                    attempt_number,
+                ));
+            }
+            GateVerdict::Hold { category, evidence } => {
+                let hold =
+                    crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionHold {
+                        category: *category,
+                        budget_secs: acceptance_runtime_limit_secs,
+                        cleanup_confirmed: true,
+                        cleanup_diagnostics: "no reviewer was started".to_string(),
+                        fingerprint: boundary.manifest.fingerprint(),
+                        evidence: evidence.clone(),
+                    };
+                record_acceptance_terminal_manifest(workspace_path, &boundary.manifest, &hold);
+                emit_acceptance_execution_hold(change_id, &hold, event_tx.as_ref(), 0).await;
+                return Ok((
+                    crate::orchestration::AcceptanceResult::ExecutionHold { hold },
+                    0,
+                ));
+            }
+        }
+    }
+
+    // No manifest, no boundary block: a non-repository workspace gets the
+    // unchanged prompt, which is exactly what the skill's "if no manifest is
+    // supplied" clause is written for.
+    let boundary_context = boundary.as_ref().map_or_else(String::new, |boundary| {
+        crate::agent::build_acceptance_boundary_context(&boundary.manifest, &boundary.gates)
+    });
 
     // Build prompt injected into `{prompt}`
     let full_prompt = crate::agent::append_optional_prompt(
@@ -1808,8 +2183,7 @@ pub async fn execute_acceptance_in_workspace(
         },
         config.get_acceptance_append_prompt(),
     );
-    let full_prompt =
-        crate::agent::append_optional_prompt(full_prompt, Some(&verification_reuse_context));
+    let full_prompt = crate::agent::append_optional_prompt(full_prompt, Some(&boundary_context));
     // Trusted Conflux-owned framing, appended only for an escalation retry.
     let full_prompt = crate::agent::append_optional_prompt(
         full_prompt,
@@ -1849,17 +2223,6 @@ pub async fn execute_acceptance_in_workspace(
     // Capture start time for history recording
     let start_time = std::time::Instant::now();
 
-    // Acceptance reviews an implementation rather than producing one, so it runs
-    // under its own dedicated absolute deadline instead of Apply's much larger
-    // `command_max_runtime_secs`. A positive common limit still caps it; a
-    // disabled (`0`) common limit does not unbound it. The runner selects that
-    // bound from the `"acceptance"` operation type below, so this reads the same
-    // resolution the runner enforces rather than a second copy of the rule: the
-    // diagnostic can never name a limit other than the one that expired.
-    let acceptance_runtime_limit_secs = ai_runner
-        .queue_config()
-        .effective_max_runtime_secs(Some(crate::command_queue::ACCEPTANCE_OPERATION_TYPE));
-
     // Execute command via AiCommandRunner (with stagger and retry)
     let (mut child, mut output_rx) = ai_runner
         .execute_streaming_with_retry(
@@ -1886,10 +2249,35 @@ pub async fn execute_acceptance_in_workspace(
     let mut verdict_deadline: Option<tokio::time::Instant> = None;
     let mut early_terminated = false;
 
-    // Stream output until channel closes or verdict grace period expires.
+    // The reviewer's half of the shared budget: whatever the declared gates did
+    // not spend, minus the finalization reserve the partition already took out.
+    // `None` only when the operator disabled the absolute limit entirely, which
+    // is the one case where reserving a window would invent a deadline they
+    // switched off.
+    // Only a boundary can impose a review deadline: without a manifest there is
+    // nothing to bind a hold to, so a deadline would terminate a reviewer and
+    // then have no typed outcome to report.
+    let review_deadline: Option<tokio::time::Instant> = boundary
+        .as_ref()
+        .and_then(|boundary| effective_review_budget(boundary.review_budget))
+        .map(|budget| tokio::time::Instant::now() + budget);
+    let mut review_deadline_expired = false;
+
+    // Stream output until the channel closes, the verdict grace period expires,
+    // or the shared review deadline arrives — whichever comes first.
     use crate::ai_command_runner::OutputLine as AiOutputLine;
     loop {
-        let line = if let Some(deadline) = verdict_deadline {
+        // Earliest wins. A verdict grace period that outlives the review
+        // deadline must not extend the invocation past the reserved window: the
+        // reserve exists so termination, reap, persistence, and projection all
+        // complete before the outer absolute limit fires.
+        let active_deadline = match (verdict_deadline, review_deadline) {
+            (Some(verdict), Some(review)) => Some((verdict.min(review), review < verdict)),
+            (Some(verdict), None) => Some((verdict, false)),
+            (None, Some(review)) => Some((review, true)),
+            (None, None) => None,
+        };
+        let line = if let Some((deadline, is_review_deadline)) = active_deadline {
             let recv_future = output_rx.recv();
             let recv_with_deadline = tokio::time::timeout_at(deadline, recv_future);
             let recv_result = if let Some(token) = cancel_token {
@@ -1913,6 +2301,19 @@ pub async fn execute_acceptance_in_workspace(
             match recv_result {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
+                Err(_) if is_review_deadline => {
+                    warn!(
+                        change_id = %change_id,
+                        workspace = %workspace_path.display(),
+                        iteration = acceptance_iteration,
+                        "Acceptance review deadline reached; terminating the owned reviewer \
+                         process group inside the reserved finalization window"
+                    );
+                    let _ = child.terminate();
+                    early_terminated = true;
+                    review_deadline_expired = true;
+                    break;
+                }
                 Err(_) => {
                     info!(
                         "Acceptance verdict grace period ({}s) expired for {}, terminating child process",
@@ -2032,6 +2433,67 @@ pub async fn execute_acceptance_in_workspace(
         }
         Err(err) => return Err(err),
     };
+
+    // Review-deadline finalization. This runs before the runtime-limit gate
+    // because it is the boundary that is supposed to fire first: reaching it
+    // means the reserved window is now spent on termination, reap, persistence,
+    // and projection instead of on the outer absolute limit killing everything
+    // with nothing recorded.
+    //
+    // A reviewer that *did* emit a canonical verdict before the deadline keeps
+    // it — terminating a process that already answered is finalization, not
+    // failure — so only a genuinely verdictless expiry becomes a hold.
+    //
+    // A review deadline only exists when a boundary does, so the boundary is
+    // present here by construction.
+    if let (true, false, Some(boundary)) =
+        (review_deadline_expired, verdict_detected, boundary.as_ref())
+    {
+        let cleanup = child.process_group_cleanup().await;
+        let category = if cleanup.is_confirmed() {
+            crate::orchestration::acceptance::execution_manifest::AcceptanceHoldCategory::ReviewDeadlineExhausted
+        } else {
+            crate::orchestration::acceptance::execution_manifest::AcceptanceHoldCategory::ReviewCleanupUnproven
+        };
+        let hold = crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionHold {
+            category,
+            budget_secs: acceptance_runtime_limit_secs,
+            cleanup_confirmed: cleanup.is_confirmed(),
+            cleanup_diagnostics: cleanup.diagnostics(),
+            fingerprint: boundary.manifest.fingerprint(),
+            evidence: {
+                let mut evidence = boundary.gates.summary_lines();
+                evidence.push(
+                    "semantic review emitted no canonical verdict before the reserved \
+                         finalization window"
+                        .to_string(),
+                );
+                evidence
+            },
+        };
+        warn!(
+            change_id = %change_id,
+            workspace = %workspace_path.display(),
+            iteration = acceptance_iteration,
+            category = hold.category.as_str(),
+            cleanup_confirmed = hold.cleanup_confirmed,
+            "Acceptance review deadline exhausted: {}",
+            hold.cleanup_diagnostics
+        );
+        record_acceptance_terminal_manifest(workspace_path, &boundary.manifest, &hold);
+        // No canonical attempt was produced, so nothing is recorded in
+        // acceptance history and no attempt number is consumed. Deadline
+        // termination deliberately bypasses missing-verdict retry: the reviewer
+        // did not fail the protocol, it ran out of the budget it shared with the
+        // gates, and re-asking the identical question is exactly what the
+        // fingerprint refusal exists to prevent.
+        emit_acceptance_execution_hold(change_id, &hold, event_tx.as_ref(), acceptance_iteration)
+            .await;
+        return Ok((
+            crate::orchestration::AcceptanceResult::ExecutionHold { hold },
+            0,
+        ));
+    }
 
     // Absolute Acceptance runtime limit. This gate runs before the exit-status
     // and verdict branches below because a SIGKILLed agent reports the same

@@ -832,6 +832,15 @@ fn is_inside_evidence_dir(path: &str) -> bool {
 pub trait RepositoryFacts: Send + Sync {
     /// Full-length object ID of `HEAD`.
     async fn head_commit(&self, workspace: &Path) -> Result<String, String>;
+    /// Full-length commit object ID a revision name resolves to.
+    ///
+    /// Defaulted to a refusal rather than to `HEAD`: a fact source that cannot
+    /// resolve a base must leave the review range empty, and silently answering
+    /// with the candidate would bind evidence to a comparison nobody made.
+    async fn resolve_revision(&self, workspace: &Path, revision: &str) -> Result<String, String> {
+        let _ = (workspace, revision);
+        Err(format!("revision '{revision}' cannot be resolved here"))
+    }
     /// Full-length tree ID of `HEAD`.
     async fn head_tree(&self, workspace: &Path) -> Result<String, String>;
     /// Full-length blob ID of a tracked path at `HEAD`.
@@ -1437,6 +1446,12 @@ impl RepositoryFacts for GitRepositoryFacts {
 
     async fn head_tree(&self, workspace: &Path) -> Result<String, String> {
         run_git(workspace, &["rev-parse", "HEAD^{tree}"]).await
+    }
+
+    async fn resolve_revision(&self, workspace: &Path, revision: &str) -> Result<String, String> {
+        // `^{commit}` is what refuses a tag or tree that would otherwise resolve
+        // to something a `base..candidate` range cannot mean.
+        run_git(workspace, &["rev-parse", &format!("{revision}^{{commit}}")]).await
     }
 
     async fn tracked_blob_oid(&self, workspace: &Path, path: &str) -> Result<String, String> {

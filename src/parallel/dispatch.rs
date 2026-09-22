@@ -3821,6 +3821,61 @@ impl ParallelExecutor {
                         };
                     }
                     Ok((
+                        crate::orchestration::AcceptanceResult::ExecutionHold { hold },
+                        acceptance_iteration,
+                    )) => {
+                        // The bounded boundary settled without a verdict. It is
+                        // a non-resumable in-memory hold rather than a terminal
+                        // error: the worktree is preserved exactly as Acceptance
+                        // found it, nothing is written outside it, and the
+                        // recorded manifest fingerprint is what refuses an
+                        // unchanged retry. Re-dispatching here would re-run
+                        // exactly the work the boundary stopped.
+                        let blocker = hold.to_stalled_blocker(&change_id);
+                        warn!(
+                            "Acceptance settled as a non-resumable execution hold for {} ({}, cycle {})",
+                            change_id,
+                            hold.category.as_str(),
+                            cycle_count
+                        );
+                        record_stall_in_shared_state(
+                            &shared_orchestrator_state,
+                            &crate::events::ExecutionEvent::ExecutionBlocked {
+                                change_id: change_id.clone(),
+                                blocker: blocker.clone(),
+                            },
+                        )
+                        .await;
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::ExecutionBlocked {
+                                    change_id: change_id.clone(),
+                                    blocker: blocker.clone(),
+                                })
+                                .await;
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::error(format!(
+                                        "Acceptance execution hold (cycle {}): {}",
+                                        cycle_count,
+                                        hold.summary(&change_id)
+                                    ))
+                                    .with_change_id(&change_id)
+                                    .with_operation("acceptance")
+                                    .with_iteration(acceptance_iteration),
+                                ))
+                                .await;
+                        }
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: None,
+                            rejected: None,
+                        };
+                    }
+                    Ok((
                         crate::orchestration::AcceptanceResult::Cancelled,
                         _acceptance_iteration,
                     )) => {

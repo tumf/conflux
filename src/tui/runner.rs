@@ -683,6 +683,11 @@ async fn run_tui_loop(
         use crate::orchestration::operator_command::{
             HookRunnerQueueHooks, OperatorCommandService,
         };
+        // The same two inputs the Acceptance boundary itself derives from: where
+        // a change's managed worktree lives, and which embedded reviewer skill
+        // the manifest binds.
+        let acceptance_worktree_base_dir = worktree_base_dir.clone();
+        let accept_skill_name = config.get_accept_skill().to_string();
         let hook_runner = crate::hooks::HookRunner::with_event_tx(
             config.get_hooks(),
             repo_root.clone(),
@@ -704,7 +709,23 @@ async fn run_tui_loop(
             // through. It re-reads the *live* run's command scope on every
             // call, so a kill always reaches the run that is actually
             // executing and reports "owns nothing" between runs.
-            .with_managed_termination(managed_termination.clone()),
+            .with_managed_termination(managed_termination.clone())
+            // Recomputes a change's Acceptance fingerprint from its managed
+            // worktree so an unchanged retry is refused before anything is
+            // dispatched. The path is resolved per call, and a change whose
+            // worktree is gone simply has no evidence to refuse on.
+            .with_acceptance_admission(Arc::new(
+                crate::orchestration::acceptance::execution_manifest::WorkspaceAcceptanceAdmission::new(
+                    {
+                        let base = acceptance_worktree_base_dir.clone();
+                        move |change_id: &str| {
+                            let path = base.join(change_id.replace(['/', '\\', ' '], "-"));
+                            path.is_dir().then_some(path)
+                        }
+                    },
+                    accept_skill_name.clone(),
+                ),
+            )),
         )
     };
     // One store, three readers: the start guard, the operator service that

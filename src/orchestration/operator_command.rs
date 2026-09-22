@@ -1237,6 +1237,23 @@ pub enum OperatorCommandError {
         /// Bounded diagnostic naming the identities that stayed alive.
         detail: String,
     },
+    /// The target's Acceptance input is unchanged since a non-resumable
+    /// deadline hold, so a retry would re-ask an identical question.
+    ///
+    /// Deliberately its own variant rather than a flavour of
+    /// [`Self::RetryUnsupported`]: the status *is* retryable, and what refuses
+    /// is repository evidence the operator can change. The detail therefore
+    /// names the components rather than the status.
+    UnchangedAcceptanceInput {
+        /// Target change.
+        change_id: String,
+        /// Category of the hold that recorded this fingerprint.
+        category: String,
+        /// The unchanged input fingerprint.
+        fingerprint: String,
+        /// Components whose repository-visible change restores eligibility.
+        components: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for OperatorCommandError {
@@ -1279,12 +1296,66 @@ impl std::fmt::Display for OperatorCommandError {
                 "the managed process group of '{change_id}' was not proven empty after SIGKILL, \
                  so no dequeue was committed: {detail}"
             ),
+            Self::UnchangedAcceptanceInput {
+                change_id,
+                category,
+                fingerprint,
+                components,
+            } => write!(
+                f,
+                "retry of '{change_id}' is refused as `{}`: its Acceptance input is unchanged \
+                 since the {category} hold (fingerprint {}). No analysis, Apply, gate, or \
+                 Acceptance work was dispatched. A repository-visible change to one of {} \
+                 restores retry eligibility.",
+                crate::orchestration::acceptance::execution_manifest::UNCHANGED_ACCEPTANCE_INPUT,
+                &fingerprint[..16.min(fingerprint.len())],
+                components.join(", ")
+            ),
         }
     }
 }
 
 /// Result alias for operator command execution.
 pub type OperatorResult<T> = std::result::Result<T, OperatorCommandError>;
+
+// ============================================================================
+// Acceptance admission
+// ============================================================================
+
+/// Recomputes a change's workspace-derived Acceptance fingerprint on demand.
+///
+/// A port rather than a direct filesystem read because this service has no
+/// workspace path: it operates on reducer state, and the managed worktree a
+/// change lives in is owned by the parallel runtime. Binding it here keeps one
+/// classifier behind `retry_change`, `retry_errors`, Start/F5, the terminal-error
+/// queue alias, and mark settlement, so an API snapshot and command admission
+/// cannot disagree about whether a target is retryable.
+#[async_trait::async_trait]
+pub trait AcceptanceAdmissionPort: Send + Sync {
+    /// Classify one change against its persisted terminal manifest.
+    async fn classify(
+        &self,
+        change_id: &str,
+    ) -> crate::orchestration::acceptance::execution_manifest::AcceptanceAdmission;
+}
+
+/// The default port for an assembly with no managed worktree behind it.
+///
+/// Admits everything, which is the honest answer: with no workspace to read, no
+/// fingerprint can be recomputed, and refusing on an unknown would strand a
+/// change on evidence nobody observed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AlwaysAdmitAcceptance;
+
+#[async_trait::async_trait]
+impl AcceptanceAdmissionPort for AlwaysAdmitAcceptance {
+    async fn classify(
+        &self,
+        _change_id: &str,
+    ) -> crate::orchestration::acceptance::execution_manifest::AcceptanceAdmission {
+        crate::orchestration::acceptance::execution_manifest::AcceptanceAdmission::Admit
+    }
+}
 
 // ============================================================================
 // Execution marks (process-local)
@@ -1727,6 +1798,13 @@ pub struct OperatorCommandService {
     /// Defaults to [`NoManagedProcesses`], which is the honest answer for an
     /// assembly with no live run behind it.
     managed_termination: Arc<dyn ManagedProcessTermination>,
+    /// Workspace-derived Acceptance fingerprint recomputation.
+    ///
+    /// Defaults to [`AlwaysAdmitAcceptance`] for an assembly with no managed
+    /// worktree; the authoritative workspace-derived guard still runs inside the
+    /// Acceptance boundary itself, so a permissive port here can at worst cost
+    /// one bounded attempt that immediately re-refuses.
+    acceptance_admission: Arc<dyn AcceptanceAdmissionPort>,
 }
 
 impl OperatorCommandService {
@@ -1750,7 +1828,14 @@ impl OperatorCommandService {
             cancellation_timeout: DEFAULT_CANCELLATION_TIMEOUT,
             execution_facts: None,
             managed_termination: Arc::new(NoManagedProcesses),
+            acceptance_admission: Arc::new(AlwaysAdmitAcceptance),
         }
+    }
+
+    /// Bind workspace-derived Acceptance fingerprint recomputation.
+    pub fn with_acceptance_admission(mut self, port: Arc<dyn AcceptanceAdmissionPort>) -> Self {
+        self.acceptance_admission = port;
+        self
     }
 
     /// Bind the shared parallel runtime store.
@@ -2640,10 +2725,49 @@ impl OperatorCommandService {
                 display_status,
             });
         };
+        // Unchanged Acceptance input is a typed refusal rather than an empty
+        // classification: the status really is retryable, and what refuses is
+        // repository evidence the operator can change. Saying "unsupported"
+        // would name the wrong thing to fix.
+        if let Some(refusal) = self.unchanged_acceptance_refusal(change_id).await {
+            return Err(refusal);
+        }
         Ok(self
             .route_is_committable(change_id, route)
             .await
             .then_some(route))
+    }
+
+    /// The typed unchanged-input refusal for one change, when it applies.
+    ///
+    /// Read-only and dispatch-free by construction: it recomputes a fingerprint
+    /// and compares it, and nothing else. A target with no recorded hold, or one
+    /// whose repository evidence moved, produces `None` and takes the ordinary
+    /// route.
+    async fn unchanged_acceptance_refusal(&self, change_id: &str) -> Option<OperatorCommandError> {
+        use crate::orchestration::acceptance::execution_manifest::AcceptanceAdmission;
+
+        match self.acceptance_admission.classify(change_id).await {
+            AcceptanceAdmission::Admit => None,
+            AcceptanceAdmission::Refuse {
+                category,
+                fingerprint,
+                components,
+                ..
+            } => {
+                tracing::warn!(
+                    change_id = %change_id,
+                    category = category.as_str(),
+                    "Retry refused: Acceptance input is unchanged since a non-resumable hold"
+                );
+                Some(OperatorCommandError::UnchangedAcceptanceInput {
+                    change_id: change_id.to_string(),
+                    category: category.as_str().to_string(),
+                    fingerprint,
+                    components: components.iter().map(|part| part.to_string()).collect(),
+                })
+            }
+        }
     }
 
     /// Classify every retryable change in `change_ids`, skipping the rest.
@@ -2651,18 +2775,37 @@ impl OperatorCommandService {
     /// The bulk counterpart of [`Self::plan_retry_change`], and read-only for the
     /// same reason.
     pub async fn plan_retry_errors(&self, change_ids: &[String]) -> Vec<(String, RetryRoute)> {
+        self.plan_retry_errors_with_refusals(change_ids).await.0
+    }
+
+    /// The bulk classification plus the typed refusals it produced.
+    ///
+    /// Mixed eligibility is the normal case: one unchanged-input target in a
+    /// bulk request must not refuse the whole request, and an admitted sibling
+    /// must still be dispatched exactly once. Both halves are returned so a
+    /// caller can report each target truthfully instead of presenting a skip and
+    /// a refusal as the same thing.
+    pub async fn plan_retry_errors_with_refusals(
+        &self,
+        change_ids: &[String],
+    ) -> (Vec<(String, RetryRoute)>, Vec<OperatorCommandError>) {
         let mut routes = Vec::new();
+        let mut refusals = Vec::new();
         for change_id in change_ids {
             let display_status = self.display_status(change_id).await;
             let blocker_kind = self.blocker_kind(change_id).await;
             let Some(route) = classify_retry_route(&display_status, blocker_kind) else {
                 continue;
             };
+            if let Some(refusal) = self.unchanged_acceptance_refusal(change_id).await {
+                refusals.push(refusal);
+                continue;
+            }
             if self.route_is_committable(change_id, route).await {
                 routes.push((change_id.clone(), route));
             }
         }
-        routes
+        (routes, refusals)
     }
 
     /// Whether an already-classified route may actually be consumed.
@@ -2875,3 +3018,7 @@ impl QueuePort for crate::tui::queue::DynamicQueue {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "operator_command/acceptance_admission_tests.rs"]
+mod acceptance_admission_tests;

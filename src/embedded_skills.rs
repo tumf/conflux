@@ -32,6 +32,23 @@ const CFLX_ARCHIVE_SKILL_MD: &str = include_str!("../skills/cflx-archive/SKILL.m
 const CFLX_ARCHIVE_REF: &str = include_str!("../skills/cflx-archive/references/cflx-archive.md");
 const CFLX_RESOLVE_SKILL_MD: &str = include_str!("../skills/cflx-resolve/SKILL.md");
 
+/// Embedded text of the acceptance skill the reviewer will actually load.
+///
+/// The Acceptance execution manifest binds this text so that shipping a new
+/// reviewer contract is a repository-visible change: an edited skill produces a
+/// different input fingerprint, which is exactly what makes a previously refused
+/// unchanged retry admissible again without any operator flag.
+///
+/// Returns `None` for a name this binary does not embed, because a manifest must
+/// never bind a skill identity it did not read.
+pub fn embedded_acceptance_skill_text(name: &str) -> Option<&'static str> {
+    match name {
+        "cflx-accept" => Some(CFLX_ACCEPT_SKILL_MD),
+        "cflx-accept-with-speca" => Some(CFLX_ACCEPT_WITH_SPECA_SKILL_MD),
+        _ => None,
+    }
+}
+
 /// Return all cflx bundled skills with their auxiliary files embedded at compile time.
 pub fn get_cflx_embedded_skills() -> Result<Vec<Skill>> {
     let proposal = register_embedded_skill(
@@ -452,6 +469,88 @@ mod tests {
         assert!(
             CFLX_ACCEPT_SKILL_MD.contains("#### Example: post-integration physical-device scan"),
             "cflx-accept must show a concrete non-blocking observation example"
+        );
+    }
+
+    /// Both acceptance skills must define the *same* closed blocking boundary.
+    ///
+    /// A portable contract that only one of them carries is not a contract: an
+    /// operator who switches to the SPECA skill would silently get the old
+    /// reviewer-owned expansion back, deadline and all.
+    #[test]
+    fn acceptance_execution_boundary_is_defined_by_both_acceptance_skills() {
+        for (name, skill) in [
+            ("cflx-accept", CFLX_ACCEPT_SKILL_MD),
+            ("cflx-accept-with-speca", CFLX_ACCEPT_WITH_SPECA_SKILL_MD),
+        ] {
+            for required in &[
+                // The boundary itself.
+                "complete blocking command boundary",
+                "Do not start",
+                "repository-wide",
+                "base-worktree",
+                "sibling-change",
+                // Undeclared observation is allowed to inform, never to block.
+                "may inform a finding",
+                // Read-only inspection remains expected.
+                "Read-only inspection",
+                // Passing gates are evidence, not a verdict.
+                "never imply",
+                // The deadline contract and its consequence.
+                "acceptance_review_deadline_exhausted",
+                "unchanged_acceptance_input",
+            ] {
+                assert!(
+                    skill.contains(required),
+                    "{name} must define the runtime-owned execution boundary: missing {required:?}"
+                );
+            }
+        }
+    }
+
+    /// The reviewer must be told that manifest-declared gates are already done,
+    /// not merely that it should not add new ones.
+    #[test]
+    fn acceptance_execution_boundary_skill_forbids_rerunning_declared_gates() {
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains("Do not rerun or supplement a declared gate"),
+            "cflx-accept must forbid reviewer-owned reruns of runtime-supervised gates"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("do not rerun them"),
+            "the SPECA skill must forbid rerunning manifest-declared SPECA phases"
+        );
+    }
+
+    /// The embedded copies and the on-disk sources must not drift: the skill
+    /// files shipped in the binary are what the reviewer actually reads.
+    #[test]
+    fn acceptance_execution_boundary_skill_mirrors_match_the_repository_sources() {
+        assert_eq!(
+            CFLX_ACCEPT_SKILL_MD,
+            include_str!("../skills/cflx-accept/SKILL.md"),
+            "embedded cflx-accept must match skills/cflx-accept/SKILL.md"
+        );
+        assert_eq!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD,
+            include_str!("../skills/cflx-accept-with-speca/SKILL.md"),
+            "embedded SPECA acceptance skill must match its repository source"
+        );
+        // The manifest binds the skill by digest, so the accessor and the
+        // constant must be the same bytes or the fingerprint describes a text
+        // the reviewer never reads.
+        assert_eq!(
+            embedded_acceptance_skill_text("cflx-accept"),
+            Some(CFLX_ACCEPT_SKILL_MD)
+        );
+        assert_eq!(
+            embedded_acceptance_skill_text("cflx-accept-with-speca"),
+            Some(CFLX_ACCEPT_WITH_SPECA_SKILL_MD)
+        );
+        assert_eq!(
+            embedded_acceptance_skill_text("cflx-apply"),
+            None,
+            "a manifest must never bind a skill identity this binary did not read"
         );
     }
 

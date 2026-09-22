@@ -40,7 +40,7 @@ Conflux MAY reuse successful Apply or runtime-owned Acceptance verification evid
 **Then**: the sidecar difference does not make the capture dirty or stale
 **And**: any difference outside that directory still forces rerun
 
-#### Scenario: Agent-authored evidence is not authority
+#### Scenario: Apply-authored evidence is not authority
 
 **Given**: an envelope was written or modified without a matching runtime-supervised execution
 **When**: Acceptance evaluates the envelope
