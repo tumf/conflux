@@ -194,11 +194,18 @@ async fn acceptance_execution_boundary_retry_change_refuses_unchanged_input() {
 }
 
 /// A changed fingerprint takes the ordinary route and publishes exactly one
-/// retry edge.
+/// retry edge — on the hold the boundary actually publishes.
+///
+/// The seed matters. Every runtime-owned execution hold carries
+/// `resumable: false`, because an execution stop is not a wait on a named
+/// prerequisite. Seeding a *resumable* stall here would prove only that the
+/// resumability guard lets resumable things through, which was never in doubt;
+/// what has to hold is that a changed fingerprint restores eligibility for the
+/// non-resumable hold the boundary really emits.
 #[tokio::test]
 async fn acceptance_execution_boundary_retry_change_admits_changed_input() {
     let harness = harness(&["change-a"], FakeAdmission::admitting_everything());
-    hold(&harness, "change-a", resumable_stall_blocker()).await;
+    hold(&harness, "change-a", execution_hold_blocker()).await;
 
     let plan = harness
         .service
@@ -212,6 +219,106 @@ async fn acceptance_execution_boundary_retry_change_admits_changed_input() {
     assert_eq!(
         harness.state.read().await.display_status("change-a"),
         "queued"
+    );
+}
+
+/// The same admission through the bulk verb, and the unchanged case still
+/// refused on the same seed. Together these are the whole contract: the
+/// fingerprint — not the hold's `resumable` flag — decides whether a bounded
+/// execution hold may be retried, and it decides identically for both aliases.
+#[tokio::test]
+async fn acceptance_execution_boundary_execution_hold_retry_follows_the_fingerprint() {
+    for admitting in [true, false] {
+        let admission = if admitting {
+            FakeAdmission::admitting_everything()
+        } else {
+            FakeAdmission::refusing(&["change-a"])
+        };
+        let single_harness = harness(&["change-a"], admission);
+        hold(&single_harness, "change-a", execution_hold_blocker()).await;
+
+        let single = single_harness.service.retry_change("change-a").await;
+        if admitting {
+            let plan = single.expect("a moved fingerprint must admit the execution hold");
+            assert_eq!(plan.change_ids, vec!["change-a".to_string()]);
+            assert_eq!(plan.routes, vec![RetryRoute::AcceptanceStall]);
+            assert!(plan.explicit_retry);
+            assert_eq!(
+                single_harness.state.read().await.display_status("change-a"),
+                "queued"
+            );
+        } else {
+            assert!(
+                matches!(
+                    single,
+                    Err(OperatorCommandError::UnchangedAcceptanceInput { .. })
+                ),
+                "an unchanged execution hold must stay refused, got {single:?}"
+            );
+            assert_eq!(
+                single_harness.state.read().await.display_status("change-a"),
+                "stalled",
+                "a refused retry keeps the hold and its evidence"
+            );
+        }
+
+        // The bulk verb, against a fresh row in the same state.
+        let bulk_harness = harness(
+            &["change-a"],
+            if admitting {
+                FakeAdmission::admitting_everything()
+            } else {
+                FakeAdmission::refusing(&["change-a"])
+            },
+        );
+        hold(&bulk_harness, "change-a", execution_hold_blocker()).await;
+        let plan = bulk_harness
+            .service
+            .retry_errors(&["change-a".to_string()])
+            .await;
+        if admitting {
+            assert_eq!(
+                plan.change_ids,
+                vec!["change-a".to_string()],
+                "retry_errors must admit the same hold retry_change admits, exactly once"
+            );
+        } else {
+            assert!(
+                plan.change_ids.is_empty(),
+                "retry_errors must refuse the same unchanged hold retry_change refuses"
+            );
+        }
+    }
+}
+
+/// A non-resumable acceptance stall that is *not* fingerprint-guarded keeps the
+/// old refusal. The boundary's exception is scoped to holds whose category the
+/// admission classifier can actually answer for; an ordinary stall has no
+/// fingerprint behind it, so retrying past it would still dispatch ambiguous
+/// work.
+#[tokio::test]
+async fn acceptance_execution_boundary_unguarded_non_resumable_stall_is_still_refused() {
+    let harness = harness(&["change-a"], FakeAdmission::admitting_everything());
+    let unguarded = StalledBlocker {
+        category: "permission_denied".to_string(),
+        gate: "apply".to_string(),
+        ..execution_hold_blocker()
+    };
+    hold(&harness, "change-a", unguarded).await;
+
+    let plan = harness
+        .service
+        .retry_change("change-a")
+        .await
+        .expect("refusal of a non-resumable hold is not an error");
+
+    assert!(
+        plan.change_ids.is_empty() && plan.routes.is_empty() && !plan.explicit_retry,
+        "a non-resumable stall with no fingerprint behind it must still dispatch nothing"
+    );
+    assert_eq!(
+        harness.state.read().await.display_status("change-a"),
+        "stalled"
     );
 }
 
@@ -331,33 +438,193 @@ async fn acceptance_execution_boundary_bulk_retry_admits_the_eligible_sibling() 
     );
 }
 
-// ============================================================================
-// Non-resumable holds and the default port
-// ============================================================================
-
-/// A non-resumable hold whose fingerprint *did* move is still refused by the
-/// existing resumability guard: the fingerprint check does not widen retry
-/// admission, it only narrows it.
+/// The bulk verb reports the refused target rather than silently shortening the
+/// accepted list, and admits the eligible sibling exactly once.
 #[tokio::test]
-async fn acceptance_execution_boundary_changed_input_does_not_widen_admission() {
-    let harness = harness(&["change-a"], FakeAdmission::admitting_everything());
-    hold(&harness, "change-a", execution_hold_blocker()).await;
+async fn acceptance_execution_boundary_bulk_retry_carries_the_refusal_per_target() {
+    let harness = harness(&["alpha", "beta"], FakeAdmission::refusing(&["alpha"]));
+    hold(&harness, "alpha", execution_hold_blocker()).await;
+    hold(&harness, "beta", execution_hold_blocker()).await;
 
-    let plan = harness
+    let (plan, refusals) = harness
         .service
-        .retry_change("change-a")
+        .retry_errors_with_refusals(&["alpha".to_string(), "beta".to_string()])
+        .await;
+
+    assert_eq!(
+        plan.change_ids,
+        vec!["beta".to_string()],
+        "only the admitted sibling may be dispatched, and exactly once"
+    );
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].change_id(), "alpha");
+    assert_eq!(
+        refusals[0].outcome_token(),
+        Some(UNCHANGED_ACCEPTANCE_INPUT),
+        "the refusal must carry its own stable token so a caller reports it per target"
+    );
+
+    let guard = harness.state.read().await;
+    assert_eq!(guard.display_status("alpha"), "stalled");
+    assert_eq!(guard.display_status("beta"), "queued");
+}
+
+// ============================================================================
+// The terminal-error queue alias
+// ============================================================================
+
+/// `add_to_queue` with `set_queue_intent = true` on a terminal-error row *is* a
+/// retry — it applies `RetryError` and publishes an explicit-retry edge — so it
+/// consults the same classifier, and a refusal mutates nothing.
+#[tokio::test]
+async fn acceptance_execution_boundary_queue_intent_alias_refuses_a_terminal_error_row() {
+    let harness = harness(&["change-a"], FakeAdmission::refusing(&["change-a"]));
+    mark_terminal_error(&harness, "change-a").await;
+
+    let error = harness
+        .service
+        .add_to_queue("change-a")
         .await
-        .expect("refusal of a non-resumable hold is not an error");
+        .expect_err("the queue-intent alias must consult the same classifier");
 
     assert!(
-        plan.change_ids.is_empty() && plan.routes.is_empty() && !plan.explicit_retry,
-        "a non-resumable hold must still dispatch nothing"
+        matches!(error, OperatorCommandError::UnchangedAcceptanceInput { .. }),
+        "got {error:?}"
     );
     assert_eq!(
         harness.state.read().await.display_status("change-a"),
-        "stalled"
+        "error",
+        "a refused alias must not release the terminal classification"
+    );
+    assert!(
+        harness.queue.is_empty().await,
+        "no work may be queued for a refused alias"
     );
 }
+
+/// The same alias on a *stalled* acceptance hold, which `AddToQueue` would
+/// otherwise release and queue.
+#[tokio::test]
+async fn acceptance_execution_boundary_queue_intent_alias_refuses_a_stalled_hold() {
+    let harness = harness(&["change-a"], FakeAdmission::refusing(&["change-a"]));
+    hold(&harness, "change-a", execution_hold_blocker()).await;
+
+    let error = harness
+        .service
+        .add_to_queue("change-a")
+        .await
+        .expect_err("releasing a stalled acceptance hold is retry intent");
+
+    assert!(
+        matches!(error, OperatorCommandError::UnchangedAcceptanceInput { .. }),
+        "got {error:?}"
+    );
+    assert_eq!(
+        harness.state.read().await.display_status("change-a"),
+        "stalled",
+        "the hold and its blocker evidence must survive"
+    );
+    assert!(harness.queue.is_empty().await);
+}
+
+/// An ordinary addition is not a retry: it arms no edge and releases nothing, so
+/// it keeps its unconditional path and never pays for a classifier call.
+#[tokio::test]
+async fn acceptance_execution_boundary_ordinary_queue_addition_skips_the_classifier() {
+    let harness = harness(&["change-a"], FakeAdmission::refusing(&["change-a"]));
+
+    let outcome = harness
+        .service
+        .add_to_queue("change-a")
+        .await
+        .expect("an ordinary addition is not retry intent");
+
+    assert!(outcome.reducer_changed);
+    assert!(
+        harness.admission.queried().is_empty(),
+        "admission must not be consulted for an addition that dispatches no retry"
+    );
+}
+
+// ============================================================================
+// Automatic mark settlement
+// ============================================================================
+
+/// Settlement is the one admission path with no operator in front of it, and a
+/// restart discards the in-memory hold — so an already-refused change presents
+/// as an ordinary `not queued` row. The classifier reads the worktree, which is
+/// where the refusal actually lives.
+#[tokio::test]
+async fn acceptance_execution_boundary_mark_settlement_refuses_unchanged_input() {
+    use crate::orchestration::mark_settlement::{MarkSettlementAction, MarkSettlementExclusion};
+
+    let harness = harness(&["change-a"], FakeAdmission::refusing(&["change-a"]));
+    harness.service.marks().set("change-a", true);
+
+    let plan = harness
+        .service
+        .plan_mark_settlement(&["change-a".to_string()])
+        .await;
+
+    assert!(
+        plan.additions.is_empty(),
+        "an unchanged-input target must not be planned as a queue addition"
+    );
+    assert_eq!(
+        plan.excluded,
+        vec![(
+            "change-a".to_string(),
+            MarkSettlementExclusion::UnchangedAcceptanceInput
+        )],
+        "the settlement detail must name the refusal, not a lifecycle reason"
+    );
+    assert_eq!(
+        MarkSettlementExclusion::UnchangedAcceptanceInput.as_str(),
+        UNCHANGED_ACCEPTANCE_INPUT
+    );
+
+    // And the application half refuses too, so a plan derived a moment earlier
+    // cannot slip a mutation past a hold that landed since.
+    let applied = harness
+        .service
+        .apply_settlement_queue_intent("change-a", MarkSettlementAction::Add)
+        .await;
+
+    assert_eq!(
+        applied.skipped,
+        Some(MarkSettlementExclusion::UnchangedAcceptanceInput)
+    );
+    assert!(!applied.outcome.reducer_changed);
+    assert!(!applied.outcome.dynamic_queue_mutated);
+    assert!(
+        harness.queue.is_empty().await,
+        "settlement must dispatch no work for a refused target"
+    );
+    assert_eq!(
+        harness.state.read().await.display_status("change-a"),
+        "not queued",
+        "a refused settlement must not move the row"
+    );
+}
+
+/// The mirror: an admitting port leaves settlement exactly as it was.
+#[tokio::test]
+async fn acceptance_execution_boundary_mark_settlement_admits_a_changed_target() {
+    let harness = harness(&["change-a"], FakeAdmission::admitting_everything());
+    harness.service.marks().set("change-a", true);
+
+    let plan = harness
+        .service
+        .plan_mark_settlement(&["change-a".to_string()])
+        .await;
+
+    assert_eq!(plan.additions, vec!["change-a".to_string()]);
+    assert!(plan.excluded.is_empty(), "{:?}", plan.excluded);
+}
+
+// ============================================================================
+// Non-resumable holds and the default port
+// ============================================================================
 
 /// The operator-facing projection of a bounded hold: `stalled`, blocker kind
 /// `none`, non-resumable — and therefore a row `cflx client wait` releases with

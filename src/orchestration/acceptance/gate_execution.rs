@@ -29,7 +29,8 @@ use tokio::time::Instant;
 use super::execution_manifest::{AcceptanceExecutionManifest, GateOutcome, GateResults};
 use super::verification_evidence::{
     evaluate_reuse, CaptureOutcome, Clock, CommandSupervisor, CurrentBindings, EvidenceStore,
-    RepositoryFacts, ReuseDecision, ReusePolicy, RuntimeVerificationExecutor, VerificationRequest,
+    RepositoryFacts, ReuseDecision, ReusePolicy, ReviewBinding, RuntimeVerificationExecutor,
+    VerificationRequest,
 };
 
 /// Refusal code for a declared command whose executable does not exist here.
@@ -108,8 +109,13 @@ where
     for gate in &manifest.gates {
         let id = gate.verification_id.as_str();
         if budget.is_exhausted() {
+            // Never started, so there is nothing of this gate's to clean up. The
+            // gate that actually spent the budget carries the real sweep
+            // evidence.
             outcomes.push(GateOutcome::DeadlineExhausted {
                 verification_id: id.to_string(),
+                cleanup_confirmed: true,
+                cleanup_diagnostics: "the gate was never started".to_string(),
             });
             continue;
         }
@@ -192,21 +198,13 @@ where
     C: Clock,
 {
     let id = request.verification_id.clone();
-    let capture = match remaining {
-        Some(remaining) => match tokio::time::timeout(remaining, executor.capture(request)).await {
-            Ok(capture) => capture,
-            // Expiry is the operation's own boundary, not the command's verdict:
-            // nothing is recorded as passing or failing, and the caller turns
-            // this into the typed gate-deadline hold.
-            Err(_) => {
-                return GateOutcome::DeadlineExhausted {
-                    verification_id: id,
-                }
-            }
-        },
-        None => executor.capture(request).await,
-    };
-    match capture {
+    // The budget is handed to the capture rather than wrapped around it. A
+    // `timeout` here would drop the capture future mid-run and leave the
+    // declared command alive in the worktree, with nobody left to reap it — and
+    // the hold written afterwards would claim a cleanup nobody performed.
+    // Pushing the bound down is what makes expiry carry real termination
+    // evidence instead of an assumption.
+    match executor.capture_bounded(request, remaining).await {
         CaptureOutcome::Captured(evidence) => GateOutcome::Executed {
             verification_id: id,
             artifact_path: evidence.artifact_path.clone(),
@@ -225,6 +223,15 @@ where
             verification_id: id,
             code: refusal.code.to_string(),
             detail: refusal.detail,
+        },
+        // Expiry is the operation's own boundary, not the command's verdict:
+        // nothing is recorded as passing or failing, and the caller turns this
+        // into the typed gate-deadline hold — carrying the sweep's own answer to
+        // "is it actually gone".
+        CaptureOutcome::DeadlineExhausted { cleanup, .. } => GateOutcome::DeadlineExhausted {
+            verification_id: id,
+            cleanup_confirmed: cleanup.is_confirmed(),
+            cleanup_diagnostics: cleanup.diagnostics(),
         },
     }
 }
@@ -381,6 +388,15 @@ pub async fn plan_manifest_reuse<F: RepositoryFacts>(
         let current = CurrentBindings {
             commit_oid: manifest.candidate_commit_oid.clone(),
             tree_oid: manifest.candidate_tree_oid.clone(),
+            // Taken from the frozen manifest, so a base branch that moves
+            // mid-review cannot make stale evidence look current. An envelope
+            // bound to a different base or range decides `Rerun` with the
+            // mismatching field named. Always `Some` here: the manifest is a
+            // review, even when its base did not resolve.
+            review: Some(ReviewBinding {
+                base_commit: manifest.review_base_commit.clone(),
+                range: manifest.review_range.clone(),
+            }),
             automation_blob_oid: gate.automation_blob_oid.clone(),
             tool: gate.tool.clone(),
             clean: true,

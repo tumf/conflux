@@ -107,6 +107,43 @@ impl ExcludedTarget {
     }
 }
 
+/// Render one typed operator refusal as its own excluded target.
+///
+/// The refusal names a status the classifier *would* have routed, so the status
+/// alone explains nothing. Carrying the stable outcome token plus the refusal's
+/// own message is what makes a per-target report actionable — and what keeps a
+/// refusal distinguishable from the ordinary "your status is not retryable"
+/// skip that a shorter accepted list would otherwise be mistaken for.
+fn refusal_exclusion(refusal: &OperatorCommandError) -> ExcludedTarget {
+    let status = refusal.outcome_token().unwrap_or("refused").to_string();
+    ExcludedTarget::new(refusal.change_id().to_string(), status).with_detail(refusal.to_string())
+}
+
+/// Replace each named target's exclusion with its typed refusal.
+///
+/// Targets a refusal does not name keep whatever exclusion they already had, and
+/// a refusal naming a target that was never excluded still appears — otherwise a
+/// per-target refusal could vanish just because the status classifier had
+/// nothing to say about the same row.
+fn annotate_refusals(
+    excluded: Vec<ExcludedTarget>,
+    refusals: &[OperatorCommandError],
+) -> Vec<ExcludedTarget> {
+    if refusals.is_empty() {
+        return excluded;
+    }
+    let mut annotated: Vec<ExcludedTarget> = excluded
+        .into_iter()
+        .filter(|target| {
+            !refusals
+                .iter()
+                .any(|refusal| refusal.change_id() == target.change_id)
+        })
+        .collect();
+    annotated.extend(refusals.iter().map(refusal_exclusion));
+    annotated
+}
+
 /// Name every excluded target with the status that excluded it.
 ///
 /// Target-specific by construction: a marked row an operator can see excluded
@@ -1247,8 +1284,9 @@ impl RunControlService {
         // Only marked retry-eligible rows are routed; every other marked row is
         // named as excluded rather than silently dropped, and a request with no
         // runnable target is rejected before any effect.
-        let routes = self.operator.plan_retry_errors(&marked).await;
+        let (routes, refusals) = self.operator.plan_retry_errors_with_refusals(&marked).await;
         let excluded = self.describe_non_retryable(&marked, &routes, mode).await;
+        let excluded = annotate_refusals(excluded, &refusals);
         if routes.is_empty() {
             return Err(RunControlError::NoEligibleTarget {
                 command: RunCommandKind::Start,
@@ -1271,8 +1309,8 @@ impl RunControlService {
         if ids.is_empty() {
             return excluded;
         }
-        let routes = self.operator.plan_retry_errors(&ids).await;
-        excluded
+        let (routes, refusals) = self.operator.plan_retry_errors_with_refusals(&ids).await;
+        let excluded: Vec<ExcludedTarget> = excluded
             .into_iter()
             .map(|target| {
                 if routes.iter().any(|(id, _)| *id == target.change_id) {
@@ -1281,7 +1319,11 @@ impl RunControlService {
                     target
                 }
             })
-            .collect()
+            .collect();
+        // A refused target is not merely "deferred": the next request would
+        // refuse it too, and only the refusal says what to change. It therefore
+        // overwrites the deferral detail rather than being dropped behind it.
+        annotate_refusals(excluded, &refusals)
     }
 
     /// Name every marked target the retry classification did not accept.
@@ -1329,8 +1371,15 @@ impl RunControlService {
         &self,
         change_ids: &[String],
     ) -> RunControlResult<PreparedRunCommand> {
-        let routes = self.operator.plan_retry_errors(change_ids).await;
-        self.prepare_routes(RunCommandKind::Retry, routes, Vec::new())
+        let (routes, refusals) = self
+            .operator
+            .plan_retry_errors_with_refusals(change_ids)
+            .await;
+        // Each refused target travels as its own exclusion, so a mixed bulk
+        // retry reports the refusal next to the target it belongs to rather than
+        // returning a shorter accepted list with no explanation.
+        let excluded = refusals.iter().map(refusal_exclusion).collect();
+        self.prepare_routes(RunCommandKind::Retry, routes, excluded)
             .await
     }
 

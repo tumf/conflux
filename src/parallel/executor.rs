@@ -1765,11 +1765,21 @@ pub(crate) async fn run_acceptance_boundary(
         None => GateBudget::unbounded(),
     };
     let gate_start = std::time::Instant::now();
+    // Every envelope this executor writes is bound to the manifest's own review,
+    // so a later attempt against a different base or range reruns the gate
+    // instead of reusing an answer produced for a comparison nobody is making
+    // any more.
     let executor = RuntimeVerificationExecutor::new(
         workspace_path.to_path_buf(),
         GitRepositoryFacts,
         DirectCommandSupervisor,
         SystemClock,
+    )
+    .with_review_binding(
+        crate::orchestration::acceptance::verification_evidence::ReviewBinding {
+            base_commit: manifest.review_base_commit.clone(),
+            range: manifest.review_range.clone(),
+        },
     );
     let gates = execute_declared_gates(&executor, &manifest, &reuse_decisions, gate_budget).await;
     for outcome in &gates.outcomes {
@@ -1785,9 +1795,48 @@ pub(crate) async fn run_acceptance_boundary(
         .work_duration()
         .map(|work| work.saturating_sub(gate_start.elapsed()));
 
+    // Re-bind the artifacts the gates just wrote.
+    //
+    // `artifact_digest` is a fingerprint component, and a gate that executes
+    // *writes* its artifact. The pre-gate manifest's fingerprint is therefore
+    // already stale the moment a gate finishes: recording it as the terminal
+    // fingerprint would describe a question nobody can ask again, and the next
+    // attempt — recomputing over the artifact that now exists — would get a
+    // different value, find no match, and be admitted once more. That is exactly
+    // the loop the refusal exists to stop, arriving one attempt later.
+    //
+    // Only the artifact digests are refreshed, because they are the only
+    // components gate execution can move. Every other binding is already proven
+    // stable across the run: capture refuses on a dirty worktree, and refuses
+    // again if the commit, tree, automation blob, or tool digest changed while
+    // the command ran. Re-reading them would spend a round of Git subprocesses
+    // reconfirming what the executor already guaranteed.
+    let mut manifest = manifest;
+    {
+        use crate::orchestration::acceptance::verification_evidence::RepositoryFacts;
+        for gate in &mut manifest.gates {
+            gate.artifact_digest = GitRepositoryFacts
+                .hash_file(workspace_path, &workspace_path.join(&gate.artifact_path))
+                .await
+                .ok();
+        }
+    }
+    let settled_fingerprint = manifest.fingerprint();
+    if settled_fingerprint != fingerprint {
+        // Persist the settled bindings, so a restart reads what actually ran
+        // rather than what was about to run.
+        if let Err(error) = store.store(&manifest) {
+            warn!(
+                change_id = change_id,
+                "Settled Acceptance manifest could not be persisted: {}", error
+            );
+        }
+    }
+
     debug!(
         change_id = change_id,
-        fingerprint = %fingerprint,
+        fingerprint = %settled_fingerprint,
+        pre_gate_fingerprint = %fingerprint,
         "Acceptance execution manifest frozen"
     );
     Ok(Some(AcceptanceBoundary {
@@ -2125,12 +2174,17 @@ pub async fn execute_acceptance_in_workspace(
                 ));
             }
             GateVerdict::Hold { category, evidence } => {
+                // Read from the gate phase's own sweep, never assumed. A gate
+                // that hit the shared deadline was terminated and its process
+                // group swept; whether that sweep *proved* the group empty is
+                // the one fact this hold must not invent.
+                let (cleanup_confirmed, cleanup_diagnostics) = boundary.gates.cleanup_evidence();
                 let hold =
                     crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionHold {
                         category: *category,
                         budget_secs: acceptance_runtime_limit_secs,
-                        cleanup_confirmed: true,
-                        cleanup_diagnostics: "no reviewer was started".to_string(),
+                        cleanup_confirmed,
+                        cleanup_diagnostics,
                         fingerprint: boundary.manifest.fingerprint(),
                         evidence: evidence.clone(),
                     };

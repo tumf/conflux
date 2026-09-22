@@ -145,6 +145,28 @@ impl AcceptanceHoldCategory {
         }
     }
 
+    /// Whether a recorded hold of this category refuses an *unchanged* retry.
+    ///
+    /// Only the three deadline categories do. They are the ones a fingerprint
+    /// actually decides: the invocation was bounded, the bound expired, and
+    /// asking the identical question again can only expire again.
+    ///
+    /// [`Self::RuntimeDefect`] and [`Self::ManifestMalformed`] deliberately do
+    /// not. Neither is a statement about the input at all — a dirty worktree, an
+    /// unreadable evidence directory, a transient Git failure, or an unparsable
+    /// sidecar can recover without any fingerprint component moving, and
+    /// cleanliness is not a fingerprint component. Refusing on them would turn a
+    /// recoverable environment fact into a permanent `unchanged_acceptance_input`
+    /// refusal nobody can clear by fixing the environment.
+    pub fn refuses_unchanged_retry(self) -> bool {
+        match self {
+            Self::DeclaredGateDeadlineExhausted
+            | Self::ReviewDeadlineExhausted
+            | Self::ReviewCleanupUnproven => true,
+            Self::ManifestMalformed | Self::RuntimeDefect => false,
+        }
+    }
+
     /// Operator-facing explanation of what stopped the invocation.
     pub fn detail(self) -> &'static str {
         match self {
@@ -392,7 +414,19 @@ pub enum GateOutcome {
         detail: String,
     },
     /// The shared budget ran out before this gate could finish.
-    DeadlineExhausted { verification_id: String },
+    ///
+    /// The runtime terminated the command and swept its owned process group
+    /// before producing this outcome. `cleanup_confirmed` says whether that
+    /// sweep *proved* the group empty: "we stopped it" and "it is gone" are
+    /// separate facts, and the hold this becomes must not claim the second from
+    /// the first.
+    DeadlineExhausted {
+        verification_id: String,
+        #[serde(default)]
+        cleanup_confirmed: bool,
+        #[serde(default)]
+        cleanup_diagnostics: String,
+    },
 }
 
 impl GateOutcome {
@@ -410,7 +444,9 @@ impl GateOutcome {
             | Self::Refused {
                 verification_id, ..
             }
-            | Self::DeadlineExhausted { verification_id } => verification_id,
+            | Self::DeadlineExhausted {
+                verification_id, ..
+            } => verification_id,
         }
     }
 
@@ -464,9 +500,19 @@ impl GateOutcome {
                 code,
                 detail,
             } => format!("{verification_id}: not executed ({code}) {detail}"),
-            Self::DeadlineExhausted { verification_id } => {
-                format!("{verification_id}: did not finish inside the shared Acceptance budget")
-            }
+            Self::DeadlineExhausted {
+                verification_id,
+                cleanup_confirmed,
+                cleanup_diagnostics,
+            } => format!(
+                "{verification_id}: did not finish inside the shared Acceptance budget; \
+                 terminated, process-group cleanup {}",
+                if *cleanup_confirmed {
+                    "confirmed".to_string()
+                } else {
+                    format!("unproven: {cleanup_diagnostics}")
+                }
+            ),
         }
     }
 }
@@ -492,6 +538,27 @@ impl GateResults {
         self.outcomes
             .iter()
             .find(|outcome| matches!(outcome, GateOutcome::DeadlineExhausted { .. }))
+    }
+
+    /// Process-group cleanup evidence for the gate phase.
+    ///
+    /// A gate that hit the shared deadline was terminated, and its own sweep is
+    /// the only thing that knows whether the group is provably gone. Every other
+    /// shape started nothing that could survive — a refusal never spawned, a
+    /// reuse never ran, and a completed gate exited on its own — so the honest
+    /// answer there is a confirmed cleanup with no reviewer involved.
+    pub fn cleanup_evidence(&self) -> (bool, String) {
+        match self.first_deadline_exhausted() {
+            Some(GateOutcome::DeadlineExhausted {
+                cleanup_confirmed,
+                cleanup_diagnostics,
+                ..
+            }) => (*cleanup_confirmed, cleanup_diagnostics.clone()),
+            _ => (
+                true,
+                "no reviewer was started and no gate was left running".to_string(),
+            ),
+        }
     }
 
     /// The first gate the runtime could not run at all, when one exists.
@@ -942,12 +1009,14 @@ impl AcceptanceAdmission {
 /// Decide whether the current input may be dispatched, given what a prior
 /// invocation recorded.
 ///
-/// Only a *non-resumable hold* whose recorded fingerprint equals the current one
+/// Only a recorded *deadline* hold whose fingerprint equals the current one
 /// refuses. Every other shape admits: no stored manifest, a stored manifest with
-/// no terminal record, a terminal record from a different fingerprint, or a
-/// terminal record with no hold category (an ordinary settled verdict). That
-/// asymmetry is the point — the guard exists to stop one specific loop, not to
-/// become a general gate on Acceptance.
+/// no terminal record, a terminal record from a different fingerprint, a
+/// terminal record with no hold category (an ordinary settled verdict), and a
+/// hold category that says nothing about the input
+/// ([`AcceptanceHoldCategory::refuses_unchanged_retry`]). That asymmetry is the
+/// point — the guard exists to stop one specific loop, not to become a general
+/// gate on Acceptance.
 pub fn classify_admission(
     current_fingerprint: &str,
     stored: Option<&AcceptanceExecutionManifest>,
@@ -958,6 +1027,13 @@ pub fn classify_admission(
     let Some(category) = terminal.hold_category else {
         return AcceptanceAdmission::Admit;
     };
+    // A runtime defect or a malformed manifest is an environment fact, not an
+    // answer about this input. The fingerprint cannot express "the worktree was
+    // dirty" or "Git could not be read", so an equal fingerprint after one of
+    // those proves nothing and must not strand the change.
+    if !category.refuses_unchanged_retry() {
+        return AcceptanceAdmission::Admit;
+    }
     if terminal.fingerprint != current_fingerprint {
         return AcceptanceAdmission::Admit;
     }

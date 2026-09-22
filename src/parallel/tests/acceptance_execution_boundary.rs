@@ -315,30 +315,44 @@ async fn acceptance_execution_boundary_non_terminating_reviewer_settles_as_stall
         AcceptanceResult::ExecutionHold { hold } => hold,
         other => panic!("a verdictless reviewer must settle as an execution hold, got {other:?}"),
     };
+    // Cleanup is *proven*, not accepted as either-or. `ReviewCleanupUnproven`
+    // is a real category for a real failure — a reviewer whose process group
+    // outlived termination — and accepting it here would have let the proposal's
+    // "cleanup is confirmed" claim pass on a run that never proved it.
+    assert_eq!(
+        hold.category,
+        AcceptanceHoldCategory::ReviewDeadlineExhausted,
+        "the reviewer's owned process group must be proven quiescent: {}",
+        hold.cleanup_diagnostics
+    );
     assert!(
-        matches!(
-            hold.category,
-            AcceptanceHoldCategory::ReviewDeadlineExhausted
-                | AcceptanceHoldCategory::ReviewCleanupUnproven
-        ),
-        "unexpected hold category {:?}",
-        hold.category
+        hold.cleanup_confirmed,
+        "cleanup evidence must be confirmed: {}",
+        hold.cleanup_diagnostics
     );
     assert!(reviewer_started(repo_root.path()));
     assert_eq!(
         iteration, 0,
         "a bounded hold is not a verdict and consumes no attempt number"
     );
-    assert!(!hold.permits_retry());
 
     let blocker = hold.to_stalled_blocker(CHANGE);
     assert_eq!(blocker.phase, "acceptance");
     assert!(!blocker.resumable);
     assert!(blocker.unblock_condition.is_none());
     assert!(blocker.worktree_preserved);
+    assert!(
+        blocker
+            .evidence
+            .iter()
+            .any(|line| line == "process_group_cleanup=confirmed"),
+        "the published blocker must carry the proof, not just the claim: {:?}",
+        blocker.evidence
+    );
 
     // The terminal record is persisted in the worktree, which is what a restart
-    // re-derives the refusal from.
+    // re-derives the refusal from — and it carries the same cleanup verdict, so
+    // the proof survives the process that produced it.
     let stored = ManifestStore::new(repo_root.path().to_path_buf())
         .load(CHANGE)
         .expect("the terminal manifest must be persisted");
@@ -348,6 +362,11 @@ async fn acceptance_execution_boundary_non_terminating_reviewer_settles_as_stall
         .or_fail("the hold must be recorded on the manifest");
     assert_eq!(terminal.hold_category, Some(hold.category));
     assert_eq!(terminal.fingerprint, fingerprint);
+    assert!(
+        terminal.cleanup_confirmed,
+        "the persisted record must keep the cleanup proof: {}",
+        terminal.cleanup_diagnostics
+    );
 }
 
 /// The result classifies as a hold rather than as a runtime limit, so it never
@@ -470,6 +489,142 @@ async fn acceptance_execution_boundary_unchanged_input_dispatches_nothing() {
             .join(".cflx/verification-evidence/focused-gate.json")
             .exists(),
         "no gate may be executed for an unchanged input"
+    );
+}
+
+/// The invariant the refusal rests on: the fingerprint an invocation *settles*
+/// with is the one the next attempt recomputes from the unchanged worktree.
+///
+/// An executed gate writes its artifact, and the artifact digest is a
+/// fingerprint component — so a manifest frozen *before* the gates ran carries a
+/// fingerprint that is already stale by the time anything terminal could be
+/// recorded against it. Recording that value means the next attempt computes a
+/// different one, the guard finds no match, and the review the deadline already
+/// stopped is dispatched once more.
+///
+/// Boundary-scoped so it runs in the default suite; the end-to-end two-attempt
+/// proof is the heavy test below.
+#[tokio::test]
+async fn acceptance_execution_boundary_settled_fingerprint_survives_gate_execution() {
+    use crate::orchestration::acceptance::manifest_builder::build_manifest_for_workspace;
+    use crate::orchestration::acceptance::verification_evidence::GitRepositoryFacts;
+
+    let repo_root = workspace_with(&proposal_with_gate("sh -c true")).await;
+    let config = config_with_reviewer(canonical_reviewer());
+
+    let boundary = crate::parallel::executor::run_acceptance_boundary(
+        CHANGE,
+        repo_root.path(),
+        config.get_accept_skill(),
+        Some("main"),
+        3600,
+    )
+    .await
+    .expect("a readable repository must produce a boundary")
+    .expect("a Git working tree must produce a manifest");
+
+    assert!(
+        boundary.gates.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            crate::orchestration::acceptance::execution_manifest::GateOutcome::Executed { .. }
+        )),
+        "the declared gate must really have executed: {:?}",
+        boundary.gates.outcomes
+    );
+
+    // What a fresh attempt on the untouched worktree would compute.
+    let next_attempt = build_manifest_for_workspace(
+        &GitRepositoryFacts,
+        repo_root.path(),
+        CHANGE,
+        config.get_accept_skill(),
+        Some("main"),
+        3600,
+    )
+    .await
+    .expect("the manifest must be derivable from the workspace");
+
+    assert_eq!(
+        boundary.manifest.fingerprint(),
+        next_attempt.fingerprint(),
+        "the settled fingerprint must equal what the next attempt recomputes for the same \
+         commit, tree, inputs, declarations, and tool identity"
+    );
+    assert!(
+        boundary
+            .manifest
+            .gates
+            .iter()
+            .all(|gate| gate.artifact_digest.is_some()),
+        "the settled manifest must bind the artifacts the gates actually wrote"
+    );
+}
+
+/// A hold reached *after a gate actually executed* refuses the next unchanged
+/// attempt, exactly as one reached with no gates does.
+///
+/// This is the case `record_hold` cannot reach and the gateless proposals do not
+/// exercise: two complete bounded attempts, the first ending in a real
+/// review-deadline hold with a gate behind it, the second proving the refusal
+/// survives on an untouched worktree. Heavy because that is two full
+/// `execute_acceptance_in_workspace` invocations against a real repository with
+/// real subprocesses — roughly 1.5s, and not reducible without giving up one of
+/// the two attempts that make it a regression at all. The default suite keeps
+/// the invariant through
+/// `acceptance_execution_boundary_settled_fingerprint_survives_gate_execution`
+/// above.
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn acceptance_execution_boundary_hold_after_a_gate_ran_still_refuses_unchanged_input() {
+    let repo_root = workspace_with(&proposal_with_gate("sh -c true")).await;
+    let evidence = repo_root
+        .path()
+        .join(".cflx/verification-evidence/focused-gate.json");
+
+    // First attempt: the gate runs for real, then the reviewer exhausts the
+    // shared review deadline.
+    let holding_config = config_with_reviewer(non_terminating_reviewer());
+    let (first, _) = scoped_review_budget_millis_for_test(
+        150,
+        run_acceptance(repo_root.path(), &holding_config, &runner(3600)),
+    )
+    .await;
+    assert!(first.is_execution_hold(), "{first:?}");
+    assert!(
+        evidence.is_file(),
+        "the declared gate must really have executed under runtime supervision"
+    );
+    let executed_evidence = std::fs::read(&evidence).or_fail("unexpected error");
+    std::fs::remove_file(repo_root.path().join(REVIEWER_MARKER)).or_fail("unexpected error");
+
+    // Second attempt on the untouched worktree. A canonical reviewer would pass
+    // instantly, so a PASS here would mean the refusal was lost rather than that
+    // the change is good.
+    let (second, iteration) = run_acceptance(
+        repo_root.path(),
+        &config_with_reviewer(canonical_reviewer()),
+        &runner(3600),
+    )
+    .await;
+
+    match second {
+        AcceptanceResult::ExecutionHold { hold } => assert_eq!(
+            hold.category,
+            AcceptanceHoldCategory::ReviewDeadlineExhausted,
+            "the recorded deadline hold must still refuse the unchanged input"
+        ),
+        other => panic!("an unchanged retry after an executed gate must be refused, got {other:?}"),
+    }
+    assert_eq!(iteration, 0);
+    assert!(
+        !reviewer_started(repo_root.path()),
+        "no reviewer may be dispatched for an unchanged input"
+    );
+    assert_eq!(
+        std::fs::read(&evidence).or_fail("unexpected error"),
+        executed_evidence,
+        "no gate may be re-executed for an unchanged input: a rerun would rewrite this \
+         envelope's timestamps"
     );
 }
 

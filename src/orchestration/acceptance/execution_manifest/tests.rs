@@ -537,6 +537,82 @@ fn acceptance_execution_boundary_admits_every_non_hold_shape() {
     );
 }
 
+/// A recorded hold whose category is a *deadline* refuses an unchanged
+/// fingerprint; one that is a runtime or manifest defect does not.
+///
+/// The difference is what the category is evidence *about*. A deadline answered
+/// this exact input: re-asking it can only expire again. A runtime defect —
+/// dirty worktree, unreadable evidence directory, transient Git failure —
+/// answered the environment, and cleanliness is not a fingerprint component, so
+/// an equal fingerprint after one says nothing. Refusing on it would make a
+/// recoverable environment fact a permanent refusal.
+#[test]
+fn acceptance_execution_boundary_only_deadline_categories_refuse_unchanged_input() {
+    let current = manifest("alpha", vec![gate("focused")]);
+    let with_category = |category: AcceptanceHoldCategory| {
+        let mut stored = current.clone();
+        stored.terminal = Some(ManifestTerminal {
+            hold_category: Some(category),
+            fingerprint: current.fingerprint(),
+            cleanup_confirmed: true,
+            cleanup_diagnostics: String::new(),
+            recorded_at: chrono::Utc::now(),
+        });
+        stored
+    };
+
+    for category in [
+        AcceptanceHoldCategory::DeclaredGateDeadlineExhausted,
+        AcceptanceHoldCategory::ReviewDeadlineExhausted,
+        AcceptanceHoldCategory::ReviewCleanupUnproven,
+    ] {
+        assert!(category.refuses_unchanged_retry(), "{category:?}");
+        let stored = with_category(category);
+        assert!(
+            classify_admission(&current.fingerprint(), Some(&stored)).is_refused(),
+            "an equal fingerprint after {category:?} must be refused"
+        );
+    }
+
+    for category in [
+        AcceptanceHoldCategory::RuntimeDefect,
+        AcceptanceHoldCategory::ManifestMalformed,
+    ] {
+        assert!(!category.refuses_unchanged_retry(), "{category:?}");
+        let stored = with_category(category);
+        assert_eq!(
+            classify_admission(&current.fingerprint(), Some(&stored)),
+            AcceptanceAdmission::Admit,
+            "{category:?} says nothing about the input, so it must admit a fresh bounded attempt"
+        );
+    }
+}
+
+/// The same asymmetry through the workspace-derived path a restart takes: a
+/// stored `RuntimeDefect` hold does not survive as a permanent refusal.
+#[test]
+fn acceptance_execution_boundary_runtime_defect_hold_admits_from_the_store() {
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ManifestStore::new(workspace.path().to_path_buf());
+    let current = manifest("alpha", vec![gate("focused")]);
+    let mut stored = current.clone();
+    stored.terminal = Some(ManifestTerminal {
+        hold_category: Some(AcceptanceHoldCategory::RuntimeDefect),
+        fingerprint: current.fingerprint(),
+        cleanup_confirmed: true,
+        cleanup_diagnostics: "worktree was dirty".to_string(),
+        recorded_at: chrono::Utc::now(),
+    });
+    store.store(&stored).unwrap();
+
+    assert_eq!(
+        classify_admission_from_store(workspace.path(), "alpha", &current.fingerprint()),
+        AcceptanceAdmission::Admit,
+        "cleaning the worktree changes no fingerprint component, so a runtime-defect hold \
+         must not become a permanent refusal"
+    );
+}
+
 /// Restart: delete every out-of-worktree file and the same worktree answers the
 /// same way. This is constitutional law 1 expressed as a test — the workspace
 /// alone decides the next action.

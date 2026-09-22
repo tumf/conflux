@@ -274,6 +274,8 @@ fn stored_evidence(id: &str) -> VerificationEvidence {
         verification_id: id.to_string(),
         commit_oid: COMMIT.to_string(),
         tree_oid: TREE.to_string(),
+        review_base_commit: BLOB.to_string(),
+        review_range: format!("{BLOB}..{COMMIT}"),
         argv: vec!["cargo".to_string(), "test".to_string(), id.to_string()],
         cwd: ".".to_string(),
         automation_path: "src/lib.rs".to_string(),
@@ -523,6 +525,205 @@ async fn acceptance_execution_boundary_missing_tool_keeps_the_external_contract(
     }
 }
 
+/// A gate that hits the shared deadline leaves nothing running.
+///
+/// The double above spawns no process, so it can only prove the *routing*. This
+/// one uses `DirectCommandSupervisor` and a real long-running child, because the
+/// defect it guards is invisible to an in-memory supervisor: a `timeout` wrapped
+/// around the capture future would drop that future and leave `sleep` alive in
+/// the worktree, while the hold written afterwards claimed a confirmed cleanup.
+///
+/// Two assertions carry the contract. The outcome's own cleanup evidence must be
+/// confirmed — which the sweep only reports after a membership probe finds the
+/// owned group empty — and the process group must still be gone when the outcome
+/// is read, which is a statement about ordering: termination and reaping happen
+/// *before* `DeadlineExhausted` is returned, not after.
+#[tokio::test]
+async fn acceptance_execution_boundary_gate_deadline_terminates_and_reaps_a_real_child() {
+    use crate::orchestration::acceptance::verification_evidence::{
+        DirectCommandSupervisor, SupervisedRun,
+    };
+
+    let workspace = tempfile::tempdir().unwrap();
+    let supervisor = DirectCommandSupervisor;
+
+    let run = supervisor
+        .run_bounded(
+            &["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            workspace.path(),
+            Some(std::time::Duration::from_millis(150)),
+        )
+        .await
+        .expect("spawning a real child must succeed");
+
+    let report = match run {
+        SupervisedRun::DeadlineExhausted(report) => report,
+        SupervisedRun::Completed(outcome) => {
+            panic!("a 30-second sleep cannot finish inside 150ms, got {outcome:?}")
+        }
+    };
+    assert!(
+        report.is_confirmed(),
+        "the gate's owned process group must be proven empty before the outcome is \
+         returned: {}",
+        report.diagnostics()
+    );
+
+    // The proof is re-taken here, from the caller's side of the return. If
+    // termination happened lazily — on drop, or on a detached task — the group
+    // could still have members at this point.
+    #[cfg(unix)]
+    if let Some(pgid) = report.pgid() {
+        use nix::errno::Errno;
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        assert_eq!(
+            killpg(Pid::from_raw(pgid as i32), None),
+            Err(Errno::ESRCH),
+            "no member of the gate's process group may survive the DeadlineExhausted outcome"
+        );
+    }
+}
+
+/// The same deadline through the gate phase: the typed hold carries the sweep's
+/// own verdict rather than a constant, so "we stopped it" and "it is gone" stay
+/// separate facts.
+#[tokio::test]
+async fn acceptance_execution_boundary_gate_deadline_hold_reports_real_cleanup_evidence() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut sleeping = gate("alpha-gate");
+    sleeping.argv = vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()];
+    let executor =
+        crate::orchestration::acceptance::verification_evidence::RuntimeVerificationExecutor::new(
+            workspace.path().to_path_buf(),
+            FakeFacts::new(),
+            crate::orchestration::acceptance::verification_evidence::DirectCommandSupervisor,
+            StepClock::new(),
+        );
+
+    let results = execute_declared_gates(
+        &executor,
+        &manifest(vec![sleeping]),
+        &[],
+        GateBudget::bounded(std::time::Duration::from_millis(150)),
+    )
+    .await;
+
+    match results.outcomes.as_slice() {
+        [GateOutcome::DeadlineExhausted {
+            cleanup_confirmed,
+            cleanup_diagnostics,
+            ..
+        }] => assert!(
+            *cleanup_confirmed,
+            "the terminated gate's cleanup must be proven, not assumed: {cleanup_diagnostics}"
+        ),
+        other => panic!("a gate that outlives its budget must report a deadline, got {other:?}"),
+    }
+    let (confirmed, diagnostics) = results.cleanup_evidence();
+    assert!(confirmed, "{diagnostics}");
+    assert_eq!(
+        classify_gate_results(&results),
+        GateVerdict::Hold {
+            category: AcceptanceHoldCategory::DeclaredGateDeadlineExhausted,
+            evidence: results.summary_lines(),
+        }
+    );
+}
+
+/// Evidence bound to a *different* review base is not evidence about this
+/// review, so the gate is executed rather than reused — even though every other
+/// binding is exact.
+#[tokio::test]
+async fn acceptance_execution_boundary_review_base_mismatch_forces_rerun() {
+    let workspace = tempfile::tempdir().unwrap();
+    let store = crate::orchestration::acceptance::verification_evidence::EvidenceStore::new(
+        workspace.path().to_path_buf(),
+    );
+    // Exact in every binding except the review it was produced for.
+    let mut foreign = stored_evidence("alpha-gate");
+    foreign.review_base_commit = "9".repeat(40);
+    foreign.review_range = format!("{}..{COMMIT}", "9".repeat(40));
+    store.store(&foreign).unwrap();
+    std::fs::write(
+        workspace
+            .path()
+            .join(".cflx/verification-evidence/alpha-gate.log"),
+        b"gate output\n",
+    )
+    .ok();
+
+    let decisions = plan_manifest_reuse(
+        &FakeFacts::new(),
+        workspace.path(),
+        &manifest(vec![gate("alpha-gate")]),
+        ReusePolicy::default(),
+    )
+    .await;
+
+    match decisions.as_slice() {
+        [ReuseDecision::Rerun {
+            reason: RerunReason::Mismatch { field, .. },
+            ..
+        }] => assert_eq!(
+            *field, "review_base_commit",
+            "the rerun reason must name the binding that actually moved"
+        ),
+        other => panic!("a foreign review base must force a rerun, got {other:?}"),
+    }
+
+    // And the exact same envelope, bound to *this* review, is reused.
+    store.store(&stored_evidence("alpha-gate")).unwrap();
+    let decisions = plan_manifest_reuse(
+        &FakeFacts::new(),
+        workspace.path(),
+        &manifest(vec![gate("alpha-gate")]),
+        ReusePolicy::default(),
+    )
+    .await;
+    assert!(
+        matches!(decisions.as_slice(), [ReuseDecision::Reuse { .. }]),
+        "evidence bound to this review is still reused: {decisions:?}"
+    );
+}
+
+/// A moved review *range* invalidates evidence on its own: the same base with a
+/// different candidate is a different comparison.
+#[tokio::test]
+async fn acceptance_execution_boundary_review_range_mismatch_forces_rerun() {
+    let workspace = tempfile::tempdir().unwrap();
+    let store = crate::orchestration::acceptance::verification_evidence::EvidenceStore::new(
+        workspace.path().to_path_buf(),
+    );
+    let mut foreign = stored_evidence("alpha-gate");
+    foreign.review_range = format!("{BLOB}..{}", "9".repeat(40));
+    store.store(&foreign).unwrap();
+    std::fs::write(
+        workspace
+            .path()
+            .join(".cflx/verification-evidence/alpha-gate.log"),
+        b"gate output\n",
+    )
+    .ok();
+
+    let decisions = plan_manifest_reuse(
+        &FakeFacts::new(),
+        workspace.path(),
+        &manifest(vec![gate("alpha-gate")]),
+        ReusePolicy::default(),
+    )
+    .await;
+
+    match decisions.as_slice() {
+        [ReuseDecision::Rerun {
+            reason: RerunReason::Mismatch { field, .. },
+            ..
+        }] => assert_eq!(*field, "review_range"),
+        other => panic!("a foreign review range must force a rerun, got {other:?}"),
+    }
+}
+
 /// External prerequisite outranks a gate-deadline hold in the same result set.
 #[test]
 fn acceptance_execution_boundary_external_prerequisite_outranks_runtime_holds() {
@@ -530,6 +731,8 @@ fn acceptance_execution_boundary_external_prerequisite_outranks_runtime_holds() 
         outcomes: vec![
             GateOutcome::DeadlineExhausted {
                 verification_id: "alpha-gate".to_string(),
+                cleanup_confirmed: true,
+                cleanup_diagnostics: String::new(),
             },
             GateOutcome::Refused {
                 verification_id: "beta-gate".to_string(),

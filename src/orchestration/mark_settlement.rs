@@ -108,6 +108,15 @@ pub enum MarkSettlementExclusion {
     AlreadyNotQueued,
     /// Worktree execution refuses the change.
     Unavailable,
+    /// Acceptance input is unchanged since a non-resumable deadline hold.
+    ///
+    /// Not derivable from the display status, which is why it is classified
+    /// separately. A restart discards the in-memory hold, so after one the row
+    /// is an ordinary `not queued` that settlement would happily queue —
+    /// dispatching analysis and Apply for a question the repository already
+    /// refused. The refusal lives in the worktree, so it is the only thing that
+    /// still knows.
+    UnchangedAcceptanceInput,
 }
 
 impl MarkSettlementExclusion {
@@ -121,6 +130,9 @@ impl MarkSettlementExclusion {
             Self::AlreadyQueued => "already_queued",
             Self::AlreadyNotQueued => "already_not_queued",
             Self::Unavailable => "unavailable",
+            Self::UnchangedAcceptanceInput => {
+                crate::orchestration::acceptance::execution_manifest::UNCHANGED_ACCEPTANCE_INPUT
+            }
         }
     }
 

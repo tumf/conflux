@@ -43,6 +43,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -120,6 +121,20 @@ pub struct VerificationEvidence {
     pub commit_oid: String,
     /// Full-length tree ID of that commit.
     pub tree_oid: String,
+    /// Full-length review base commit the candidate is being judged against, or
+    /// empty when no base was resolvable.
+    ///
+    /// Bound because "this command succeeded" is only reusable evidence for the
+    /// review it was produced under. The same argv at the same commit against a
+    /// *different* base is a different question, and reusing the older answer
+    /// would silently carry a verdict across review ranges. Defaulted so an
+    /// envelope written before this binding existed reads as "no base recorded"
+    /// and reruns, which is the conservative direction.
+    #[serde(default)]
+    pub review_base_commit: String,
+    /// Exact `base..candidate` range the review covers.
+    #[serde(default)]
+    pub review_range: String,
     /// Exact argv, as an array. Never a shell string.
     pub argv: Vec<String>,
     /// Working directory, normalized repository-relative (`.` for the root).
@@ -159,6 +174,8 @@ impl VerificationEvidence {
             "verification_id": self.verification_id,
             "commit_oid": self.commit_oid,
             "tree_oid": self.tree_oid,
+            "review_base_commit": self.review_base_commit,
+            "review_range": self.review_range,
             "argv": self.argv,
             "cwd": self.cwd,
             "automation_path": self.automation_path,
@@ -312,6 +329,18 @@ pub fn parse_evidence(bytes: &[u8]) -> Result<VerificationEvidence, EvidenceDefe
                 "{field} '{value}' is not a full-length object id"
             )));
         }
+    }
+    // An empty review base is a real state — a first commit, a detached
+    // candidate — and stays legal. A *present* one must be a full object ID for
+    // the same reason every other binding must: an abbreviation is ambiguous,
+    // and an ambiguous base cannot prove which review this evidence belongs to.
+    if !record.review_base_commit.is_empty()
+        && !is_full_length_object_id(&record.review_base_commit)
+    {
+        return Err(EvidenceDefect::Malformed(format!(
+            "review_base_commit '{}' is not a full-length object id",
+            record.review_base_commit
+        )));
     }
     if record.argv.is_empty() || record.argv.iter().any(|arg| arg.trim().is_empty()) {
         return Err(EvidenceDefect::Malformed(
@@ -479,6 +508,14 @@ pub fn eligible_request(
 pub struct CurrentBindings {
     pub commit_oid: String,
     pub tree_oid: String,
+    /// The review this comparison is being made for, when the caller binds one.
+    ///
+    /// `None` is not "no base": it is *this caller asks no review question*, and
+    /// the check is skipped rather than answered against a value nobody
+    /// supplied. `Some` with empty fields is the opposite — a review with no
+    /// resolvable base — and an envelope recorded under a real base mismatches
+    /// it, which is exactly the rerun that case deserves.
+    pub review: Option<ReviewBinding>,
     pub automation_blob_oid: String,
     pub tool: ToolIdentity,
     /// Cleanliness with [`EVIDENCE_DIR`] excluded.
@@ -732,6 +769,27 @@ pub fn evaluate_reuse(
             current: current.tree_oid.clone(),
         });
     }
+    // Checked right after the candidate, and before the cheaper bindings, because
+    // this is the mismatch an operator is most likely to have *caused*: rebasing
+    // or repointing the base branch changes what the review covers without
+    // touching the candidate at all, and evidence produced against the old range
+    // is not evidence about the new one.
+    if let Some(review) = current.review.as_ref() {
+        if record.review_base_commit != review.base_commit {
+            return rerun(RerunReason::Mismatch {
+                field: "review_base_commit",
+                recorded: record.review_base_commit.clone(),
+                current: review.base_commit.clone(),
+            });
+        }
+        if record.review_range != review.range {
+            return rerun(RerunReason::Mismatch {
+                field: "review_range",
+                recorded: record.review_range.clone(),
+                current: review.range.clone(),
+            });
+        }
+    }
     if record.automation_blob_oid != current.automation_blob_oid {
         return rerun(RerunReason::Mismatch {
             field: "automation_blob_oid",
@@ -861,10 +919,67 @@ pub struct SupervisedOutcome {
     pub output: Vec<u8>,
 }
 
+/// Seconds a supervised gate is given to exit cooperatively after its own
+/// deadline expired, before the owned process group is force-killed.
+///
+/// Deliberately short: the deadline that just expired was the whole budget, and
+/// what remains is the finalization reserve termination, reap, persistence, and
+/// projection all have to fit inside.
+const GATE_TERMINATION_GRACE_MS: u64 = 200;
+
+/// Total budget for *proving* a terminated gate's process group is quiescent.
+const GATE_CLEANUP_TIMEOUT_MS: u64 = 5_000;
+
+/// What one supervised run produced, including the supervisor's own bound.
+///
+/// The second variant is why this type exists at all. A bound enforced by
+/// cancelling the caller's future cannot terminate anything: dropping a future
+/// that is awaiting a child leaves that child running in the worktree, and the
+/// hold written afterwards would claim a cleanup nobody performed. Enforcing the
+/// bound *inside* the supervisor is what makes "the gate is gone" a fact the
+/// outcome can carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupervisedRun {
+    /// The command ran to completion inside its budget.
+    Completed(SupervisedOutcome),
+    /// The budget expired. The child and its owned process group were
+    /// terminated; the report is the proof — or the explicit failure to prove —
+    /// that nothing survived.
+    DeadlineExhausted(Box<crate::process_manager::ProcessGroupCleanupReport>),
+}
+
 /// The runtime's own process supervision.
 #[async_trait]
 pub trait CommandSupervisor: Send + Sync {
     async fn run(&self, argv: &[String], cwd: &Path) -> Result<SupervisedOutcome, String>;
+
+    /// Run under a finite budget the supervisor itself enforces.
+    ///
+    /// The default is for supervisors that own no OS process — in-memory
+    /// doubles, and anything whose `run` starts nothing. For those, cancelling
+    /// the future really is the whole termination, so the cleanup evidence is
+    /// `not_applicable` rather than a claim about a process that never existed.
+    /// A supervisor that *does* spawn must override this: see
+    /// [`DirectCommandSupervisor`].
+    async fn run_bounded(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        budget: Option<Duration>,
+    ) -> Result<SupervisedRun, String> {
+        let Some(budget) = budget else {
+            return self.run(argv, cwd).await.map(SupervisedRun::Completed);
+        };
+        match tokio::time::timeout(budget, self.run(argv, cwd)).await {
+            Ok(result) => result.map(SupervisedRun::Completed),
+            Err(_) => Ok(SupervisedRun::DeadlineExhausted(Box::new(
+                crate::process_manager::ProcessGroupCleanupReport::not_applicable(
+                    "this supervisor owns no OS process, so cancelling its run is the whole \
+                     termination",
+                ),
+            ))),
+        }
+    }
 }
 
 /// Wall-clock source, injected so capture timestamps are deterministic in tests.
@@ -923,6 +1038,16 @@ pub enum CaptureOutcome {
     },
     /// Nothing was captured, and the reason is not a command failure.
     Refused(CaptureRefusal),
+    /// The supervisor's own budget expired. The command was terminated and its
+    /// owned process group swept; the report says whether that is *proven*.
+    ///
+    /// Distinct from [`Self::Refused`] because it is neither a verdict nor an
+    /// environment defect: the command was perfectly runnable, and what ended it
+    /// was the shared Acceptance budget.
+    DeadlineExhausted {
+        verification_id: String,
+        cleanup: Box<crate::process_manager::ProcessGroupCleanupReport>,
+    },
 }
 
 impl CaptureOutcome {
@@ -944,6 +1069,15 @@ impl CaptureOutcome {
                 "artifact_path": artifact_path,
             }),
             Self::Refused(refusal) => refusal.to_json(),
+            Self::DeadlineExhausted {
+                verification_id,
+                cleanup,
+            } => serde_json::json!({
+                "verification_id": verification_id,
+                "outcome": "deadline_exhausted",
+                "cleanup_confirmed": cleanup.is_confirmed(),
+                "cleanup_diagnostics": cleanup.diagnostics(),
+            }),
         }
     }
 }
@@ -1105,6 +1239,20 @@ pub struct RuntimeVerificationExecutor<F, S, C> {
     facts: F,
     supervisor: S,
     clock: C,
+    review: Option<ReviewBinding>,
+}
+
+/// The review this executor's captures are evidence *for*.
+///
+/// Carried rather than recomputed: the manifest already resolved the base once
+/// and froze it, and re-resolving here could bind a capture to a base branch
+/// that moved between the two reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewBinding {
+    /// Full-length review base commit, or empty when none resolved.
+    pub base_commit: String,
+    /// Exact `base..candidate` range.
+    pub range: String,
 }
 
 impl<F, S, C> RuntimeVerificationExecutor<F, S, C>
@@ -1119,7 +1267,19 @@ where
             facts,
             supervisor,
             clock,
+            review: None,
         }
+    }
+
+    /// Bind every capture this executor writes to one review base and range.
+    ///
+    /// Unbound by default so a caller with no review context — `openspec
+    /// verify`, a unit test — records no base rather than a fabricated one. An
+    /// envelope with no base is still valid evidence; it is simply not reusable
+    /// where a real review base *is* bound.
+    pub fn with_review_binding(mut self, review: ReviewBinding) -> Self {
+        self.review = Some(review);
+        self
     }
 
     /// Observe every binding the envelope will carry.
@@ -1139,6 +1299,7 @@ where
         Ok(CurrentBindings {
             commit_oid,
             tree_oid,
+            review: self.review.clone(),
             automation_blob_oid,
             tool,
             clean: dirty_entries_excluding_evidence(&status).is_empty(),
@@ -1154,6 +1315,22 @@ where
     /// binding the record would otherwise claim. Capture is refused in that case
     /// rather than recorded with the pre-execution values.
     pub async fn capture(&self, request: &VerificationRequest) -> CaptureOutcome {
+        self.capture_bounded(request, None).await
+    }
+
+    /// [`Self::capture`] under a finite budget the *supervisor* enforces.
+    ///
+    /// The budget is pushed all the way down rather than wrapped around this
+    /// call on purpose. A `timeout` around the capture future would drop it
+    /// mid-execution, leaving the declared command running in the worktree with
+    /// nobody left to reap it — and the hold written afterwards would claim a
+    /// cleanup that never happened. Handing the bound to the supervisor is what
+    /// lets the expiry carry real termination evidence.
+    pub async fn capture_bounded(
+        &self,
+        request: &VerificationRequest,
+        budget: Option<Duration>,
+    ) -> CaptureOutcome {
         let id = request.verification_id.as_str();
         let store = EvidenceStore::new(self.workspace.clone());
         if let Err(error) = store.ensure_directory() {
@@ -1187,8 +1364,21 @@ where
             self.workspace.join(&request.cwd)
         };
         let started_at = self.clock.now();
-        let outcome = match self.supervisor.run(&request.argv, &cwd).await {
-            Ok(outcome) => outcome,
+        let outcome = match self
+            .supervisor
+            .run_bounded(&request.argv, &cwd, budget)
+            .await
+        {
+            Ok(SupervisedRun::Completed(outcome)) => outcome,
+            // The command was terminated and its group swept before this
+            // returned, so the caller can report the deadline *and* whether the
+            // worktree is provably free of it.
+            Ok(SupervisedRun::DeadlineExhausted(cleanup)) => {
+                return CaptureOutcome::DeadlineExhausted {
+                    verification_id: id.to_string(),
+                    cleanup,
+                }
+            }
             Err(error) => {
                 return CaptureOutcome::Refused(CaptureRefusal::new(
                     id,
@@ -1287,6 +1477,16 @@ where
             verification_id: id.to_string(),
             commit_oid: before.commit_oid.clone(),
             tree_oid: before.tree_oid.clone(),
+            review_base_commit: before
+                .review
+                .as_ref()
+                .map(|review| review.base_commit.clone())
+                .unwrap_or_default(),
+            review_range: before
+                .review
+                .as_ref()
+                .map(|review| review.range.clone())
+                .unwrap_or_default(),
             argv: request.argv.clone(),
             cwd: request.cwd.clone(),
             automation_path: request.automation_path.clone(),
@@ -1402,6 +1602,11 @@ pub async fn decide_reuse<F: RepositoryFacts>(
     let current = CurrentBindings {
         commit_oid,
         tree_oid,
+        // This path has no manifest and therefore no review to bind. It asks
+        // "does this evidence still describe the current worktree", not "does it
+        // describe the current review", so it does not compare a review binding
+        // it never resolved.
+        review: None,
         automation_blob_oid,
         tool,
         clean: true,
@@ -1556,29 +1761,113 @@ async fn run_git_raw(workspace: &Path, args: &[&str]) -> Result<String, String> 
 }
 
 /// Directly supervised child process with merged, bounded output.
+///
+/// The gate is started in its own session, so the declared command and every
+/// descendant it spawns belong to one owned process group. That is what makes
+/// termination provable: killing a shell says nothing about the `sleep` it
+/// `exec`ed or forked, and a gate whose deadline expires must leave nothing
+/// running in the worktree the next phase is about to read.
 pub struct DirectCommandSupervisor;
 
 #[async_trait]
 impl CommandSupervisor for DirectCommandSupervisor {
     async fn run(&self, argv: &[String], cwd: &Path) -> Result<SupervisedOutcome, String> {
+        match self.run_bounded(argv, cwd, None).await? {
+            SupervisedRun::Completed(outcome) => Ok(outcome),
+            // Unreachable: an unbounded run has no deadline to exhaust. Reported
+            // as a supervision failure rather than panicked on, because a
+            // refusal is recoverable and a panic in a gate is not.
+            SupervisedRun::DeadlineExhausted(report) => Err(format!(
+                "unbounded supervision reported a deadline: {}",
+                report.diagnostics()
+            )),
+        }
+    }
+
+    async fn run_bounded(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        budget: Option<Duration>,
+    ) -> Result<SupervisedRun, String> {
+        use tokio::io::AsyncReadExt;
+
         let (program, arguments) = argv
             .split_first()
             .ok_or_else(|| "verification argv is empty".to_string())?;
-        let output = tokio::process::Command::new(program)
+        let mut command = tokio::process::Command::new(program);
+        command
             .args(arguments)
             .current_dir(cwd)
             .stdin(std::process::Stdio::null())
-            .output()
-            .await
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // Belt and braces for every path that is *not* the deadline below:
+            // a panic, an early return, or a caller that drops this future must
+            // not leave the gate running either.
+            .kill_on_drop(true);
+        crate::process_manager::configure_process_group(&mut command);
+        let mut child = command
+            .spawn()
             .map_err(|error| format!("{program}: {error}"))?;
-        let mut merged = output.stdout;
-        merged.extend_from_slice(&output.stderr);
-        Ok(SupervisedOutcome {
+        // `setsid` makes the child its own session and group leader, so its PID
+        // is the PGID every descendant inherits.
+        let pgid = child.id().unwrap_or(0);
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        // Drained on their own tasks so a chatty gate can never fill a pipe and
+        // wedge the wait this deadline is supposed to bound.
+        let stdout_task = tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            if let Some(mut stream) = stdout {
+                let _ = stream.read_to_end(&mut buffer).await;
+            }
+            buffer
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            if let Some(mut stream) = stderr {
+                let _ = stream.read_to_end(&mut buffer).await;
+            }
+            buffer
+        });
+
+        let status = match budget {
+            None => child.wait().await,
+            Some(budget) => match tokio::time::timeout(budget, child.wait()).await {
+                Ok(status) => status,
+                Err(_) => {
+                    // Order matters. The leader is killed and *reaped* first: an
+                    // unreaped zombie is still a process-group member, so
+                    // probing before reaping would report "members remain" for a
+                    // group whose only occupant is already dead. Only then is
+                    // the rest of the group swept and proven.
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    let report = crate::process_manager::cleanup_process_group_verified(
+                        pgid,
+                        GATE_TERMINATION_GRACE_MS,
+                        GATE_CLEANUP_TIMEOUT_MS,
+                        Some("acceptance-gate"),
+                        None,
+                    )
+                    .await;
+                    return Ok(SupervisedRun::DeadlineExhausted(Box::new(report)));
+                }
+            },
+        };
+        let status = status.map_err(|error| format!("{program}: {error}"))?;
+        let mut merged = stdout_task.await.unwrap_or_default();
+        merged.extend_from_slice(&stderr_task.await.unwrap_or_default());
+        Ok(SupervisedRun::Completed(SupervisedOutcome {
             // A signal-terminated child reports no code; treating that as a
             // distinct non-zero value keeps it out of the success path.
-            exit_code: output.status.code().unwrap_or(-1),
+            exit_code: status.code().unwrap_or(-1),
             output: merged,
-        })
+        }))
     }
 }
 
