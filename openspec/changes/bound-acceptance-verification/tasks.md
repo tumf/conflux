@@ -18,10 +18,7 @@
 - The superseded prompt-only advisory reuse block (`build_verification_reuse_context` and its tests) was removed rather than left alongside the boundary block: two competing prompt contracts for the same decision is exactly the ambiguity this change exists to end. The reuse *machinery* (`plan_reuse`, `decide_reuse`, `RuntimeVerificationExecutor`) is unchanged and is now driven by the runtime.
 - `RepositoryFacts` gained a defaulted `resolve_revision`. The default refuses rather than answering with `HEAD`, so a fact source that cannot resolve a base leaves the review range empty instead of binding evidence to a comparison nobody made.
 - Test-only task-local `REVIEW_BUDGET_OVERRIDE_MS` scopes the semantic review budget to milliseconds, mirroring the existing verdict-grace override. The production partition is whole seconds and its smallest positive work budget is one second; proving the deadline fires, terminates, reaps, and settles does not need a real second of waiting.
-
-## Observed Flakiness (not caused by this change)
-
-- `parallel::tests::manual_resolve::persistent_scheduler_dynamic_queue_push_after_initial_analysis_bypasses_debounce` and `parallel::tests::run_command_scope::run_fatal_error_precedes_cleanup_barrier` failed once each under the heavier concurrent load of `cargo test --tests`, and pass individually and in repeated full `cargo test --lib` runs. Neither touches Acceptance, the manifest, or any code this change modified; both assert on timing-sensitive scheduler ordering.
+- Observed flakiness, not caused by this change: `parallel::tests::manual_resolve::persistent_scheduler_dynamic_queue_push_after_initial_analysis_bypasses_debounce` and `parallel::tests::run_command_scope::run_fatal_error_precedes_cleanup_barrier` failed once each under the heavier concurrent load of `cargo test --tests`, and pass individually and in repeated full `cargo test --lib` runs. Neither touches Acceptance, the manifest, or any code this change modified; both assert on timing-sensitive scheduler ordering.
 
 ## Final Validation
 
