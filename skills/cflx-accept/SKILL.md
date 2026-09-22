@@ -108,9 +108,35 @@ canonical contract remains JSON-primary.
 
 Do not emit alternate schemas, extra machine-readable verdict objects, or provider-specific terminal markers.
 
+## Runtime-Owned Execution Boundary
+
+When the runtime supplies an Acceptance execution manifest (an `<acceptance_execution_boundary>` block), **its eligible declared change-blocking verification set is the complete blocking command boundary.** Conflux has already executed — or exactly reused bound evidence for — every gate in that set, under its own supervision, against the frozen candidate revision. The results you receive are immutable.
+
+Inside that boundary:
+
+- **Do not start** repository-wide or full-suite checks, base-worktree comparisons, sibling-change checks, or unrelated artifact investigations as prerequisites for your verdict. They are not in the manifest, so the runtime will neither await them nor count them as blocking evidence, and waiting on one only spends the shared budget your review needs.
+- **Do not rerun or supplement a declared gate.** The runtime supervised it and bound the result to this exact commit, tree, automation blob, and tool identity. A second run of your own is bound to none of that.
+- **An already-available undeclared observation may inform a finding.** If something you can already see reveals a concrete defect in the candidate, cite it in an atomic repository finding. But a missing, failed, running, or incomplete undeclared observation MUST NOT delay or block your verdict by itself.
+- **Read-only inspection of in-range repository content is expected.** Read the diff, the proposal, the tasks, the spec deltas, and any source file you need to judge the implementation. That is inspection, not blocking verification work.
+- **Evaluate the frozen candidate revision and the exact review range** the manifest names, not whatever `HEAD` happens to be when you look.
+
+What the boundary does not do is decide the verdict for you. Passing gates never imply `PASS`: they are evidence that the declared commands pass, never evidence that the implementation is acceptable. A correct-looking test result over a wrong implementation is still a `FAIL`, and semantic review of the diff against the proposal and specs remains entirely yours.
+
+Gate result statuses and what each means for you:
+
+| Gate status | Meaning | Your obligation |
+| --- | --- | --- |
+| `executed` | the runtime ran the declared command now; it passed | treat as passing declared evidence |
+| `reused` | exact bound evidence for this commit and tree was still valid | identical to `executed`; do not rerun it |
+| `failed` | the declared command ran and failed | a blocking failure of this candidate; emit `FAIL` with the gate as evidence |
+| `refused` | the runtime could not run it (environment, prerequisite, earlier failure) | a runtime/environment fact; never a finding against the change |
+| `deadline_exhausted` | the shared budget ran out before it finished | a runtime fact; never a finding against the change |
+
+If no manifest is supplied, the guidance in the rest of this skill applies unchanged.
+
 ## Verification Completion Ownership
 
-The parent acceptance agent retains ownership of every verification it starts and MUST wait for the final result of every command, sub-agent, job, or monitored verification before emitting the final verdict.
+The parent acceptance agent retains ownership of every verification it starts and MUST wait for the final result of every command, sub-agent, job, or monitored verification before emitting the final verdict. Within a runtime-owned boundary, the only work you may start is manifest-authorized or read-only review; you MUST NOT start undeclared verification work at all.
 
 - If a verification result arrives asynchronously (for example through a completion notification or a background job), keep waiting until the final result is received and evaluated. Do not exit while owned verification work is still running.
 - Progress prose, a waiting/status message, or a promise to decide after a future completion notification is not a valid terminal acceptance response. Only the canonical verdict terminates acceptance.
@@ -118,6 +144,8 @@ The parent acceptance agent retains ownership of every verification it starts an
 - This rule is portable and does not depend on a named runtime-specific monitoring tool. Whatever mechanism the current runtime uses to run or observe verification work, the parent agent must obtain the final result before terminating.
 
 The Conflux runtime classifies a completed acceptance run that emits no canonical verdict as a missing-verdict protocol failure. It is not treated as an intentional `CONTINUE` and does not use the explicit-CONTINUE retry path.
+
+Work that is still active at the **review deadline** is terminated and reaped by the runtime, and that invocation settles as a non-resumable `stalled` execution hold with category `acceptance_review_deadline_exhausted` — it does not enter the missing-verdict retry loop. A retry with unchanged repository input is then refused as `unchanged_acceptance_input`. Budget your review accordingly: finish inside the boundary and emit a verdict rather than holding out for work the runtime never authorized.
 
 ## Scoped Guidance
 

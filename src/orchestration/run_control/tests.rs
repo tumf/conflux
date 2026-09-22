@@ -79,8 +79,52 @@ struct Harness {
     eligibility: Arc<StartEligibility>,
 }
 
+/// An in-memory acceptance-admission port: refuses exactly the IDs it was given.
+struct FakeAdmission {
+    refused: Vec<String>,
+}
+
+#[async_trait]
+impl crate::orchestration::operator_command::AcceptanceAdmissionPort for FakeAdmission {
+    async fn classify(
+        &self,
+        change_id: &str,
+    ) -> crate::orchestration::acceptance::execution_manifest::AcceptanceAdmission {
+        use crate::orchestration::acceptance::execution_manifest::{
+            AcceptanceAdmission, AcceptanceHoldCategory, FINGERPRINT_COMPONENTS,
+            UNCHANGED_ACCEPTANCE_INPUT,
+        };
+
+        if self.refused.iter().any(|id| id == change_id) {
+            AcceptanceAdmission::Refuse {
+                outcome: UNCHANGED_ACCEPTANCE_INPUT,
+                category: AcceptanceHoldCategory::ReviewDeadlineExhausted,
+                fingerprint: "a".repeat(64),
+                components: FINGERPRINT_COMPONENTS.to_vec(),
+            }
+        } else {
+            AcceptanceAdmission::Admit
+        }
+    }
+}
+
 impl Harness {
     fn new(change_ids: &[&str]) -> Self {
+        Self::with_refused_acceptance(change_ids, &[])
+    }
+
+    /// A harness whose acceptance-admission port refuses the named changes.
+    fn with_refused_acceptance(change_ids: &[&str], refused: &[&str]) -> Self {
+        let admission = Arc::new(FakeAdmission {
+            refused: refused.iter().map(|id| id.to_string()).collect(),
+        });
+        Self::build(change_ids, Some(admission))
+    }
+
+    fn build(
+        change_ids: &[&str],
+        admission: Option<Arc<dyn crate::orchestration::operator_command::AcceptanceAdmissionPort>>,
+    ) -> Self {
         let state = Arc::new(RwLock::new(OrchestratorState::new(
             change_ids.iter().map(|id| id.to_string()).collect(),
             10,
@@ -91,12 +135,18 @@ impl Harness {
         // The scheduler handle stays with run control, which is the only thing
         // that reads liveness: it chooses between waking an existing boundary
         // and starting a new one. Command admission observes no boundary at all.
-        let operator = Arc::new(OperatorCommandService::new(
-            state.clone(),
-            queue.clone(),
-            Arc::new(NoopQueueHooks),
-            marks.clone(),
-        ));
+        let operator = {
+            let service = OperatorCommandService::new(
+                state.clone(),
+                queue.clone(),
+                Arc::new(NoopQueueHooks),
+                marks.clone(),
+            );
+            Arc::new(match admission {
+                Some(admission) => service.with_acceptance_admission(admission),
+                None => service,
+            })
+        };
         let resolves = Arc::new(ResolveReservations::new());
         let eligibility = Arc::new(StartEligibility::new());
         Self {
@@ -1618,6 +1668,102 @@ async fn run_mark_intent_start_admission_unmark_does_not_cancel_or_dequeue_admit
         harness.effects().await,
         admitted,
         "unmarking must not dequeue, cancel, unschedule, or restatus admitted work"
+    );
+}
+
+// ============================================================================
+// Per-target unchanged-Acceptance-input refusals
+// ============================================================================
+
+/// A bulk retry over a mixed request reports the refused target *by name and
+/// reason* while admitting the eligible sibling exactly once.
+///
+/// The point is that a refusal and a skip are different answers. Before this,
+/// the reporting variant had no production caller, so `alpha` simply vanished
+/// from the accepted list and the operator was left to guess why.
+#[tokio::test]
+async fn bulk_retry_reports_the_unchanged_acceptance_input_refusal_per_target() {
+    use crate::orchestration::acceptance::execution_manifest::UNCHANGED_ACCEPTANCE_INPUT;
+
+    let harness = Harness::with_refused_acceptance(&["alpha", "beta"], &["alpha"]);
+    harness.to_error("alpha").await;
+    harness.to_error("beta").await;
+
+    let prepared = harness
+        .service
+        .prepare_retry_errors(&["alpha".to_string(), "beta".to_string()])
+        .await
+        .expect("one refused target must not refuse the whole request");
+
+    let PreparedIntent::Retry { routes, excluded } = &prepared.intent else {
+        panic!(
+            "a bulk retry must produce retry intent, got {:?}",
+            prepared.intent
+        );
+    };
+    assert_eq!(
+        routes.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        vec!["beta"],
+        "only the admitted sibling may be routed"
+    );
+    assert_eq!(excluded.len(), 1, "{excluded:?}");
+    assert_eq!(excluded[0].change_id, "alpha");
+    assert_eq!(
+        excluded[0].status, UNCHANGED_ACCEPTANCE_INPUT,
+        "the exclusion must carry the stable outcome token, not a lifecycle status"
+    );
+    assert!(
+        excluded[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("restores retry eligibility")),
+        "the exclusion must say what to change: {:?}",
+        excluded[0].detail
+    );
+}
+
+/// Start/F5 retry admission carries the same per-target refusal. Start is the
+/// path with no explicit target list at all, so an unexplained short accepted
+/// set is exactly where an operator has the least to go on.
+#[tokio::test]
+async fn start_retry_admission_reports_the_unchanged_acceptance_input_refusal() {
+    use crate::orchestration::acceptance::execution_manifest::UNCHANGED_ACCEPTANCE_INPUT;
+
+    let harness = Harness::with_refused_acceptance(&["alpha", "beta"], &["alpha"]);
+    harness.to_error("alpha").await;
+    harness.to_error("beta").await;
+    harness.mark(&["alpha", "beta"]);
+
+    let outcome = harness
+        .service
+        .start(OperatorMode::Select)
+        .await
+        .expect("a retry-eligible sibling keeps Start runnable");
+
+    let RunControlOutcome::RunDispatched {
+        change_ids,
+        explicit_retry,
+        excluded,
+        ..
+    } = outcome
+    else {
+        panic!("Start must dispatch the admitted retry, got {outcome:?}");
+    };
+    assert_eq!(change_ids, vec!["beta".to_string()]);
+    assert!(explicit_retry);
+    assert_eq!(excluded.len(), 1, "{excluded:?}");
+    assert_eq!(excluded[0].change_id, "alpha");
+    assert_eq!(excluded[0].status, UNCHANGED_ACCEPTANCE_INPUT);
+    assert!(
+        excluded[0].describe().contains(UNCHANGED_ACCEPTANCE_INPUT),
+        "the one operator-facing spelling must name the refusal: {}",
+        excluded[0].describe()
+    );
+
+    assert_eq!(
+        harness.status("alpha").await,
+        "error",
+        "a refused target keeps its terminal evidence"
     );
 }
 

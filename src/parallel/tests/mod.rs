@@ -1,6 +1,8 @@
 //! Tests for parallel execution module.
 
 #[cfg(test)]
+mod acceptance_execution_boundary;
+#[cfg(test)]
 mod acceptance_runtime_limit;
 #[cfg(test)]
 mod analysis_liveness_loop;

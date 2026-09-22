@@ -51,15 +51,29 @@ Backward-compatible fallback markers:
 
 Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or the current stalled-hold compatibility token `gated`. For blocking SPECA/property failures that are repository-fixable, return the standard JSON `fail` verdict with actionable `findings` under the portable Conflux acceptance interface. Valid Implementation Blockers still create stalled acceptance holds and use the shared `gated` compatibility handoff until parser support for a `stalled` verdict exists, but only with the full structured blocker payload (explicit supported `category`, non-empty `evidence`, a verifiable `unblock_condition`, `next_action`, and `resumable`). Choose the category from observed evidence; the runtime never infers one from prose, and it never accepts a bare token as a hold. Conflux — not this skill — classifies the validated result as operator-facing `blocked` (a validated non-repository prerequisite) or `stalled` (repeated findings, no semantic progress, or an exhausted repair budget). Do not emit any SPECA-specific terminal marker, alternate verdict line, alternate schema, or extra machine-readable verdict object. During JSON rollout, follow `cflx-accept` transition behavior by emitting JSON first and the matching legacy marker second as the final two lines when compatibility with older runtimes is required.
 
+## Runtime-Owned Execution Boundary
+
+Apply the same runtime-owned execution boundary as `cflx-accept`. When the runtime supplies an `<acceptance_execution_boundary>` manifest, its eligible declared change-blocking verification set is the **complete blocking command boundary**, the runtime has already executed or exactly reused every gate in it, and those typed results are immutable.
+
+This constrains SPECA work exactly as it constrains anything else: a SPECA runner phase that is not in the manifest is undeclared verification work, so it must not be started as a prerequisite for the verdict, and its absence or incompletion must not delay one. SPECA phases the manifest *does* declare have already been run by the runtime; do not rerun them.
+
+Do not start repository-wide or full-suite checks, base-worktree comparisons, sibling-change checks, or unrelated artifact investigations as completion prerequisites. Read-only inspection of in-range repository content is expected. An already-available undeclared observation may inform a finding and be cited in it; a missing, failed, running, or incomplete one may not block the verdict.
+
+A gate reported `failed` is a blocking failure of this candidate. A gate reported `refused` or `deadline_exhausted` is a runtime/environment fact, never a finding against the change.
+
+Passing gates never imply `PASS`: semantic review of the frozen candidate and the exact review range against the proposal and specs remains yours.
+
 ## Verification Completion Ownership
 
-Apply the same completion-ownership rule as `cflx-accept`: the parent acceptance agent retains ownership of every verification it starts and MUST wait for the final result of every command, sub-agent, job, or monitored verification before emitting the final verdict. This includes SPECA runner phases and any other asynchronous or long-running verification work started during acceptance.
+Apply the same completion-ownership rule as `cflx-accept`: the parent acceptance agent retains ownership of every verification it starts and MUST wait for the final result of every command, sub-agent, job, or monitored verification before emitting the final verdict. This includes SPECA runner phases and any other asynchronous or long-running verification work started during acceptance. Within a runtime-owned boundary, the only work you may start is manifest-authorized or read-only review.
 
 - If a verification result arrives asynchronously (for example through a completion notification or a background job), keep waiting until the final result is received and evaluated. Do not exit while owned verification work is still running.
 - Progress prose, a waiting/status message, or a promise to decide after a future completion notification is not a valid terminal acceptance response. Only the canonical verdict terminates acceptance.
 - This rule is portable and does not depend on a named runtime-specific monitoring tool. Whatever mechanism the current runtime uses to run or observe verification work, the parent agent must obtain the final result before terminating.
 
 The Conflux runtime classifies a completed acceptance run that emits no canonical verdict as a missing-verdict protocol failure. It is not treated as an intentional `CONTINUE` and does not use the explicit-CONTINUE retry path.
+
+Work still active at the **review deadline** is terminated and reaped by the runtime, and that invocation settles as a non-resumable `stalled` execution hold with category `acceptance_review_deadline_exhausted` rather than entering the missing-verdict retry loop. A retry with unchanged repository input is then refused as `unchanged_acceptance_input`.
 
 ## Declared Verification Phases
 

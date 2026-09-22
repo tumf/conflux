@@ -500,6 +500,31 @@ impl ChangeRuntimeState {
         self.is_acceptance_stalled() && self.blocked_metadata.resumable
     }
 
+    /// Whether this hold is one the runtime-owned Acceptance execution boundary
+    /// published, and is therefore *fingerprint-guarded*.
+    ///
+    /// The distinction decides who refuses an explicit retry. An ordinary
+    /// non-resumable stall has nothing that can tell "the operator changed
+    /// something" from "the operator pressed the key again", so retrying past it
+    /// would dispatch ambiguous work and the resumability guard refuses it. A
+    /// boundary hold does: its stable category names a bounded invocation whose
+    /// re-admissibility the input fingerprint answers, and the admission
+    /// classifier has already answered it by the time a route is committed.
+    /// Refusing those a second time on `resumable: false` is what made a changed
+    /// fingerprint unable to restore retry eligibility at all.
+    pub fn is_acceptance_execution_hold(&self) -> bool {
+        use crate::orchestration::acceptance::execution_manifest::AcceptanceHoldCategory;
+
+        self.is_acceptance_stalled()
+            && self
+                .blocked_metadata
+                .blocker_reason
+                .as_deref()
+                .map(|reason| reason.rsplit(':').next().unwrap_or(reason))
+                .and_then(AcceptanceHoldCategory::parse)
+                .is_some()
+    }
+
     /// Whether a validated external prerequisite currently blocks this change.
     #[allow(dead_code)] // Consumed by external-blocked lifecycle regression coverage.
     pub fn is_external_blocked(&self) -> bool {

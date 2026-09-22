@@ -17,6 +17,7 @@ const TREE: &str = "2222222222222222222222222222222222222222";
 const BLOB: &str = "3333333333333333333333333333333333333333";
 const TOOL_DIGEST: &str = "4444444444444444444444444444444444444444";
 const ARTIFACT_DIGEST: &str = "5555555555555555555555555555555555555555";
+const REVIEW_BASE: &str = "6666666666666666666666666666666666666666";
 
 fn tool() -> ToolIdentity {
     ToolIdentity {
@@ -54,6 +55,8 @@ fn evidence() -> VerificationEvidence {
         verification_id: "bound-evidence-tests".to_string(),
         commit_oid: COMMIT.to_string(),
         tree_oid: TREE.to_string(),
+        review_base_commit: REVIEW_BASE.to_string(),
+        review_range: format!("{REVIEW_BASE}..{COMMIT}"),
         argv: vec![
             "cargo".to_string(),
             "test".to_string(),
@@ -78,6 +81,10 @@ fn current() -> CurrentBindings {
     CurrentBindings {
         commit_oid: COMMIT.to_string(),
         tree_oid: TREE.to_string(),
+        review: Some(ReviewBinding {
+            base_commit: REVIEW_BASE.to_string(),
+            range: format!("{REVIEW_BASE}..{COMMIT}"),
+        }),
         automation_blob_oid: BLOB.to_string(),
         tool: tool(),
         clean: true,

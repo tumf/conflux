@@ -207,7 +207,12 @@ pub fn map_operator_error(error: &OperatorCommandError) -> CommandFailure {
         // A refused targeted force-stop is always a fact about *this* target —
         // terminal, unadmitted, or owning no killable process — so a different
         // target is what would change the answer.
-        | OperatorCommandError::ForceStopIneligible { .. } => {
+        | OperatorCommandError::ForceStopIneligible { .. }
+        // Unchanged Acceptance input is the same shape: this target, as the
+        // repository currently describes it, cannot be retried. The message
+        // names the fingerprint components, so the client is told what to change
+        // rather than merely that it was refused.
+        | OperatorCommandError::UnchangedAcceptanceInput { .. } => {
             CommandFailure::new(ErrorCode::TargetIneligible, error.to_string())
         }
         // Termination did not confirm: the change is still occupying the root.

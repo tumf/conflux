@@ -8,6 +8,17 @@
 /// belongs to this exact tree, or has to be run again.
 pub mod verification_evidence;
 
+/// The runtime-owned manifest that closes the Acceptance blocking command set
+/// and gives one invocation's input a stable identity.
+pub mod execution_manifest;
+
+/// Runtime-owned execution of the manifest's declared gates, before the
+/// semantic reviewer starts and inside the same shared budget.
+pub mod gate_execution;
+
+/// Deriving the execution manifest from workspace evidence alone.
+pub mod manifest_builder;
+
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{AcceptanceAttempt, OutputCollector};
@@ -788,6 +799,10 @@ pub fn classify_invalid_acceptance_result(
         | AcceptanceResult::PermissionStalled { .. }
         | AcceptanceResult::CommandFailed { .. }
         | AcceptanceResult::RuntimeLimit { .. }
+        // A bounded execution hold is a boundary decision, not an invalid
+        // reviewer response: escalating it would re-dispatch exactly the work
+        // the boundary just stopped.
+        | AcceptanceResult::ExecutionHold { .. }
         | AcceptanceResult::Cancelled => None,
     }
 }
@@ -2049,6 +2064,23 @@ pub enum AcceptanceResult {
     /// continuation; and it is not `Cancelled`, so an operator stop and a
     /// runaway Acceptance stay distinguishable in reporting.
     RuntimeLimit { limit: AcceptanceRuntimeLimit },
+    /// The bounded Acceptance boundary settled without a verdict and without an
+    /// external prerequisite: a non-resumable execution hold.
+    ///
+    /// This is the variant that makes [`AcceptanceResult::RuntimeLimit`] rare.
+    /// A declared gate that ran out of shared budget, a reviewer that reached
+    /// the reserved finalization window with no canonical verdict, an unproven
+    /// process group, a malformed manifest, or a runtime defect all settle here
+    /// *before* the outer absolute limit, carrying a stable category and the
+    /// input fingerprint that refuses an unchanged retry. The outer runtime
+    /// limit remains only a defect-containment fallback.
+    ///
+    /// Not a verdict: a review that ran out of time says nothing about whether
+    /// the implementation is correct, so this never reaches verdict routing and
+    /// never enters missing-verdict continuation.
+    ExecutionHold {
+        hold: execution_manifest::AcceptanceExecutionHold,
+    },
     /// Acceptance was cancelled (e.g., by user or timeout).
     Cancelled,
 }
@@ -2092,8 +2124,16 @@ impl AcceptanceResult {
     pub fn permits_acceptance_retry(&self) -> bool {
         !matches!(
             self,
-            AcceptanceResult::RuntimeLimit { .. } | AcceptanceResult::Cancelled
+            AcceptanceResult::RuntimeLimit { .. }
+                | AcceptanceResult::Cancelled
+                | AcceptanceResult::ExecutionHold { .. }
         )
+    }
+
+    /// Returns true when this invocation settled as a non-resumable bounded
+    /// execution hold.
+    pub fn is_execution_hold(&self) -> bool {
+        matches!(self, AcceptanceResult::ExecutionHold { .. })
     }
 }
 
@@ -2484,6 +2524,10 @@ where
         // limit, which is classified from the runner's typed termination before
         // any output is parsed. A terminated invocation carries no findings.
         AcceptanceResult::RuntimeLimit { .. } => None,
+        // Same reason: the bounded execution hold is decided by the runtime
+        // before or instead of verdict parsing, so it records no canonical
+        // attempt and contributes no findings.
+        AcceptanceResult::ExecutionHold { .. } => None,
         AcceptanceResult::CommandFailed { .. }
         | AcceptanceResult::PermissionStalled { .. }
         | AcceptanceResult::Cancelled => {

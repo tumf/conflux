@@ -551,6 +551,8 @@ Repository-fixable findings MUST be atomic and SHOULD include a stable finding c
 
 Apply guidance MUST treat runtime-owned acceptance finding text as immutable task identity metadata. The general rule allowing task descriptions to be refined MUST NOT apply to runtime-owned acceptance findings; remediation and verification evidence MUST be recorded separately.
 
+When the runtime supplies an Acceptance execution manifest, its eligible declared change-blocking verification set MUST be the complete blocking command boundary for both `cflx-accept` and `cflx-accept-with-speca`. The skill MUST evaluate the frozen candidate revision, review range, change artifacts, diff, and typed gate results. It MUST NOT start repository-wide/full-suite checks, base-worktree comparisons, sibling-change checks, or unrelated artifact investigations as prerequisites for a verdict. Already-available undeclared observations MAY inform a repository finding, but their absence, failure, or incompletion MUST remain non-blocking.
+
 #### Scenario: cflx-accept defines JSON-primary verdict contract
 
 - **GIVEN** the acceptance prompt loads `cflx-accept`
@@ -582,6 +584,22 @@ Apply guidance MUST treat runtime-owned acceptance finding text as immutable tas
 - **WHEN** apply fixes and verifies that finding
 - **THEN** apply marks the existing task complete without rewriting its finding text
 - **AND** remediation or verification evidence is recorded separately
+
+
+#### Scenario: declared verification closes the blocking command set
+
+- **GIVEN** the execution manifest names one eligible change-blocking verification
+- **AND** its typed runtime-owned result is successful or exactly reused
+- **WHEN** either acceptance skill performs semantic review
+- **THEN** it does not start any undeclared verification as a completion prerequisite
+- **AND** it emits a verdict from the frozen candidate and declared evidence
+
+#### Scenario: broad observation is non-blocking
+
+- **GIVEN** an undeclared repository-wide observation is already complete and available to the reviewer
+- **WHEN** it reveals a concrete defect in the candidate implementation
+- **THEN** the reviewer may cite that evidence in an atomic repository finding
+- **AND** a missing, failed, running, or incomplete undeclared observation cannot delay or block the verdict by itself
 
 ### Requirement: Dedicated analyze and resolve skills MUST own fixed operation guidance
 
@@ -918,7 +936,7 @@ Acceptance prompt construction MUST include current repository diff context and 
 
 ### Requirement: Acceptance agents retain ownership of started verification
 
-Acceptance guidance MUST require the parent acceptance agent to wait for the final result of every command, sub-agent, job, or monitored verification it starts before emitting its final verdict. The agent MUST NOT terminate with only progress prose, a waiting message, or a promise to decide after a future completion notification. This rule MUST remain portable and MUST NOT depend on a named runtime-specific monitoring tool.
+Acceptance guidance MUST require the parent acceptance agent to wait for the final result of every manifest-declared verification, sub-agent, job, or monitored operation it starts within the runtime-provided review boundary before emitting its final verdict. The agent MUST NOT start undeclared verification work. It MUST NOT terminate with only progress prose, a waiting message, or a promise to decide after a future completion notification. Work that remains active at the review deadline MUST be terminated and reaped by the runtime and MUST NOT enter the missing-verdict retry loop. This rule MUST remain portable and MUST NOT depend on a named runtime-specific monitoring tool.
 
 #### Scenario: monitored verification completes before verdict
 
@@ -937,9 +955,17 @@ Acceptance guidance MUST require the parent acceptance agent to wait for the fin
 #### Scenario: standard and SPECA skills share completion ownership
 
 **Given**: either `cflx-accept` or `cflx-accept-with-speca` is selected
-**When**: acceptance starts verification work
-**Then**: both skills require the same wait-for-result and final-verdict behavior
+**When**: acceptance starts manifest-authorized verification or review work
+**Then**: both skills require the same bounded wait-for-result and final-verdict behavior
 **And**: neither skill depends on a provider-specific command or tool name
+
+
+#### Scenario: review deadline owns unfinished work
+
+**Given**: the acceptance agent has not completed manifest-authorized work by the review deadline
+**When**: the reserved finalization window begins
+**Then**: runtime terminates and reaps the owned process group
+**And**: the invocation settles as `stalled` with category `acceptance_review_deadline_exhausted` rather than starting a missing-verdict retry
 
 ### Requirement: Acceptance findings MUST define an actionable structured repair contract
 

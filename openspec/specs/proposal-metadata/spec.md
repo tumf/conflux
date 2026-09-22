@@ -141,7 +141,7 @@ Each verification declaration MUST contain a unique non-empty `id`, a non-empty 
 
 ### Requirement: Verification evidence reuse is bound to current repository state
 
-Conflux MAY reuse successful Apply verification evidence during Acceptance only from a versioned repository-local sidecar created by a Conflux-runtime-owned executor that directly supervised the declared process and bound the result to one declared verification ID. An Apply-agent-authored record MUST NOT be reusable. The record MUST include the full-length Apply commit object ID and tree ID, exact argv, repository-relative working directory, tracked automation-file blob identity, tool executable identity, start and end timestamps, exit code, evidence artifact content digest, and clean index/worktree state before and after execution. The designated Git-excluded runtime evidence directory MUST be ignored when comparing cleanliness and tree differences; no other difference from the bound Apply commit is permitted. Acceptance MUST compare every binding with current Git state and the current proposal declaration. A missing, malformed, stale, dirty, mismatched, unsuccessful, agent-authored, or unverifiable record MUST force command rerun and MUST NOT imply PASS. Reuse decisions MUST NOT depend on out-of-worktree durable state.
+Conflux MAY reuse successful Apply or runtime-owned Acceptance verification evidence during Acceptance only from a versioned repository-local sidecar created by a Conflux-runtime-owned executor that directly supervised the declared process and bound the result to one declared verification ID. An agent-authored record MUST NOT be reusable. The record MUST include the full-length candidate commit object ID and tree ID, exact review base and range, exact argv, repository-relative working directory, tracked automation-file blob identity, tool executable identity, start and end timestamps, exit code, evidence artifact content digest, and clean index/worktree state before and after execution. The designated Git-excluded runtime evidence directory MUST be ignored when comparing cleanliness and tree differences; no other difference from the bound Apply commit is permitted. Acceptance MUST compare every binding with current Git state, the current proposal declaration, and the runtime-owned execution manifest. A missing, malformed, stale, dirty, mismatched, unsuccessful, agent-authored, or unverifiable record MUST force runtime-owned command execution or a typed hold and MUST NOT imply PASS. Reuse decisions MUST NOT depend on out-of-worktree durable state.
 
 #### Scenario: Exact successful evidence is reused
 
@@ -173,7 +173,7 @@ Conflux MAY reuse successful Apply verification evidence during Acceptance only 
 
 #### Scenario: Evidence sidecar does not invalidate its own binding
 
-**Given**: the current commit and tree match the bound Apply result
+**Given**: the current commit and tree match the bound candidate result
 **And**: the only worktree difference is inside the designated runtime evidence directory
 **When**: Acceptance evaluates the runtime-authored sidecar
 **Then**: the sidecar difference does not make the capture dirty or stale
@@ -198,3 +198,18 @@ Conflux MAY reuse successful Apply verification evidence during Acceptance only 
 **Given**: Conflux restarts and external caches are absent
 **When**: Acceptance reconstructs the next action
 **Then**: it derives reuse eligibility from repository-local runtime evidence and current Git state alone
+
+
+#### Scenario: Review range mismatch invalidates evidence
+
+**Given**: otherwise valid evidence is bound to a different candidate revision, review base, or review range
+**When**: Acceptance constructs the current execution manifest
+**Then**: the evidence is not reusable
+**And**: the runtime executes the declared verification or returns its ordinary typed hold
+
+#### Scenario: Undeclared command has no blocking authority
+
+**Given**: the execution manifest contains every eligible change-blocking declaration
+**When**: a semantic reviewer proposes an undeclared repository-wide command
+**Then**: that command is not started or stored as blocking evidence
+**And**: its absence cannot prevent a verdict

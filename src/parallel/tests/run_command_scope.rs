@@ -285,6 +285,28 @@ async fn pump<F>(
 ) where
     F: Future,
 {
+    pump_until(scheduler, finished, events, collected, window, |_| false).await;
+}
+
+/// [`pump`] that also stops as soon as `arrived` is satisfied.
+///
+/// The difference matters for a *positive* claim. "The Error is published before
+/// the barrier" is a statement about ordering, and polling for a fixed window to
+/// observe it turns that ordering into a wall-clock race the test loses whenever
+/// the machine is busy. Waiting for the event itself — under a window that is
+/// only a hang safeguard — asserts the same contract and stops depending on how
+/// loaded the suite is. A *negative* claim ("and it still has not returned")
+/// keeps its real window, because there is no event to wait for.
+async fn pump_until<F>(
+    scheduler: &mut Pin<Box<F>>,
+    finished: &mut Option<F::Output>,
+    events: &mut mpsc::Receiver<ParallelEvent>,
+    collected: &mut Vec<ParallelEvent>,
+    window: Duration,
+    arrived: impl Fn(&[ParallelEvent]) -> bool,
+) where
+    F: Future,
+{
     if finished.is_some() {
         return;
     }
@@ -298,7 +320,7 @@ async fn pump<F>(
         while let Ok(event) = events.try_recv() {
             collected.push(event);
         }
-        if finished.is_some() {
+        if finished.is_some() || arrived(collected) {
             break;
         }
     }
@@ -369,12 +391,16 @@ async fn run_fatal_error_precedes_cleanup_barrier() {
     let mut finished = None;
     let mut collected = Vec::new();
 
-    pump(
+    // Wait for the Error itself rather than for a fixed slice of wall clock: the
+    // claim is that it arrives *before* the barrier releases, and `EVENT_WAIT` is
+    // only there so a genuinely missing event fails instead of hanging.
+    pump_until(
         &mut scheduler,
         &mut finished,
         &mut events,
         &mut collected,
-        BARRIER_WINDOW,
+        EVENT_WAIT,
+        |collected| !global_errors(collected).is_empty(),
     )
     .await;
 
@@ -396,10 +422,23 @@ async fn run_fatal_error_precedes_cleanup_barrier() {
     );
 
     // Half two: ordered. While the registration is held, the scheduler owes its
-    // barrier and must not have returned failure.
+    // barrier and must not have returned failure — not at the instant the Error
+    // landed, and not for a real window afterwards either.
     assert!(
         finished.is_none(),
         "scheduler failure return must wait for run-owned command cleanup"
+    );
+    pump(
+        &mut scheduler,
+        &mut finished,
+        &mut events,
+        &mut collected,
+        BARRIER_WINDOW,
+    )
+    .await;
+    assert!(
+        finished.is_none(),
+        "the held registration keeps the barrier open for as long as it is held"
     );
 
     held.release_confirmed();
