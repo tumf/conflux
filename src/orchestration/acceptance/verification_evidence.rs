@@ -1142,9 +1142,9 @@ impl CaptureOutcome {
 /// path from a workspace, which is what makes "Acceptance never writes into a
 /// target" a property of the type rather than a rule callers have to remember.
 /// The caller resolves the directory through
-/// [`crate::config::defaults::acceptance_store_path`], which refuses any root
-/// inside the target repository or a managed worktree before this store exists
-/// at all.
+/// [`crate::orchestration::acceptance::evidence_location::store_path`], which
+/// refuses any root inside the target repository or a managed worktree before
+/// this store exists at all.
 ///
 /// The directory is runtime-owned: `0700`, holding files written `0400`. Reads
 /// apply the same ownership test they would apply to any untrusted input,

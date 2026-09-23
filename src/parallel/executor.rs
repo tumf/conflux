@@ -2318,7 +2318,11 @@ pub async fn execute_acceptance_in_workspace(
     // unchanged prompt, which is exactly what the skill's "if no manifest is
     // supplied" clause is written for.
     let boundary_context = boundary.as_ref().map_or_else(String::new, |boundary| {
-        crate::agent::build_acceptance_boundary_context(&boundary.manifest, &boundary.gates)
+        crate::agent::build_acceptance_boundary_context(
+            &boundary.manifest,
+            &boundary.gates,
+            boundary.store.root(),
+        )
     });
 
     // Build prompt injected into `{prompt}`

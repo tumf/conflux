@@ -1111,7 +1111,10 @@ inspection of in-range repository content is expected; starting blocking work is
 of the implementation against the proposal and specs is still yours, and a correct-looking test \
 result over a wrong implementation is a FAIL.\n\
 - A gate reported `failed` is a blocking failure of this candidate. A gate reported `refused` or \
-`deadline_exhausted` is a runtime/environment fact, never a finding against the change.";
+`deadline_exhausted` is a runtime/environment fact, never a finding against the change.\n\
+- Captured gate output lives outside the worktree. Each `artifact_path` is relative to \
+`evidence_store_root` below: join the two to read an artifact. Never look for one inside the \
+target repository, and never write to the store.";
 
 /// Build the runtime-owned execution-boundary context for one acceptance
 /// invocation.
@@ -1119,15 +1122,26 @@ result over a wrong implementation is a FAIL.\n\
 /// Always non-empty once a manifest exists, including when the change declares
 /// no gate at all: "there are no blocking gates" is precisely the statement that
 /// stops a reviewer from inventing some.
+///
+/// `evidence_store_root` is the resolved external store directory. It is emitted
+/// alongside the gate results because every `artifact_path` in them is
+/// store-relative: without the root the reviewer is told it may cite an artifact
+/// it has no way to locate, and the worktree-relative reading it would otherwise
+/// fall back to is exactly the path this change removed.
 pub fn build_acceptance_boundary_context(
     manifest: &crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionManifest,
     gates: &crate::orchestration::acceptance::execution_manifest::GateResults,
+    evidence_store_root: &std::path::Path,
 ) -> String {
     const MAX_CONTEXT_BYTES: usize = 24_576;
 
     let mut payload = manifest.to_review_json();
     if let Some(object) = payload.as_object_mut() {
         object.insert("gate_results".to_string(), gates.to_json());
+        object.insert(
+            "evidence_store_root".to_string(),
+            serde_json::Value::String(evidence_store_root.display().to_string()),
+        );
     }
     let encoded = payload
         .to_string()

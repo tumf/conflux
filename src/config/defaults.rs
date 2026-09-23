@@ -700,21 +700,6 @@ pub fn acceptance_store_path_in(
     Ok(path)
 }
 
-/// Process-facing wrapper over [`acceptance_store_path_in`].
-pub fn acceptance_store_path(
-    configured: Option<&str>,
-    project_root: &std::path::Path,
-    workspace: &std::path::Path,
-    change_id: &str,
-) -> std::result::Result<PathBuf, AcceptanceStoreError> {
-    acceptance_store_path_in(
-        &acceptance_root_path(configured)?,
-        project_root,
-        workspace,
-        change_id,
-    )
-}
-
 /// Create the resolved store and prove it is writable.
 ///
 /// Existence is not permission: an unwritable mount answers `create_dir_all`
