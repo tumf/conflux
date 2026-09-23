@@ -1,6 +1,7 @@
 //! Configuration templates for different AI agents
 
 use crate::cli::Template;
+use crate::config::OrchestratorConfig;
 
 /// Claude Code agent configuration template
 pub const CLAUDE_TEMPLATE: &str = r#"{
@@ -432,6 +433,65 @@ pub fn get_template_content(template: Template) -> &'static str {
         Template::Opencode => OPENCODE_TEMPLATE,
         Template::Codex => CODEX_TEMPLATE,
     }
+}
+
+/// Build a project template containing only required commands absent from the
+/// merged global configuration. An empty result means no project config is needed.
+pub fn get_missing_required_template(
+    template: Template,
+    global: &OrchestratorConfig,
+) -> crate::error::Result<Option<String>> {
+    let selected = OrchestratorConfig::parse_jsonc(get_template_content(template))?;
+    let mut fields = serde_json::Map::new();
+
+    for (name, global_value, template_value) in [
+        (
+            "analyze_command",
+            &global.analyze_command,
+            &selected.analyze_command,
+        ),
+        (
+            "apply_command",
+            &global.apply_command,
+            &selected.apply_command,
+        ),
+        (
+            "archive_command",
+            &global.archive_command,
+            &selected.archive_command,
+        ),
+        (
+            "acceptance_command",
+            &global.acceptance_command,
+            &selected.acceptance_command,
+        ),
+        (
+            "resolve_command",
+            &global.resolve_command,
+            &selected.resolve_command,
+        ),
+    ] {
+        if global_value.is_none() {
+            fields.insert(
+                name.to_string(),
+                serde_json::Value::String(
+                    template_value
+                        .clone()
+                        .expect("built-in templates define every required command"),
+                ),
+            );
+        }
+    }
+
+    if fields.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        serde_json::to_string_pretty(&serde_json::Value::Object(fields))
+            .expect("required command template must serialize")
+            + "\n",
+    ))
 }
 
 #[cfg(test)]

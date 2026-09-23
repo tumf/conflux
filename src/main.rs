@@ -1350,7 +1350,7 @@ async fn main() -> Result<()> {
             run_judge_eval_subcommand(args, cli.config.as_deref());
         }
 
-        // Init subcommand: generate configuration file
+        // Init subcommand: generate only required commands missing globally.
         Some(Commands::Init(args)) => {
             let config_path = Path::new(".cflx.jsonc");
 
@@ -1363,11 +1363,16 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
-            let content = templates::get_template_content(args.template);
+            let global = OrchestratorConfig::load_global_settings()?;
+            let Some(content) = templates::get_missing_required_template(args.template, &global)?
+            else {
+                println!("Global configuration already defines all required commands; no project configuration was created.");
+                return Ok(());
+            };
             std::fs::write(config_path, content)?;
 
             println!(
-                "Created configuration file '{}' with {:?} template.",
+                "Created configuration file '{}' with required {:?} commands missing from global configuration.",
                 config_path.display(),
                 args.template
             );
