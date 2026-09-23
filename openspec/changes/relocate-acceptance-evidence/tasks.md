@@ -1,0 +1,13 @@
+## Implementation Tasks
+
+- [ ] Add one external Acceptance storage resolver under the resolved Conflux state root, isolated by project, workspace, and change identity, with validated identifiers and an external temporary fallback only when no persistent root exists (verification: unit - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [ ] Refactor `EvidenceStore` and `ManifestStore` to receive explicit external paths and wire the same store through manifest construction, gate reuse planning, declared-gate execution, terminal diagnostics, and settlement cleanup (verification: integration - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [ ] Remove every production write below `.cflx/verification-evidence`, self-ignore creation, and evidence-directory cleanliness exclusion; evaluate the full target status and fail closed when legacy target-local artifacts remain visible (verification: integration - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [ ] Make external manifests and evidence cache-only: preserve exact valid gate reuse, rerun or hold on missing/malformed/stale cache, and remove durable manifest-based admission or next-action authority (verification: integration - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [ ] Preserve same-owner unchanged-input refusal in typed live reducer state while admitting one fresh bounded explicit retry after owner restart without a repository mutation (verification: integration - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [ ] Add regression coverage proving zero target writes, external path isolation, state-root failure before gate launch, full cleanliness including legacy ignored evidence, cache-loss rerun without PASS, live-owner refusal, restart admission, bounded deadlines, and owned-process cleanup (verification: e2e - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [ ] Update Acceptance evidence documentation and source comments to describe external cache semantics, legacy non-migration, explicit cleanup ownership, and the prohibition on target-worktree writes or ignore-based exceptions (verification: manual - inspect `docs/guides/VERIFICATION_EVIDENCE.md`, `src/orchestration/acceptance/verification_evidence.rs`, and `src/orchestration/acceptance/execution_manifest.rs`; verification-id: external-acceptance-state-tests)
+
+## Final Validation
+
+Archive validation is authoritative: `cflx openspec validate relocate-acceptance-evidence --archive-gate`.
