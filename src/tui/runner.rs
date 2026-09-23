@@ -710,10 +710,13 @@ async fn run_tui_loop(
             // call, so a kill always reaches the run that is actually
             // executing and reports "owns nothing" between runs.
             .with_managed_termination(managed_termination.clone())
-            // Recomputes a change's Acceptance fingerprint from its managed
-            // worktree so an unchanged retry is refused before anything is
-            // dispatched. The path is resolved per call, and a change whose
-            // worktree is gone simply has no evidence to refuse on.
+            // Refuses an unchanged retry before anything is dispatched, from
+            // two facts that must both hold: a hold *this owner* recorded, and
+            // a fingerprint recomputed from the managed worktree right now. A
+            // restarted owner remembers nothing and refuses nothing; a
+            // repository change moves the fingerprint and restores eligibility.
+            // The path is resolved per call, and a change whose worktree is gone
+            // simply has nothing to compare against.
             .with_acceptance_admission(Arc::new(
                 crate::orchestration::acceptance::execution_manifest::WorkspaceAcceptanceAdmission::new(
                     {
@@ -724,6 +727,7 @@ async fn run_tui_loop(
                         }
                     },
                     accept_skill_name.clone(),
+                    config.get_state_base_dir().map(str::to_string),
                 ),
             )),
         )

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::*;
-use crate::orchestration::acceptance::verification_evidence::ToolIdentity;
+use crate::orchestration::acceptance::verification_evidence::{EvidenceStore, ToolIdentity};
 
 const COMMIT: &str = "1111111111111111111111111111111111111111";
 const TREE: &str = "2222222222222222222222222222222222222222";
@@ -158,14 +158,37 @@ fn workspace_with_change(change_id: &str) -> tempfile::TempDir {
     workspace
 }
 
+/// The Conflux-owned store the builder reads artifact digests from.
+///
+/// Deliberately a sibling of the workspace rather than a path inside it: the
+/// builder must never be handed somewhere in the target, and these tests would
+/// rather fail loudly than quietly pass on a store that happens to coincide.
+fn external_store(workspace: &tempfile::TempDir) -> EvidenceStore {
+    EvidenceStore::new(
+        workspace
+            .path()
+            .parent()
+            .expect("a tempdir has a parent")
+            .join(format!(
+                "cflx-acceptance-store-{}",
+                workspace
+                    .path()
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            )),
+    )
+}
+
 async fn build(
     facts: &FakeFacts,
-    workspace: &Path,
+    workspace: &tempfile::TempDir,
     change_id: &str,
 ) -> AcceptanceExecutionManifest {
     build_manifest_for_workspace(
         facts,
-        workspace,
+        workspace.path(),
+        &external_store(workspace),
         change_id,
         "cflx-accept",
         Some("main"),
@@ -183,7 +206,7 @@ async fn acceptance_execution_boundary_manifest_binds_workspace_evidence() {
     let workspace = workspace_with_change("alpha");
     let facts = FakeFacts::new();
 
-    let manifest = build(&facts, workspace.path(), "alpha").await;
+    let manifest = build(&facts, &workspace, "alpha").await;
 
     assert_eq!(manifest.candidate_commit_oid, COMMIT);
     assert_eq!(manifest.candidate_tree_oid, TREE);
@@ -206,7 +229,6 @@ async fn acceptance_execution_boundary_manifest_binds_workspace_evidence() {
     assert_eq!(manifest.gates[0].automation_blob_oid, BLOB);
     assert_eq!(manifest.gates[0].tool.executable_digest, TOOL_DIGEST);
     assert_eq!(manifest.work_budget_secs, 270);
-    assert!(manifest.terminal.is_none());
     // The manifest must survive its own serialization unchanged.
     let bytes = serde_json::to_vec(&manifest).unwrap();
     assert_eq!(
@@ -224,8 +246,8 @@ async fn acceptance_execution_boundary_rebuild_is_deterministic() {
     let workspace = workspace_with_change("alpha");
     let facts = FakeFacts::new();
 
-    let first = build(&facts, workspace.path(), "alpha").await;
-    let second = build(&facts, workspace.path(), "alpha").await;
+    let first = build(&facts, &workspace, "alpha").await;
+    let second = build(&facts, &workspace, "alpha").await;
 
     assert_eq!(first.fingerprint(), second.fingerprint());
 }
@@ -236,14 +258,14 @@ async fn acceptance_execution_boundary_rebuild_is_deterministic() {
 async fn acceptance_execution_boundary_editing_change_inputs_moves_the_fingerprint() {
     let workspace = workspace_with_change("alpha");
     let facts = FakeFacts::new();
-    let before = build(&facts, workspace.path(), "alpha").await;
+    let before = build(&facts, &workspace, "alpha").await;
 
     std::fs::write(
         workspace.path().join("openspec/changes/alpha/tasks.md"),
         "- [x] Do the thing\n- [x] Do the other thing\n",
     )
     .unwrap();
-    let after = build(&facts, workspace.path(), "alpha").await;
+    let after = build(&facts, &workspace, "alpha").await;
 
     assert_ne!(before.fingerprint(), after.fingerprint());
 }
@@ -254,14 +276,14 @@ async fn acceptance_execution_boundary_editing_change_inputs_moves_the_fingerpri
 async fn acceptance_execution_boundary_constitution_participates_in_change_inputs() {
     let workspace = workspace_with_change("alpha");
     let facts = FakeFacts::new();
-    let before = build(&facts, workspace.path(), "alpha").await;
+    let before = build(&facts, &workspace, "alpha").await;
 
     std::fs::write(
         workspace.path().join("openspec/CONSTITUTION.md"),
         "# Conflux Constitution\n\n### 4. New law\n",
     )
     .unwrap();
-    let after = build(&facts, workspace.path(), "alpha").await;
+    let after = build(&facts, &workspace, "alpha").await;
 
     assert_ne!(before.fingerprint(), after.fingerprint());
 }
@@ -272,11 +294,11 @@ async fn acceptance_execution_boundary_constitution_participates_in_change_input
 async fn acceptance_execution_boundary_moved_review_base_moves_the_fingerprint() {
     let workspace = workspace_with_change("alpha");
     let facts = FakeFacts::new();
-    let before = build(&facts, workspace.path(), "alpha").await;
+    let before = build(&facts, &workspace, "alpha").await;
 
     let mut moved = FakeFacts::new();
     moved.revisions.insert("main".to_string(), "9".repeat(40));
-    let after = build(&moved, workspace.path(), "alpha").await;
+    let after = build(&moved, &workspace, "alpha").await;
 
     assert_ne!(before.fingerprint(), after.fingerprint());
     assert_eq!(after.review_base_commit, "9".repeat(40));
@@ -292,6 +314,7 @@ async fn acceptance_execution_boundary_unresolvable_base_leaves_the_range_empty(
     let manifest = build_manifest_for_workspace(
         &facts,
         workspace.path(),
+        &external_store(&workspace),
         "alpha",
         "cflx-accept",
         Some("no-such-branch"),
@@ -316,7 +339,7 @@ async fn acceptance_execution_boundary_unresolvable_tool_is_recorded_not_guessed
     let mut facts = FakeFacts::new();
     facts.tool = None;
 
-    let manifest = build(&facts, workspace.path(), "alpha").await;
+    let manifest = build(&facts, &workspace, "alpha").await;
 
     assert_eq!(manifest.gates[0].tool, ToolIdentity::default());
 }
@@ -328,7 +351,7 @@ async fn acceptance_execution_boundary_missing_proposal_yields_an_empty_allowlis
     let workspace = tempfile::tempdir().unwrap();
     let facts = FakeFacts::new();
 
-    let manifest = build(&facts, workspace.path(), "alpha").await;
+    let manifest = build(&facts, &workspace, "alpha").await;
 
     assert!(!manifest.has_gates());
 }
@@ -341,6 +364,7 @@ async fn acceptance_execution_boundary_unobservable_repository_is_a_build_error(
     let error = build_manifest_for_workspace(
         &BlindFacts,
         workspace.path(),
+        &external_store(&workspace),
         "alpha",
         "cflx-accept",
         Some("main"),
@@ -362,6 +386,7 @@ async fn acceptance_execution_boundary_refuses_an_unstorable_change_id() {
     let error = build_manifest_for_workspace(
         &facts,
         workspace.path(),
+        &external_store(&workspace),
         "../escape",
         "cflx-accept",
         None,
@@ -380,7 +405,7 @@ async fn acceptance_execution_boundary_resolves_the_review_base_once() {
     let workspace = workspace_with_change("alpha");
     let facts = FakeFacts::new();
 
-    let _ = build(&facts, workspace.path(), "alpha").await;
+    let _ = build(&facts, &workspace, "alpha").await;
 
     assert_eq!(
         facts.resolve_calls.lock().unwrap().as_slice(),

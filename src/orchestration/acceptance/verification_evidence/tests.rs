@@ -3,8 +3,12 @@
 //! Every test here is a way an unbound, stale, forged, or self-referential
 //! record could otherwise turn "no evidence" into PASS. The Git and process
 //! boundaries are in-memory doubles, so these stay unit-scoped: the only real
-//! filesystem use is a temporary directory holding the sidecar the module is
+//! filesystem use is a temporary directory holding the records the module is
 //! defined to read from disk.
+//!
+//! The target tree and the Conflux-owned store are separate directories in
+//! every case, because that separation is now the contract: nothing this module
+//! writes may land inside the tree it is verifying.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -70,7 +74,7 @@ fn evidence() -> VerificationEvidence {
         started_at,
         ended_at: started_at + chrono::Duration::seconds(300),
         exit_code: 0,
-        artifact_path: format!("{EVIDENCE_DIR}/bound-evidence-tests.log"),
+        artifact_path: EvidenceStore::artifact_relative_path("bound-evidence-tests"),
         artifact_digest: ARTIFACT_DIGEST.to_string(),
         clean_before: true,
         clean_after: true,
@@ -101,6 +105,23 @@ fn rerun_code(decision: &ReuseDecision) -> String {
         ReuseDecision::Reuse { .. } => panic!("expected rerun, got reuse"),
         ReuseDecision::Rerun { reason, .. } => reason.code().to_string(),
     }
+}
+
+/// The target tree under test. Always a *sibling* of the store below, never its
+/// ancestor, so an accidental target-local write would be visible as an entry
+/// somewhere it does not belong.
+fn target_of(temp: &tempfile::TempDir) -> PathBuf {
+    let target = temp.path().join("target");
+    std::fs::create_dir_all(&target).expect("create target");
+    target
+}
+
+/// The Conflux-owned external store, shaped like the real layout.
+fn store_of(temp: &tempfile::TempDir) -> EvidenceStore {
+    EvidenceStore::new(
+        temp.path()
+            .join("cflx-state/acceptance/project-slug/workspace-slug/change-a"),
+    )
 }
 
 fn mismatch_field(decision: &ReuseDecision) -> String {
@@ -191,12 +212,28 @@ fn reversed_timestamps_are_refused() {
     assert!(defect.detail().contains("precedes"));
 }
 
+/// The artifact path is not merely constrained to a prefix — it must be exactly
+/// the store-relative path this verification's artifact would occupy. Anything
+/// else is a record describing a file the store does not own, whether it points
+/// into the target, at another gate, or nowhere at all.
 #[test]
-fn artifact_outside_the_evidence_directory_is_refused() {
-    let mut record = evidence();
-    record.artifact_path = "target/output.log".to_string();
-    let defect = parse_evidence(&serde_json::to_vec(&record).unwrap()).unwrap_err();
-    assert!(defect.detail().contains("outside"));
+fn an_artifact_path_the_store_does_not_own_is_refused() {
+    for hostile in [
+        "target/output.log",
+        "/absolute/output.log",
+        "gates/../escape.log",
+        "gates/some-other-gate.log",
+    ] {
+        let mut record = evidence();
+        record.artifact_path = hostile.to_string();
+        let defect = parse_evidence(&serde_json::to_vec(&record).unwrap()).unwrap_err();
+        assert_eq!(defect.code(), "evidence_malformed", "'{hostile}'");
+        assert!(
+            defect.detail().contains("store-relative"),
+            "'{hostile}': {}",
+            defect.detail()
+        );
+    }
 }
 
 #[test]
@@ -409,50 +446,92 @@ fn every_rerun_reason_states_an_actionable_detail() {
 }
 
 // ---------------------------------------------------------------------------
-// Self-reference: the sidecar may not invalidate its own binding
+// Cleanliness: no Conflux-owned path is excluded any more
 // ---------------------------------------------------------------------------
 
+/// The exclusion is gone, not relaxed. Constitutional law 4 says a cleanliness
+/// exception does not make a Conflux-owned write permissible, so the honest
+/// implementation has no exception at all — and since nothing lands in the
+/// target now, there is nothing left for one to protect.
 #[test]
-fn evidence_directory_changes_do_not_make_the_worktree_dirty() {
+fn a_conflux_owned_path_in_the_target_is_dirty_like_any_other() {
     let status = format!(
-        "?? {EVIDENCE_DIR}/\n?? {EVIDENCE_DIR}/bound-evidence-tests.json\n M {EVIDENCE_DIR}/bound-evidence-tests.log\n"
+        "?? {LEGACY_EVIDENCE_DIR}/\n\
+         ?? {LEGACY_EVIDENCE_DIR}/bound-evidence-tests.json\n\
+          M {LEGACY_EVIDENCE_DIR}/bound-evidence-tests.log\n"
     );
-    assert!(dirty_entries_excluding_evidence(&status).is_empty());
+    assert_eq!(
+        dirty_entries(&status).len(),
+        3,
+        "no path is exempt from the tracked/untracked porcelain status"
+    );
 }
 
 #[test]
-fn any_change_outside_the_evidence_directory_is_dirty() {
-    let status = format!("?? {EVIDENCE_DIR}/bound-evidence-tests.json\n M src/lib.rs\n");
-    let dirty = dirty_entries_excluding_evidence(&status);
-    assert_eq!(dirty, vec!["M src/lib.rs".to_string()]);
+fn every_status_entry_counts_as_dirty() {
+    let status = " M src/lib.rs\n?? untracked.txt\nA  staged.rs\n";
+    assert_eq!(
+        dirty_entries(status),
+        vec![
+            "M src/lib.rs".to_string(),
+            "?? untracked.txt".to_string(),
+            "A  staged.rs".to_string(),
+        ]
+    );
 }
 
 #[test]
-fn a_rename_out_of_the_evidence_directory_is_dirty() {
-    let status = format!("R  {EVIDENCE_DIR}/a.log -> src/leaked.log\n");
-    assert_eq!(dirty_entries_excluding_evidence(&status).len(), 1);
+fn a_clean_status_has_no_dirty_entries() {
+    assert!(dirty_entries("").is_empty());
+}
+
+/// A rename is one entry, whichever side of it you look at: there is no longer
+/// a rule that inspects the paths at all.
+#[test]
+fn a_rename_is_one_dirty_entry() {
+    assert_eq!(dirty_entries("R  a.log -> src/leaked.log\n").len(), 1);
 }
 
 // ---------------------------------------------------------------------------
 // Store authority
 // ---------------------------------------------------------------------------
 
+/// The envelope is read-only and runtime-owned, it lives in the external store,
+/// and — the part this change adds — no ignore file is written anywhere. Hiding
+/// an artifact was never what made one permissible; not writing it into the
+/// target is.
 #[test]
-fn store_writes_a_self_ignoring_read_only_sidecar() {
+fn store_writes_a_read_only_envelope_outside_the_target() {
     let workspace = tempfile::tempdir().expect("tempdir");
-    let store = EvidenceStore::new(workspace.path());
+    let target = target_of(&workspace);
+    let store = store_of(&workspace);
     store.store(&evidence()).expect("store");
-
-    let ignore = workspace.path().join(EVIDENCE_DIR).join(".gitignore");
-    assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "*\n");
 
     let loaded = store.load("bound-evidence-tests").expect("load");
     assert_eq!(loaded, evidence());
 
+    assert!(
+        !store.root().starts_with(&target),
+        "the store must not be inside the target: {:?}",
+        store.root()
+    );
+    assert_eq!(
+        std::fs::read_dir(&target)
+            .expect("read target")
+            .filter_map(Result::ok)
+            .count(),
+        0,
+        "storing evidence must write nothing into the target"
+    );
+    assert!(
+        !store.directory().join(".gitignore").exists() && !store.root().join(".gitignore").exists(),
+        "no self-ignoring file may be written any more"
+    );
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let envelope = workspace.path().join(EvidenceStore::envelope_relative_path(
+        let envelope = store.root().join(EvidenceStore::envelope_relative_path(
             "bound-evidence-tests",
         ));
         let mode = std::fs::metadata(&envelope).unwrap().permissions().mode() & 0o777;
@@ -460,10 +539,45 @@ fn store_writes_a_self_ignoring_read_only_sidecar() {
     }
 }
 
+/// The store-relative artifact path is part of the record's validity: an
+/// envelope naming a repository-relative path — the version-1 shape — is
+/// malformed rather than migrated.
+#[test]
+fn a_target_relative_artifact_path_is_malformed() {
+    let mut record = evidence();
+    record.artifact_path = format!("{LEGACY_EVIDENCE_DIR}/bound-evidence-tests.log");
+    let defect = parse_evidence(&serde_json::to_vec(&record).unwrap()).unwrap_err();
+    assert_eq!(defect.code(), "evidence_malformed");
+    assert!(
+        defect.detail().contains("store-relative"),
+        "{}",
+        defect.detail()
+    );
+}
+
+/// Legacy detection is existence, nothing more: no read, no parse, no delete.
+#[test]
+fn legacy_target_evidence_is_detected_by_existence_alone() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let target = target_of(&workspace);
+    assert!(legacy_target_evidence(&target).is_none());
+
+    let legacy = target.join(LEGACY_EVIDENCE_DIR);
+    std::fs::create_dir_all(&legacy).expect("create legacy");
+    std::fs::write(legacy.join("focused-gate.json"), b"unreadable").expect("write legacy");
+
+    let found = legacy_target_evidence(&target).expect("existing legacy evidence is reported");
+    assert_eq!(found, legacy);
+    assert!(
+        legacy.join("focused-gate.json").is_file(),
+        "the probe must not delete what it finds"
+    );
+}
+
 #[test]
 fn store_replaces_a_previous_read_only_sidecar() {
     let workspace = tempfile::tempdir().expect("tempdir");
-    let store = EvidenceStore::new(workspace.path());
+    let store = store_of(&workspace);
     store.store(&evidence()).expect("first store");
     let mut second = evidence();
     second.commit_oid = "abababababababababababababababababababab".to_string();
@@ -477,7 +591,7 @@ fn store_replaces_a_previous_read_only_sidecar() {
 #[test]
 fn missing_sidecar_reports_missing_rather_than_failure() {
     let workspace = tempfile::tempdir().expect("tempdir");
-    let store = EvidenceStore::new(workspace.path());
+    let store = store_of(&workspace);
     assert_eq!(
         store.load("bound-evidence-tests"),
         Err(EvidenceDefect::Missing)
@@ -490,9 +604,9 @@ fn a_writable_envelope_is_reported_as_agent_authored() {
     use std::os::unix::fs::PermissionsExt;
 
     let workspace = tempfile::tempdir().expect("tempdir");
-    let store = EvidenceStore::new(workspace.path());
+    let store = store_of(&workspace);
     store.ensure_directory().expect("directory");
-    let envelope = workspace.path().join(EvidenceStore::envelope_relative_path(
+    let envelope = store.root().join(EvidenceStore::envelope_relative_path(
         "bound-evidence-tests",
     ));
     std::fs::write(&envelope, serde_json::to_vec(&evidence()).unwrap()).expect("write");
@@ -654,12 +768,20 @@ impl Clock for StepClock {
     }
 }
 
+/// An executor bound to the target it runs in and the external store it writes
+/// to — two separate directories, as production always has them.
 fn executor(
-    workspace: &Path,
+    temp: &tempfile::TempDir,
     facts: FakeFacts,
     supervisor: FakeSupervisor,
 ) -> RuntimeVerificationExecutor<FakeFacts, FakeSupervisor, StepClock> {
-    RuntimeVerificationExecutor::new(workspace.to_path_buf(), facts, supervisor, StepClock::new())
+    RuntimeVerificationExecutor::new(
+        target_of(temp),
+        store_of(temp),
+        facts,
+        supervisor,
+        StepClock::new(),
+    )
 }
 
 #[tokio::test]
@@ -667,7 +789,7 @@ async fn runtime_capture_writes_a_reusable_envelope() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let facts = FakeFacts::new();
     let supervisor = FakeSupervisor::succeeding();
-    let outcome = executor(workspace.path(), facts.clone(), supervisor.clone())
+    let outcome = executor(&workspace, facts.clone(), supervisor.clone())
         .capture(&request())
         .await;
 
@@ -680,11 +802,9 @@ async fn runtime_capture_writes_a_reusable_envelope() {
     assert_eq!(captured.elapsed_seconds(), Some(300));
     assert_eq!(supervisor.calls.lock().unwrap().len(), 1);
 
-    let store = EvidenceStore::new(workspace.path());
+    let store = store_of(&workspace);
     assert_eq!(store.load("bound-evidence-tests").unwrap(), *captured);
-    let artifact = workspace.path().join(EvidenceStore::artifact_relative_path(
-        "bound-evidence-tests",
-    ));
+    let artifact = store.artifact_path("bound-evidence-tests");
     assert_eq!(std::fs::read(artifact).unwrap(), b"test result: ok");
 }
 
@@ -693,7 +813,7 @@ async fn a_failing_command_captures_no_envelope() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let mut supervisor = FakeSupervisor::succeeding();
     supervisor.exit_code = 101;
-    let outcome = executor(workspace.path(), FakeFacts::new(), supervisor)
+    let outcome = executor(&workspace, FakeFacts::new(), supervisor)
         .capture(&request())
         .await;
 
@@ -702,7 +822,7 @@ async fn a_failing_command_captures_no_envelope() {
         CaptureOutcome::CommandFailed { exit_code: 101, .. }
     ));
     assert_eq!(
-        EvidenceStore::new(workspace.path()).load("bound-evidence-tests"),
+        store_of(&workspace).load("bound-evidence-tests"),
         Err(EvidenceDefect::Missing)
     );
 }
@@ -713,7 +833,7 @@ async fn capture_is_refused_when_the_worktree_is_dirty_before_execution() {
     let facts = FakeFacts::new();
     *facts.status.lock().unwrap() = " M src/lib.rs\n".to_string();
     let supervisor = FakeSupervisor::succeeding();
-    let outcome = executor(workspace.path(), facts, supervisor.clone())
+    let outcome = executor(&workspace, facts, supervisor.clone())
         .capture(&request())
         .await;
 
@@ -740,7 +860,7 @@ async fn capture_is_refused_when_a_binding_moves_while_the_command_runs() {
         *moved.lock().unwrap() = "cccccccccccccccccccccccccccccccccccccccc".to_string();
     });
 
-    let outcome = executor(workspace.path(), facts, supervisor)
+    let outcome = executor(&workspace, facts, supervisor)
         .capture(&request())
         .await;
     let CaptureOutcome::Refused(refusal) = outcome else {
@@ -748,7 +868,7 @@ async fn capture_is_refused_when_a_binding_moves_while_the_command_runs() {
     };
     assert_eq!(refusal.code, "binding_moved_during_execution");
     assert_eq!(
-        EvidenceStore::new(workspace.path()).load("bound-evidence-tests"),
+        store_of(&workspace).load("bound-evidence-tests"),
         Err(EvidenceDefect::Missing)
     );
 }
@@ -763,7 +883,7 @@ async fn capture_is_refused_when_the_command_dirties_the_worktree() {
         *status.lock().unwrap() = " M src/generated.rs\n".to_string();
     });
 
-    let outcome = executor(workspace.path(), facts, supervisor)
+    let outcome = executor(&workspace, facts, supervisor)
         .capture(&request())
         .await;
     assert!(matches!(
@@ -780,7 +900,7 @@ async fn capture_is_refused_when_repository_state_cannot_be_observed() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let facts = FakeFacts::new();
     *facts.failure.lock().unwrap() = Some("git rev-parse failed".to_string());
-    let outcome = executor(workspace.path(), facts, FakeSupervisor::succeeding())
+    let outcome = executor(&workspace, facts, FakeSupervisor::succeeding())
         .capture(&request())
         .await;
     assert!(matches!(
@@ -800,17 +920,14 @@ async fn capture_is_refused_when_repository_state_cannot_be_observed() {
 async fn captured_evidence_is_reused_on_the_next_evaluation() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let facts = FakeFacts::new();
-    executor(
-        workspace.path(),
-        facts.clone(),
-        FakeSupervisor::succeeding(),
-    )
-    .capture(&request())
-    .await;
+    executor(&workspace, facts.clone(), FakeSupervisor::succeeding())
+        .capture(&request())
+        .await;
 
     let plan = plan_reuse(
         &facts,
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &[declaration()],
         ReusePolicy::default(),
     )
@@ -824,18 +941,15 @@ async fn captured_evidence_is_reused_on_the_next_evaluation() {
 async fn a_new_commit_forces_rerun_of_previously_captured_evidence() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let facts = FakeFacts::new();
-    executor(
-        workspace.path(),
-        facts.clone(),
-        FakeSupervisor::succeeding(),
-    )
-    .capture(&request())
-    .await;
+    executor(&workspace, facts.clone(), FakeSupervisor::succeeding())
+        .capture(&request())
+        .await;
     *facts.commit.lock().unwrap() = "dddddddddddddddddddddddddddddddddddddddd".to_string();
 
     let plan = plan_reuse(
         &facts,
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &[declaration()],
         ReusePolicy::default(),
     )
@@ -851,18 +965,15 @@ async fn a_new_commit_forces_rerun_of_previously_captured_evidence() {
 async fn evidence_from_a_dirty_worktree_is_not_reused() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let facts = FakeFacts::new();
-    executor(
-        workspace.path(),
-        facts.clone(),
-        FakeSupervisor::succeeding(),
-    )
-    .capture(&request())
-    .await;
+    executor(&workspace, facts.clone(), FakeSupervisor::succeeding())
+        .capture(&request())
+        .await;
     *facts.status.lock().unwrap() = " M src/lib.rs\n".to_string();
 
     let plan = plan_reuse(
         &facts,
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &[declaration()],
         ReusePolicy::default(),
     )
@@ -873,24 +984,41 @@ async fn evidence_from_a_dirty_worktree_is_not_reused() {
     );
 }
 
+/// The old self-reference problem is solved by *relocation*, not by an
+/// exception. A capture writes into the external store, so the target's status
+/// is untouched and stays clean, and the very next evaluation reuses the record
+/// without anything having to be excluded from the comparison.
 #[tokio::test]
-async fn the_written_sidecar_does_not_invalidate_its_own_binding() {
+async fn a_capture_leaves_the_target_clean_without_any_exclusion() {
     let workspace = tempfile::tempdir().expect("tempdir");
+    let target = target_of(&workspace);
     let facts = FakeFacts::new();
-    executor(
-        workspace.path(),
-        facts.clone(),
-        FakeSupervisor::succeeding(),
-    )
-    .capture(&request())
-    .await;
-    // The only difference from the bound commit is the sidecar the runtime just
-    // wrote, reported the way `git status` would report an untracked directory.
-    *facts.status.lock().unwrap() = format!("?? {EVIDENCE_DIR}/\n");
+    executor(&workspace, facts.clone(), FakeSupervisor::succeeding())
+        .capture(&request())
+        .await;
+
+    // `FakeFacts` reports the status the runtime would observe: still empty,
+    // because nothing was written into the target at all.
+    assert!(facts.status.lock().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_dir(&target)
+            .expect("read target")
+            .filter_map(Result::ok)
+            .count(),
+        0,
+        "a capture must write nothing into the target"
+    );
+    assert!(
+        store_of(&workspace)
+            .artifact_path("bound-evidence-tests")
+            .is_file(),
+        "the artifact belongs in the external store"
+    );
 
     let plan = plan_reuse(
         &facts,
-        workspace.path(),
+        &target,
+        &store_of(&workspace),
         &[declaration()],
         ReusePolicy::default(),
     )
@@ -898,12 +1026,53 @@ async fn the_written_sidecar_does_not_invalidate_its_own_binding() {
     assert_eq!(plan.reused_ids(), vec!["bound-evidence-tests"]);
 }
 
+/// Deleting the external cache reruns the declared gate. It never proves PASS,
+/// and it never changes what the next workflow action would be.
+#[tokio::test]
+async fn a_deleted_cache_reruns_rather_than_proving_anything() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let facts = FakeFacts::new();
+    executor(&workspace, facts.clone(), FakeSupervisor::succeeding())
+        .capture(&request())
+        .await;
+    assert_eq!(
+        plan_reuse(
+            &facts,
+            &target_of(&workspace),
+            &store_of(&workspace),
+            &[declaration()],
+            ReusePolicy::default(),
+        )
+        .await
+        .reused_ids(),
+        vec!["bound-evidence-tests"]
+    );
+
+    std::fs::remove_dir_all(store_of(&workspace).root()).expect("delete the cache");
+
+    let plan = plan_reuse(
+        &facts,
+        &target_of(&workspace),
+        &store_of(&workspace),
+        &[declaration()],
+        ReusePolicy::default(),
+    )
+    .await;
+    assert_eq!(plan.rerun_ids(), vec!["bound-evidence-tests"]);
+    assert_eq!(
+        plan.to_json()["verifications"][0]["reason"],
+        "evidence_missing",
+        "cache loss is a rerun reason, never a verdict"
+    );
+}
+
 #[tokio::test]
 async fn missing_evidence_reruns_with_an_actionable_reason() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let plan = plan_reuse(
         &FakeFacts::new(),
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &[declaration()],
         ReusePolicy::default(),
     )
@@ -926,7 +1095,8 @@ async fn a_deployed_observation_has_no_local_reuse_decision() {
     declaration.completion_role = Some("operational-observation".to_string());
     let plan = plan_reuse(
         &FakeFacts::new(),
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &[declaration],
         ReusePolicy::default(),
     )
@@ -938,18 +1108,15 @@ async fn a_deployed_observation_has_no_local_reuse_decision() {
 async fn unobservable_repository_state_reruns_rather_than_reusing() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let facts = FakeFacts::new();
-    executor(
-        workspace.path(),
-        facts.clone(),
-        FakeSupervisor::succeeding(),
-    )
-    .capture(&request())
-    .await;
+    executor(&workspace, facts.clone(), FakeSupervisor::succeeding())
+        .capture(&request())
+        .await;
     *facts.failure.lock().unwrap() = Some("git rev-parse failed".to_string());
 
     let plan = plan_reuse(
         &facts,
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &[declaration()],
         ReusePolicy::default(),
     )
@@ -964,19 +1131,16 @@ async fn unobservable_repository_state_reruns_rather_than_reusing() {
 async fn restart_derives_the_same_decision_from_the_worktree_alone() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let facts = FakeFacts::new();
-    executor(
-        workspace.path(),
-        facts.clone(),
-        FakeSupervisor::succeeding(),
-    )
-    .capture(&request())
-    .await;
+    executor(&workspace, facts.clone(), FakeSupervisor::succeeding())
+        .capture(&request())
+        .await;
 
     // A "restart" is nothing more than dropping every in-memory structure and
     // reading the same worktree again: no cache, no store handle, no prior plan.
     let first = plan_reuse(
         &facts,
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &[declaration()],
         ReusePolicy::default(),
     )
@@ -984,7 +1148,8 @@ async fn restart_derives_the_same_decision_from_the_worktree_alone() {
     let restarted_facts = FakeFacts::new();
     let second = plan_reuse(
         &restarted_facts,
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &[declaration()],
         ReusePolicy::default(),
     )
@@ -998,7 +1163,8 @@ async fn duplicate_declared_ids_produce_one_decision() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let plan = plan_reuse(
         &FakeFacts::new(),
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &[declaration(), declaration()],
         ReusePolicy::default(),
     )

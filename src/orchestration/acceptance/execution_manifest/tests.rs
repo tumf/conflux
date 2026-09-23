@@ -41,8 +41,20 @@ fn gate(id: &str) -> ManifestGate {
             executable_digest: "c".repeat(64),
             version: Some("cargo 1.80.0".to_string()),
         },
-        artifact_path: format!(".cflx/verification-evidence/{id}.log"),
+        artifact_path: EvidenceStore::artifact_relative_path(id),
         artifact_digest: Some("d".repeat(64)),
+    }
+}
+
+/// A live hold for `manifest`'s current fingerprint.
+fn live_hold(
+    manifest: &AcceptanceExecutionManifest,
+    category: AcceptanceHoldCategory,
+) -> LiveAcceptanceHold {
+    LiveAcceptanceHold {
+        category,
+        fingerprint: manifest.fingerprint(),
+        review_base_ref: manifest.review_base_ref.clone(),
     }
 }
 
@@ -65,7 +77,6 @@ fn manifest(change_id: &str, gates: Vec<ManifestGate>) -> AcceptanceExecutionMan
         created_at: chrono::Utc::now(),
         absolute_deadline_secs: 3600,
         work_budget_secs: 3570,
-        terminal: None,
     }
 }
 
@@ -189,12 +200,11 @@ fn acceptance_execution_boundary_gate_order_is_canonical() {
 // Fingerprint identity
 // ============================================================================
 
-/// The fingerprint is stable across timestamps, budgets, and terminal records.
-/// If any of those moved it, recording "the deadline expired" would itself make
-/// the next question look different and the unchanged-retry refusal could never
-/// fire.
+/// The fingerprint is stable across timestamps and budgets. If either moved it,
+/// recording "the deadline expired" would itself make the next question look
+/// different and the unchanged-retry refusal could never fire.
 #[test]
-fn acceptance_execution_boundary_fingerprint_excludes_timing_and_terminal_state() {
+fn acceptance_execution_boundary_fingerprint_excludes_timing_and_budget() {
     let base = manifest("alpha", vec![gate("focused")]);
     let expected = base.fingerprint();
 
@@ -203,20 +213,50 @@ fn acceptance_execution_boundary_fingerprint_excludes_timing_and_terminal_state(
     moved.absolute_deadline_secs = 300;
     moved.work_budget_secs = 270;
     moved.review_base_ref = Some("develop".to_string());
-    moved.terminal = Some(ManifestTerminal {
-        hold_category: Some(AcceptanceHoldCategory::ReviewDeadlineExhausted),
-        fingerprint: expected.clone(),
-        cleanup_confirmed: true,
-        cleanup_diagnostics: String::new(),
-        recorded_at: chrono::Utc::now(),
-    });
 
     assert_eq!(
         moved.fingerprint(),
         expected,
-        "timestamps, budgets, the base ref name, and the terminal record must \
-         not participate in the input fingerprint"
+        "timestamps, budgets, and the base ref name must not participate in the \
+         input fingerprint"
     );
+}
+
+/// The manifest carries no terminal record at all any more. That is the shape
+/// change: a manifest that could hold one would be a durable artifact capable
+/// of refusing work after a restart, which constitutional law 1 forbids.
+#[test]
+fn acceptance_execution_boundary_manifest_serializes_no_terminal_record() {
+    let value = serde_json::to_value(manifest("alpha", vec![gate("focused")])).unwrap();
+    let object = value.as_object().expect("a manifest is a JSON object");
+    assert!(
+        !object.contains_key("terminal"),
+        "no persisted field may carry retry authority: {:?}",
+        object.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        object["schema"], MANIFEST_SCHEMA,
+        "the relocated, authority-free manifest is its own schema version"
+    );
+}
+
+/// A version-1 manifest — the repository-local, terminal-record-carrying shape —
+/// is refused rather than migrated. Reading one would mean resurrecting the
+/// durable admission this change removed.
+#[test]
+fn acceptance_execution_boundary_version_one_manifest_is_refused() {
+    let mut value = serde_json::to_value(manifest("alpha", vec![gate("focused")])).unwrap();
+    value["schema"] = serde_json::json!("conflux-acceptance-execution-manifest-v1");
+    value["terminal"] = serde_json::json!({
+        "hold_category": "review_deadline_exhausted",
+        "fingerprint": "a".repeat(64),
+        "cleanup_confirmed": true,
+        "cleanup_diagnostics": "",
+        "recorded_at": "2026-08-23T00:00:00Z",
+    });
+
+    let defect = parse_manifest(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+    assert_eq!(defect.code(), "manifest_unknown_schema");
 }
 
 /// Every declared fingerprint component actually changes the fingerprint.
@@ -371,8 +411,7 @@ fn acceptance_execution_boundary_refuses_short_object_ids() {
 /// accepting a reordered list would let one declaration set hash two ways.
 #[test]
 fn acceptance_execution_boundary_refuses_non_canonical_gate_order() {
-    let mut original = manifest("alpha", vec![gate("zulu"), gate("alpha")]);
-    original.terminal = None;
+    let original = manifest("alpha", vec![gate("zulu"), gate("alpha")]);
     let bytes = serde_json::to_vec(&original).unwrap();
 
     match parse_manifest(&bytes) {
@@ -398,77 +437,115 @@ fn acceptance_execution_boundary_refuses_malformed_json() {
 // Storage: atomic, repository-local, restart-derivable
 // ============================================================================
 
+/// A store root, a target, and the assertion that the two never meet.
+fn external_store(temp: &tempfile::TempDir, change_id: &str) -> ManifestStore {
+    ManifestStore::new(
+        temp.path()
+            .join("cflx-state/acceptance/project-slug/workspace-slug")
+            .join(change_id),
+    )
+}
+
 #[test]
-fn acceptance_execution_boundary_stores_and_reloads_from_the_workspace() {
-    let workspace = tempfile::tempdir().unwrap();
-    let store = ManifestStore::new(workspace.path().to_path_buf());
+fn acceptance_execution_boundary_stores_and_reloads_from_the_external_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let store = external_store(&temp, "alpha");
     let original = manifest("alpha", vec![gate("focused")]);
 
     store.store(&original).expect("manifest must persist");
-    let reloaded = store.load("alpha").expect("manifest must reload");
+    let reloaded = store.load().expect("manifest must reload");
 
     assert_eq!(reloaded.fingerprint(), original.fingerprint());
     assert!(
-        workspace
-            .path()
-            .join(manifest_relative_path("alpha"))
-            .is_file(),
-        "the manifest must live inside the Git-excluded repository evidence area"
+        store.path().is_file() && store.path().ends_with("alpha/manifest.json"),
+        "the manifest belongs at the change's own external store root: {:?}",
+        store.path()
+    );
+    assert_eq!(
+        std::fs::read_dir(&target)
+            .unwrap()
+            .filter_map(Result::ok)
+            .count(),
+        0,
+        "persisting a manifest must write nothing into the target"
     );
     assert!(
-        workspace
-            .path()
-            .join(EVIDENCE_DIR)
-            .join(".gitignore")
-            .is_file(),
-        "the evidence directory must stay self-ignoring"
+        !store.path().parent().unwrap().join(".gitignore").exists(),
+        "no self-ignoring file may be written any more"
+    );
+}
+
+/// Diagnostics are written for an operator and never read back. Storing them
+/// must therefore be possible, and nothing in this module may consume them.
+#[test]
+fn acceptance_execution_boundary_diagnostics_are_inert_external_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = external_store(&temp, "alpha");
+    let current = manifest("alpha", vec![gate("focused")]);
+
+    store
+        .record_diagnostics(&AcceptanceDiagnostics {
+            hold_category: Some(AcceptanceHoldCategory::ReviewDeadlineExhausted),
+            fingerprint: current.fingerprint(),
+            cleanup_confirmed: true,
+            cleanup_diagnostics: "owned process group confirmed quiescent".to_string(),
+            evidence: vec!["semantic review emitted no canonical verdict".to_string()],
+            recorded_at: chrono::Utc::now(),
+            recorded_by_pid: std::process::id(),
+        })
+        .expect("diagnostics must persist");
+
+    assert!(store.diagnostics_path().is_file());
+    // The record exists on disk and still refuses nothing: admission reads live
+    // typed state, which is empty here.
+    let holds = LiveAcceptanceHolds::new();
+    assert_eq!(
+        holds.classify("alpha", &current.fingerprint()),
+        AcceptanceAdmission::Admit,
+        "a persisted diagnostics record must never refuse an attempt"
     );
 }
 
 #[test]
 fn acceptance_execution_boundary_missing_manifest_is_not_an_error_shape() {
-    let workspace = tempfile::tempdir().unwrap();
-    let store = ManifestStore::new(workspace.path().to_path_buf());
+    let temp = tempfile::tempdir().unwrap();
 
-    assert_eq!(store.load("absent"), Err(ManifestDefect::Missing));
+    assert_eq!(
+        external_store(&temp, "absent").load(),
+        Err(ManifestDefect::Missing)
+    );
 }
 
 #[test]
 fn acceptance_execution_boundary_refuses_unstorable_change_id() {
-    let workspace = tempfile::tempdir().unwrap();
-    let store = ManifestStore::new(workspace.path().to_path_buf());
+    let temp = tempfile::tempdir().unwrap();
+    let store = external_store(&temp, "alpha");
 
-    assert!(matches!(
-        store.load("../escape"),
-        Err(ManifestDefect::Malformed(_))
-    ));
     let mut escaping = manifest("alpha", Vec::new());
     escaping.change_id = "../escape".to_string();
-    assert!(store.store(&escaping).is_err());
+    assert!(
+        store.store(&escaping).is_err(),
+        "a manifest whose change id could escape its store is refused"
+    );
+    assert!(!store.path().exists());
 }
 
 // ============================================================================
 // Admission: unchanged input is refused, changed input is admitted
 // ============================================================================
 
-fn held(manifest: &AcceptanceExecutionManifest) -> AcceptanceExecutionManifest {
-    let mut stored = manifest.clone();
-    stored.terminal = Some(ManifestTerminal {
-        hold_category: Some(AcceptanceHoldCategory::ReviewDeadlineExhausted),
-        fingerprint: manifest.fingerprint(),
-        cleanup_confirmed: true,
-        cleanup_diagnostics: "owned process group confirmed quiescent".to_string(),
-        recorded_at: chrono::Utc::now(),
-    });
-    stored
+fn held(manifest: &AcceptanceExecutionManifest) -> LiveAcceptanceHold {
+    live_hold(manifest, AcceptanceHoldCategory::ReviewDeadlineExhausted)
 }
 
 #[test]
 fn acceptance_execution_boundary_refuses_unchanged_input_after_a_hold() {
     let current = manifest("alpha", vec![gate("focused")]);
-    let stored = held(&current);
+    let live = held(&current);
 
-    let admission = classify_admission(&current.fingerprint(), Some(&stored));
+    let admission = classify_admission(&current.fingerprint(), Some(&live));
 
     match &admission {
         AcceptanceAdmission::Refuse {
@@ -496,22 +573,21 @@ fn acceptance_execution_boundary_refuses_unchanged_input_after_a_hold() {
 #[test]
 fn acceptance_execution_boundary_changed_input_permits_a_new_attempt() {
     let previous = manifest("alpha", vec![gate("focused")]);
-    let stored = held(&previous);
+    let live = held(&previous);
     let mut current = previous.clone();
     current.candidate_commit_oid = "9".repeat(40);
 
     assert_eq!(
-        classify_admission(&current.fingerprint(), Some(&stored)),
+        classify_admission(&current.fingerprint(), Some(&live)),
         AcceptanceAdmission::Admit,
         "a repository-visible change to the candidate must permit one new bounded attempt"
     );
 }
 
-/// No stored manifest, no terminal record, and a terminal record with no hold
-/// category all admit. The guard exists to stop one specific loop, not to become
-/// a general gate on Acceptance.
+/// No live hold at all admits. The guard exists to stop one specific loop within
+/// one process, not to become a general gate on Acceptance.
 #[test]
-fn acceptance_execution_boundary_admits_every_non_hold_shape() {
+fn acceptance_execution_boundary_admits_when_this_owner_remembers_nothing() {
     let current = manifest("alpha", vec![gate("focused")]);
 
     assert_eq!(
@@ -519,47 +595,24 @@ fn acceptance_execution_boundary_admits_every_non_hold_shape() {
         AcceptanceAdmission::Admit
     );
     assert_eq!(
-        classify_admission(&current.fingerprint(), Some(&current)),
-        AcceptanceAdmission::Admit
-    );
-
-    let mut settled = current.clone();
-    settled.terminal = Some(ManifestTerminal {
-        hold_category: None,
-        fingerprint: current.fingerprint(),
-        cleanup_confirmed: true,
-        cleanup_diagnostics: String::new(),
-        recorded_at: chrono::Utc::now(),
-    });
-    assert_eq!(
-        classify_admission(&current.fingerprint(), Some(&settled)),
-        AcceptanceAdmission::Admit
+        LiveAcceptanceHolds::new().classify("alpha", &current.fingerprint()),
+        AcceptanceAdmission::Admit,
+        "an empty registry — which is exactly what a restarted owner has — admits"
     );
 }
 
 /// A recorded hold whose category is a *deadline* refuses an unchanged
-/// fingerprint; one that is a runtime or manifest defect does not.
+/// fingerprint; every other category does not.
 ///
 /// The difference is what the category is evidence *about*. A deadline answered
-/// this exact input: re-asking it can only expire again. A runtime defect —
-/// dirty worktree, unreadable evidence directory, transient Git failure —
-/// answered the environment, and cleanliness is not a fingerprint component, so
-/// an equal fingerprint after one says nothing. Refusing on it would make a
-/// recoverable environment fact a permanent refusal.
+/// this exact input: re-asking it can only expire again. A runtime defect, an
+/// unwritable state root, or legacy target evidence answered the *environment*,
+/// and none of those facts is a fingerprint component, so an equal fingerprint
+/// after one says nothing. Refusing on it would make a recoverable environment
+/// fact a permanent refusal.
 #[test]
 fn acceptance_execution_boundary_only_deadline_categories_refuse_unchanged_input() {
     let current = manifest("alpha", vec![gate("focused")]);
-    let with_category = |category: AcceptanceHoldCategory| {
-        let mut stored = current.clone();
-        stored.terminal = Some(ManifestTerminal {
-            hold_category: Some(category),
-            fingerprint: current.fingerprint(),
-            cleanup_confirmed: true,
-            cleanup_diagnostics: String::new(),
-            recorded_at: chrono::Utc::now(),
-        });
-        stored
-    };
 
     for category in [
         AcceptanceHoldCategory::DeclaredGateDeadlineExhausted,
@@ -567,9 +620,9 @@ fn acceptance_execution_boundary_only_deadline_categories_refuse_unchanged_input
         AcceptanceHoldCategory::ReviewCleanupUnproven,
     ] {
         assert!(category.refuses_unchanged_retry(), "{category:?}");
-        let stored = with_category(category);
         assert!(
-            classify_admission(&current.fingerprint(), Some(&stored)).is_refused(),
+            classify_admission(&current.fingerprint(), Some(&live_hold(&current, category)))
+                .is_refused(),
             "an equal fingerprint after {category:?} must be refused"
         );
     }
@@ -577,84 +630,99 @@ fn acceptance_execution_boundary_only_deadline_categories_refuse_unchanged_input
     for category in [
         AcceptanceHoldCategory::RuntimeDefect,
         AcceptanceHoldCategory::ManifestMalformed,
+        AcceptanceHoldCategory::StatePathUnavailable,
+        AcceptanceHoldCategory::LegacyTargetEvidence,
     ] {
         assert!(!category.refuses_unchanged_retry(), "{category:?}");
-        let stored = with_category(category);
         assert_eq!(
-            classify_admission(&current.fingerprint(), Some(&stored)),
+            classify_admission(&current.fingerprint(), Some(&live_hold(&current, category))),
             AcceptanceAdmission::Admit,
             "{category:?} says nothing about the input, so it must admit a fresh bounded attempt"
         );
     }
 }
 
-/// The same asymmetry through the workspace-derived path a restart takes: a
-/// stored `RuntimeDefect` hold does not survive as a permanent refusal.
+/// A non-refusing category is not even remembered: recording it would only give
+/// a later reader something misleading to find, since admission would admit on
+/// it anyway.
 #[test]
-fn acceptance_execution_boundary_runtime_defect_hold_admits_from_the_store() {
-    let workspace = tempfile::tempdir().unwrap();
-    let store = ManifestStore::new(workspace.path().to_path_buf());
+fn acceptance_execution_boundary_registry_remembers_only_refusing_holds() {
     let current = manifest("alpha", vec![gate("focused")]);
-    let mut stored = current.clone();
-    stored.terminal = Some(ManifestTerminal {
-        hold_category: Some(AcceptanceHoldCategory::RuntimeDefect),
-        fingerprint: current.fingerprint(),
-        cleanup_confirmed: true,
-        cleanup_diagnostics: "worktree was dirty".to_string(),
-        recorded_at: chrono::Utc::now(),
-    });
-    store.store(&stored).unwrap();
+    let holds = LiveAcceptanceHolds::new();
 
+    holds.record(
+        "alpha",
+        live_hold(&current, AcceptanceHoldCategory::ReviewDeadlineExhausted),
+    );
+    assert!(holds.get("alpha").is_some());
+
+    holds.record(
+        "alpha",
+        live_hold(&current, AcceptanceHoldCategory::StatePathUnavailable),
+    );
+    assert!(
+        holds.get("alpha").is_none(),
+        "an environment-fact hold replaces the refusal rather than accumulating beside it"
+    );
     assert_eq!(
-        classify_admission_from_store(workspace.path(), "alpha", &current.fingerprint()),
-        AcceptanceAdmission::Admit,
-        "cleaning the worktree changes no fingerprint component, so a runtime-defect hold \
-         must not become a permanent refusal"
+        holds.classify("alpha", &current.fingerprint()),
+        AcceptanceAdmission::Admit
     );
 }
 
-/// Restart: delete every out-of-worktree file and the same worktree answers the
-/// same way. This is constitutional law 1 expressed as a test — the workspace
-/// alone decides the next action.
+/// Restart: the refusal lives only in this process, so a new registry — which is
+/// exactly what a restarted owner has — admits one fresh bounded attempt without
+/// requiring any repository mutation.
+///
+/// This is constitutional law 1 expressed as a test. The durable record that
+/// used to refuse here is gone, so deleting out-of-worktree state can no longer
+/// change the next action either.
 #[test]
-fn acceptance_execution_boundary_restart_derives_the_same_refusal_from_the_workspace() {
-    let workspace = tempfile::tempdir().unwrap();
-    let store = ManifestStore::new(workspace.path().to_path_buf());
+fn acceptance_execution_boundary_restart_admits_one_fresh_attempt() {
     let current = manifest("alpha", vec![gate("focused")]);
-    store.store(&held(&current)).unwrap();
 
-    // A "restart" here is the total absence of any carried-over value: the
-    // classification below reads nothing but the workspace path and the
-    // recomputed fingerprint.
-    let after_restart =
-        classify_admission_from_store(workspace.path(), "alpha", &current.fingerprint());
+    let owner = LiveAcceptanceHolds::new();
+    owner.record("alpha", held(&current));
+    assert!(
+        owner.classify("alpha", &current.fingerprint()).is_refused(),
+        "the owner that recorded the hold still refuses the unchanged input"
+    );
 
-    assert!(after_restart.is_refused());
+    // "Restart": a new registry, the same unchanged fingerprint.
+    let restarted = LiveAcceptanceHolds::new();
+    assert_eq!(
+        restarted.classify("alpha", &current.fingerprint()),
+        AcceptanceAdmission::Admit,
+        "a restarted owner must admit one fresh bounded attempt with no repository change"
+    );
 
+    // And the live owner still restores eligibility the ordinary way.
     let mut moved = current.clone();
     moved.candidate_tree_oid = "7".repeat(40);
     assert_eq!(
-        classify_admission_from_store(workspace.path(), "alpha", &moved.fingerprint()),
+        owner.classify("alpha", &moved.fingerprint()),
         AcceptanceAdmission::Admit
     );
 }
 
-/// A manifest nobody can read admits rather than refuses: a change must not be
-/// stranded on a defect it did not cause, and the worst case is one bounded
-/// attempt that rewrites the file correctly.
+/// Admitting a fresh attempt clears the hold, so a refusal describes the latest
+/// answer rather than accumulating across attempts.
 #[test]
-fn acceptance_execution_boundary_malformed_stored_manifest_admits() {
-    let workspace = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(workspace.path().join(EVIDENCE_DIR)).unwrap();
-    std::fs::write(
-        workspace.path().join(manifest_relative_path("alpha")),
-        b"{ truncated",
-    )
-    .unwrap();
+fn acceptance_execution_boundary_clearing_a_hold_restores_admission() {
+    let current = manifest("alpha", vec![gate("focused")]);
+    let holds = LiveAcceptanceHolds::new();
+    holds.record("alpha", held(&current));
+    holds.record("beta", held(&current));
+
+    holds.clear("alpha");
 
     assert_eq!(
-        classify_admission_from_store(workspace.path(), "alpha", &"a".repeat(64)),
+        holds.classify("alpha", &current.fingerprint()),
         AcceptanceAdmission::Admit
+    );
+    assert!(
+        holds.classify("beta", &current.fingerprint()).is_refused(),
+        "clearing one change must not disturb another"
     );
 }
 

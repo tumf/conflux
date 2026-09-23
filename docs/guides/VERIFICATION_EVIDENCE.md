@@ -39,8 +39,8 @@ it captured, and records:
 | Automation file | The declared path's blob ID at that commit |
 | Tool | Resolved executable path, its file digest, and its `--version` output |
 | Result | Start/end timestamps and the exit code of the child it waited on |
-| Artifact | Repository-relative path plus content digest |
-| Clean state | Evidence-path-excluded cleanliness before *and* after the run |
+| Artifact | Store-relative path plus content digest |
+| Clean state | Full target cleanliness before *and* after the run, with no Conflux-owned path excluded |
 
 Reuse is an all-fields conjunction. There is no partial score and no freshness
 heuristic: the first binding that differs is the rerun reason, reported per
@@ -50,18 +50,93 @@ changed.
 
 ## Where it lives
 
-`.cflx/verification-evidence/` inside the change worktree, holding one
-`<verification-id>.json` envelope and one `<verification-id>.log` artifact per
-verification. The directory carries a self-ignoring `.gitignore`, so nothing is
-added to a commit and `.git/info/exclude` is not touched.
+Outside the target. Constitutional law 4 forbids Conflux from writing its own
+runtime artifacts into a target repository or any managed worktree, and it is
+explicit that hiding such a write with an ignore file or a cleanliness exception
+does not make it permissible. So nothing lives in the worktree at all:
 
-That directory is also the one difference from the bound commit that does *not*
-count as dirty — otherwise writing the sidecar would invalidate the sidecar. Any
-change outside it forces rerun.
+```text
+<conflux-state-root>/acceptance/
+  <project-slug>/
+    <workspace-slug>/
+      <change-id>/
+        manifest.json          # the frozen execution manifest
+        diagnostics.json       # how the last invocation ended (read by humans only)
+        gates/
+          <verification-id>.json   # the bound envelope
+          <verification-id>.log    # the captured artifact
+```
 
-Everything the decision depends on is inside the worktree. Deleting
-`~/.local/state/cflx/**` cannot change a decision, and a restart re-derives the
-same answer from the same files, as constitutional law 1 requires.
+The root follows the ordinary `state_base_dir` → `XDG_STATE_HOME` →
+`~/.local/state` precedence, with a Conflux-owned system temporary root only when
+no persistent one can be derived. Project and workspace slugs come from the same
+canonical-path algorithm the worktree and log paths use, so two worktrees of one
+project never share a cache and one worktree's cache is stable across runs.
+
+**It fails closed, never into the target.** A root that cannot be resolved,
+created, or written — and a root that resolves *inside* the target repository or
+a managed worktree — produces the typed
+`acceptance_state_path_unavailable` runtime hold before any declared gate is
+launched. There is no `.cflx` fallback, because a fallback is exactly the
+pollution this arrangement removes.
+
+**Cleanliness has no exceptions.** Acceptance evaluates the target with the
+ordinary tracked/untracked porcelain status and no Conflux-owned path excluded.
+The old evidence-directory exception existed so that writing the sidecar could
+not invalidate the sidecar; with the sidecar out of the tree there is nothing
+left for it to protect.
+
+## Losing the cache costs work, never correctness
+
+Everything under that directory is **cache and diagnostics**. It is never
+workflow authority:
+
+- A missing, unreadable, malformed, stale, or deliberately deleted record means
+  exactly one thing: run the declared command again.
+- It never implies PASS, never suppresses a command, and never selects the next
+  workflow action — admission, retry, archive, merge, and next-action selection
+  are all decided from repository and Git state.
+- Deleting `~/.local/state/cflx/**` may discard reusable evidence, but it cannot
+  modify the target worktree or make its repository state look cleaner than it
+  is.
+
+That is constitutional law 1 in practice: the next action chosen for the same
+workspace contents does not depend on out-of-worktree state.
+
+## Legacy `.cflx/verification-evidence`
+
+Earlier releases wrote evidence into `.cflx/verification-evidence/` inside the
+worktree, behind a self-ignoring `.gitignore`. The current runtime treats that
+path as **someone else's file**:
+
+- It probes only whether the path exists — including when self-ignored, because
+  the probe is a filesystem check rather than a `git status` question.
+- If it exists, Acceptance stops with the typed
+  `acceptance_legacy_target_evidence` hold naming the path.
+- It never opens, parses, migrates, rewrites, hides, or deletes the content.
+- No other ignored path is evaluated. A build-output directory or a dependency
+  cache is none of Conflux's business, and inspecting one would reintroduce the
+  Conflux-specific status filtering the constitution forbids.
+
+Removing the directory is an explicit repository-owner action:
+
+```bash
+rm -rf .cflx/verification-evidence
+```
+
+## Retry refusal is process-local
+
+An Acceptance invocation whose deadline expires settles as a non-resumable hold.
+While the owner process that recorded it is alive, an unchanged retry of that
+exact input is refused as `unchanged_acceptance_input`, and the refusal names the
+fingerprint components a repository change would have to move.
+
+That refusal lives in memory and nowhere else. A restarted owner reconstructs no
+hold: the first admission in the new lifetime — an explicit retry or automatic
+mark settlement — gets one fresh bounded attempt with no repository mutation
+required, while still-valid cached gate results keep it cheap. A durable record
+that could refuse work after a restart would mean deleting out-of-worktree state
+changed the next action, which is the thing law 1 rules out.
 
 ## What is eligible
 
@@ -83,8 +158,9 @@ plan.
 ## The authority boundary
 
 Only the runtime executor may write a reusable envelope. Records are written
-`0400` inside a `0700` runtime-owned directory, and one whose mode or `authority`
-field says otherwise is refused as `evidence_agent_authored`.
+`0400` inside a `0700` runtime-owned directory in the Conflux state root, and one
+whose mode or `authority` field says otherwise is refused as
+`evidence_agent_authored`.
 
 A process running under the same UID can `chmod` past that, so this is default
 mutation refusal rather than an integrity guarantee. What makes a forged envelope
@@ -93,8 +169,8 @@ live Git state, so the only envelope that survives validation is one describing 
 command that really did run against exactly this tree — and a rerun would have to
 satisfy the same conditions anyway.
 
-**Never hand-edit anything under the evidence directory.** Editing an envelope
-only forces the rerun it was trying to avoid.
+**Never hand-edit anything under the store.** Editing an envelope only forces the
+rerun it was trying to avoid. Deleting the whole directory is always safe.
 
 ## What Acceptance sees
 

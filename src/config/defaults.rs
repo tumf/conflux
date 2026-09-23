@@ -538,6 +538,209 @@ pub fn ensure_state_root_usable(
     Ok(Some(root))
 }
 
+// ── External Acceptance evidence store ─────────────────────────────────────
+
+/// Directory Conflux owns for Acceptance evidence inside the state root.
+///
+/// A sibling of `logs` and `evaluations`, never a descendant: log retention and
+/// the log viewer are scoped to `logs` alone, so neither can read or delete an
+/// Acceptance record.
+pub const ACCEPTANCE_DIR_NAME: &str = "acceptance";
+
+/// Why an external Acceptance store path could not be produced or used.
+///
+/// Every variant is a refusal rather than a degraded path. Constitutional law 4
+/// forbids falling back into the target worktree, so a store that cannot be
+/// resolved has no second choice to offer.
+#[derive(Debug, thiserror::Error)]
+pub enum AcceptanceStoreError {
+    #[error("the Conflux state root could not be resolved: {0}")]
+    StateRoot(#[from] StateRootError),
+
+    #[error(
+        "'{0}' is not usable as a single Acceptance store path component; \
+         a change or verification identifier may not be empty, '.', '..', longer \
+         than 128 characters, or contain anything outside [A-Za-z0-9._-]"
+    )]
+    UnsafeComponent(String),
+
+    #[error(
+        "the resolved Acceptance store '{path}' is inside the target tree '{target}'. \
+         Conflux-owned evidence must live outside the target repository and every \
+         managed worktree; point state_base_dir at a directory outside the project."
+    )]
+    InsideTarget { path: PathBuf, target: PathBuf },
+
+    #[error("the Acceptance store '{path}' could not be created: {source}")]
+    Uncreatable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("the Acceptance store '{path}' is not writable: {source}")]
+    NotWritable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl AcceptanceStoreError {
+    /// Stable machine-readable code for typed runtime holds and JSON output.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::StateRoot(_) => "acceptance_state_root_unresolvable",
+            Self::UnsafeComponent(_) => "acceptance_store_unsafe_component",
+            Self::InsideTarget { .. } => "acceptance_store_inside_target",
+            Self::Uncreatable { .. } => "acceptance_store_uncreatable",
+            Self::NotWritable { .. } => "acceptance_store_not_writable",
+        }
+    }
+}
+
+/// Whether `value` may be used as exactly one path component of a Conflux-owned
+/// store.
+///
+/// Refused rather than sanitized: a sanitized name binds a store to an identity
+/// it does not describe, and two identities that sanitize to one name would
+/// share a cache.
+pub fn is_safe_path_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// The Acceptance evidence root shared by every store this process resolves.
+///
+/// Format: `<state root>/acceptance`. When no state root can be derived at all
+/// it keeps the same temp-directory fallback shape logging and evaluations use,
+/// so a machine without a home directory still gets an isolated external root
+/// rather than a target-local one.
+pub fn acceptance_root_path(
+    configured: Option<&str>,
+) -> std::result::Result<PathBuf, StateRootError> {
+    Ok(match conflux_state_root(configured)? {
+        Some(root) => root.join(ACCEPTANCE_DIR_NAME),
+        None => std::env::temp_dir().join("cflx-acceptance-fallback"),
+    })
+}
+
+/// Resolve a path to its canonical form as far as the filesystem allows.
+///
+/// A store path usually does not exist yet, so `canonicalize` on the whole path
+/// fails. The nearest existing ancestor is canonicalized instead and the
+/// remaining components are rejoined, which is what makes containment comparable
+/// on platforms where the temp directory is itself a symlink (macOS `/var` →
+/// `/private/var`). Without this a store under `/var/folders/...` and a target
+/// under `/private/var/folders/...` would look unrelated.
+fn canonical_or_lexical(path: &std::path::Path) -> PathBuf {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        if let Ok(canonical) = cursor.canonicalize() {
+            let mut resolved = canonical;
+            for component in suffix.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+        let Some(name) = cursor.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return path.to_path_buf();
+        };
+        suffix.push(name);
+        if !cursor.pop() {
+            return path.to_path_buf();
+        }
+    }
+}
+
+/// Whether `path` is `target` or lives below it.
+///
+/// Both sides are resolved through [`canonical_or_lexical`] first, and the raw
+/// lexical forms are compared too: a symlinked target whose link cannot be read
+/// must still refuse rather than silently pass the containment check.
+fn is_inside(path: &std::path::Path, target: &std::path::Path) -> bool {
+    canonical_or_lexical(path).starts_with(canonical_or_lexical(target)) || path.starts_with(target)
+}
+
+/// Compose the external Acceptance store directory for one change.
+///
+/// Layout: `<acceptance root>/<project-slug>/<workspace-slug>/<change-id>/`.
+/// Both slugs come from [`generate_project_slug`], so they are derived from the
+/// canonical absolute path and are deterministic within one binary; `change_id`
+/// keeps strict single-component validation.
+///
+/// Pure: it resolves no configuration, reads no environment, and creates
+/// nothing. Containment against the target repository *and* the managed
+/// workspace is checked here so a refusal happens before any gate is launched.
+pub fn acceptance_store_path_in(
+    acceptance_root: &std::path::Path,
+    project_root: &std::path::Path,
+    workspace: &std::path::Path,
+    change_id: &str,
+) -> std::result::Result<PathBuf, AcceptanceStoreError> {
+    if !is_safe_path_component(change_id) {
+        return Err(AcceptanceStoreError::UnsafeComponent(change_id.to_string()));
+    }
+    let path = acceptance_root
+        .join(generate_project_slug(project_root))
+        .join(generate_project_slug(workspace))
+        .join(change_id);
+    for target in [project_root, workspace] {
+        if is_inside(&path, target) {
+            return Err(AcceptanceStoreError::InsideTarget {
+                path,
+                target: target.to_path_buf(),
+            });
+        }
+    }
+    Ok(path)
+}
+
+/// Process-facing wrapper over [`acceptance_store_path_in`].
+pub fn acceptance_store_path(
+    configured: Option<&str>,
+    project_root: &std::path::Path,
+    workspace: &std::path::Path,
+    change_id: &str,
+) -> std::result::Result<PathBuf, AcceptanceStoreError> {
+    acceptance_store_path_in(
+        &acceptance_root_path(configured)?,
+        project_root,
+        workspace,
+        change_id,
+    )
+}
+
+/// Create the resolved store and prove it is writable.
+///
+/// Existence is not permission: an unwritable mount answers `create_dir_all`
+/// with success for a directory that already exists, so the probe is what turns
+/// "the path resolves" into "a gate's output can actually land there".
+pub fn ensure_acceptance_store_usable(
+    path: &std::path::Path,
+) -> std::result::Result<(), AcceptanceStoreError> {
+    std::fs::create_dir_all(path).map_err(|source| AcceptanceStoreError::Uncreatable {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+    let probe = path.join(format!(".cflx-write-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"").map_err(|source| AcceptanceStoreError::NotWritable {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 /// Generates the log file path for a project under the resolved state root.
 /// Format: `<state root>/logs/<project_slug>/<YYYY-MM-DD>.log`
 ///
@@ -1025,6 +1228,172 @@ mod tests {
         assert!(
             !Path::new("relative/state").exists(),
             "rejection must not create the configured directory"
+        );
+    }
+
+    // ── External Acceptance store resolution ───────────────────────────────
+    //
+    // Pure cases: every input is explicit, so they assert the layout and the
+    // containment law rather than the ambient process environment.
+
+    #[test]
+    fn acceptance_store_isolates_project_workspace_and_change() {
+        let root = Path::new("/var/state/cflx/acceptance");
+        let project = Path::new("/home/alice/projects/conflux");
+        let workspace = Path::new("/home/alice/.local/share/cflx/worktrees/p/add-a-thing");
+
+        let path = acceptance_store_path_in(root, project, workspace, "add-a-thing")
+            .expect("an external root resolves");
+
+        let components: Vec<_> = path
+            .strip_prefix(root)
+            .expect("the store lives under the acceptance root")
+            .iter()
+            .map(|component| component.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            components.len(),
+            3,
+            "project / workspace / change: {path:?}"
+        );
+        assert_eq!(components[0], generate_project_slug(project));
+        assert_eq!(components[1], generate_project_slug(workspace));
+        assert_eq!(components[2], "add-a-thing");
+
+        // Deterministic within one binary: the same inputs resolve identically,
+        // which is what lets a later attempt find the cache the first one wrote.
+        assert_eq!(
+            path,
+            acceptance_store_path_in(root, project, workspace, "add-a-thing").unwrap()
+        );
+
+        // A second workspace of the same project cannot collide with the first.
+        let sibling = Path::new("/home/alice/.local/share/cflx/worktrees/p/other-thing");
+        assert_ne!(
+            path,
+            acceptance_store_path_in(root, project, sibling, "add-a-thing").unwrap()
+        );
+    }
+
+    #[test]
+    fn acceptance_store_refuses_an_unsafe_change_component() {
+        let root = Path::new("/var/state/cflx/acceptance");
+        let project = Path::new("/home/alice/project");
+        let workspace = Path::new("/home/alice/workspace");
+
+        for hostile in ["", ".", "..", "../escape", "a/b", "with space"] {
+            let error = acceptance_store_path_in(root, project, workspace, hostile)
+                .expect_err("an unsafe component must fail closed");
+            assert!(
+                matches!(error, AcceptanceStoreError::UnsafeComponent(_)),
+                "'{hostile}' produced {error:?}"
+            );
+        }
+        assert!(is_safe_path_component("add-a-thing"));
+        assert!(is_safe_path_component("focused-gate.log"));
+        assert!(!is_safe_path_component(&"x".repeat(129)));
+    }
+
+    /// Constitutional law 4, checked before anything is created: a resolved root
+    /// inside the target repository or inside the managed worktree is refused,
+    /// never used and never quietly relocated.
+    #[test]
+    fn acceptance_store_refuses_a_root_inside_the_target() {
+        let project = Path::new("/home/alice/projects/conflux");
+        let workspace = Path::new("/home/alice/projects/conflux/.worktrees/add-a-thing");
+
+        let inside_repo = acceptance_store_path_in(
+            &project.join(".cflx/state/acceptance"),
+            project,
+            workspace,
+            "add-a-thing",
+        )
+        .expect_err("a root inside the repository must fail closed");
+        assert!(
+            matches!(
+                &inside_repo,
+                AcceptanceStoreError::InsideTarget { target, .. } if target == project
+            ),
+            "{inside_repo:?}"
+        );
+        assert_eq!(inside_repo.code(), "acceptance_store_inside_target");
+
+        let inside_worktree = acceptance_store_path_in(
+            &workspace.join("acceptance"),
+            Path::new("/home/alice/elsewhere"),
+            workspace,
+            "add-a-thing",
+        )
+        .expect_err("a root inside the managed worktree must fail closed");
+        assert!(
+            matches!(
+                &inside_worktree,
+                AcceptanceStoreError::InsideTarget { target, .. } if target == workspace
+            ),
+            "{inside_worktree:?}"
+        );
+    }
+
+    /// The containment check survives a symlinked ancestor. On macOS the system
+    /// temp directory is itself a symlink, so a purely lexical comparison would
+    /// report "outside" for a store that is genuinely inside the target.
+    #[test]
+    fn acceptance_store_containment_follows_symlinked_ancestors() {
+        let real = tempfile::TempDir::new().expect("tempdir");
+        let project = real.path().join("project");
+        std::fs::create_dir_all(project.join(".cflx")).expect("create project");
+
+        let link_parent = tempfile::TempDir::new().expect("tempdir");
+        let linked_project = link_parent.path().join("linked-project");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&project, &linked_project).expect("symlink");
+        #[cfg(not(unix))]
+        let linked_project = project.clone();
+
+        let error = acceptance_store_path_in(
+            &project.join(".cflx/acceptance"),
+            &linked_project,
+            &project.join("worktree"),
+            "add-a-thing",
+        )
+        .expect_err("a store under the symlinked target must still be refused");
+        assert!(matches!(error, AcceptanceStoreError::InsideTarget { .. }));
+    }
+
+    #[test]
+    fn acceptance_root_falls_back_to_an_external_temporary_root() {
+        // No configuration, no XDG value, and no home directory: the fallback is
+        // still outside every target tree, which is the property that matters.
+        let root = acceptance_root_path(Some("/volumes/external/cflx-state"))
+            .expect("an absolute configured root resolves");
+        assert_eq!(
+            root,
+            PathBuf::from("/volumes/external/cflx-state/cflx/acceptance")
+        );
+
+        let fallback = std::env::temp_dir().join("cflx-acceptance-fallback");
+        assert!(fallback.is_absolute());
+        assert_eq!(
+            fallback.file_name().and_then(|n| n.to_str()),
+            Some("cflx-acceptance-fallback")
+        );
+    }
+
+    #[test]
+    fn ensure_acceptance_store_usable_creates_and_proves_the_directory() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = temp.path().join("acceptance/project/workspace/change");
+
+        ensure_acceptance_store_usable(&store).expect("a fresh store is creatable and writable");
+
+        assert!(store.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&store)
+                .expect("read store")
+                .filter_map(Result::ok)
+                .count(),
+            0,
+            "the write probe must be removed again"
         );
     }
 }

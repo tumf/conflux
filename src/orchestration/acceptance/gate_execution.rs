@@ -328,19 +328,17 @@ pub fn classify_gate_results(results: &GateResults) -> GateVerdict {
 pub async fn plan_manifest_reuse<F: RepositoryFacts>(
     facts: &F,
     workspace: &Path,
+    store: &EvidenceStore,
     manifest: &AcceptanceExecutionManifest,
     policy: ReusePolicy,
 ) -> Vec<ReuseDecision> {
-    use super::verification_evidence::{
-        dirty_entries_excluding_evidence, EvidenceDefect, RerunReason,
-    };
+    use super::verification_evidence::{dirty_entries, EvidenceDefect, RerunReason};
 
     let mut decisions = Vec::new();
-    let store = EvidenceStore::new(workspace.to_path_buf());
     // One status read for every gate: two reads could straddle a write and let
     // one gate believe the tree was clean while another saw it dirty.
     let dirty = match facts.porcelain_status(workspace).await {
-        Ok(status) => dirty_entries_excluding_evidence(&status),
+        Ok(status) => dirty_entries(&status),
         Err(error) => {
             for gate in &manifest.gates {
                 decisions.push(ReuseDecision::Rerun {
@@ -371,15 +369,19 @@ pub async fn plan_manifest_reuse<F: RepositoryFacts>(
             });
             continue;
         }
+        // The artifact is hashed out of the external store. A cache an operator
+        // deleted — or one a moved state root no longer reaches — is exactly an
+        // unreadable artifact, and the only thing that may follow from it is a
+        // rerun.
         let artifact_digest = facts
-            .hash_file(workspace, &workspace.join(&record.artifact_path))
+            .hash_file(workspace, &store.artifact_path(&request.verification_id))
             .await
             .ok();
         if artifact_digest.is_none() {
             decisions.push(ReuseDecision::Rerun {
                 verification_id: request.verification_id,
                 reason: RerunReason::Defect(EvidenceDefect::Unreadable(format!(
-                    "artifact '{}' is absent or unreadable",
+                    "artifact '{}' is absent or unreadable in the external store",
                     record.artifact_path
                 ))),
             });

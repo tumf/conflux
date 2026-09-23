@@ -19,6 +19,10 @@ pub mod gate_execution;
 /// Deriving the execution manifest from workspace evidence alone.
 pub mod manifest_builder;
 
+/// Where Acceptance evidence lives: one Conflux-owned external store per change,
+/// resolved and proven before any declared gate runs, and never inside a target.
+pub mod evidence_location;
+
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{AcceptanceAttempt, OutputCollector};
@@ -1330,9 +1334,13 @@ pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Re
             .next()
             .and_then(crate::task_file::TaskFileFormat::from_file_name)
     }
+    // Conflux-owned runtime artifacts no longer live in the target, so there is
+    // no Conflux path left to filter out here: the only exclusions remaining are
+    // Git's own directory and the repository-owned locations this fingerprint
+    // was never about. `.cflx.jsonc` stays *included* — it is a repository file
+    // the project owns, and editing it is real progress.
     fn include(path: &str) -> bool {
         !path.starts_with(".git/")
-            && !path.starts_with(".cflx/")
             && !path.contains("/APPLY_BLOCKED/")
             && !path.starts_with("logs/")
             && !path.starts_with("history/")

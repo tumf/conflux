@@ -75,6 +75,51 @@ Evaluate target cleanliness without special Conflux path exclusions. Remove the 
 - Regression tests inspect both the external store and target tree, test state-root failure and in-target containment refusal before command launch, prove cache deletion causes rerun rather than PASS, replace `acceptance_execution_boundary_restart_reaches_the_same_refusal` with post-restart fresh-attempt coverage, and prove the dedicated legacy-path probe detects self-ignored evidence without evaluating unrelated ignored paths.
 - `cargo test acceptance_execution_boundary --lib` passes.
 
+## Retired Scenarios
+
+Both are superseded rather than merely reworded: each one's replacement states a
+contract the original now contradicts.
+
+- parallel-execution: Parallel execution acceptance loop / process restart uses workspace evidence
+  — replaced by `process restart reconstructs work without external authority`.
+  The original's "does not require an external retry checkpoint" said nothing
+  about external state that *is* present; the replacement keeps workspace
+  derivation and adds that valid external cache may reuse a gate result but may
+  not refuse a fresh retry or select the next action.
+- parallel-execution: Parallel execution acceptance loop / unchanged deadline exhaustion is not redispatched
+  — replaced by `unchanged deadline exhaustion is suppressed only by the live owner`.
+  The original refused on "a prior hold" with no owner scope, which this change
+  makes false: after owner restart a matching fingerprint MUST be admitted for
+  one fresh bounded attempt.
+- remote-control-api: Shared lifecycle scheduling semantics / Unchanged retry is refused consistently
+  — replaced by `Unchanged retry is refused consistently within one owner lifetime`.
+  The original's given condition was "the *persisted* deadline-hold fingerprint",
+  and this change deletes that persisted record: the refusal now comes from the
+  live owner's typed state and cannot outlive the process that recorded it.
+- remote-control-api: Shared lifecycle scheduling semantics / Changed fingerprint restores retry eligibility
+  — replaced by `Repository change restores live-owner retry eligibility`. The
+  original said "a prior Acceptance deadline hold exists", which after this
+  change no longer identifies anything a restarted owner can observe; the
+  replacement scopes the same restoration to the owner still holding it.
+- remote-control-api: Shared lifecycle scheduling semantics / Bulk retry reports mixed eligibility
+  — replaced by `Bulk retry reports mixed live eligibility`, for the same reason:
+  per-target mixing is unchanged, but "unchanged Acceptance input" is only a
+  refusal while this owner's typed hold is live.
+- proposal-metadata: Verification evidence reuse is bound to current repository state / Evidence sidecar does not invalidate its own binding
+  — replaced by `Evidence cache does not alter target cleanliness`. The original
+  granted exactly the cleanliness exception constitutional law 4 forbids: "the
+  only worktree difference is inside the designated runtime evidence directory"
+  describes a Conflux-owned write inside the target, which no longer happens and
+  is no longer excused. Its replacement keeps the same protection — a sidecar
+  cannot invalidate itself — by relocating the record instead of exempting it.
+- proposal-metadata: Verification evidence reuse is bound to current repository state / Restart preserves only repository-derived authority
+  — replaced by `Restart does not promote external cache to workflow authority`.
+  The original's "derives reuse eligibility from repository-local runtime
+  evidence" named a location that no longer exists; the replacement states the
+  property that actually matters — repository and Git state decide the next
+  action, and valid cache may reuse a gate result but cannot refuse admission or
+  imply PASS — and covers cache that is *present* as well as absent.
+
 ## Out of Scope
 
 - Automatically deleting legacy `.cflx/verification-evidence` from user repositories or worktrees.

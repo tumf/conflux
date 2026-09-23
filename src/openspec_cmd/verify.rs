@@ -19,14 +19,22 @@
 //! Nothing here is a verdict. A failing command exits non-zero with its artifact
 //! path, and that is a *command* result: whether the change is acceptable stays
 //! an Acceptance question.
+//!
+//! Like every other Acceptance writer, the envelope and its artifact go into the
+//! Conflux-owned external store rather than into the repository being verified.
+//! The store is resolved and proven before the first command starts, so an
+//! unusable one is reported instead of silently producing an unrecordable run —
+//! and a repository that still carries legacy `.cflx/verification-evidence`
+//! content is reported rather than read, migrated, or cleaned up.
 
 use std::path::{Path, PathBuf};
 
 use crate::archive_layout;
 use crate::openspec::VerificationDeclaration;
+use crate::orchestration::acceptance::evidence_location::{prepare_store, AcceptanceStore};
 use crate::orchestration::acceptance::verification_evidence::{
-    decide_reuse, eligible_request, plan_reuse, CaptureOutcome, GitRepositoryFacts, ReusePolicy,
-    RuntimeVerificationExecutor, SystemClock, VerificationRequest,
+    decide_reuse, eligible_request, plan_reuse, CaptureOutcome, EvidenceStore, GitRepositoryFacts,
+    ReusePolicy, RuntimeVerificationExecutor, SystemClock, VerificationRequest,
 };
 
 /// Exit status when at least one selected verification neither reused nor
@@ -89,12 +97,14 @@ fn select(
 /// Report the reuse plan without executing anything.
 async fn report_plan(
     workspace: &Path,
+    store: &EvidenceStore,
     declarations: &[VerificationDeclaration],
     json_output: bool,
 ) -> Result<(), String> {
     let plan = plan_reuse(
         &GitRepositoryFacts,
         workspace,
+        store,
         declarations,
         ReusePolicy::default(),
     )
@@ -119,6 +129,7 @@ async fn report_plan(
 /// Run everything that cannot be reused, then report per verification.
 async fn run_verifications(
     workspace: &Path,
+    store: &EvidenceStore,
     declarations: &[VerificationDeclaration],
     json_output: bool,
 ) -> Result<i32, String> {
@@ -131,7 +142,8 @@ async fn run_verifications(
         // A declaration with no local reuse decision is not something this
         // command runs at all: deployed, credentialed, and device observations
         // are owned elsewhere by design.
-        let Some(decision) = decide_reuse(&facts, workspace, declaration, policy).await else {
+        let Some(decision) = decide_reuse(&facts, workspace, store, declaration, policy).await
+        else {
             continue;
         };
         if decision.is_reuse() {
@@ -155,6 +167,7 @@ async fn run_verifications(
         };
         let executor = RuntimeVerificationExecutor::new(
             workspace.to_path_buf(),
+            store.clone(),
             GitRepositoryFacts,
             crate::orchestration::acceptance::verification_evidence::DirectCommandSupervisor,
             SystemClock,
@@ -209,11 +222,33 @@ pub async fn cmd_verify(
         .map_err(|error| format!("Failed to resolve the current directory: {error}"))?;
     let workspace: PathBuf = workspace;
     let selected = select(declarations(&workspace, change_id)?, verification_id)?;
+    let store = resolve_store(&workspace, change_id)?;
     if plan_only {
-        report_plan(&workspace, &selected, json_output).await?;
+        report_plan(&workspace, &store.evidence(), &selected, json_output).await?;
         return Ok(0);
     }
-    run_verifications(&workspace, &selected, json_output).await
+    run_verifications(&workspace, &store.evidence(), &selected, json_output).await
+}
+
+/// Resolve the Conflux-owned external store this command reads and writes.
+///
+/// `cflx openspec verify` runs against the repository the operator is standing
+/// in, so the project and the workspace are the same directory; the store is
+/// still resolved outside both, and a refusal is reported as an error rather
+/// than worked around.
+fn resolve_store(workspace: &Path, change_id: &str) -> Result<AcceptanceStore, String> {
+    // Storage settings only: this command starts no AI subprocess, so an
+    // installation that has not configured its commands yet must still be able
+    // to resolve the state root its evidence belongs in.
+    let state_base_dir = crate::config::OrchestratorConfig::load_storage_settings(None)
+        .ok()
+        .and_then(|config| config.get_state_base_dir().map(str::to_string));
+    prepare_store(state_base_dir.as_deref(), workspace, workspace, change_id).map_err(|refusal| {
+        format!(
+            "Verification evidence cannot be stored outside the repository: {}",
+            refusal.evidence()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -352,6 +387,7 @@ mod tests {
         let plan = plan_reuse(
             &UnobservedFacts,
             workspace.path(),
+            &EvidenceStore::new(workspace.path().join("../external-acceptance-store")),
             &declared,
             ReusePolicy::default(),
         )

@@ -757,7 +757,6 @@ mod acceptance_execution_boundary_context {
             created_at: chrono::Utc::now(),
             absolute_deadline_secs: 3600,
             work_budget_secs: 3570,
-            terminal: None,
         }
     }
 
@@ -769,7 +768,7 @@ mod acceptance_execution_boundary_context {
             automation_path: "src/lib.rs".to_string(),
             automation_blob_oid: "1".repeat(40),
             tool: ToolIdentity::default(),
-            artifact_path: format!(".cflx/verification-evidence/{id}.log"),
+            artifact_path: crate::orchestration::acceptance::verification_evidence::EvidenceStore::artifact_relative_path(id),
             artifact_digest: None,
         }
     }
@@ -779,7 +778,7 @@ mod acceptance_execution_boundary_context {
         let results = GateResults {
             outcomes: vec![GateOutcome::Executed {
                 verification_id: "focused-gate".to_string(),
-                artifact_path: ".cflx/verification-evidence/focused-gate.log".to_string(),
+                artifact_path: "gates/focused-gate.log".to_string(),
                 elapsed_seconds: 120,
             }],
         };

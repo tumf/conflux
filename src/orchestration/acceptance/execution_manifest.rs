@@ -21,34 +21,58 @@
 //!   candidate commit/tree, review base/range, canonical change inputs, skill
 //!   and executable identity, and every normalized gate entry. Two invocations
 //!   with the same fingerprint are the same question; re-asking it after the
-//!   deadline already answered "no" is refused rather than redispatched.
-//! * **Nothing lives outside the worktree.** The manifest is a repository-local
-//!   sidecar inside the existing Git-excluded evidence directory, so deleting
-//!   `~/.local/state/cflx/**` cannot change a retry decision — constitutional
-//!   law 1 — and a restart re-derives the same fingerprint from the same files.
+//!   deadline already answered "no" is refused rather than redispatched —
+//!   *within the owner that recorded the answer*.
+//! * **Nothing lives inside the target, and nothing outside it is authority.**
+//!   The manifest is persisted into the Conflux-owned external store, never into
+//!   the target repository or a managed worktree (constitutional law 4), and it
+//!   is cache and diagnostics only. Deleting it may cost a rerun; it may not
+//!   change admission, retry, archive, merge, or next-action selection
+//!   (constitutional law 1).
+//!
+//! **Retry refusal is process-local.** The unchanged-input guard lives in
+//! [`LiveAcceptanceHolds`], a typed in-memory registry owned by the current
+//! process. Ephemeral single-process state is explicitly permitted; a durable
+//! record that could refuse work after a restart is not, because then deleting
+//! out-of-worktree state would change the next action chosen for the same
+//! workspace contents. So a restarted owner reconstructs no hold at all: the
+//! first admission in the new lifetime — explicit retry or automatic mark
+//! settlement — gets one fresh bounded attempt, while still-valid cached gate
+//! results may be reused to make it cheap.
 //!
 //! What the fingerprint deliberately excludes is as load-bearing as what it
-//! includes: timestamps, terminal output, gate durations, and the terminal
-//! record itself are all absent, because a fingerprint that moved on its own
-//! would turn "nothing changed" into an infinite retry loop.
+//! includes: timestamps, terminal output, and gate durations are all absent,
+//! because a fingerprint that moved on its own would turn "nothing changed" into
+//! an infinite retry loop.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::verification_evidence::{
-    eligible_request, is_storable_verification_id, EvidenceStore, ToolIdentity,
-    VerificationRequest, EVIDENCE_DIR,
+    eligible_request, is_storable_verification_id, EvidenceStore, ToolIdentity, VerificationRequest,
 };
 use crate::openspec::VerificationDeclaration;
 
 /// The only phase whose declarations may block a change before integration.
 pub const PRE_INTEGRATION_PHASE: &str = "pre-integration";
 
-/// Manifest schema. Any other value is a hard refusal, never a migration.
-pub const MANIFEST_SCHEMA: &str = "conflux-acceptance-execution-manifest-v1";
+/// Manifest schema.
+///
+/// Version 2 is where the manifest stopped being workflow authority: it lives in
+/// the external store, its gate artifact paths are store-relative, and it no
+/// longer carries a terminal record that could refuse a retry. A version-1
+/// manifest describes the opposite arrangement, so it is refused rather than
+/// migrated — reading one would mean resurrecting the durable admission this
+/// change removed.
+pub const MANIFEST_SCHEMA: &str = "conflux-acceptance-execution-manifest-v2";
+
+/// File name of the manifest inside one change's external store.
+pub const MANIFEST_FILE_NAME: &str = "manifest.json";
 
 /// Seconds reserved at the end of the effective Acceptance deadline for
 /// termination, reap, persistence, and state projection.
@@ -77,17 +101,12 @@ pub const FINGERPRINT_COMPONENTS: &[&str] = &[
     "artifact_digest",
 ];
 
-/// Repository-relative manifest path for one change.
-pub fn manifest_relative_path(change_id: &str) -> String {
-    format!("{EVIDENCE_DIR}/acceptance-manifest-{change_id}.json")
-}
-
-/// Whether a change ID is usable as a manifest file name.
+/// Whether a change ID is usable as a single external-store path component.
 ///
-/// Same rule the evidence sidecar applies to a verification ID: anything that
-/// could escape the evidence directory or collide across changes is refused
-/// rather than sanitized, because a sanitized name binds a manifest to a change
-/// it does not describe.
+/// Same rule the evidence envelope applies to a verification ID: anything that
+/// could escape the store directory or collide across changes is refused rather
+/// than sanitized, because a sanitized name binds a manifest to a change it does
+/// not describe.
 pub fn is_storable_change_id(change_id: &str) -> bool {
     is_storable_verification_id(change_id)
 }
@@ -117,6 +136,22 @@ pub enum AcceptanceHoldCategory {
     ManifestMalformed,
     /// The runtime itself could not execute or observe what it needed to.
     RuntimeDefect,
+    /// The external Acceptance state path is unavailable, unwritable, or
+    /// resolves inside the target repository or a managed worktree.
+    ///
+    /// Distinct from [`Self::RuntimeDefect`] because the operator action is
+    /// different and knowable: point `state_base_dir` somewhere outside the
+    /// project, or make the resolved directory writable. Reported *before* any
+    /// declared gate starts, and never satisfied by writing into the target.
+    StatePathUnavailable,
+    /// The target still carries legacy `.cflx/verification-evidence` content.
+    ///
+    /// Its own category because it is neither a defect nor a verdict: the
+    /// repository contains Conflux-owned files an earlier release wrote, and
+    /// removing them is an explicit repository-owner action. The runtime refuses
+    /// to proceed rather than opening, parsing, migrating, hiding, or deleting
+    /// content it no longer owns.
+    LegacyTargetEvidence,
 }
 
 impl AcceptanceHoldCategory {
@@ -128,6 +163,8 @@ impl AcceptanceHoldCategory {
             Self::ReviewCleanupUnproven => "acceptance_review_cleanup_unproven",
             Self::ManifestMalformed => "acceptance_manifest_malformed",
             Self::RuntimeDefect => "acceptance_runtime_defect",
+            Self::StatePathUnavailable => "acceptance_state_path_unavailable",
+            Self::LegacyTargetEvidence => "acceptance_legacy_target_evidence",
         }
     }
 
@@ -141,6 +178,8 @@ impl AcceptanceHoldCategory {
             "acceptance_review_cleanup_unproven" => Some(Self::ReviewCleanupUnproven),
             "acceptance_manifest_malformed" => Some(Self::ManifestMalformed),
             "acceptance_runtime_defect" => Some(Self::RuntimeDefect),
+            "acceptance_state_path_unavailable" => Some(Self::StatePathUnavailable),
+            "acceptance_legacy_target_evidence" => Some(Self::LegacyTargetEvidence),
             _ => None,
         }
     }
@@ -151,19 +190,23 @@ impl AcceptanceHoldCategory {
     /// actually decides: the invocation was bounded, the bound expired, and
     /// asking the identical question again can only expire again.
     ///
-    /// [`Self::RuntimeDefect`] and [`Self::ManifestMalformed`] deliberately do
-    /// not. Neither is a statement about the input at all — a dirty worktree, an
-    /// unreadable evidence directory, a transient Git failure, or an unparsable
-    /// sidecar can recover without any fingerprint component moving, and
-    /// cleanliness is not a fingerprint component. Refusing on them would turn a
-    /// recoverable environment fact into a permanent `unchanged_acceptance_input`
-    /// refusal nobody can clear by fixing the environment.
+    /// Every other category deliberately does not. None of them is a statement
+    /// about the input at all — a dirty worktree, an unwritable state root, a
+    /// transient Git failure, an unparsable cache record, or legacy evidence a
+    /// repository owner has since deleted can all recover without any
+    /// fingerprint component moving, and none of those facts is a fingerprint
+    /// component. Refusing on them would turn a recoverable environment fact
+    /// into a permanent `unchanged_acceptance_input` refusal nobody can clear by
+    /// fixing the environment.
     pub fn refuses_unchanged_retry(self) -> bool {
         match self {
             Self::DeclaredGateDeadlineExhausted
             | Self::ReviewDeadlineExhausted
             | Self::ReviewCleanupUnproven => true,
-            Self::ManifestMalformed | Self::RuntimeDefect => false,
+            Self::ManifestMalformed
+            | Self::RuntimeDefect
+            | Self::StatePathUnavailable
+            | Self::LegacyTargetEvidence => false,
         }
     }
 
@@ -186,6 +229,14 @@ impl AcceptanceHoldCategory {
             }
             Self::RuntimeDefect => {
                 "the Conflux runtime could not execute or observe the declared Acceptance boundary"
+            }
+            Self::StatePathUnavailable => {
+                "the external Conflux-owned Acceptance state path could not be resolved, created, \
+                 or written, and Acceptance may not fall back to the target worktree"
+            }
+            Self::LegacyTargetEvidence => {
+                "the target still carries legacy Conflux-owned '.cflx/verification-evidence' \
+                 content, which this runtime neither reads nor removes"
             }
         }
     }
@@ -218,19 +269,55 @@ impl AcceptanceExecutionHold {
     }
 
     /// Actionable operator-facing summary used as the blocker's error text.
+    ///
+    /// The refusal clause is stated only for the categories that actually refuse
+    /// — and only for the owner that recorded them. Claiming a general refusal
+    /// on a state-path or legacy-evidence hold would tell an operator to edit
+    /// the repository when what they need to do is fix the environment.
     pub fn summary(&self, change_id: &str) -> String {
-        format!(
+        let head = format!(
             "Acceptance for '{}' settled as a non-resumable execution hold ({}): {}. \
-             Input fingerprint {}. This is not a PASS, not a FAIL, and not an external block. \
-             A retry with unchanged repository input is refused as `{}`; change one of {} to \
-             permit a new bounded attempt.",
+             Input fingerprint {}. This is not a PASS, not a FAIL, and not an external block.",
             change_id,
             self.category.as_str(),
             self.category.detail(),
             &self.fingerprint[..16.min(self.fingerprint.len())],
-            UNCHANGED_ACCEPTANCE_INPUT,
-            FINGERPRINT_COMPONENTS.join(", "),
-        )
+        );
+        if self.category.refuses_unchanged_retry() {
+            format!(
+                "{head} While this owner process is alive, a retry with unchanged repository \
+                 input is refused as `{}`; change one of {} to permit a new bounded attempt. A \
+                 restarted owner admits one fresh attempt without a repository change.",
+                UNCHANGED_ACCEPTANCE_INPUT,
+                FINGERPRINT_COMPONENTS.join(", "),
+            )
+        } else {
+            format!("{head} {}", self.next_action())
+        }
+    }
+
+    /// What an operator does about this hold.
+    pub fn next_action(&self) -> String {
+        match self.category {
+            AcceptanceHoldCategory::StatePathUnavailable => {
+                "Make the Conflux-owned Acceptance state root resolvable and writable outside the \
+                 target repository — set `state_base_dir` to an absolute path outside the project, \
+                 or grant write permission on the resolved directory — then retry acceptance."
+                    .to_string()
+            }
+            AcceptanceHoldCategory::LegacyTargetEvidence => {
+                "Remove the legacy '.cflx/verification-evidence' directory from the target \
+                 yourself; Conflux will not read, migrate, or delete it. Then retry acceptance."
+                    .to_string()
+            }
+            _ if self.category.refuses_unchanged_retry() => format!(
+                "Change one of {} in the repository, then retry explicitly. While this owner \
+                 process is alive an unchanged retry is refused as `{}`.",
+                FINGERPRINT_COMPONENTS.join(", "),
+                UNCHANGED_ACCEPTANCE_INPUT
+            ),
+            _ => "Resolve the reported runtime condition, then retry acceptance.".to_string(),
+        }
     }
 
     /// Project the hold as the shared stalled-blocker payload.
@@ -258,12 +345,7 @@ impl AcceptanceExecutionHold {
             evidence,
             unblock_condition: None,
             prerequisite_owner: None,
-            next_action: format!(
-                "Change one of {} in the repository, then retry explicitly. An unchanged retry is \
-                 refused as `{}`.",
-                FINGERPRINT_COMPONENTS.join(", "),
-                UNCHANGED_ACCEPTANCE_INPUT
-            ),
+            next_action: self.next_action(),
             resumable: false,
             worktree_preserved: true,
         }
@@ -341,7 +423,7 @@ pub struct ManifestGate {
     pub automation_blob_oid: String,
     #[serde(default)]
     pub tool: ToolIdentity,
-    /// Repository-relative artifact path the runtime binds results to.
+    /// Store-relative artifact path the runtime binds results to.
     pub artifact_path: String,
     /// Digest of the currently stored artifact, when one exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -580,24 +662,35 @@ impl GateResults {
     }
 }
 
-/// The terminal record one invocation leaves behind.
+/// What one invocation left behind, as *diagnostics*.
 ///
-/// Deliberately outside the fingerprint: recording that the deadline expired
-/// must not itself make the next question different, or the refusal this whole
-/// module exists for would never fire.
+/// Persisted next to the manifest in the external store so an operator reading
+/// the cache can see how the last attempt ended. It is deliberately inert: no
+/// code path reads it back to decide admission, retry, archive, merge, or the
+/// next workflow action, and deleting the whole store changes nothing but how
+/// much work the next attempt repeats. The refusal that *is* consulted lives in
+/// [`LiveAcceptanceHolds`], in memory, for this process only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestTerminal {
+pub struct AcceptanceDiagnostics {
     /// The hold category, when the invocation settled as a non-resumable hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_category: Option<AcceptanceHoldCategory>,
-    /// The fingerprint that was current when the terminal state was recorded.
+    /// The fingerprint that was current when the diagnostics were recorded.
     pub fingerprint: String,
     /// Whether the owned process group was proven quiescent.
     pub cleanup_confirmed: bool,
     /// One-line cleanup diagnostics.
     #[serde(default)]
     pub cleanup_diagnostics: String,
+    /// Concrete evidence lines from the invocation.
+    #[serde(default)]
+    pub evidence: Vec<String>,
     pub recorded_at: DateTime<Utc>,
+    /// The process that wrote this record. Present so a reader can tell "the
+    /// owner that produced this is gone" without inferring it, and absent from
+    /// every decision.
+    #[serde(default)]
+    pub recorded_by_pid: u32,
 }
 
 /// The frozen Acceptance execution manifest for one invocation.
@@ -641,18 +734,16 @@ pub struct AcceptanceExecutionManifest {
     /// Work budget after the finalization reserve is taken out.
     #[serde(default)]
     pub work_budget_secs: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal: Option<ManifestTerminal>,
 }
 
 impl AcceptanceExecutionManifest {
     /// SHA-256 over canonical JSON of every field that can change review
     /// authority or gate validity.
     ///
-    /// Timestamps, budgets, and the terminal record are excluded: a fingerprint
-    /// that moved on its own would let an unchanged retry look changed. Gate
-    /// ordering is deterministic by verification ID, which is enforced at
-    /// construction and re-checked by [`parse_manifest`].
+    /// Timestamps and budgets are excluded: a fingerprint that moved on its own
+    /// would let an unchanged retry look changed. Gate ordering is deterministic
+    /// by verification ID, which is enforced at construction and re-checked by
+    /// [`parse_manifest`].
     pub fn fingerprint(&self) -> String {
         let canonical = serde_json::json!({
             "schema": self.schema,
@@ -826,14 +917,6 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<AcceptanceExecutionManifest, Manif
         }
         previous = Some(gate.verification_id.as_str());
     }
-    if let Some(terminal) = &manifest.terminal {
-        if !is_full_length_object_id(&terminal.fingerprint) {
-            return Err(ManifestDefect::Malformed(format!(
-                "terminal fingerprint '{}' is not a full-length digest",
-                terminal.fingerprint
-            )));
-        }
-    }
     Ok(manifest)
 }
 
@@ -841,39 +924,39 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<AcceptanceExecutionManifest, Manif
 // Storage
 // ============================================================================
 
-/// Repository-local manifest storage inside the existing evidence directory.
+/// Conflux-owned external manifest storage for one change.
+///
+/// Rooted at the same already-resolved external directory [`EvidenceStore`]
+/// uses, and for the same reason: there is no constructor that can derive a path
+/// from a workspace, so no caller can accidentally write a manifest into a
+/// target. The change ID is already a component of that root, so the file name
+/// here is fixed.
 #[derive(Debug, Clone)]
 pub struct ManifestStore {
-    workspace: PathBuf,
+    root: PathBuf,
 }
 
 impl ManifestStore {
-    pub fn new(workspace: impl Into<PathBuf>) -> Self {
-        Self {
-            workspace: workspace.into(),
-        }
+    /// Bind the store to one already-resolved external directory.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 
-    /// Absolute manifest path for one change.
-    pub fn path(&self, change_id: &str) -> PathBuf {
-        self.workspace.join(manifest_relative_path(change_id))
+    /// Absolute manifest path.
+    pub fn path(&self) -> PathBuf {
+        self.root.join(MANIFEST_FILE_NAME)
     }
 
     /// Read and structurally validate the stored manifest.
     ///
-    /// Unlike the verification sidecar this does not test the file mode: the
+    /// Unlike the verification envelope this does not test the file mode: the
     /// manifest is runtime-derived rather than runtime-*witnessed*, so a forged
     /// one buys nothing. Every field it could lie about — commit, tree, blob,
     /// tool, artifact digest — is recomputed from live Git state before it is
-    /// compared, and a forged terminal record can only ever *refuse* a retry the
-    /// operator can restore by touching the repository.
-    pub fn load(&self, change_id: &str) -> Result<AcceptanceExecutionManifest, ManifestDefect> {
-        if !is_storable_change_id(change_id) {
-            return Err(ManifestDefect::Malformed(format!(
-                "change id '{change_id}' is not storable"
-            )));
-        }
-        let path = self.path(change_id);
+    /// compared, and since the manifest no longer carries admission authority a
+    /// forged one cannot refuse anything at all.
+    pub fn load(&self) -> Result<AcceptanceExecutionManifest, ManifestDefect> {
+        let path = self.path();
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -887,8 +970,8 @@ impl ManifestStore {
     /// Atomically replace the stored manifest.
     ///
     /// Atomic replacement is what keeps a partially written manifest from ever
-    /// becoming authority: a reader sees the previous complete file or the new
-    /// complete file, never a prefix of either.
+    /// becoming a readable half-record: a reader sees the previous complete file
+    /// or the new complete file, never a prefix of either.
     pub fn store(&self, manifest: &AcceptanceExecutionManifest) -> std::io::Result<()> {
         if !is_storable_change_id(&manifest.change_id) {
             return Err(std::io::Error::new(
@@ -896,23 +979,41 @@ impl ManifestStore {
                 format!("change id '{}' is not storable", manifest.change_id),
             ));
         }
-        EvidenceStore::new(self.workspace.clone()).ensure_directory()?;
-        let directory = self.workspace.join(EVIDENCE_DIR);
-        let final_path = self.path(&manifest.change_id);
-        let temporary = directory.join(format!(
-            ".acceptance-manifest-{}.tmp-{}",
-            manifest.change_id,
-            std::process::id()
-        ));
-        let serialized = serde_json::to_vec_pretty(manifest)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        std::fs::write(&temporary, &serialized)?;
+        self.write_atomically(MANIFEST_FILE_NAME, &serde_json::to_vec_pretty(manifest)?)
+    }
+
+    /// File name of the inert per-invocation diagnostics record.
+    pub const DIAGNOSTICS_FILE_NAME: &'static str = "diagnostics.json";
+
+    /// Absolute path of the diagnostics record.
+    pub fn diagnostics_path(&self) -> PathBuf {
+        self.root.join(Self::DIAGNOSTICS_FILE_NAME)
+    }
+
+    /// Record how one invocation ended, for an operator reading the cache.
+    ///
+    /// Write-only from the runtime's point of view: nothing loads this back to
+    /// decide anything, which is precisely what keeps external state out of
+    /// workflow control.
+    pub fn record_diagnostics(&self, diagnostics: &AcceptanceDiagnostics) -> std::io::Result<()> {
+        self.write_atomically(
+            Self::DIAGNOSTICS_FILE_NAME,
+            &serde_json::to_vec_pretty(diagnostics)?,
+        )
+    }
+
+    fn write_atomically(&self, name: &str, serialized: &[u8]) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.root)?;
+        let temporary = self
+            .root
+            .join(format!(".{name}.tmp-{}", std::process::id()));
+        std::fs::write(&temporary, serialized)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
         }
-        match std::fs::rename(&temporary, &final_path) {
+        match std::fs::rename(&temporary, self.root.join(name)) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let _ = std::fs::remove_file(&temporary);
@@ -920,25 +1021,92 @@ impl ManifestStore {
             }
         }
     }
+}
 
-    /// Record the terminal outcome of one invocation against the stored manifest.
-    pub fn record_terminal(
-        &self,
-        manifest: &AcceptanceExecutionManifest,
-        terminal: ManifestTerminal,
-    ) -> std::io::Result<()> {
-        let mut stored = manifest.clone();
-        stored.terminal = Some(terminal);
-        self.store(&stored)
+// ============================================================================
+// Live, process-local retry refusal
+// ============================================================================
+
+/// One non-resumable Acceptance hold, remembered for this process only.
+///
+/// Everything needed to answer "is the current input the same input" and
+/// nothing else: no verdict, no findings, no history. It is discarded on
+/// restart by construction, because a `HashMap` in a `OnceLock` has nowhere to
+/// survive to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveAcceptanceHold {
+    pub category: AcceptanceHoldCategory,
+    /// The fingerprint the hold was recorded against.
+    pub fingerprint: String,
+    /// The revision name the review base was resolved from, so a later
+    /// recomputation re-resolves the same ref rather than a different one.
+    pub review_base_ref: Option<String>,
+}
+
+/// The current owner's typed Acceptance refusal state.
+///
+/// Constitutional law 1 allows ephemeral in-memory state held within a single
+/// process lifetime, and forbids durable out-of-worktree state that changes the
+/// next action. This registry is exactly the former: it suppresses a repeat of a
+/// question the deadline already answered, and it vanishes with the process that
+/// asked it.
+#[derive(Debug, Default)]
+pub struct LiveAcceptanceHolds {
+    holds: Mutex<HashMap<String, LiveAcceptanceHold>>,
+}
+
+impl LiveAcceptanceHolds {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Drop a stored manifest. Used when a change settles normally, so a stale
-    /// hold cannot refuse a later legitimate attempt.
-    pub fn clear(&self, change_id: &str) {
-        if is_storable_change_id(change_id) {
-            let _ = std::fs::remove_file(self.path(change_id));
+    /// Remember a non-resumable hold for `change_id`.
+    ///
+    /// A category that does not refuse an unchanged retry is deliberately not
+    /// remembered: storing it would only give a later reader something
+    /// misleading to find, since admission would admit on it anyway.
+    pub fn record(&self, change_id: &str, hold: LiveAcceptanceHold) {
+        if !hold.category.refuses_unchanged_retry() {
+            self.clear(change_id);
+            return;
         }
+        self.lock().insert(change_id.to_string(), hold);
     }
+
+    /// Forget any hold for `change_id`.
+    ///
+    /// Called when a fresh attempt is admitted, so the refusal describes the
+    /// latest answer rather than accumulating.
+    pub fn clear(&self, change_id: &str) {
+        self.lock().remove(change_id);
+    }
+
+    /// The hold currently recorded for `change_id`, if any.
+    pub fn get(&self, change_id: &str) -> Option<LiveAcceptanceHold> {
+        self.lock().get(change_id).cloned()
+    }
+
+    /// Classify one change's current fingerprint against live state.
+    pub fn classify(&self, change_id: &str, current_fingerprint: &str) -> AcceptanceAdmission {
+        classify_admission(current_fingerprint, self.get(change_id).as_ref())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, LiveAcceptanceHold>> {
+        self.holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The process-wide registry.
+///
+/// A single instance because the refusal must be the same fact for the parallel
+/// executor that records it and the shared operator-command service that reads
+/// it; two registries would let a keypress and a gate disagree about whether a
+/// change is retryable.
+pub fn live_acceptance_holds() -> &'static Arc<LiveAcceptanceHolds> {
+    static HOLDS: OnceLock<Arc<LiveAcceptanceHolds>> = OnceLock::new();
+    HOLDS.get_or_init(|| Arc::new(LiveAcceptanceHolds::new()))
 }
 
 // ============================================================================
@@ -1006,58 +1174,39 @@ impl AcceptanceAdmission {
     }
 }
 
-/// Decide whether the current input may be dispatched, given what a prior
-/// invocation recorded.
+/// Decide whether the current input may be dispatched, given what this owner
+/// still remembers.
 ///
-/// Only a recorded *deadline* hold whose fingerprint equals the current one
-/// refuses. Every other shape admits: no stored manifest, a stored manifest with
-/// no terminal record, a terminal record from a different fingerprint, a
-/// terminal record with no hold category (an ordinary settled verdict), and a
-/// hold category that says nothing about the input
+/// Only a live *deadline* hold whose fingerprint equals the current one refuses.
+/// Every other shape admits: no live hold at all (which is what a restarted
+/// owner always sees), a hold from a different fingerprint, and a hold category
+/// that says nothing about the input
 /// ([`AcceptanceHoldCategory::refuses_unchanged_retry`]). That asymmetry is the
-/// point — the guard exists to stop one specific loop, not to become a general
-/// gate on Acceptance.
+/// point — the guard exists to stop one specific loop within one process, not to
+/// become a general gate on Acceptance.
 pub fn classify_admission(
     current_fingerprint: &str,
-    stored: Option<&AcceptanceExecutionManifest>,
+    live: Option<&LiveAcceptanceHold>,
 ) -> AcceptanceAdmission {
-    let Some(terminal) = stored.and_then(|manifest| manifest.terminal.as_ref()) else {
+    let Some(live) = live else {
         return AcceptanceAdmission::Admit;
     };
-    let Some(category) = terminal.hold_category else {
-        return AcceptanceAdmission::Admit;
-    };
-    // A runtime defect or a malformed manifest is an environment fact, not an
-    // answer about this input. The fingerprint cannot express "the worktree was
-    // dirty" or "Git could not be read", so an equal fingerprint after one of
-    // those proves nothing and must not strand the change.
-    if !category.refuses_unchanged_retry() {
+    // A runtime defect, an unusable state path, or legacy target evidence is an
+    // environment fact, not an answer about this input. The fingerprint cannot
+    // express "the worktree was dirty" or "the state root was unwritable", so an
+    // equal fingerprint after one of those proves nothing and must not strand
+    // the change.
+    if !live.category.refuses_unchanged_retry() {
         return AcceptanceAdmission::Admit;
     }
-    if terminal.fingerprint != current_fingerprint {
+    if live.fingerprint != current_fingerprint {
         return AcceptanceAdmission::Admit;
     }
     AcceptanceAdmission::Refuse {
         outcome: UNCHANGED_ACCEPTANCE_INPUT,
-        category,
+        category: live.category,
         fingerprint: current_fingerprint.to_string(),
         components: FINGERPRINT_COMPONENTS.to_vec(),
-    }
-}
-
-/// Read the stored manifest and classify admission for one change.
-///
-/// A malformed stored manifest **admits**: refusing on a file nobody can read
-/// would strand a change on a defect it did not cause, and the worst case of
-/// admitting is one more bounded attempt that rewrites the manifest correctly.
-pub fn classify_admission_from_store(
-    workspace: &Path,
-    change_id: &str,
-    current_fingerprint: &str,
-) -> AcceptanceAdmission {
-    match ManifestStore::new(workspace.to_path_buf()).load(change_id) {
-        Ok(stored) => classify_admission(current_fingerprint, Some(&stored)),
-        Err(_) => AcceptanceAdmission::Admit,
     }
 }
 
@@ -1065,25 +1214,58 @@ pub fn classify_admission_from_store(
 // Construction
 // ============================================================================
 
-/// Workspace-derived admission for the shared operator command service.
+/// Live-owner admission for the shared operator command service.
+///
+/// Two facts are combined, and neither alone is enough. The *refusal* comes from
+/// this process's own [`LiveAcceptanceHolds`], so a restarted owner refuses
+/// nothing. The *comparison* is recomputed from the managed worktree, so a
+/// repository change genuinely restores eligibility instead of waiting for
+/// someone to clear a flag.
 ///
 /// Holds a resolver rather than a path because a change's managed worktree is
 /// created and destroyed by the parallel runtime: resolving per call means a
-/// change whose worktree has gone is admitted (there is no evidence to refuse
-/// on) instead of being refused against a path that no longer exists.
+/// change whose worktree has gone is admitted (there is nothing to compare
+/// against) instead of being refused against a path that no longer exists.
 pub struct WorkspaceAcceptanceAdmission<R> {
     resolve_workspace: R,
     skill_name: String,
+    /// The configured `state_base_dir`, so the recomputation reads the same
+    /// external cache the executor wrote.
+    state_base_dir: Option<String>,
+    holds: Arc<LiveAcceptanceHolds>,
 }
 
 impl<R> WorkspaceAcceptanceAdmission<R>
 where
     R: Fn(&str) -> Option<PathBuf> + Send + Sync,
 {
-    pub fn new(resolve_workspace: R, skill_name: impl Into<String>) -> Self {
+    /// Bind to the process-wide live registry the executor records into.
+    pub fn new(
+        resolve_workspace: R,
+        skill_name: impl Into<String>,
+        state_base_dir: Option<String>,
+    ) -> Self {
+        Self::with_holds(
+            resolve_workspace,
+            skill_name,
+            state_base_dir,
+            live_acceptance_holds().clone(),
+        )
+    }
+
+    /// Bind to an explicit registry. Used by tests that must not share process
+    /// state with a concurrently running case.
+    pub fn with_holds(
+        resolve_workspace: R,
+        skill_name: impl Into<String>,
+        state_base_dir: Option<String>,
+        holds: Arc<LiveAcceptanceHolds>,
+    ) -> Self {
         Self {
             resolve_workspace,
             skill_name: skill_name.into(),
+            state_base_dir,
+            holds,
         }
     }
 }
@@ -1095,41 +1277,57 @@ where
     R: Fn(&str) -> Option<PathBuf> + Send + Sync,
 {
     async fn classify(&self, change_id: &str) -> AcceptanceAdmission {
+        // Nothing this owner remembers means nothing to refuse — and it is
+        // checked first so the common path costs no Git subprocesses at all.
+        let Some(live) = self.holds.get(change_id) else {
+            return AcceptanceAdmission::Admit;
+        };
         let Some(workspace) = (self.resolve_workspace)(change_id) else {
             return AcceptanceAdmission::Admit;
         };
-        // Nothing recorded means nothing to refuse, and reading the stored
-        // manifest first is also how the base *ref* is recovered: recomputing
-        // against a different base would produce a mismatching fingerprint for
-        // the wrong reason and silently admit every unchanged retry.
-        let store = ManifestStore::new(workspace.clone());
-        let Ok(stored) = store.load(change_id) else {
+        // Bound to the *existing* external store without creating one: this path
+        // starts nothing, and materializing a cache directory as a side effect
+        // of answering "may this be retried" would be a write nobody asked for.
+        // A store that is absent simply contributes no artifact digests, which
+        // is the same thing a deleted cache contributes.
+        let project_root = super::manifest_builder::repository_project_root(&workspace)
+            .await
+            .unwrap_or_else(|| workspace.clone());
+        let Ok(store_root) = super::evidence_location::store_path(
+            self.state_base_dir.as_deref(),
+            &project_root,
+            &workspace,
+            change_id,
+        ) else {
             return AcceptanceAdmission::Admit;
         };
-        if stored.terminal.is_none() {
-            return AcceptanceAdmission::Admit;
-        }
+        // The base *ref* comes from the hold rather than being guessed:
+        // recomputing against a different base would produce a mismatching
+        // fingerprint for the wrong reason and silently admit every unchanged
+        // retry.
+        //
         // The deadline the manifest was built under does not participate in the
-        // fingerprint, so passing the stored value back in is not required: any
-        // value reproduces the same digest. Zero is used to say "no bound is
-        // being asserted here", because this path starts nothing.
+        // fingerprint, so any value reproduces the same digest. Zero is used to
+        // say "no bound is being asserted here", because this path starts
+        // nothing.
         let manifest = match super::manifest_builder::build_manifest_for_workspace(
             &super::verification_evidence::GitRepositoryFacts,
             &workspace,
+            &EvidenceStore::new(store_root),
             change_id,
             &self.skill_name,
-            stored.review_base_ref.as_deref(),
+            live.review_base_ref.as_deref(),
             0,
         )
         .await
         {
             Ok(manifest) => manifest,
-            // An underivable manifest admits, for the same reason a malformed
-            // stored one does: a change must not be stranded on a defect it did
-            // not cause.
+            // An underivable manifest admits: a change must not be stranded on a
+            // defect it did not cause, and the worst case of admitting is one
+            // more bounded attempt.
             Err(_) => return AcceptanceAdmission::Admit,
         };
-        classify_admission(&manifest.fingerprint(), Some(&stored))
+        classify_admission(&manifest.fingerprint(), Some(&live))
     }
 }
 
