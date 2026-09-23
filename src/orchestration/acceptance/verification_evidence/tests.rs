@@ -793,7 +793,11 @@ async fn runtime_capture_writes_a_reusable_envelope() {
         .capture(&request())
         .await;
 
-    let CaptureOutcome::Captured(captured) = outcome else {
+    let CaptureOutcome::Captured {
+        evidence: captured,
+        artifact_location,
+    } = &outcome
+    else {
         panic!("expected capture, got {outcome:?}");
     };
     assert_eq!(captured.authority, EVIDENCE_AUTHORITY);
@@ -803,9 +807,22 @@ async fn runtime_capture_writes_a_reusable_envelope() {
     assert_eq!(supervisor.calls.lock().unwrap().len(), 1);
 
     let store = store_of(&workspace);
-    assert_eq!(store.load("bound-evidence-tests").unwrap(), *captured);
+    assert_eq!(store.load("bound-evidence-tests").unwrap(), **captured);
     let artifact = store.artifact_path("bound-evidence-tests");
-    assert_eq!(std::fs::read(artifact).unwrap(), b"test result: ok");
+    assert_eq!(std::fs::read(&artifact).unwrap(), b"test result: ok");
+
+    // The envelope keeps the store-relative spelling; the report carries the
+    // path that actually opens.
+    assert_eq!(
+        captured.artifact_path,
+        EvidenceStore::artifact_relative_path("bound-evidence-tests")
+    );
+    assert_eq!(artifact_location, &artifact);
+    assert_eq!(outcome.artifact_location(), Some(artifact.as_path()));
+    assert_eq!(
+        outcome.to_json()["artifact_location"].as_str(),
+        Some(artifact.display().to_string().as_str())
+    );
 }
 
 #[tokio::test]
@@ -813,6 +830,7 @@ async fn a_failing_command_captures_no_envelope() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let mut supervisor = FakeSupervisor::succeeding();
     supervisor.exit_code = 101;
+    supervisor.output = b"error: 1 test failed".to_vec();
     let outcome = executor(&workspace, FakeFacts::new(), supervisor)
         .capture(&request())
         .await;
@@ -824,6 +842,55 @@ async fn a_failing_command_captures_no_envelope() {
     assert_eq!(
         store_of(&workspace).load("bound-evidence-tests"),
         Err(EvidenceDefect::Missing)
+    );
+}
+
+#[tokio::test]
+async fn a_failing_command_reports_an_artifact_path_that_opens() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let mut supervisor = FakeSupervisor::succeeding();
+    supervisor.exit_code = 101;
+    supervisor.output = b"error: 1 test failed".to_vec();
+    let outcome = executor(&workspace, FakeFacts::new(), supervisor)
+        .capture(&request())
+        .await;
+
+    let CaptureOutcome::CommandFailed {
+        artifact_path,
+        artifact_location,
+        ..
+    } = &outcome
+    else {
+        panic!("expected a command failure, got {outcome:?}");
+    };
+
+    // The store-relative spelling stays exactly what the envelope schema uses,
+    // and resolves to nothing on its own.
+    assert_eq!(
+        artifact_path,
+        &EvidenceStore::artifact_relative_path("bound-evidence-tests")
+    );
+    assert!(!Path::new(artifact_path).is_absolute());
+
+    // The reported location is the real file under the external store root, not
+    // a bare string: a caller can read the failing output from it directly.
+    let store = store_of(&workspace);
+    assert!(artifact_location.is_absolute());
+    assert!(artifact_location.starts_with(store.root()));
+    assert!(!artifact_location.starts_with(target_of(&workspace)));
+    assert_eq!(
+        std::fs::read(artifact_location).expect("the reported artifact exists on disk"),
+        b"error: 1 test failed"
+    );
+
+    // And the same location travels on the machine-readable report.
+    let reported = outcome.to_json()["artifact_location"]
+        .as_str()
+        .expect("reports name an openable artifact")
+        .to_string();
+    assert_eq!(
+        std::fs::read(&reported).expect("the reported location is readable"),
+        b"error: 1 test failed"
     );
 }
 

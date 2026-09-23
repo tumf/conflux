@@ -94,6 +94,26 @@ fn select(
     Ok(selected)
 }
 
+/// Wrap per-verification reports in the envelope an operator can resolve paths
+/// against.
+///
+/// Every path inside a report is store-relative, because the envelope on disk
+/// has to survive a state root that moves. A report is read from wherever the
+/// operator happens to be standing, so the resolved store root travels with it:
+/// `store_root` plus `artifact_path` names a real file, and `artifact_path`
+/// alone names nothing. The store-relative spelling is left exactly as the
+/// envelope records it.
+fn report_envelope(store: &EvidenceStore, body: serde_json::Value) -> serde_json::Value {
+    let mut envelope = body;
+    if let Some(object) = envelope.as_object_mut() {
+        object.insert(
+            "store_root".to_string(),
+            serde_json::Value::String(store.root().display().to_string()),
+        );
+    }
+    envelope
+}
+
 /// Report the reuse plan without executing anything.
 async fn report_plan(
     workspace: &Path,
@@ -112,7 +132,8 @@ async fn report_plan(
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&plan.to_json()).unwrap_or_default()
+            serde_json::to_string_pretty(&report_envelope(store, plan.to_json()))
+                .unwrap_or_default()
         );
         return Ok(());
     }
@@ -120,6 +141,7 @@ async fn report_plan(
         println!("No repository-local verifications are declared.");
         return Ok(());
     }
+    println!("Evidence store: {}", store.root().display());
     for decision in &plan.decisions {
         println!("{}", decision.summary());
     }
@@ -173,7 +195,7 @@ async fn run_verifications(
             SystemClock,
         );
         let outcome = executor.capture(&request).await;
-        if !matches!(outcome, CaptureOutcome::Captured(_)) {
+        if !matches!(outcome, CaptureOutcome::Captured { .. }) {
             unsatisfied += 1;
         }
         reports.push(outcome.to_json());
@@ -182,20 +204,30 @@ async fn run_verifications(
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({"verifications": reports}))
-                .unwrap_or_default()
+            serde_json::to_string_pretty(&report_envelope(
+                store,
+                serde_json::json!({"verifications": reports})
+            ))
+            .unwrap_or_default()
         );
     } else if reports.is_empty() {
         println!("No repository-local verifications are declared.");
     } else {
+        println!("Evidence store: {}", store.root().display());
         for report in &reports {
             println!(
-                "{}: {}{}",
+                "{}: {}{}{}",
                 report["verification_id"].as_str().unwrap_or_default(),
                 report["outcome"].as_str().unwrap_or_default(),
                 report["detail"]
                     .as_str()
                     .map(|detail| format!(" — {detail}"))
+                    .unwrap_or_default(),
+                // The openable path, not the store-relative one: a failing gate's
+                // output is worth nothing if reading it needs a second lookup.
+                report["artifact_location"]
+                    .as_str()
+                    .map(|location| format!(" — {location}"))
                     .unwrap_or_default()
             );
         }
@@ -256,6 +288,7 @@ mod tests {
     use super::*;
     use crate::orchestration::acceptance::verification_evidence::{
         EvidenceDefect, RepositoryFacts, RerunReason, ReuseDecision, ToolIdentity,
+        VerificationReusePlan,
     };
 
     fn declaration(id: &str) -> VerificationDeclaration {
@@ -479,6 +512,82 @@ mod tests {
         let error = declarations(workspace.path(), "example").unwrap_err();
         assert!(error.contains("has no proposal"));
         assert!(error.contains("no archived proposal"));
+    }
+
+    /// Write one captured artifact into an external store, the way a real
+    /// capture would, and hand back the store bound to it.
+    fn store_with_artifact(root: &Path, verification_id: &str, output: &[u8]) -> EvidenceStore {
+        let store = EvidenceStore::new(root.join("cflx-state/acceptance/project/workspace/change"));
+        store.ensure_directory().expect("create store directory");
+        std::fs::write(store.artifact_path(verification_id), output).expect("write artifact");
+        store
+    }
+
+    #[test]
+    fn a_json_report_lets_a_caller_locate_the_captured_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = store_with_artifact(temp.path(), "local-tests", b"error: 1 test failed");
+        let outcome = CaptureOutcome::CommandFailed {
+            verification_id: "local-tests".to_string(),
+            exit_code: 101,
+            artifact_path: EvidenceStore::artifact_relative_path("local-tests"),
+            artifact_location: store.artifact_path("local-tests"),
+        };
+
+        let report = report_envelope(
+            &store,
+            serde_json::json!({"verifications": [outcome.to_json()]}),
+        );
+
+        // Route one: the absolute location travels on the per-verification
+        // report and opens directly.
+        let entry = &report["verifications"][0];
+        let location = entry["artifact_location"]
+            .as_str()
+            .expect("a failing verification names an openable artifact");
+        assert_eq!(
+            std::fs::read(location).expect("the reported location opens"),
+            b"error: 1 test failed"
+        );
+
+        // Route two: the store-relative spelling the envelope schema requires is
+        // unchanged, and the envelope's own store root is what resolves it — so
+        // a reused decision, which carries no absolute path of its own, is
+        // locatable too.
+        let root = report["store_root"]
+            .as_str()
+            .expect("the report names the resolved store root");
+        assert_eq!(root, store.root().display().to_string());
+        let relative = entry["artifact_path"]
+            .as_str()
+            .expect("the store-relative artifact path is preserved");
+        assert_eq!(relative, "gates/local-tests.log");
+        assert_eq!(
+            std::fs::read(Path::new(root).join(relative))
+                .expect("store_root + artifact_path opens"),
+            b"error: 1 test failed"
+        );
+    }
+
+    #[test]
+    fn a_plan_report_carries_the_store_root_it_was_resolved_against() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = store_with_artifact(temp.path(), "local-tests", b"test result: ok");
+        let plan = VerificationReusePlan {
+            decisions: vec![ReuseDecision::Rerun {
+                verification_id: "local-tests".to_string(),
+                reason: RerunReason::Defect(EvidenceDefect::Missing),
+            }],
+        };
+
+        let report = report_envelope(&store, plan.to_json());
+        assert_eq!(
+            report["store_root"].as_str(),
+            Some(store.root().display().to_string().as_str())
+        );
+        // Wrapping adds the root and nothing else: the plan body is untouched.
+        assert_eq!(report["verifications"], plan.to_json()["verifications"]);
+        assert_eq!(report["rerun"], serde_json::json!(["local-tests"]));
     }
 
     #[test]

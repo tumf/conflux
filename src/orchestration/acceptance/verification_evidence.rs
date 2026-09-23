@@ -1041,16 +1041,31 @@ impl CaptureRefusal {
 }
 
 /// What one supervised execution produced.
+///
+/// Two artifact paths travel together on purpose. The envelope's
+/// `artifact_path` is store-relative because the *record* has to survive a
+/// state root that moves; a report is read once, by an operator standing
+/// somewhere the store root is not, so it also carries `artifact_location` —
+/// the absolute path of the same file. Reporting only the store-relative form
+/// names a location that resolves to nothing from the caller's directory, which
+/// is the one thing a capture report exists to avoid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureOutcome {
     /// The command succeeded and every binding held; the envelope is on disk.
-    Captured(Box<VerificationEvidence>),
+    Captured {
+        evidence: Box<VerificationEvidence>,
+        /// Absolute path of the captured artifact inside the external store.
+        artifact_location: PathBuf,
+    },
     /// The command ran and failed. No envelope: a failure is not reusable, and
     /// it is also not this module's verdict to report.
     CommandFailed {
         verification_id: String,
         exit_code: i32,
+        /// Store-relative artifact path, the same spelling the envelope uses.
         artifact_path: String,
+        /// Absolute path of that artifact, so the failing output is openable.
+        artifact_location: PathBuf,
     },
     /// Nothing was captured, and the reason is not a command failure.
     Refused(CaptureRefusal),
@@ -1067,22 +1082,45 @@ pub enum CaptureOutcome {
 }
 
 impl CaptureOutcome {
+    /// Absolute path of the artifact this outcome produced, when it produced
+    /// one.
+    ///
+    /// A refusal and an exhausted deadline have no artifact to name: the first
+    /// never wrote one, and the second reports a sweep rather than output.
+    pub fn artifact_location(&self) -> Option<&Path> {
+        match self {
+            Self::Captured {
+                artifact_location, ..
+            }
+            | Self::CommandFailed {
+                artifact_location, ..
+            } => Some(artifact_location.as_path()),
+            Self::Refused(_) | Self::DeadlineExhausted { .. } => None,
+        }
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
         match self {
-            Self::Captured(evidence) => serde_json::json!({
+            Self::Captured {
+                evidence,
+                artifact_location,
+            } => serde_json::json!({
                 "verification_id": evidence.verification_id,
                 "outcome": "captured",
                 "evidence": evidence.to_json(),
+                "artifact_location": artifact_location.display().to_string(),
             }),
             Self::CommandFailed {
                 verification_id,
                 exit_code,
                 artifact_path,
+                artifact_location,
             } => serde_json::json!({
                 "verification_id": verification_id,
                 "outcome": "command_failed",
                 "exit_code": exit_code,
                 "artifact_path": artifact_path,
+                "artifact_location": artifact_location.display().to_string(),
             }),
             Self::Refused(refusal) => refusal.to_json(),
             Self::DeadlineExhausted {
@@ -1460,6 +1498,9 @@ where
                 verification_id: id.to_string(),
                 exit_code: outcome.exit_code,
                 artifact_path: EvidenceStore::artifact_relative_path(id),
+                // The path `store_artifact` just wrote, not a path rebuilt from
+                // a root the reporter would have to guess at.
+                artifact_location: artifact_path,
             };
         }
 
@@ -1563,7 +1604,10 @@ where
                 error.to_string(),
             ));
         }
-        CaptureOutcome::Captured(Box::new(evidence))
+        CaptureOutcome::Captured {
+            evidence: Box::new(evidence),
+            artifact_location: artifact_path,
+        }
     }
 }
 

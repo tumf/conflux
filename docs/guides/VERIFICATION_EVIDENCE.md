@@ -26,6 +26,14 @@ captured, and `1` when at least one is neither. A failing command is reported
 with its exit code and artifact path — that is a *command* result, not a verdict
 about the change.
 
+Both artifact spellings travel with every report. The envelope's
+`artifact_path` stays store-relative (`gates/<id>.log`) so the record survives a
+state root that moves; a captured or failed verification also reports
+`artifact_location`, the absolute path of that same file, and every report
+carries the resolved `store_root` it was produced against. So a reused
+decision — which has only the store-relative spelling of its own — is still
+openable as `store_root` + `artifact_path`.
+
 ## What gets bound
 
 The runtime executor starts the declared argv itself, waits for it, hashes what

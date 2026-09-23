@@ -205,7 +205,7 @@ where
     // Pushing the bound down is what makes expiry carry real termination
     // evidence instead of an assumption.
     match executor.capture_bounded(request, remaining).await {
-        CaptureOutcome::Captured(evidence) => GateOutcome::Executed {
+        CaptureOutcome::Captured { evidence, .. } => GateOutcome::Executed {
             verification_id: id,
             artifact_path: evidence.artifact_path.clone(),
             elapsed_seconds: evidence.elapsed_seconds().unwrap_or_default(),
