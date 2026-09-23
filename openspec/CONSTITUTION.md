@@ -35,3 +35,15 @@ A proposal that intentionally changes constitutional behavior MUST amend this do
 Tasks, acceptance, and archive decisions MUST be based on repository-verifiable evidence.
 
 No change may be treated as implemented, accepted, or archive-ready based only on narrative claims, checklist normalization, or hidden runtime state.
+
+### 4. Target worktree non-pollution
+
+Conflux MUST NOT create, modify, or retain files or directories in a target repository or managed worktree solely for Conflux's own runtime, orchestration, caching, logging, evidence, checkpoint, coordination, or observability needs.
+
+The target worktree may change only when that change is an intended repository deliverable required by the active change contract. Conflux-owned operational artifacts MUST live outside the target repository and all of its worktrees.
+
+Hiding a Conflux-owned artifact with `.gitignore`, `.git/info/exclude`, an embedded ignore file, status filtering, or cleanliness-check exceptions does not make the write permissible and MUST NOT be treated as non-polluting.
+
+Conflux MUST evaluate target-worktree cleanliness without excluding Conflux-owned paths. If an operation would require a Conflux-owned write inside the target worktree, it MUST fail closed before writing and report the conflicting requirement.
+
+Deleting all out-of-worktree Conflux state MAY discard caches, logs, and reusable evidence, but MUST NOT modify the target worktree or make its repository state appear cleaner than it actually is.
