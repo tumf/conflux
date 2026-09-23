@@ -229,7 +229,7 @@ pub enum Commands {
     /// Override the default start key in ~/.config/cflx/tui.jsonc.
     Tui(TuiArgs),
 
-    /// Initialize a new configuration file
+    /// Generate project overrides for required commands missing globally
     Init(InitArgs),
 
     /// Check for conflicts between spec delta files across changes
@@ -895,11 +895,11 @@ pub enum Template {
 /// Arguments for the init subcommand
 #[derive(Parser, Debug)]
 pub struct InitArgs {
-    /// Template to use for configuration
+    /// Template to use for required commands missing from global configuration
     #[arg(long, short = 't', value_enum, default_value_t = Template::Claude)]
     pub template: Template,
 
-    /// Overwrite existing configuration file
+    /// Overwrite an existing project configuration with the missing-command template
     #[arg(long, short = 'f')]
     pub force: bool,
 }

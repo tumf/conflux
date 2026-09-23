@@ -105,18 +105,23 @@ impl OrchestratorConfig {
         Self::merge_all_sources(custom_path)
     }
 
-    /// Merge every configuration source in priority order without validating.
-    fn merge_all_sources(custom_path: Option<&Path>) -> Result<Self> {
+    /// Load global configuration layers only, without project-local overrides
+    /// or required-command validation.
+    pub fn load_global_settings() -> Result<Self> {
         let mut config = Self::default();
-
-        // 1-3. Global config candidates (low → high priority)
         for path in get_global_config_paths() {
             if path.exists() {
                 debug!("Loading global config from: {:?}", path);
-                let loaded_config = Self::load_from_file(&path)?;
-                config.merge(loaded_config);
+                config.merge(Self::load_from_file(&path)?);
             }
         }
+        Ok(config)
+    }
+
+    /// Merge every configuration source in priority order without validating.
+    fn merge_all_sources(custom_path: Option<&Path>) -> Result<Self> {
+        // 1-3. Global config candidates (low → high priority)
+        let mut config = Self::load_global_settings()?;
 
         // 4. Project config (higher priority than global)
         let project_config_path = PathBuf::from(PROJECT_CONFIG_FILE);
