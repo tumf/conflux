@@ -56,13 +56,14 @@ Start, retry, stop, cancel stop, force stop, and resolve MUST use shared applica
 **Given**: the current live owner's typed state retains an unchanged non-resumable Acceptance deadline hold for `alpha`
 **When**: `retry_change`, `retry_errors`, Start/F5, terminal-error queue intent, or automatic mark settlement evaluates `alpha`
 **Then**: shared admission refuses `alpha` with `unchanged_acceptance_input`
+**And**: detail lists the fingerprint components whose repository-visible change can restore eligibility
 **And**: no scheduler notification or work dispatch occurs
 
 #### Scenario: Restart does not reconstruct refusal from external state
 
 **Given**: a prior owner persisted Acceptance cache or diagnostics for `alpha`
 **And**: the new owner has no live typed refusal state
-**When**: an operator explicitly retries `alpha`
+**When**: an operator explicitly retries `alpha` or automatic mark settlement evaluates it
 **Then**: shared admission permits one fresh bounded attempt without requiring repository mutation
 **And**: valid external gate evidence may be reused but cannot refuse the command
 

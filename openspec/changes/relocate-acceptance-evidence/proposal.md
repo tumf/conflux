@@ -12,6 +12,7 @@ references:
   - src/orchestration/acceptance/execution_manifest.rs
   - src/orchestration/acceptance/gate_execution.rs
   - src/orchestration/acceptance/manifest_builder.rs
+  - src/orchestration/acceptance.rs
   - src/parallel/executor.rs
   - src/orchestration/operator_command.rs
 verifications:
@@ -42,36 +43,36 @@ The stored terminal manifest additionally controls unchanged-input retry after p
 
 ## Proposed Solution
 
-Store Acceptance manifests, gate evidence envelopes, and bounded gate-output artifacts under the resolved Conflux state root, never under the target repository or any managed worktree. Add one shared resolver rooted at `<conflux-state-root>/acceptance/<project-slug>/<workspace-slug>/<change-id>/`. `project-slug` and `workspace-slug` use the existing canonical-path slug algorithm; every path component supplied by a change or verification ID remains validated before use. The resolver follows existing `state_base_dir` precedence and uses an external temporary fallback only when no state root can be derived.
+Store Acceptance manifests, gate evidence envelopes, and bounded gate-output artifacts under the resolved Conflux state root, never under the target repository or any managed worktree. Add one shared resolver rooted at `<conflux-state-root>/acceptance/<project-slug>/<workspace-slug>/<change-id>/`. `project-slug` and `workspace-slug` use the existing canonical-path slug algorithm and are deterministic within one binary; every path component supplied by a change or verification ID remains validated before use. The resolver follows existing `state_base_dir` precedence and uses an external temporary fallback only when no state root can be derived.
 
 Pass the resolved store explicitly through manifest construction, gate planning, execution, terminal recording, and cleanup. Storage creation or write failure yields the existing typed Acceptance runtime hold before any declared gate starts. It must not fall back to the target worktree.
 
 Treat external records as cache and diagnostics only. Exact successful gate evidence may still be reused when every repository, declaration, tool, review-range, artifact, and clean-state binding matches. Missing, malformed, deleted, or stale external evidence reruns the declared gate or produces its ordinary typed hold; it never implies PASS.
 
-Remove durable manifest-based admission. During one live owner process, the reducer's typed non-resumable hold may refuse an unchanged retry and expose `unchanged_acceptance_input`. After owner restart, no external manifest may recreate that refusal; an explicit retry receives one fresh bounded attempt, while exact valid gate evidence may reduce repeated work. This keeps retry control process-local and prevents external cache deletion from changing repository-derived workflow state.
+Remove durable manifest-based admission. During one live owner process, the reducer's typed non-resumable hold and its input fingerprint may refuse an unchanged retry and expose `unchanged_acceptance_input`. After owner restart, no external manifest may recreate that refusal; the first admission in the new owner lifetime, whether explicit retry or automatic mark settlement, receives one fresh bounded attempt, while exact valid gate evidence may reduce repeated work. This keeps retry control process-local and prevents external cache deletion from changing repository-derived workflow state.
 
-Evaluate target cleanliness without special Conflux path exclusions. Remove the self-ignoring file, `dirty_entries_excluding_evidence`, evidence-path filtering, and all production writes below `.cflx/verification-evidence`. Legacy target-local evidence is never read, migrated, rewritten, or automatically deleted. If an old target-local evidence path is visible as untracked or ignored state, full cleanliness detects it and fails closed with an actionable diagnostic; cleanup remains an explicit repository-owner action.
+Evaluate target cleanliness without special Conflux path exclusions. Remove the self-ignoring file, `dirty_entries_excluding_evidence`, evidence-path filtering including `semantic_progress_fingerprint`, and all production writes below `.cflx/verification-evidence`. Cleanliness uses the existing porcelain status for tracked and untracked entries with no Conflux path excluded. Separately, before any declared gate and before reuse, runtime checks whether legacy target-local `.cflx/verification-evidence` exists. If it exists, Acceptance fails closed with a typed hold naming the path without opening, parsing, migrating, rewriting, or automatically deleting it. No other ignored path is evaluated; cleanup remains an explicit repository-owner action.
 
 ## Acceptance Criteria
 
 - Running declared Acceptance gates creates no file or directory in the target repository or managed worktree except the intended repository deliverables already produced by Apply or Archive.
-- Gate envelopes, bounded output, and manifests resolve below the configured/default Conflux state root and are isolated by project, workspace, and change identity.
+- Gate envelopes, bounded output, and manifests resolve below the configured/default Conflux state root and are isolated by project, workspace, and change identity. A root inside the target repository or any managed worktree is refused with a typed runtime hold.
 - An unavailable or unwritable Acceptance state path yields a typed runtime hold before gate execution and never falls back to `.cflx` or another target path.
-- Cleanliness checks evaluate all staged, unstaged, untracked, and ignored target paths relevant to legacy Conflux evidence; no Conflux-owned path is excluded.
+- Cleanliness uses the existing tracked/untracked porcelain status with no Conflux-owned path excluded. A separate existence probe detects legacy target-local `.cflx/verification-evidence`, including self-ignored content, and returns a typed hold without opening or parsing it; unrelated ignored paths are not evaluated.
 - Exact valid external gate evidence remains reusable. Missing, malformed, stale, mismatched, or deleted external evidence reruns the declared gate or returns its ordinary typed hold and never proves PASS.
 - External manifests and evidence do not control retry admission, queue intent, scheduler dispatch, archive, merge, or next-action selection.
-- An unchanged non-resumable hold may be refused within the same live owner from typed reducer state. After owner restart, explicit retry is admitted as one fresh bounded attempt without requiring a repository mutation.
-- Existing bounded Acceptance deadline, process cleanup, closed declared-gate allowlist, semantic verdict, and `client wait` terminal projection remain unchanged.
+- An unchanged non-resumable hold may be refused within the same live owner from typed reducer state carrying its input fingerprint. After owner restart, the first explicit retry or automatic mark settlement is admitted as one fresh bounded attempt without requiring a repository mutation.
+- Existing bounded Acceptance deadline, process cleanup, closed declared-gate allowlist, semantic verdict, and `client wait` terminal projection remain unchanged within the owner that recorded the hold; after restart no prior Acceptance hold is reconstructed.
 - Legacy `.cflx/verification-evidence` content is not read, written, hidden, or automatically deleted by the new runtime.
 
 ## Explicit Completion Conditions
 
-- `src/config/defaults.rs` provides and tests the external Acceptance state-root resolver, including configured root, platform/XDG root, project/workspace isolation, safe identifiers, and external temporary fallback.
+- `src/config/defaults.rs` provides and tests the external Acceptance state-root resolver, including configured root, platform/XDG root, project/workspace isolation, safe identifiers, external temporary fallback, and refusal with a typed runtime hold when the resolved root is inside the target repository or any managed worktree.
 - `EvidenceStore` and `ManifestStore` receive explicit external storage paths; their APIs no longer derive storage by joining a target workspace with `.cflx/verification-evidence`.
-- Manifest build, gate reuse planning, gate execution, terminal diagnostics, settlement cleanup, and all operator paths use the same resolved external store.
+- Manifest build, gate reuse planning, gate execution, terminal diagnostics, settlement cleanup, semantic progress fingerprinting, and all operator paths use the same resolved external store or full target state without `.cflx` filtering.
 - Production code contains no writer for `.cflx/verification-evidence`, no self-ignore creation, and no cleanliness function that excludes an evidence path.
 - Admission tests prove live reducer refusal without durable-manifest authority and restart admission for one fresh bounded attempt.
-- Regression tests inspect both the external store and target tree, test state-root failure before command launch, prove cache deletion causes rerun rather than PASS, and prove legacy ignored evidence makes the target fail full cleanliness.
+- Regression tests inspect both the external store and target tree, test state-root failure and in-target containment refusal before command launch, prove cache deletion causes rerun rather than PASS, replace `acceptance_execution_boundary_restart_reaches_the_same_refusal` with post-restart fresh-attempt coverage, and prove the dedicated legacy-path probe detects self-ignored evidence without evaluating unrelated ignored paths.
 - `cargo test acceptance_execution_boundary --lib` passes.
 
 ## Out of Scope

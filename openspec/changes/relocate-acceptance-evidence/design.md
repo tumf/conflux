@@ -24,7 +24,7 @@ Resolve one root from the existing Conflux state-root policy:
           <verification-id>.log
 ```
 
-`project-slug` and `workspace-slug` are generated from canonical absolute paths with the existing slug algorithm. `change-id` and `verification-id` retain strict path-component validation. No resolved path may be within the target repository or any managed worktree.
+`project-slug` and `workspace-slug` are generated from canonical absolute paths with the existing slug algorithm and are deterministic within one binary. `change-id` and `verification-id` retain strict path-component validation. No resolved path may be within the target repository or any managed worktree; containment is checked before gate launch and refused with a typed runtime hold.
 
 When no persistent root exists, use a Conflux-owned system temporary root with the same isolation. If root creation, permission validation, or writes fail, return a typed Acceptance runtime hold before launching a gate. Never fall back to the target tree.
 
@@ -40,8 +40,8 @@ When no persistent root exists, use a Conflux-owned system temporary root with t
 
 ## Legacy handling
 
-The runtime does not read, migrate, rewrite, hide, or delete target-local `.cflx/verification-evidence` content. Full cleanliness treats it like any other target content, including ignored content when the relevant cleanliness contract requires ignored-path observation. The diagnostic identifies the path and requires explicit repository-owner cleanup.
+The runtime does not open, parse, migrate, rewrite, hide, or delete target-local `.cflx/verification-evidence` content. Cleanliness keeps the existing tracked/untracked porcelain status and removes the Conflux evidence exclusion. Separately, before gate execution and reuse, runtime probes only whether the legacy path exists, including when self-ignored. Existence yields a typed hold naming the path and requires explicit repository-owner cleanup. Unrelated ignored paths are not evaluated.
 
 ## Retry semantics
 
-The prior durable terminal-manifest guard is removed. Same-owner suppression uses typed reducer state already projected for the non-resumable hold. Restart cannot reconstruct refusal from external cache. This deliberately permits one new bounded explicit attempt after restart while retaining valid gate-result reuse.
+The prior durable terminal-manifest guard is removed. Same-owner suppression uses typed reducer state carrying the input fingerprint for the non-resumable hold. Restart cannot reconstruct refusal from external cache. The first admission in the new owner lifetime, whether explicit retry or automatic mark settlement, deliberately permits one new bounded attempt while retaining valid gate-result reuse.
