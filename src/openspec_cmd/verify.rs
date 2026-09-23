@@ -19,14 +19,22 @@
 //! Nothing here is a verdict. A failing command exits non-zero with its artifact
 //! path, and that is a *command* result: whether the change is acceptable stays
 //! an Acceptance question.
+//!
+//! Like every other Acceptance writer, the envelope and its artifact go into the
+//! Conflux-owned external store rather than into the repository being verified.
+//! The store is resolved and proven before the first command starts, so an
+//! unusable one is reported instead of silently producing an unrecordable run —
+//! and a repository that still carries legacy `.cflx/verification-evidence`
+//! content is reported rather than read, migrated, or cleaned up.
 
 use std::path::{Path, PathBuf};
 
 use crate::archive_layout;
 use crate::openspec::VerificationDeclaration;
+use crate::orchestration::acceptance::evidence_location::{prepare_store, AcceptanceStore};
 use crate::orchestration::acceptance::verification_evidence::{
-    decide_reuse, eligible_request, plan_reuse, CaptureOutcome, GitRepositoryFacts, ReusePolicy,
-    RuntimeVerificationExecutor, SystemClock, VerificationRequest,
+    decide_reuse, eligible_request, plan_reuse, CaptureOutcome, EvidenceStore, GitRepositoryFacts,
+    ReusePolicy, RuntimeVerificationExecutor, SystemClock, VerificationRequest,
 };
 
 /// Exit status when at least one selected verification neither reused nor
@@ -86,15 +94,37 @@ fn select(
     Ok(selected)
 }
 
+/// Wrap per-verification reports in the envelope an operator can resolve paths
+/// against.
+///
+/// Every path inside a report is store-relative, because the envelope on disk
+/// has to survive a state root that moves. A report is read from wherever the
+/// operator happens to be standing, so the resolved store root travels with it:
+/// `store_root` plus `artifact_path` names a real file, and `artifact_path`
+/// alone names nothing. The store-relative spelling is left exactly as the
+/// envelope records it.
+fn report_envelope(store: &EvidenceStore, body: serde_json::Value) -> serde_json::Value {
+    let mut envelope = body;
+    if let Some(object) = envelope.as_object_mut() {
+        object.insert(
+            "store_root".to_string(),
+            serde_json::Value::String(store.root().display().to_string()),
+        );
+    }
+    envelope
+}
+
 /// Report the reuse plan without executing anything.
 async fn report_plan(
     workspace: &Path,
+    store: &EvidenceStore,
     declarations: &[VerificationDeclaration],
     json_output: bool,
 ) -> Result<(), String> {
     let plan = plan_reuse(
         &GitRepositoryFacts,
         workspace,
+        store,
         declarations,
         ReusePolicy::default(),
     )
@@ -102,7 +132,8 @@ async fn report_plan(
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&plan.to_json()).unwrap_or_default()
+            serde_json::to_string_pretty(&report_envelope(store, plan.to_json()))
+                .unwrap_or_default()
         );
         return Ok(());
     }
@@ -110,6 +141,7 @@ async fn report_plan(
         println!("No repository-local verifications are declared.");
         return Ok(());
     }
+    println!("Evidence store: {}", store.root().display());
     for decision in &plan.decisions {
         println!("{}", decision.summary());
     }
@@ -119,6 +151,7 @@ async fn report_plan(
 /// Run everything that cannot be reused, then report per verification.
 async fn run_verifications(
     workspace: &Path,
+    store: &EvidenceStore,
     declarations: &[VerificationDeclaration],
     json_output: bool,
 ) -> Result<i32, String> {
@@ -131,7 +164,8 @@ async fn run_verifications(
         // A declaration with no local reuse decision is not something this
         // command runs at all: deployed, credentialed, and device observations
         // are owned elsewhere by design.
-        let Some(decision) = decide_reuse(&facts, workspace, declaration, policy).await else {
+        let Some(decision) = decide_reuse(&facts, workspace, store, declaration, policy).await
+        else {
             continue;
         };
         if decision.is_reuse() {
@@ -155,12 +189,13 @@ async fn run_verifications(
         };
         let executor = RuntimeVerificationExecutor::new(
             workspace.to_path_buf(),
+            store.clone(),
             GitRepositoryFacts,
             crate::orchestration::acceptance::verification_evidence::DirectCommandSupervisor,
             SystemClock,
         );
         let outcome = executor.capture(&request).await;
-        if !matches!(outcome, CaptureOutcome::Captured(_)) {
+        if !matches!(outcome, CaptureOutcome::Captured { .. }) {
             unsatisfied += 1;
         }
         reports.push(outcome.to_json());
@@ -169,20 +204,30 @@ async fn run_verifications(
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({"verifications": reports}))
-                .unwrap_or_default()
+            serde_json::to_string_pretty(&report_envelope(
+                store,
+                serde_json::json!({"verifications": reports})
+            ))
+            .unwrap_or_default()
         );
     } else if reports.is_empty() {
         println!("No repository-local verifications are declared.");
     } else {
+        println!("Evidence store: {}", store.root().display());
         for report in &reports {
             println!(
-                "{}: {}{}",
+                "{}: {}{}{}",
                 report["verification_id"].as_str().unwrap_or_default(),
                 report["outcome"].as_str().unwrap_or_default(),
                 report["detail"]
                     .as_str()
                     .map(|detail| format!(" — {detail}"))
+                    .unwrap_or_default(),
+                // The openable path, not the store-relative one: a failing gate's
+                // output is worth nothing if reading it needs a second lookup.
+                report["artifact_location"]
+                    .as_str()
+                    .map(|location| format!(" — {location}"))
                     .unwrap_or_default()
             );
         }
@@ -209,11 +254,33 @@ pub async fn cmd_verify(
         .map_err(|error| format!("Failed to resolve the current directory: {error}"))?;
     let workspace: PathBuf = workspace;
     let selected = select(declarations(&workspace, change_id)?, verification_id)?;
+    let store = resolve_store(&workspace, change_id)?;
     if plan_only {
-        report_plan(&workspace, &selected, json_output).await?;
+        report_plan(&workspace, &store.evidence(), &selected, json_output).await?;
         return Ok(0);
     }
-    run_verifications(&workspace, &selected, json_output).await
+    run_verifications(&workspace, &store.evidence(), &selected, json_output).await
+}
+
+/// Resolve the Conflux-owned external store this command reads and writes.
+///
+/// `cflx openspec verify` runs against the repository the operator is standing
+/// in, so the project and the workspace are the same directory; the store is
+/// still resolved outside both, and a refusal is reported as an error rather
+/// than worked around.
+fn resolve_store(workspace: &Path, change_id: &str) -> Result<AcceptanceStore, String> {
+    // Storage settings only: this command starts no AI subprocess, so an
+    // installation that has not configured its commands yet must still be able
+    // to resolve the state root its evidence belongs in.
+    let state_base_dir = crate::config::OrchestratorConfig::load_storage_settings(None)
+        .ok()
+        .and_then(|config| config.get_state_base_dir().map(str::to_string));
+    prepare_store(state_base_dir.as_deref(), workspace, workspace, change_id).map_err(|refusal| {
+        format!(
+            "Verification evidence cannot be stored outside the repository: {}",
+            refusal.evidence()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -221,6 +288,7 @@ mod tests {
     use super::*;
     use crate::orchestration::acceptance::verification_evidence::{
         EvidenceDefect, RepositoryFacts, RerunReason, ReuseDecision, ToolIdentity,
+        VerificationReusePlan,
     };
 
     fn declaration(id: &str) -> VerificationDeclaration {
@@ -352,6 +420,7 @@ mod tests {
         let plan = plan_reuse(
             &UnobservedFacts,
             workspace.path(),
+            &EvidenceStore::new(workspace.path().join("../external-acceptance-store")),
             &declared,
             ReusePolicy::default(),
         )
@@ -443,6 +512,82 @@ mod tests {
         let error = declarations(workspace.path(), "example").unwrap_err();
         assert!(error.contains("has no proposal"));
         assert!(error.contains("no archived proposal"));
+    }
+
+    /// Write one captured artifact into an external store, the way a real
+    /// capture would, and hand back the store bound to it.
+    fn store_with_artifact(root: &Path, verification_id: &str, output: &[u8]) -> EvidenceStore {
+        let store = EvidenceStore::new(root.join("cflx-state/acceptance/project/workspace/change"));
+        store.ensure_directory().expect("create store directory");
+        std::fs::write(store.artifact_path(verification_id), output).expect("write artifact");
+        store
+    }
+
+    #[test]
+    fn a_json_report_lets_a_caller_locate_the_captured_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = store_with_artifact(temp.path(), "local-tests", b"error: 1 test failed");
+        let outcome = CaptureOutcome::CommandFailed {
+            verification_id: "local-tests".to_string(),
+            exit_code: 101,
+            artifact_path: EvidenceStore::artifact_relative_path("local-tests"),
+            artifact_location: store.artifact_path("local-tests"),
+        };
+
+        let report = report_envelope(
+            &store,
+            serde_json::json!({"verifications": [outcome.to_json()]}),
+        );
+
+        // Route one: the absolute location travels on the per-verification
+        // report and opens directly.
+        let entry = &report["verifications"][0];
+        let location = entry["artifact_location"]
+            .as_str()
+            .expect("a failing verification names an openable artifact");
+        assert_eq!(
+            std::fs::read(location).expect("the reported location opens"),
+            b"error: 1 test failed"
+        );
+
+        // Route two: the store-relative spelling the envelope schema requires is
+        // unchanged, and the envelope's own store root is what resolves it — so
+        // a reused decision, which carries no absolute path of its own, is
+        // locatable too.
+        let root = report["store_root"]
+            .as_str()
+            .expect("the report names the resolved store root");
+        assert_eq!(root, store.root().display().to_string());
+        let relative = entry["artifact_path"]
+            .as_str()
+            .expect("the store-relative artifact path is preserved");
+        assert_eq!(relative, "gates/local-tests.log");
+        assert_eq!(
+            std::fs::read(Path::new(root).join(relative))
+                .expect("store_root + artifact_path opens"),
+            b"error: 1 test failed"
+        );
+    }
+
+    #[test]
+    fn a_plan_report_carries_the_store_root_it_was_resolved_against() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = store_with_artifact(temp.path(), "local-tests", b"test result: ok");
+        let plan = VerificationReusePlan {
+            decisions: vec![ReuseDecision::Rerun {
+                verification_id: "local-tests".to_string(),
+                reason: RerunReason::Defect(EvidenceDefect::Missing),
+            }],
+        };
+
+        let report = report_envelope(&store, plan.to_json());
+        assert_eq!(
+            report["store_root"].as_str(),
+            Some(store.root().display().to_string().as_str())
+        );
+        // Wrapping adds the root and nothing else: the plan body is untouched.
+        assert_eq!(report["verifications"], plan.to_json()["verifications"]);
+        assert_eq!(report["rerun"], serde_json::json!(["local-tests"]));
     }
 
     #[test]

@@ -1,0 +1,30 @@
+## Implementation Tasks
+
+- [x] Add one external Acceptance storage resolver under the resolved Conflux state root, isolated by project, workspace, and change identity, with validated identifiers and an external temporary fallback only when no persistent root exists; refuse with a typed runtime hold any resolved root inside the target repository or any managed worktree and cover the containment check with a unit test (verification: unit - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [x] Refactor `EvidenceStore` and `ManifestStore` to receive explicit external paths and wire the same store through manifest construction, gate reuse planning, declared-gate execution, terminal diagnostics, and settlement cleanup (verification: integration - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [x] Remove every production write below `.cflx/verification-evidence`, self-ignore creation, evidence-directory cleanliness exclusion, and `semantic_progress_fingerprint` filtering; use normal tracked/untracked porcelain status plus a dedicated legacy-path existence probe that detects self-ignored `.cflx/verification-evidence` without evaluating unrelated ignored paths (verification: integration - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [x] Make external manifests and evidence cache-only: bump the evidence schema to v2 with store-relative artifact paths, preserve exact valid gate reuse, rerun or hold on missing/malformed/stale cache, and remove durable manifest-based admission or next-action authority (verification: integration - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [x] Preserve same-owner unchanged-input refusal in typed live reducer state carrying the input fingerprint while admitting one fresh bounded first admission after owner restart, whether explicit retry or automatic mark settlement, without a repository mutation (verification: integration - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [x] Add regression coverage proving zero target writes, external path isolation and containment refusal, state-root failure before gate launch, normal full cleanliness plus the dedicated legacy ignored-path probe, cache-loss rerun without PASS, live-owner refusal, post-restart explicit and automatic admission, bounded deadlines, and owned-process cleanup; replace `acceptance_execution_boundary_restart_reaches_the_same_refusal` with the new restart contract (verification: e2e - `cargo test acceptance_execution_boundary --lib`; verification-id: external-acceptance-state-tests)
+- [x] Update Acceptance evidence documentation and source comments to describe external cache semantics, legacy non-migration, explicit cleanup ownership, and the prohibition on target-worktree writes or ignore-based exceptions (verification: manual - inspect `docs/guides/VERIFICATION_EVIDENCE.md`, `src/orchestration/acceptance/verification_evidence.rs`, and `src/orchestration/acceptance/execution_manifest.rs`; verification-id: external-acceptance-state-tests)
+
+## Final Validation
+
+Archive validation is authoritative: `cflx openspec validate relocate-acceptance-evidence --archive-gate`.
+
+## Notes
+
+Attempt-3 repair verification: `cargo clippy --locked --all-targets --all-features -- -D warnings`
+and `cargo clippy --locked -- -D warnings` both clean. `cargo test --locked --lib` reported
+4712 passed / 1 failed; the single failure was
+`parallel::tests::manual_resolve::persistent_scheduler_dynamic_queue_push_after_initial_analysis_bypasses_debounce`,
+a wall-clock debounce assertion that timed out under the fully loaded suite and passes on its own
+(`cargo test --locked --lib persistent_scheduler_dynamic_queue_push_after_initial_analysis_bypasses_debounce`
+= 1 passed). Neither open finding touches the scheduler, its debounce window, or the dynamic queue,
+so this is unrelated load flakiness rather than repair fallout.
+
+Staging iteration: the attempt-3 repair had left `src/agent/tests.rs` unformatted, so `cargo fmt`
+was applied (formatting only, no semantic edit) and `cargo fmt --check` is now clean. Re-verified
+after that repair: `cargo clippy --locked --all-targets --all-features -- -D warnings` exit 0, and
+`cargo test --locked --lib agent::tests::acceptance_execution_boundary_context` = 7 passed /
+0 failed.

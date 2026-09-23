@@ -1506,6 +1506,13 @@ pub async fn execute_archive_in_workspace(
         archive_hist.clear(change_id);
     }
 
+    // Drop this change's Acceptance cache and live refusal alongside its
+    // history. Both are settlement bookkeeping rather than authority: the cache
+    // describes a review that has already concluded, and an archived change has
+    // no unchanged retry left to refuse. Deleting either can only cost a rerun
+    // that will never be asked for, and neither touches the target worktree.
+    clear_acceptance_state(change_id, workspace_path, config).await;
+
     if let Err(err) = delete_archive_state(workspace_path) {
         warn!(
             "Failed to delete archive state for {} after archive completion: {}",
@@ -1615,11 +1622,12 @@ fn effective_review_budget(derived: Option<std::time::Duration>) -> Option<std::
 
 /// The runtime-owned boundary phase, completed before any reviewer starts.
 ///
-/// Everything here is derived from the workspace: the proposal's own
-/// declarations, the runtime-written sidecars, and live Git state. Nothing is
-/// remembered across invocations, so a restart in the middle of a change
-/// recomputes the same manifest, the same fingerprint, and the same reuse
-/// decisions from the same files.
+/// Everything that decides anything here is derived from the workspace: the
+/// proposal's own declarations and live Git state. The Conflux-owned external
+/// store contributes cache only — an exact gate result that may be reused — so a
+/// restart, or an operator who deleted the whole state root, recomputes the same
+/// manifest and the same fingerprint from the same files and simply reruns what
+/// it can no longer prove.
 ///
 /// What changed from the advisory predecessor is ownership. The plan used to be
 /// observation handed to a reviewer that decided for itself what to run. Here
@@ -1631,6 +1639,12 @@ pub(crate) struct AcceptanceBoundary {
     pub verdict: crate::orchestration::acceptance::gate_execution::GateVerdict,
     /// Work budget left for semantic review after the gates spent theirs.
     pub review_budget: Option<std::time::Duration>,
+    /// The Conflux-owned external store this invocation used, for terminal
+    /// diagnostics and settlement cleanup. Never inside the target.
+    pub store: crate::orchestration::acceptance::evidence_location::AcceptanceStore,
+    /// The revision name the review base was resolved from, carried so a live
+    /// refusal can be recomputed against the same base later.
+    pub review_base_ref: Option<String>,
 }
 
 /// Build the manifest and run its declared gates.
@@ -1652,17 +1666,21 @@ pub(crate) async fn run_acceptance_boundary(
     skill_name: &str,
     review_base: Option<&str>,
     absolute_deadline_secs: u64,
+    state_base_dir: Option<&str>,
 ) -> std::result::Result<
     Option<AcceptanceBoundary>,
     crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionHold,
 > {
+    use crate::orchestration::acceptance::evidence_location::prepare_store;
     use crate::orchestration::acceptance::execution_manifest::{
-        partition_deadline, AcceptanceExecutionHold, AcceptanceHoldCategory, ManifestStore,
+        live_acceptance_holds, partition_deadline, AcceptanceExecutionHold, AcceptanceHoldCategory,
     };
     use crate::orchestration::acceptance::gate_execution::{
         classify_gate_results, execute_declared_gates, plan_manifest_reuse, GateBudget,
     };
-    use crate::orchestration::acceptance::manifest_builder::build_manifest_for_workspace;
+    use crate::orchestration::acceptance::manifest_builder::{
+        build_manifest_for_workspace, repository_project_root,
+    };
     use crate::orchestration::acceptance::verification_evidence::{
         DirectCommandSupervisor, GitRepositoryFacts, ReusePolicy, RuntimeVerificationExecutor,
         SystemClock,
@@ -1682,9 +1700,45 @@ pub(crate) async fn run_acceptance_boundary(
         );
         return Ok(None);
     }
+
+    // The external store is resolved, proven, and legacy-probed *first* — before
+    // a manifest is derived and long before a declared command is launched. A
+    // gate that runs and then discovers it has nowhere to record has spent the
+    // shared budget for nothing, and there is deliberately no target-local
+    // fallback to spend it into.
+    let project_root = repository_project_root(workspace_path)
+        .await
+        .unwrap_or_else(|| workspace_path.to_path_buf());
+    let store = match prepare_store(state_base_dir, &project_root, workspace_path, change_id) {
+        Ok(store) => store,
+        Err(refusal) => {
+            let category = refusal.category();
+            warn!(
+                change_id = change_id,
+                category = category.as_str(),
+                "Acceptance not dispatched: {}",
+                refusal.evidence()
+            );
+            return Err(AcceptanceExecutionHold {
+                category,
+                budget_secs: partition.absolute_secs,
+                cleanup_confirmed: true,
+                cleanup_diagnostics: "no gate and no reviewer was started".to_string(),
+                // No store means no manifest and therefore no fingerprint to
+                // bind a refusal to. An all-zero one cannot match any real
+                // input, so the next attempt is admitted rather than stranded on
+                // an environment fault.
+                fingerprint: "0".repeat(64),
+                evidence: vec![refusal.evidence()],
+            });
+        }
+    };
+    let evidence_store = store.evidence();
+
     let manifest = match build_manifest_for_workspace(
         &GitRepositoryFacts,
         workspace_path,
+        &evidence_store,
         change_id,
         skill_name,
         review_base,
@@ -1710,19 +1764,16 @@ pub(crate) async fn run_acceptance_boundary(
     };
     let fingerprint = manifest.fingerprint();
 
-    // The authoritative unchanged-input guard, derived from the workspace alone.
+    // The unchanged-input guard, read from this owner's own typed state.
     //
-    // Shared admission refuses earlier and more cheaply, but it depends on
-    // process-local reducer state that a restart discards. This one does not: it
-    // reads the same repository-local manifest a previous invocation wrote, so a
-    // restarted Conflux facing the same worktree makes the same decision rather
-    // than re-dispatching the review the deadline already stopped.
-    let admission =
-        crate::orchestration::acceptance::execution_manifest::classify_admission_from_store(
-            workspace_path,
-            change_id,
-            &fingerprint,
-        );
+    // Deliberately *not* read from the external store. A durable record that
+    // could refuse work after a restart would mean deleting out-of-worktree
+    // state changed the next action chosen for the same workspace contents,
+    // which constitutional law 1 forbids. So a restarted owner remembers no hold
+    // and admits one fresh bounded attempt, while still-valid cached gate
+    // results keep that attempt cheap.
+    let holds = live_acceptance_holds();
+    let admission = holds.classify(change_id, &fingerprint);
     if let crate::orchestration::acceptance::execution_manifest::AcceptanceAdmission::Refuse {
         category,
         ..
@@ -1731,7 +1782,7 @@ pub(crate) async fn run_acceptance_boundary(
         warn!(
             change_id = change_id,
             category = category.as_str(),
-            "Acceptance not dispatched: input is unchanged since a non-resumable hold"
+            "Acceptance not dispatched: input is unchanged since this owner's non-resumable hold"
         );
         return Err(AcceptanceExecutionHold {
             category: *category,
@@ -1742,20 +1793,27 @@ pub(crate) async fn run_acceptance_boundary(
             evidence: admission.detail().into_iter().collect(),
         });
     }
+    // This attempt supersedes whatever this owner remembered: a hold recorded
+    // against a fingerprint that no longer matches must not outlive the answer
+    // it described.
+    holds.clear(change_id);
 
     // Persist before running anything: a manifest that exists only after the
     // gates finish could not explain an invocation the gates themselves killed.
-    let store = ManifestStore::new(workspace_path.to_path_buf());
-    if let Err(error) = store.store(&manifest) {
+    // Diagnostics, not authority — a failure to write one costs traceability,
+    // never correctness, so it is logged rather than escalated.
+    let manifest_store = store.manifests();
+    if let Err(error) = manifest_store.store(&manifest) {
         warn!(
             change_id = change_id,
-            "Acceptance manifest could not be persisted: {}", error
+            "Acceptance manifest could not be persisted to the external store: {}", error
         );
     }
 
     let reuse_decisions = plan_manifest_reuse(
         &GitRepositoryFacts,
         workspace_path,
+        &evidence_store,
         &manifest,
         ReusePolicy::default(),
     )
@@ -1771,6 +1829,7 @@ pub(crate) async fn run_acceptance_boundary(
     // any more.
     let executor = RuntimeVerificationExecutor::new(
         workspace_path.to_path_buf(),
+        evidence_store.clone(),
         GitRepositoryFacts,
         DirectCommandSupervisor,
         SystemClock,
@@ -1816,16 +1875,19 @@ pub(crate) async fn run_acceptance_boundary(
         use crate::orchestration::acceptance::verification_evidence::RepositoryFacts;
         for gate in &mut manifest.gates {
             gate.artifact_digest = GitRepositoryFacts
-                .hash_file(workspace_path, &workspace_path.join(&gate.artifact_path))
+                .hash_file(
+                    workspace_path,
+                    &evidence_store.artifact_path(&gate.verification_id),
+                )
                 .await
                 .ok();
         }
     }
     let settled_fingerprint = manifest.fingerprint();
     if settled_fingerprint != fingerprint {
-        // Persist the settled bindings, so a restart reads what actually ran
-        // rather than what was about to run.
-        if let Err(error) = store.store(&manifest) {
+        // Persist the settled bindings, so a later read of the cache describes
+        // what actually ran rather than what was about to run.
+        if let Err(error) = manifest_store.store(&manifest) {
             warn!(
                 change_id = change_id,
                 "Settled Acceptance manifest could not be persisted: {}", error
@@ -1837,6 +1899,7 @@ pub(crate) async fn run_acceptance_boundary(
         change_id = change_id,
         fingerprint = %settled_fingerprint,
         pre_gate_fingerprint = %fingerprint,
+        store = %store.root().display(),
         "Acceptance execution manifest frozen"
     );
     Ok(Some(AcceptanceBoundary {
@@ -1844,36 +1907,88 @@ pub(crate) async fn run_acceptance_boundary(
         manifest,
         gates,
         review_budget,
+        store,
+        review_base_ref: review_base.map(str::to_string),
     }))
 }
 
-/// Persist the terminal record that refuses an unchanged retry.
+/// Discard one change's Acceptance settlement state.
 ///
-/// Written to the same repository-local manifest the invocation ran under, so
-/// the refusal survives a restart with no out-of-worktree state — and so
-/// deleting `~/.local/state/cflx/**` cannot turn a refused retry into an
-/// admitted one.
-pub(crate) fn record_acceptance_terminal_manifest(
+/// Both halves are safe to lose by construction. The external store is cache and
+/// diagnostics, so removing it can only cost a rerun; the live hold is this
+/// owner's own refusal, and a change that has settled has no unchanged retry
+/// left to refuse. Nothing here reads or writes the target worktree, and a store
+/// that cannot be resolved is simply not there to remove.
+pub(crate) async fn clear_acceptance_state(
+    change_id: &str,
     workspace_path: &Path,
-    manifest: &crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionManifest,
+    config: &OrchestratorConfig,
+) {
+    use crate::orchestration::acceptance::evidence_location::{store_path, AcceptanceStore};
+    use crate::orchestration::acceptance::execution_manifest::live_acceptance_holds;
+    use crate::orchestration::acceptance::manifest_builder::repository_project_root;
+
+    live_acceptance_holds().clear(change_id);
+
+    let project_root = repository_project_root(workspace_path)
+        .await
+        .unwrap_or_else(|| workspace_path.to_path_buf());
+    match store_path(
+        config.get_state_base_dir(),
+        &project_root,
+        workspace_path,
+        change_id,
+    ) {
+        Ok(root) => AcceptanceStore::at(root).clear(),
+        Err(error) => debug!(
+            change_id = change_id,
+            "Acceptance cache was not removed because its path did not resolve: {}", error
+        ),
+    }
+}
+
+/// Record a terminal Acceptance hold: the refusal in memory, the account of it
+/// on disk.
+///
+/// The split is the whole point of this change. The *refusal* goes into this
+/// owner's [`LiveAcceptanceHolds`], which a restart discards — so deleting
+/// `~/.local/state/cflx/**`, or replacing the owner, cannot turn an admitted
+/// retry into a refused one or the reverse. The *diagnostics* go into the
+/// Conflux-owned external store so an operator can read how the last attempt
+/// ended, and nothing ever reads them back to decide anything.
+pub(crate) fn record_acceptance_hold(
+    boundary: &AcceptanceBoundary,
     hold: &crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionHold,
 ) {
-    use crate::orchestration::acceptance::execution_manifest::{ManifestStore, ManifestTerminal};
+    use crate::orchestration::acceptance::execution_manifest::{
+        live_acceptance_holds, AcceptanceDiagnostics, LiveAcceptanceHold,
+    };
 
-    let store = ManifestStore::new(workspace_path.to_path_buf());
-    if let Err(error) = store.record_terminal(
-        manifest,
-        ManifestTerminal {
+    let change_id = boundary.manifest.change_id.as_str();
+    live_acceptance_holds().record(
+        change_id,
+        LiveAcceptanceHold {
+            category: hold.category,
+            fingerprint: hold.fingerprint.clone(),
+            review_base_ref: boundary.review_base_ref.clone(),
+        },
+    );
+    if let Err(error) = boundary
+        .store
+        .manifests()
+        .record_diagnostics(&AcceptanceDiagnostics {
             hold_category: Some(hold.category),
             fingerprint: hold.fingerprint.clone(),
             cleanup_confirmed: hold.cleanup_confirmed,
             cleanup_diagnostics: hold.cleanup_diagnostics.clone(),
+            evidence: hold.evidence.clone(),
             recorded_at: chrono::Utc::now(),
-        },
-    ) {
+            recorded_by_pid: std::process::id(),
+        })
+    {
         warn!(
-            change_id = %manifest.change_id,
-            "Acceptance terminal manifest could not be persisted: {}", error
+            change_id = %change_id,
+            "Acceptance diagnostics could not be persisted to the external store: {}", error
         );
     }
 }
@@ -2072,6 +2187,7 @@ pub async fn execute_acceptance_in_workspace(
         config.get_accept_skill(),
         base_branch,
         acceptance_runtime_limit_secs,
+        config.get_state_base_dir(),
     )
     .await
     {
@@ -2188,7 +2304,7 @@ pub async fn execute_acceptance_in_workspace(
                         fingerprint: boundary.manifest.fingerprint(),
                         evidence: evidence.clone(),
                     };
-                record_acceptance_terminal_manifest(workspace_path, &boundary.manifest, &hold);
+                record_acceptance_hold(boundary, &hold);
                 emit_acceptance_execution_hold(change_id, &hold, event_tx.as_ref(), 0).await;
                 return Ok((
                     crate::orchestration::AcceptanceResult::ExecutionHold { hold },
@@ -2202,7 +2318,11 @@ pub async fn execute_acceptance_in_workspace(
     // unchanged prompt, which is exactly what the skill's "if no manifest is
     // supplied" clause is written for.
     let boundary_context = boundary.as_ref().map_or_else(String::new, |boundary| {
-        crate::agent::build_acceptance_boundary_context(&boundary.manifest, &boundary.gates)
+        crate::agent::build_acceptance_boundary_context(
+            &boundary.manifest,
+            &boundary.gates,
+            boundary.store.root(),
+        )
     });
 
     // Build prompt injected into `{prompt}`
@@ -2534,7 +2654,7 @@ pub async fn execute_acceptance_in_workspace(
             "Acceptance review deadline exhausted: {}",
             hold.cleanup_diagnostics
         );
-        record_acceptance_terminal_manifest(workspace_path, &boundary.manifest, &hold);
+        record_acceptance_hold(boundary, &hold);
         // No canonical attempt was produced, so nothing is recorded in
         // acceptance history and no attempt number is consumed. Deadline
         // termination deliberately bypasses missing-verdict retry: the reviewer

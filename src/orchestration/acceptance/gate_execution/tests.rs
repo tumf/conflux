@@ -18,8 +18,8 @@ use crate::orchestration::acceptance::execution_manifest::{
     MANIFEST_SCHEMA,
 };
 use crate::orchestration::acceptance::verification_evidence::{
-    RerunReason, ReuseDecision, SupervisedOutcome, ToolIdentity, VerificationEvidence,
-    EVIDENCE_AUTHORITY, EVIDENCE_SCHEMA,
+    EvidenceStore, RerunReason, ReuseDecision, SupervisedOutcome, ToolIdentity,
+    VerificationEvidence, EVIDENCE_AUTHORITY, EVIDENCE_SCHEMA,
 };
 
 const COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -44,7 +44,7 @@ fn gate(id: &str) -> ManifestGate {
         automation_path: "src/lib.rs".to_string(),
         automation_blob_oid: BLOB.to_string(),
         tool: tool(),
-        artifact_path: format!(".cflx/verification-evidence/{id}.log"),
+        artifact_path: EvidenceStore::artifact_relative_path(id),
         artifact_digest: Some(ARTIFACT_DIGEST.to_string()),
     }
 }
@@ -68,7 +68,6 @@ fn manifest(gates: Vec<ManifestGate>) -> AcceptanceExecutionManifest {
         created_at: Utc::now(),
         absolute_deadline_secs: 3600,
         work_budget_secs: 3570,
-        terminal: None,
     }
 }
 
@@ -206,12 +205,34 @@ impl Clock for StepClock {
     }
 }
 
+/// The target tree the gates run in. A sibling of the store below, never its
+/// ancestor, so a target-local write would be visible as an unexpected entry.
+fn target_of(temp: &tempfile::TempDir) -> std::path::PathBuf {
+    let target = temp.path().join("target");
+    std::fs::create_dir_all(&target).expect("create target");
+    target
+}
+
+/// The Conflux-owned external store, shaped like the real layout.
+fn store_of(temp: &tempfile::TempDir) -> EvidenceStore {
+    EvidenceStore::new(
+        temp.path()
+            .join("cflx-state/acceptance/project-slug/workspace-slug/alpha"),
+    )
+}
+
 fn executor(
-    workspace: &Path,
+    temp: &tempfile::TempDir,
     facts: FakeFacts,
     supervisor: RecordingSupervisor,
 ) -> RuntimeVerificationExecutor<FakeFacts, RecordingSupervisor, StepClock> {
-    RuntimeVerificationExecutor::new(workspace.to_path_buf(), facts, supervisor, StepClock::new())
+    RuntimeVerificationExecutor::new(
+        target_of(temp),
+        store_of(temp),
+        facts,
+        supervisor,
+        StepClock::new(),
+    )
 }
 
 // ============================================================================
@@ -224,7 +245,7 @@ fn executor(
 async fn acceptance_execution_boundary_runs_only_manifest_declared_gates() {
     let workspace = tempfile::tempdir().unwrap();
     let supervisor = RecordingSupervisor::passing();
-    let executor = executor(workspace.path(), FakeFacts::new(), supervisor.clone());
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
     let manifest = manifest(vec![gate("alpha-gate"), gate("beta-gate")]);
 
     let results = execute_declared_gates(&executor, &manifest, &[], GateBudget::unbounded()).await;
@@ -248,7 +269,7 @@ async fn acceptance_execution_boundary_runs_only_manifest_declared_gates() {
 async fn acceptance_execution_boundary_empty_manifest_starts_nothing() {
     let workspace = tempfile::tempdir().unwrap();
     let supervisor = RecordingSupervisor::passing();
-    let executor = executor(workspace.path(), FakeFacts::new(), supervisor.clone());
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
 
     let results = execute_declared_gates(
         &executor,
@@ -284,7 +305,7 @@ fn stored_evidence(id: &str) -> VerificationEvidence {
         started_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
         ended_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 2, 0).unwrap(),
         exit_code: 0,
-        artifact_path: format!(".cflx/verification-evidence/{id}.log"),
+        artifact_path: EvidenceStore::artifact_relative_path(id),
         artifact_digest: ARTIFACT_DIGEST.to_string(),
         clean_before: true,
         clean_after: true,
@@ -295,7 +316,7 @@ fn stored_evidence(id: &str) -> VerificationEvidence {
 async fn acceptance_execution_boundary_reuses_exact_bound_evidence_without_running_it() {
     let workspace = tempfile::tempdir().unwrap();
     let supervisor = RecordingSupervisor::passing();
-    let executor = executor(workspace.path(), FakeFacts::new(), supervisor.clone());
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
     let manifest = manifest(vec![gate("alpha-gate")]);
     let decisions = vec![ReuseDecision::Reuse {
         verification_id: "alpha-gate".to_string(),
@@ -322,7 +343,7 @@ async fn acceptance_execution_boundary_reuses_exact_bound_evidence_without_runni
 async fn acceptance_execution_boundary_stale_evidence_executes_the_command() {
     let workspace = tempfile::tempdir().unwrap();
     let supervisor = RecordingSupervisor::passing();
-    let executor = executor(workspace.path(), FakeFacts::new(), supervisor.clone());
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
     let manifest = manifest(vec![gate("alpha-gate")]);
     let decisions = vec![ReuseDecision::Rerun {
         verification_id: "alpha-gate".to_string(),
@@ -349,23 +370,16 @@ async fn acceptance_execution_boundary_stale_evidence_executes_the_command() {
 #[tokio::test]
 async fn acceptance_execution_boundary_dirty_worktree_forces_rerun_for_every_gate() {
     let workspace = tempfile::tempdir().unwrap();
-    let store = crate::orchestration::acceptance::verification_evidence::EvidenceStore::new(
-        workspace.path().to_path_buf(),
-    );
+    let store = store_of(&workspace);
     store.store(&stored_evidence("alpha-gate")).unwrap();
-    std::fs::write(
-        workspace
-            .path()
-            .join(".cflx/verification-evidence/alpha-gate.log"),
-        b"gate output\n",
-    )
-    .ok();
+    std::fs::write(store.artifact_path("alpha-gate"), b"gate output\n").ok();
     let mut facts = FakeFacts::new();
     facts.status = " M src/lib.rs\n".to_string();
 
     let decisions = plan_manifest_reuse(
         &facts,
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &manifest(vec![gate("alpha-gate")]),
         ReusePolicy::default(),
     )
@@ -391,7 +405,8 @@ async fn acceptance_execution_boundary_unobservable_state_reruns_every_gate() {
 
     let decisions = plan_manifest_reuse(
         &facts,
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &manifest(vec![gate("alpha-gate"), gate("beta-gate")]),
         ReusePolicy::default(),
     )
@@ -418,7 +433,7 @@ async fn acceptance_execution_boundary_unobservable_state_reruns_every_gate() {
 async fn acceptance_execution_boundary_failing_gate_stops_the_gate_phase() {
     let workspace = tempfile::tempdir().unwrap();
     let supervisor = RecordingSupervisor::failing();
-    let executor = executor(workspace.path(), FakeFacts::new(), supervisor.clone());
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
     let manifest = manifest(vec![gate("alpha-gate"), gate("beta-gate")]);
 
     let results = execute_declared_gates(&executor, &manifest, &[], GateBudget::unbounded()).await;
@@ -444,7 +459,7 @@ async fn acceptance_execution_boundary_failing_gate_stops_the_gate_phase() {
 async fn acceptance_execution_boundary_gate_deadline_becomes_a_typed_hold() {
     let workspace = tempfile::tempdir().unwrap();
     let supervisor = RecordingSupervisor::hanging();
-    let executor = executor(workspace.path(), FakeFacts::new(), supervisor.clone());
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
     let manifest = manifest(vec![gate("alpha-gate")]);
 
     let results = execute_declared_gates(
@@ -473,7 +488,7 @@ async fn acceptance_execution_boundary_gate_deadline_becomes_a_typed_hold() {
 async fn acceptance_execution_boundary_exhausted_budget_starts_no_further_gate() {
     let workspace = tempfile::tempdir().unwrap();
     let supervisor = RecordingSupervisor::hanging();
-    let executor = executor(workspace.path(), FakeFacts::new(), supervisor.clone());
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
     let manifest = manifest(vec![gate("alpha-gate"), gate("beta-gate")]);
 
     let results = execute_declared_gates(
@@ -503,7 +518,7 @@ async fn acceptance_execution_boundary_exhausted_budget_starts_no_further_gate()
 async fn acceptance_execution_boundary_missing_tool_keeps_the_external_contract() {
     let workspace = tempfile::tempdir().unwrap();
     let supervisor = RecordingSupervisor::passing();
-    let executor = executor(workspace.path(), FakeFacts::new(), supervisor.clone());
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
     let mut unresolvable = gate("alpha-gate");
     unresolvable.tool = ToolIdentity::default();
     let manifest = manifest(vec![unresolvable]);
@@ -596,7 +611,8 @@ async fn acceptance_execution_boundary_gate_deadline_hold_reports_real_cleanup_e
     sleeping.argv = vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()];
     let executor =
         crate::orchestration::acceptance::verification_evidence::RuntimeVerificationExecutor::new(
-            workspace.path().to_path_buf(),
+            target_of(&workspace),
+            store_of(&workspace),
             FakeFacts::new(),
             crate::orchestration::acceptance::verification_evidence::DirectCommandSupervisor,
             StepClock::new(),
@@ -638,25 +654,18 @@ async fn acceptance_execution_boundary_gate_deadline_hold_reports_real_cleanup_e
 #[tokio::test]
 async fn acceptance_execution_boundary_review_base_mismatch_forces_rerun() {
     let workspace = tempfile::tempdir().unwrap();
-    let store = crate::orchestration::acceptance::verification_evidence::EvidenceStore::new(
-        workspace.path().to_path_buf(),
-    );
+    let store = store_of(&workspace);
     // Exact in every binding except the review it was produced for.
     let mut foreign = stored_evidence("alpha-gate");
     foreign.review_base_commit = "9".repeat(40);
     foreign.review_range = format!("{}..{COMMIT}", "9".repeat(40));
     store.store(&foreign).unwrap();
-    std::fs::write(
-        workspace
-            .path()
-            .join(".cflx/verification-evidence/alpha-gate.log"),
-        b"gate output\n",
-    )
-    .ok();
+    std::fs::write(store.artifact_path("alpha-gate"), b"gate output\n").ok();
 
     let decisions = plan_manifest_reuse(
         &FakeFacts::new(),
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &manifest(vec![gate("alpha-gate")]),
         ReusePolicy::default(),
     )
@@ -677,7 +686,8 @@ async fn acceptance_execution_boundary_review_base_mismatch_forces_rerun() {
     store.store(&stored_evidence("alpha-gate")).unwrap();
     let decisions = plan_manifest_reuse(
         &FakeFacts::new(),
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &manifest(vec![gate("alpha-gate")]),
         ReusePolicy::default(),
     )
@@ -693,23 +703,16 @@ async fn acceptance_execution_boundary_review_base_mismatch_forces_rerun() {
 #[tokio::test]
 async fn acceptance_execution_boundary_review_range_mismatch_forces_rerun() {
     let workspace = tempfile::tempdir().unwrap();
-    let store = crate::orchestration::acceptance::verification_evidence::EvidenceStore::new(
-        workspace.path().to_path_buf(),
-    );
+    let store = store_of(&workspace);
     let mut foreign = stored_evidence("alpha-gate");
     foreign.review_range = format!("{BLOB}..{}", "9".repeat(40));
     store.store(&foreign).unwrap();
-    std::fs::write(
-        workspace
-            .path()
-            .join(".cflx/verification-evidence/alpha-gate.log"),
-        b"gate output\n",
-    )
-    .ok();
+    std::fs::write(store.artifact_path("alpha-gate"), b"gate output\n").ok();
 
     let decisions = plan_manifest_reuse(
         &FakeFacts::new(),
-        workspace.path(),
+        &target_of(&workspace),
+        &store_of(&workspace),
         &manifest(vec![gate("alpha-gate")]),
         ReusePolicy::default(),
     )
@@ -776,7 +779,7 @@ async fn acceptance_execution_boundary_dirty_capture_is_refused_not_recorded() {
     let supervisor = RecordingSupervisor::passing();
     let mut facts = FakeFacts::new();
     facts.status = " M src/lib.rs\n".to_string();
-    let executor = executor(workspace.path(), facts, supervisor.clone());
+    let executor = executor(&workspace, facts, supervisor.clone());
 
     let results = execute_declared_gates(
         &executor,

@@ -1,12 +1,16 @@
-//! Deriving the Acceptance execution manifest from workspace evidence alone.
+//! Deriving the Acceptance execution manifest from workspace evidence.
 //!
-//! Every input this module reads is one of the three the constitution allows as
-//! workflow-control authority: workspace file state, workspace Git state, and
-//! base-tree comparison. Nothing is read from `~/.local/state/cflx/**`, no
-//! global setting participates, and no value is carried over from a previous
-//! invocation. That is what makes the restart property hold: delete every
-//! out-of-worktree file, rebuild from the same worktree, and the fingerprint,
-//! the reuse decisions, and the retry verdict are the same.
+//! Every *workflow-control* input this module reads is one of the three the
+//! constitution allows as authority: workspace file state, workspace Git state,
+//! and base-tree comparison. No global setting participates, and no value is
+//! carried over from a previous invocation.
+//!
+//! The one thing it also reads from the external store is the digest of a gate's
+//! captured artifact, and that is a cache fact rather than an authority: a
+//! deleted store makes the digest `None`, which makes the reuse decision
+//! `Rerun`. Losing out-of-worktree state can therefore cost work — it cannot
+//! change the next action chosen for the same workspace contents, which is
+//! exactly what constitutional law 1 requires.
 //!
 //! The one identity that is *not* a repository file — the embedded skill text
 //! and the executable identity — is bound under the existing tool-identity
@@ -22,7 +26,7 @@ use super::execution_manifest::{
     digest_change_inputs, digest_text, eligible_gates, partition_deadline,
     AcceptanceExecutionManifest, ManifestGate, SkillIdentity, MANIFEST_SCHEMA,
 };
-use super::verification_evidence::{RepositoryFacts, ToolIdentity};
+use super::verification_evidence::{EvidenceStore, RepositoryFacts, ToolIdentity};
 
 /// Why a manifest could not be derived at all.
 ///
@@ -30,7 +34,7 @@ use super::verification_evidence::{RepositoryFacts, ToolIdentity};
 /// read the repository says nothing about whether the change is correct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestBuildError {
-    /// The change ID cannot name a repository-local sidecar.
+    /// The change ID cannot name a single external-store path component.
     UnstorableChangeId(String),
     /// Git state could not be observed.
     Unobservable(String),
@@ -40,7 +44,7 @@ impl ManifestBuildError {
     pub fn detail(&self) -> String {
         match self {
             Self::UnstorableChangeId(id) => {
-                format!("change id '{id}' cannot name a repository-local manifest")
+                format!("change id '{id}' cannot name an Acceptance store component")
             }
             Self::Unobservable(error) => {
                 format!("current repository state could not be proven: {error}")
@@ -135,9 +139,11 @@ pub async fn workspace_is_repository(workspace: &Path) -> bool {
 /// `review_base` is the resolved base revision for the candidate diff, when one
 /// exists. It is bound rather than recomputed later so a base branch that moves
 /// mid-review cannot silently change what "the review range" meant.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_manifest<F: RepositoryFacts>(
     facts: &F,
     workspace: &Path,
+    store: &EvidenceStore,
     change_id: &str,
     declarations: &[crate::openspec::VerificationDeclaration],
     skill_name: &str,
@@ -187,11 +193,12 @@ pub async fn build_manifest<F: RepositoryFacts>(
             .resolve_tool(workspace, request.argv.first().map_or("", String::as_str))
             .await
             .unwrap_or_else(|_| ToolIdentity::default());
-        let artifact_path = super::verification_evidence::EvidenceStore::artifact_relative_path(
-            &request.verification_id,
-        );
+        let artifact_path = EvidenceStore::artifact_relative_path(&request.verification_id);
+        // Hashed out of the external store, never out of the target. `None` is
+        // the honest answer for a cache that was never written or has since been
+        // deleted, and it is what makes cache loss decide `Rerun`.
         let artifact_digest = facts
-            .hash_file(workspace, &workspace.join(&artifact_path))
+            .hash_file(workspace, &store.artifact_path(&request.verification_id))
             .await
             .ok();
         gates.push(ManifestGate {
@@ -229,7 +236,6 @@ pub async fn build_manifest<F: RepositoryFacts>(
         created_at: Utc::now(),
         absolute_deadline_secs: partition.absolute_secs,
         work_budget_secs: partition.work_secs,
-        terminal: None,
     })
 }
 
@@ -241,6 +247,7 @@ pub async fn build_manifest<F: RepositoryFacts>(
 pub async fn build_manifest_for_workspace<F: RepositoryFacts>(
     facts: &F,
     workspace: &Path,
+    store: &EvidenceStore,
     change_id: &str,
     skill_name: &str,
     review_base: Option<&str>,
@@ -258,6 +265,7 @@ pub async fn build_manifest_for_workspace<F: RepositoryFacts>(
     build_manifest(
         facts,
         workspace,
+        store,
         change_id,
         &declarations,
         skill_name,
@@ -265,6 +273,46 @@ pub async fn build_manifest_for_workspace<F: RepositoryFacts>(
         absolute_deadline_secs,
     )
     .await
+}
+
+/// The repository a managed worktree belongs to.
+///
+/// Derived from the Git common directory rather than from the worktree path, so
+/// a linked worktree resolves to the *same* project as its main checkout and
+/// their Acceptance caches share one project component instead of splitting into
+/// two unrelated trees.
+///
+/// `None` when the workspace is not a Git working tree at all; the caller falls
+/// back to the workspace itself, which is still an external, isolated identity.
+pub async fn repository_project_root(workspace: &Path) -> Option<std::path::PathBuf> {
+    let output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(workspace)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let common = Path::new(&raw);
+    let common = if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        workspace.join(common)
+    };
+    // `<root>/.git` for both a main worktree and a linked one; a bare repository
+    // answers with the repository directory itself, whose parent is still a
+    // stable per-project identity.
+    common.parent().map(|parent| {
+        parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
+    })
 }
 
 #[cfg(test)]

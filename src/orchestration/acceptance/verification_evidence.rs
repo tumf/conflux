@@ -20,16 +20,21 @@
 //!   partial score and no freshness heuristic. Commit, tree, argv, cwd,
 //!   automation blob, tool identity, artifact digest, exit code, and clean state
 //!   must *all* match; the first mismatch is the rerun reason.
-//! * **Nothing lives outside the worktree.** The envelope is a repository-local
-//!   sidecar under [`EVIDENCE_DIR`], excluded from Git and from the clean-state
-//!   comparison. Deleting `~/.local/state/cflx/**` cannot change a decision,
-//!   which is what constitutional law 1 requires, and a restart re-derives the
-//!   same answer from the same files.
+//! * **Nothing lives inside the target.** The envelope and its artifact are
+//!   written into a Conflux-owned store below the resolved state root, never
+//!   into the target repository or any managed worktree, which is what
+//!   constitutional law 4 requires. [`EvidenceStore`] is handed that directory
+//!   explicitly; it cannot derive one by joining a workspace with a hidden
+//!   sidecar path, so there is no code path left that could pollute a target.
 //!
-//! The evidence directory is excluded from the cleanliness comparison so that
-//! writing the sidecar cannot invalidate the sidecar. That exclusion is the only
-//! permitted difference from the bound Apply commit: any other dirty path forces
-//! rerun.
+//! **The external record is cache, not authority.** Constitutional law 1 keeps
+//! workflow control in the workspace, so a missing, unreadable, malformed,
+//! stale, or deliberately deleted record means exactly one thing: run the
+//! declared command again. It never implies PASS, never suppresses work, and
+//! never selects the next workflow action. That is why cleanliness is now
+//! evaluated with *no* Conflux-owned path excluded: the store is outside the
+//! tree, so there is nothing left to exclude, and writing evidence can no longer
+//! invalidate the evidence it is writing.
 //!
 //! **What the authority check is and is not.** The envelope is written `0400`
 //! inside a `0700` runtime-owned directory, and a file whose mode says otherwise
@@ -53,24 +58,45 @@ use crate::openspec::{
     VerificationCompletionRole, VerificationDeclaration, VerificationExecutionClass,
 };
 
-/// Envelope schema. Any other value is a hard refusal, never a migration.
-pub const EVIDENCE_SCHEMA: &str = "conflux-verification-evidence-v1";
+/// Envelope schema.
+///
+/// Version 2 is where the record left the target worktree: `artifact_path` is
+/// store-relative rather than repository-relative, and `clean_before` /
+/// `clean_after` mean full target cleanliness with no Conflux path excluded. A
+/// version-1 record describes a different world — a repository-local sidecar and
+/// an evidence-path-excluded clean state — so it is refused rather than
+/// migrated. Refusal costs one rerun; migration would carry a cleanliness claim
+/// that was never made.
+pub const EVIDENCE_SCHEMA: &str = "conflux-verification-evidence-v2";
 
 /// Marking that says the Conflux runtime executor wrote this record.
 pub const EVIDENCE_AUTHORITY: &str = "conflux-runtime-executor";
 
-/// Repository-relative directory holding envelopes and their artifacts.
-///
-/// Git-excluded by a self-ignoring `.gitignore`, and excluded from every
-/// cleanliness comparison in this module.
-pub const EVIDENCE_DIR: &str = ".cflx/verification-evidence";
+/// Store-relative directory holding envelopes and their artifacts.
+pub const GATES_DIR: &str = "gates";
 
-/// Contents of the self-ignoring `.gitignore` written into [`EVIDENCE_DIR`].
+/// The target-local path earlier releases wrote Acceptance evidence into.
 ///
-/// `*` matches the `.gitignore` itself, so the whole subtree stays invisible to
-/// `git status` without touching `.git/info/exclude` or the tracked
-/// `.gitignore`.
-const EVIDENCE_GITIGNORE: &str = "*\n";
+/// Retained as a *name to probe for*, never as a path to write, read, parse,
+/// migrate, or delete. Its existence in a target is reported so a repository
+/// owner can remove it explicitly; nothing in this runtime touches its content.
+pub const LEGACY_EVIDENCE_DIR: &str = ".cflx/verification-evidence";
+
+/// Whether a target carries legacy Conflux-owned evidence.
+///
+/// Existence only. `symlink_metadata` is used rather than `exists` so a dangling
+/// symlink at that path is still reported instead of read through, and no entry
+/// below it is opened, listed, or parsed. Self-ignored content is detected for
+/// the same reason: this is a filesystem probe, not a `git status` question, so
+/// an ignore rule cannot hide it.
+///
+/// Exactly one path is evaluated. Unrelated ignored paths are none of this
+/// probe's business, and widening it would reintroduce the Conflux-specific
+/// status filtering constitutional law 4 forbids.
+pub fn legacy_target_evidence(workspace: &Path) -> Option<PathBuf> {
+    let path = workspace.join(LEGACY_EVIDENCE_DIR);
+    std::fs::symlink_metadata(&path).ok().map(|_| path)
+}
 
 /// Default minimum elapsed duration eligible for reuse.
 ///
@@ -147,13 +173,20 @@ pub struct VerificationEvidence {
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     pub exit_code: i32,
-    /// Repository-relative path of the captured output artifact.
+    /// Store-relative path of the captured output artifact (`gates/<id>.log`).
+    ///
+    /// Store-relative rather than absolute so the cache survives a state root
+    /// that moves — a configured `state_base_dir` change, a different machine —
+    /// without every record becoming unreadable, and so nothing in the envelope
+    /// names a location inside the target.
     pub artifact_path: String,
     /// Full-length content digest of that artifact.
     pub artifact_digest: String,
-    /// Evidence-path-excluded cleanliness observed before execution.
+    /// Full target cleanliness observed before execution, with no Conflux-owned
+    /// path excluded.
     pub clean_before: bool,
-    /// Evidence-path-excluded cleanliness observed after execution.
+    /// Full target cleanliness observed after execution, with no Conflux-owned
+    /// path excluded.
     pub clean_after: bool,
 }
 
@@ -243,18 +276,15 @@ fn is_full_length_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Whether a verification ID is usable as a sidecar file name.
+/// Whether a verification ID is usable as an evidence file name.
 ///
-/// Anything that could escape [`EVIDENCE_DIR`] or collide across changes is
-/// refused; the declaration is corrected rather than sanitized here.
+/// Anything that could escape the store's `gates/` directory or collide across
+/// changes is refused; the declaration is corrected rather than sanitized here.
+/// The same single-component rule the external store applies to every other
+/// identity it puts on a path, so a name that is safe in one place is safe in
+/// all of them.
 pub fn is_storable_verification_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id != "."
-        && id != ".."
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    crate::config::defaults::is_safe_path_component(id)
 }
 
 /// Normalize a repository-relative working directory.
@@ -289,8 +319,8 @@ pub fn normalize_relative_cwd(raw: &str) -> Option<String> {
 ///
 /// Fail-closed: every required field must be present, every object ID must be
 /// full length, the timestamps must be ordered, the exit status must be success,
-/// and the artifact must live inside the evidence directory. A record that fails
-/// any of these is not a candidate at all.
+/// and the artifact must live inside the store's own `gates/` directory. A
+/// record that fails any of these is not a candidate at all.
 pub fn parse_evidence(bytes: &[u8]) -> Result<VerificationEvidence, EvidenceDefect> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| EvidenceDefect::Malformed(error.to_string()))?;
@@ -358,13 +388,11 @@ pub fn parse_evidence(bytes: &[u8]) -> Result<VerificationEvidence, EvidenceDefe
             "automation path and tool path are required".to_string(),
         ));
     }
-    if !record
-        .artifact_path
-        .starts_with(&format!("{EVIDENCE_DIR}/"))
-    {
+    if record.artifact_path != EvidenceStore::artifact_relative_path(&record.verification_id) {
         return Err(EvidenceDefect::Malformed(format!(
-            "artifact path '{}' is outside '{EVIDENCE_DIR}'",
-            record.artifact_path
+            "artifact path '{}' is not the store-relative '{}'",
+            record.artifact_path,
+            EvidenceStore::artifact_relative_path(&record.verification_id)
         )));
     }
     if record.elapsed_seconds().is_none() {
@@ -518,7 +546,7 @@ pub struct CurrentBindings {
     pub review: Option<ReviewBinding>,
     pub automation_blob_oid: String,
     pub tool: ToolIdentity,
-    /// Cleanliness with [`EVIDENCE_DIR`] excluded.
+    /// Full target cleanliness, with no Conflux-owned path excluded.
     pub clean: bool,
     /// Digest of the artifact as it exists now, or `None` when it is absent or
     /// unreadable.
@@ -536,7 +564,7 @@ pub enum RerunReason {
         recorded: String,
         current: String,
     },
-    /// The worktree carries changes outside the evidence directory.
+    /// The target carries staged, unstaged, or untracked changes.
     DirtyWorktree(Vec<String>),
     /// Current repository state could not be observed at all.
     Unobservable(String),
@@ -571,7 +599,7 @@ impl RerunReason {
                 current,
             } => format!("{field} changed: evidence '{recorded}', current '{current}'"),
             Self::DirtyWorktree(entries) => format!(
-                "worktree differs from the bound commit outside {EVIDENCE_DIR}: {}",
+                "worktree differs from the bound commit: {}",
                 entries.join(", ")
             ),
             Self::Unobservable(detail) => {
@@ -850,36 +878,24 @@ pub fn evaluate_reuse(
     }
 }
 
-/// Porcelain v1 entries that live outside the runtime evidence directory.
+/// Every porcelain v1 entry, with no Conflux-owned path excluded.
 ///
-/// This is what makes the sidecar unable to invalidate its own binding: writing
-/// under [`EVIDENCE_DIR`] is the one difference from the bound Apply commit that
-/// does not count as dirty. Every other entry does.
-pub fn dirty_entries_excluding_evidence(porcelain_status: &str) -> Vec<String> {
-    let mut entries = Vec::new();
-    for line in porcelain_status.lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        let payload = &line[3..];
-        // Renames and copies report `orig -> dest`; both sides are worktree
-        // paths, so an entry counts unless *both* are inside the evidence
-        // directory.
-        let paths: Vec<&str> = payload.split(" -> ").map(str::trim).collect();
-        let outside = paths
-            .iter()
-            .map(|path| path.trim_matches('"'))
-            .any(|path| !is_inside_evidence_dir(path));
-        if outside {
-            entries.push(line.trim().to_string());
-        }
-    }
-    entries
-}
-
-/// Whether a repository-relative path is inside the runtime evidence directory.
-fn is_inside_evidence_dir(path: &str) -> bool {
-    path == EVIDENCE_DIR || path.starts_with(&format!("{EVIDENCE_DIR}/"))
+/// Constitutional law 4 is explicit that a cleanliness exception is not a way to
+/// make a Conflux-owned write permissible, so there is no exception here: a
+/// staged, unstaged, or untracked entry is dirty whatever its path. Nothing this
+/// runtime writes lands in a target any more, so the exclusion the predecessor
+/// needed — writing the sidecar must not invalidate the sidecar — has nothing
+/// left to protect.
+///
+/// Ignored paths are outside this function's remit entirely: porcelain status is
+/// asked the ordinary tracked/untracked question, and the one legacy path that
+/// still matters is probed separately by [`legacy_target_evidence`].
+pub fn dirty_entries(porcelain_status: &str) -> Vec<String> {
+    porcelain_status
+        .lines()
+        .filter(|line| line.len() >= 4)
+        .map(|line| line.trim().to_string())
+        .collect()
 }
 
 /// Repository observations the executor and validator both need.
@@ -1025,16 +1041,31 @@ impl CaptureRefusal {
 }
 
 /// What one supervised execution produced.
+///
+/// Two artifact paths travel together on purpose. The envelope's
+/// `artifact_path` is store-relative because the *record* has to survive a
+/// state root that moves; a report is read once, by an operator standing
+/// somewhere the store root is not, so it also carries `artifact_location` —
+/// the absolute path of the same file. Reporting only the store-relative form
+/// names a location that resolves to nothing from the caller's directory, which
+/// is the one thing a capture report exists to avoid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureOutcome {
     /// The command succeeded and every binding held; the envelope is on disk.
-    Captured(Box<VerificationEvidence>),
+    Captured {
+        evidence: Box<VerificationEvidence>,
+        /// Absolute path of the captured artifact inside the external store.
+        artifact_location: PathBuf,
+    },
     /// The command ran and failed. No envelope: a failure is not reusable, and
     /// it is also not this module's verdict to report.
     CommandFailed {
         verification_id: String,
         exit_code: i32,
+        /// Store-relative artifact path, the same spelling the envelope uses.
         artifact_path: String,
+        /// Absolute path of that artifact, so the failing output is openable.
+        artifact_location: PathBuf,
     },
     /// Nothing was captured, and the reason is not a command failure.
     Refused(CaptureRefusal),
@@ -1051,22 +1082,45 @@ pub enum CaptureOutcome {
 }
 
 impl CaptureOutcome {
+    /// Absolute path of the artifact this outcome produced, when it produced
+    /// one.
+    ///
+    /// A refusal and an exhausted deadline have no artifact to name: the first
+    /// never wrote one, and the second reports a sweep rather than output.
+    pub fn artifact_location(&self) -> Option<&Path> {
+        match self {
+            Self::Captured {
+                artifact_location, ..
+            }
+            | Self::CommandFailed {
+                artifact_location, ..
+            } => Some(artifact_location.as_path()),
+            Self::Refused(_) | Self::DeadlineExhausted { .. } => None,
+        }
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
         match self {
-            Self::Captured(evidence) => serde_json::json!({
+            Self::Captured {
+                evidence,
+                artifact_location,
+            } => serde_json::json!({
                 "verification_id": evidence.verification_id,
                 "outcome": "captured",
                 "evidence": evidence.to_json(),
+                "artifact_location": artifact_location.display().to_string(),
             }),
             Self::CommandFailed {
                 verification_id,
                 exit_code,
                 artifact_path,
+                artifact_location,
             } => serde_json::json!({
                 "verification_id": verification_id,
                 "outcome": "command_failed",
                 "exit_code": exit_code,
                 "artifact_path": artifact_path,
+                "artifact_location": artifact_location.display().to_string(),
             }),
             Self::Refused(refusal) => refusal.to_json(),
             Self::DeadlineExhausted {
@@ -1082,51 +1136,69 @@ impl CaptureOutcome {
     }
 }
 
-/// Repository-local sidecar storage.
+/// Conflux-owned external evidence storage for one change.
 ///
-/// The directory is runtime-owned: `0700`, self-ignoring, and holding files
-/// written `0400`. Reads apply the same ownership test they would apply to any
-/// untrusted input, because on this filesystem the Apply agent could have
-/// written the bytes.
+/// The root is handed in rather than derived: this type has no way to build a
+/// path from a workspace, which is what makes "Acceptance never writes into a
+/// target" a property of the type rather than a rule callers have to remember.
+/// The caller resolves the directory through
+/// [`crate::orchestration::acceptance::evidence_location::store_path`], which
+/// refuses any root inside the target repository or a managed worktree before
+/// this store exists at all.
+///
+/// The directory is runtime-owned: `0700`, holding files written `0400`. Reads
+/// apply the same ownership test they would apply to any untrusted input,
+/// because any process under this UID could have written the bytes.
 #[derive(Debug, Clone)]
 pub struct EvidenceStore {
-    workspace: PathBuf,
+    root: PathBuf,
 }
 
 impl EvidenceStore {
-    pub fn new(workspace: impl Into<PathBuf>) -> Self {
-        Self {
-            workspace: workspace.into(),
-        }
+    /// Bind the store to one already-resolved external directory.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 
-    /// Absolute path of the evidence directory.
+    /// The external store root this instance owns.
+    pub fn root(&self) -> &Path {
+        self.root.as_path()
+    }
+
+    /// Absolute path of the gate directory holding envelopes and artifacts.
     pub fn directory(&self) -> PathBuf {
-        self.workspace.join(EVIDENCE_DIR)
+        self.root.join(GATES_DIR)
     }
 
-    /// Repository-relative envelope path for one verification.
+    /// Store-relative envelope path for one verification.
     pub fn envelope_relative_path(verification_id: &str) -> String {
-        format!("{EVIDENCE_DIR}/{verification_id}.json")
+        format!("{GATES_DIR}/{verification_id}.json")
     }
 
-    /// Repository-relative artifact path for one verification.
+    /// Store-relative artifact path for one verification.
     pub fn artifact_relative_path(verification_id: &str) -> String {
-        format!("{EVIDENCE_DIR}/{verification_id}.log")
+        format!("{GATES_DIR}/{verification_id}.log")
     }
 
-    /// Create the runtime-owned, Git-excluded directory.
+    /// Absolute path of one verification's captured artifact.
+    pub fn artifact_path(&self, verification_id: &str) -> PathBuf {
+        self.root
+            .join(Self::artifact_relative_path(verification_id))
+    }
+
+    /// Create the runtime-owned external directory.
+    ///
+    /// No ignore file is written. There is nothing to hide from Git out here,
+    /// and constitutional law 4 is explicit that hiding a Conflux-owned artifact
+    /// was never what made one permissible.
     pub fn ensure_directory(&self) -> std::io::Result<()> {
         let directory = self.directory();
         std::fs::create_dir_all(&directory)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700));
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let ignore = directory.join(".gitignore");
-        if std::fs::read(&ignore).ok().as_deref() != Some(EVIDENCE_GITIGNORE.as_bytes()) {
-            std::fs::write(&ignore, EVIDENCE_GITIGNORE)?;
         }
         Ok(())
     }
@@ -1143,7 +1215,7 @@ impl EvidenceStore {
             )));
         }
         let path = self
-            .workspace
+            .root
             .join(Self::envelope_relative_path(verification_id));
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
@@ -1178,7 +1250,7 @@ impl EvidenceStore {
         self.ensure_directory()?;
         let directory = self.directory();
         let final_path = self
-            .workspace
+            .root
             .join(Self::envelope_relative_path(&evidence.verification_id));
         let temporary = directory.join(format!(
             ".{}.tmp-{}",
@@ -1208,9 +1280,7 @@ impl EvidenceStore {
     /// Write the captured output artifact next to its envelope.
     fn store_artifact(&self, verification_id: &str, output: &[u8]) -> std::io::Result<PathBuf> {
         self.ensure_directory()?;
-        let path = self
-            .workspace
-            .join(Self::artifact_relative_path(verification_id));
+        let path = self.artifact_path(verification_id);
         let bounded = if output.len() > MAX_ARTIFACT_BYTES {
             &output[output.len() - MAX_ARTIFACT_BYTES..]
         } else {
@@ -1236,6 +1306,8 @@ impl EvidenceStore {
 /// restatement of a claim.
 pub struct RuntimeVerificationExecutor<F, S, C> {
     workspace: PathBuf,
+    /// Where the envelope and artifact are written. Always outside `workspace`.
+    store: EvidenceStore,
     facts: F,
     supervisor: S,
     clock: C,
@@ -1261,14 +1333,32 @@ where
     S: CommandSupervisor,
     C: Clock,
 {
-    pub fn new(workspace: impl Into<PathBuf>, facts: F, supervisor: S, clock: C) -> Self {
+    /// Bind an executor to the target it runs in and the external store it
+    /// writes to.
+    ///
+    /// The two are separate parameters because they are separate trees, and
+    /// keeping them separate is the point: the command's working directory is
+    /// the target, and every byte this executor produces lands in `store`.
+    pub fn new(
+        workspace: impl Into<PathBuf>,
+        store: EvidenceStore,
+        facts: F,
+        supervisor: S,
+        clock: C,
+    ) -> Self {
         Self {
             workspace: workspace.into(),
+            store,
             facts,
             supervisor,
             clock,
             review: None,
         }
+    }
+
+    /// The external store this executor writes to.
+    pub fn store(&self) -> &EvidenceStore {
+        &self.store
     }
 
     /// Bind every capture this executor writes to one review base and range.
@@ -1302,7 +1392,7 @@ where
             review: self.review.clone(),
             automation_blob_oid,
             tool,
-            clean: dirty_entries_excluding_evidence(&status).is_empty(),
+            clean: dirty_entries(&status).is_empty(),
             artifact_digest: None,
         })
     }
@@ -1332,11 +1422,15 @@ where
         budget: Option<Duration>,
     ) -> CaptureOutcome {
         let id = request.verification_id.as_str();
-        let store = EvidenceStore::new(self.workspace.clone());
+        // The external store is proven usable *before* the command starts. A
+        // gate that runs and then cannot record anything has spent the shared
+        // budget for nothing, and — since there is no target-local fallback —
+        // failing here is the whole refusal rather than the first half of one.
+        let store = &self.store;
         if let Err(error) = store.ensure_directory() {
             return CaptureOutcome::Refused(CaptureRefusal::new(
                 id,
-                "evidence_directory_unavailable",
+                "evidence_store_unavailable",
                 error.to_string(),
             ));
         }
@@ -1354,7 +1448,7 @@ where
             return CaptureOutcome::Refused(CaptureRefusal::new(
                 id,
                 "worktree_dirty",
-                format!("worktree is dirty outside {EVIDENCE_DIR} before execution"),
+                "the target worktree is dirty before execution".to_string(),
             ));
         }
 
@@ -1404,6 +1498,9 @@ where
                 verification_id: id.to_string(),
                 exit_code: outcome.exit_code,
                 artifact_path: EvidenceStore::artifact_relative_path(id),
+                // The path `store_artifact` just wrote, not a path rebuilt from
+                // a root the reporter would have to guess at.
+                artifact_location: artifact_path,
             };
         }
 
@@ -1443,7 +1540,7 @@ where
             return CaptureOutcome::Refused(CaptureRefusal::new(
                 id,
                 "worktree_dirty",
-                format!("worktree became dirty outside {EVIDENCE_DIR} during execution"),
+                "the target worktree became dirty while the command ran".to_string(),
             ));
         }
         for (field, recorded, current) in [
@@ -1500,21 +1597,30 @@ where
             clean_before: true,
             clean_after: true,
         };
-        if let Err(error) = store.store(&evidence) {
+        if let Err(error) = self.store.store(&evidence) {
             return CaptureOutcome::Refused(CaptureRefusal::new(
                 id,
                 "evidence_unwritable",
                 error.to_string(),
             ));
         }
-        CaptureOutcome::Captured(Box::new(evidence))
+        CaptureOutcome::Captured {
+            evidence: Box::new(evidence),
+            artifact_location: artifact_path,
+        }
     }
 }
 
-/// Decide reuse for one declared verification from repository state alone.
+/// Decide reuse for one declared verification.
+///
+/// Repository state is the only authority: `store` supplies a *candidate*
+/// record, and every binding on it is then compared against what Git says right
+/// now. A store that holds nothing, or holds something that no longer matches,
+/// decides `Rerun` — never PASS and never "skip this gate".
 pub async fn decide_reuse<F: RepositoryFacts>(
     facts: &F,
     workspace: &Path,
+    store: &EvidenceStore,
     declaration: &VerificationDeclaration,
     policy: ReusePolicy,
 ) -> Option<ReuseDecision> {
@@ -1543,7 +1649,6 @@ pub async fn decide_reuse<F: RepositoryFacts>(
             })
         }
     };
-    let store = EvidenceStore::new(workspace.to_path_buf());
     let record = match store.load(&request.verification_id) {
         Ok(record) => record,
         Err(defect) => {
@@ -1586,15 +1691,18 @@ pub async fn decide_reuse<F: RepositoryFacts>(
         Ok(value) => value,
         Err(error) => return unobservable(error),
     };
-    let dirty = dirty_entries_excluding_evidence(&status);
+    let dirty = dirty_entries(&status);
     if !dirty.is_empty() {
         return Some(ReuseDecision::Rerun {
             verification_id: request.verification_id,
             reason: RerunReason::DirtyWorktree(dirty),
         });
     }
+    // Hashed from the external store, so deleting the cache makes the artifact
+    // unreadable and forces the rerun — the one behaviour cache loss is allowed
+    // to cause.
     let artifact_digest = facts
-        .hash_file(workspace, &workspace.join(&record.artifact_path))
+        .hash_file(workspace, &store.artifact_path(&request.verification_id))
         .await
         .ok()
         .filter(|digest| is_full_length_object_id(digest));
@@ -1619,13 +1727,14 @@ pub async fn decide_reuse<F: RepositoryFacts>(
 pub async fn plan_reuse<F: RepositoryFacts>(
     facts: &F,
     workspace: &Path,
+    store: &EvidenceStore,
     declarations: &[VerificationDeclaration],
     policy: ReusePolicy,
 ) -> VerificationReusePlan {
     let mut decisions = Vec::new();
     let mut seen = BTreeMap::new();
     for declaration in declarations {
-        if let Some(decision) = decide_reuse(facts, workspace, declaration, policy).await {
+        if let Some(decision) = decide_reuse(facts, workspace, store, declaration, policy).await {
             // A duplicate declared ID is a proposal defect the validator already
             // reports; here the first decision stands so the plan never lists one
             // ID twice with two outcomes.
