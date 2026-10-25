@@ -13,8 +13,8 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: src/web/remote_control_api/tests/read_tests.rs
-    evidence: cargo test --lib --features web-monitoring owner_incarnation -- --nocapture
-    rerun: cargo test --lib --features web-monitoring owner_incarnation -- --nocapture
+    evidence: cargo test --lib --features web-monitoring,heavy-tests owner_incarnation -- --nocapture
+    rerun: cargo test --lib --features web-monitoring,heavy-tests owner_incarnation -- --nocapture
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -24,8 +24,8 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: tests/run_exit_tests.rs
-    evidence: cargo test --test run_exit_tests --features web-monitoring owner_incarnation -- --nocapture
-    rerun: cargo test --test run_exit_tests --features web-monitoring owner_incarnation -- --nocapture
+    evidence: cargo test --test run_exit_tests --features web-monitoring,heavy-tests owner_incarnation -- --nocapture
+    rerun: cargo test --test run_exit_tests --features web-monitoring,heavy-tests owner_incarnation -- --nocapture
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking

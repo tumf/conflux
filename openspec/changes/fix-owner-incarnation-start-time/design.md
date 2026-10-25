@@ -75,9 +75,19 @@ no reader of the old owner file in the birth path and no repair command.
 
 Use the `owner_incarnation` test-name prefix for every new regression. Both
 focused commands must report tests actually run; zero selected tests is not
-acceptance. Keep tests deterministic and small (the repository's under-one-second
-normal-runtime target); use event handshakes and generous finite hang guards,
-never elapsed-time precision assertions or sleeps to manufacture equal clocks.
+acceptance. Keep fast tests under the repository's one-second total-runtime
+target. Real-child startup cases belong to the explicit heavy tier and use
+`#[cfg_attr(not(feature = "heavy-tests"), ignore)]`; any other new case that
+cannot practically meet the target must use the same marker. `Cargo.toml`
+names the existing feature `heavy-tests` (the `heavy` spelling in AGENTS is
+stale); do not introduce a new feature or waive default-suite exclusion.
+Both declared commands enable `web-monitoring,heavy-tests` while retaining
+the `owner_incarnation` filter, so fast and marked focused cases execute,
+without running unrelated heavy cases. Verify discovery and actual nonzero
+passed counts for each required case group; ignored-only output is not success.
+This is test classification, not a claim of measured runtime. Use event
+handshakes and generous finite hang guards, never elapsed-time precision
+assertions or sleeps to manufacture equal clocks.
 
 ### Unit and router gate: `owner-incarnation-local`
 
