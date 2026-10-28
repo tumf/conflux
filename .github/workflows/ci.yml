@@ -5,7 +5,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, develop]
     paths-ignore:
       - "**/*.md"
       # Not "docs/**": docs/ still holds executable material whose checks must
@@ -13,7 +13,7 @@ on:
       - "docs/images/**"
       - "openspec/**"
   pull_request:
-    branches: [main, master]
+    branches: [main, master, develop]
     paths-ignore:
       - "**/*.md"
       # Not "docs/**": docs/ still holds executable material whose checks must
