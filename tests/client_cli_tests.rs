@@ -3870,6 +3870,276 @@ mod enabled {
         owner.stop().await;
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Settled stop: reducer-derived `not queued` display + stopped execution
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// The owner's real reducer, published through the fixture exactly the way
+    /// the owner publishes it: the facts store observes each event against the
+    /// reducer, and the snapshot carries the reducer's own display status. No
+    /// row or execution fact in these tests is hand-built.
+    struct StopWaitReducer {
+        state: conflux::orchestration::state::OrchestratorState,
+    }
+
+    impl StopWaitReducer {
+        fn new(change_ids: &[&str]) -> Self {
+            Self {
+                state: conflux::orchestration::state::OrchestratorState::new(
+                    change_ids.iter().map(|id| id.to_string()).collect(),
+                    0,
+                ),
+            }
+        }
+
+        /// Reduce one event, let the facts store observe it, then publish.
+        fn event(&mut self, owner: &Owner, event: conflux::events::ExecutionEvent) {
+            self.state.apply_execution_event(&event);
+            let dispatch = owner.dispatch.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            owner
+                .facts
+                .observe(dispatch, &event, Some(&self.state), chrono::Utc::now());
+            self.publish(owner);
+        }
+
+        fn command(
+            &mut self,
+            owner: &Owner,
+            command: conflux::orchestration::state::ReducerCommand,
+            event: conflux::events::ExecutionEvent,
+        ) {
+            self.state.apply_command(command);
+            self.event(owner, event);
+        }
+
+        fn admit(&mut self, owner: &Owner, change_id: &str) -> String {
+            use conflux::events::{ExecutionEvent, OperatorCommandEffect};
+            use conflux::orchestration::state::ReducerCommand;
+            self.command(
+                owner,
+                ReducerCommand::AddToQueue(change_id.to_string()),
+                ExecutionEvent::OperatorCommandApplied {
+                    effect: OperatorCommandEffect::QueueDelta {
+                        change_id: change_id.to_string(),
+                        queued: true,
+                    },
+                },
+            );
+            owner
+                .facts
+                .change(change_id)
+                .execution_id
+                .expect("admission opens an execution episode")
+        }
+
+        fn apply_started(&mut self, owner: &Owner, change_id: &str) {
+            self.event(
+                owner,
+                conflux::events::ExecutionEvent::ApplyStarted {
+                    change_id: change_id.to_string(),
+                    command: "apply".to_string(),
+                },
+            );
+        }
+
+        fn publish(&self, owner: &Owner) {
+            let changes = self
+                .state
+                .tracked_change_ids()
+                .iter()
+                .map(|id| change(id, "select", self.state.display_status(id)))
+                .collect();
+            owner.publish(snapshot("select", changes));
+        }
+    }
+
+    /// Await a wait the test expects to end, with a generous hang guard.
+    ///
+    /// Reaching the guard is the failure this change exists to fix — an
+    /// unbounded wait that only a harness kill would end — so it panics rather
+    /// than being treated as an outcome.
+    async fn stop_wait_settles(waiting: tokio::task::JoinHandle<Output>) -> Output {
+        tokio::time::timeout(Duration::from_secs(60), waiting)
+            .await
+            .expect("the wait must end by itself, without a harness kill")
+            .unwrap()
+    }
+
+    fn assert_stop_wait_release(output: &Output, execution_id: &str) {
+        let parsed = envelope(output);
+        assert_eq!(
+            parsed["outcome"],
+            "change_requires_action",
+            "stderr={}",
+            stderr_of(output)
+        );
+        // 27 is an action outcome, not completion.
+        assert_eq!(output.status.code(), Some(27));
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["operation"], "wait");
+        assert_eq!(parsed["change_id"], "alpha");
+        assert_eq!(parsed["detail"]["observed_status"], "not queued");
+        assert_eq!(parsed["detail"]["execution_state"], "stopped");
+        assert_eq!(parsed["detail"]["execution_id"], execution_id);
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+    }
+
+    fn assert_stop_wait_read_only(api: &ApiSpy, spy: &SpyExecutor) {
+        assert_eq!(spy.call_count(), 0, "wait must submit no command");
+        assert!(api.exchanges().is_empty(), "wait must POST no command");
+        assert!(
+            api.requests()
+                .iter()
+                .all(|request| request.starts_with("GET ")),
+            "wait must only read the owner: {:?}",
+            api.requests()
+        );
+    }
+
+    /// The incident: an unbounded wait observing live work, released by a
+    /// process-level stop that leaves the row at `not queued`.
+    #[tokio::test]
+    async fn stop_wait_process_stop_releases_an_unbounded_wait_already_observing() {
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+        let head_before = repo.git(&["rev-parse", "HEAD"]);
+
+        let spy = SpyExecutor::new();
+        let api = ApiSpy::new();
+        let owner = Owner::start_intercepted(Some(spy.clone()), None, api.clone()).await;
+        owner.contract(merged_contract("main"));
+        let mut reducer = StopWaitReducer::new(&["alpha"]);
+        let episode = reducer.admit(&owner, "alpha");
+        reducer.apply_started(&owner, "alpha");
+
+        let waiting = spawn_wait(&owner, repo.path(), "alpha", None);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !waiting.is_finished(),
+            "an applying change must keep the wait observing"
+        );
+
+        reducer.event(&owner, conflux::events::ExecutionEvent::Stopping);
+        reducer.event(&owner, conflux::events::ExecutionEvent::Stopped);
+
+        let output = stop_wait_settles(waiting).await;
+        assert_stop_wait_release(&output, &episode);
+        assert_stop_wait_read_only(&api, &spy);
+        assert_eq!(
+            repo.git(&["rev-parse", "HEAD"]),
+            head_before,
+            "wait must not touch the repository"
+        );
+        owner.stop().await;
+    }
+
+    /// Every reducer stop/dequeue path, already settled when the wait starts:
+    /// both a bounded and the default unbounded wait answer on the first look.
+    #[tokio::test]
+    async fn stop_wait_already_settled_stop_releases_bounded_and_unbounded_waits() {
+        use conflux::events::ExecutionEvent;
+        use conflux::orchestration::state::ReducerCommand;
+
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        for path in ["process stop", "change stopped", "graceful dequeue"] {
+            for timeout in [Some("30s"), None] {
+                let spy = SpyExecutor::new();
+                let api = ApiSpy::new();
+                let owner = Owner::start_intercepted(Some(spy.clone()), None, api.clone()).await;
+                owner.contract(merged_contract("main"));
+                let mut reducer = StopWaitReducer::new(&["alpha"]);
+                let episode = reducer.admit(&owner, "alpha");
+                reducer.apply_started(&owner, "alpha");
+                match path {
+                    "process stop" => reducer.event(&owner, ExecutionEvent::Stopped),
+                    "change stopped" => reducer.event(
+                        &owner,
+                        ExecutionEvent::ChangeStopped {
+                            change_id: "alpha".to_string(),
+                        },
+                    ),
+                    _ => reducer.command(
+                        &owner,
+                        ReducerCommand::DequeueChange("alpha".to_string()),
+                        ExecutionEvent::ChangeDequeued {
+                            change_id: "alpha".to_string(),
+                        },
+                    ),
+                }
+
+                let output =
+                    stop_wait_settles(spawn_wait(&owner, repo.path(), "alpha", timeout)).await;
+                assert_stop_wait_release(&output, &episode);
+                assert_stop_wait_read_only(&api, &spy);
+                owner.stop().await;
+            }
+        }
+    }
+
+    /// Idle unadmitted work, another target's stop, and a resumed episode all
+    /// keep observing until the caller's own deadline.
+    #[tokio::test]
+    async fn stop_wait_idle_other_target_and_resumed_episode_keep_observing() {
+        use conflux::events::ExecutionEvent;
+
+        let repo = Fixture::new();
+        repo.stage_active("alpha");
+
+        let spy = SpyExecutor::new();
+        let api = ApiSpy::new();
+        let owner = Owner::start_intercepted(Some(spy.clone()), None, api.clone()).await;
+        owner.contract(merged_contract("main"));
+        let mut reducer = StopWaitReducer::new(&["alpha", "beta", "gamma"]);
+
+        // beta: admitted, then stopped. gamma: stopped, then explicitly resumed.
+        reducer.admit(&owner, "beta");
+        reducer.event(
+            &owner,
+            ExecutionEvent::ChangeStopped {
+                change_id: "beta".to_string(),
+            },
+        );
+        let first = reducer.admit(&owner, "gamma");
+        reducer.event(
+            &owner,
+            ExecutionEvent::ChangeStopped {
+                change_id: "gamma".to_string(),
+            },
+        );
+        let second = reducer.admit(&owner, "gamma");
+        assert_ne!(first, second, "re-admission replaces the episode");
+
+        let (idle, resumed) = tokio::join!(
+            wait_for(&owner, repo.path(), "alpha", "300ms"),
+            wait_for(&owner, repo.path(), "gamma", "300ms"),
+        );
+        for (output, change_id) in [(&idle, "alpha"), (&resumed, "gamma")] {
+            let parsed = envelope(output);
+            assert_eq!(
+                parsed["outcome"],
+                "timeout",
+                "'{change_id}' must keep observing, stderr={}",
+                stderr_of(output)
+            );
+            assert_eq!(output.status.code(), Some(19), "{change_id}");
+        }
+        // The diagnostics name only the target, at its live episode.
+        let resumed = envelope(&resumed);
+        let last = &resumed["detail"]["last_observation"];
+        assert_eq!(last["execution"]["execution_id"], second);
+        assert_eq!(last["execution"]["execution_state"], "queued");
+        assert!(!last.to_string().contains("beta"));
+
+        // beta's own wait does release, which is what makes alpha's hold real.
+        let output = wait_for(&owner, repo.path(), "beta", "30s").await;
+        assert_eq!(envelope(&output)["outcome"], "change_requires_action");
+        assert_eq!(output.status.code(), Some(27));
+        assert_stop_wait_read_only(&api, &spy);
+        owner.stop().await;
+    }
+
     /// The other half of the same rule: a row the owner can still advance keeps
     /// the wait observing, and the only thing that ends it is the deadline the
     /// caller asked for.

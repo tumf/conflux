@@ -20,7 +20,7 @@
 //! from the snapshot, and not a callback exiting zero.
 
 pub use crate::client::repo::{verify as certify, CertificationStage, Verdict};
-use crate::web::remote_control_api::dto::BlockerKind;
+use crate::web::remote_control_api::dto::{BlockerKind, ChangeExecutionState};
 
 /// Display statuses that claim the change reached a terminal success.
 ///
@@ -105,6 +105,38 @@ pub fn classify(display_status: Option<&str>, blocker: Option<BlockerKind>) -> D
         other if claims_terminal_success(other) => Disposition::Certify,
         _ => Disposition::KeepObserving,
     }
+}
+
+/// Whether a row the display alone would keep observing is a settled stop.
+///
+/// A process-level stop and a graceful dequeue both return the row to an idle,
+/// resumable `not queued` — on purpose, so the operator can mark it again — and
+/// that display is indistinguishable from work nobody has admitted yet. The
+/// execution projection is what tells them apart: a settled stop keeps the
+/// episode's `execution_id` and projects `stopped`, while an unadmitted row has
+/// no episode at all. Only that combination is an execution this owner will not
+/// advance by itself.
+///
+/// It is an exception to [`Disposition::KeepObserving`] and nothing else, so it
+/// can never override `rejected`, a success claim, disappearance, or a release
+/// the display already made. `Stopping` is still in flight; a `stopped` state
+/// without an `execution_id` — an owner that never admitted the change in this
+/// incarnation, or one that predates execution identity — proves no episode
+/// ended. A re-admitted change carries a new episode in an admitted state, so an
+/// earlier episode's stop cannot leak into it.
+///
+/// The caller supplies the execution fact from the *same* coherent observation
+/// and the *same* change; this predicate cannot check that, and a fact borrowed
+/// from another target or revision would be exactly the spurious release it
+/// exists to avoid.
+pub fn is_settled_stop(
+    disposition: Disposition,
+    execution_id: Option<&str>,
+    execution_state: ChangeExecutionState,
+) -> bool {
+    disposition == Disposition::KeepObserving
+        && execution_id.is_some_and(|id| !id.trim().is_empty())
+        && execution_state == ChangeExecutionState::Stopped
 }
 
 /// Whether a success-claiming status is a row the owner has already settled.
@@ -243,6 +275,56 @@ mod tests {
             Disposition::KeepObserving
         );
         assert_eq!(classify(Some(""), None), Disposition::KeepObserving);
+    }
+
+    /// Only a settled stop of an admitted episode turns observation into release.
+    #[test]
+    fn stop_wait_settled_stop_requires_an_episode_and_the_stopped_state() {
+        let observing = classify(Some("not queued"), None);
+        assert_eq!(observing, Disposition::KeepObserving);
+        assert!(is_settled_stop(
+            observing,
+            Some("x-1"),
+            ChangeExecutionState::Stopped
+        ));
+        // No episode: an unadmitted row, or an owner predating execution IDs.
+        assert!(!is_settled_stop(
+            observing,
+            None,
+            ChangeExecutionState::Stopped
+        ));
+        assert!(!is_settled_stop(
+            observing,
+            Some("  "),
+            ChangeExecutionState::Stopped
+        ));
+        for state in [
+            ChangeExecutionState::Unknown,
+            ChangeExecutionState::Queued,
+            ChangeExecutionState::Active,
+            ChangeExecutionState::Waiting,
+            ChangeExecutionState::Stopping,
+        ] {
+            assert!(
+                !is_settled_stop(observing, Some("x-1"), state),
+                "{state:?} is not a settled stop"
+            );
+        }
+    }
+
+    /// The exception never overrides a disposition the display already made.
+    #[test]
+    fn stop_wait_settled_stop_never_overrides_another_disposition() {
+        for disposition in [
+            Disposition::Rejected,
+            Disposition::Certify,
+            Disposition::RequiresAction,
+        ] {
+            assert!(
+                !is_settled_stop(disposition, Some("x-1"), ChangeExecutionState::Stopped),
+                "{disposition:?}"
+            );
+        }
     }
 
     /// The two success claims part company only when the repository says no.
