@@ -36,6 +36,15 @@
 //! observing, because giving up on live work is the opposite mistake and the
 //! more expensive one.
 //!
+//! A stopped execution is the one parked row the display cannot name. A process
+//! stop or a graceful dequeue returns the row to a resumable `not queued` — the
+//! same display as work nobody admitted yet — so the wait also reads the
+//! target's execution facts from the same coherent observation: an admitted
+//! episode (a non-null `execution_id`) whose state is `stopped` releases with
+//! the same `change_requires_action`, reporting the real display status beside
+//! the stopped execution fact. `stopping`, an unadmitted row, and an episode a
+//! later re-admission replaced keep observing.
+//!
 //! `blocked` is on both sides of that line, and only its structured blocker says
 //! which. A dependency wait clears when the owner archives what it is waiting
 //! on, so it is live work. A validated *external* prerequisite is a hold the
@@ -110,12 +119,15 @@ use tokio::time::Instant;
 
 use crate::bounded_git::GitDeadline;
 use crate::client::completion::{
-    certify, classify, is_settled_success_claim, CertificationStage, Disposition, Verdict,
+    certify, classify, is_settled_stop, is_settled_success_claim, CertificationStage, Disposition,
+    Verdict,
 };
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
 use crate::client::session::{observe, Connection, Observation};
 use crate::client::transport::Wake;
-use crate::web::remote_control_api::dto::{BlockerKind, ChangeBlocker, OwnerExecutionContract};
+use crate::web::remote_control_api::dto::{
+    BlockerKind, ChangeBlocker, ChangeExecutionStatus, OwnerExecutionContract,
+};
 
 /// Longest gap between authoritative rehydrations.
 ///
@@ -504,7 +516,24 @@ async fn evaluate(
     let blocker = change.and_then(|change| change.blocker.as_ref());
     let error_detail = change.and_then(|change| change.error_detail.clone());
 
-    match classify(status, blocker.map(|blocker| blocker.kind)) {
+    let disposition = classify(status, blocker.map(|blocker| blocker.kind));
+
+    // A stop or dequeue the owner already settled leaves the row at an idle,
+    // resumable `not queued` that the display alone cannot tell apart from work
+    // nobody admitted yet. The target's own execution facts in this same
+    // observation can, and only where the display would otherwise keep the
+    // caller waiting for an owner that will never move this episode again.
+    if let Some(stopped) = settled_stop(observation, change_id, disposition) {
+        return Step::settled(stopped_execution_envelope(
+            change_id,
+            instance_id,
+            status.unwrap_or_default(),
+            error_detail,
+            stopped,
+        ));
+    }
+
+    match disposition {
         Disposition::Rejected => {
             let detail = error_detail.unwrap_or_else(|| "the change was rejected".to_string());
             return Step::settled(
@@ -602,6 +631,75 @@ async fn evaluate(
             detail: None,
         },
     }
+}
+
+/// The target's settled-stop execution fact, when this observation carries one.
+///
+/// Read only from the observation being evaluated and only for the requested
+/// change: another target's stop, a previous observation's fact, or a row read
+/// from a different incarnation or revision must never release this waiter.
+/// The session already reconciles every resource at one `instance_id` and
+/// `state_revision`; the check is repeated here because this is the one place a
+/// mismatch would turn into a release rather than a reread.
+fn settled_stop<'a>(
+    observation: &'a Observation,
+    change_id: &str,
+    disposition: Disposition,
+) -> Option<&'a ChangeExecutionStatus> {
+    if observation.execution.instance_id != observation.instance_id
+        || observation.execution.state_revision != observation.state_revision
+    {
+        return None;
+    }
+    let execution = observation
+        .execution
+        .changes
+        .iter()
+        .find(|execution| execution.id == change_id)?;
+    is_settled_stop(
+        disposition,
+        execution.execution_id.as_deref(),
+        execution.execution_state,
+    )
+    .then_some(execution)
+}
+
+/// The release for an execution the owner stopped and will not resume itself.
+///
+/// The observed status is the real display — usually `not queued` — rather than
+/// a fabricated `stopped` row: the owner deliberately kept that row resumable,
+/// and the caller has to see what the owner published. The execution fact that
+/// justified the release travels beside it, so "stopped" is something a caller
+/// reads as data rather than infers from an exit status.
+fn stopped_execution_envelope(
+    change_id: &str,
+    instance_id: &str,
+    observed_status: &str,
+    error_detail: Option<String>,
+    execution: &ChangeExecutionStatus,
+) -> ResultEnvelope {
+    let mut envelope = requires_action_envelope(
+        change_id,
+        instance_id,
+        observed_status,
+        error_detail,
+        None,
+        format!(
+            "'{change_id}' is at status '{observed_status}' after its execution was stopped, and \
+             the owner will not resume it without a new operator action"
+        ),
+    );
+    if let Some(object) = envelope.detail.as_object_mut() {
+        object.insert(
+            "execution_state".to_string(),
+            serde_json::json!(execution.execution_state),
+        );
+        object.insert(
+            "execution_id".to_string(),
+            serde_json::json!(execution.execution_id),
+        );
+    }
+    envelope
 }
 
 fn completed_envelope(
@@ -1336,5 +1434,399 @@ mod tests {
             .await,
             None
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Settled stop: the display stays `not queued`, the execution says stopped
+    // ────────────────────────────────────────────────────────────────────────
+
+    use crate::events::{ExecutionEvent, OperatorCommandEffect};
+    use crate::orchestration::execution_facts::ExecutionFactsStore;
+    use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+
+    /// The real reducer and execution-facts store, observed the way the owner
+    /// publishes them, so every display status and execution fact a test
+    /// evaluates is derived rather than hand-built.
+    struct ReducerOwner {
+        state: OrchestratorState,
+        facts: ExecutionFactsStore,
+        dispatch: u64,
+        revision: u64,
+    }
+
+    impl ReducerOwner {
+        fn new(change_ids: &[&str]) -> Self {
+            Self {
+                state: OrchestratorState::new(
+                    change_ids.iter().map(|id| id.to_string()).collect(),
+                    0,
+                ),
+                facts: ExecutionFactsStore::new(),
+                dispatch: 0,
+                revision: 0,
+            }
+        }
+
+        fn event(&mut self, event: ExecutionEvent) {
+            self.state.apply_execution_event(&event);
+            self.dispatch += 1;
+            self.facts
+                .observe(self.dispatch, &event, Some(&self.state), chrono::Utc::now());
+        }
+
+        /// Admit one change through queue intent and return its episode.
+        fn admit(&mut self, change_id: &str) -> String {
+            self.state
+                .apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+            self.event(ExecutionEvent::OperatorCommandApplied {
+                effect: OperatorCommandEffect::QueueDelta {
+                    change_id: change_id.to_string(),
+                    queued: true,
+                },
+            });
+            self.facts
+                .change(change_id)
+                .execution_id
+                .expect("admission opens an execution episode")
+        }
+
+        fn apply_started(&mut self, change_id: &str) {
+            self.event(ExecutionEvent::ApplyStarted {
+                change_id: change_id.to_string(),
+                command: "apply".to_string(),
+            });
+        }
+
+        /// One coherent observation at a fresh revision.
+        fn observe(&mut self) -> Observation {
+            self.revision += 1;
+            let ids = self.state.tracked_change_ids();
+            let changes = ids
+                .iter()
+                .map(|id| change(id, self.state.display_status(id)))
+                .collect();
+            let executions = ids
+                .iter()
+                .map(|id| {
+                    let facts = self.facts.change(id);
+                    let mut status =
+                        execution(id, ExecutionPhase::from_shared(facts.current_phase));
+                    status.execution_id = facts.execution_id;
+                    status.execution_state =
+                        ChangeExecutionState::from_shared(facts.execution_state);
+                    status
+                })
+                .collect();
+            let mut observation = observation(changes, executions, self.revision);
+            observation.execution.state_revision = self.revision;
+            observation
+        }
+    }
+
+    /// Evaluate a non-first observation of the test owner.
+    ///
+    /// No path exercised with this helper reaches the repository oracle: every
+    /// observation it is handed is either kept observing or settled before
+    /// certification, which is what keeps these tests free of Git.
+    async fn evaluate_stop_wait(observation: &Observation, change_id: &str, first: bool) -> Step {
+        evaluate(
+            observation,
+            "i-test",
+            change_id,
+            std::path::Path::new("/nonexistent-stop-wait-repository"),
+            &contract(),
+            None,
+            first,
+        )
+        .await
+    }
+
+    fn settled(step: Step) -> ResultEnvelope {
+        match step {
+            Step::Settled(envelope) => *envelope,
+            Step::KeepObserving { detail } => {
+                panic!("expected a release, kept observing: {detail:?}")
+            }
+            Step::UncertifiedClaim { status, .. } => {
+                panic!("unexpected uncertified claim {status}")
+            }
+            Step::Expired { stage, .. } => panic!("unexpected expiry at {stage:?}"),
+        }
+    }
+
+    fn assert_keeps_observing(step: Step, why: &str) {
+        assert!(matches!(step, Step::KeepObserving { .. }), "{why}");
+    }
+
+    fn assert_stopped_release(envelope: &ResultEnvelope, execution_id: &str) {
+        assert_eq!(envelope.outcome, Outcome::ChangeRequiresAction);
+        assert_eq!(envelope.exit_code(), 27);
+        assert!(!envelope.ok);
+        assert_eq!(envelope.change_id.as_deref(), Some("alpha"));
+        // The real display, not a fabricated `stopped` row.
+        assert_eq!(envelope.detail["observed_status"], "not queued");
+        assert_eq!(envelope.detail["execution_state"], "stopped");
+        assert_eq!(envelope.detail["execution_id"], execution_id);
+        assert_eq!(envelope.detail["commands_submitted"], 0);
+    }
+
+    /// The incident: a process stop settles an observed admitted target.
+    #[tokio::test]
+    async fn stop_wait_process_stop_releases_a_wait_already_observing() {
+        let mut owner = ReducerOwner::new(&["alpha"]);
+        let episode = owner.admit("alpha");
+        assert_keeps_observing(
+            evaluate_stop_wait(&owner.observe(), "alpha", true).await,
+            "queued work keeps observing",
+        );
+        owner.apply_started("alpha");
+        assert_keeps_observing(
+            evaluate_stop_wait(&owner.observe(), "alpha", false).await,
+            "applying work keeps observing",
+        );
+        // A graceful stop in flight is not settled yet.
+        owner.event(ExecutionEvent::Stopping);
+        let stopping = owner.observe();
+        assert_eq!(
+            stopping.execution.changes[0].execution_state,
+            ChangeExecutionState::Stopping
+        );
+        assert_keeps_observing(
+            evaluate_stop_wait(&stopping, "alpha", false).await,
+            "stopping is still in flight",
+        );
+
+        owner.event(ExecutionEvent::Stopped);
+        let stopped = owner.observe();
+        assert_eq!(
+            stopped.state.snapshot.changes[0].display_status,
+            "not queued"
+        );
+        let envelope = settled(evaluate_stop_wait(&stopped, "alpha", false).await);
+        assert_stopped_release(&envelope, &episode);
+    }
+
+    /// Waiting on a change that was already stopped answers on the first look.
+    #[tokio::test]
+    async fn stop_wait_already_stopped_execution_releases_on_first_observation() {
+        let mut owner = ReducerOwner::new(&["alpha"]);
+        let episode = owner.admit("alpha");
+        owner.apply_started("alpha");
+        owner.event(ExecutionEvent::Stopped);
+        let envelope = settled(evaluate_stop_wait(&owner.observe(), "alpha", true).await);
+        assert_stopped_release(&envelope, &episode);
+    }
+
+    #[tokio::test]
+    async fn stop_wait_change_stopped_event_releases_the_target() {
+        let mut owner = ReducerOwner::new(&["alpha"]);
+        let episode = owner.admit("alpha");
+        owner.apply_started("alpha");
+        owner.event(ExecutionEvent::ChangeStopped {
+            change_id: "alpha".to_string(),
+        });
+        let envelope = settled(evaluate_stop_wait(&owner.observe(), "alpha", false).await);
+        assert_stopped_release(&envelope, &episode);
+    }
+
+    #[tokio::test]
+    async fn stop_wait_graceful_dequeue_releases_the_target() {
+        let mut owner = ReducerOwner::new(&["alpha"]);
+        let episode = owner.admit("alpha");
+        owner.apply_started("alpha");
+        owner
+            .state
+            .apply_command(ReducerCommand::DequeueChange("alpha".to_string()));
+        owner.event(ExecutionEvent::ChangeDequeued {
+            change_id: "alpha".to_string(),
+        });
+        let envelope = settled(evaluate_stop_wait(&owner.observe(), "alpha", false).await);
+        assert_stopped_release(&envelope, &episode);
+    }
+
+    /// Targeted force-stop already publishes a `stopped` display; that release
+    /// keeps its own shape and does not grow execution fields it never had.
+    #[tokio::test]
+    async fn stop_wait_targeted_force_stop_keeps_its_display_release() {
+        let mut owner = ReducerOwner::new(&["alpha"]);
+        owner.admit("alpha");
+        owner.apply_started("alpha");
+        owner
+            .state
+            .apply_command(ReducerCommand::StopChange("alpha".to_string()));
+        owner.event(ExecutionEvent::ChangeDequeued {
+            change_id: "alpha".to_string(),
+        });
+        let envelope = settled(evaluate_stop_wait(&owner.observe(), "alpha", false).await);
+        assert_eq!(envelope.outcome, Outcome::ChangeRequiresAction);
+        assert_eq!(envelope.exit_code(), 27);
+        assert_eq!(envelope.detail["observed_status"], "stopped");
+        assert_eq!(envelope.detail["commands_submitted"], 0);
+    }
+
+    /// Idle work nobody admitted is the "mark it, then wait" sequence.
+    #[tokio::test]
+    async fn stop_wait_idle_unadmitted_row_keeps_observing() {
+        let mut owner = ReducerOwner::new(&["alpha"]);
+        let observation = owner.observe();
+        let execution = &observation.execution.changes[0];
+        assert_eq!(execution.execution_state, ChangeExecutionState::Unknown);
+        assert_eq!(execution.execution_id, None);
+        assert_keeps_observing(
+            evaluate_stop_wait(&observation, "alpha", true).await,
+            "an unadmitted not queued row keeps observing",
+        );
+        // A global Stopped owner mode by itself says nothing about this target.
+        let mut stopped_mode = owner.observe();
+        stopped_mode.execution.process.app_mode = "stopped".to_string();
+        assert_keeps_observing(
+            evaluate_stop_wait(&stopped_mode, "alpha", false).await,
+            "owner mode alone is not target evidence",
+        );
+    }
+
+    /// `stopped` without an episode — an owner predating execution identity.
+    #[tokio::test]
+    async fn stop_wait_stopped_without_an_execution_id_keeps_observing() {
+        let mut stopped = execution("alpha", ExecutionPhase::None);
+        stopped.execution_id = None;
+        stopped.execution_state = ChangeExecutionState::Stopped;
+        let observation = observation(vec![change("alpha", "not queued")], vec![stopped], 1);
+        assert_keeps_observing(
+            evaluate_stop_wait(&observation, "alpha", false).await,
+            "a stop with no admitted episode proves nothing ended",
+        );
+    }
+
+    /// Another target's stop never releases this one.
+    #[tokio::test]
+    async fn stop_wait_another_targets_stop_does_not_release() {
+        let mut owner = ReducerOwner::new(&["alpha", "beta"]);
+        owner.admit("alpha");
+        owner.admit("beta");
+        owner.apply_started("alpha");
+        owner.event(ExecutionEvent::ChangeStopped {
+            change_id: "beta".to_string(),
+        });
+        let observation = owner.observe();
+        assert_keeps_observing(
+            evaluate_stop_wait(&observation, "alpha", false).await,
+            "beta's stop is not alpha's",
+        );
+        let envelope = settled(evaluate_stop_wait(&observation, "beta", false).await);
+        assert_eq!(envelope.detail["execution_state"], "stopped");
+    }
+
+    /// A fact from a different revision or incarnation cannot qualify.
+    #[tokio::test]
+    async fn stop_wait_mixed_revision_or_incarnation_fact_does_not_release() {
+        let mut owner = ReducerOwner::new(&["alpha"]);
+        owner.admit("alpha");
+        owner.event(ExecutionEvent::Stopped);
+
+        let mut stale = owner.observe();
+        stale.execution.state_revision -= 1;
+        assert_keeps_observing(
+            evaluate_stop_wait(&stale, "alpha", false).await,
+            "a stop read at another revision is not this observation's",
+        );
+
+        let mut foreign = owner.observe();
+        foreign.execution.instance_id = "i-other".to_string();
+        assert_keeps_observing(
+            evaluate_stop_wait(&foreign, "alpha", false).await,
+            "a stop read from another incarnation is not this owner's",
+        );
+
+        // The coherent read of the same facts does release.
+        let coherent = owner.observe();
+        assert_eq!(
+            settled(evaluate_stop_wait(&coherent, "alpha", false).await).outcome,
+            Outcome::ChangeRequiresAction
+        );
+    }
+
+    /// Explicit resume opens a new episode the old stop cannot release.
+    #[tokio::test]
+    async fn stop_wait_fresh_resumed_episode_does_not_inherit_an_old_stop() {
+        let mut owner = ReducerOwner::new(&["alpha"]);
+        let first = owner.admit("alpha");
+        owner.apply_started("alpha");
+        owner.event(ExecutionEvent::Stopped);
+        assert_stopped_release(
+            &settled(evaluate_stop_wait(&owner.observe(), "alpha", false).await),
+            &first,
+        );
+
+        let second = owner.admit("alpha");
+        assert_ne!(first, second, "re-admission replaces the episode");
+        let resumed = owner.observe();
+        assert_eq!(
+            resumed.execution.changes[0].execution_state,
+            ChangeExecutionState::Queued
+        );
+        assert_keeps_observing(
+            evaluate_stop_wait(&resumed, "alpha", false).await,
+            "the resumed episode is live work",
+        );
+        owner.apply_started("alpha");
+        assert_keeps_observing(
+            evaluate_stop_wait(&owner.observe(), "alpha", false).await,
+            "the resumed episode is applying",
+        );
+    }
+
+    /// Existing releases keep their own outcomes even beside a stopped fact.
+    #[tokio::test]
+    async fn stop_wait_existing_rejected_blocked_and_failure_paths_are_unchanged() {
+        let mut stopped = execution("alpha", ExecutionPhase::None);
+        stopped.execution_state = ChangeExecutionState::Stopped;
+
+        let rejected = observation(vec![change("alpha", "rejected")], vec![stopped.clone()], 1);
+        let envelope = settled(evaluate_stop_wait(&rejected, "alpha", false).await);
+        assert_eq!(envelope.outcome, Outcome::ChangeRejected);
+
+        let mut blocked = change("alpha", "blocked");
+        blocked.blocker = Some(external_blocker());
+        let external = observation(vec![blocked], vec![stopped.clone()], 1);
+        let envelope = settled(evaluate_stop_wait(&external, "alpha", false).await);
+        assert_eq!(envelope.outcome, Outcome::ChangeRequiresAction);
+        assert_eq!(envelope.detail["observed_status"], "blocked");
+        assert_eq!(envelope.detail["blocker"]["kind"], "external");
+        assert!(envelope.detail.get("execution_state").is_none());
+
+        // A fatal process failure is answered before any classification.
+        let mut failed = observation(vec![change("alpha", "not queued")], vec![stopped], 1);
+        failed.state.snapshot.process_error = Some("owner crashed".to_string());
+        let envelope = settled(evaluate_stop_wait(&failed, "alpha", false).await);
+        assert_eq!(envelope.outcome, Outcome::ProcessFailed);
+    }
+
+    /// Absence, owner replacement, and success claims are never a settled stop.
+    ///
+    /// Those paths consult the repository oracle, so they are asserted here at
+    /// the decision boundary rather than by spawning Git: the stop exception
+    /// declines every observation it does not own.
+    #[test]
+    fn stop_wait_exception_declines_absence_replacement_and_success_claims() {
+        let mut stopped = execution("alpha", ExecutionPhase::None);
+        stopped.execution_state = ChangeExecutionState::Stopped;
+
+        // Absent row, stopped fact left over: disappearance stays Certify.
+        let absent = observation(Vec::new(), vec![stopped.clone()], 1);
+        let disposition = classify(
+            absent.change("alpha").map(|c| c.display_status.as_str()),
+            None,
+        );
+        assert_eq!(disposition, Disposition::Certify);
+        assert!(settled_stop(&absent, "alpha", disposition).is_none());
+
+        let merged = observation(vec![change("alpha", "merged")], vec![stopped.clone()], 1);
+        assert!(settled_stop(&merged, "alpha", classify(Some("merged"), None)).is_none());
+
+        // A different incarnation never qualifies.
+        let mut replaced = observation(vec![change("alpha", "not queued")], vec![stopped], 1);
+        replaced.execution.instance_id = "i-replacement".to_string();
+        assert!(settled_stop(&replaced, "alpha", Disposition::KeepObserving).is_none());
     }
 }

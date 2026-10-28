@@ -2534,7 +2534,7 @@ Client commands MUST support concise human output and a machine-readable JSON mo
 
 On positive deadline expiry, the typed timeout detail MUST report `timeout_ms`, measured `wait_elapsed_ms`, a stable `timeout_stage`, and `commands_submitted: 0`. `timeout_stage` MUST distinguish `initial_observation`, `observing_owner`, `repository_certification`, and `remote_verification`. If a coherent observation of the target completed before expiry, detail MUST carry that latest completed target-only `last_observation`, including observation identity/cursor facts, the target change's existing sanitized progress projection, and its matching execution projection. The client MUST NOT include unrelated changes, unrestricted logs, or a mixed-revision projection. If no coherent observation completed, `last_observation` MUST be `null` and the client MUST NOT invent an owner identity. Wait MUST NOT start another read after deadline expiry merely to enrich diagnostics.
 
-Wait MUST submit no mutation command. Change disappearance alone MUST NOT count as success. The display statuses `not queued`, `queued`, `applying`, `accepting`, `rejecting`, `archiving`, and `resolving` MUST continue observing. A `blocked` row without a structured external blocker, including a dependency wait, MUST continue observing. A `blocked` row whose structured blocker kind is `external` MUST release immediately with outcome `change_requires_action`. The statuses `error`, `merge wait`, `stopped`, and `stalled` MUST also release immediately with outcome `change_requires_action`; `rejected` MUST retain `change_rejected`. This classification MUST run on the initial observation and every later coherent observation.
+Wait MUST submit no mutation command. Change disappearance alone MUST NOT count as success. The display statuses `not queued`, `queued`, `applying`, `accepting`, `rejecting`, `archiving`, and `resolving` MUST continue observing, with one target-scoped exception: when the display classification alone would keep observing and the target's matching execution projection in the same coherent observation — the same `instance_id`, the same `state_revision`, and the execution row whose `id` equals the requested change — carries a non-null `execution_id` together with `execution_state` `stopped`, the owner has settled a stop or dequeue removal of an admitted execution episode that it will not advance by itself, and wait MUST release immediately with outcome `change_requires_action` and exit status `27`. That release MUST report the actual observed `display_status` (for example `not queued`) as `detail.observed_status`, MUST carry the typed execution fact as `detail.execution_state` and `detail.execution_id`, MUST keep `detail.commands_submitted: 0`, and MUST NOT fabricate a `stopped` display row, claim completion, restart the execution, or submit any command. The exception MUST NOT fire when the matching execution projection is absent, carries a `null` `execution_id`, or reports `unknown`, `queued`, `active`, `waiting`, or `stopping`; a global owner Stopped mode by itself, another change's stopped execution, and an execution fact read at a different revision or from a different owner incarnation MUST NOT release the waiter. Re-admission replaces the `execution_id` and projects an admitted execution state in the same coherent observation, so an earlier episode's stop MUST NOT release a wait that observes the re-admitted episode. This exception runs on the initial observation and every later coherent observation, after owner replacement, fatal process failure, and first-observation absence handling, and it never overrides `rejected`, a success-claiming row, or the display-based releases below. A `blocked` row without a structured external blocker, including a dependency wait, MUST continue observing. A `blocked` row whose structured blocker kind is `external` MUST release immediately with outcome `change_requires_action`. The statuses `error`, `merge wait`, `stopped`, and `stalled` MUST also release immediately with outcome `change_requires_action`; `rejected` MUST retain `change_rejected`. This classification MUST run on the initial observation and every later coherent observation.
 
 For terminal mode `merged`, success requires the existing repository completion oracle to return `Completed` for the captured base branch. For `base_published`, the selected remote base ref must additionally equal the locally verified base tip. For `branch_pushed`, archived proposal evidence must exist on the named local change branch and the selected remote branch ref must equal that local branch tip; this proves publication, not base integration. On an observed `merged` row whose first certification returns `NotCompleted`, wait MUST perform one bounded coherent re-observation and re-certification to avoid reporting in-flight publication as failure. If that second certification remains `NotCompleted`, wait MUST release with `change_requires_action` rather than hold indefinitely. `Contradictory`, `EvidenceError`, unsupported mode, and missing or ambiguous repository evidence MUST remain their existing typed non-success outcomes.
 
@@ -2657,6 +2657,41 @@ For terminal mode `merged`, success requires the existing repository completion 
 **When**: an agent runs `cflx client wait alpha --json`
 **Then**: it exits with `change_requires_action`, observed status `stopped`, and exit status `27`
 **And**: it submits no command
+
+#### Scenario: Process stop releases a wait already observing an admitted target
+
+**Given**: `wait alpha` is observing a target with an admitted execution episode and a non-null `execution_id`
+**When**: the owner settles a process-level `Stopped` event and the same coherent observation reports `alpha` at display `not queued` with execution state `stopped`
+**Then**: `wait alpha` returns `change_requires_action` with exit status `27`
+**And**: detail reports `observed_status: not queued`, `execution_state: stopped`, the settled `execution_id`, and zero submitted commands
+**And**: a wait without a positive timeout also returns without operator intervention or a harness kill
+
+#### Scenario: Already stopped execution releases on first observation
+
+**Given**: `alpha` had an admitted execution episode which then settled as stopped
+**When**: `cflx client wait alpha --json` first coherently observes display `not queued` with target execution state `stopped`
+**Then**: it returns `change_requires_action` with exit status `27` without waiting for a deadline or another state transition
+**And**: it submits no command
+
+#### Scenario: Dequeue and change-scoped stop release the same target only
+
+**Given**: `wait alpha` observes an admitted execution episode
+**When**: graceful stop-and-dequeue, a `ChangeStopped` event, or dequeue removal settles and the coherent observation reads `alpha` at `not queued` with execution state `stopped`
+**Then**: the wait releases with `change_requires_action` and exit status `27`
+**And**: the same stop settling for `beta` alone does not release `wait alpha`
+
+#### Scenario: Unadmitted or still-stopping work is not terminal
+
+**Given**: the target reads `not queued` with execution state `unknown` or a `null` `execution_id`, or its execution state is `stopping`
+**When**: wait evaluates that coherent observation
+**Then**: it continues observing
+**And**: owner mode Stopped by itself does not imply this target stopped
+
+#### Scenario: Fresh resumed execution does not inherit an old stop
+
+**Given**: a prior execution of `alpha` stopped and `alpha` was explicitly re-admitted with a replacement `execution_id`
+**When**: `wait alpha` coherently observes the new admitted episode
+**Then**: it continues observing rather than releasing on the old episode's stopped fact
 
 #### Scenario: Existing merged status is classified after one bounded retry
 
