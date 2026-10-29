@@ -2088,3 +2088,217 @@ async fn verification_declaration_integrity_valid_and_empty_candidates_still_run
         assert!(!manifest.is_declaration_invalid());
     }
 }
+
+// ============================================================================
+// verification_frontmatter_line_endings: Apply rewrote the candidate's
+// proposal with CRLF after an LF admission
+// ============================================================================
+
+fn crlf(content: &str) -> String {
+    content.replace('\n', "\r\n")
+}
+
+/// A counting gate outside the target that exits with `code` after recording
+/// the run.
+fn counting_gate_exiting(external: &Path, code: i32) -> (String, PathBuf) {
+    let counter = external.join("gate-runs.txt");
+    let script = external.join("gate.sh");
+    std::fs::write(
+        &script,
+        format!("echo run >> '{}'\nexit {code}\n", counter.display()),
+    )
+    .or_fail("unexpected error");
+    (format!("sh {}", script.display()), counter)
+}
+
+/// Every file under `root`, by path, with its bytes.
+fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut snapshot = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                snapshot.insert(
+                    path.clone(),
+                    std::fs::read(&path).or_fail("unexpected error"),
+                );
+            }
+        }
+    }
+    snapshot
+}
+
+/// The committed candidate proposal really is CRLF, and its blob is not the
+/// LF admission blob: equivalent decoding never merges content identities.
+async fn assert_crlf_candidate_identity(fixture: &Fixture) {
+    let path = format!("openspec/changes/{}/proposal.md", fixture.change());
+    let committed = Command::new("git")
+        .args(["show", &format!("HEAD:{path}")])
+        .current_dir(fixture.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    assert!(
+        committed.stdout.windows(2).any(|pair| pair == b"\r\n"),
+        "the candidate blob keeps its CRLF bytes"
+    );
+    let base_blob = git_out(fixture.path(), &["rev-parse", &format!("HEAD~1:{path}")]).await;
+    assert_ne!(candidate_proposal_blob(fixture).await, base_blob);
+}
+
+#[tokio::test]
+async fn verification_frontmatter_line_endings_crlf_candidate_gate_executes_natively() {
+    for (suffix, exit_code) in [("pass", 0), ("fail", 1)] {
+        let change = format!("verification-frontmatter-line-endings-{suffix}");
+        let gate_root = TempDir::new().or_fail("unexpected error");
+        let (command, counter) = counting_gate_exiting(gate_root.path(), exit_code);
+        let candidate = crlf(&proposal_with_declarations(&[declaration_yaml(
+            &change,
+            "crlf-gate",
+            &command,
+        )]));
+        // Admission saw a valid LF proposal; only the candidate is CRLF.
+        let fixture = apply_mutated_fixture(&change, &command, &candidate).await;
+        assert_crlf_candidate_identity(&fixture).await;
+        let config = config_with_reviewer(canonical_reviewer());
+
+        let (result, _) = fixture.accept(&config, &runner(3600)).await;
+
+        assert_eq!(gate_runs(&counter), 1, "{suffix}: the CRLF gate runs once");
+        let manifest = fixture.manifests().await.load().expect("manifest");
+        assert!(!manifest.is_declaration_invalid(), "{suffix}");
+        assert_eq!(manifest.gates.len(), 1, "{suffix}: exactly one gate");
+        assert_eq!(manifest.gates[0].verification_id, "crlf-gate");
+        if exit_code == 0 {
+            assert!(matches!(result, AcceptanceResult::Pass), "{result:?}");
+            assert!(
+                fixture.reviewer_started(),
+                "the reviewer runs after the gate"
+            );
+        } else {
+            match result {
+                AcceptanceResult::Fail { findings } => assert!(
+                    findings
+                        .iter()
+                        .any(|finding| finding.text().contains("crlf-gate")),
+                    "the failing gate decides the verdict: {findings:?}"
+                ),
+                other => panic!("a failing CRLF gate must FAIL natively, got {other:?}"),
+            }
+            assert!(
+                !fixture.reviewer_started(),
+                "no reviewer after a failed gate"
+            );
+        }
+        // The reviewer marker is the only thing allowed into the target.
+        fixture.clear_reviewer_marker();
+        assert!(fixture.porcelain_status().await.is_empty(), "{suffix}");
+    }
+}
+
+#[tokio::test]
+async fn verification_frontmatter_line_endings_crlf_defective_candidate_fails_closed() {
+    for (suffix, lf_candidate, field) in [
+        (
+            "wrong-typed",
+            "---\nverifications:\n  - id: valid-gate\n    rerun: [cargo, test]\n    completion_role: change-blocking\n---\n# Change\n",
+            "rerun",
+        ),
+        (
+            "unclosed",
+            "---\nverifications:\n  - id: valid-gate\n    completion_role: change-blocking\n# Change without a closing delimiter\n",
+            "frontmatter",
+        ),
+    ] {
+        let change = format!("verification-frontmatter-line-endings-{suffix}");
+        let gate_root = TempDir::new().or_fail("unexpected error");
+        let (command, counter) = counting_gate(gate_root.path());
+        // A valid LF attempt first, so there is real evidence that could be reused.
+        let fixture = Fixture::new(
+            &change,
+            &proposal_with_declarations(&[declaration_yaml(&change, "valid-gate", &command)]),
+        )
+        .await;
+        let config = config_with_reviewer(canonical_reviewer());
+        let (result, _) = fixture.accept(&config, &runner(3600)).await;
+        assert!(matches!(result, AcceptanceResult::Pass), "{suffix}: {result:?}");
+        assert_eq!(gate_runs(&counter), 1);
+        let gates = fixture.store_root().await.join("gates");
+        let evidence_before = tree_snapshot(&gates);
+        assert!(!evidence_before.is_empty(), "{suffix}: evidence exists");
+        fixture.clear_reviewer_marker();
+
+        std::fs::write(
+            fixture
+                .path()
+                .join("openspec/changes")
+                .join(&change)
+                .join("proposal.md"),
+            crlf(lf_candidate),
+        )
+        .or_fail("unexpected error");
+        commit_all(fixture.path(), &format!("Apply: CRLF {change}")).await;
+        assert_crlf_candidate_identity(&fixture).await;
+
+        let (result, _) = fixture.accept(&config, &runner(3600)).await;
+
+        let findings = match result {
+            AcceptanceResult::Fail { findings } => findings,
+            other => panic!("{suffix}: defective CRLF metadata must FAIL, got {other:?}"),
+        };
+        assert_eq!(findings.len(), 1, "{suffix}: {findings:?}");
+        assert!(
+            findings[0].text().contains("declaration_metadata_invalid"),
+            "{}",
+            findings[0]
+        );
+        assert!(!fixture.reviewer_started(), "{suffix}: no reviewer");
+        assert_eq!(gate_runs(&counter), 1, "{suffix}: no further gate run");
+        assert_eq!(
+            tree_snapshot(&gates),
+            evidence_before,
+            "{suffix}: evidence is neither reused nor written"
+        );
+        let manifest = fixture.manifests().await.load().expect("manifest");
+        assert!(manifest.gates.is_empty());
+        assert_eq!(manifest.declaration_defects.len(), 1);
+        assert_eq!(
+            manifest.declaration_defects[0].code,
+            "declaration_metadata_invalid"
+        );
+        assert_eq!(manifest.declaration_defects[0].field, field);
+        assert!(fixture.porcelain_status().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn verification_frontmatter_line_endings_crlf_empty_candidates_still_run() {
+    for (suffix, candidate) in [
+        ("legacy", "# Legacy proposal without frontmatter\r\n"),
+        ("empty-block", "---\r\n---\r\n# Change\r\n"),
+        ("null", "---\r\nverifications:\r\n---\r\n# Change\r\n"),
+        (
+            "empty-list",
+            "---\r\nverifications: []\r\n---\r\n# Change\r\n",
+        ),
+    ] {
+        let change = format!("verification-frontmatter-line-endings-empty-{suffix}");
+        let fixture = Fixture::new(&change, candidate).await;
+        let config = config_with_reviewer(canonical_reviewer());
+        let (result, _) = fixture.accept(&config, &runner(3600)).await;
+        assert!(
+            matches!(result, AcceptanceResult::Pass),
+            "{suffix}: {result:?}"
+        );
+        assert!(fixture.reviewer_started(), "{suffix}: reviewer runs");
+        let manifest = fixture.manifests().await.load().expect("manifest");
+        assert!(!manifest.has_gates(), "{suffix}");
+        assert!(!manifest.is_declaration_invalid(), "{suffix}");
+    }
+}

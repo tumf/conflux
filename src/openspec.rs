@@ -144,26 +144,61 @@ const VERIFICATION_STRING_FIELDS: [&str; 10] = [
     "completion_role",
 ];
 
-/// Locate the frontmatter block for the verification reader.
+/// Where a proposal's frontmatter block is, as one delimiter decision shared by
+/// every reader.
 ///
-/// `Ok(None)` is a proposal without frontmatter; `Err(())` is an opened block
-/// with no closing delimiter. Unlike the display splitter, an empty block and a
-/// closing delimiter at end of file are recognized rather than read as prose.
-fn verification_frontmatter(content: &str) -> std::result::Result<Option<&str>, ()> {
-    if !content.starts_with("---\n") {
-        return Ok(None);
+/// `yaml` and `body` borrow the original content: no byte is rewritten, so
+/// content identity stays over the actual file while LF and CRLF decode alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontmatterScan<'a> {
+    /// The file does not open with a delimiter line.
+    Absent,
+    /// A closed block. `yaml` ends at the closing line's start offset, so it
+    /// keeps the complete terminator of the preceding line; `body` starts after
+    /// the closing line's terminator, or at end of file.
+    Present { yaml: &'a str, body: &'a str },
+    /// An opened block with no closing delimiter line.
+    Unclosed,
+}
+
+/// Scan for the frontmatter delimiters.
+///
+/// A line terminator is LF with an optional immediately preceding CR, and may
+/// differ per line. The opening line is exactly `---` at offset zero with a
+/// terminator; the closing line is exactly `---` with a terminator or at end of
+/// file. No BOM stripping, whitespace trimming, or lone-CR terminator.
+fn scan_proposal_frontmatter(content: &str) -> FrontmatterScan<'_> {
+    let yaml_start = if content.starts_with("---\n") {
+        4
+    } else if content.starts_with("---\r\n") {
+        5
+    } else {
+        return FrontmatterScan::Absent;
+    };
+    let mut line_start = yaml_start;
+    loop {
+        let rest = &content[line_start..];
+        let (line, next_line_start) = match rest.find('\n') {
+            Some(lf) => {
+                let line = &rest[..lf];
+                (
+                    line.strip_suffix('\r').unwrap_or(line),
+                    Some(line_start + lf + 1),
+                )
+            }
+            None => (rest, None),
+        };
+        if line == "---" {
+            return FrontmatterScan::Present {
+                yaml: &content[yaml_start..line_start],
+                body: next_line_start.map_or("", |start| &content[start..]),
+            };
+        }
+        match next_line_start {
+            Some(start) => line_start = start,
+            None => return FrontmatterScan::Unclosed,
+        }
     }
-    let remainder = &content[4..];
-    if remainder.starts_with("---\n") || remainder == "---" {
-        return Ok(Some(""));
-    }
-    if let Some(end) = remainder.find("\n---\n") {
-        return Ok(Some(&remainder[..end]));
-    }
-    if let Some(stripped) = remainder.strip_suffix("\n---") {
-        return Ok(Some(stripped));
-    }
-    Err(())
 }
 
 /// Read the verification declarations of one proposal's already-read content.
@@ -183,10 +218,10 @@ pub fn parse_verification_source(content: &str, _path: &Path) -> VerificationSou
         }],
     };
 
-    let frontmatter = match verification_frontmatter(content) {
-        Ok(Some(frontmatter)) => frontmatter,
-        Ok(None) => return VerificationSource::default(),
-        Err(()) => {
+    let frontmatter = match scan_proposal_frontmatter(content) {
+        FrontmatterScan::Present { yaml, .. } => yaml,
+        FrontmatterScan::Absent => return VerificationSource::default(),
+        FrontmatterScan::Unclosed => {
             return proposal_defect(
                 "frontmatter",
                 "opened frontmatter block has no closing delimiter".to_string(),
@@ -650,13 +685,20 @@ pub fn parse_proposal_metadata_from_file(path: &Path) -> ProposalMetadata {
 /// declarations as an empty dependency list.
 pub fn parse_proposal_dependencies_strict_from_file(path: &Path) -> Result<Vec<String>> {
     let content = fs::read_to_string(path)?;
-    let (frontmatter, body) = split_frontmatter(&content);
-    if content.starts_with("---\n") && frontmatter.is_none() {
-        return Err(OrchestratorError::Parse(format!(
-            "Failed to find closing frontmatter delimiter in {}",
-            path.display()
-        )));
-    }
+    parse_proposal_dependencies_strict(&content, path)
+}
+
+fn parse_proposal_dependencies_strict(content: &str, path: &Path) -> Result<Vec<String>> {
+    let (frontmatter, body) = match scan_proposal_frontmatter(content) {
+        FrontmatterScan::Present { yaml, body } => (Some(yaml), body),
+        FrontmatterScan::Absent => (None, content),
+        FrontmatterScan::Unclosed => {
+            return Err(OrchestratorError::Parse(format!(
+                "Failed to find closing frontmatter delimiter in {}",
+                path.display()
+            )))
+        }
+    };
 
     let mut dependencies = match frontmatter {
         Some(frontmatter) => {
@@ -692,19 +734,13 @@ fn parse_proposal_metadata(content: &str, path: &Path) -> ProposalMetadata {
     metadata
 }
 
+/// Display split: an absent or unclosed block falls back to reading the whole
+/// file as body. That fallback is display tolerance, never gate authority.
 fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
-    if !content.starts_with("---\n") {
-        return (None, content);
+    match scan_proposal_frontmatter(content) {
+        FrontmatterScan::Present { yaml, body } => (Some(yaml), body),
+        FrontmatterScan::Absent | FrontmatterScan::Unclosed => (None, content),
     }
-
-    let remainder = &content[4..];
-    if let Some(end) = remainder.find("\n---\n") {
-        let frontmatter = &remainder[..end];
-        let body = &remainder[end + 5..];
-        return (Some(frontmatter), body);
-    }
-
-    (None, content)
 }
 
 fn parse_frontmatter_metadata(
@@ -716,10 +752,15 @@ fn parse_frontmatter_metadata(
 }
 
 pub fn parse_proposal_frontmatter_strict(content: &str, path: &Path) -> ProposalFrontmatterParse {
-    split_frontmatter(content)
-        .0
-        .map(|frontmatter| parse_frontmatter_metadata_strict(frontmatter, path))
-        .unwrap_or_default()
+    match scan_proposal_frontmatter(content) {
+        FrontmatterScan::Present { yaml, .. } => parse_frontmatter_metadata_strict(yaml, path),
+        FrontmatterScan::Absent => ProposalFrontmatterParse::default(),
+        // Structural only: no decoder text and no content is echoed.
+        FrontmatterScan::Unclosed => ProposalFrontmatterParse {
+            metadata: None,
+            diagnostics: vec!["Failed to find closing proposal frontmatter delimiter".to_string()],
+        },
+    }
 }
 
 pub fn parse_frontmatter_metadata_strict(
@@ -737,6 +778,10 @@ pub fn parse_frontmatter_metadata_strict(
             };
         }
     };
+    // An empty block or an explicit null root declares nothing.
+    if value.is_null() {
+        return ProposalFrontmatterParse::default();
+    }
 
     let mut warnings = Vec::new();
     let mut diagnostics = Vec::new();
@@ -2154,6 +2199,226 @@ references: []
         assert_eq!(
             DeclarationKey::Id("<position 3>".into()).label(),
             "<position 3>"
+        );
+    }
+    // ====================
+    // verification_frontmatter_line_endings: one delimiter scanner for LF/CRLF
+    // ====================
+
+    const LINE_ENDINGS_PROPOSAL: &str = "---\nchange_type: implementation\npriority: high\ndependencies:\n  - dep-a\nreferences:\n  - src/openspec.rs\nverifications:\n  - id: gate\n    requirement: r\n    phase: pre-integration\n    rerun: cargo test\n    prerequisites: []\n    execution_class: repository-local\n    completion_role: change-blocking\n  - id: second\n    rerun: cargo build\n---\n# Change\n\n## Dependencies\n\n- body-dep\n";
+
+    fn crlf(content: &str) -> String {
+        content.replace('\n', "\r\n")
+    }
+
+    /// Every other line CRLF, the rest LF.
+    fn mixed(content: &str) -> String {
+        content
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(index, line)| {
+                if index % 2 == 0 {
+                    line.replace('\n', "\r\n")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect()
+    }
+
+    fn line_ending_variants(content: &str) -> [(&'static str, String); 3] {
+        [
+            ("lf", content.to_string()),
+            ("crlf", crlf(content)),
+            ("mixed", mixed(content)),
+        ]
+    }
+
+    fn strict_dependencies(content: &str) -> Result<Vec<String>> {
+        parse_proposal_dependencies_strict(content, Path::new("openspec/changes/c/proposal.md"))
+    }
+
+    #[test]
+    fn verification_frontmatter_line_endings_variants_share_metadata_and_declarations() {
+        let path = Path::new("openspec/changes/c/proposal.md");
+        let lf_source = source(LINE_ENDINGS_PROPOSAL);
+        assert_eq!(lf_source.declarations.len(), 2, "{lf_source:?}");
+        assert!(lf_source.is_valid());
+        let lf_strict = parse_proposal_frontmatter_strict(LINE_ENDINGS_PROPOSAL, path);
+        assert!(lf_strict.diagnostics.is_empty(), "{lf_strict:?}");
+        let lf_display = parse_proposal_metadata(LINE_ENDINGS_PROPOSAL, path);
+        assert_eq!(lf_display.dependencies, vec!["dep-a".to_string()]);
+        assert_eq!(lf_display.verifications.len(), 2);
+
+        for (label, content) in line_ending_variants(LINE_ENDINGS_PROPOSAL) {
+            assert_eq!(source(&content), lf_source, "{label}");
+            let strict = parse_proposal_frontmatter_strict(&content, path);
+            assert_eq!(strict, lf_strict, "{label}");
+            assert_eq!(
+                parse_proposal_metadata(&content, path),
+                lf_display,
+                "{label}"
+            );
+            assert_eq!(
+                strict_dependencies(&content).unwrap(),
+                vec!["dep-a".to_string()],
+                "{label}"
+            );
+        }
+        // Equivalent decoding does not mean equivalent bytes.
+        assert_ne!(LINE_ENDINGS_PROPOSAL, crlf(LINE_ENDINGS_PROPOSAL));
+    }
+
+    #[test]
+    fn verification_frontmatter_line_endings_slices_borrow_the_original_bytes() {
+        let content = "---\r\nkey: a\nother: \"x\r\ny\"\r\n---\r\n# Body\r\nline\n";
+        let FrontmatterScan::Present { yaml, body } = scan_proposal_frontmatter(content) else {
+            panic!("a CRLF block is present");
+        };
+        assert_eq!(yaml, "key: a\nother: \"x\r\ny\"\r\n");
+        assert_eq!(body, "# Body\r\nline\n");
+        // The slices are views into the input, ending at the closing line start.
+        let base = content.as_ptr() as usize;
+        assert_eq!(yaml.as_ptr() as usize - base, 5);
+        assert_eq!(
+            yaml.as_ptr() as usize - base + yaml.len(),
+            content.find("---\r\n# Body").unwrap()
+        );
+        assert_eq!(body.as_ptr() as usize - base, content.len() - body.len());
+
+        let lf = "---\nkey: a\n---\nbody";
+        assert_eq!(
+            scan_proposal_frontmatter(lf),
+            FrontmatterScan::Present {
+                yaml: "key: a\n",
+                body: "body"
+            }
+        );
+    }
+
+    #[test]
+    fn verification_frontmatter_line_endings_empty_and_eof_blocks_are_present() {
+        for (content, yaml, body) in [
+            ("---\n---\n# Change\n", "", "# Change\n"),
+            ("---\r\n---\r\n# Change\r\n", "", "# Change\r\n"),
+            ("---\r\n---\n# Change\n", "", "# Change\n"),
+            ("---\n---", "", ""),
+            ("---\r\n---", "", ""),
+            ("---\r\nkey: a\r\n---", "key: a\r\n", ""),
+            ("---\nkey: a\r\n---", "key: a\r\n", ""),
+        ] {
+            assert_eq!(
+                scan_proposal_frontmatter(content),
+                FrontmatterScan::Present { yaml, body },
+                "{content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_frontmatter_line_endings_unclosed_and_unsupported_delimiters() {
+        for unclosed in [
+            "---\r\nverifications:\r\n  - id: gate\r\n# Change\r\n",
+            "---\r\n",
+            "---\n",
+            // An isolated CR is not a terminator, so these never close.
+            "---\r\nkey: a\r\n---\r",
+            "---\r\nkey: a\r\n---\r\r\nbody\r\n",
+            "---\r\nkey: a\r\n --- \r\nbody\r\n",
+        ] {
+            assert_eq!(
+                scan_proposal_frontmatter(unclosed),
+                FrontmatterScan::Unclosed,
+                "{unclosed:?}"
+            );
+        }
+        for absent in [
+            "# No frontmatter\r\n",
+            "---",
+            "---\rkey: a\r---\r",
+            "\u{feff}---\r\nkey: a\r\n---\r\n",
+            " ---\r\nkey: a\r\n---\r\n",
+            "--- \r\nkey: a\r\n---\r\n",
+        ] {
+            assert_eq!(
+                scan_proposal_frontmatter(absent),
+                FrontmatterScan::Absent,
+                "{absent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_frontmatter_line_endings_crlf_unclosed_is_invalid_never_absent() {
+        let path = Path::new("openspec/changes/c/proposal.md");
+        let content = crlf("---\nverifications:\n  - id: gate\n    rerun: cargo test\n# Change\n");
+        let defect = only_defect(&content);
+        assert_eq!(defect.key, DeclarationKey::Proposal);
+        assert_eq!(defect.field, "frontmatter");
+        assert_eq!(
+            defect.detail,
+            "opened frontmatter block has no closing delimiter"
+        );
+        let strict = parse_proposal_frontmatter_strict(&content, path);
+        assert!(strict.metadata.is_none());
+        assert_eq!(
+            strict.diagnostics,
+            vec!["Failed to find closing proposal frontmatter delimiter".to_string()]
+        );
+        let error = strict_dependencies(&content).unwrap_err().to_string();
+        assert!(
+            error.contains("Failed to find closing frontmatter delimiter"),
+            "{error}"
+        );
+        assert!(!error.contains("gate"), "{error}");
+    }
+
+    #[test]
+    fn verification_frontmatter_line_endings_typed_defect_keys_match_across_endings() {
+        let lf = "---\nverifications:\n  - id: gate\n    rerun: [cargo, test]\n  - owner: 7\n---\n# Change\n";
+        let expected = source(lf);
+        assert_eq!(expected.defects.len(), 2, "{expected:?}");
+        assert_eq!(expected.defects[0].key, DeclarationKey::Id("gate".into()));
+        assert_eq!(expected.defects[1].key, DeclarationKey::Position(2));
+        for (label, content) in line_ending_variants(lf) {
+            assert_eq!(source(&content), expected, "{label}");
+        }
+        // Malformed YAML keeps the same file-relative location.
+        let malformed = "---\nkey: a\nverifications: [\n---\n";
+        let expected = only_defect(malformed);
+        for (label, content) in line_ending_variants(malformed) {
+            assert_eq!(only_defect(&content), expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn verification_frontmatter_line_endings_empty_and_null_roots_are_empty_metadata() {
+        let path = Path::new("openspec/changes/c/proposal.md");
+        let body = "# Change\n\n## Dependencies\n\n- body-dep\n";
+        for block in ["---\n---\n", "---\n~\n---\n", "---\nnull\n---\n"] {
+            for (label, content) in line_ending_variants(&format!("{block}{body}")) {
+                assert!(source(&content).is_valid(), "{label} {content:?}");
+                assert!(source(&content).declarations.is_empty());
+                let strict = parse_proposal_frontmatter_strict(&content, path);
+                assert_eq!(
+                    strict,
+                    ProposalFrontmatterParse::default(),
+                    "{label} {content:?}"
+                );
+                assert_eq!(
+                    strict_dependencies(&content).unwrap(),
+                    vec!["body-dep".to_string()],
+                    "{label} {content:?}: body fallback"
+                );
+                let display = parse_proposal_metadata(&content, path);
+                assert!(display.warnings.is_empty(), "{label}");
+                assert_eq!(display.dependencies, vec!["body-dep".to_string()]);
+            }
+        }
+        // Absent frontmatter keeps the body fallback too.
+        assert_eq!(
+            strict_dependencies(&crlf(body)).unwrap(),
+            vec!["body-dep".to_string()]
         );
     }
 }
