@@ -20,6 +20,11 @@
 //! keep a stop owed (an in-flight task, a lane waiter, a manual resolver, a
 //! pending merge) cannot be produced without starting real agent work.
 //!
+//! The classifier-barrier cases suspend the real blocked-only classification
+//! inside an archived dependency's base lookup and accept cancel-stop through
+//! shared run control while it is pending, so the settlement's post-
+//! classification flag read is what decides — not the stale entry read.
+//!
 //! Integration-scoped: git, the filesystem, and the reducer lock are real.
 
 use crate::analyzer::{AnalysisOutcome, AnalysisProvenance, AnalysisResult};
@@ -538,4 +543,500 @@ async fn blocked_idle_graceful_stop_dispatchable_candidate_does_not_settle() {
         "dispatchable work owes the stop a later boundary"
     );
     assert_eq!(stopped_events(&mut rx), 0);
+}
+
+// ============================================================================
+// Cancel-stop across the awaited blocked-only classification
+// ============================================================================
+
+const ARCHIVED_UPSTREAM: &str = "archived-upstream";
+
+/// Workspace-manager double that suspends the first dependency-base lookup.
+///
+/// Blocked-only classification awaits `ensure_original_branch_initialized`
+/// only for an *archived* dependency, before the real Git merge-evidence probe.
+/// The first call acknowledges entry and then waits for the test to release
+/// it; every later call passes straight through. Base evidence itself stays
+/// real (`is_merged_to_base` is not routed through the manager), and nothing
+/// this fixture never expects the scheduler to do is answered quietly: every
+/// workspace-mutating method panics.
+struct BlockingDependencyWorkspaceManager {
+    repo_root: std::path::PathBuf,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::vcs::WorkspaceManager for BlockingDependencyWorkspaceManager {
+    fn backend_type(&self) -> crate::vcs::VcsBackend {
+        crate::vcs::VcsBackend::Git
+    }
+
+    async fn check_available(&self) -> crate::vcs::VcsResult<bool> {
+        Ok(true)
+    }
+
+    async fn prepare_for_parallel(&self) -> crate::vcs::VcsResult<Option<crate::vcs::VcsWarning>> {
+        panic!("blocked-idle settlement must not prepare parallel workspaces")
+    }
+
+    async fn get_current_revision(&self) -> crate::vcs::VcsResult<String> {
+        panic!("blocked-idle settlement must not read the checkout revision")
+    }
+
+    async fn current_branch(&self) -> crate::vcs::VcsResult<Option<String>> {
+        Ok(Some("main".to_string()))
+    }
+
+    async fn create_workspace(
+        &mut self,
+        _change_id: &str,
+        _base_revision: Option<&str>,
+    ) -> crate::vcs::VcsResult<crate::vcs::Workspace> {
+        panic!("blocked-idle settlement must not create a workspace")
+    }
+
+    fn update_workspace_status(
+        &mut self,
+        _workspace_name: &str,
+        _status: crate::vcs::WorkspaceStatus,
+    ) {
+        panic!("blocked-idle settlement must not update a workspace")
+    }
+
+    async fn merge_workspaces(&self, _revisions: &[String]) -> crate::vcs::VcsResult<String> {
+        panic!("blocked-idle settlement must not merge")
+    }
+
+    async fn cleanup_workspace(&mut self, _workspace_name: &str) -> crate::vcs::VcsResult<()> {
+        panic!("blocked-idle settlement must not clean up a workspace")
+    }
+
+    async fn cleanup_all(&mut self) -> crate::vcs::VcsResult<()> {
+        panic!("blocked-idle settlement must not clean up workspaces")
+    }
+
+    fn max_concurrent(&self) -> usize {
+        1
+    }
+
+    fn workspaces(&self) -> Vec<crate::vcs::Workspace> {
+        Vec::new()
+    }
+
+    async fn list_worktree_change_ids(&self) -> crate::vcs::VcsResult<HashSet<String>> {
+        Ok(HashSet::new())
+    }
+
+    fn conflict_resolution_prompt(&self) -> &'static str {
+        "unused"
+    }
+
+    async fn snapshot_working_copy(
+        &self,
+        _workspace_path: &std::path::Path,
+    ) -> crate::vcs::VcsResult<()> {
+        panic!("blocked-idle settlement must not snapshot a workspace")
+    }
+
+    async fn create_verified_commit(
+        &self,
+        _workspace_path: &std::path::Path,
+        _message: &str,
+    ) -> crate::vcs::VcsResult<crate::vcs::VerifiedCommitOutcome> {
+        panic!("blocked-idle settlement must not commit")
+    }
+
+    async fn create_iteration_snapshot(
+        &self,
+        _workspace_path: &std::path::Path,
+        _change_id: &str,
+        _iteration: u32,
+        _completed: u32,
+        _total: u32,
+    ) -> crate::vcs::VcsResult<()> {
+        panic!("blocked-idle settlement must not snapshot an iteration")
+    }
+
+    async fn squash_wip_commits(
+        &self,
+        _workspace_path: &std::path::Path,
+        _change_id: &str,
+        _final_iteration: u32,
+    ) -> crate::vcs::VcsResult<()> {
+        panic!("blocked-idle settlement must not squash commits")
+    }
+
+    async fn get_revision_in_workspace(
+        &self,
+        _workspace_path: &std::path::Path,
+    ) -> crate::vcs::VcsResult<String> {
+        panic!("blocked-idle settlement must not read a workspace revision")
+    }
+
+    async fn get_status(&self) -> crate::vcs::VcsResult<String> {
+        Ok(String::new())
+    }
+
+    async fn get_log_for_revisions(&self, _revisions: &[String]) -> crate::vcs::VcsResult<String> {
+        Ok(String::new())
+    }
+
+    async fn detect_conflicts(&self) -> crate::vcs::VcsResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    fn forget_workspace_sync(&self, _workspace_name: &str) {}
+
+    fn repo_root(&self) -> &std::path::Path {
+        &self.repo_root
+    }
+
+    async fn ensure_original_branch_initialized(&self) -> crate::vcs::VcsResult<String> {
+        let entered = self
+            .entered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(entered) = entered {
+            entered
+                .send(())
+                .expect("the test awaits the classifier entry acknowledgement");
+            let release = self.release.lock().await.take();
+            if let Some(release) = release {
+                release
+                    .await
+                    .expect("the test releases the suspended classifier");
+            }
+        }
+        Ok("main".to_string())
+    }
+
+    fn original_branch(&self) -> Option<String> {
+        Some("main".to_string())
+    }
+
+    async fn find_existing_workspace(
+        &mut self,
+        _change_id: &str,
+    ) -> crate::vcs::VcsResult<Option<crate::vcs::WorkspaceInfo>> {
+        panic!("blocked-idle settlement must not look up a workspace")
+    }
+
+    async fn reuse_workspace(
+        &mut self,
+        _workspace_info: &crate::vcs::WorkspaceInfo,
+    ) -> crate::vcs::VcsResult<crate::vcs::Workspace> {
+        panic!("blocked-idle settlement must not reuse a workspace")
+    }
+}
+
+/// One evaluation boundary over genuinely blocked archived-dependency
+/// evidence, a suspended classifier, and the shared run-control service.
+struct ClassifierBarrierFixture {
+    executor: ParallelExecutor,
+    events: mpsc::Receiver<ParallelEvent>,
+    service: crate::orchestration::run_control::RunControlService,
+    scheduler: Arc<crate::orchestration::run_control::testing::RecordingScheduler>,
+    graceful_stop: Arc<AtomicBool>,
+    queued: Vec<Change>,
+    snapshot: ReducerWorkSnapshot,
+    entered: Option<tokio::sync::oneshot::Receiver<()>>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+    _repo: TempDir,
+}
+
+impl ClassifierBarrierFixture {
+    async fn new() -> Self {
+        use crate::orchestration::operator_command::{
+            ExecutionMarkStore, NoopQueueHooks, OperatorCommandService,
+        };
+        use crate::orchestration::run_control::testing::RecordingScheduler;
+        use crate::orchestration::run_control::{
+            ResolveReservations, RunControlService, StartEligibility,
+        };
+
+        // A committed, valid queued proposal whose only dependency is archived
+        // on disk but not integrated into `main`.
+        let repo = TempDir::new().expect("create temp repo");
+        let root = repo.path();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test User"]);
+        std::fs::write(root.join("README.md"), "base\n").expect("write base file");
+        let change_dir = root.join("openspec/changes").join(BLOCKED);
+        std::fs::create_dir_all(&change_dir).expect("create change directory");
+        let proposal = change_dir.join("proposal.md");
+        std::fs::write(
+            &proposal,
+            format!("---\ndependencies:\n  - {ARCHIVED_UPSTREAM}\n---\n# {BLOCKED}\n"),
+        )
+        .expect("write proposal");
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] apply\n",
+        )
+        .expect("write tasks");
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", "Base"]);
+        let archive_entry = root
+            .join("openspec/changes/archive")
+            .join(format!("2026-01-01-{ARCHIVED_UPSTREAM}"));
+        std::fs::create_dir_all(&archive_entry).expect("create archive entry");
+        std::fs::write(
+            archive_entry.join("proposal.md"),
+            format!("# {ARCHIVED_UPSTREAM}\n"),
+        )
+        .expect("write archived proposal");
+
+        assert_eq!(
+            crate::openspec::parse_proposal_dependencies_strict_from_file(&proposal)
+                .expect("strict metadata parses"),
+            vec![ARCHIVED_UPSTREAM.to_string()]
+        );
+        assert!(
+            crate::dependency_targets::collect_archived_change_ids(root)
+                .contains(ARCHIVED_UPSTREAM),
+            "archive discovery sees the dependency"
+        );
+        assert!(
+            !root
+                .join("openspec/changes")
+                .join(ARCHIVED_UPSTREAM)
+                .exists(),
+            "there is no active proposal for the dependency"
+        );
+        assert!(
+            !crate::execution::state::is_merged_to_base(ARCHIVED_UPSTREAM, root, "main")
+                .await
+                .expect("base evidence is readable"),
+            "the archived dependency is not integrated into main"
+        );
+
+        let shared = Arc::new(RwLock::new(OrchestratorState::new(
+            vec![BLOCKED.to_string()],
+            10,
+        )));
+        shared
+            .write()
+            .await
+            .apply_command(ReducerCommand::AddToQueue(BLOCKED.to_string()));
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        // Known spare capacity: this isolates classifier suspension from send
+        // backpressure.
+        let (event_tx, events) = mpsc::channel(16);
+        let mut executor = ParallelExecutor::new(root.to_path_buf(), config(root), Some(event_tx));
+        executor.set_persistent_lifetime();
+        executor.set_shared_orchestrator_state(shared.clone());
+        executor.set_workspace_manager(Box::new(BlockingDependencyWorkspaceManager {
+            repo_root: root.to_path_buf(),
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        }));
+
+        let queue = Arc::new(DynamicQueue::new());
+        let scheduler = Arc::new(RecordingScheduler::new());
+        let graceful_stop = scheduler.graceful_stop_flag();
+        executor.set_graceful_stop_flag(graceful_stop.clone());
+        let operator = Arc::new(OperatorCommandService::new(
+            shared.clone(),
+            queue,
+            Arc::new(NoopQueueHooks),
+            Arc::new(ExecutionMarkStore::new()),
+        ));
+        let service = RunControlService::new(
+            shared,
+            operator,
+            scheduler.clone(),
+            Arc::new(ResolveReservations::new()),
+            Arc::new(StartEligibility::new()),
+        );
+
+        let snapshot = executor.capture_reducer_work_snapshot().await;
+        assert!(snapshot.is_complete());
+        let queued = vec![Change {
+            id: BLOCKED.to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            last_modified: String::new(),
+            dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
+        }];
+
+        Self {
+            executor,
+            events,
+            service,
+            scheduler,
+            graceful_stop,
+            queued,
+            snapshot,
+            entered: Some(entered_rx),
+            release: Some(release_tx),
+            _repo: repo,
+        }
+    }
+
+    async fn request_stop(&self) {
+        use crate::orchestration::operator_command::OperatorMode;
+        use crate::orchestration::run_control::RunControlOutcome;
+        assert_eq!(
+            self.service
+                .stop(OperatorMode::Running)
+                .await
+                .expect("stop is accepted while running"),
+            RunControlOutcome::StopRequested
+        );
+        assert!(self.graceful_stop.load(Ordering::SeqCst));
+    }
+
+    /// One settlement evaluation from the actual production helper.
+    async fn settle(&self) -> bool {
+        self.executor
+            .settle_graceful_stop_when_no_work(true, &self.queued, &HashSet::new(), &self.snapshot)
+            .await
+    }
+
+    fn drain(&mut self) -> Counts {
+        let mut counts = Counts::default();
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                ParallelEvent::PersistentSchedulerIdle => counts.idle_edges += 1,
+                ParallelEvent::Stopped => counts.stopped += 1,
+                ParallelEvent::AllCompleted => counts.all_completed += 1,
+                ParallelEvent::Error { .. } => counts.errors += 1,
+                ParallelEvent::AnalysisStarted { .. }
+                | ParallelEvent::WorkspacePreparationStarted { .. }
+                | ParallelEvent::ApplyStarted { .. }
+                | ParallelEvent::AcceptanceStarted { .. }
+                | ParallelEvent::ArchiveStarted { .. }
+                | ParallelEvent::MergeStarted { .. }
+                | ParallelEvent::ResolveStarted { .. } => counts.work_starts += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+}
+
+/// Verification `idle-stop-cancel-race`: cancel-stop accepted while the real
+/// blocked-only classifier is suspended in its archived-dependency base lookup
+/// wins that evaluation — no `Stopped` — and a later accepted Stop on the same
+/// executor still settles exactly once.
+#[tokio::test]
+async fn blocked_idle_graceful_stop_cancel_during_classifier_never_stops() {
+    use crate::orchestration::operator_command::OperatorMode;
+    use crate::orchestration::run_control::RunControlOutcome;
+
+    let mut fixture = ClassifierBarrierFixture::new().await;
+    fixture.request_stop().await;
+
+    let entered = fixture.entered.take().expect("entry barrier");
+    let release = fixture.release.take().expect("release barrier");
+    let control = async {
+        entered
+            .await
+            .expect("the classifier reaches its dependency-base lookup");
+        assert!(
+            fixture.graceful_stop.load(Ordering::SeqCst),
+            "the request was pending when classification suspended"
+        );
+        assert_eq!(
+            fixture
+                .service
+                .cancel_stop(OperatorMode::Stopping)
+                .await
+                .expect("cancel-stop is accepted while stopping"),
+            RunControlOutcome::StopCancelled
+        );
+        assert!(
+            !fixture.graceful_stop.load(Ordering::SeqCst),
+            "cancel-stop withdrew the shared request"
+        );
+        release
+            .send(())
+            .expect("the suspended classifier is still waiting");
+    };
+    let (settled, ()) = tokio::time::timeout(MUST_HAPPEN, async {
+        tokio::join!(fixture.settle(), control)
+    })
+    .await
+    .expect("the boundary evaluation must finish once released");
+
+    assert!(
+        !settled,
+        "a request withdrawn during classification must not settle"
+    );
+    assert_eq!(
+        fixture.drain(),
+        Counts::default(),
+        "the withdrawn evaluation publishes nothing"
+    );
+
+    // A fresh Stop is a new pending request, not one suppressed forever. The
+    // barrier is spent, so this evaluation classifies without suspending.
+    fixture.request_stop().await;
+    assert!(
+        tokio::time::timeout(MUST_HAPPEN, fixture.settle())
+            .await
+            .expect("the later evaluation must finish"),
+        "a later accepted Stop settles at its own boundary"
+    );
+    assert_eq!(
+        fixture.drain(),
+        Counts {
+            stopped: 1,
+            ..Counts::default()
+        },
+        "exactly one Stopped in total, and nothing executed or completed"
+    );
+    assert!(
+        fixture.scheduler.started_targets().is_empty(),
+        "no run was started"
+    );
+}
+
+/// Verification `idle-stop-cancel-race`: with the same suspended classifier and
+/// no cancellation, the pending request settles exactly once after release —
+/// the fence does not disable Stop.
+#[tokio::test]
+async fn blocked_idle_graceful_stop_pending_after_classifier_stops_once() {
+    let mut fixture = ClassifierBarrierFixture::new().await;
+    fixture.request_stop().await;
+
+    let entered = fixture.entered.take().expect("entry barrier");
+    let release = fixture.release.take().expect("release barrier");
+    let mut events = std::mem::replace(&mut fixture.events, mpsc::channel(1).1);
+    let control = async {
+        entered
+            .await
+            .expect("the classifier reaches its dependency-base lookup");
+        assert!(
+            matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "nothing is published while classification is suspended"
+        );
+        release
+            .send(())
+            .expect("the suspended classifier is still waiting");
+    };
+    let (settled, ()) = tokio::time::timeout(MUST_HAPPEN, async {
+        tokio::join!(fixture.settle(), control)
+    })
+    .await
+    .expect("the boundary evaluation must finish once released");
+    fixture.events = events;
+
+    assert!(settled, "a still-pending request settles at this boundary");
+    assert!(fixture.graceful_stop.load(Ordering::SeqCst));
+    assert_eq!(
+        fixture.drain(),
+        Counts {
+            stopped: 1,
+            ..Counts::default()
+        },
+        "exactly one Stopped, and nothing executed or completed"
+    );
+    assert!(fixture.scheduler.started_targets().is_empty());
 }

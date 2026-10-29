@@ -9527,6 +9527,11 @@ async fn parallel_pass_to_archive_to_merge_never_creates_or_cleans_an_acceptance
     // resolve command in this fixture may still fail the later conflict phase;
     // what this regression asserts is that archive verification never produces
     // a manual deferral and that the change reaches the resolving stage.
+    //
+    // The direct attempt enters the process-global base lane, so it shares the
+    // fixture serialization lock with every other lane-entering test; the
+    // pipeline preparation above stays parallel.
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     let attempt = executor
         .attempt_merge(
             std::slice::from_ref(&workspace.workspace_name),
@@ -11224,6 +11229,9 @@ async fn test_dirty_to_clean_resolve_wait_wakes_retry_without_new_trigger() {
     executor.sync_resolve_wait_from_shared_state().await;
     executor.last_dispatched_resolve_wait_changes = executor.resolve_wait_changes.clone();
 
+    // Both inline retries can reach `attempt_merge` and the process-global base
+    // lane, so hold the shared fixture lock across them and their assertions.
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     executor.maybe_dispatch_resolve_wait_retry().await;
     assert!(
         !executor.should_dispatch_resolve_wait_retry(),
