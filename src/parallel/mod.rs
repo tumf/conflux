@@ -210,6 +210,12 @@ pub struct ParallelExecutor {
     /// eligibility; `select_changes_for_dispatch` still derives executable work from
     /// the current analysis result and repository/workspace state on every pass.
     dependency_blocker_fingerprints: HashMap<String, DependencyBlockerFingerprint>,
+    /// Process-local per-target epochs of emitted proposal-metadata errors.
+    ///
+    /// Deduplication only: an epoch suppresses a repeated `ProcessingError`
+    /// while the first one still awaits reducer adoption. It never decides
+    /// admission, and it is cleared by explicit Retry and candidate removal.
+    proposal_metadata_error_epochs: HashMap<String, queue_state::ProposalMetadataErrorEpoch>,
     /// Changes that need forced worktree recreation (dependency just resolved)
     force_recreate_worktree: HashSet<String>,
     /// Hook runner for executing hooks (optional)
