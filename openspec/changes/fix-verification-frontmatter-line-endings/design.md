@@ -4,16 +4,16 @@
 
 Create one internal scanner in `src/openspec.rs`, e.g. `scan_proposal_frontmatter`, with three logical outcomes: Absent, Present { yaml, body }, Unclosed. `yaml` and `body` borrow the input string. The names are local implementation details, but the three-way distinction is mandatory.
 
-Read lines by byte offsets. A newline is LF with an optional immediately preceding CR. For delimiter comparison only, exclude that terminator. The first complete line must be exactly `---` with an LF/CRLF terminator; no BOM stripping or whitespace trimming. Search subsequent line spans for a line exactly `---`, also accepting the final EOF line. An immediate closing delimiter yields an empty YAML slice. Preserve all non-delimiter bytes, including CRLF within YAML scalar bodies and ordinary document body text. A final bare `---` without an opening line terminator keeps its existing no-frontmatter behavior; it is not an opened block.
+Read lines by byte offsets. A newline is LF with an optional immediately preceding CR. For delimiter comparison only, exclude that terminator. The first complete line must be exactly `---` with an LF/CRLF terminator; no BOM stripping or whitespace trimming. Search subsequent line spans for a line exactly `---`, also accepting the final EOF line. The YAML slice starts immediately after the opening line terminator and ends at the closing line start offset; thus the complete LF/CRLF terminator before the closing line remains in the slice, and an isolated trailing CR is never manufactured. The body starts immediately after the closing line terminator (or at EOF). An immediate closing delimiter yields an empty YAML slice. Preserve all non-delimiter bytes, including CRLF within YAML scalar bodies and ordinary document body text. A final bare `---` without an opening line terminator keeps its existing no-frontmatter behavior; it is not an opened block.
 
 Do not use `str::lines()` plus reconstruction, blanket newline substitution, or scanner output as the canonical Git content. Existing Git commit/blob/digest inputs stay unchanged.
 
 ## Consumer mapping
 
 - Execution reader: Absent => existing legitimate empty source; Present => current typed YAML decoder; Unclosed => proposal-scoped metadata-invalid defect with the current bounded value-free detail.
-- Strict frontmatter decoder: Present => existing decoder; Unclosed => a bounded structural diagnostic, never a decoder error echo; Absent => current empty metadata result. Strict validation still uses the execution reader's typed diagnostics when available.
+- Strict frontmatter decoder: Present with a YAML Null root (including an empty block) => empty metadata and no decode diagnostics; otherwise Present => existing decoder; Unclosed => a bounded structural diagnostic, never a decoder error echo; Absent => current empty metadata result. Strict validation still uses the execution reader's typed diagnostics when available.
 - Display reader: Present => tolerant current metadata decoder; Absent/Unclosed => its existing display fallback. Display fallback is not execution authority.
-- Strict dependency reader: Unclosed => current parse error; Present => current strict metadata/dependency handling; Absent => existing body dependency fallback.
+- Strict dependency reader: Unclosed => current parse error; Present with a YAML Null root (including an empty block) => empty metadata, no decode diagnostics, and the existing body dependency fallback; otherwise Present => current strict metadata/dependency handling; Absent => existing body dependency fallback. The empty/Null rule does not waive implementation-proposal required-verification policy.
 - Task linkage, change-type lookup, release-dependency validation and manifest building already consume these shared paths; audit them for independent delimiter checks and remove only relevant redundant LF-only checks.
 
 ## Invalid versus empty

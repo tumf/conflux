@@ -6,7 +6,7 @@ Conflux MUST recognize a proposal's opening delimiter line `---` at the beginnin
 
 Execution verification reading, strict validation metadata, display metadata and strict dependency parsing MUST share this delimiter classification. Caller-specific tolerant display behavior MUST NOT become gate authority. The verification reader MUST preserve the existing typed source defects for malformed opened blocks and invalid decoded shapes; the native Acceptance and CLI failure behavior remains that of Required verification declarations fail closed.
 
-Parsing MUST retain the original YAML/body slices and MUST NOT rewrite the proposal or alter commit/blob/digest inputs. Equivalent parsed declarations across LF and CRLF do not imply identical repository content IDs. Legitimately absent, null and empty verification sources MUST keep their existing semantics. No new configuration or authoring restriction may bypass these rules.
+Parsing MUST retain the original YAML/body slices and MUST NOT rewrite the proposal or alter commit/blob/digest inputs. Equivalent parsed declarations across LF and CRLF do not imply identical repository content IDs. Legitimately absent, null and empty verification sources MUST keep their existing semantics. Empty/Null YAML roots MUST produce empty strict/display metadata without decode diagnostics, and strict dependency reading MUST retain the body dependency fallback; this does not waive implementation-proposal required-verification policy. The YAML slice MUST end at the closing line start offset, retaining the complete preceding LF/CRLF terminator; the body slice MUST start after the closing line terminator or at EOF. No new configuration or authoring restriction may bypass these rules.
 
 #### Scenario: CRLF required failing gate is not omitted
 
@@ -45,4 +45,6 @@ Parsing MUST retain the original YAML/body slices and MUST NOT rewrite the propo
 - **WHEN** the shared scanner and verification reader run
 - **THEN** the block is recognized without modifying original bytes
 - **AND** legitimately empty verifications retain zero defects
+- **AND** strict/display metadata decoding yields no decode diagnostics for an empty/Null root and strict dependencies retain body fallback
+- **AND** independent implementation-proposal required-verification policy is not waived
 - **AND** distinct raw LF/CRLF proposal blobs retain their actual distinct content identities

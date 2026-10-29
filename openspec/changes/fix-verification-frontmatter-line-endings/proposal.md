@@ -10,7 +10,7 @@ references:
   - src/openspec_cmd/validation.rs
   - src/openspec_cmd/verify.rs
   - src/orchestration/acceptance/manifest_builder.rs
-  - src/parallel/tests/executor.rs
+  - src/parallel/tests/acceptance_execution_boundary.rs
   - tests/run_exit_tests.rs
 verifications:
   - id: frontmatter-line-endings-native
@@ -61,7 +61,7 @@ The new scanner must replace delimiter decisions in both existing splitters and 
 
 ## Acceptance and explicit completion
 
-1. Parser and metadata parity: LF, CRLF and mixed LF/CRLF versions of the same complete proposal expose the same metadata, dependencies, ordered declarations and typed defect keys. Closing delimiter at EOF and empty blocks work with either opening terminator. An opened CRLF block without a closing delimiter is `declaration_metadata_invalid`, never absent. A line with an isolated carriage return is not a supported delimiter. BOM handling and leading whitespace outside the established contract are unchanged.
+1. Parser and metadata parity: LF, CRLF and mixed LF/CRLF versions of the same complete proposal expose the same metadata, dependencies, ordered declarations and typed defect keys. Closing delimiter at EOF and empty blocks work with either opening terminator. Empty/Null roots yield empty strict/display metadata without decode diagnostics; strict dependencies retain body fallback, while implementation-required verification policy remains enforced. YAML slices end at the closing line start offset, preserving the complete preceding LF/CRLF terminator. An opened CRLF block without a closing delimiter is `declaration_metadata_invalid`, never absent. A line with an isolated carriage return is not a supported delimiter. BOM handling and leading whitespace outside the established contract are unchanged.
 2. Real CLI: use disposable tracked repositories and a non-echoing local gate. In both LF and CRLF fixtures, a passing gate selects exactly one verification and succeeds; a failing gate selects exactly one and returns a nonzero actual run. The plan may succeed without running the failing command but must select it. Strict and archive-gate validate the valid declaration independently of its future runtime exit. Both validators and verify plan/run reject wrong-typed and unclosed sources; verify must not execute a marker gate or read/write existing evidence on invalid input. Keep a no-frontmatter/empty source control for verify.
 3. Native candidate boundary: start with a valid LF proposal at admission, then exercise the production manifest/gate boundary using the candidate's CRLF bytes after Apply. A failing required command must execute, fail natively and prevent reviewer start; a passing CRLF gate executes once before one reviewer invocation. CRLF wrong-typed or unclosed metadata must produce typed defects, with no gate, reviewer, evidence reuse or write. Tests must use the production reader/manifest path, not a hand-built empty/defective manifest.
 4. Every new test name contains `verification_frontmatter_line_endings`. Both declared commands must execute nonzero tests. Existing declaration integrity, leading-env and proposal metadata tests must remain green; report their exact counts and any unrelated suite failures separately. No test may assert success merely from matching labels, a no-op fake reader, or validator exit without the gate marker/count.
