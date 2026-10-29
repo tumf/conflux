@@ -37,6 +37,11 @@ mod upstream_lane;
 mod work_snapshot;
 mod workspace;
 
+/// The executor's production `[DECLARATION_INVALID]` finding construction,
+/// exposed to the repair-identity regressions outside this module.
+#[cfg(test)]
+pub(crate) use executor::declaration_invalid_findings;
+
 // Re-export unified event type as ParallelEvent for backward compatibility.
 pub use crate::events::ExecutionEvent as ParallelEvent;
 

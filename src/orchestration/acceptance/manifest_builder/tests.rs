@@ -344,16 +344,90 @@ async fn acceptance_execution_boundary_unresolvable_tool_is_recorded_not_guessed
     assert_eq!(manifest.gates[0].tool, ToolIdentity::default());
 }
 
-/// A change with no proposal at all produces an empty allowlist rather than an
-/// error: nothing declared means nothing blocking.
+/// A change with no proposal at all is source-unavailable: no manifest is
+/// derived, which is distinct from an empty allowlist.
 #[tokio::test]
-async fn acceptance_execution_boundary_missing_proposal_yields_an_empty_allowlist() {
+async fn verification_declaration_integrity_missing_proposal_refuses_a_manifest() {
     let workspace = tempfile::tempdir().unwrap();
     let facts = FakeFacts::new();
 
-    let manifest = build(&facts, &workspace, "alpha").await;
+    let error = build_manifest_for_workspace(
+        &facts,
+        workspace.path(),
+        &external_store(&workspace),
+        "alpha",
+        "cflx-accept",
+        Some("main"),
+        300,
+    )
+    .await
+    .expect_err("a missing proposal must not produce a manifest");
+
+    assert_eq!(
+        error,
+        ManifestBuildError::ProposalUnreadable {
+            path: "openspec/changes/alpha/proposal.md".to_string(),
+            kind: std::io::ErrorKind::NotFound,
+        }
+    );
+    assert!(error
+        .detail()
+        .contains("openspec/changes/alpha/proposal.md"));
+    assert!(error.detail().contains("NotFound"));
+    assert!(facts.tool_programs.lock().unwrap().is_empty());
+}
+
+/// Structural metadata defects in the candidate proposal are recorded on the
+/// manifest, bound to the candidate commit, with no gate and no tool lookup.
+#[tokio::test]
+async fn verification_declaration_integrity_defective_source_freezes_metadata_defects() {
+    for (proposal, field) in [
+        (
+            "---\nverifications:\n  - id: gate\n    rerun: [cargo, test]\n    completion_role: change-blocking\n---\n# Change\n",
+            "rerun",
+        ),
+        (
+            "---\nverifications:\n  - id: gate\n# Change without a closing delimiter\n",
+            "frontmatter",
+        ),
+    ] {
+        let workspace = workspace_with_change("alpha");
+        std::fs::write(
+            workspace.path().join("openspec/changes/alpha/proposal.md"),
+            proposal,
+        )
+        .unwrap();
+        let facts = FakeFacts::new();
+
+        let manifest = build(&facts, &workspace, "alpha").await;
+
+        assert!(!manifest.has_gates());
+        assert!(manifest.is_declaration_invalid());
+        assert_eq!(manifest.candidate_commit_oid, COMMIT);
+        assert_eq!(manifest.declaration_defects.len(), 1);
+        assert_eq!(
+            manifest.declaration_defects[0].code,
+            "declaration_metadata_invalid"
+        );
+        assert_eq!(manifest.declaration_defects[0].field, field);
+        assert!(facts.tool_programs.lock().unwrap().is_empty());
+    }
+}
+
+/// A readable proposal with no declarations is a legitimately empty allowlist.
+#[tokio::test]
+async fn verification_declaration_integrity_legitimately_empty_source_is_valid() {
+    let workspace = workspace_with_change("alpha");
+    std::fs::write(
+        workspace.path().join("openspec/changes/alpha/proposal.md"),
+        "# Legacy proposal\n",
+    )
+    .unwrap();
+
+    let manifest = build(&FakeFacts::new(), &workspace, "alpha").await;
 
     assert!(!manifest.has_gates());
+    assert!(!manifest.is_declaration_invalid());
 }
 
 /// An unobservable repository is a runtime defect, never a verdict.

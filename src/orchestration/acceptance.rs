@@ -1170,29 +1170,33 @@ pub struct NormalizedFinding {
 
 /// Derive comparison identities for a finding list.
 ///
-/// A structured finding's identity is its reviewer-authored `id`, so changed
-/// prose, line numbers, evidence, or cited paths cannot manufacture a new
-/// identity. Legacy string findings keep the historical deterministic fallback.
+/// A runtime-native declaration finding's identity is its typed declaration
+/// identity, consulted first. A structured finding's identity is its
+/// reviewer-authored `id`, so changed prose, line numbers, evidence, or cited
+/// paths cannot manufacture a new identity. Legacy string findings keep the
+/// historical deterministic fallback.
 pub fn normalize_findings(
     findings: &[crate::acceptance::AcceptanceFinding],
 ) -> Vec<NormalizedFinding> {
     let mut normalized = findings
         .iter()
         .filter_map(|finding| {
-            let structured = finding.structured_payload()?;
+            let identity = match (finding.native_identity(), finding.structured_payload()) {
+                (Some(native), _) => native.comparison_identity(),
+                (None, Some(structured)) => format!("repository|id|{}", structured.id),
+                (None, None) => return None,
+            };
             Some(NormalizedFinding {
-                identity: format!("repository|id|{}", structured.id),
+                identity,
                 text: finding.text().to_string(),
                 external: false,
                 finding: finding.clone(),
             })
         })
         .collect::<Vec<_>>();
-    normalized.extend(normalize_legacy_findings(
-        findings
-            .iter()
-            .filter(|finding| finding.structured_payload().is_none()),
-    ));
+    normalized.extend(normalize_legacy_findings(findings.iter().filter(
+        |finding| finding.native_identity().is_none() && finding.structured_payload().is_none(),
+    )));
     normalized.sort_by(|left, right| left.identity.cmp(&right.identity));
     normalized.dedup_by(|left, right| left.identity == right.identity);
     normalized
@@ -1317,7 +1321,8 @@ pub fn repository_findings(
     findings
         .iter()
         .filter(|finding| {
-            finding.structured_payload().is_some()
+            finding.native_identity().is_some()
+                || finding.structured_payload().is_some()
                 || normalize_legacy_texts(&[finding.text().to_string()])
                     .first()
                     .is_some_and(|normalized| !normalized.external)
@@ -5340,5 +5345,276 @@ mod tests {
             assert!(InvalidAcceptanceResult::MalformedFinding.has_protocol_retry_budget());
             assert!(!InvalidAcceptanceResult::EmptyFail.has_protocol_retry_budget());
         }
+    }
+
+    // === verification_declaration_integrity: native declaration identity ===
+
+    /// Defects for a proposal through the production reader and planner.
+    fn vdi_defects(
+        content: &str,
+    ) -> Vec<crate::orchestration::acceptance::verification_evidence::DeclarationDefect> {
+        crate::orchestration::acceptance::execution_manifest::plan_verification_source(
+            &crate::openspec::parse_verification_source(
+                content,
+                std::path::Path::new("openspec/changes/vdi/proposal.md"),
+            ),
+        )
+        .defects
+    }
+
+    /// The executor's production findings for those defects.
+    fn vdi_findings(content: &str, candidate: &str) -> Vec<AcceptanceFinding> {
+        crate::parallel::declaration_invalid_findings("vdi", candidate, &vdi_defects(content))
+    }
+
+    fn vdi_entry(id: Option<&str>, command: &str) -> String {
+        let id_line = id.map_or_else(String::new, |id| format!("    id: \"{id}\"\n"));
+        format!(
+            "  - completion_role: change-blocking\n{id_line}    requirement: r\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: t\n    automation: Cargo.toml\n    evidence: \"{command}\"\n    rerun: \"{command}\"\n    prerequisites: []\n    execution_class: repository-local\n"
+        )
+    }
+
+    fn vdi_proposal(entries: &[String]) -> String {
+        format!("---\nverifications:\n{}---\n# Change\n", entries.concat())
+    }
+
+    fn vdi_identities(findings: &[AcceptanceFinding]) -> Vec<String> {
+        normalize_findings(findings)
+            .into_iter()
+            .map(|normalized| normalized.identity)
+            .collect()
+    }
+
+    #[test]
+    fn verification_declaration_integrity_repair_of_a_duplicate_grants_the_new_defect_a_repair() {
+        let mut ledger = FindingRepairLedger::default();
+        let duplicate = vdi_findings(
+            &vdi_proposal(&[
+                vdi_entry(Some("gate"), "cargo test"),
+                vdi_entry(Some("gate"), "cargo test --lib"),
+            ]),
+            "aaaaaaaaaaaa",
+        );
+        assert_eq!(duplicate.len(), 2, "both occurrences stay in the verdict");
+        assert!(duplicate
+            .iter()
+            .all(|finding| finding.text().starts_with("[DECLARATION_INVALID]")));
+        let FindingRepairDecision::Repair { identities } = observe(&mut ledger, &duplicate) else {
+            panic!("the first declaration defect gets a repair");
+        };
+        assert_eq!(
+            identities,
+            [r#"repository|declaration|["vdi","id","gate","id","declaration_duplicate_id"]"#],
+            "two occurrences share one repair opportunity"
+        );
+        ledger.record_repair_dispatched(&identities);
+
+        // The repair removed the duplicate and exposed a shell-syntax defect.
+        let shell = vdi_findings(
+            &vdi_proposal(&[vdi_entry(Some("gate"), "cargo test | tee out.log")]),
+            "bbbbbbbbbbbb",
+        );
+        let decision = observe(&mut ledger, &shell);
+        let FindingRepairDecision::Repair { identities } = decision else {
+            panic!("a newly exposed defect gets its first repair: {decision:?}");
+        };
+        assert_eq!(
+            identities,
+            [r#"repository|declaration|["vdi","id","gate","rerun","declaration_shell_syntax"]"#]
+        );
+        ledger.record_repair_dispatched(&identities);
+
+        // The same still-open defect after its repair stops.
+        let again = vdi_findings(
+            &vdi_proposal(&[vdi_entry(Some("gate"), "cargo test && true")]),
+            "cccccccccccc",
+        );
+        assert!(matches!(
+            observe(&mut ledger, &again),
+            FindingRepairDecision::Stop {
+                reason: REPEATED_FINDING_REASON,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn verification_declaration_integrity_unrepaired_duplicate_stops_after_its_repair() {
+        let mut ledger = FindingRepairLedger::default();
+        let content = vdi_proposal(&[
+            vdi_entry(Some("gate"), "cargo test"),
+            vdi_entry(Some("gate"), "cargo test"),
+        ]);
+        let FindingRepairDecision::Repair { identities } =
+            observe(&mut ledger, &vdi_findings(&content, "aaaaaaaaaaaa"))
+        else {
+            panic!("first repair");
+        };
+        ledger.record_repair_dispatched(&identities);
+        assert!(matches!(
+            observe(&mut ledger, &vdi_findings(&content, "bbbbbbbbbbbb")),
+            FindingRepairDecision::Stop { .. }
+        ));
+    }
+
+    #[test]
+    fn verification_declaration_integrity_identity_ignores_order_prose_and_candidate() {
+        let shell = "cargo test | tee out.log";
+        let first = vdi_findings(
+            &vdi_proposal(&[
+                vdi_entry(Some("gate"), shell),
+                vdi_entry(Some("other"), "cargo test"),
+            ]),
+            "aaaaaaaaaaaa",
+        );
+        // Reordered, a different offending construct (so different detail and
+        // text), and a different candidate commit.
+        let moved = vdi_findings(
+            &format!(
+                "---\nchange_type: implementation\n{}",
+                vdi_proposal(&[
+                    vdi_entry(Some("other"), "cargo test"),
+                    vdi_entry(Some(" gate "), "cargo test ; true"),
+                ])
+                .trim_start_matches("---\n")
+            ),
+            "dddddddddddd",
+        );
+        assert_ne!(first[0].text(), moved[0].text());
+        assert_eq!(vdi_identities(&first), vdi_identities(&moved));
+    }
+
+    #[test]
+    fn verification_declaration_integrity_distinct_defects_stay_distinct() {
+        let findings = vdi_findings(
+            &vdi_proposal(&[
+                vdi_entry(Some("alpha"), "cargo test | tee x"),
+                vdi_entry(Some("beta"), "cargo test | tee x"),
+                vdi_entry(None, "cargo test"),
+            ]),
+            "aaaaaaaaaaaa",
+        );
+        assert_eq!(findings.len(), 3);
+        let identities = vdi_identities(&findings);
+        assert_eq!(identities.len(), 3, "{identities:?}");
+        let mut ledger = FindingRepairLedger::default();
+        let FindingRepairDecision::Repair { identities } = observe(&mut ledger, &findings) else {
+            panic!("all new");
+        };
+        assert_eq!(identities.len(), 3);
+    }
+
+    #[test]
+    fn verification_declaration_integrity_fallback_spelled_id_is_distinct_from_a_nameless_entry() {
+        let shell = "cargo test | tee out.log";
+        let fillers = || {
+            vec![
+                vdi_entry(Some("filler-a"), "cargo test"),
+                vdi_entry(Some("filler-b"), "cargo test"),
+            ]
+        };
+        let named_content = "---\nverifications:\n  - id: a\n  - id: b\n  - id: \"<position 3>\"\n    rerun: [x]\n---\n";
+        let nameless_content = "---\nverifications:\n  - id: a\n  - id: b\n  - rerun: [x]\n---\n";
+        let named = vdi_findings(named_content, "aaaaaaaaaaaa");
+        let nameless = vdi_findings(nameless_content, "aaaaaaaaaaaa");
+        assert_eq!(named.len(), 1);
+        assert_eq!(nameless.len(), 1);
+        // Equal label text, position, field, and code — distinct identities.
+        assert_eq!(named[0].text(), nameless[0].text());
+        assert_ne!(vdi_identities(&named), vdi_identities(&nameless));
+        assert_eq!(
+            vdi_identities(&named),
+            [
+                r#"repository|declaration|["vdi","id","<position 3>","rerun","declaration_metadata_invalid"]"#
+            ]
+        );
+        assert_eq!(
+            vdi_identities(&nameless),
+            [
+                r#"repository|declaration|["vdi","position","3","rerun","declaration_metadata_invalid"]"#
+            ]
+        );
+
+        // Through the planner too, and the named one survives a move to position 1.
+        for authored in ["<position 3>", "<proposal>"] {
+            let mut entries = fillers();
+            entries.push(vdi_entry(Some(authored), shell));
+            let at_three = vdi_findings(&vdi_proposal(&entries), "aaaaaaaaaaaa");
+            let mut moved = vec![vdi_entry(Some(authored), shell)];
+            moved.extend(fillers());
+            let at_one = vdi_findings(&vdi_proposal(&moved), "bbbbbbbbbbbb");
+            assert_eq!(vdi_identities(&at_three), vdi_identities(&at_one));
+            assert!(
+                vdi_identities(&at_three)[0].contains(r#""id","#),
+                "{authored}"
+            );
+        }
+
+        // A proposal-scoped defect is keyed by the proposal.
+        let proposal = vdi_findings("---\nverifications: true\n---\n", "aaaaaaaaaaaa");
+        assert_eq!(
+            vdi_identities(&proposal),
+            [
+                r#"repository|declaration|["vdi","proposal","","verifications","declaration_metadata_invalid"]"#
+            ]
+        );
+        // An unstorable authored ID is keyed by that ID.
+        let unstorable = vdi_findings(
+            &vdi_proposal(&[vdi_entry(Some("../x"), "cargo test")]),
+            "aaaaaaaaaaaa",
+        );
+        assert_eq!(
+            vdi_identities(&unstorable),
+            [r#"repository|declaration|["vdi","id","../x","id","declaration_unstorable_id"]"#]
+        );
+    }
+
+    #[test]
+    fn verification_declaration_integrity_native_findings_carry_no_reviewer_obligations() {
+        let native = vdi_findings(
+            &vdi_proposal(&[vdi_entry(Some("gate"), "cargo test | tee x")]),
+            "aaaaaaaaaaaa",
+        );
+        let finding = &native[0];
+        assert!(!finding.declares_paths());
+        assert_eq!(finding.id(), None);
+        assert!(finding.structured_payload().is_none());
+        assert_eq!(repository_findings(&native).len(), 1, "repository-scoped");
+        assert!(!normalize_findings(&native)[0].external);
+        let json = finding.to_json();
+        assert_eq!(json["finding"], finding.text());
+        assert_eq!(
+            json["declaration_identity"],
+            serde_json::json!({
+                "change_id": "vdi",
+                "key": {"kind": "id", "value": "gate"},
+                "field": "rerun",
+                "code": "declaration_shell_syntax",
+            })
+        );
+        let coverage = evaluate_remediation_coverage(&native, &[]);
+        assert!(coverage.missing_required.is_empty());
+        assert!(coverage.missing_verification.is_empty());
+
+        // A structured reviewer finding in the same process is unchanged.
+        let reviewer = secret_value_finding();
+        let mixed = vec![reviewer.clone(), finding.clone()];
+        let normalized = normalize_findings(&mixed);
+        assert!(normalized
+            .iter()
+            .any(|entry| entry.identity == "repository|id|acceptance-secret-value-scan"));
+        assert!(reviewer.declares_paths());
+        assert_eq!(reviewer.id(), Some("acceptance-secret-value-scan"));
+        assert!(reviewer.to_json().get("declaration_identity").is_none());
+        let coverage = evaluate_remediation_coverage(&mixed, &[]);
+        assert_eq!(coverage.missing_required.len(), 1);
+        assert_eq!(coverage.missing_verification.len(), 1);
+        // Legacy text findings keep the fallback identity.
+        assert_eq!(
+            vdi_identities(&crate::acceptance::legacy_findings([
+                "Missing retry test at src/run.rs:10"
+            ])),
+            ["repository|src/run.rs|verification"]
+        );
     }
 }

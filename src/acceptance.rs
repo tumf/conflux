@@ -535,6 +535,75 @@ pub fn validate_repository_finding(
 pub struct AcceptanceFinding {
     text: String,
     structured: Option<RepositoryFinding>,
+    native: Option<NativeDeclarationIdentity>,
+}
+
+/// Runtime-native identity of one verification declaration defect.
+///
+/// Carried beside the human `[DECLARATION_INVALID]` text rather than parsed out
+/// of it, so the repair ledger compares (change, declaration key, field, code)
+/// and nothing else: list order, line numbers, detail wording, and the
+/// candidate revision are never identity inputs. Process-local observability,
+/// never persisted as workflow authority.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NativeDeclarationIdentity {
+    change_id: String,
+    key: crate::openspec::DeclarationKey,
+    field: String,
+    code: String,
+}
+
+impl NativeDeclarationIdentity {
+    /// Copy the identity of a production declaration defect.
+    ///
+    /// The key is the defect's own typed key, fixed by the reader or planner
+    /// where the source still knew whether an `id` was authored. Neither the
+    /// display label nor the position is consulted, so an authored ID spelled
+    /// like a fallback label keeps its named identity.
+    pub fn from_defect(
+        change_id: &str,
+        defect: &crate::orchestration::acceptance::verification_evidence::DeclarationDefect,
+    ) -> Self {
+        Self {
+            change_id: change_id.to_string(),
+            key: defect.key.clone(),
+            field: defect.field.clone(),
+            code: defect.code.clone(),
+        }
+    }
+
+    /// `repository|declaration|` plus a JSON array, so a user-authored ID can
+    /// never collide with a positional or proposal-scoped key, and `|`, `"`, or
+    /// `,` inside an ID stays unambiguous.
+    pub fn comparison_identity(&self) -> String {
+        use crate::openspec::DeclarationKey;
+        let (tag, value) = match &self.key {
+            DeclarationKey::Id(id) => ("id", id.clone()),
+            DeclarationKey::Position(position) => ("position", position.to_string()),
+            DeclarationKey::Proposal => ("proposal", String::new()),
+        };
+        let parts = [
+            self.change_id.as_str(),
+            tag,
+            value.as_str(),
+            self.field.as_str(),
+            self.code.as_str(),
+        ];
+        format!(
+            "repository|declaration|{}",
+            serde_json::to_string(&parts).unwrap_or_default()
+        )
+    }
+
+    /// Observability-only projection.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "change_id": self.change_id,
+            "key": self.key,
+            "field": self.field,
+            "code": self.code,
+        })
+    }
 }
 
 impl AcceptanceFinding {
@@ -543,6 +612,7 @@ impl AcceptanceFinding {
         Self {
             text: text.into(),
             structured: None,
+            native: None,
         }
     }
 
@@ -551,7 +621,24 @@ impl AcceptanceFinding {
         Self {
             text: finding.to_single_line(),
             structured: Some(finding),
+            native: None,
         }
+    }
+
+    /// A runtime-native declaration-defect finding: the complete human text
+    /// plus its typed identity. It carries no reviewer ID and declares no
+    /// remediation paths.
+    pub fn declaration_defect(text: String, identity: NativeDeclarationIdentity) -> Self {
+        Self {
+            text,
+            structured: None,
+            native: Some(identity),
+        }
+    }
+
+    /// Typed native declaration identity, when the runtime constructed one.
+    pub fn native_identity(&self) -> Option<&NativeDeclarationIdentity> {
+        self.native.as_ref()
     }
 
     /// Complete actionable text. Never a normalized identity.
@@ -577,9 +664,13 @@ impl AcceptanceFinding {
 
     /// Machine-readable payload for the Apply repair prompt.
     pub fn to_json(&self) -> serde_json::Value {
-        match &self.structured {
-            Some(finding) => finding.to_json(),
-            None => serde_json::json!({"finding": self.text}),
+        match (&self.structured, &self.native) {
+            (Some(finding), _) => finding.to_json(),
+            (None, Some(identity)) => serde_json::json!({
+                "finding": self.text,
+                "declaration_identity": identity.to_json(),
+            }),
+            (None, None) => serde_json::json!({"finding": self.text}),
         }
     }
 }

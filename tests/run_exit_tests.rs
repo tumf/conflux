@@ -2469,3 +2469,237 @@ fn rerun_leading_env_verify_metadata_never_carries_an_assignment_value() {
     );
     assert!(!stderr.contains(SENTINEL), "{stderr}");
 }
+
+// ─── Verification declaration integrity (real binary) ──────────────────────
+
+impl FailClosedProject {
+    /// Replace the change's `proposal.md` with `content` verbatim and commit.
+    fn write_raw_proposal(&self, change: &str, content: &str) {
+        let path = self
+            .repo
+            .path()
+            .join("openspec/changes")
+            .join(change)
+            .join("proposal.md");
+        fs::write(path, content).unwrap();
+        git(self.repo.path(), &["add", "-A"]);
+        git(
+            self.repo.path(),
+            &["commit", "--quiet", "-m", "raw proposal"],
+        );
+    }
+}
+
+/// Strict and archive-gate validation collide `gate` and `" gate "` on the
+/// trimmed ID every other consumer uses, rather than treating them as distinct
+/// or suppressing the planner's duplicate defect as already reported.
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn verification_declaration_integrity_validate_rejects_trimmed_duplicate_ids() {
+    let project = FailClosedProject::new();
+    let change = "trimmed-duplicate";
+    project.write_change(
+        change,
+        &[
+            required_gate(change, "gate", "git --version"),
+            required_gate(change, "\" gate \"", "git --version"),
+        ],
+    );
+
+    for mode in ["--strict", "--archive-gate"] {
+        let output = project.cflx(&["openspec", "validate", change, mode]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{mode} must fail: {stderr}");
+        assert!(
+            stderr.contains("trimmed-duplicate: verification 'gate': id: ")
+                && stderr.contains("(declaration_duplicate_id)")
+                && stderr.contains("positions 1, 2"),
+            "{mode} must report the planner's trimmed duplicate: {stderr}"
+        );
+    }
+}
+
+/// `verify --plan` and `verify` refuse a wrong-typed `rerun` and an unclosed
+/// frontmatter with exit 1 and typed JSON defects — regardless of
+/// `--verification-id` — leave pre-existing evidence byte-identical, and run
+/// nothing; the valid control proves the fixture really can run a gate.
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn verification_declaration_integrity_verify_refuses_defective_sources() {
+    const SENTINEL: &str = "VDI-CLI-SENTINEL-5c0e2a";
+    let project = FailClosedProject::new();
+    let change = "declaration-source";
+    let markers = tempfile::tempdir().expect("marker dir");
+    let valid_marker = markers.path().join("valid-ran");
+    let invalid_marker = markers.path().join("invalid-ran");
+    let valid = required_gate(
+        change,
+        "valid-gate",
+        &format!("touch {}", valid_marker.display()),
+    );
+
+    // Valid control: real evidence recorded outside the repository.
+    project.write_change(change, std::slice::from_ref(&valid));
+    let first = project.cflx(&["openspec", "verify", change, "--json"]);
+    assert!(
+        first.status.success(),
+        "the valid control must capture evidence: {} {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(valid_marker.exists(), "the valid gate really ran once");
+    fs::remove_file(&valid_marker).unwrap();
+    let before = project.state_snapshot();
+    assert!(before
+        .keys()
+        .any(|path| path.ends_with("gates/valid-gate.json")));
+
+    let wrong_typed = format!(
+        "---\nverifications:\n{valid}  - id: list-gate\n    requirement: fixture\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: pull request\n    automation: openspec/changes/{change}/proposal.md\n    evidence: \"x\"\n    rerun: [touch, {}, {SENTINEL}]\n    prerequisites: []\n    execution_class: repository-local\n    completion_role: change-blocking\n---\n# Fixture\n",
+        invalid_marker.display()
+    );
+    let unclosed = format!(
+        "---\nverifications:\n{valid}  - id: {SENTINEL}\n# Fixture without a closing delimiter\n"
+    );
+    for (label, content, expected_key, field) in [
+        (
+            "wrong-typed",
+            wrong_typed,
+            serde_json::json!({"kind": "id", "value": "list-gate"}),
+            "rerun",
+        ),
+        (
+            "unclosed",
+            unclosed,
+            serde_json::json!({"kind": "proposal"}),
+            "frontmatter",
+        ),
+    ] {
+        project.write_raw_proposal(change, &content);
+        let before_runs = project.state_snapshot();
+        assert_eq!(before_runs, before, "{label}: state untouched so far");
+        for args in [
+            vec!["openspec", "verify", change, "--plan", "--json"],
+            vec!["openspec", "verify", change, "--json"],
+            vec![
+                "openspec",
+                "verify",
+                change,
+                "--verification-id",
+                "valid-gate",
+                "--json",
+            ],
+            vec![
+                "openspec",
+                "verify",
+                change,
+                "--plan",
+                "--verification-id",
+                "valid-gate",
+                "--json",
+            ],
+            vec!["openspec", "verify", change],
+        ] {
+            let output = project.cflx(&args);
+            assert_eq!(output.status.code(), Some(1), "{label} {args:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            assert!(
+                !stdout.is_empty(),
+                "{label} {args:?}: a diagnostic is printed"
+            );
+            assert!(
+                !stdout.contains(SENTINEL),
+                "{label} {args:?} echoed: {stdout}"
+            );
+            assert!(
+                !stdout.contains("touch"),
+                "{label} {args:?} echoed: {stdout}"
+            );
+            if !args.contains(&"--json") {
+                assert!(
+                    stdout.contains("(declaration_metadata_invalid)"),
+                    "{stdout}"
+                );
+                continue;
+            }
+            let report: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|e| panic!("{label} {args:?}: JSON ({e}): {stdout}"));
+            let defects = report["declaration_defects"].as_array().unwrap();
+            assert_eq!(defects.len(), 1, "{label}: {report}");
+            assert_eq!(defects[0]["code"], "declaration_metadata_invalid");
+            assert_eq!(defects[0]["field"], field);
+            assert_eq!(defects[0]["key"], expected_key);
+            assert_eq!(report["verifications"], serde_json::json!([]));
+        }
+        assert!(
+            !valid_marker.exists(),
+            "{label}: not even the valid gate runs"
+        );
+        assert!(
+            !invalid_marker.exists(),
+            "{label}: the defective gate never runs"
+        );
+        assert_eq!(
+            project.state_snapshot(),
+            before,
+            "{label}: existing evidence must be byte-identical"
+        );
+    }
+
+    // A legitimately empty source keeps zero-gate success.
+    project.write_raw_proposal(change, "---\nverifications: []\n---\n# Fixture\n");
+    let empty = project.cflx(&["openspec", "verify", change, "--plan", "--json"]);
+    assert_eq!(
+        empty.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    let empty: serde_json::Value = serde_json::from_slice(&empty.stdout).expect("JSON");
+    assert_eq!(empty["verifications"], serde_json::json!([]));
+
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(project.repo.path())
+        .output()
+        .unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "nothing may be written inside the repository: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+/// Strict validation reports source defects with a non-echoing diagnostic
+/// naming the change, the ID label, and the field.
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn verification_declaration_integrity_validate_reports_source_defects() {
+    const SENTINEL: &str = "VDI-VALIDATE-SENTINEL-71d4";
+    let project = FailClosedProject::new();
+    let change = "source-validate";
+    project.write_change(change, &[required_gate(change, "gate", "git --version")]);
+    for (content, expected) in [
+        (
+            format!("---\nverifications:\n  - id: gate\n    rerun: [{SENTINEL}]\n---\n# Fixture\n"),
+            "source-validate: verification 'gate': rerun: rerun is a sequence, expected a string (declaration_metadata_invalid)",
+        ),
+        (
+            format!("---\nverifications:\n  - id: {SENTINEL}\n# no closing delimiter\n"),
+            "source-validate: verification '<proposal>': frontmatter: opened frontmatter block has no closing delimiter (declaration_metadata_invalid)",
+        ),
+    ] {
+        project.write_raw_proposal(change, &content);
+        for mode in ["--strict", "--archive-gate"] {
+            let output = project.cflx(&["openspec", "validate", change, mode]);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{mode}: {stderr}");
+            assert!(stderr.contains(expected), "{mode}: {stderr}");
+            assert!(!stderr.contains(SENTINEL), "{mode} echoed: {stderr}");
+            assert!(
+                !stderr.contains("Failed to decode proposal frontmatter fields"),
+                "{mode}: {stderr}"
+            );
+        }
+    }
+}

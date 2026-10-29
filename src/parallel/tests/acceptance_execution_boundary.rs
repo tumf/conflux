@@ -1906,3 +1906,185 @@ async fn acceptance_provenance_state_root_loss_changes_no_admission() {
     assert_eq!(with_state, without_state);
     assert_eq!(without_state, AcceptanceAdmission::Admit);
 }
+
+// ============================================================================
+// verification_declaration_integrity: the candidate's own metadata, read through
+// the fallible source reader
+// ============================================================================
+
+/// A fixture whose base commit carries a valid required gate and whose Apply
+/// commit then rewrote the candidate's `proposal.md` to `candidate`.
+///
+/// The base proposal would pass strict validation; nothing about it may be
+/// consulted as evidence about the candidate.
+async fn apply_mutated_fixture(change: &str, command: &str, candidate: &str) -> Fixture {
+    let fixture = Fixture::new(
+        change,
+        &proposal_with_declarations(&[declaration_yaml(change, "valid-gate", command)]),
+    )
+    .await;
+    std::fs::write(
+        fixture
+            .path()
+            .join("openspec/changes")
+            .join(change)
+            .join("proposal.md"),
+        candidate,
+    )
+    .or_fail("unexpected error");
+    commit_all(fixture.path(), &format!("Apply: mutate {change}")).await;
+    fixture
+}
+
+async fn head_commit(fixture: &Fixture) -> String {
+    git_out(fixture.path(), &["rev-parse", "HEAD"]).await
+}
+
+#[tokio::test]
+async fn verification_declaration_integrity_mutated_candidate_metadata_fails_natively() {
+    for (suffix, candidate, field) in [
+        (
+            "wrong-typed",
+            "---\nverifications:\n  - id: valid-gate\n    rerun: [cargo, test]\n    completion_role: change-blocking\n---\n# Change\n",
+            "rerun",
+        ),
+        (
+            "unclosed",
+            "---\nverifications:\n  - id: valid-gate\n    completion_role: change-blocking\n# Change without a closing delimiter\n",
+            "frontmatter",
+        ),
+    ] {
+        let change = format!("verification-declaration-integrity-{suffix}");
+        let gate_root = TempDir::new().or_fail("unexpected error");
+        let (command, counter) = counting_gate(gate_root.path());
+        let fixture = apply_mutated_fixture(&change, &command, candidate).await;
+        let candidate_commit = head_commit(&fixture).await;
+        let config = config_with_reviewer(canonical_reviewer());
+
+        let (result, iteration) = fixture.accept(&config, &runner(3600)).await;
+
+        let findings = match result {
+            AcceptanceResult::Fail { findings } => findings,
+            other => panic!("{suffix}: defective candidate metadata must FAIL, got {other:?}"),
+        };
+        assert_eq!(findings.len(), 1, "{suffix}: {findings:?}");
+        let finding = &findings[0];
+        assert!(
+            finding.text().starts_with(&format!(
+                "[DECLARATION_INVALID] openspec/changes/{change}/proposal.md: "
+            )),
+            "{finding}"
+        );
+        assert!(
+            finding.text().contains("declaration_metadata_invalid"),
+            "{finding}"
+        );
+        assert!(!finding.text().contains("cargo"), "{finding}");
+        assert!(finding.native_identity().is_some());
+        assert!(!finding.declares_paths());
+        assert!(iteration > 0, "a declaration verdict records a real attempt");
+
+        assert!(!fixture.reviewer_started(), "{suffix}: no reviewer");
+        assert_eq!(gate_runs(&counter), 0, "{suffix}: no gate");
+        assert!(
+            !fixture.store_root().await.join("gates").exists(),
+            "{suffix}: no evidence written"
+        );
+        assert!(
+            crate::orchestration::acceptance::execution_manifest::live_acceptance_holds()
+                .get(&change)
+                .is_none(),
+            "{suffix}: a verdict records no execution hold"
+        );
+        let manifest = fixture.manifests().await.load().expect("manifest");
+        assert_eq!(manifest.candidate_commit_oid, candidate_commit);
+        assert!(manifest.gates.is_empty());
+        assert_eq!(manifest.declaration_defects.len(), 1);
+        assert_eq!(
+            manifest.declaration_defects[0].code,
+            "declaration_metadata_invalid"
+        );
+        assert_eq!(manifest.declaration_defects[0].field, field);
+        assert!(fixture.porcelain_status().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn verification_declaration_integrity_missing_candidate_proposal_is_a_manifest_hold() {
+    let change = "verification-declaration-integrity-missing";
+    let gate_root = TempDir::new().or_fail("unexpected error");
+    let (command, counter) = counting_gate(gate_root.path());
+    let fixture = Fixture::new(
+        change,
+        &proposal_with_declarations(&[declaration_yaml(change, "valid-gate", &command)]),
+    )
+    .await;
+    std::fs::remove_file(
+        fixture
+            .path()
+            .join("openspec/changes")
+            .join(change)
+            .join("proposal.md"),
+    )
+    .or_fail("unexpected error");
+    commit_all(fixture.path(), "Apply: drop the proposal").await;
+    let config = config_with_reviewer(canonical_reviewer());
+
+    let (result, _) = fixture.accept(&config, &runner(3600)).await;
+
+    let hold = hold_of(result);
+    assert_eq!(hold.category, AcceptanceHoldCategory::ManifestMalformed);
+    assert_eq!(hold.fingerprint, "0".repeat(64));
+    assert!(
+        hold.evidence.iter().any(|line| line
+            .contains(&format!("openspec/changes/{change}/proposal.md"))
+            && line.contains("NotFound")),
+        "{:?}",
+        hold.evidence
+    );
+    assert!(!fixture.reviewer_started(), "no reviewer");
+    assert_eq!(gate_runs(&counter), 0, "no gate");
+    assert!(
+        !fixture.store_root().await.join("gates").exists(),
+        "no evidence written"
+    );
+    assert!(
+        fixture.manifests().await.load().is_err(),
+        "no manifest was derived"
+    );
+}
+
+#[tokio::test]
+async fn verification_declaration_integrity_valid_and_empty_candidates_still_run() {
+    let change = "verification-declaration-integrity-valid";
+    let gate_root = TempDir::new().or_fail("unexpected error");
+    let (command, counter) = counting_gate(gate_root.path());
+    let fixture = Fixture::new(
+        change,
+        &proposal_with_declarations(&[declaration_yaml(change, "valid-gate", &command)]),
+    )
+    .await;
+    let config = config_with_reviewer(canonical_reviewer());
+    let (result, _) = fixture.accept(&config, &runner(3600)).await;
+    assert!(matches!(result, AcceptanceResult::Pass), "{result:?}");
+    assert_eq!(gate_runs(&counter), 1);
+    assert!(fixture.reviewer_started());
+
+    for (suffix, candidate) in [
+        ("legacy", "# Legacy proposal without frontmatter\n"),
+        ("null", "---\nverifications:\n---\n# Change\n"),
+        ("empty-list", "---\nverifications: []\n---\n# Change\n"),
+    ] {
+        let change = format!("verification-declaration-integrity-empty-{suffix}");
+        let fixture = Fixture::new(&change, candidate).await;
+        let (result, _) = fixture.accept(&config, &runner(3600)).await;
+        assert!(
+            matches!(result, AcceptanceResult::Pass),
+            "{suffix}: {result:?}"
+        );
+        assert!(fixture.reviewer_started(), "{suffix}: reviewer runs");
+        let manifest = fixture.manifests().await.load().expect("manifest");
+        assert!(!manifest.has_gates());
+        assert!(!manifest.is_declaration_invalid());
+    }
+}

@@ -204,13 +204,13 @@ fn acceptance_provenance_tokens_serialize_as_their_documented_strings() {
 #[test]
 fn acceptance_provenance_declaration_invalid_names_the_defect_without_a_reviewer() {
     let mut manifest = manifest("alpha", Vec::new());
-    let defect = DeclarationDefect {
-        verification_id: "shell-gate".to_string(),
-        position: 2,
-        field: "rerun".to_string(),
-        code: "declaration_shell_syntax".to_string(),
-        detail: "uses shell syntax".to_string(),
-    };
+    let defect = DeclarationDefect::new(
+        crate::openspec::DeclarationKey::Id("shell-gate".to_string()),
+        2,
+        "rerun",
+        "declaration_shell_syntax",
+        "uses shell syntax".to_string(),
+    );
     manifest.declaration_defects = vec![defect.clone()];
     let verdict = GateVerdict::DeclarationInvalid {
         defects: vec![defect],

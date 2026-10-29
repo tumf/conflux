@@ -30,9 +30,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::archive_layout;
-use crate::openspec::VerificationDeclaration;
+use crate::openspec::{VerificationDeclaration, VerificationSource};
 use crate::orchestration::acceptance::evidence_location::{prepare_store, AcceptanceStore};
-use crate::orchestration::acceptance::execution_manifest::plan_declared_gates;
+use crate::orchestration::acceptance::execution_manifest::plan_verification_source;
 use crate::orchestration::acceptance::verification_evidence::{
     decide_reuse, eligible_request, plan_reuse, CaptureOutcome, DeclarationDefect, EvidenceStore,
     GitRepositoryFacts, ReusePolicy, RuntimeVerificationExecutor, SystemClock, VerificationRequest,
@@ -69,10 +69,20 @@ fn proposal_path(workspace: &Path, change_id: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Read the declarations of one change from the workspace.
-fn declarations(workspace: &Path, change_id: &str) -> Result<Vec<VerificationDeclaration>, String> {
+/// Read the declaration source of one change from the workspace.
+///
+/// Through the fallible reader, never the tolerant display parser: structural
+/// metadata defects travel with the answer, and a proposal that cannot be read
+/// is the same proposal-resolution error as one that does not exist.
+fn declarations(workspace: &Path, change_id: &str) -> Result<VerificationSource, String> {
     let proposal = proposal_path(workspace, change_id)?;
-    Ok(crate::openspec::parse_proposal_metadata_from_file(&proposal).verifications)
+    crate::openspec::read_verification_source(&proposal).map_err(|error| {
+        format!(
+            "Change '{change_id}' proposal at {} could not be read ({:?})",
+            error.path.display(),
+            error.kind
+        )
+    })
 }
 
 /// Keep only the declaration the operator named, if they named one.
@@ -301,17 +311,18 @@ pub(crate) async fn verify_in_workspace(
     json_output: bool,
 ) -> Result<i32, String> {
     let workspace: PathBuf = workspace.to_path_buf();
-    let declared = declarations(&workspace, change_id)?;
-    // The whole proposal is planned before any selection: duplicates and the
-    // required set are properties of the list, so `--verification-id` cannot
-    // narrow defect evaluation. Defects stop here, before the store is even
-    // resolved, so no evidence is read for reuse or modified.
-    let plan = plan_declared_gates(&declared);
+    let source = declarations(&workspace, change_id)?;
+    // The whole proposal is planned before any selection: source defects,
+    // duplicates, and the required set are properties of the list, so
+    // `--verification-id` cannot narrow defect evaluation. Defects stop here,
+    // before the store is even resolved, so no evidence is read for reuse or
+    // modified.
+    let plan = plan_verification_source(&source);
     if !plan.is_valid() {
         report_declaration_defects(change_id, &plan.defects, json_output);
         return Ok(EXIT_UNSATISFIED);
     }
-    let selected = select(declared, verification_id)?;
+    let selected = select(source.declarations, verification_id)?;
     let store = resolve_store(&workspace, change_id)?;
     if plan_only {
         report_plan(&workspace, &store.evidence(), &selected, json_output).await?;
@@ -344,6 +355,7 @@ fn resolve_store(workspace: &Path, change_id: &str) -> Result<AcceptanceStore, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::acceptance::execution_manifest::plan_declared_gates;
     use crate::orchestration::acceptance::verification_evidence::{
         EvidenceDefect, RepositoryFacts, RerunReason, ReuseDecision, ToolIdentity,
         VerificationReusePlan,
@@ -402,7 +414,9 @@ mod tests {
         )
         .expect("write proposal");
 
-        let declared = declarations(workspace.path(), "example").expect("declarations");
+        let declared = declarations(workspace.path(), "example")
+            .expect("declarations")
+            .declarations;
         assert_eq!(declared.len(), 1);
         assert_eq!(declared[0].id.as_deref(), Some("local-tests"));
     }
@@ -509,7 +523,9 @@ mod tests {
                 .path()
                 .join("openspec/changes/archive/2026-07-09-example/proposal.md")
         );
-        let declared = declarations(workspace.path(), "example").expect("declarations");
+        let declared = declarations(workspace.path(), "example")
+            .expect("declarations")
+            .declarations;
         assert_eq!(declared.len(), 1);
         assert_eq!(declared[0].id.as_deref(), Some("local-tests"));
 
@@ -568,6 +584,7 @@ mod tests {
         assert_eq!(
             declarations(workspace.path(), "example")
                 .expect("declarations")
+                .declarations
                 .len(),
             1
         );
@@ -704,5 +721,97 @@ mod tests {
         let line = decision.summary();
         assert!(line.starts_with("local-tests: rerun"));
         assert!(line.contains("evidence_missing"));
+    }
+
+    fn write_proposal_content(workspace: &Path, change: &str, content: &str) {
+        let dir = workspace.join("openspec/changes").join(change);
+        std::fs::create_dir_all(&dir).expect("create proposal dir");
+        std::fs::write(dir.join("proposal.md"), content).expect("write proposal");
+    }
+
+    /// A wrong-typed field or an unclosed frontmatter is a source defect that
+    /// stops `verify` before the store is resolved — with or without
+    /// `--verification-id` — never a successful empty plan.
+    #[tokio::test]
+    async fn verification_declaration_integrity_verify_refuses_defective_sources() {
+        for content in [
+            "---\nverifications:\n  - id: local-tests\n    rerun: [cargo, test]\n    completion_role: change-blocking\n---\n# Example\n",
+            "---\nverifications:\n  - id: local-tests\n# Example without a closing delimiter\n",
+        ] {
+            let workspace = tempfile::tempdir().expect("tempdir");
+            write_proposal_content(workspace.path(), "example", content);
+
+            let source = declarations(workspace.path(), "example").expect("readable");
+            assert!(source.declarations.is_empty());
+            assert_eq!(source.defects.len(), 1);
+            let plan = plan_verification_source(&source);
+            assert_eq!(plan.defects[0].code, "declaration_metadata_invalid");
+
+            for verification_id in [None, Some("local-tests")] {
+                for plan_only in [true, false] {
+                    let status = verify_in_workspace(
+                        workspace.path(),
+                        "example",
+                        verification_id,
+                        plan_only,
+                        true,
+                    )
+                    .await
+                    .expect("defects are a reported outcome");
+                    assert_eq!(status, EXIT_UNSATISFIED);
+                }
+            }
+            let mut entries = std::fs::read_dir(workspace.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            assert_eq!(entries, vec![std::ffi::OsString::from("openspec")]);
+        }
+    }
+
+    /// A proposal that cannot be resolved or read uses the proposal-resolution
+    /// error route, never an empty declaration list.
+    #[tokio::test]
+    async fn verification_declaration_integrity_verify_unreadable_proposal_is_an_error() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let error = verify_in_workspace(workspace.path(), "absent", None, true, true)
+            .await
+            .unwrap_err();
+        assert!(error.contains("has no proposal"), "{error}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            write_proposal_content(workspace.path(), "locked", PROPOSAL);
+            let path = workspace.path().join("openspec/changes/locked/proposal.md");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Privileged runners can read a 0000 file; the route is only
+            // observable where the read genuinely fails.
+            if std::fs::read(&path).is_err() {
+                let error = verify_in_workspace(workspace.path(), "locked", None, true, true)
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("could not be read"), "{error}");
+                assert!(error.contains("PermissionDenied"), "{error}");
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    /// Legitimately empty sources keep their zero-defect plan.
+    #[test]
+    fn verification_declaration_integrity_verify_keeps_empty_sources_valid() {
+        for content in [
+            "# Example\n",
+            "---\nverifications:\n---\n# Example\n",
+            "---\nverifications: []\n---\n# Example\n",
+        ] {
+            let workspace = tempfile::tempdir().expect("tempdir");
+            write_proposal_content(workspace.path(), "example", content);
+            let source = declarations(workspace.path(), "example").expect("readable");
+            assert!(plan_verification_source(&source).is_valid());
+            assert!(source.declarations.is_empty());
+        }
     }
 }

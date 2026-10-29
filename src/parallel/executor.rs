@@ -2188,6 +2188,34 @@ pub async fn execute_acceptance_in_workspace(
     outcome
 }
 
+/// The `fail` findings of an invalid required declaration set: one native
+/// finding per defect.
+///
+/// The human text is exactly what it always was; the typed identity travels
+/// beside it, so each distinct defect gets its own repair opportunity and
+/// nothing downstream parses the prose.
+pub(crate) fn declaration_invalid_findings(
+    change_id: &str,
+    short_candidate: &str,
+    defects: &[crate::orchestration::acceptance::verification_evidence::DeclarationDefect],
+) -> Vec<crate::acceptance::AcceptanceFinding> {
+    let proposal = format!("openspec/changes/{change_id}/proposal.md");
+    defects
+        .iter()
+        .map(|defect| {
+            crate::acceptance::AcceptanceFinding::declaration_defect(
+                format!(
+                    "[DECLARATION_INVALID] {proposal}: {} — a change-blocking verification must \
+                     be a supervisable declaration; no declared gate ran against candidate \
+                     {short_candidate}.",
+                    defect.summary()
+                ),
+                crate::acceptance::NativeDeclarationIdentity::from_defect(change_id, defect),
+            )
+        })
+        .collect()
+}
+
 /// One Acceptance invocation, recording what it did into `trace`.
 #[allow(clippy::too_many_arguments)]
 async fn run_acceptance_invocation(
@@ -2399,7 +2427,7 @@ async fn run_acceptance_invocation(
                 )];
                 findings.extend(evidence.iter().cloned());
                 Some((
-                    findings,
+                    crate::acceptance::legacy_findings(findings),
                     format!(
                         "Acceptance failed on a declared change-blocking verification: {}",
                         evidence.join(" | ")
@@ -2408,19 +2436,8 @@ async fn run_acceptance_invocation(
             }
             GateVerdict::DeclarationInvalid { defects } => {
                 let proposal = format!("openspec/changes/{change_id}/proposal.md");
-                let findings: Vec<String> = defects
-                    .iter()
-                    .map(|defect| {
-                        format!(
-                            "[DECLARATION_INVALID] {proposal}: {} — a change-blocking \
-                             verification must be a supervisable declaration; no declared gate \
-                             ran against candidate {short_candidate}.",
-                            defect.summary()
-                        )
-                    })
-                    .collect();
                 Some((
-                    findings,
+                    declaration_invalid_findings(change_id, short_candidate, defects),
                     format!(
                         "Acceptance failed: {} invalid required verification declaration(s) in \
                          {proposal}",
@@ -2432,7 +2449,6 @@ async fn run_acceptance_invocation(
         };
         if let Some((findings, log_message)) = gate_fail {
             let attempt_number = agent.next_acceptance_attempt_number(change_id);
-            let findings = crate::acceptance::legacy_findings(findings);
             let attempt = crate::history::AcceptanceAttempt {
                 attempt: attempt_number,
                 passed: false,

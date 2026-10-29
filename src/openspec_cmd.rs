@@ -2828,9 +2828,10 @@ mod openspec_list_show_tests {
         fs::write(change_dir.join("proposal.md"), invalid).unwrap();
         let (valid, errors, _) = mgr.validate_change(Some("verification-contract"), true, "off");
         assert!(!valid);
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("duplicate verification id")));
+        // Reported once per occurrence by the shared planner, on the trimmed ID.
+        assert!(errors.iter().any(|error| error
+            .contains("verification-contract: verification 'duplicate': id: ")
+            && error.contains("(declaration_duplicate_id)")));
         assert!(errors
             .iter()
             .any(|error| error.contains("post-integration requires owner")));
@@ -3612,8 +3613,8 @@ mod openspec_list_show_tests {
         assert!(!target_valid);
         assert!(
             target_errors.iter().any(|error| error
-                .contains("malformed-target: proposal.md verification metadata")
-                && error.contains("surprise_key")),
+                == "malformed-target: verification 'local-tests': surprise_key: unknown \
+                    verification field (declaration_metadata_invalid)"),
             "{target_errors:?}"
         );
         assert!(

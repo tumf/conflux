@@ -153,6 +153,15 @@ async fn commit_archive_to_base(repo_root: &Path, archive_leaf: &str, change_id:
         .await
         .or_fail("unexpected error");
 }
+/// A readable proposal with no verification declarations: a legitimately
+/// empty Acceptance allowlist. A missing proposal is source-unavailable and
+/// settles as a manifest hold, which is not what these routing cases exercise.
+fn write_readable_proposal(repo_root: &std::path::Path, change_id: &str) {
+    let change_dir = repo_root.join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("unexpected error");
+    std::fs::write(change_dir.join("proposal.md"), "# Change\n").or_fail("unexpected error");
+}
+
 #[tokio::test]
 async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() {
     let temp = TempDir::new().or_fail("create temp repo");
@@ -1872,6 +1881,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
 async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_context() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     // Create a workspace commit so acceptance diff context has a real delta target.
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
@@ -1996,6 +2006,7 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
 async fn test_acceptance_fail_records_follow_up_tasks() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
         .or_fail("unexpected error");
@@ -2333,6 +2344,7 @@ fn repeated_follow_up_recovery_produces_identical_files() {
 async fn test_acceptance_history_records_end_revision_when_head_changes() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
         .or_fail("unexpected error");
@@ -2424,6 +2436,7 @@ async fn test_acceptance_history_records_end_revision_when_head_changes() {
 async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
         .or_fail("unexpected error");
@@ -2545,6 +2558,7 @@ async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
 async fn test_archive_guard_allows_archive_after_acceptance_head_change_pass() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
         .or_fail("unexpected error");
@@ -11924,6 +11938,7 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
     use std::time::{Duration, Instant};
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
         .or_fail("unexpected error");
@@ -12038,6 +12053,7 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
 async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
         .or_fail("unexpected error");
@@ -12145,6 +12161,7 @@ async fn test_acceptance_cancels_while_waiting_for_silent_streaming_output() {
 
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     let acceptance_config = create_test_config_with(OrchestratorConfig {
         acceptance_command: Some("sh -c 'sleep 30'".to_string()),
@@ -12293,6 +12310,7 @@ async fn test_archive_cancels_while_waiting_for_silent_streaming_output() {
 async fn test_acceptance_trailing_text_pass_is_not_canonical() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
         .or_fail("unexpected error");
@@ -12382,6 +12400,7 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
 async fn test_acceptance_status_only_exit_is_missing_verdict_not_continue() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
         .or_fail("unexpected error");
@@ -12509,6 +12528,7 @@ async fn test_acceptance_status_only_exit_is_missing_verdict_not_continue() {
 async fn test_acceptance_explicit_continue_verdict_retains_continue_routing() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
         .or_fail("unexpected error");
@@ -12590,6 +12610,7 @@ async fn test_acceptance_explicit_continue_verdict_retains_continue_routing() {
 async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
+    write_readable_proposal(repo_root.path(), "change-a");
 
     std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
         .or_fail("unexpected error");

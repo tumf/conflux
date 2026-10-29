@@ -59,7 +59,8 @@ use super::verification_evidence::{
     VerificationRequest,
 };
 use crate::openspec::{
-    VerificationCompletionRole, VerificationDeclaration, VerificationExecutionClass,
+    DeclarationKey, VerificationCompletionRole, VerificationDeclaration,
+    VerificationExecutionClass, VerificationSource,
 };
 
 /// The only phase whose declarations may block a change before integration.
@@ -1445,15 +1446,15 @@ pub fn plan_declared_gates(declarations: &[VerificationDeclaration]) -> Declarat
     for (index, declaration) in declarations.iter().enumerate() {
         let position = index + 1;
         let id = trimmed_id(declaration);
-        let label = id
+        // Provenance is fixed here, while the source still knows whether an
+        // `id` was authored; the label is only a projection of the key.
+        let key = id
             .clone()
-            .unwrap_or_else(|| format!("<position {position}>"));
-        let defect = |field: &str, code: &str, detail: String| DeclarationDefect {
-            verification_id: label.clone(),
-            position,
-            field: field.to_string(),
-            code: code.to_string(),
-            detail,
+            .map(DeclarationKey::Id)
+            .unwrap_or(DeclarationKey::Position(position));
+        let label = key.label();
+        let defect = |field: &str, code: &str, detail: String| {
+            DeclarationDefect::new(key.clone(), position, field, code, detail)
         };
 
         if let Some(positions) = id
@@ -1555,6 +1556,38 @@ pub fn plan_declared_gates(declarations: &[VerificationDeclaration]) -> Declarat
     }
     plan
 }
+
+/// Plan the blocking gate set from the fallible verification-source reader.
+///
+/// With any source defect no gate is planned and the planner rules are not
+/// evaluated on a partially decoded list: each source defect becomes one
+/// `declaration_metadata_invalid` defect carrying the reader's own key and
+/// position, in reader order. A defect-free source is exactly
+/// [`plan_declared_gates`].
+pub fn plan_verification_source(source: &VerificationSource) -> DeclarationPlan {
+    if source.is_valid() {
+        return plan_declared_gates(&source.declarations);
+    }
+    DeclarationPlan {
+        gates: Vec::new(),
+        defects: source
+            .defects
+            .iter()
+            .map(|defect| {
+                DeclarationDefect::new(
+                    defect.key.clone(),
+                    defect.position,
+                    &defect.field,
+                    DECLARATION_METADATA_INVALID,
+                    defect.detail.clone(),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Stable code of a structural verification-metadata source defect.
+pub const DECLARATION_METADATA_INVALID: &str = "declaration_metadata_invalid";
 
 /// Digest a set of canonical change inputs into one full-length value.
 ///

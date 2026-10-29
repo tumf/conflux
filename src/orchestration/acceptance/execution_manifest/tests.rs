@@ -1226,3 +1226,228 @@ fn rerun_leading_env_stored_manifest_carries_names_and_digest_only() {
         "values are never reloaded"
     );
 }
+
+// ============================================================================
+// verification_declaration_integrity: one fallible source-to-plan path and
+// declaration keys fixed from source provenance
+// ============================================================================
+
+/// One required declaration entry as proposal YAML; `id: None` omits the key.
+fn required_yaml(id: Option<&str>, command: &str) -> String {
+    let id_line = id.map_or_else(String::new, |id| format!("    id: \"{id}\"\n"));
+    format!(
+        "  - completion_role: change-blocking\n{id_line}    requirement: r\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: t\n    automation: Cargo.toml\n    evidence: \"{command}\"\n    rerun: \"{command}\"\n    prerequisites: []\n    execution_class: repository-local\n"
+    )
+}
+
+/// Plan a proposal assembled from entries through the production reader.
+fn plan_entries(entries: &[String]) -> DeclarationPlan {
+    let content = format!("---\nverifications:\n{}---\n# Change\n", entries.concat());
+    plan_verification_source(&crate::openspec::parse_verification_source(
+        &content,
+        std::path::Path::new("openspec/changes/c/proposal.md"),
+    ))
+}
+
+fn plan_content(content: &str) -> DeclarationPlan {
+    plan_verification_source(&crate::openspec::parse_verification_source(
+        content,
+        std::path::Path::new("openspec/changes/c/proposal.md"),
+    ))
+}
+
+#[test]
+fn verification_declaration_integrity_wrong_typed_rerun_is_a_metadata_defect_not_an_empty_plan() {
+    let plan = plan_content(
+        "---\nverifications:\n  - id: gate\n    rerun: [cargo, test]\n    completion_role: change-blocking\n---\n",
+    );
+    assert!(!plan.is_valid());
+    assert!(plan.gates.is_empty());
+    assert_eq!(plan.defects.len(), 1);
+    let defect = &plan.defects[0];
+    assert_eq!(defect.code, DECLARATION_METADATA_INVALID);
+    assert_eq!(defect.key, DeclarationKey::Id("gate".to_string()));
+    assert_eq!(defect.verification_id, "gate");
+    assert_eq!(defect.position, 1);
+    assert_eq!(defect.field, "rerun");
+    assert!(defect.detail.contains("sequence"));
+    assert!(!defect.summary().contains("cargo"));
+}
+
+#[test]
+fn verification_declaration_integrity_source_defects_skip_planner_rules() {
+    // A duplicate pair beside a source defect: only the source defect is
+    // reported, because the planner never sees a partially decoded list.
+    let plan = plan_entries(&[
+        required_yaml(Some("gate"), "cargo test"),
+        required_yaml(Some("gate"), "cargo test"),
+        "  - not-a-mapping\n".to_string(),
+    ]);
+    assert!(plan.gates.is_empty());
+    assert_eq!(plan.defects.len(), 1, "{:?}", plan.defects);
+    assert_eq!(plan.defects[0].code, DECLARATION_METADATA_INVALID);
+    assert_eq!(plan.defects[0].key, DeclarationKey::Position(3));
+    assert_eq!(plan.defects[0].field, "verifications");
+}
+
+#[test]
+fn verification_declaration_integrity_proposal_scoped_defect_has_position_zero() {
+    for (content, field) in [
+        (
+            "---\nverifications:\n  - id: gate\n# no closing delimiter\n",
+            "frontmatter",
+        ),
+        ("---\n- a\n---\n", "frontmatter"),
+        ("---\nverifications: [\n---\n", "frontmatter"),
+        ("---\nverifications: true\n---\n", "verifications"),
+    ] {
+        let plan = plan_content(content);
+        assert_eq!(plan.defects.len(), 1, "{content:?}");
+        let defect = &plan.defects[0];
+        assert_eq!(defect.key, DeclarationKey::Proposal);
+        assert_eq!(defect.verification_id, "<proposal>");
+        assert_eq!(defect.position, 0);
+        assert_eq!(defect.field, field);
+        assert_eq!(defect.code, DECLARATION_METADATA_INVALID);
+        assert_eq!(defect.to_json()["position"], 0);
+        assert_eq!(
+            defect.to_json()["key"],
+            serde_json::json!({"kind": "proposal"})
+        );
+    }
+}
+
+#[test]
+fn verification_declaration_integrity_legitimately_empty_sources_plan_nothing() {
+    for content in [
+        "# Legacy\n",
+        "---\nchange_type: spec\n---\n",
+        "---\nverifications:\n---\n",
+        "---\nverifications: []\n---\n",
+    ] {
+        let plan = plan_content(content);
+        assert!(plan.is_valid(), "{content:?}");
+        assert!(plan.gates.is_empty());
+    }
+    // A valid required leading-env declaration still plans one gate.
+    let plan = plan_entries(&[required_yaml(Some("env-gate"), "A=b cargo test")]);
+    assert!(plan.is_valid(), "{:?}", plan.defects);
+    assert_eq!(plan.gates.len(), 1);
+    assert_eq!(plan.gates[0].argv, vec!["cargo", "test"]);
+}
+
+#[test]
+fn verification_declaration_integrity_trimmed_duplicate_ids_collide() {
+    let plan = plan_entries(&[
+        required_yaml(Some("gate"), "cargo test"),
+        required_yaml(Some(" gate "), "cargo test --lib"),
+    ]);
+    assert!(plan.gates.is_empty());
+    assert_eq!(plan.defects.len(), 2);
+    for (defect, position) in plan.defects.iter().zip([1, 2]) {
+        assert_eq!(defect.code, "declaration_duplicate_id");
+        assert_eq!(defect.key, DeclarationKey::Id("gate".to_string()));
+        assert_eq!(defect.position, position);
+        assert!(
+            defect.detail.contains("positions 1, 2"),
+            "{}",
+            defect.detail
+        );
+    }
+}
+
+#[test]
+fn verification_declaration_integrity_authored_fallback_spelling_keeps_a_named_key() {
+    let filler = || required_yaml(Some("filler-a"), "cargo test");
+    let filler_b = || required_yaml(Some("filler-b"), "cargo test");
+    let shell = "cargo test | tee out.log";
+    for authored in ["<position 3>", "<proposal>"] {
+        let named = plan_entries(&[filler(), filler_b(), required_yaml(Some(authored), shell)]);
+        assert_eq!(named.defects.len(), 1, "{:?}", named.defects);
+        let named = &named.defects[0];
+        assert_eq!(named.key, DeclarationKey::Id(authored.to_string()));
+        assert_eq!(named.position, 3);
+        assert_eq!(named.verification_id, authored);
+        // The authored spelling is not a storable ID, which the planner checks
+        // before the command; the key is still the authored ID.
+        assert_eq!(named.code, "declaration_unstorable_id");
+        assert_eq!(
+            named.to_json()["key"],
+            serde_json::json!({"kind": "id", "value": authored})
+        );
+
+        // Moved to position 1, the key is unchanged.
+        let moved = plan_entries(&[required_yaml(Some(authored), shell), filler(), filler_b()]);
+        assert_eq!(moved.defects[0].key, named.key);
+        assert_eq!(moved.defects[0].position, 1);
+    }
+
+    let nameless = plan_entries(&[filler(), filler_b(), required_yaml(None, shell)]);
+    let nameless = &nameless.defects[0];
+    assert_eq!(nameless.code, "declaration_missing_id");
+    assert_eq!(nameless.key, DeclarationKey::Position(3));
+    assert_eq!(nameless.verification_id, "<position 3>");
+    assert_eq!(
+        nameless.to_json()["key"],
+        serde_json::json!({"kind": "position", "value": 3})
+    );
+
+    // Same label, same position, same field and code: still distinct keys.
+    let named_wrong_type = plan_content(
+        "---\nverifications:\n  - id: a\n  - id: b\n  - id: \"<position 3>\"\n    rerun: [x]\n---\n",
+    );
+    let nameless_wrong_type =
+        plan_content("---\nverifications:\n  - id: a\n  - id: b\n  - rerun: [x]\n---\n");
+    let (left, right) = (
+        &named_wrong_type.defects[0],
+        &nameless_wrong_type.defects[0],
+    );
+    assert_eq!(left.verification_id, right.verification_id);
+    assert_eq!(left.position, right.position);
+    assert_eq!(left.field, right.field);
+    assert_eq!(left.code, right.code);
+    assert_ne!(left.key, right.key);
+}
+
+#[test]
+fn verification_declaration_integrity_unstorable_authored_id_is_keyed_by_that_id() {
+    let plan = plan_entries(&[required_yaml(Some("../x"), "cargo test")]);
+    assert_eq!(plan.defects.len(), 1);
+    assert_eq!(plan.defects[0].code, "declaration_unstorable_id");
+    assert_eq!(plan.defects[0].key, DeclarationKey::Id("../x".to_string()));
+    assert_eq!(plan.defects[0].verification_id, "../x");
+}
+
+#[test]
+fn verification_declaration_integrity_json_keeps_the_five_fields_and_adds_key() {
+    let plan = plan_entries(&[required_yaml(Some("gate"), "cargo test | tee out.log")]);
+    let defect = &plan.defects[0];
+    let json = defect.to_json();
+    let object = json.as_object().unwrap();
+    assert_eq!(object.len(), 6);
+    let mut five = object.clone();
+    five.remove("key");
+    assert_eq!(
+        serde_json::Value::Object(five).to_string(),
+        serde_json::json!({
+            "verification_id": defect.verification_id,
+            "position": defect.position,
+            "field": defect.field,
+            "code": defect.code,
+            "detail": defect.detail,
+        })
+        .to_string()
+    );
+    assert_eq!(
+        json["key"],
+        serde_json::json!({"kind": "id", "value": "gate"})
+    );
+    // `summary()` is unchanged.
+    assert_eq!(
+        defect.summary(),
+        format!(
+            "verification 'gate': rerun: {} (declaration_shell_syntax)",
+            defect.detail
+        )
+    );
+}

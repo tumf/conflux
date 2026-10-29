@@ -49,6 +49,305 @@ pub struct VerificationDeclaration {
     pub completion_role: Option<String>,
 }
 
+/// Which declaration a verification defect is about, fixed where the source
+/// still knows whether an `id` was authored.
+///
+/// The key is provenance, never a judgement about the ID: an authored ID that is
+/// unstorable, or literally spelled like a fallback label (`<position 3>`,
+/// `<proposal>`), is still `Id`. `Id` deliberately carries no occurrence
+/// position, because a named identity must survive reordering; the occurrence
+/// position travels separately wherever it is needed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum DeclarationKey {
+    /// A source defect not attributable to one declaration.
+    Proposal,
+    /// A declaration without an authored `id`, by 1-based position.
+    Position(usize),
+    /// A declaration with an authored `id`, trimmed.
+    Id(String),
+}
+
+impl DeclarationKey {
+    /// Display label: the trimmed ID, `<position N>`, or `<proposal>`.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Proposal => "<proposal>".to_string(),
+            Self::Position(position) => format!("<position {position}>"),
+            Self::Id(id) => id.clone(),
+        }
+    }
+}
+
+/// The verification declarations of one readable proposal, as the
+/// execution-authoritative reader decoded them.
+///
+/// `declarations` is empty whenever `defects` is not, so a consumer that forgets
+/// to look at the defects still cannot plan a partially decoded list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerificationSource {
+    pub declarations: Vec<VerificationDeclaration>,
+    pub defects: Vec<VerificationSourceDefect>,
+}
+
+impl VerificationSource {
+    pub fn is_valid(&self) -> bool {
+        self.defects.is_empty()
+    }
+}
+
+/// One structural defect of a proposal's verification metadata.
+///
+/// `detail` describes shape, YAML types, and location only; it never carries a
+/// field value, a command, a YAML fragment, or the decoder's own error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationSourceDefect {
+    pub key: DeclarationKey,
+    /// `0` for proposal scope, otherwise the 1-based occurrence position.
+    pub position: usize,
+    pub field: String,
+    pub detail: String,
+}
+
+/// A proposal that could not be read at all: distinct from both an invalid and
+/// an empty declaration list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationSourceUnavailable {
+    pub path: std::path::PathBuf,
+    pub kind: std::io::ErrorKind,
+}
+
+/// The fixed YAML type vocabulary used in source-defect details.
+fn yaml_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Sequence(_) => "sequence",
+        Value::Mapping(_) => "mapping",
+        Value::Tagged(_) => "tagged",
+    }
+}
+
+/// Declaration fields whose value must be a string (or null).
+const VERIFICATION_STRING_FIELDS: [&str; 10] = [
+    "id",
+    "requirement",
+    "phase",
+    "owner",
+    "trigger",
+    "automation",
+    "evidence",
+    "rerun",
+    "execution_class",
+    "completion_role",
+];
+
+/// Locate the frontmatter block for the verification reader.
+///
+/// `Ok(None)` is a proposal without frontmatter; `Err(())` is an opened block
+/// with no closing delimiter. Unlike the display splitter, an empty block and a
+/// closing delimiter at end of file are recognized rather than read as prose.
+fn verification_frontmatter(content: &str) -> std::result::Result<Option<&str>, ()> {
+    if !content.starts_with("---\n") {
+        return Ok(None);
+    }
+    let remainder = &content[4..];
+    if remainder.starts_with("---\n") || remainder == "---" {
+        return Ok(Some(""));
+    }
+    if let Some(end) = remainder.find("\n---\n") {
+        return Ok(Some(&remainder[..end]));
+    }
+    if let Some(stripped) = remainder.strip_suffix("\n---") {
+        return Ok(Some(stripped));
+    }
+    Err(())
+}
+
+/// Read the verification declarations of one proposal's already-read content.
+///
+/// The execution-authoritative counterpart of the tolerant display parser: a
+/// structural defect is reported, never turned into an empty list. Detection
+/// walks the YAML value tree and stops at the first proposal-scoped defect;
+/// every declaration entry is checked, so one answer lists every entry defect.
+pub fn parse_verification_source(content: &str, _path: &Path) -> VerificationSource {
+    let proposal_defect = |field: &str, detail: String| VerificationSource {
+        declarations: Vec::new(),
+        defects: vec![VerificationSourceDefect {
+            key: DeclarationKey::Proposal,
+            position: 0,
+            field: field.to_string(),
+            detail,
+        }],
+    };
+
+    let frontmatter = match verification_frontmatter(content) {
+        Ok(Some(frontmatter)) => frontmatter,
+        Ok(None) => return VerificationSource::default(),
+        Err(()) => {
+            return proposal_defect(
+                "frontmatter",
+                "opened frontmatter block has no closing delimiter".to_string(),
+            )
+        }
+    };
+    let root: Value = match serde_yaml::from_str(frontmatter) {
+        Ok(root) => root,
+        Err(error) => {
+            // Location only: the decoder's message can embed values.
+            let detail = match error.location() {
+                // +1 for the opening delimiter line, so the line is file-relative.
+                Some(location) => format!(
+                    "frontmatter is not well-formed YAML at line {} column {}",
+                    location.line() + 1,
+                    location.column()
+                ),
+                None => "frontmatter is not well-formed YAML".to_string(),
+            };
+            return proposal_defect("frontmatter", detail);
+        }
+    };
+    let mapping = match &root {
+        Value::Null => return VerificationSource::default(),
+        Value::Mapping(mapping) => mapping,
+        other => {
+            return proposal_defect(
+                "frontmatter",
+                format!(
+                    "frontmatter root is a {}, expected a mapping",
+                    yaml_type_name(other)
+                ),
+            )
+        }
+    };
+    let entries = match mapping.get(Value::String("verifications".to_string())) {
+        None | Some(Value::Null) => return VerificationSource::default(),
+        Some(Value::Sequence(entries)) => entries,
+        Some(other) => {
+            return proposal_defect(
+                "verifications",
+                format!(
+                    "verifications is a {}, expected a sequence",
+                    yaml_type_name(other)
+                ),
+            )
+        }
+    };
+
+    let mut defects = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let position = index + 1;
+        let Value::Mapping(entry) = entry else {
+            defects.push(VerificationSourceDefect {
+                key: DeclarationKey::Position(position),
+                position,
+                field: "verifications".to_string(),
+                detail: format!(
+                    "declaration at position {position} is a {}, expected a mapping",
+                    yaml_type_name(entry)
+                ),
+            });
+            continue;
+        };
+        let key = match entry.get(Value::String("id".to_string())) {
+            Some(Value::String(id)) if !id.trim().is_empty() => {
+                DeclarationKey::Id(id.trim().to_string())
+            }
+            _ => DeclarationKey::Position(position),
+        };
+        let mut push = |field: &str, detail: String| {
+            defects.push(VerificationSourceDefect {
+                key: key.clone(),
+                position,
+                field: field.to_string(),
+                detail,
+            })
+        };
+        for (field, value) in entry {
+            let Some(field) = field.as_str() else {
+                push(
+                    "<non-string key>",
+                    format!(
+                        "declaration key is a {}, expected a string",
+                        yaml_type_name(field)
+                    ),
+                );
+                continue;
+            };
+            if VERIFICATION_STRING_FIELDS.contains(&field) {
+                if !matches!(value, Value::String(_) | Value::Null) {
+                    push(
+                        field,
+                        format!("{field} is a {}, expected a string", yaml_type_name(value)),
+                    );
+                }
+            } else if field == "prerequisites" {
+                match value {
+                    Value::Null => {}
+                    Value::Sequence(items) => {
+                        if let Some(item) =
+                            items.iter().find(|item| !matches!(item, Value::String(_)))
+                        {
+                            push(
+                                field,
+                                format!(
+                                    "prerequisites is a sequence containing a {}, expected a \
+                                     sequence of strings",
+                                    yaml_type_name(item)
+                                ),
+                            );
+                        }
+                    }
+                    other => push(
+                        field,
+                        format!(
+                            "prerequisites is a {}, expected a sequence of strings",
+                            yaml_type_name(other)
+                        ),
+                    ),
+                }
+            } else {
+                push(field, "unknown verification field".to_string());
+            }
+        }
+    }
+    if !defects.is_empty() {
+        return VerificationSource {
+            declarations: Vec::new(),
+            defects,
+        };
+    }
+
+    match serde_yaml::from_value::<Vec<VerificationDeclaration>>(Value::Sequence(entries.clone())) {
+        Ok(declarations) => VerificationSource {
+            declarations,
+            defects: Vec::new(),
+        },
+        // Unreachable after the shape checks above; reported without the
+        // decoder's text rather than ever becoming an empty success.
+        Err(_) => proposal_defect(
+            "verifications",
+            "verifications could not be decoded as declarations".to_string(),
+        ),
+    }
+}
+
+/// [`parse_verification_source`] over the proposal file itself.
+///
+/// A missing or unreadable file is a typed source-unavailable value, never an
+/// empty declaration list.
+pub fn read_verification_source(
+    path: &Path,
+) -> std::result::Result<VerificationSource, VerificationSourceUnavailable> {
+    let content = fs::read_to_string(path).map_err(|error| VerificationSourceUnavailable {
+        path: path.to_path_buf(),
+        kind: error.kind(),
+    })?;
+    Ok(parse_verification_source(&content, path))
+}
+
 /// Execution environment for a structured verification declaration.
 ///
 /// Only `RepositoryLocal` evidence can be produced offline from the repository
@@ -1574,5 +1873,287 @@ references: []
 
         assert!(!should_log_progress);
         assert!(!should_log_count);
+    }
+
+    // ====================
+    // verification_declaration_integrity: the fallible verification reader
+    // ====================
+
+    const SOURCE_SENTINEL: &str = "VDI-SENTINEL-93be17";
+
+    fn source(content: &str) -> VerificationSource {
+        parse_verification_source(content, Path::new("openspec/changes/c/proposal.md"))
+    }
+
+    fn only_defect(content: &str) -> VerificationSourceDefect {
+        let parsed = source(content);
+        assert!(parsed.declarations.is_empty(), "{parsed:?}");
+        assert_eq!(parsed.defects.len(), 1, "{parsed:?}");
+        parsed.defects.into_iter().next().unwrap()
+    }
+
+    const FULL_ENTRY: &str = "  - id: gate\n    requirement: r\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: t\n    automation: Cargo.toml\n    evidence: cargo test\n    rerun: cargo test\n    prerequisites: []\n    execution_class: repository-local\n    completion_role: change-blocking\n";
+
+    #[test]
+    fn verification_declaration_integrity_legitimately_empty_sources_have_no_defects() {
+        for content in [
+            "# Legacy proposal without frontmatter\n",
+            "---\nchange_type: implementation\n---\n# Change\n",
+            "---\nverifications:\n---\n# Change\n",
+            "---\nverifications: []\n---\n# Change\n",
+            "---\n---\n# Change\n",
+        ] {
+            let parsed = source(content);
+            assert_eq!(parsed, VerificationSource::default(), "{content:?}");
+            assert!(parsed.is_valid());
+        }
+    }
+
+    #[test]
+    fn verification_declaration_integrity_valid_declarations_decode() {
+        let parsed = source(&format!(
+            "---\nunknown_top_level: kept-as-warning\nverifications:\n{FULL_ENTRY}---\n# Change\n"
+        ));
+        assert!(parsed.is_valid(), "{parsed:?}");
+        assert_eq!(parsed.declarations.len(), 1);
+        assert_eq!(parsed.declarations[0].id.as_deref(), Some("gate"));
+        assert_eq!(parsed.declarations[0].rerun.as_deref(), Some("cargo test"));
+        // A non-required shell command is not inspected by the reader at all.
+        let shell = source(
+            "---\nverifications:\n  - id: obs\n    rerun: \"curl x | jq .\"\n    completion_role: operational-observation\n---\n",
+        );
+        assert!(shell.is_valid());
+        // Nor is a leading environment assignment.
+        let env = source("---\nverifications:\n  - id: env\n    rerun: \"A=b cargo test\"\n---\n");
+        assert!(env.is_valid());
+    }
+
+    #[test]
+    fn verification_declaration_integrity_unclosed_frontmatter_is_proposal_scoped() {
+        let defect = only_defect(&format!(
+            "---\nverifications:\n  - id: {SOURCE_SENTINEL}\n# Change body without a closing delimiter\n"
+        ));
+        assert_eq!(defect.key, DeclarationKey::Proposal);
+        assert_eq!(defect.position, 0);
+        assert_eq!(defect.field, "frontmatter");
+        assert!(defect.detail.contains("no closing delimiter"));
+    }
+
+    #[test]
+    fn verification_declaration_integrity_malformed_yaml_reports_location_only() {
+        let defect = only_defect(&format!(
+            "---\nverifications: [\n  - id: \"{SOURCE_SENTINEL}\n---\n# Change\n"
+        ));
+        assert_eq!(defect.key, DeclarationKey::Proposal);
+        assert_eq!(defect.position, 0);
+        assert_eq!(defect.field, "frontmatter");
+        assert!(defect
+            .detail
+            .starts_with("frontmatter is not well-formed YAML"));
+        assert!(
+            !defect.detail.contains(SOURCE_SENTINEL),
+            "{}",
+            defect.detail
+        );
+    }
+
+    #[test]
+    fn verification_declaration_integrity_non_mapping_root_is_a_defect() {
+        let defect = only_defect(&format!("---\n- {SOURCE_SENTINEL}\n---\n# Change\n"));
+        assert_eq!(defect.key, DeclarationKey::Proposal);
+        assert_eq!(defect.field, "frontmatter");
+        assert_eq!(
+            defect.detail,
+            "frontmatter root is a sequence, expected a mapping"
+        );
+        let scalar = only_defect(&format!("---\n{SOURCE_SENTINEL}\n---\n"));
+        assert_eq!(
+            scalar.detail,
+            "frontmatter root is a string, expected a mapping"
+        );
+    }
+
+    #[test]
+    fn verification_declaration_integrity_wrong_typed_verifications_is_a_defect() {
+        for (value, found) in [
+            ("true", "boolean"),
+            (SOURCE_SENTINEL, "string"),
+            ("{id: x}", "mapping"),
+            ("3", "number"),
+        ] {
+            let defect = only_defect(&format!("---\nverifications: {value}\n---\n"));
+            assert_eq!(defect.key, DeclarationKey::Proposal);
+            assert_eq!(defect.position, 0);
+            assert_eq!(defect.field, "verifications");
+            assert_eq!(
+                defect.detail,
+                format!("verifications is a {found}, expected a sequence")
+            );
+        }
+    }
+
+    #[test]
+    fn verification_declaration_integrity_non_mapping_entry_is_keyed_by_position() {
+        let parsed = source(&format!(
+            "---\nverifications:\n{FULL_ENTRY}  - {SOURCE_SENTINEL}\n---\n"
+        ));
+        assert!(parsed.declarations.is_empty());
+        assert_eq!(parsed.defects.len(), 1);
+        let defect = &parsed.defects[0];
+        assert_eq!(defect.key, DeclarationKey::Position(2));
+        assert_eq!(defect.position, 2);
+        assert_eq!(defect.field, "verifications");
+        assert_eq!(
+            defect.detail,
+            "declaration at position 2 is a string, expected a mapping"
+        );
+    }
+
+    #[test]
+    fn verification_declaration_integrity_wrong_typed_field_names_id_and_field() {
+        let defect = only_defect(
+            "---\nverifications:\n  - id: \" gate \"\n    rerun: [cargo, test]\n    completion_role: change-blocking\n---\n",
+        );
+        assert_eq!(defect.key, DeclarationKey::Id("gate".to_string()));
+        assert_eq!(defect.position, 1);
+        assert_eq!(defect.field, "rerun");
+        assert_eq!(defect.detail, "rerun is a sequence, expected a string");
+        assert!(!defect.detail.contains("cargo"));
+
+        let prerequisites = only_defect(&format!(
+            "---\nverifications:\n  - id: gate\n    prerequisites: {SOURCE_SENTINEL}\n---\n"
+        ));
+        assert_eq!(prerequisites.field, "prerequisites");
+        assert_eq!(
+            prerequisites.detail,
+            "prerequisites is a string, expected a sequence of strings"
+        );
+        let nested = only_defect(
+            "---\nverifications:\n  - id: gate\n    prerequisites: [ok, {a: b}]\n---\n",
+        );
+        assert!(
+            nested.detail.contains("containing a mapping"),
+            "{}",
+            nested.detail
+        );
+    }
+
+    #[test]
+    fn verification_declaration_integrity_unknown_field_is_a_defect() {
+        let defect = only_defect(&format!(
+            "---\nverifications:\n  - id: gate\n    unexpected: {SOURCE_SENTINEL}\n---\n"
+        ));
+        assert_eq!(defect.key, DeclarationKey::Id("gate".to_string()));
+        assert_eq!(defect.field, "unexpected");
+        assert_eq!(defect.detail, "unknown verification field");
+    }
+
+    #[test]
+    fn verification_declaration_integrity_every_entry_is_checked_and_keyed_by_provenance() {
+        let parsed = source(
+            "---\nverifications:\n  - rerun: [a]\n  - id: \"<position 3>\"\n    rerun: [b]\n  - id: 7\n    owner: [c]\n  - id: \"   \"\n    trigger: {d: e}\n---\n",
+        );
+        assert!(parsed.declarations.is_empty());
+        let keys: Vec<_> = parsed
+            .defects
+            .iter()
+            .map(|defect| (defect.key.clone(), defect.position, defect.field.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (DeclarationKey::Position(1), 1, "rerun"),
+                (DeclarationKey::Id("<position 3>".to_string()), 2, "rerun"),
+                (DeclarationKey::Position(3), 3, "id"),
+                (DeclarationKey::Position(3), 3, "owner"),
+                (DeclarationKey::Position(4), 4, "trigger"),
+            ]
+        );
+    }
+
+    #[test]
+    fn verification_declaration_integrity_wrong_typed_other_fields_do_not_hide_declarations() {
+        let parsed = source(&format!(
+            "---\npriority: [not, a, priority]\ndependencies: 5\nverifications:\n{FULL_ENTRY}---\n"
+        ));
+        assert!(parsed.is_valid(), "{parsed:?}");
+        assert_eq!(parsed.declarations.len(), 1);
+    }
+
+    #[test]
+    fn verification_declaration_integrity_no_detail_echoes_a_value() {
+        for content in [
+            format!("---\nverifications:\n  - id: g\n    rerun: [{SOURCE_SENTINEL}]\n---\n"),
+            format!("---\nverifications:\n  - id: g\n    rerun: {{{SOURCE_SENTINEL}: 1}}\n---\n"),
+            format!("---\nverifications:\n  - id: g\n    rerun: !tag {SOURCE_SENTINEL}\n---\n"),
+            format!("---\nverifications: !!str {SOURCE_SENTINEL}\n---\n"),
+            format!("---\nverifications: \"{SOURCE_SENTINEL}\n---\n"),
+            format!("---\nverifications:\n  - {SOURCE_SENTINEL}: 1\n---\n"),
+            format!("---\nfoo: {SOURCE_SENTINEL}\n  bad: [\n---\n"),
+        ] {
+            let parsed = source(&content);
+            assert!(!parsed.defects.is_empty(), "{content:?}");
+            for defect in &parsed.defects {
+                assert!(
+                    !defect.detail.contains(SOURCE_SENTINEL),
+                    "{content:?} echoed: {}",
+                    defect.detail
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verification_declaration_integrity_unreadable_proposal_is_typed_unavailable() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("proposal.md");
+        let error = read_verification_source(&missing).unwrap_err();
+        assert_eq!(error.kind, std::io::ErrorKind::NotFound);
+        assert_eq!(error.path, missing);
+
+        let directory = dir.path().join("dir-proposal.md");
+        fs::create_dir(&directory).unwrap();
+        assert!(read_verification_source(&directory).is_err());
+
+        fs::write(&missing, format!("---\nverifications:\n{FULL_ENTRY}---\n")).unwrap();
+        let read = read_verification_source(&missing).unwrap();
+        assert_eq!(read.declarations.len(), 1);
+    }
+
+    #[test]
+    fn verification_declaration_integrity_display_parser_is_unchanged() {
+        // The tolerant display API keeps its existing behavior for its callers.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("proposal.md");
+        fs::write(
+            &path,
+            "---\nverifications:\n  - id: g\n    rerun: [cargo, test]\n---\n",
+        )
+        .unwrap();
+        assert!(parse_proposal_metadata_from_file(&path)
+            .verifications
+            .is_empty());
+    }
+
+    #[test]
+    fn verification_declaration_integrity_key_serializes_adjacently_tagged() {
+        assert_eq!(
+            serde_json::to_value(DeclarationKey::Proposal).unwrap(),
+            serde_json::json!({"kind": "proposal"})
+        );
+        assert_eq!(
+            serde_json::to_value(DeclarationKey::Position(3)).unwrap(),
+            serde_json::json!({"kind": "position", "value": 3})
+        );
+        assert_eq!(
+            serde_json::to_value(DeclarationKey::Id("gate".to_string())).unwrap(),
+            serde_json::json!({"kind": "id", "value": "gate"})
+        );
+        assert_eq!(DeclarationKey::Proposal.label(), "<proposal>");
+        assert_eq!(DeclarationKey::Position(3).label(), "<position 3>");
+        assert_eq!(
+            DeclarationKey::Id("<position 3>".into()).label(),
+            "<position 3>"
+        );
     }
 }

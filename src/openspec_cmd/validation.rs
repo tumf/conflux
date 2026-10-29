@@ -497,22 +497,27 @@ fn validate_verification_declarations(
 ) -> (Vec<String>, Vec<String>) {
     let parsed =
         crate::openspec::parse_proposal_frontmatter_strict(proposal_content, proposal_file);
-    let mut errors = parsed
-        .diagnostics
-        .into_iter()
-        .map(|diagnostic| {
-            format!(
-                "{}: proposal.md verification metadata: {}",
-                change_id, diagnostic
-            )
-        })
-        .collect::<Vec<_>>();
+    // The same fallible reader `verify` and native Acceptance use. When it
+    // reports structural defects, those are what this proposal's metadata
+    // errors are: the raw decoder diagnostics would duplicate them and may echo
+    // values, so they are not pushed for this proposal.
+    let source = crate::openspec::parse_verification_source(proposal_content, proposal_file);
+    let mut errors = if source.is_valid() {
+        parsed
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| {
+                format!(
+                    "{}: proposal.md verification metadata: {}",
+                    change_id, diagnostic
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut warnings = Vec::new();
-    let verifications = parsed
-        .metadata
-        .map(|metadata| metadata.verifications)
-        .unwrap_or_default();
-    let mut ids = HashSet::new();
+    let verifications = source.declarations.clone();
     let mut has_pre_integration = false;
 
     for verification in &verifications {
@@ -546,15 +551,6 @@ fn validate_verification_declarations(
                 ));
             }
             Some(_) => {}
-        }
-        if let Some(id) = verification
-            .id
-            .as_deref()
-            .filter(|id| !id.trim().is_empty())
-        {
-            if !ids.insert(id) {
-                errors.push(format!("{}: duplicate verification id '{}'", change_id, id));
-            }
         }
         match verification.phase.as_deref() {
             Some("pre-integration") => {
@@ -593,21 +589,23 @@ fn validate_verification_declarations(
         }
     }
 
-    // The shared declaration planner Acceptance and `cflx openspec verify` use.
+    // The shared source-to-plan path Acceptance and `cflx openspec verify` use.
     // Conditions the per-field checks above already report — each naming the
-    // verification and the field — are not repeated: duplicate IDs, a missing
-    // ID or command, and role conflicts. What this adds is that a required
-    // declaration whose command or automation the runtime cannot supervise
-    // fails here, before Apply, instead of silently leaving the Acceptance
-    // allowlist. Non-required declarations never produce a defect.
-    const REPORTED_ABOVE: [&str; 4] = [
-        "declaration_duplicate_id",
+    // verification and the field — are not repeated: a missing ID or command,
+    // and role conflicts. Duplicate IDs are *not* suppressed: the planner's
+    // per-occurrence defect uses the trimmed ID, which is the identity every
+    // other consumer collides on. What this adds is that source metadata
+    // defects, and a required declaration whose command or automation the
+    // runtime cannot supervise, fail here, before Apply, instead of silently
+    // leaving the Acceptance allowlist. Non-required declarations never
+    // produce a planner defect.
+    const REPORTED_ABOVE: [&str; 3] = [
         "declaration_missing_id",
         "declaration_missing_command",
         "declaration_role_conflict",
     ];
     for defect in
-        crate::orchestration::acceptance::execution_manifest::plan_declared_gates(&verifications)
+        crate::orchestration::acceptance::execution_manifest::plan_verification_source(&source)
             .defects
     {
         if !REPORTED_ABOVE.contains(&defect.code.as_str()) {
