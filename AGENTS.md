@@ -32,6 +32,9 @@ cflx client unmark add-my-change --json
 cflx client start --json                  # F5 equivalent over the authoritative marks
 cflx client stop --json                   # graceful; force-stop for the immediate one
 cflx client force-stop-change add-my-change --json   # kill exactly this proposal, now
+cflx client refresh-proposal add-my-change --source-ref develop --dry-run --json   # preview only
+cflx client refresh-proposal add-my-change --source-ref develop \
+  --expected-source <source_commit> --expected-head <candidate_head> --json
 cflx client wait add-my-change --json     # waits for as long as the work takes
 cflx client wait add-my-change --timeout 45m --json   # or give up at an explicit deadline
 I=$(cflx client status --json | jq -r .instance_id)
@@ -88,15 +91,16 @@ stdout (`schema_version`, `ok`, `operation`, `outcome`, `instance_id`,
 each outcome has its own stable exit status. Operations are `status`,
 `control_mark`, `control_unmark`, `control_start`, `control_stop`,
 `control_force_stop`, `control_force_stop_change`, `wait`, `subscribe_set`,
-`subscribe_get`, and `subscribe_clear`. Success is narrow: `observed`, `marked`,
+`subscribe_get`, `subscribe_clear`, `refresh_proposal_preview`, and
+`control_refresh_proposal`. Success is narrow: `observed`, `marked`,
 `unmarked`, `unchanged`, `stopped`, `accepted`, `subscribed`, `cleared`,
-`completed`. Everything else —
+`completed`, `previewed`, `refreshed`. Everything else —
 `owner_not_running`, `owner_not_command_capable`, `owner_restarted`,
 `change_not_found`, `target_ineligible`, `revision_conflict`,
 `transport_not_permitted`, `unsupported_owner`, `partial_intent`,
 `observation_conflict`, `evidence_error`, `change_rejected`,
-`change_requires_action`, `process_failed`, `timeout`, `usage_error` — is a
-non-zero refusal.
+`change_requires_action`, `process_failed`, `timeout`, `usage_error`,
+`refresh_refused` — is a non-zero refusal.
 
 A multi-target request names no single `change_id`; `detail.targets` lists each
 proposal with whether it changed and why. A mark result never carries an
@@ -135,6 +139,49 @@ idle `queued` or `blocked` target is eligible for dequeue-only settlement; and
 merge-wait, resolve-wait, terminal, rejected, unknown, and unadmitted rows are
 refused with `target_ineligible` and a typed reason. Process-wide `force_stop`
 and graceful `stop_and_dequeue` are unchanged.
+
+**Refreshing a candidate proposal is not a retry.** When a proposal is
+corrected on the base branch after its candidate worktree was already applied,
+`cflx client refresh-proposal <change-id> --source-ref REF` carries exactly the
+corrected `openspec/changes/<change-id>/proposal.md` into the candidate as one
+commit on top of its current `HEAD`. `--source-ref` is always required — there
+is no default branch — and only that one blob is read: no `design.md`,
+`tasks.md`, `specs/`, implementation file, merge, rebase, or fetch is involved.
+`--dry-run` reads the owner's `GET
+/api/v2/proposals/{change_id}/refresh-preview` resource (operation
+`refresh_proposal_preview`, outcome `previewed`, nothing submitted); it reports
+`source_commit`, `candidate_head`, both blob identities, and a unified patch.
+The apply passes those two full 40-hex IDs back as `--expected-source` and
+`--expected-head` and submits the shared `refresh_proposal` command (operation
+`control_refresh_proposal`, outcome `refreshed`, or `unchanged` when the blobs
+already match). Missing `--source-ref`, `--dry-run` with an expectation, one
+expectation alone, or an abbreviated commit ID is a `usage_error` before any
+owner is contacted.
+
+Eligibility is the owner's published `actions.refresh_proposal`: a tracked row
+with a managed worktree, no live managed process, and display status `error`,
+`stopped`, `stalled`, `not queued`, or `blocked` on an external prerequisite.
+Anything else is `target_ineligible` with a typed reason (`target_active`,
+`target_admitted`, `terminal_target`, `merge_wait`, `resolve_wait`,
+`reject_wait`, `no_candidate_worktree`, `unknown_target`). A candidate whose own
+repository state refuses — a moved ref (`refresh_expectation_mismatch`), any
+staged, unstaged, or untracked entry (`candidate_dirty`), an in-progress merge
+or rebase, a symlinked path, a rejecting hook — is `refresh_refused` with exit
+status `28`, `detail.reason`, and `detail.effects {file_written, staged,
+committed, clean_after}` re-read from Git. The commit always runs repository
+hooks, and nothing is ever reset, amended, or cleaned: after `hook_rejected`
+the corrected file stays written and staged, and after
+`refresh_commit_unexpected_tree` the commit stays where it landed. Read
+`effects` rather than inferring them from the reason.
+
+The command never starts, retries, queues, marks, stops, resolves, archives,
+or merges, and the row keeps its status. The next explicit retry reads the
+corrected candidate through ordinary resume routing, and stale Acceptance
+evidence is invalidated by content identity alone: the manifest's change inputs
+and the evidence commit/tree bindings move with the refresh commit. The TUI
+offers the same transaction as `p` on an eligible Changes row (source ref = the
+run's base branch, confirmation popup, `Enter`/`y` submits, `Esc` cancels). It is
+not exposed over `cflx client mcp`: `cflx_control`'s action list is unchanged.
 
 **Marking admits nothing.** A settled mark proves the owner recorded your
 selection, and nothing else. The owner's own settlement decides whether stable

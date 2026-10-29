@@ -1318,10 +1318,11 @@ fn incomplete_contracts_are_rejected_and_the_failure_names_what_is_missing() {
                     .as_array_mut()
                     .unwrap()
                 {
-                    variant["properties"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("apply_commit");
+                    // The `refresh_proposal` variant is an `allOf` over its own
+                    // result schema and carries no Apply-commit member.
+                    if let Some(properties) = variant["properties"].as_object_mut() {
+                        properties.remove("apply_commit");
+                    }
                 }
             }),
         ),
@@ -1641,6 +1642,9 @@ fn change_resource() -> ChangeResource {
             ),
             resolve_merge: ActionEligibility::blocked(
                 conflux::web::remote_control_api::dto::ActionBlockedReason::NotMergeWaiting,
+            ),
+            refresh_proposal: ActionEligibility::blocked(
+                conflux::web::remote_control_api::dto::ActionBlockedReason::NoCandidateWorktree,
             ),
         },
         parallel: ParallelEligibility {

@@ -37,6 +37,10 @@ use crate::orchestration::mark_settlement::{
     classify_mark_settlement_row, plan_mark_settlement, MarkSettlementAction,
     MarkSettlementCoordinator, MarkSettlementExclusion, MarkSettlementPlan, MarkSettlementRow,
 };
+use crate::orchestration::proposal_refresh::{
+    classify_refresh_proposal, RefreshAdmission, RefreshPreview, RefreshReason, RefreshReport,
+    RefreshRequest,
+};
 use crate::orchestration::state::{OrchestratorState, ReduceOutcome, ReducerCommand};
 
 /// Default bound for waiting on confirmed task termination during stop-and-dequeue.
@@ -826,6 +830,21 @@ pub enum OperatorCommand {
     },
     /// Apply one derived execution-mark state to every eligible change.
     SetAllExecutionMarks,
+    /// Refresh one candidate's `proposal.md` from an explicitly named source
+    /// commit as one hook-retaining commit.
+    ///
+    /// Exactly one target and no lifecycle effect: it never starts, retries,
+    /// queues, marks, or stops anything.
+    RefreshProposal {
+        /// Target change.
+        change_id: String,
+        /// Explicit source ref; there is no default.
+        source_ref: String,
+        /// Full commit ID the source ref must still resolve to.
+        expected_source: String,
+        /// Full commit ID the candidate `HEAD` must still be at.
+        expected_head: String,
+    },
 }
 
 // ============================================================================
@@ -1162,6 +1181,11 @@ pub enum OperatorOutcome {
         /// Why nothing changed.
         reason: NoOpReason,
     },
+    /// A candidate proposal refresh settled as `refreshed` or `unchanged`.
+    ///
+    /// Carries the full observed report: success is a claim about Git, and the
+    /// identities and effects are what make it checkable.
+    ProposalRefreshed(Box<RefreshReport>),
 }
 
 /// Routing decision for a retry request.
@@ -1254,6 +1278,25 @@ pub enum OperatorCommandError {
         /// Components whose repository-visible change restores eligibility.
         components: Vec<String>,
     },
+    /// A candidate proposal refresh was refused by the published lifecycle
+    /// table, before any Git read.
+    RefreshIneligible {
+        /// Target change.
+        change_id: String,
+        /// Display status the refusal was classified from.
+        display_status: String,
+        /// Stable lifecycle reason.
+        reason: RefreshReason,
+    },
+    /// A candidate proposal refresh was refused at command time.
+    ///
+    /// The report carries the stable reason and the effects re-read from Git,
+    /// which after a hook rejection include a written, staged file that was
+    /// deliberately left in place.
+    RefreshRefused {
+        /// The observed report.
+        report: Box<RefreshReport>,
+    },
 }
 
 impl OperatorCommandError {
@@ -1270,7 +1313,9 @@ impl OperatorCommandError {
             | Self::RetryUnsupported { change_id, .. }
             | Self::ForceStopIneligible { change_id, .. }
             | Self::ForceStopUnconfirmed { change_id, .. }
-            | Self::UnchangedAcceptanceInput { change_id, .. } => change_id,
+            | Self::UnchangedAcceptanceInput { change_id, .. }
+            | Self::RefreshIneligible { change_id, .. } => change_id,
+            Self::RefreshRefused { report } => &report.change_id,
         }
     }
 
@@ -1340,6 +1385,18 @@ impl std::fmt::Display for OperatorCommandError {
                 &fingerprint[..16.min(fingerprint.len())],
                 components.join(", ")
             ),
+            Self::RefreshIneligible {
+                change_id,
+                display_status,
+                reason,
+            } => write!(
+                f,
+                "proposal refresh of '{change_id}' with status '{display_status}' is refused as \
+                 `{}`: it {}",
+                reason.as_str(),
+                reason.describe()
+            ),
+            Self::RefreshRefused { report } => f.write_str(&report.describe()),
         }
     }
 }
@@ -1805,6 +1862,63 @@ impl QueueHookPort for HookRunnerQueueHooks {
 }
 
 // ============================================================================
+// Candidate worktrees
+// ============================================================================
+
+/// Where the project repository and a change's managed candidate worktree live.
+///
+/// A port for the same reason [`AcceptanceAdmissionPort`] is one: this service
+/// operates on reducer state and owns no paths. The answer is resolved per
+/// call, so a worktree that was removed is simply absent.
+pub trait CandidateWorktreePort: Send + Sync {
+    /// The project repository root a `source_ref` is resolved in.
+    fn project_root(&self) -> Option<std::path::PathBuf>;
+    /// The registered managed worktree for one change, when one exists.
+    fn worktree_path(&self, change_id: &str) -> Option<std::path::PathBuf>;
+}
+
+/// The honest port for an assembly with no repository behind it.
+pub struct NoCandidateWorktrees;
+
+impl CandidateWorktreePort for NoCandidateWorktrees {
+    fn project_root(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn worktree_path(&self, _change_id: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+/// Managed worktrees laid out under one base directory, the way the parallel
+/// runtime creates them.
+pub struct WorktreeBaseDirCandidates {
+    project_root: std::path::PathBuf,
+    base_dir: std::path::PathBuf,
+}
+
+impl WorktreeBaseDirCandidates {
+    /// Bind a project root and the base directory managed worktrees live under.
+    pub fn new(project_root: std::path::PathBuf, base_dir: std::path::PathBuf) -> Self {
+        Self {
+            project_root,
+            base_dir,
+        }
+    }
+}
+
+impl CandidateWorktreePort for WorktreeBaseDirCandidates {
+    fn project_root(&self) -> Option<std::path::PathBuf> {
+        Some(self.project_root.clone())
+    }
+
+    fn worktree_path(&self, change_id: &str) -> Option<std::path::PathBuf> {
+        let path = self.base_dir.join(change_id.replace(['/', '\\', ' '], "-"));
+        path.is_dir().then_some(path)
+    }
+}
+
+// ============================================================================
 // Service
 // ============================================================================
 
@@ -1834,6 +1948,11 @@ pub struct OperatorCommandService {
     /// Acceptance boundary itself, so a permissive port here can at worst cost
     /// one bounded attempt that immediately re-refuses.
     acceptance_admission: Arc<dyn AcceptanceAdmissionPort>,
+    /// Where candidate worktrees live, for the proposal refresh command.
+    ///
+    /// Defaults to [`NoCandidateWorktrees`], which refuses every refresh as
+    /// `no_candidate_worktree`.
+    candidate_worktrees: Arc<dyn CandidateWorktreePort>,
 }
 
 impl OperatorCommandService {
@@ -1858,7 +1977,14 @@ impl OperatorCommandService {
             execution_facts: None,
             managed_termination: Arc::new(NoManagedProcesses),
             acceptance_admission: Arc::new(AlwaysAdmitAcceptance),
+            candidate_worktrees: Arc::new(NoCandidateWorktrees),
         }
+    }
+
+    /// Bind where the project repository and candidate worktrees live.
+    pub fn with_candidate_worktrees(mut self, port: Arc<dyn CandidateWorktreePort>) -> Self {
+        self.candidate_worktrees = port;
+        self
     }
 
     /// Bind workspace-derived Acceptance fingerprint recomputation.
@@ -1957,6 +2083,20 @@ impl OperatorCommandService {
                 .await
                 .map(OperatorOutcome::Retry),
             OperatorCommand::SetAllExecutionMarks => self.set_all_execution_marks().await,
+            OperatorCommand::RefreshProposal {
+                change_id,
+                source_ref,
+                expected_source,
+                expected_head,
+            } => {
+                self.refresh_proposal(&RefreshRequest {
+                    change_id,
+                    source_ref,
+                    expected_source,
+                    expected_head,
+                })
+                .await
+            }
         }
     }
 
@@ -2764,6 +2904,118 @@ impl OperatorCommandService {
                 apply_commit_oid: apply_commit.oid,
             },
         })
+    }
+
+    /// The refresh eligibility one request would be classified with, plus the
+    /// display status it was classified from.
+    ///
+    /// Read-only, and the same classification admission runs, so a frontend
+    /// that wants to offer the action never re-derives the table.
+    pub async fn refresh_admission(&self, change_id: &str) -> (RefreshAdmission, String) {
+        let (display_status, tracked, blocker_kind) = {
+            let guard = self.state.read().await;
+            (
+                guard.display_status(change_id).to_string(),
+                guard.is_tracked_change(change_id),
+                guard
+                    .change_runtime(change_id)
+                    .map(crate::orchestration::state::ChangeRuntimeState::blocker_kind)
+                    .unwrap_or_default(),
+            )
+        };
+        let has_worktree = self.candidate_worktrees.worktree_path(change_id).is_some()
+            && self.candidate_worktrees.project_root().is_some();
+        let owns_managed_process = self
+            .managed_termination
+            .owns_managed_process(change_id)
+            .await;
+        (
+            classify_refresh_proposal(
+                &display_status,
+                blocker_kind,
+                tracked,
+                has_worktree,
+                owns_managed_process,
+            ),
+            display_status,
+        )
+    }
+
+    /// Read-only preview of a candidate proposal refresh.
+    ///
+    /// Creates no command record, submits no intent, and writes nothing.
+    pub async fn preview_proposal_refresh(
+        &self,
+        change_id: &str,
+        source_ref: &str,
+    ) -> RefreshPreview {
+        let (admission, _) = self.refresh_admission(change_id).await;
+        if let Some(reason) = admission.exclusion() {
+            return RefreshPreview::refused(change_id, source_ref, reason);
+        }
+        let (Some(root), Some(worktree)) = (
+            self.candidate_worktrees.project_root(),
+            self.candidate_worktrees.worktree_path(change_id),
+        ) else {
+            return RefreshPreview::refused(
+                change_id,
+                source_ref,
+                RefreshReason::NoCandidateWorktree,
+            );
+        };
+        crate::orchestration::proposal_refresh::preview(&root, &worktree, change_id, source_ref)
+            .await
+    }
+
+    /// Apply one candidate proposal refresh.
+    ///
+    /// Eligibility is re-validated against the fresh authoritative state first
+    /// and refuses before any Git read. Nothing here touches the reducer, a
+    /// mark, queue intent, the mode, or the scheduler: the commit in the
+    /// candidate worktree is the whole effect.
+    pub async fn refresh_proposal(
+        &self,
+        request: &RefreshRequest,
+    ) -> OperatorResult<OperatorOutcome> {
+        let change_id = request.change_id.as_str();
+        let (admission, display_status) = self.refresh_admission(change_id).await;
+        if let Some(reason) = admission.exclusion() {
+            return Err(OperatorCommandError::RefreshIneligible {
+                change_id: change_id.to_string(),
+                display_status,
+                reason,
+            });
+        }
+        let (Some(root), Some(worktree)) = (
+            self.candidate_worktrees.project_root(),
+            self.candidate_worktrees.worktree_path(change_id),
+        ) else {
+            return Err(OperatorCommandError::RefreshIneligible {
+                change_id: change_id.to_string(),
+                display_status,
+                reason: RefreshReason::NoCandidateWorktree,
+            });
+        };
+        let report = crate::orchestration::proposal_refresh::apply(&root, &worktree, request).await;
+        tracing::info!(
+            change_id = %change_id,
+            operation = "refresh_proposal",
+            outcome = report.outcome.map(|outcome| outcome.as_str()),
+            refusal = report.refusal.map(|reason| reason.as_str()),
+            file_written = report.effects.file_written,
+            staged = report.effects.staged,
+            committed = report.effects.committed,
+            clean_after = report.effects.clean_after,
+            "{}",
+            report.describe()
+        );
+        if report.refusal.is_some() {
+            Err(OperatorCommandError::RefreshRefused {
+                report: Box::new(report),
+            })
+        } else {
+            Ok(OperatorOutcome::ProposalRefreshed(Box::new(report)))
+        }
     }
 
     /// Whether a typed push episode is open for a change.

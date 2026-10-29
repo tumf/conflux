@@ -24,6 +24,7 @@ use crate::web::state::WebState;
 
 use super::dto::{
     ApplyCommitEvidence, CommandResult, CommandSpec, ErrorCode, ExecutionPhase as DtoPhase,
+    RefreshProposalResult,
 };
 
 /// What a delegated command did.
@@ -97,6 +98,13 @@ pub struct CommandFailure {
     /// the reacquired settlement boundary, because unrelated commands may have
     /// advanced projection while it waited.
     pub result_revision: Option<u64>,
+    /// Typed evidence a refusal still has to report.
+    ///
+    /// `None` for every refusal that had no effect. Only a refused
+    /// `refresh_proposal` sets it: a hook rejection leaves a written, staged
+    /// file behind, and the record must say so rather than read as "nothing
+    /// happened".
+    pub result: Option<Box<CommandResult>>,
 }
 
 impl CommandFailure {
@@ -106,7 +114,14 @@ impl CommandFailure {
             error_code,
             message: message.into(),
             result_revision: None,
+            result: None,
         }
+    }
+
+    /// Bind the typed evidence this refusal reports.
+    pub fn with_result(mut self, result: CommandResult) -> Self {
+        self.result = Some(Box::new(result));
+        self
     }
 
     /// Bind the revision this refusal settles at.
@@ -225,6 +240,17 @@ pub fn map_operator_error(error: &OperatorCommandError) -> CommandFailure {
         OperatorCommandError::CancellationFailed { .. } => {
             CommandFailure::new(ErrorCode::InternalError, error.to_string())
         }
+        // The published lifecycle table refused: a different target, or the
+        // same one once it moves, is what would change the answer.
+        OperatorCommandError::RefreshIneligible { .. } => {
+            CommandFailure::new(ErrorCode::TargetIneligible, error.to_string())
+        }
+        // Eligible, but the repository refused. The effects travel with it.
+        OperatorCommandError::RefreshRefused { report } => {
+            CommandFailure::new(ErrorCode::RefreshRefused, error.to_string()).with_result(
+                CommandResult::RefreshProposal(Box::new(RefreshProposalResult::from_report(report))),
+            )
+        }
     }
 }
 
@@ -286,6 +312,17 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
                 ));
             }
             ExecutionSummary::changed(detail)
+        }
+        OperatorOutcome::ProposalRefreshed(report) => {
+            let result = CommandResult::RefreshProposal(Box::new(
+                RefreshProposalResult::from_report(report),
+            ));
+            match report.outcome {
+                Some(crate::orchestration::proposal_refresh::RefreshOutcome::Refreshed) => {
+                    ExecutionSummary::changed(report.describe()).with_result(result)
+                }
+                _ => ExecutionSummary::no_op(report.describe()).with_result(result),
+            }
         }
         OperatorOutcome::NoOp { change_id, reason } => {
             let why = match reason {
@@ -538,7 +575,7 @@ impl SharedServiceExecutor {
     ///
     /// `None` for the worktree commands, which are repository operations rather
     /// than operator lifecycle intent and own their own guards.
-    fn intent(command: &CommandSpec) -> Option<OperatorIntent> {
+    pub(crate) fn intent(command: &CommandSpec) -> Option<OperatorIntent> {
         Some(match command {
             CommandSpec::Start => OperatorIntent::Start,
             CommandSpec::Stop => OperatorIntent::Stop,
@@ -573,6 +610,17 @@ impl SharedServiceExecutor {
                 change_id: change_id.clone(),
             },
             CommandSpec::SetAllExecutionMarks {} => OperatorIntent::SetAllExecutionMarks,
+            CommandSpec::RefreshProposal {
+                change_id,
+                source_ref,
+                expected_source,
+                expected_head,
+            } => OperatorIntent::RefreshProposal {
+                change_id: change_id.clone(),
+                source_ref: source_ref.clone(),
+                expected_source: expected_source.clone(),
+                expected_head: expected_head.clone(),
+            },
             CommandSpec::CreateWorktree { .. }
             | CommandSpec::DeleteWorktree { .. }
             | CommandSpec::MergeWorktree { .. } => return None,

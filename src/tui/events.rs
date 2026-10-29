@@ -101,4 +101,23 @@ pub enum TuiCommand {
     },
     /// Force-stop and dequeue a single active change (during Running mode)
     DequeueChange(String),
+    /// Run the shared read-only refresh preview for one change and open the
+    /// confirmation popup with its result.
+    PreviewProposalRefresh {
+        /// Target change.
+        change_id: String,
+        /// The run's configured base branch, named explicitly.
+        source_ref: String,
+    },
+    /// Submit the shared `refresh_proposal` command with previewed expectations.
+    RefreshProposal {
+        /// Target change.
+        change_id: String,
+        /// Explicit source ref the preview resolved.
+        source_ref: String,
+        /// Previewed source commit.
+        expected_source: String,
+        /// Previewed candidate `HEAD`.
+        expected_head: String,
+    },
 }

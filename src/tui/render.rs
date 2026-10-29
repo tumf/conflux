@@ -363,6 +363,17 @@ fn push_change_row_hints(keys: &mut Vec<String>, app: &AppState, item: &ChangeSt
         });
     }
 
+    // Advertised exactly where the shared refresh table allows it, so `p` is
+    // never offered on a row the key would ignore.
+    if app.focused_row_refreshable()
+        && app
+            .changes
+            .get(app.cursor_index)
+            .is_some_and(|focused| focused.id == item.id)
+    {
+        keys.push("p: refresh proposal".to_string());
+    }
+
     // Presentation-only dismissal of a reviewed row. Advertised only on a row
     // the key would actually act on, so `d` is never offered where it is a
     // no-op — and never confused with the Worktrees view's `d`, which deletes a
@@ -481,6 +492,9 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
         // Force-kill confirmation keeps its existing in-list presentation (the
         // `Y: confirm kill` / `N: cancel` hints and the header label); it has no
         // separate popup widget, and this change does not add one.
+        Some(ModalState::ConfirmProposalRefresh { preview }) => {
+            popups::render_proposal_refresh(frame, preview, area)
+        }
         Some(ModalState::ConfirmForceKill { .. }) | None => {}
     }
 
@@ -663,6 +677,14 @@ mod popups {
     pub(super) fn render_error_details(frame: &mut Frame, app: &AppState, area: Rect) {
         super::render_error_details_popup(frame, app, area);
     }
+
+    pub(super) fn render_proposal_refresh(
+        frame: &mut Frame,
+        preview: &crate::orchestration::proposal_refresh::RefreshPreview,
+        area: Rect,
+    ) {
+        super::render_proposal_refresh_popup(frame, preview, area);
+    }
 }
 
 /// Render header
@@ -700,6 +722,9 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         ) => (modal.title_label().to_string(), Color::Red, true),
         Some(modal @ ModalState::ConfirmForceKill { .. }) => {
             (modal.title_label().to_string(), Color::Red, true)
+        }
+        Some(modal @ ModalState::ConfirmProposalRefresh { .. }) => {
+            (modal.title_label().to_string(), Color::Yellow, true)
         }
         None => match app.execution_mode {
             AppExecutionMode::Select | AppExecutionMode::Stopped => {
@@ -2389,6 +2414,92 @@ fn render_warning_popup(frame: &mut Frame, app: &AppState, area: Rect) {
         Span::raw(" scroll  "),
         Span::styled("Esc", Style::default().fg(Color::Cyan)),
         Span::raw(" close"),
+    ]))
+    .alignment(Alignment::Center)
+    .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, chunks[1]);
+}
+
+/// Body lines of the proposal refresh confirmation: the facts the shared
+/// preview resolved, then either the change size, the no-op notice, or the
+/// refusal that an `Enter` would not get past.
+fn proposal_refresh_popup_lines(
+    preview: &crate::orchestration::proposal_refresh::RefreshPreview,
+) -> Vec<Line<'static>> {
+    let short = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(|oid| oid[..12.min(oid.len())].to_string())
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let fact = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("{label:<15}"), Style::default().fg(Color::Cyan)),
+            Span::styled(value, Style::default().fg(Color::White)),
+        ])
+    };
+    let mut lines = vec![
+        fact("Change:", preview.change_id.clone()),
+        fact("Path:", preview.path.clone()),
+        fact("Source ref:", preview.source_ref.clone()),
+        fact("Source commit:", short(&preview.source_commit)),
+        fact("Candidate HEAD:", short(&preview.candidate_head)),
+        fact("Source blob:", short(&preview.source_blob)),
+        fact("Candidate blob:", short(&preview.candidate_blob)),
+        Line::from(""),
+    ];
+    let status = match preview.refusal {
+        Some(reason) => Line::from(Span::styled(
+            format!("Refused: {} ({})", reason.as_str(), reason.describe()),
+            Style::default().fg(Color::LightRed),
+        )),
+        None if preview.no_op => Line::from(Span::styled(
+            "No change: the candidate proposal already matches the source.",
+            Style::default().fg(Color::Green),
+        )),
+        None => Line::from(Span::styled(
+            format!(
+                "+{} / -{} lines; one hook-enabled commit on the candidate HEAD.",
+                preview.added_lines, preview.removed_lines
+            ),
+            Style::default().fg(Color::Yellow),
+        )),
+    };
+    lines.push(status);
+    lines
+}
+
+/// Render the proposal refresh confirmation popup.
+fn render_proposal_refresh_popup(
+    frame: &mut Frame,
+    preview: &crate::orchestration::proposal_refresh::RefreshPreview,
+    area: Rect,
+) {
+    let modal_area = warning_popup_modal_area(area);
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(" Refresh Proposal ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner_area = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner_area);
+    frame.render_widget(
+        Paragraph::new(proposal_refresh_popup_lines(preview)).wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+
+    let confirm = if preview.eligible {
+        "Enter/y submit  "
+    } else {
+        "Enter close  "
+    };
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(confirm, Style::default().fg(Color::Cyan)),
+        Span::styled("Esc", Style::default().fg(Color::Cyan)),
+        Span::raw(" cancel"),
     ]))
     .alignment(Alignment::Center)
     .style(Style::default().fg(Color::DarkGray));
@@ -8114,5 +8225,81 @@ mod tests {
 
         assert!(content.contains("D: delete"), "{content}");
         assert!(!content.contains("dismiss"), "{content}");
+    }
+
+    // ── Candidate proposal refresh ───────────────────────────────────────
+
+    fn refresh_app(status: &str) -> AppState {
+        let mut app = create_test_app(vec![create_test_change("alpha")]);
+        app.changes[0].set_display_status_cache(status);
+        app.changes[0].has_worktree = true;
+        app.cursor_index = 0;
+        app.set_base_branch(Some("develop"));
+        app
+    }
+
+    #[test]
+    fn candidate_proposal_refresh_hint_is_shown_only_on_an_eligible_row() {
+        let mut eligible = refresh_app("error");
+        let content = buffer_to_string(&render_buffer(&mut eligible, 160, 30));
+        assert!(content.contains("p: refresh proposal"), "{content}");
+
+        for status in ["applying", "queued", "merge wait", "archived"] {
+            let mut app = refresh_app(status);
+            let content = buffer_to_string(&render_buffer(&mut app, 160, 30));
+            assert!(!content.contains("p: refresh proposal"), "{status}");
+        }
+        let mut no_worktree = refresh_app("error");
+        no_worktree.changes[0].has_worktree = false;
+        let content = buffer_to_string(&render_buffer(&mut no_worktree, 160, 30));
+        assert!(!content.contains("p: refresh proposal"));
+    }
+
+    #[test]
+    fn candidate_proposal_refresh_popup_shows_the_preview_facts() {
+        use crate::orchestration::proposal_refresh::{RefreshPreview, RefreshReason};
+        let mut preview = RefreshPreview::refused("alpha", "develop", RefreshReason::GitReadFailed);
+        preview.refusal = None;
+        preview.eligible = true;
+        preview.source_commit = Some("1234567890ab".repeat(3) + "cdef");
+        preview.candidate_head = Some("feedfacecafe".repeat(3) + "beef");
+        preview.source_blob = Some("aaaaaaaaaaaa".repeat(3) + "aaaa");
+        preview.candidate_blob = Some("bbbbbbbbbbbb".repeat(3) + "bbbb");
+        preview.added_lines = 4;
+        preview.removed_lines = 2;
+
+        let mut app = refresh_app("error");
+        app.modal = Some(ModalState::ConfirmProposalRefresh {
+            preview: Box::new(preview.clone()),
+        });
+        let content = buffer_to_string(&render_buffer(&mut app, 160, 40));
+        for needle in [
+            "Refresh Proposal",
+            "develop",
+            "1234567890ab",
+            "feedfacecafe",
+            "aaaaaaaaaaaa",
+            "bbbbbbbbbbbb",
+            "+4 / -2 lines",
+            "Enter/y submit",
+        ] {
+            assert!(content.contains(needle), "{needle} missing:\n{content}");
+        }
+
+        preview.no_op = true;
+        app.modal = Some(ModalState::ConfirmProposalRefresh {
+            preview: Box::new(preview.clone()),
+        });
+        let content = buffer_to_string(&render_buffer(&mut app, 160, 40));
+        assert!(content.contains("No change"), "{content}");
+
+        preview.eligible = false;
+        preview.refusal = Some(RefreshReason::CandidateDirty);
+        app.modal = Some(ModalState::ConfirmProposalRefresh {
+            preview: Box::new(preview),
+        });
+        let content = buffer_to_string(&render_buffer(&mut app, 160, 40));
+        assert!(content.contains("candidate_dirty"), "{content}");
+        assert!(content.contains("Enter close"), "{content}");
     }
 }

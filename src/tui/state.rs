@@ -1700,6 +1700,111 @@ impl AppState {
         }
     }
 
+    /// Whether the shared refresh table allows `p` on the focused Changes row.
+    pub fn focused_row_refreshable(&self) -> bool {
+        self.view_mode == ViewMode::Changes
+            && self
+                .changes
+                .get(self.cursor_index)
+                .is_some_and(|change| modal_logic::refresh_admission_for_row(change).is_allowed())
+    }
+
+    /// Request the shared refresh preview for the focused row.
+    ///
+    /// Returns `None` — and opens nothing — on an ineligible row, or when no
+    /// base branch was captured to name as the explicit source.
+    pub fn request_proposal_refresh(&mut self) -> Option<TuiCommand> {
+        if self.modal.is_some() || !self.focused_row_refreshable() {
+            return None;
+        }
+        let change_id = self.changes[self.cursor_index].id.clone();
+        let Some(source_ref) = self.base_branch().map(str::to_string) else {
+            let message = format!(
+                "Proposal refresh for '{change_id}' needs a configured base branch to name as \
+                 the source"
+            );
+            self.warning_message = Some(message.clone());
+            self.add_log(LogEntry::warn(message));
+            return None;
+        };
+        Some(TuiCommand::PreviewProposalRefresh {
+            change_id,
+            source_ref,
+        })
+    }
+
+    /// Open the refresh confirmation for a settled preview.
+    ///
+    /// Ignored when another overlay is up or the row stopped being eligible
+    /// while the preview ran.
+    pub fn open_proposal_refresh_confirmation(
+        &mut self,
+        preview: crate::orchestration::proposal_refresh::RefreshPreview,
+    ) {
+        if self.modal.is_some() {
+            return;
+        }
+        if modal_logic::evaluate_proposal_refresh(
+            &preview.change_id,
+            &self.modal_validity_context(),
+        )
+        .is_err()
+        {
+            return;
+        }
+        self.modal = Some(ModalState::ConfirmProposalRefresh {
+            preview: Box::new(preview),
+        });
+    }
+
+    /// Confirm the refresh popup.
+    ///
+    /// Submits the apply with the previewed expectations only when the preview
+    /// itself was eligible; a refused preview just closes. The transaction
+    /// revalidates everything either way.
+    pub fn confirm_proposal_refresh(&mut self) -> Option<TuiCommand> {
+        let Some(ModalState::ConfirmProposalRefresh { preview }) = self.modal.clone() else {
+            return None;
+        };
+        if let Err(invalidation) = modal_logic::evaluate_proposal_refresh(
+            &preview.change_id,
+            &self.modal_validity_context(),
+        ) {
+            self.invalidate_modal_with_report(invalidation, "Proposal refresh");
+            return None;
+        }
+        self.modal = None;
+        let (true, Some(expected_source), Some(expected_head)) = (
+            preview.eligible,
+            preview.source_commit.clone(),
+            preview.candidate_head.clone(),
+        ) else {
+            self.add_log(LogEntry::info(format!(
+                "Proposal refresh closed for '{}' without submitting",
+                preview.change_id
+            )));
+            return None;
+        };
+        self.add_log(LogEntry::info(format!(
+            "Proposal refresh confirmed: {}",
+            preview.change_id
+        )));
+        Some(TuiCommand::RefreshProposal {
+            change_id: preview.change_id.clone(),
+            source_ref: preview.source_ref.clone(),
+            expected_source,
+            expected_head,
+        })
+    }
+
+    /// Close the refresh popup without submitting anything.
+    pub fn cancel_proposal_refresh(&mut self) {
+        if matches!(self.modal, Some(ModalState::ConfirmProposalRefresh { .. })) {
+            self.modal = None;
+            self.add_log(LogEntry::info("Proposal refresh canceled".to_string()));
+        }
+    }
+
     /// Dismiss the focused `merged` row immediately, with no confirmation.
     ///
     /// Presentation only: it hides a reviewed row from this process's Changes

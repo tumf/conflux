@@ -428,3 +428,191 @@ fn acceptance_execution_boundary_workspace_resolution_stays_inside_the_base() {
     assert_eq!(resolve("alpha"), Some(base.path().join("alpha")));
     assert_eq!(resolve("missing"), None);
 }
+
+// ── Candidate proposal refresh: invalidation by content identity ───────────
+
+/// After a candidate proposal refresh, nothing new has to happen for stale
+/// Acceptance state to stop applying: the manifest's change inputs read the
+/// candidate `proposal.md`, evidence binds the candidate commit, and a live hold
+/// is keyed by the fingerprint those produce. Real Git, real refresh commit.
+#[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn candidate_proposal_refresh_invalidates_stale_acceptance_state_by_content_identity() {
+    use crate::orchestration::acceptance::evidence_location::scoped_acceptance_root_for_test;
+    use crate::orchestration::acceptance::execution_manifest::{
+        AcceptanceAdmission, AcceptanceHoldCategory, LiveAcceptanceHold, LiveAcceptanceHolds,
+        WorkspaceAcceptanceAdmission,
+    };
+    use crate::orchestration::acceptance::verification_evidence::{
+        eligible_request, evaluate_reuse, CurrentBindings, GitRepositoryFacts, ReuseDecision,
+        ReusePolicy, ReviewBinding, VerificationEvidence, EVIDENCE_AUTHORITY, EVIDENCE_SCHEMA,
+    };
+    use crate::orchestration::operator_command::AcceptanceAdmissionPort;
+    use crate::orchestration::proposal_refresh::tests::{Fixture, CHANGE, CORRECTED_PROPOSAL};
+    use crate::orchestration::proposal_refresh::{apply, RefreshOutcome};
+
+    let fx = Fixture::new();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = EvidenceStore::new(store_dir.path().join("store"));
+    let manifest = |label: &'static str| {
+        let worktree = fx.worktree.clone();
+        let store = &store;
+        async move {
+            build_manifest_for_workspace(
+                &GitRepositoryFacts,
+                &worktree,
+                store,
+                CHANGE,
+                "cflx-accept",
+                Some("develop"),
+                300,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label} manifest: {error:?}"))
+        }
+    };
+
+    let before = manifest("pre-refresh").await;
+
+    // A live hold for the pre-refresh input refuses an unchanged retry.
+    let holds = Arc::new(LiveAcceptanceHolds::new());
+    holds.record(
+        CHANGE,
+        LiveAcceptanceHold {
+            category: AcceptanceHoldCategory::ReviewDeadlineExhausted,
+            fingerprint: before.fingerprint(),
+            review_base_ref: Some("develop".to_string()),
+        },
+    );
+    let resolve = {
+        let worktree = fx.worktree.clone();
+        move |_: &str| Some(worktree.clone())
+    };
+    let admission =
+        WorkspaceAcceptanceAdmission::with_holds(resolve, "cflx-accept", None, holds.clone());
+    let acceptance_root = store_dir.path().join("acceptance-root");
+    assert!(
+        matches!(
+            scoped_acceptance_root_for_test(acceptance_root.clone(), admission.classify(CHANGE))
+                .await,
+            AcceptanceAdmission::Refuse { .. }
+        ),
+        "the unchanged pre-refresh input must be refused"
+    );
+
+    // A gate evidence record bound to the pre-refresh candidate.
+    let declaration = crate::openspec::VerificationDeclaration {
+        id: Some("refresh-gate".to_string()),
+        requirement: Some("gate".to_string()),
+        phase: Some("pre-integration".to_string()),
+        owner: Some("conflux-acceptance".to_string()),
+        trigger: Some("pull-request-validation".to_string()),
+        automation: Some("src/impl.rs".to_string()),
+        evidence: Some("cargo test --lib".to_string()),
+        rerun: Some("cargo test --lib".to_string()),
+        prerequisites: Some(Vec::new()),
+        execution_class: Some("repository-local".to_string()),
+        completion_role: Some("change-blocking".to_string()),
+    };
+    let request = eligible_request(&declaration).expect("the declaration is eligible");
+    let tool = crate::orchestration::acceptance::verification_evidence::ToolIdentity {
+        path: "/usr/bin/cargo".to_string(),
+        executable_digest: "d".repeat(64),
+        version: Some("cargo 1.80.0".to_string()),
+    };
+    let started_at = chrono::Utc::now() - chrono::Duration::seconds(600);
+    let record = VerificationEvidence {
+        schema: EVIDENCE_SCHEMA.to_string(),
+        authority: EVIDENCE_AUTHORITY.to_string(),
+        verification_id: "refresh-gate".to_string(),
+        commit_oid: before.candidate_commit_oid.clone(),
+        tree_oid: before.candidate_tree_oid.clone(),
+        review_base_commit: before.review_base_commit.clone(),
+        review_range: before.review_range.clone(),
+        argv: request.argv.clone(),
+        cwd: request.cwd.clone(),
+        automation_path: request.automation_path.clone(),
+        automation_blob_oid: "b".repeat(40),
+        tool: tool.clone(),
+        started_at,
+        ended_at: started_at + chrono::Duration::seconds(300),
+        exit_code: 0,
+        artifact_path: EvidenceStore::artifact_relative_path("refresh-gate"),
+        artifact_digest: "a".repeat(64),
+        clean_before: true,
+        clean_after: true,
+    };
+    let bindings = |manifest: &AcceptanceExecutionManifest| CurrentBindings {
+        commit_oid: manifest.candidate_commit_oid.clone(),
+        tree_oid: manifest.candidate_tree_oid.clone(),
+        review: Some(ReviewBinding {
+            base_commit: record.review_base_commit.clone(),
+            range: record.review_range.clone(),
+        }),
+        automation_blob_oid: "b".repeat(40),
+        tool: tool.clone(),
+        clean: true,
+        artifact_digest: Some("a".repeat(64)),
+    };
+    assert!(
+        evaluate_reuse(
+            &request,
+            &record,
+            &bindings(&before),
+            ReusePolicy::default()
+        )
+        .is_reuse(),
+        "the record is reusable against the candidate it was bound to"
+    );
+
+    // The refresh commit.
+    let report = apply(&fx.root, &fx.worktree, &fx.request()).await;
+    assert_eq!(
+        report.outcome,
+        Some(RefreshOutcome::Refreshed),
+        "{report:?}"
+    );
+
+    let after = manifest("post-refresh").await;
+    assert_ne!(after.change_input_digest, before.change_input_digest);
+    assert_ne!(after.fingerprint(), before.fingerprint());
+    assert_ne!(after.candidate_commit_oid, before.candidate_commit_oid);
+
+    match evaluate_reuse(&request, &record, &bindings(&after), ReusePolicy::default()) {
+        ReuseDecision::Rerun { reason, .. } => {
+            assert_eq!(reason.code(), "binding_mismatch");
+            assert!(
+                reason.detail().starts_with("commit_oid changed"),
+                "{}",
+                reason.detail()
+            );
+        }
+        other => panic!("pre-refresh evidence must rerun, got {other:?}"),
+    }
+
+    // The same live registry no longer refuses: the hold names a fingerprint the
+    // candidate no longer produces.
+    assert_eq!(
+        scoped_acceptance_root_for_test(acceptance_root, admission.classify(CHANGE)).await,
+        AcceptanceAdmission::Admit
+    );
+
+    // What the next Apply/Acceptance prompt points at is the corrected file.
+    let prompt = crate::agent::prompt::build_apply_prompt_with_skill(
+        "cflx-apply",
+        Some(&fx.worktree),
+        CHANGE,
+        "",
+        "",
+        "",
+        "",
+    );
+    let proposal_line = prompt
+        .lines()
+        .find_map(|line| line.strip_prefix("proposal_path: "))
+        .expect("the prompt names the proposal path");
+    assert_eq!(
+        std::fs::read_to_string(fx.worktree.join(proposal_line)).unwrap(),
+        CORRECTED_PROPOSAL
+    );
+}
