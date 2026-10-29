@@ -341,21 +341,38 @@ impl ParallelExecutor {
         if !self.graceful_stop_requested() || !work_snapshot.is_complete() {
             return false;
         }
-        if self.is_fully_drained(join_set_empty, queued.is_empty(), in_flight.is_empty()) {
-            info!(
-                "Graceful stop requested with no work remaining; settling the scheduler at this boundary"
-            );
-        } else if join_set_empty
-            && self
-                .is_blocked_only_scheduler_state_with_snapshot(queued, in_flight, work_snapshot)
-                .await
-        {
+        let blocked_only =
+            if self.is_fully_drained(join_set_empty, queued.is_empty(), in_flight.is_empty()) {
+                false
+            } else if join_set_empty
+                && self
+                    .is_blocked_only_scheduler_state_with_snapshot(queued, in_flight, work_snapshot)
+                    .await
+            {
+                true
+            } else {
+                return false;
+            };
+        // The entry read is stale once blocked-only classification has awaited
+        // (an archived dependency's base-evidence lookup suspends): shared run
+        // control may have accepted cancel-stop and withdrawn the request in
+        // the meantime. Re-read the flag here, with no await between this load
+        // and starting the terminal send, so a withdrawn request is neither
+        // logged as settled nor stopped. A later Stop sets the flag again and
+        // settles at its own boundary. This load is the observation boundary,
+        // not an atomic stop commit: a change after it is not covered here.
+        if !self.graceful_stop_requested() {
+            return false;
+        }
+        if blocked_only {
             info!(
                 queued = queued.len(),
                 "Graceful stop requested with only inactive blocked work remaining; settling the scheduler at this boundary"
             );
         } else {
-            return false;
+            info!(
+                "Graceful stop requested with no work remaining; settling the scheduler at this boundary"
+            );
         }
         send_event(&self.event_tx, ParallelEvent::Stopped).await;
         true
