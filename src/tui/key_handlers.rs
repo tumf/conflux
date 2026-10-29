@@ -735,6 +735,17 @@ pub(crate) async fn handle_modal_key(key: KeyEvent, ctx: &mut KeyEventContext<'_
         ModalState::QrPopup => {
             ctx.app.hide_qr_popup();
         }
+        ModalState::ConfirmProposalRefresh { .. } => match (key.code, key.modifiers) {
+            (KeyCode::Enter, _) | (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+                if let Some(cmd) = ctx.app.confirm_proposal_refresh() {
+                    let _ = ctx.cmd_tx.send(cmd).await;
+                }
+            }
+            (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
+                ctx.app.cancel_proposal_refresh();
+            }
+            _ => {}
+        },
         ModalState::ConfirmForceKill { .. } => match (key.code, key.modifiers) {
             (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
                 if let Some(cmd) = ctx.app.confirm_force_kill() {
@@ -952,6 +963,13 @@ pub async fn handle_key_event(
         }
         (KeyCode::Char('f'), _) => {
             handle_selected_proposal_log_filter_key(ctx.app);
+        }
+        (KeyCode::Char('p'), _) => {
+            // Ask the shared service for a read-only refresh preview of the
+            // focused row; an ineligible row ignores the key entirely.
+            if let Some(cmd) = ctx.app.request_proposal_refresh() {
+                let _ = ctx.cmd_tx.send(cmd).await;
+            }
         }
         (KeyCode::Char('K'), _) => {
             // Open the force-kill confirmation overlay for active changes in
@@ -3240,5 +3258,129 @@ mod tests {
             );
             assert!(app.dismissed_merged_ids().is_empty());
         }
+    }
+
+    // ── Candidate proposal refresh (`p`) ─────────────────────────────────
+
+    /// An `error` row with a managed worktree, under a captured base branch.
+    fn refreshable_app() -> AppState {
+        let mut app = routing_app();
+        app.execution_mode = AppExecutionMode::Select;
+        app.changes[1].set_display_status_cache("error");
+        app.changes[1].has_worktree = true;
+        app.cursor_index = 1;
+        app.set_base_branch(Some("develop"));
+        app
+    }
+
+    fn refresh_preview(eligible: bool) -> crate::orchestration::proposal_refresh::RefreshPreview {
+        use crate::orchestration::proposal_refresh::{RefreshPreview, RefreshReason};
+        let mut preview =
+            RefreshPreview::refused("change-b", "develop", RefreshReason::GitReadFailed);
+        preview.refusal = (!eligible).then_some(RefreshReason::CandidateDirty);
+        preview.eligible = eligible;
+        preview.source_commit = Some("a".repeat(40));
+        preview.candidate_head = Some("b".repeat(40));
+        preview.source_blob = Some("c".repeat(40));
+        preview.candidate_blob = Some("d".repeat(40));
+        preview.added_lines = 3;
+        preview.removed_lines = 1;
+        preview
+    }
+
+    #[tokio::test]
+    async fn candidate_proposal_refresh_p_requests_the_shared_preview_for_the_base_branch() {
+        let mut app = refreshable_app();
+
+        let commands = route_key(&mut app, KeyCode::Char('p')).await;
+
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [TuiCommand::PreviewProposalRefresh { change_id, source_ref }]
+                    if change_id == "change-b" && source_ref == "develop"
+            ),
+            "{commands:?}"
+        );
+        assert!(
+            app.modal.is_none(),
+            "the popup opens from the preview, not the key"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_proposal_refresh_p_is_ignored_on_every_ineligible_row() {
+        for status in ["applying", "queued", "merge wait", "archived"] {
+            let mut app = refreshable_app();
+            app.changes[1].set_display_status_cache(status);
+
+            let commands = route_key(&mut app, KeyCode::Char('p')).await;
+
+            assert!(commands.is_empty(), "{status}: {commands:?}");
+            assert!(app.modal.is_none(), "{status}");
+        }
+        // Eligible status, but no managed worktree to refresh.
+        let mut app = refreshable_app();
+        app.changes[1].has_worktree = false;
+        assert!(route_key(&mut app, KeyCode::Char('p')).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn candidate_proposal_refresh_enter_submits_the_previewed_expectations_once() {
+        for confirm in [KeyCode::Enter, KeyCode::Char('y')] {
+            let mut app = refreshable_app();
+            app.open_proposal_refresh_confirmation(refresh_preview(true));
+            assert!(matches!(
+                app.modal,
+                Some(ModalState::ConfirmProposalRefresh { .. })
+            ));
+
+            let commands = route_key(&mut app, confirm).await;
+
+            assert_eq!(commands.len(), 1, "{confirm:?}");
+            assert!(
+                matches!(
+                    &commands[0],
+                    TuiCommand::RefreshProposal { change_id, source_ref, expected_source, expected_head }
+                        if change_id == "change-b"
+                            && source_ref == "develop"
+                            && *expected_source == "a".repeat(40)
+                            && *expected_head == "b".repeat(40)
+                ),
+                "{commands:?}"
+            );
+            assert!(app.modal.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_proposal_refresh_esc_and_refused_previews_submit_nothing() {
+        let mut app = refreshable_app();
+        app.open_proposal_refresh_confirmation(refresh_preview(true));
+        assert!(route_key(&mut app, KeyCode::Esc).await.is_empty());
+        assert!(app.modal.is_none());
+        assert_eq!(app.changes[1].display_status_cache, "error");
+        assert!(!app.changes[1].selected);
+
+        // A preview the shared service refused only closes.
+        let mut app = refreshable_app();
+        app.open_proposal_refresh_confirmation(refresh_preview(false));
+        assert!(route_key(&mut app, KeyCode::Enter).await.is_empty());
+        assert!(app.modal.is_none());
+
+        // The popup swallows unrelated keys while it is open.
+        let mut app = refreshable_app();
+        app.open_proposal_refresh_confirmation(refresh_preview(true));
+        assert!(route_key(&mut app, KeyCode::Char(' ')).await.is_empty());
+        assert!(!app.changes[1].selected);
+        assert!(app.modal.is_some());
+    }
+
+    #[tokio::test]
+    async fn candidate_proposal_refresh_popup_does_not_open_for_a_row_that_became_ineligible() {
+        let mut app = refreshable_app();
+        app.changes[1].set_display_status_cache("applying");
+        app.open_proposal_refresh_confirmation(refresh_preview(true));
+        assert!(app.modal.is_none());
     }
 }

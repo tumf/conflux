@@ -136,6 +136,14 @@ impl OperatorFactsStore {
         self.repo_root.clone()
     }
 
+    /// The absolute managed worktree path last observed for one change.
+    pub fn worktree_path(&self, change_id: &str) -> Option<PathBuf> {
+        self.worktree_paths
+            .get(change_id)
+            .filter(|path| path.is_dir())
+            .cloned()
+    }
+
     /// Facts for one change, or the empty defaults.
     pub fn facts(&self, change_id: &str) -> ChangeOperatorFacts {
         self.facts.get(change_id).cloned().unwrap_or_default()

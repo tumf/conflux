@@ -14,6 +14,7 @@ pub mod mark_settlement;
 pub mod operator_command;
 pub mod operator_coordinator;
 pub mod output;
+pub mod proposal_refresh;
 pub mod rejection;
 pub mod run_control;
 pub mod state;

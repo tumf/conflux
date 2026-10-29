@@ -1179,6 +1179,8 @@ EXAMPLES:
   cflx client subscribe set alpha beta --instance-id <owner-instance> --json -- /absolute/callback --flag value
   cflx client subscribe get alpha --instance-id <owner-instance> --json
   cflx client subscribe clear alpha beta --instance-id <owner-instance> --json
+  cflx client refresh-proposal alpha --source-ref develop --dry-run --json
+  cflx client refresh-proposal alpha --source-ref develop --expected-source <commit> --expected-head <commit> --json
   cflx client mcp
   cflx client --unix-socket /tmp/cflx-api.sock status"
 )]
@@ -1302,6 +1304,39 @@ pub enum ClientCommands {
     ///   cflx client force-stop-change add-my-change
     ///   cflx client force-stop-change add-my-change --json
     ForceStopChange(ClientForceStopChangeArgs),
+
+    /// Refresh one candidate's proposal.md from an explicitly named source ref
+    ///
+    /// Carries a corrected `openspec/changes/<id>/proposal.md` from the source
+    /// commit into the change's managed candidate worktree as exactly one
+    /// commit on top of the candidate's current HEAD, with repository hooks
+    /// enabled. Only that one file is read and written: no other proposal
+    /// artifact, no implementation file, no merge or rebase.
+    ///
+    /// Two forms. `--dry-run` reads the owner's preview resource — source
+    /// commit, candidate HEAD, both blob identities, and a unified patch — and
+    /// submits nothing (operation `refresh_proposal_preview`, outcome
+    /// `previewed`). The apply form takes the two full commit IDs that preview
+    /// reported as `--expected-source` and `--expected-head` and submits the
+    /// shared `refresh_proposal` command (operation `control_refresh_proposal`,
+    /// outcomes `refreshed` or `unchanged`). `--source-ref` is required in both:
+    /// there is no default branch.
+    ///
+    /// It is not a retry. Nothing is started, retried, queued, marked, stopped,
+    /// or merged; the row keeps its status, and the next explicit retry reads
+    /// the corrected candidate through ordinary resume routing. A row the owner
+    /// cannot refresh is `target_ineligible`. A refusal the repository itself
+    /// produced — a moved ref, a dirty candidate, a rejecting hook — is
+    /// `refresh_refused` (exit 28) with `detail.reason` and `detail.effects`.
+    /// Nothing is ever reset or cleaned: after a hook rejection the corrected
+    /// file stays written and staged, and `effects` says so. This client runs no
+    /// Git itself, and the command is not exposed over `cflx client mcp`.
+    ///
+    /// EXAMPLES:
+    ///   cflx client refresh-proposal alpha --source-ref develop --dry-run --json
+    ///   cflx client refresh-proposal alpha --source-ref develop \
+    ///     --expected-source <source_commit> --expected-head <candidate_head> --json
+    RefreshProposal(ClientRefreshProposalArgs),
 
     /// Observe one change until verified completion or a typed failure
     ///
@@ -1464,6 +1499,62 @@ pub struct ClientForceStopChangeArgs {
     /// Emit one versioned JSON envelope on stdout
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `cflx client refresh-proposal`.
+///
+/// Exactly one of the two forms: `--dry-run`, or both expectations. Clap
+/// enforces the shape so a malformed invocation is a `usage_error` before any
+/// owner is contacted.
+#[derive(Parser, Debug)]
+#[command(group(
+    clap::ArgGroup::new("refresh_form")
+        .required(true)
+        .args(["dry_run", "expected_source"])
+))]
+pub struct ClientRefreshProposalArgs {
+    /// The one proposal whose candidate to refresh
+    #[arg(value_parser = parse_change_id)]
+    pub change_id: String,
+
+    /// Source ref the corrected proposal.md is read from (required; no default)
+    #[arg(long, value_name = "REF", required = true)]
+    pub source_ref: String,
+
+    /// Read the preview only; submit nothing
+    #[arg(long, conflicts_with_all = ["expected_source", "expected_head"])]
+    pub dry_run: bool,
+
+    /// Full 40-hex source commit a preview reported
+    #[arg(long, value_name = "COMMIT", requires = "expected_head", value_parser = parse_full_commit_id)]
+    pub expected_source: Option<String>,
+
+    /// Full 40-hex candidate HEAD a preview reported
+    #[arg(long, value_name = "COMMIT", requires = "expected_source", value_parser = parse_full_commit_id)]
+    pub expected_head: Option<String>,
+
+    /// Emit one versioned JSON envelope on stdout
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Parse a full-length 40-hex commit ID.
+///
+/// Abbreviations are refused: an expectation exists to name exactly the commit
+/// a preview saw, and a prefix could name a different one later.
+pub fn parse_full_commit_id(value: &str) -> std::result::Result<String, String> {
+    if value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "'{value}' is not a full-length commit ID: expected exactly 40 lowercase hexadecimal \
+             characters"
+        ))
+    }
 }
 
 /// Arguments for `cflx client start`, `stop`, and `force-stop`.

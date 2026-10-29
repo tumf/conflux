@@ -880,6 +880,26 @@ impl WebState {
             .await;
     }
 
+    /// Seed the repository root and change-to-worktree relation a workspace
+    /// refresh would publish, then republish the projection.
+    ///
+    /// Test seam for the candidate proposal refresh: it is the same relation the
+    /// projected `worktree` field and the refresh preview both read.
+    #[allow(dead_code)]
+    #[doc(hidden)]
+    pub async fn seed_worktree_paths_for_tests(
+        &self,
+        repo_root: std::path::PathBuf,
+        worktree_paths: std::collections::HashMap<String, std::path::PathBuf>,
+    ) {
+        {
+            let mut facts = self.operator_facts.write().await;
+            facts.set_repo_root(repo_root);
+            facts.apply_worktree_paths(worktree_paths);
+        }
+        self.sync_remote_control_projection().await;
+    }
+
     /// Merge one workspace observation into the projected snapshot.
     ///
     /// A workspace listing carries neither the run's execution mode nor the
@@ -1592,6 +1612,14 @@ impl WebState {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::web::remote_control_api::proposal_refresh::RefreshPathSource for WebState {
+    async fn locate(&self, change_id: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let facts = self.operator_facts.read().await;
+        Some((facts.repo_root()?, facts.worktree_path(change_id)?))
     }
 }
 

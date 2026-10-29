@@ -24,6 +24,7 @@ pub mod commands;
 pub mod dto;
 pub mod executor;
 pub mod projection;
+pub mod proposal_refresh;
 pub mod proposal_subscriptions;
 pub mod reads;
 pub mod registry;
@@ -508,6 +509,11 @@ pub struct RemoteControlState {
     /// discovery reports exactly that, so a client never has to infer support
     /// from a refusal.
     pub completion_sinks: Arc<CompletionSinkHandle>,
+    /// Where candidate worktrees live, for the refresh preview.
+    ///
+    /// `None` is a process that knows no candidate worktree, which previews
+    /// every eligible row as `no_candidate_worktree`.
+    pub refresh_paths: Option<Arc<dyn proposal_refresh::RefreshPathSource>>,
 }
 
 impl RemoteControlState {
@@ -533,7 +539,17 @@ impl RemoteControlState {
             execution_facts: Arc::new(ExecutionFactsHandle::default()),
             execution_contract: Arc::new(ExecutionContractHandle::default()),
             completion_sinks: Arc::new(CompletionSinkHandle::default()),
+            refresh_paths: None,
         }
+    }
+
+    /// Attach the candidate-worktree locator the refresh preview reads.
+    pub fn with_refresh_paths(
+        mut self,
+        source: Arc<dyn proposal_refresh::RefreshPathSource>,
+    ) -> Self {
+        self.refresh_paths = Some(source);
+        self
     }
 
     /// Attach the completion-sink handle this router serves.
@@ -597,6 +613,10 @@ pub fn router(state: RemoteControlState) -> Router {
             get(proposal_subscriptions::get_subscription)
                 .put(proposal_subscriptions::put_subscription)
                 .delete(proposal_subscriptions::delete_subscription),
+        )
+        .route(
+            proposal_refresh::PREVIEW_ROUTE,
+            get(proposal_refresh::preview),
         )
         .route("/api/v2/changes", get(reads::list_changes))
         .route("/api/v2/changes/{change_id}", get(reads::get_change))
