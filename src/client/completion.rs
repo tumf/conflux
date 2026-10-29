@@ -154,6 +154,23 @@ pub fn is_settled_success_claim(display_status: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    /// Verification `blocked-idle-graceful-stop`: a blocked-only graceful stop
+    /// leaves the queued row at `not queued`, and that row is never completion.
+    ///
+    /// A `wait` that observes it keeps the classification it already had —
+    /// keep observing an unadmitted row, release only on its own settled-stop
+    /// execution fact — and never certifies success because Stop returned 0.
+    #[test]
+    fn blocked_idle_graceful_stop_not_queued_row_is_never_completion() {
+        let disposition = classify(Some("not queued"), None);
+        assert_eq!(disposition, Disposition::KeepObserving);
+        assert!(!claims_terminal_success(Some("not queued")));
+        assert!(
+            !is_settled_stop(disposition, None, ChangeExecutionState::Stopped),
+            "a row with no execution episode proves no episode ended"
+        );
+    }
+
     #[test]
     fn only_post_archive_statuses_claim_a_success_worth_verifying() {
         assert!(claims_terminal_success(Some("archived")));

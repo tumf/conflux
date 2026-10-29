@@ -9,6 +9,8 @@ mod analysis_liveness_loop;
 #[cfg(test)]
 mod auto_resolve;
 #[cfg(test)]
+mod blocked_idle_graceful_stop;
+#[cfg(test)]
 mod capacity_gated_reanalysis;
 #[cfg(test)]
 mod change_error_f5_retry;
