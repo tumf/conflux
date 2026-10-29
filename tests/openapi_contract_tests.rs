@@ -1094,6 +1094,40 @@ fn force_stop_change_contract_is_published_end_to_end() {
     }
 }
 
+/// The server always publishes refresh eligibility even though the client
+/// decoder accepts its absence from owners built before refresh existed.
+#[test]
+fn refresh_eligibility_remains_required_and_non_null_in_published_schema() {
+    let doc = generated();
+    let actions = &schemas(&doc)["ChangeActions"];
+    let required = actions["required"]
+        .as_array()
+        .expect("ChangeActions publishes a required-member list");
+    assert!(
+        required.iter().any(|member| member == "refresh_proposal"),
+        "the server's refresh eligibility is required in the published contract"
+    );
+    let property = &actions["properties"]["refresh_proposal"];
+    assert_eq!(
+        property["$ref"], "#/components/schemas/ActionEligibility",
+        "refresh eligibility remains a non-null ActionEligibility reference"
+    );
+    assert!(
+        property
+            .get("nullable")
+            .is_none_or(|nullable| nullable == false),
+        "refresh eligibility must not be nullable"
+    );
+    assert!(
+        property.get("type").is_none_or(|kind| {
+            kind.as_array()
+                .is_none_or(|types| !types.iter().any(|t| t == "null"))
+        }),
+        "refresh eligibility must not admit a null type"
+    );
+    assert!(property.get("anyOf").is_none() && property.get("oneOf").is_none());
+}
+
 /// The retired Apply-limit token stays published, and stays a token.
 ///
 /// No current projection or command admission produces
