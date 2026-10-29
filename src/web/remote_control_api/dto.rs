@@ -1031,7 +1031,24 @@ pub struct ChangeActions {
     /// Lifecycle eligibility only, from the shared refresh table: a candidate
     /// that is allowed here can still be refused at command time by its own
     /// repository state, which the `refresh-preview` read reports.
-    pub refresh_proposal: ActionEligibility,
+    ///
+    /// `Option` with `#[serde(default)]` because the member is additive: an
+    /// owner built before the candidate refresh surface publishes every other
+    /// member of this table and not this one, and a client reading such an
+    /// owner must keep decoding `/api/v2/state` for `status`, `wait`, `mark`,
+    /// and every other verb that never consults refresh eligibility. `None`
+    /// means exactly "this owner published no refresh table for the row" — it
+    /// is never `allowed`, and it is distinct from a published refusal. The
+    /// server always writes `Some`, so a `None` decoded from an owner whose
+    /// capabilities advertise the surface is a contract mismatch, not an
+    /// eligibility. The remaining members stay required: a payload missing
+    /// one of them is malformed and is rejected as such. The published
+    /// contract keeps the member required and non-null, because that is what
+    /// this server serves; the `Option` is a decoding affordance for older
+    /// owners, not a licence to omit.
+    #[serde(default)]
+    #[schema(required, nullable = false)]
+    pub refresh_proposal: Option<ActionEligibility>,
 }
 
 /// Why a change cannot take part in parallel execution.

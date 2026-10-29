@@ -794,6 +794,9 @@ mod enabled {
     struct OwnerExtras {
         /// Bind an execution-sink registry and publish the capability.
         sinks: bool,
+        /// Serve the production router's answers reshaped to an older wire
+        /// contract. `None` serves this build's own shape.
+        legacy: Option<LegacyShape>,
         /// The transport marker the router labels every request with.
         ///
         /// Production attaches this per listener. This fixture serves exactly
@@ -810,8 +813,138 @@ mod enabled {
             Self {
                 sinks: true,
                 transport: Some(conflux::web::remote_control_api::ApiTransport::Unix),
+                legacy: None,
             }
         }
+    }
+
+    /// An older owner's wire contract, reproduced from the production router.
+    ///
+    /// The responses are the real handlers' own, with exactly the members an
+    /// older build never published removed — and the removal asserts each
+    /// member was present, so a server that stops publishing one fails the
+    /// test loudly instead of letting the "legacy" owner silently become the
+    /// current one. The fields are the ones the DTO history shows were added
+    /// after that owner was built, which is what makes the shape that owner's
+    /// rather than an invented one.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LegacyShape {
+        /// An owner built before candidate proposal refresh (v0.6.328-rc.1 is
+        /// the deployed instance): `actions` lacks `refresh_proposal`,
+        /// capabilities lack the `proposal_refresh` block and the
+        /// `refresh_proposal` command, and the preview route does not exist.
+        PreRefresh,
+        /// Not an owner that ever existed: a `state` payload that drops a
+        /// member every build has required. Decoding must refuse it, so the
+        /// tolerance for additive members is proven not to be tolerance for
+        /// malformed ones.
+        MissingForceStopEligibility,
+    }
+
+    /// Counts the members a legacy layer actually removed, so a test can prove
+    /// the reshaping happened rather than that the client merely succeeded.
+    #[derive(Default)]
+    struct LegacyStrips(AtomicUsize);
+
+    impl LegacyStrips {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn reshape_as_legacy(
+        shape: LegacyShape,
+        strips: Arc<LegacyStrips>,
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        let method = request.method().clone();
+        let path = request.uri().path().to_string();
+
+        // An owner without the route answers the router's bare 404: no typed
+        // body, because no handler exists to write one.
+        if shape == LegacyShape::PreRefresh
+            && path.starts_with("/api/v2/proposals/")
+            && path.ends_with("/refresh-preview")
+        {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
+
+        let response = next.run(request).await;
+        let target = match (method.as_str(), path.as_str()) {
+            ("GET", "/api/v2/state") | ("GET", "/api/v2/capabilities") => path.as_str(),
+            // Everything else is forwarded untouched, streams included.
+            _ => return response,
+        };
+        if response.status() != axum::http::StatusCode::OK {
+            return response;
+        }
+
+        let (mut parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("the read response body is readable");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the read response is JSON");
+
+        let mut removed = 0usize;
+        match (shape, target) {
+            (LegacyShape::PreRefresh, "/api/v2/state") => {
+                for change in value["snapshot"]["changes"]
+                    .as_array_mut()
+                    .expect("state publishes a change list")
+                {
+                    change["actions"]
+                        .as_object_mut()
+                        .expect("a change publishes actions")
+                        .remove("refresh_proposal")
+                        .expect("this build publishes `actions.refresh_proposal`");
+                    removed += 1;
+                }
+            }
+            (LegacyShape::PreRefresh, "/api/v2/capabilities") => {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("proposal_refresh")
+                    .expect("this build publishes `proposal_refresh` capabilities");
+                removed += 1;
+                let commands = value["commands"]
+                    .as_array_mut()
+                    .expect("capabilities publish the closed command set");
+                let before = commands.len();
+                commands.retain(|command| command != "refresh_proposal");
+                assert_eq!(
+                    commands.len() + 1,
+                    before,
+                    "this build advertises the `refresh_proposal` command"
+                );
+                removed += 1;
+            }
+            (LegacyShape::MissingForceStopEligibility, "/api/v2/state") => {
+                for change in value["snapshot"]["changes"]
+                    .as_array_mut()
+                    .expect("state publishes a change list")
+                {
+                    change["actions"]
+                        .as_object_mut()
+                        .expect("a change publishes actions")
+                        .remove("force_stop_change")
+                        .expect("this build publishes `actions.force_stop_change`");
+                    removed += 1;
+                }
+            }
+            (LegacyShape::MissingForceStopEligibility, _) => {}
+            (LegacyShape::PreRefresh, _) => unreachable!("only the two read paths are reshaped"),
+        }
+        strips.0.fetch_add(removed, Ordering::SeqCst);
+
+        let bytes = serde_json::to_vec(&value).expect("the reshaped body serializes");
+        // The body length changed; let the server recompute the header.
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
     }
 
     /// A real `/api/v2` router on a real Unix socket, plus the handles a test
@@ -823,6 +956,8 @@ mod enabled {
         boundary: Arc<Boundary>,
         facts: Arc<ExecutionFactsStore>,
         sinks: Option<Arc<conflux::web::completion_sink::CompletionSinkRegistry>>,
+        /// Members the legacy layer removed; zero without one.
+        strips: Arc<LegacyStrips>,
         /// Monotonic dispatch identity for the facts store's absorption check.
         dispatch: AtomicUsize,
         shutdown: tokio_util::sync::CancellationToken,
@@ -871,6 +1006,25 @@ mod enabled {
             let mut owner =
                 Self::start_layered(socket, executor, token, Some(api), OwnerExtras::default())
                     .await;
+            owner._dir = Some(dir);
+            owner
+        }
+
+        /// Start an owner whose real router is both reshaped and recorded.
+        ///
+        /// The recording layer is outermost, so it sees exactly what the client
+        /// sent — including a request a legacy owner would answer with a bare
+        /// 404 — and the reshaping layer sits inside it, over the production
+        /// handlers.
+        async fn start_intercepted_with(
+            executor: Option<Arc<dyn RemoteControlExecutor>>,
+            token: Option<&str>,
+            api: Arc<ApiSpy>,
+            extras: OwnerExtras,
+        ) -> Self {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let socket = dir.path().join("cflx-api.sock");
+            let mut owner = Self::start_layered(socket, executor, token, Some(api), extras).await;
             owner._dir = Some(dir);
             owner
         }
@@ -924,6 +1078,19 @@ mod enabled {
                     .with_execution_contract(runtime.execution_contract())
                     .with_completion_sinks(runtime.completion_sinks()),
             );
+            let strips = Arc::new(LegacyStrips::default());
+            let app = match extras.legacy {
+                Some(shape) => {
+                    let strips = strips.clone();
+                    app.layer(axum::middleware::from_fn(
+                        move |request: axum::extract::Request, next: axum::middleware::Next| {
+                            let strips = strips.clone();
+                            async move { reshape_as_legacy(shape, strips, request, next).await }
+                        },
+                    ))
+                }
+                None => app,
+            };
             let app = match api {
                 Some(api) => app.layer(axum::middleware::from_fn(
                     move |request: axum::extract::Request, next: axum::middleware::Next| {
@@ -954,6 +1121,7 @@ mod enabled {
                 boundary,
                 facts,
                 sinks,
+                strips,
                 dispatch: AtomicUsize::new(0),
                 shutdown,
                 task,
@@ -5790,6 +5958,7 @@ mod enabled {
             OwnerExtras {
                 sinks: true,
                 transport: Some(conflux::web::remote_control_api::ApiTransport::Tcp),
+                legacy: None,
             },
         )
         .await;
@@ -6980,6 +7149,302 @@ mod enabled {
                 "token '{token}' must be documented"
             );
         }
+    }
+
+    // ========================================================================
+    // legacy_owner: a client built with candidate refresh against an owner
+    // built without it
+    // ========================================================================
+    //
+    // The regression these guard: a client whose DTO gained a required member
+    // refused every operation — `status` included — against a running owner
+    // that predates the member, while the older client kept working against the
+    // same unchanged owner. Restarting the owner is not a remedy; decoding its
+    // real shape is.
+
+    fn legacy_owner_extras() -> OwnerExtras {
+        OwnerExtras {
+            legacy: Some(LegacyShape::PreRefresh),
+            ..OwnerExtras::default()
+        }
+    }
+
+    async fn refresh(owner: &Owner, cwd: &Path, tail: &[&str]) -> Output {
+        let mut args = vec!["refresh-proposal", "alpha", "--source-ref", "develop"];
+        args.extend_from_slice(tail);
+        args.push("--json");
+        run_client(&owner.socket(), cwd, &args).await
+    }
+
+    fn posted_commands(api: &ApiSpy) -> Vec<String> {
+        api.requests()
+            .into_iter()
+            .filter(|request| request.starts_with("POST "))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn legacy_owner_status_mark_and_wait_decode_the_pre_refresh_state_shape() {
+        let repo = Fixture::new();
+        let spy = SpyExecutor::new();
+        let api = ApiSpy::new();
+        let owner = Owner::start_intercepted_with(
+            Some(spy.clone()),
+            None,
+            api.clone(),
+            legacy_owner_extras(),
+        )
+        .await;
+        let mut failed = change("beta", "select", "error");
+        failed.error_detail = Some("the apply phase exited non-zero".to_string());
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued"), failed],
+        ));
+        owner.contract(merged_contract("main"));
+
+        // status: the whole observation decodes, and reports the owner's rows.
+        let output = control(&owner, &["status"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "observed", "{}", stderr_of(&output));
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(parsed["instance_id"], owner.instance_id());
+        assert_eq!(parsed["detail"]["changes"].as_array().unwrap().len(), 2);
+        assert!(
+            owner.strips.count() > 0,
+            "the owner really served the pre-refresh shape"
+        );
+
+        // mark: a control that reads the table decodes the same shape and
+        // submits exactly its own command.
+        let output = control(&owner, &["mark", "alpha"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "marked", "{}", stderr_of(&output));
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            spy.calls(),
+            vec![CommandSpec::SetExecutionMark {
+                change_id: "alpha".to_string(),
+                marked: true,
+            }]
+        );
+
+        // wait: the observation-only oracle classifies a parked row from the
+        // same shape and releases without submitting anything.
+        let output = wait_for(&owner, repo.path(), "beta", "30s").await;
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "change_requires_action",
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(27));
+        assert_eq!(parsed["detail"]["observed_status"], "error");
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(
+            posted_commands(&api).len(),
+            1,
+            "the mark was the only command on the wire"
+        );
+        owner.stop().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_owner_refresh_preview_and_apply_are_unsupported_and_submit_nothing() {
+        let spy = SpyExecutor::new();
+        let api = ApiSpy::new();
+        let owner = Owner::start_intercepted_with(
+            Some(spy.clone()),
+            None,
+            api.clone(),
+            legacy_owner_extras(),
+        )
+        .await;
+        owner.publish(snapshot("select", vec![change("alpha", "select", "error")]));
+        let cwd = neutral_cwd();
+
+        // Preview: the owner's capabilities say the surface is not served, so
+        // the route is never asked for and no 404 is ever interpreted.
+        let output = refresh(&owner, cwd.path(), &["--dry-run"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "unsupported_owner",
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(parsed["operation"], "refresh_proposal_preview");
+        assert_eq!(output.status.code(), Some(26));
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["instance_id"], owner.instance_id());
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert!(
+            !api.requests()
+                .iter()
+                .any(|request| request.contains("refresh-preview")),
+            "the preview route is not probed on an owner that does not serve it: {:?}",
+            api.requests()
+        );
+
+        // Apply: the same owner fact, read from the full observation, refuses
+        // before any command exists. The expectations are well-formed, so the
+        // refusal is the owner's and not the parser's.
+        let output = refresh(
+            &owner,
+            cwd.path(),
+            &[
+                "--expected-source",
+                &"a".repeat(40),
+                "--expected-head",
+                &"b".repeat(40),
+            ],
+        )
+        .await;
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "unsupported_owner",
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(parsed["operation"], "control_refresh_proposal");
+        assert_eq!(output.status.code(), Some(26));
+        assert_eq!(parsed["instance_id"], owner.instance_id());
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert_eq!(spy.call_count(), 0, "nothing reached the executor");
+        assert!(
+            posted_commands(&api).is_empty(),
+            "nothing was posted: {:?}",
+            api.requests()
+        );
+        assert!(api.exchanges().is_empty());
+
+        // The owner is still fully usable for everything else.
+        let output = control(&owner, &["status"]).await;
+        assert_eq!(envelope(&output)["outcome"], "observed");
+        owner.stop().await;
+    }
+
+    #[tokio::test]
+    async fn current_owner_refresh_reads_the_published_table_and_names_an_unknown_proposal() {
+        let spy = SpyExecutor::new();
+        let api = ApiSpy::new();
+        let owner = Owner::start_intercepted(Some(spy.clone()), None, api.clone()).await;
+        // An `error` row with no registered worktree: the owner's own table
+        // refuses refresh as `no_candidate_worktree`, which is a published
+        // refusal and not an absent one.
+        owner.publish(snapshot("select", vec![change("alpha", "select", "error")]));
+        let cwd = neutral_cwd();
+
+        // Preview on a served surface reaches the real preview handler.
+        let output = refresh(&owner, cwd.path(), &["--dry-run"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(parsed["outcome"], "previewed", "{}", stderr_of(&output));
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(parsed["detail"]["eligible"], false);
+        assert_eq!(parsed["detail"]["refusal"], "no_candidate_worktree");
+        assert_eq!(parsed["detail"]["commands_submitted"], 0);
+        assert!(
+            api.requests()
+                .iter()
+                .any(|request| request == "GET /api/v2/proposals/alpha/refresh-preview"),
+            "{:?}",
+            api.requests()
+        );
+
+        // A typed 404 from the served route names the proposal, which is a
+        // different answer from a route that does not exist.
+        let output = run_client(
+            &owner.socket(),
+            cwd.path(),
+            &[
+                "refresh-proposal",
+                "ghost",
+                "--source-ref",
+                "develop",
+                "--dry-run",
+                "--json",
+            ],
+        )
+        .await;
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "change_not_found",
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(9));
+
+        // Apply on a served surface is refused by the owner's published table,
+        // with the published reason, before any record exists.
+        let output = refresh(
+            &owner,
+            cwd.path(),
+            &[
+                "--expected-source",
+                &"a".repeat(40),
+                "--expected-head",
+                &"b".repeat(40),
+            ],
+        )
+        .await;
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "target_ineligible",
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(10));
+        assert_eq!(parsed["detail"]["blocked_reason"], "no_candidate_worktree");
+        assert_eq!(spy.call_count(), 0);
+        assert!(posted_commands(&api).is_empty(), "{:?}", api.requests());
+        owner.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_owner_omitting_a_pre_existing_required_member_is_still_incompatible() {
+        let spy = SpyExecutor::new();
+        let owner = Owner::start_with(
+            Some(spy.clone()),
+            None,
+            OwnerExtras {
+                legacy: Some(LegacyShape::MissingForceStopEligibility),
+                ..OwnerExtras::default()
+            },
+        )
+        .await;
+        owner.publish(snapshot(
+            "select",
+            vec![change("alpha", "select", "not queued")],
+        ));
+
+        let output = control(&owner, &["status"]).await;
+        let parsed = envelope(&output);
+        assert_eq!(
+            parsed["outcome"],
+            "incompatible_owner",
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(output.status.code(), Some(6));
+        assert!(
+            parsed["message"]
+                .as_str()
+                .unwrap()
+                .contains("force_stop_change"),
+            "the refusal names the missing member: {parsed}"
+        );
+        assert!(owner.strips.count() > 0);
+
+        // A control over the same payload is refused the same way, before any
+        // command exists.
+        let output = control(&owner, &["mark", "alpha"]).await;
+        assert_eq!(envelope(&output)["outcome"], "incompatible_owner");
+        assert_eq!(spy.call_count(), 0);
+        owner.stop().await;
     }
 }
 

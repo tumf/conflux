@@ -215,9 +215,11 @@ pub enum Outcome {
     ///
     /// Distinct from [`Self::IncompatibleOwner`]: that one says the owner and
     /// this build disagree about the API itself, while this says they agree
-    /// perfectly and the owner published that it does not offer proposal
-    /// subscriptions. A caller told the first would stop talking to the owner
-    /// at all; a caller told the second keeps using every other operation.
+    /// perfectly and the owner published that it does not offer the one
+    /// additive surface asked for — proposal subscriptions, or candidate
+    /// proposal refresh. A caller told the first would stop talking to the
+    /// owner at all; a caller told the second keeps using every other
+    /// operation.
     UnsupportedOwner,
     /// An eligible candidate's own repository state refused a proposal refresh.
     ///

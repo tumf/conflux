@@ -110,7 +110,21 @@ pub async fn preview(
         .into_response();
     };
 
-    let eligibility = change.actions.refresh_proposal;
+    // A row this process projected always carries the table: `classify_actions`
+    // publishes it for every tracked change, and `None` exists only for rows
+    // decoded from an owner that predates the surface, which this handler never
+    // reads. Refusing rather than guessing keeps a projection defect visible.
+    let Some(eligibility) = change.actions.refresh_proposal else {
+        return ApiError::new(
+            ErrorCode::TargetIneligible,
+            format!(
+                "change '{change_id}' has no published refresh eligibility in this incarnation"
+            ),
+            &correlation.0,
+        )
+        .with_revision(state_revision)
+        .into_response();
+    };
     let preview = if !eligibility.allowed {
         RefreshPreview::refused(
             &change_id,

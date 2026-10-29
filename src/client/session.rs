@@ -335,6 +335,32 @@ impl Observation {
     pub fn proposal_subscriptions_available(&self) -> bool {
         self.capabilities.proposal_subscriptions.available
     }
+
+    /// Whether this owner accepts the `refresh_proposal` command.
+    pub fn proposal_refresh_command_available(&self) -> bool {
+        refresh_command_available(&self.capabilities)
+    }
+}
+
+/// Whether capabilities advertise the candidate refresh preview resource.
+///
+/// The owner's own published fact, not a probe: an owner that predates the
+/// surface omits the whole `proposal_refresh` block, which decodes to its
+/// `Default` and therefore to `false`.
+pub fn refresh_preview_available(capabilities: &CapabilitiesResponse) -> bool {
+    capabilities.proposal_refresh.preview_available
+}
+
+/// Whether capabilities advertise the `refresh_proposal` command.
+///
+/// Read from the closed command set `POST /api/v2/commands` accepts, through
+/// the name the refresh capability block itself publishes: an owner that
+/// predates the surface advertises neither, and an owner that serves the
+/// preview but lists no command (a shape this build never produces) is not
+/// treated as accepting one.
+pub fn refresh_command_available(capabilities: &CapabilitiesResponse) -> bool {
+    let command = capabilities.proposal_refresh.command.as_str();
+    !command.is_empty() && capabilities.commands.iter().any(|name| name == command)
 }
 
 /// Why one observation attempt did not produce a usable result.
@@ -455,13 +481,7 @@ pub async fn observe(
 ) -> Result<Observation, ObserveError> {
     let client = connection.client();
 
-    let capabilities: CapabilitiesResponse = read(client, "/api/v2/capabilities").await?;
-    if capabilities.api_version != API_VERSION {
-        return Err(ObserveError::Incompatible(format!(
-            "the owner serves API version '{}', but this client speaks '{API_VERSION}'",
-            capabilities.api_version
-        )));
-    }
+    let capabilities = capabilities(connection).await?;
     let instance: InstanceResponse = read(client, "/api/v2/instance").await?;
 
     let contract_path = match change_id {
@@ -540,6 +560,24 @@ pub async fn observe(
         execution,
         contract,
     })
+}
+
+/// Read the owner's capabilities and check that it speaks this API version.
+///
+/// The first read of every observation, and on its own the read a surface
+/// check needs: whether an owner serves an additive resource is its own
+/// published fact, so a client asks here before it touches the resource rather
+/// than inferring the answer from a 404.
+pub async fn capabilities(connection: &Connection) -> Result<CapabilitiesResponse, ObserveError> {
+    let capabilities: CapabilitiesResponse =
+        read(connection.client(), "/api/v2/capabilities").await?;
+    if capabilities.api_version != API_VERSION {
+        return Err(ObserveError::Incompatible(format!(
+            "the owner serves API version '{}', but this client speaks '{API_VERSION}'",
+            capabilities.api_version
+        )));
+    }
+    Ok(capabilities)
 }
 
 /// Reread until one coherent observation is produced, up to `attempts` times.
@@ -705,6 +743,28 @@ mod tests {
         ] {
             assert!(!error.is_transient(), "{error:?}");
         }
+    }
+
+    /// The refresh surface is read from the owner's published capabilities,
+    /// and an owner that predates it publishes neither half.
+    #[test]
+    fn refresh_surface_is_read_from_published_capabilities() {
+        let mut observation = observation_for_test(Vec::new());
+        assert!(!refresh_preview_available(&observation.capabilities));
+        assert!(!observation.proposal_refresh_command_available());
+
+        // A preview block alone advertises no command.
+        observation.capabilities.proposal_refresh.preview_available = true;
+        observation.capabilities.proposal_refresh.command = "refresh_proposal".to_string();
+        assert!(refresh_preview_available(&observation.capabilities));
+        assert!(!observation.proposal_refresh_command_available());
+
+        // The command is accepted only once the closed command set lists it.
+        observation
+            .capabilities
+            .commands
+            .push("refresh_proposal".to_string());
+        assert!(observation.proposal_refresh_command_available());
     }
 
     #[test]

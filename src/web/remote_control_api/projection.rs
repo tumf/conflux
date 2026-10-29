@@ -754,7 +754,7 @@ fn classify_actions(
         stop_and_dequeue,
         force_stop_change,
         resolve_merge,
-        refresh_proposal,
+        refresh_proposal: Some(refresh_proposal),
     }
 }
 

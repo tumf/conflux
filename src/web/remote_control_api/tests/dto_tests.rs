@@ -252,3 +252,203 @@ fn command_record_status_reflects_its_lifecycle_state() {
     record.error_code = Some(ErrorCode::TargetIneligible);
     assert_eq!(record.http_status(), StatusCode::CONFLICT);
 }
+
+// ============================================================================
+// Additive-field compatibility: a client reading an older owner
+// ============================================================================
+//
+// The owner shape these tests reproduce is the one every `/api/v2` build before
+// the candidate proposal refresh surface serves (v0.6.328-rc.1 is the deployed
+// instance of it): `actions` carries every member except `refresh_proposal`,
+// and `capabilities` carries no `proposal_refresh` block and no
+// `refresh_proposal` command. The fixtures are derived from this build's own
+// serializer with exactly those members removed — and only those, which is what
+// the DTO history between that owner and this build shows was added — so they
+// cannot drift from the wire shape the way a hand-copied snapshot would.
+
+mod legacy_owner_shape {
+    use crate::web::remote_control_api::dto::{
+        ActionBlockedReason, AttentionState, CapabilitiesResponse, ChangeResource, ChangeTiming,
+        ParallelEligibility, QueueIntent,
+    };
+    use crate::web::remote_control_api::projection::change_actions_for_test;
+
+    /// One projected row as this build serializes it.
+    fn current_row(display_status: &str) -> serde_json::Value {
+        let row = ChangeResource {
+            id: "alpha".to_string(),
+            display_status: display_status.to_string(),
+            progress_status: "pending".to_string(),
+            completed_tasks: 0,
+            total_tasks: 2,
+            progress_percent: 0.0,
+            dependencies: Vec::new(),
+            iteration_number: None,
+            execution_marked: false,
+            queue_intent: QueueIntent::NotQueued,
+            attention: AttentionState::None,
+            blocker: None,
+            error_detail: None,
+            actions: change_actions_for_test("select", display_status, None),
+            parallel: ParallelEligibility::default(),
+            timing: ChangeTiming::default(),
+            latest_activity: None,
+            worktree: None,
+            acceptance_provenance: None,
+        };
+        serde_json::to_value(row).expect("a projected row serializes")
+    }
+
+    /// The same row as an owner that predates candidate refresh publishes it.
+    fn legacy_row(display_status: &str) -> serde_json::Value {
+        let mut row = current_row(display_status);
+        let removed = row["actions"]
+            .as_object_mut()
+            .expect("actions is an object")
+            .remove("refresh_proposal");
+        assert!(
+            removed.is_some(),
+            "this build publishes `refresh_proposal`; the legacy shape is defined by its absence"
+        );
+        row
+    }
+
+    /// `GET /api/v2/capabilities` as an owner that predates candidate refresh
+    /// publishes it: the closed command set without `refresh_proposal`, and no
+    /// `proposal_refresh` block at all.
+    fn legacy_capabilities() -> serde_json::Value {
+        serde_json::json!({
+            "api_version": "v2",
+            "instance_id": "i-legacy",
+            "commands": [
+                "start", "stop", "cancel_stop", "force_stop", "set_all_execution_marks",
+                "set_execution_mark", "set_queue_intent", "retry_change", "retry_errors",
+                "stop_and_dequeue", "force_stop_change", "resolve_merge",
+                "create_worktree", "delete_worktree", "merge_worktree"
+            ],
+            "transports": [],
+            "error_codes": [],
+            "limits": {
+                "max_events": 1, "max_logs": 1, "max_commands": 1,
+                "max_idempotency_records": 1, "command_record_ttl_secs": 1,
+                "max_correlation_id_len": 64
+            },
+            "authentication_required": false,
+            "command_execution": { "available": true },
+            "worktrees": serde_json::to_value(
+                crate::web::remote_control_api::worktrees::WorktreeCapabilities::default()
+            )
+            .expect("the worktree surface serializes"),
+            "parallel": { "max_concurrent": 1, "vcs_backend": "git", "blocked_reasons": [] }
+        })
+    }
+
+    #[test]
+    fn a_row_without_refresh_eligibility_decodes_with_the_table_absent() {
+        let row: ChangeResource = serde_json::from_value(legacy_row("error"))
+            .expect("an older owner's row must still decode on this build");
+        assert_eq!(
+            row.actions.refresh_proposal, None,
+            "absence is preserved as absence, never projected onto a permission"
+        );
+        // Every pre-existing member is still the published value, not a default.
+        assert!(row.actions.set_execution_mark.allowed);
+        assert!(row.actions.retry_change.allowed);
+        assert_eq!(
+            row.actions.force_stop_change.blocked_reason,
+            Some(ActionBlockedReason::NotAdmitted)
+        );
+    }
+
+    #[test]
+    fn a_row_with_refresh_eligibility_decodes_with_the_published_table() {
+        let row: ChangeResource =
+            serde_json::from_value(current_row("error")).expect("this build's own row decodes");
+        let published = row
+            .actions
+            .refresh_proposal
+            .expect("a current owner publishes the refresh table");
+        assert_eq!(
+            published.blocked_reason,
+            Some(ActionBlockedReason::NoCandidateWorktree),
+            "the published refusal survives the round trip unchanged"
+        );
+        let row: ChangeResource =
+            serde_json::from_value(serde_json::to_value(row).expect("serializes"))
+                .expect("round trip");
+        assert_eq!(row.actions.refresh_proposal, Some(published));
+    }
+
+    #[test]
+    fn the_server_always_writes_the_refresh_table() {
+        let row = current_row("not queued");
+        assert!(
+            row["actions"]["refresh_proposal"].is_object(),
+            "`Option` is a decoding affordance for older owners, not a licence to omit: {row}"
+        );
+    }
+
+    #[test]
+    fn a_row_missing_a_pre_existing_required_member_is_still_rejected() {
+        for member in [
+            "set_execution_mark",
+            "set_queue_intent",
+            "retry_change",
+            "stop_and_dequeue",
+            "force_stop_change",
+            "resolve_merge",
+        ] {
+            let mut row = legacy_row("error");
+            row["actions"]
+                .as_object_mut()
+                .unwrap()
+                .remove(member)
+                .expect("the member was published");
+            let error = serde_json::from_value::<ChangeResource>(row)
+                .expect_err("a payload missing a required member is malformed");
+            assert!(
+                error.to_string().contains(member),
+                "the rejection must name `{member}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_without_the_refresh_block_decode_as_not_served() {
+        let capabilities: CapabilitiesResponse = serde_json::from_value(legacy_capabilities())
+            .expect("an older owner's capabilities must still decode on this build");
+        assert!(!capabilities.proposal_refresh.preview_available);
+        assert!(capabilities.proposal_refresh.command.is_empty());
+        assert!(!capabilities
+            .commands
+            .iter()
+            .any(|command| command == "refresh_proposal"));
+        // The sibling additive surfaces decode the same way, by the same rule.
+        assert!(!capabilities.execution_sinks.available);
+        assert!(!capabilities.proposal_subscriptions.available);
+    }
+
+    #[test]
+    fn capabilities_missing_a_pre_existing_required_member_are_still_rejected() {
+        for member in [
+            "command_execution",
+            "commands",
+            "limits",
+            "worktrees",
+            "parallel",
+        ] {
+            let mut capabilities = legacy_capabilities();
+            capabilities
+                .as_object_mut()
+                .unwrap()
+                .remove(member)
+                .expect("the member was published");
+            let error = serde_json::from_value::<CapabilitiesResponse>(capabilities)
+                .expect_err("a payload missing a required member is malformed");
+            assert!(
+                error.to_string().contains(member),
+                "the rejection must name `{member}`: {error}"
+            );
+        }
+    }
+}

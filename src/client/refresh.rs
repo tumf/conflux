@@ -12,7 +12,9 @@ use crate::client::control::{
     submit_and_settle_within, SubmitFailure, MAX_REVISION_ATTEMPTS,
 };
 use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
-use crate::client::session::{describe_api_error, observe, Connection};
+use crate::client::session::{
+    capabilities, describe_api_error, observe, refresh_preview_available, Connection,
+};
 use crate::web::remote_control_api::dto::{CommandSpec, CommandState, RefreshPreviewResponse};
 
 /// How long one apply may stay `running` before the client stops waiting.
@@ -63,9 +65,19 @@ pub async fn run(
 /// Read the owner's preview resource.
 ///
 /// Served by a headless `cflx run` too: it is a read, and it needs no command
-/// executor.
+/// executor. Whether it is served at all is the owner's published capability,
+/// read first: an owner that predates the surface is a compatible build that
+/// does not offer this one operation, which is `unsupported_owner`, and it is
+/// never asked for a route it cannot have.
 async fn preview(connection: &Connection, change_id: &str, source_ref: &str) -> ResultEnvelope {
     let operation = Operation::RefreshProposalPreview;
+    let capabilities = match capabilities(connection).await {
+        Ok(capabilities) => capabilities,
+        Err(error) => return error.into_envelope(operation),
+    };
+    if !refresh_preview_available(&capabilities) {
+        return unsupported(operation, Some(capabilities.instance_id));
+    }
     let path = format!(
         "/api/v2/proposals/{}/refresh-preview?source_ref={}",
         crate::client::transport::encode_query_value(change_id),
@@ -88,8 +100,10 @@ async fn preview(connection: &Connection, change_id: &str, source_ref: &str) -> 
             )
         }
         404 => {
-            // A typed `not_found` names the change; anything else is a route
-            // this owner does not serve.
+            // A typed `not_found` names the change. Anything else is a route
+            // this owner does not serve even though its capabilities said it
+            // would, which is a contract mismatch rather than an unsupported
+            // surface.
             let typed = serde_json::from_slice::<crate::web::remote_control_api::dto::ApiError>(
                 &response.body,
             )
@@ -180,6 +194,12 @@ async fn apply(
             Some(_) => {}
         }
         let instance = Some(observation.instance_id.clone());
+        // The surface comes before the executor: an owner that predates the
+        // command would refuse it as unknown whether or not an executor is
+        // bound, so nothing is submitted and no executor is blamed.
+        if !observation.proposal_refresh_command_available() {
+            return unsupported(operation, instance);
+        }
         if !observation.command_capable() {
             return not_command_capable(operation, instance);
         }
@@ -191,8 +211,21 @@ async fn apply(
                 ));
         };
         // The owner's own published table, read only to refuse before a record
-        // exists. The shared transaction re-validates it anyway.
-        let eligibility = change.actions.refresh_proposal;
+        // exists. The shared transaction re-validates it anyway. The owner
+        // advertised the command, so a row without the table is a shape this
+        // build does not understand, never a permission.
+        let Some(eligibility) = change.actions.refresh_proposal else {
+            return ResultEnvelope::new(operation, Outcome::IncompatibleOwner)
+                .with_instance(instance)
+                .with_message(format!(
+                    "the owner advertises `refresh_proposal` but published no refresh \
+                     eligibility for '{change_id}', so its state does not match this build"
+                ))
+                .with_detail(serde_json::json!({
+                    "commands_submitted": Vec::<serde_json::Value>::new(),
+                    "observed_status": change.display_status,
+                }));
+        };
         if !eligibility.allowed {
             return ResultEnvelope::new(operation, Outcome::TargetIneligible)
                 .with_instance(instance)
@@ -251,6 +284,19 @@ async fn apply(
     }
 
     revision_conflict(operation, first_instance)
+}
+
+/// The owner is reachable and speaks this API, but does not serve candidate
+/// proposal refresh at all. Nothing was submitted.
+fn unsupported(operation: Operation, instance: Option<String>) -> ResultEnvelope {
+    ResultEnvelope::new(operation, Outcome::UnsupportedOwner)
+        .with_instance(instance)
+        .with_message(
+            "this owner does not serve candidate proposal refresh, so nothing was previewed or \
+             submitted. Every other client operation still works against it; refreshing needs \
+             an owner built with the surface",
+        )
+        .with_detail(serde_json::json!({ "commands_submitted": 0 }))
 }
 
 /// The envelope detail for a settled record: the typed result, flattened.

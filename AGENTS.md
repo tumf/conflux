@@ -158,6 +158,15 @@ already match). Missing `--source-ref`, `--dry-run` with an expectation, one
 expectation alone, or an abbreviated commit ID is a `usage_error` before any
 owner is contacted.
 
+An owner built before this surface is still a compatible owner. Its state
+omits `actions.refresh_proposal` and its capabilities omit the
+`proposal_refresh` block; the client decodes both as absent — never as
+allowed — so `status`, `wait`, `mark`, and every other verb keep working
+against it unchanged, and a refresh preview or apply returns typed
+`unsupported_owner` (exit `26`) without requesting the preview route or
+submitting anything. Only a payload missing a member every owner has always
+published is `incompatible_owner`.
+
 Eligibility is the owner's published `actions.refresh_proposal`: a tracked row
 with a managed worktree, no live managed process, and display status `error`,
 `stopped`, `stalled`, `not queued`, or `blocked` on an external prerequisite.

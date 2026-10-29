@@ -1203,6 +1203,8 @@ The CLI MUST expose `cflx client force-stop-change <change-id> --json` with oper
 
 The v2 command registry MUST accept `refresh_proposal` with exactly one non-empty `change_id`, a non-empty `source_ref`, full-length `expected_source` and `expected_head` commit IDs, ordinary expected-revision fencing, idempotency identity, and `deny_unknown_fields`. The preview MUST be the read resource `GET /api/v2/proposals/{change_id}/refresh-preview?source_ref=<ref>`, served on both listeners, creating no command record and advancing no revision, and returning `instance_id`, the observed `state_revision`, `eligible`, a `refusal` reason when any precondition fails, `source_ref`, `source_commit`, `candidate_head`, `path`, `source_blob`, `candidate_blob`, `no_op`, and a unified `patch`. Each projected change MUST publish `actions.refresh_proposal` eligibility with the lifecycle reasons defined by `operator-command-execution`. A settled result of kind `refresh_proposal` MUST carry `outcome` (`refreshed` or `unchanged`), `source_commit`, `source_blob`, `candidate_head_before`, `candidate_head_after`, `candidate_blob_before`, `path`, `effects`, and a bounded hook output tail; a refused command MUST carry the stable reason and the same `effects` object. A lifecycle refusal of the command MUST settle with error code `target_ineligible`; a command-time refusal MUST settle with the distinct error code `refresh_refused`, and its record MUST carry the `refresh_proposal` result so the effects remain readable. Capabilities MUST advertise the command and the preview resource, and the generated OpenAPI document MUST include the command variant, the preview route, the result kind, and the action field.
 
+The surface is additive, and compatibility with owners that predate it MUST follow the same rule as execution sinks and proposal subscriptions: `actions.refresh_proposal` and the `proposal_refresh` capability block MUST decode as absent when an older owner omits them, and absence MUST never be read as `allowed`. Every client operation that does not consult refresh eligibility — `status`, `wait`, `mark`, `unmark`, `start`, `stop`, `force-stop`, `force-stop-change`, and the subscribe group — MUST keep working against such an owner from its unchanged `/api/v2` responses. A refresh preview or apply against an owner whose capabilities do not advertise the surface MUST return typed `unsupported_owner` without requesting the preview route and without creating a command record; a typed `not_found` from an owner that does advertise it MUST remain `change_not_found`. Omitting any pre-existing required member of `actions` or of capabilities MUST still be rejected as an incompatible owner. The server MUST always publish `actions.refresh_proposal`.
+
 The CLI MUST expose `cflx client refresh-proposal <change-id> --source-ref REF` with `--dry-run` (operation `refresh_proposal_preview`, success outcome `previewed`) or `--expected-source COMMIT --expected-head COMMIT` (operation `control_refresh_proposal`, success outcomes `refreshed` and `unchanged`), each with `--json` printing one envelope. Lifecycle refusals MUST map to `target_ineligible`; command-time refusals MUST map to the outcome `refresh_refused` with its own exit status `28` and `detail.reason` plus `detail.effects`. The client MUST delegate through the ordinary v2 command and the preview resource, MUST NOT run Git itself, and MUST NOT expose the command over `cflx client mcp` in this change.
 
 #### Scenario: Preview is a read
@@ -1231,6 +1233,15 @@ The CLI MUST expose `cflx client refresh-proposal <change-id> --source-ref REF` 
 - **WHEN** `cflx client refresh-proposal alpha` is invoked without `--source-ref`, with `--dry-run` and an expectation together, with only one expectation, or with a non-40-hex expectation
 - **THEN** it returns `usage_error` before any owner request
 - **AND** no command record is created
+
+#### Scenario: An owner built before the surface stays usable
+
+- **GIVEN** a running owner whose `/api/v2/state` publishes every `actions` member except `refresh_proposal` and whose capabilities carry no `proposal_refresh` block
+- **WHEN** a client built with the surface runs `status`, `mark alpha`, and `wait beta` against it
+- **THEN** each decodes the owner's unchanged responses and returns `observed`, `marked`, and the row's own classification
+- **AND** `refresh-proposal alpha --source-ref develop --dry-run` returns `unsupported_owner` with exit status `26` without requesting the preview route
+- **AND** `refresh-proposal alpha --source-ref develop --expected-source S --expected-head H` returns `unsupported_owner` and creates no command record
+- **AND** a `state` payload that omits a pre-existing required member such as `actions.force_stop_change` is still refused as `incompatible_owner`
 
 #### Scenario: CLI reports typed refusals and effects
 

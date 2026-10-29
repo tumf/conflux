@@ -1643,9 +1643,9 @@ fn change_resource() -> ChangeResource {
             resolve_merge: ActionEligibility::blocked(
                 conflux::web::remote_control_api::dto::ActionBlockedReason::NotMergeWaiting,
             ),
-            refresh_proposal: ActionEligibility::blocked(
+            refresh_proposal: Some(ActionEligibility::blocked(
                 conflux::web::remote_control_api::dto::ActionBlockedReason::NoCandidateWorktree,
-            ),
+            )),
         },
         parallel: ParallelEligibility {
             eligible: false,
