@@ -1,0 +1,103 @@
+{
+  "contract_version": 1,
+  "authority_revision": "0444fd4c4f32be306f072619a1d2017393d457cb",
+  "owner": "web/app.js:OperatorConsole.renderChangeRow / appendDetail; web/style.css",
+  "evidence_class": "integration DOM plus inherited-token/rule contract; not pixel layout",
+  "viewports": [
+    "phone 320x640",
+    "tablet 768x1024",
+    "desktop 1280x800",
+    "short 568x320",
+    "zoom 640x800 at 200%"
+  ],
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "rows": [
+    {
+      "id": "present",
+      "state": "error",
+      "transition": "collapsed → open; supplied location/remedy",
+      "required": true
+    },
+    {
+      "id": "fallback",
+      "state": "error",
+      "transition": "open; absent/null/blank/nonstring fallback",
+      "required": true
+    },
+    {
+      "id": "hostile",
+      "state": "error",
+      "transition": "open; inert HTML, ANSI-looking text, Unicode",
+      "required": true
+    },
+    {
+      "id": "bounded",
+      "state": "error",
+      "transition": "open; producer-bounded 8192-byte string and long unbroken path",
+      "required": true
+    },
+    {
+      "id": "refresh-open",
+      "state": "error",
+      "transition": "open → new coherent detail; stays open",
+      "required": true
+    },
+    {
+      "id": "refresh-closed",
+      "state": "error",
+      "transition": "closed → new coherent detail; stays closed until opened",
+      "required": true
+    },
+    {
+      "id": "clear",
+      "state": "error → not queued",
+      "transition": "open → omit stale detail on non-error",
+      "required": true
+    },
+    {
+      "id": "become-error",
+      "state": "not queued → error",
+      "transition": "open → add detail",
+      "required": true
+    },
+    {
+      "id": "missing-after-present",
+      "state": "error",
+      "transition": "open populated → unavailable fallback",
+      "required": true
+    },
+    {
+      "id": "row-isolation",
+      "state": "multiple errors",
+      "transition": "independent disclosures and correct corresponding detail",
+      "required": true
+    },
+    {
+      "id": "reappear",
+      "state": "error → absent → error",
+      "transition": "same-console open/closed membership retained",
+      "required": true
+    },
+    {
+      "id": "gap-recovery",
+      "state": "error",
+      "transition": "event gap → authoritative current snapshot; open retained",
+      "required": true
+    },
+    {
+      "id": "action-invariance",
+      "state": "error",
+      "transition": "allowed/blocked Retry, offline/auth state unchanged; disclosure sends zero commands",
+      "required": true
+    },
+    {
+      "id": "inherited-style",
+      "state": "all above",
+      "transition": "actual definition-list anatomy, shipped dark/light token/rule inheritance and native disclosure semantics",
+      "required": true
+    }
+  ]
+}
