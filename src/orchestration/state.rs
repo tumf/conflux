@@ -1695,14 +1695,6 @@ impl OrchestratorState {
             .collect()
     }
 
-    /// Reducer-retained final diagnostics for every change in
-    /// [`TerminalState::Error`].
-    ///
-    /// Sanitized with the same helper the `/api/v2` `error_detail` projection
-    /// uses, so the diagnostic a TUI row shows and the one a remote client reads
-    /// are the same text rather than two independently derived strings. A change
-    /// that is not in error contributes no entry at all — absence is what the
-    /// frontends turn into their explicit "unavailable" fallback.
     /// Latest Acceptance provenance per change, for presentation only.
     pub fn all_acceptance_provenance(
         &self,
@@ -1717,6 +1709,14 @@ impl OrchestratorState {
             .collect()
     }
 
+    /// Reducer-retained final diagnostics for every change in
+    /// [`TerminalState::Error`].
+    ///
+    /// Sanitized with the same helper the `/api/v2` `error_detail` projection
+    /// uses, so the diagnostic a TUI row shows and the one a remote client reads
+    /// are the same text rather than two independently derived strings. A change
+    /// that is not in error contributes no entry at all — absence is what the
+    /// frontends turn into their explicit "unavailable" fallback.
     pub fn all_error_details(&self) -> HashMap<String, String> {
         self.change_runtime
             .iter()

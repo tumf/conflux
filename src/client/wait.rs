@@ -752,17 +752,6 @@ fn unknown_change_envelope(
         }))
 }
 
-/// The release that says "an operator has to look at this".
-///
-/// It reports the observed status rather than prose, because that is the fact a
-/// caller branches on: `merge wait` needs a conflict resolved, `error` needs a
-/// retry decision, and a settled success row with no evidence needs someone to
-/// look at the repository. An external hold adds the structured blocker for the
-/// same reason — `unblock_condition` and `prerequisite_owner` are what the
-/// operator actually needs, and re-deriving them from a message would be
-/// parsing prose. `commands_submitted: 0` is stated here for the same reason
-/// every other wait result states it — the release is an observation, and
-/// nothing about reaching it moved the change.
 /// Copy the row's published Acceptance provenance onto a release, verbatim.
 ///
 /// Only when the owner published one: the field is the owner's own projection,
@@ -779,6 +768,17 @@ fn attach_acceptance_provenance(envelope: &mut ResultEnvelope, change: Option<&C
     }
 }
 
+/// The release that says "an operator has to look at this".
+///
+/// It reports the observed status rather than prose, because that is the fact a
+/// caller branches on: `merge wait` needs a conflict resolved, `error` needs a
+/// retry decision, and a settled success row with no evidence needs someone to
+/// look at the repository. An external hold adds the structured blocker for the
+/// same reason — `unblock_condition` and `prerequisite_owner` are what the
+/// operator actually needs, and re-deriving them from a message would be
+/// parsing prose. `commands_submitted: 0` is stated here for the same reason
+/// every other wait result states it — the release is an observation, and
+/// nothing about reaching it moved the change.
 fn requires_action_envelope(
     change_id: &str,
     instance_id: &str,
