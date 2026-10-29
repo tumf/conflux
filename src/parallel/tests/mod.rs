@@ -5,6 +5,8 @@ mod acceptance_execution_boundary;
 #[cfg(test)]
 mod acceptance_runtime_limit;
 #[cfg(test)]
+mod analysis_activity_completion;
+#[cfg(test)]
 mod analysis_liveness_loop;
 #[cfg(test)]
 mod auto_resolve;
