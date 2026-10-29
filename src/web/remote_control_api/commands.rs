@@ -98,6 +98,10 @@ pub async fn submit_command(
         }
     };
 
+    if let Err(message) = request.command.validate() {
+        return ApiError::new(ErrorCode::ValidationFailed, message, &correlation_id)
+            .into_response();
+    }
     if request.idempotency_key.is_empty() || request.idempotency_key.len() > 200 {
         return ApiError::new(
             ErrorCode::ValidationFailed,
@@ -252,15 +256,16 @@ fn settle(
             summary.result_revision,
             summary.result,
         ),
-        // A refusal settled no evidence: it cancelled nothing and dequeued
-        // nothing, so it must not carry a settlement result that would read as
-        // one.
+        // A refusal settles no evidence unless it explicitly carries some: a
+        // stop refusal cancelled nothing and must not read as if it had, while
+        // a refused proposal refresh may have left a written, staged file and
+        // reports exactly what Git holds.
         Err(failure) => (
             CommandState::Failed,
             Some(failure.message),
             Some(failure.error_code),
             failure.result_revision,
-            None,
+            failure.result.map(|result| *result),
         ),
     };
     projection.complete_command(

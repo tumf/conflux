@@ -20,6 +20,10 @@ mod render;
 pub mod run_supervisor;
 mod runner;
 mod state;
+/// Re-exported for cross-module redaction tests that follow one provenance
+/// record from the executor all the way to the popup's copy text.
+#[cfg(test)]
+pub(crate) use state::ErrorDetailsPopup;
 pub mod stop_classification;
 mod terminal;
 mod type_impls;

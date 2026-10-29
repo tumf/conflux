@@ -80,6 +80,10 @@ pub struct ChangeStatus {
     /// advertise a kill the shared transaction refuses.
     #[serde(default)]
     pub managed_process_live: bool,
+    /// Provenance of the latest Acceptance settlement this owner observed.
+    #[serde(default)]
+    pub acceptance_provenance:
+        Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
 }
 
 impl From<&Change> for ChangeStatus {
@@ -115,6 +119,7 @@ impl From<&Change> for ChangeStatus {
             worktree: None,
             attention: AttentionState::None,
             managed_process_live: false,
+            acceptance_provenance: None,
         }
     }
 }
@@ -287,6 +292,11 @@ fn apply_reducer_derived_operator_state(
         change.error_detail = runtime
             .and_then(ChangeRuntimeState::error_message)
             .map(crate::events::sanitize_detail);
+        // Copied verbatim: the record holds identities, counts, names, and
+        // closed tokens only, so there is nothing to sanitize.
+        change.acceptance_provenance = runtime
+            .and_then(|rt| rt.acceptance_provenance.as_deref())
+            .cloned();
     }
 }
 
@@ -878,6 +888,26 @@ impl WebState {
     pub async fn seed_workspace_observation_for_tests(&self, changes: &[Change], app_mode: &str) {
         self.merge_workspace_observation(changes, Some(app_mode))
             .await;
+    }
+
+    /// Seed the repository root and change-to-worktree relation a workspace
+    /// refresh would publish, then republish the projection.
+    ///
+    /// Test seam for the candidate proposal refresh: it is the same relation the
+    /// projected `worktree` field and the refresh preview both read.
+    #[allow(dead_code)]
+    #[doc(hidden)]
+    pub async fn seed_worktree_paths_for_tests(
+        &self,
+        repo_root: std::path::PathBuf,
+        worktree_paths: std::collections::HashMap<String, std::path::PathBuf>,
+    ) {
+        {
+            let mut facts = self.operator_facts.write().await;
+            facts.set_repo_root(repo_root);
+            facts.apply_worktree_paths(worktree_paths);
+        }
+        self.sync_remote_control_projection().await;
     }
 
     /// Merge one workspace observation into the projected snapshot.
@@ -1592,6 +1622,14 @@ impl WebState {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::web::remote_control_api::proposal_refresh::RefreshPathSource for WebState {
+    async fn locate(&self, change_id: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let facts = self.operator_facts.read().await;
+        Some((facts.repo_root()?, facts.worktree_path(change_id)?))
     }
 }
 

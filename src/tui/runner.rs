@@ -163,6 +163,10 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         // commit. It never changes the canonical `applying` display status.
         ExecutionEvent::ApplyCommitPhase { .. } => true,
 
+        // The reducer holds the latest Acceptance provenance the details popup
+        // renders. Presentation only; no display status changes with it.
+        ExecutionEvent::AcceptanceSettled { .. } => true,
+
         // Presentation-only or unrelated TUI events do not affect reducer display state.
         ExecutionEvent::ApplyCommitOutput { .. }
         | ExecutionEvent::ApplyOutput { .. }
@@ -245,7 +249,7 @@ pub(crate) async fn sync_reducer_display_caches(
     if !should_apply_event_to_tui_reducer(event) {
         return;
     }
-    let (display_map, archived, blocker_views, error_details, apply_operations) = {
+    let (display_map, archived, blocker_views, error_details, apply_operations, provenance) = {
         let state = shared_state.read().await;
         (
             state.all_display_statuses(),
@@ -258,6 +262,7 @@ pub(crate) async fn sync_reducer_display_caches(
             state.all_blocker_views(),
             state.all_error_details(),
             state.all_apply_operation_labels(),
+            state.all_acceptance_provenance(),
         )
     };
     app.apply_display_statuses_from_reducer(&display_map);
@@ -270,6 +275,9 @@ pub(crate) async fn sync_reducer_display_caches(
     // never observed the failure event itself, so the row can still name its
     // failure after the matching log entry has been evicted.
     app.apply_error_details_from_reducer(&error_details);
+    // Presentation-only: the details popup renders who decided the latest
+    // Acceptance settlement and about which candidate.
+    app.apply_acceptance_provenance_from_reducer(&provenance);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,6 +736,15 @@ async fn run_tui_loop(
                     },
                     accept_skill_name.clone(),
                     config.get_state_base_dir().map(str::to_string),
+                ),
+            ))
+            // Where `refresh_proposal` reads the source ref and writes the
+            // candidate: the same project root and managed-worktree layout the
+            // Acceptance admission port above resolves.
+            .with_candidate_worktrees(Arc::new(
+                crate::orchestration::operator_command::WorktreeBaseDirCandidates::new(
+                    repo_root.clone(),
+                    acceptance_worktree_base_dir.clone(),
                 ),
             )),
         )

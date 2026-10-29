@@ -266,3 +266,29 @@ never suppresses a command, and never becomes a verdict:
   is acceptable, and never a substitute for review.
 - `rerun` means no binding evidence survives. It is not a finding, and it implies
   neither PASS nor FAIL.
+
+## Reading a settlement
+
+Every Acceptance settlement publishes one `acceptance_provenance` record on the
+change row (`/api/v2` `ChangeResource.acceptance_provenance`, copied verbatim
+into `cflx client status --json`) and in the TUI details popup, which opens with
+`Enter` on `error`, `stalled`, and externally `blocked` rows. `decision_source`
+says who decided: `native_verification` when the runtime settled before any
+reviewer was spawned (`reviewer_started: false`), or `reviewer`. `reason_code` is
+one closed token — `declaration_invalid`, `gate_failed`, `tool_unavailable`,
+`gate_deadline_exhausted`, `state_path_unavailable`, `legacy_target_evidence`,
+`manifest_malformed`, `runtime_defect`, `reviewer_pass`, `reviewer_fail`,
+`reviewer_stalled`, `reviewer_permission_stalled`, `reviewer_command_failed`,
+`reviewer_missing_verdict`, `review_deadline_exhausted`,
+`review_cleanup_unproven`, or `cancelled` — with `defect_code` for a declaration
+defect and `verification_id`/`declaration_path` for the deciding gate.
+`candidate_commit` and `proposal_content_id` (the blob of `proposal.md` at that
+commit) say exactly what was judged, and `candidate_divergence` compares that
+blob with the bound review base's (`identical`, `diverged`, or `unknown` with a
+reason) without guessing a branch or contacting a remote. The deciding command
+appears only as `program`, `argument_count`, and `env_names` — never an argument
+or environment value. `remediation` (`fix_declaration`, `satisfy_environment`,
+`repair_candidate`, `retry`, `refresh_candidate`, `none`) is a pure function of
+the reason and the divergence. The record is process-local and observability
+only: it is `null` after an owner restart, and retry, admission, archive, merge,
+and the next action never read it.

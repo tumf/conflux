@@ -278,7 +278,10 @@ pub fn remote_control_router(
         .with_completion_sinks(runtime.completion_sinks())
         // The runtime is both the command target and the worktree read port, so
         // both halves of the API see the same late binding.
-        .with_worktrees(runtime),
+        .with_worktrees(runtime)
+        // The refresh preview reads the same change-to-worktree relation the
+        // projected `worktree` field describes.
+        .with_refresh_paths(state),
     ))
 }
 

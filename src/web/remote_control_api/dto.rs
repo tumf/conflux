@@ -94,6 +94,13 @@ pub enum ErrorCode {
     /// socket, so an authenticated TCP client is refused here rather than at the
     /// bearer gate: the credentials were fine, the channel was not.
     TransportNotPermitted,
+    /// A candidate proposal refresh was refused at command time.
+    ///
+    /// Distinct from [`Self::TargetIneligible`], which is the published
+    /// lifecycle table: this says the target was eligible and the repository
+    /// itself refused — a moved ref, a dirty candidate, a hook. The record's
+    /// `result` carries the stable reason and the effects re-read from Git.
+    RefreshRefused,
     /// Sanitized server-side failure.
     InternalError,
 }
@@ -115,7 +122,8 @@ impl ErrorCode {
             | Self::WorktreeDirty
             | Self::WorktreeDirtyUnknown
             | Self::MergeConflict
-            | Self::ExecutionBindingMismatch => StatusCode::CONFLICT,
+            | Self::ExecutionBindingMismatch
+            | Self::RefreshRefused => StatusCode::CONFLICT,
             Self::TransportNotPermitted => StatusCode::FORBIDDEN,
             Self::RegistryCapacity => StatusCode::SERVICE_UNAVAILABLE,
             Self::ValidationFailed => StatusCode::UNPROCESSABLE_ENTITY,
@@ -144,13 +152,14 @@ impl ErrorCode {
             Self::MergeConflict => "merge_conflict",
             Self::ExecutionBindingMismatch => "execution_binding_mismatch",
             Self::TransportNotPermitted => "transport_not_permitted",
+            Self::RefreshRefused => "refresh_refused",
             Self::InternalError => "internal_error",
         }
     }
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 19] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 20] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
@@ -169,6 +178,7 @@ pub const ALL_ERROR_CODES: [ErrorCode; 19] = [
     ErrorCode::MergeConflict,
     ErrorCode::ExecutionBindingMismatch,
     ErrorCode::TransportNotPermitted,
+    ErrorCode::RefreshRefused,
     ErrorCode::InternalError,
 ];
 
@@ -332,6 +342,20 @@ pub enum CommandSpec {
         #[serde(default)]
         params: EmptyParams,
     },
+    /// Refresh one candidate's `proposal.md` from an explicit source commit.
+    ///
+    /// Takes the two full commit IDs a `refresh-preview` read returned. Exactly
+    /// one target; it never starts, retries, queues, marks, or stops anything.
+    RefreshProposal {
+        /// Target change.
+        change_id: String,
+        /// Explicit source ref; there is no default branch.
+        source_ref: String,
+        /// Full commit ID the source ref must still resolve to.
+        expected_source: String,
+        /// Full commit ID the candidate `HEAD` must still be at.
+        expected_head: String,
+    },
 }
 
 /// Change-addressed command target.
@@ -384,6 +408,41 @@ impl CommandSpec {
             Self::CreateWorktree { .. } => "create_worktree",
             Self::DeleteWorktree { .. } => "delete_worktree",
             Self::MergeWorktree { .. } => "merge_worktree",
+            Self::RefreshProposal { .. } => "refresh_proposal",
+        }
+    }
+
+    /// Field-level validation serde cannot express.
+    ///
+    /// Run before admission, so a malformed command is a `validation_failed`
+    /// envelope rather than a record that settles as a refusal.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::RefreshProposal {
+                change_id,
+                source_ref,
+                expected_source,
+                expected_head,
+            } => {
+                if change_id.trim().is_empty() {
+                    return Err("refresh_proposal requires a non-empty change_id".to_string());
+                }
+                if source_ref.trim().is_empty() {
+                    return Err("refresh_proposal requires a non-empty source_ref".to_string());
+                }
+                for (name, value) in [
+                    ("expected_source", expected_source),
+                    ("expected_head", expected_head),
+                ] {
+                    if !crate::orchestration::proposal_refresh::is_full_oid(value) {
+                        return Err(format!(
+                            "{name} must be a full-length lowercase hexadecimal commit ID"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -396,7 +455,8 @@ impl CommandSpec {
             | Self::RetryChange { change_id }
             | Self::StopAndDequeue { change_id }
             | Self::ForceStopChange { change_id }
-            | Self::ResolveMerge { change_id } => Some(change_id),
+            | Self::ResolveMerge { change_id }
+            | Self::RefreshProposal { change_id, .. } => Some(change_id),
             Self::CreateWorktree { target, .. } => Some(&target.change_id),
             Self::Start | Self::Stop | Self::CancelStop | Self::ForceStop => None,
             Self::RetryErrors { .. } => None,
@@ -410,7 +470,7 @@ impl CommandSpec {
 }
 
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 15] = [
+pub const SUPPORTED_COMMANDS: [&str; 16] = [
     "start",
     "stop",
     "cancel_stop",
@@ -426,6 +486,7 @@ pub const SUPPORTED_COMMANDS: [&str; 15] = [
     "create_worktree",
     "delete_worktree",
     "merge_worktree",
+    "refresh_proposal",
 ];
 
 /// `POST /api/v2/commands` request envelope.
@@ -620,6 +681,12 @@ pub struct CapabilitiesResponse {
     pub worktrees: super::worktrees::WorktreeCapabilities,
     /// The parallel execution surface, including its blocked-reason vocabulary.
     pub parallel: ParallelCapabilities,
+    /// The candidate proposal refresh surface.
+    ///
+    /// `#[serde(default)]` so a client can still read an older owner, where the
+    /// absent field means "not served".
+    #[serde(default)]
+    pub proposal_refresh: ProposalRefreshCapability,
 }
 
 /// Whether a mutation can be executed by this process at all.
@@ -823,9 +890,48 @@ pub enum ActionBlockedReason {
     /// recorded snapshot that carries it — keeps deserializing rather than
     /// failing on an unknown reason.
     ApplyIterationLimitActive,
+    /// `refresh_proposal`: the owner does not track the change.
+    UnknownTarget,
+    /// `refresh_proposal`: no managed candidate worktree is registered.
+    NoCandidateWorktree,
+    /// `refresh_proposal`: archived, merged, pushed, or rejected.
+    TerminalTarget,
+    /// `refresh_proposal`: executing, or owning a live managed process.
+    TargetActive,
+    /// `refresh_proposal`: admitted (`queued`, or `blocked` on a dependency).
+    TargetAdmitted,
+    /// `refresh_proposal`: parked on a base-lane merge wait.
+    MergeWait,
+    /// `refresh_proposal`: waiting for manual resolution.
+    ResolveWait,
+    /// `refresh_proposal`: waiting on a rejection decision.
+    RejectWait,
 }
 
 impl ActionBlockedReason {
+    /// Project a shared refresh lifecycle reason onto the wire vocabulary.
+    ///
+    /// One-to-one by token: the reason `actions.refresh_proposal` publishes is
+    /// spelled exactly the way the shared transaction refuses. A command-time
+    /// reason never reaches here — it is not a property of the row.
+    pub fn from_refresh_reason(
+        reason: crate::orchestration::proposal_refresh::RefreshReason,
+    ) -> Self {
+        use crate::orchestration::proposal_refresh::RefreshReason as R;
+        match reason {
+            R::UnknownTarget => Self::UnknownTarget,
+            R::NoCandidateWorktree => Self::NoCandidateWorktree,
+            R::TerminalTarget => Self::TerminalTarget,
+            R::TargetActive => Self::TargetActive,
+            R::MergeWait => Self::MergeWait,
+            R::ResolveWait => Self::ResolveWait,
+            R::RejectWait => Self::RejectWait,
+            // Every other lifecycle reason is an admission, and a command-time
+            // reason never classifies a row.
+            _ => Self::TargetAdmitted,
+        }
+    }
+
     /// Project a shared targeted-force-stop exclusion onto the wire vocabulary.
     ///
     /// One vocabulary, not two: the reason the shared transaction refuses a
@@ -920,6 +1026,12 @@ pub struct ChangeActions {
     pub force_stop_change: ActionEligibility,
     /// `resolve_merge`.
     pub resolve_merge: ActionEligibility,
+    /// `refresh_proposal`.
+    ///
+    /// Lifecycle eligibility only, from the shared refresh table: a candidate
+    /// that is allowed here can still be refused at command time by its own
+    /// repository state, which the `refresh-preview` read reports.
+    pub refresh_proposal: ActionEligibility,
 }
 
 /// Why a change cannot take part in parallel execution.
@@ -1071,6 +1183,31 @@ pub struct ChangeResource {
     pub latest_activity: Option<ChangeActivity>,
     /// Managed worktree relation; `null` when no worktree exists.
     pub worktree: Option<ChangeWorktree>,
+    /// Who decided the latest Acceptance settlement this owner incarnation
+    /// observed, and about which candidate.
+    ///
+    /// Additive and nullable: `null` for a change with no settlement in this
+    /// incarnation and after owner restart. Identities, counts, environment
+    /// names, and closed tokens only — never a command argument value, an
+    /// environment value, prompt text, or process output.
+    ///
+    /// `decision_source`: `native_verification` | `reviewer`.
+    /// `reason_code`: `declaration_invalid` | `gate_failed` | `tool_unavailable` |
+    /// `gate_deadline_exhausted` | `state_path_unavailable` |
+    /// `legacy_target_evidence` | `manifest_malformed` | `runtime_defect` |
+    /// `reviewer_pass` | `reviewer_fail` | `reviewer_stalled` |
+    /// `reviewer_permission_stalled` | `reviewer_command_failed` |
+    /// `reviewer_missing_verdict` | `review_deadline_exhausted` |
+    /// `review_cleanup_unproven` | `cancelled`.
+    /// `remediation`: `fix_declaration` | `satisfy_environment` |
+    /// `repair_candidate` | `retry` | `refresh_candidate` | `none`.
+    /// `candidate_divergence.status`: `identical` | `diverged` | `unknown`.
+    ///
+    /// Observability only: no command admission, retry classification,
+    /// archive, merge, or next-action decision reads it.
+    #[serde(default)]
+    pub acceptance_provenance:
+        Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
 }
 
 /// Aggregate counts over the projected changes.
@@ -1895,6 +2032,162 @@ pub enum CommandResult {
         /// completed worktree effect.
         effects_rolled_back: bool,
     },
+    /// Settlement evidence for `refresh_proposal`, successful or refused.
+    ///
+    /// The one result kind a *failed* record also carries: a refusal after the
+    /// write (a hook rejection, an unexpected tree) left real Git state behind,
+    /// and the effects object is the only truthful account of it.
+    RefreshProposal(Box<RefreshProposalResult>),
+}
+
+/// What a candidate proposal refresh actually did, re-read from Git.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RefreshEffects {
+    /// The command wrote its target file.
+    pub file_written: bool,
+    /// The command's staging step completed (not whether changes remain staged).
+    pub staged: bool,
+    /// `HEAD` was observed to have moved off `expected_head`.
+    pub committed: bool,
+    /// The candidate worktree was observed clean when the command finished.
+    pub clean_after: bool,
+}
+
+/// The settled body of a `refresh_proposal` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RefreshProposalResult {
+    /// Target change.
+    pub change_id: String,
+    /// `refreshed` or `unchanged`; `null` when refused.
+    pub outcome: Option<String>,
+    /// Stable refusal reason; `null` on success.
+    pub reason: Option<String>,
+    /// The ref the caller named.
+    pub source_ref: String,
+    /// Resolved source commit, when it resolved.
+    pub source_commit: Option<String>,
+    /// Source blob identity, when read.
+    pub source_blob: Option<String>,
+    /// Candidate `HEAD` before the command, when read.
+    pub candidate_head_before: Option<String>,
+    /// Candidate `HEAD` after the command, when read.
+    pub candidate_head_after: Option<String>,
+    /// Candidate blob identity before the command, when read.
+    pub candidate_blob_before: Option<String>,
+    /// Repository-relative proposal path.
+    pub path: String,
+    /// Observed effects.
+    pub effects: RefreshEffects,
+    /// Bounded tail of hook / commit output, when a commit ran.
+    pub hook_output_tail: Option<String>,
+    /// Bounded diagnostic detail.
+    pub detail: Option<String>,
+}
+
+impl RefreshProposalResult {
+    /// Project the shared report onto the wire.
+    pub fn from_report(report: &crate::orchestration::proposal_refresh::RefreshReport) -> Self {
+        Self {
+            change_id: report.change_id.clone(),
+            outcome: report.outcome.map(|outcome| outcome.as_str().to_string()),
+            reason: report.refusal.map(|reason| reason.as_str().to_string()),
+            source_ref: report.source_ref.clone(),
+            source_commit: report.source_commit.clone(),
+            source_blob: report.source_blob.clone(),
+            candidate_head_before: report.candidate_head_before.clone(),
+            candidate_head_after: report.candidate_head_after.clone(),
+            candidate_blob_before: report.candidate_blob_before.clone(),
+            path: report.path.clone(),
+            effects: RefreshEffects {
+                file_written: report.effects.file_written,
+                staged: report.effects.staged,
+                committed: report.effects.committed,
+                clean_after: report.effects.clean_after,
+            },
+            hook_output_tail: report.hook_output_tail.clone(),
+            detail: report.detail.clone(),
+        }
+    }
+}
+
+/// `GET /api/v2/proposals/{change_id}/refresh-preview` body.
+///
+/// A read: it creates no command record and advances no revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RefreshPreviewResponse {
+    /// Process incarnation the preview was computed in.
+    pub instance_id: String,
+    /// Revision the lifecycle eligibility was read at.
+    pub state_revision: u64,
+    /// Target change.
+    pub change_id: String,
+    /// True when no lifecycle or command-time precondition refuses.
+    pub eligible: bool,
+    /// The first refusal found, when not eligible.
+    pub refusal: Option<String>,
+    /// The ref the caller named.
+    pub source_ref: String,
+    /// Resolved source commit — pass it back as `expected_source`.
+    pub source_commit: Option<String>,
+    /// Current candidate `HEAD` — pass it back as `expected_head`.
+    pub candidate_head: Option<String>,
+    /// Repository-relative proposal path.
+    pub path: String,
+    /// Source blob identity.
+    pub source_blob: Option<String>,
+    /// Candidate blob identity.
+    pub candidate_blob: Option<String>,
+    /// True when the two blobs are identical and an apply would be `unchanged`.
+    pub no_op: bool,
+    /// Unified patch from candidate to source; `null` when not computed.
+    pub patch: Option<String>,
+    /// Lines the patch adds.
+    pub added_lines: usize,
+    /// Lines the patch removes.
+    pub removed_lines: usize,
+    /// Bounded diagnostic detail for a refusal.
+    pub detail: Option<String>,
+}
+
+impl RefreshPreviewResponse {
+    /// Project a shared preview onto the wire at one observed identity.
+    pub fn from_preview(
+        preview: crate::orchestration::proposal_refresh::RefreshPreview,
+        instance_id: String,
+        state_revision: u64,
+    ) -> Self {
+        Self {
+            instance_id,
+            state_revision,
+            change_id: preview.change_id,
+            eligible: preview.eligible,
+            refusal: preview.refusal.map(|reason| reason.as_str().to_string()),
+            source_ref: preview.source_ref,
+            source_commit: preview.source_commit,
+            candidate_head: preview.candidate_head,
+            path: preview.path,
+            source_blob: preview.source_blob,
+            candidate_blob: preview.candidate_blob,
+            no_op: preview.no_op,
+            patch: preview.patch,
+            added_lines: preview.added_lines,
+            removed_lines: preview.removed_lines,
+            detail: preview.detail,
+        }
+    }
+}
+
+/// Whether candidate proposal refresh is served, and where.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct ProposalRefreshCapability {
+    /// True when this build serves the preview resource.
+    pub preview_available: bool,
+    /// Route template of the read-only preview.
+    pub preview_route: String,
+    /// Command type an apply is submitted as.
+    pub command: String,
+    /// Every stable refusal reason, lifecycle and command time.
+    pub reasons: Vec<String>,
 }
 
 // ============================================================================

@@ -511,7 +511,7 @@ fn classify(
     Ok(Plan::Submit)
 }
 
-fn describe_block(reason: Option<ActionBlockedReason>) -> String {
+pub(crate) fn describe_block(reason: Option<ActionBlockedReason>) -> String {
     match reason {
         Some(reason) => serde_json::to_value(reason)
             .ok()
@@ -764,7 +764,11 @@ fn partial(
         }))
 }
 
-fn restarted_envelope(operation: Operation, expected: &str, observed: &str) -> ResultEnvelope {
+pub(crate) fn restarted_envelope(
+    operation: Operation,
+    expected: &str,
+    observed: &str,
+) -> ResultEnvelope {
     ResultEnvelope::new(operation, Outcome::OwnerRestarted)
         .with_instance(Some(observed.to_string()))
         .with_message(
@@ -777,7 +781,10 @@ fn restarted_envelope(operation: Operation, expected: &str, observed: &str) -> R
         }))
 }
 
-fn not_command_capable(operation: Operation, instance: Option<String>) -> ResultEnvelope {
+pub(crate) fn not_command_capable(
+    operation: Operation,
+    instance: Option<String>,
+) -> ResultEnvelope {
     ResultEnvelope::new(operation, Outcome::OwnerNotCommandCapable)
         .with_instance(instance)
         .with_message(
@@ -786,7 +793,7 @@ fn not_command_capable(operation: Operation, instance: Option<String>) -> Result
         )
 }
 
-fn revision_conflict(operation: Operation, instance: Option<String>) -> ResultEnvelope {
+pub(crate) fn revision_conflict(operation: Operation, instance: Option<String>) -> ResultEnvelope {
     ResultEnvelope::new(operation, Outcome::RevisionConflict)
         .with_instance(instance)
         .with_message(format!(
@@ -802,7 +809,7 @@ fn revision_conflict(operation: Operation, instance: Option<String>) -> ResultEn
 
 /// Why a submission did not settle successfully.
 #[derive(Debug)]
-enum SubmitFailure {
+pub(crate) enum SubmitFailure {
     /// The observed revision was consumed before the command was admitted.
     Stale {
         /// The revision the owner reported instead, when it named one.
@@ -821,10 +828,13 @@ enum SubmitFailure {
     Unauthenticated(String),
     /// The exchange failed.
     Transport(String),
+    /// A proposal refresh settled as a command-time refusal; the record carries
+    /// the stable reason and the effects re-read from Git.
+    Refused(Box<CommandRecord>),
 }
 
 impl SubmitFailure {
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         match self {
             Self::Stale { current } => match current {
                 Some(current) => format!(
@@ -842,10 +852,11 @@ impl SubmitFailure {
             | Self::Failed(detail)
             | Self::Unauthenticated(detail)
             | Self::Transport(detail) => detail.clone(),
+            Self::Refused(record) => record.detail.clone().unwrap_or_default(),
         }
     }
 
-    fn outcome(&self) -> Outcome {
+    pub(crate) fn outcome(&self) -> Outcome {
         match self {
             Self::Stale { .. } => Outcome::RevisionConflict,
             Self::ExecutorUnbound(_) => Outcome::OwnerNotCommandCapable,
@@ -854,10 +865,15 @@ impl SubmitFailure {
             Self::Restarted(_) => Outcome::OwnerRestarted,
             Self::Unauthenticated(_) => Outcome::AuthenticationFailed,
             Self::Transport(_) => Outcome::TransportError,
+            Self::Refused(_) => Outcome::RefreshRefused,
         }
     }
 
-    fn into_envelope(self, operation: Operation, instance: Option<String>) -> ResultEnvelope {
+    pub(crate) fn into_envelope(
+        self,
+        operation: Operation,
+        instance: Option<String>,
+    ) -> ResultEnvelope {
         let outcome = self.outcome();
         let message = self.message();
         ResultEnvelope::new(operation, outcome)
@@ -888,6 +904,34 @@ async fn submit_and_settle(
     expected_revision: u64,
     expected_instance: &str,
     audit: &mut Vec<serde_json::Value>,
+) -> Result<CommandRecord, SubmitFailure> {
+    submit_and_settle_within(
+        connection,
+        command,
+        name,
+        change_id,
+        expected_revision,
+        expected_instance,
+        audit,
+        SETTLEMENT_TIMEOUT,
+    )
+    .await
+}
+
+/// [`submit_and_settle`] with an explicit settlement bound.
+///
+/// A proposal refresh runs repository hooks inside its one commit, and a hook
+/// can legitimately take longer than an ordinary command; it is still bounded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn submit_and_settle_within(
+    connection: &Connection,
+    command: CommandSpec,
+    name: &str,
+    change_id: Option<&str>,
+    expected_revision: u64,
+    expected_instance: &str,
+    audit: &mut Vec<serde_json::Value>,
+    settlement_timeout: std::time::Duration,
 ) -> Result<CommandRecord, SubmitFailure> {
     let request = CommandRequest {
         command,
@@ -930,7 +974,7 @@ async fn submit_and_settle(
             object.insert("change_id".to_string(), serde_json::json!(change_id));
         }
         audit.push(entry);
-        return settle(connection, record, expected_instance).await;
+        return settle(connection, record, expected_instance, settlement_timeout).await;
     }
 
     let error: crate::web::remote_control_api::dto::ApiError = response.json().map_err(|_| {
@@ -957,9 +1001,10 @@ async fn settle(
     connection: &Connection,
     record: CommandRecord,
     expected_instance: &str,
+    settlement_timeout: std::time::Duration,
 ) -> Result<CommandRecord, SubmitFailure> {
     let mut record = record;
-    let deadline = tokio::time::Instant::now() + SETTLEMENT_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + settlement_timeout;
     loop {
         if record.instance_id != expected_instance {
             // The observed incarnation travels with the refusal: a caller told
@@ -985,6 +1030,9 @@ async fn settle(
                         | ErrorCode::RootBusy,
                     ) => SubmitFailure::Ineligible(detail),
                     Some(ErrorCode::StaleRevision) => SubmitFailure::Stale { current: None },
+                    Some(ErrorCode::RefreshRefused) => {
+                        SubmitFailure::Refused(Box::new(record.clone()))
+                    }
                     _ => SubmitFailure::Failed(format!("{detail} ({code})")),
                 });
             }
@@ -992,7 +1040,7 @@ async fn settle(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(SubmitFailure::Failed(format!(
-                "command '{}' was still running after {SETTLEMENT_TIMEOUT:?}; its effect is \
+                "command '{}' was still running after {settlement_timeout:?}; its effect is \
                  unknown and no second command was submitted",
                 record.command_id
             )));
@@ -1044,6 +1092,7 @@ mod tests {
             timing: ChangeTiming::default(),
             latest_activity: None,
             worktree: None,
+            acceptance_provenance: None,
         }
     }
 

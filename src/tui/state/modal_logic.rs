@@ -57,6 +57,8 @@ pub(crate) enum ModalInvalidation {
     ForceKillTargetNotActive,
     /// Global execution state no longer admits stop-and-dequeue.
     ForceKillExecutionInvalid,
+    /// The refresh target is gone or no longer eligible under the shared table.
+    RefreshTargetIneligible,
 }
 
 impl ModalInvalidation {
@@ -77,6 +79,9 @@ impl ModalInvalidation {
             ModalInvalidation::ForceKillTargetNotActive => "the change is no longer active work",
             ModalInvalidation::ForceKillExecutionInvalid => {
                 "no run is active to stop and dequeue from"
+            }
+            ModalInvalidation::RefreshTargetIneligible => {
+                "the change is no longer eligible for a proposal refresh"
             }
         }
     }
@@ -192,6 +197,34 @@ pub(crate) fn evaluate_force_kill(
     Ok(())
 }
 
+/// The shared refresh eligibility table, applied to one TUI row.
+///
+/// The live-process fact is approximated by the row's active status, which the
+/// table already refuses: a row this frontend cannot see as active may still own
+/// a process, and the shared transaction refuses that case with the same reason.
+pub(crate) fn refresh_admission_for_row(
+    change: &ChangeState,
+) -> crate::orchestration::proposal_refresh::RefreshAdmission {
+    crate::orchestration::proposal_refresh::classify_refresh_proposal(
+        &change.display_status_cache,
+        change.blocker_kind_cache,
+        true,
+        change.has_worktree,
+        false,
+    )
+}
+
+/// Whether a refresh confirmation still targets an eligible row.
+pub(crate) fn evaluate_proposal_refresh(
+    change_id: &str,
+    ctx: &ModalValidityContext<'_>,
+) -> Result<(), ModalInvalidation> {
+    match ctx.changes.iter().find(|change| change.id == change_id) {
+        Some(change) if refresh_admission_for_row(change).is_allowed() => Ok(()),
+        _ => Err(ModalInvalidation::RefreshTargetIneligible),
+    }
+}
+
 /// Whether the active modal still describes an actionable target.
 pub(crate) fn evaluate(
     modal: &ModalState,
@@ -215,6 +248,9 @@ pub(crate) fn evaluate(
             path, branch, head, ..
         } => evaluate_discard(path, branch, head, ctx),
         ModalState::ConfirmForceKill { change_id } => evaluate_force_kill(change_id, ctx),
+        ModalState::ConfirmProposalRefresh { preview } => {
+            evaluate_proposal_refresh(&preview.change_id, ctx)
+        }
     }
 }
 
@@ -252,6 +288,7 @@ mod tests {
             blocker_detail_cache: None,
             display_color_cache: Color::DarkGray,
             error_message_cache: None,
+            acceptance_provenance_cache: None,
             selected: false,
             is_new: false,
             parallel_eligibility: ParallelEligibility::Eligible,
@@ -580,6 +617,7 @@ mod tests {
             ModalInvalidation::ForceKillTargetFinal,
             ModalInvalidation::ForceKillTargetNotActive,
             ModalInvalidation::ForceKillExecutionInvalid,
+            ModalInvalidation::RefreshTargetIneligible,
         ] {
             assert!(!reason.reason().is_empty());
         }

@@ -1173,6 +1173,20 @@ pub trait RepositoryFacts: Send + Sync {
     async fn head_tree(&self, workspace: &Path) -> Result<String, String>;
     /// Full-length blob ID of a tracked path at `HEAD`.
     async fn tracked_blob_oid(&self, workspace: &Path, path: &str) -> Result<String, String>;
+    /// Full-length blob ID of `path` at an explicit commit.
+    ///
+    /// Defaulted to a refusal for the same reason [`Self::resolve_revision`]
+    /// is: a fact source that cannot answer must leave the identity unknown,
+    /// never substitute the `HEAD` blob for a commit nobody asked about.
+    async fn blob_at_commit(
+        &self,
+        workspace: &Path,
+        commit: &str,
+        path: &str,
+    ) -> Result<String, String> {
+        let _ = workspace;
+        Err(format!("blob '{commit}:{path}' cannot be resolved here"))
+    }
     /// Full-length content digest of an arbitrary file.
     async fn hash_file(&self, workspace: &Path, path: &Path) -> Result<String, String>;
     /// Raw porcelain v1 status, untracked files included.
@@ -2033,6 +2047,19 @@ impl RepositoryFacts for GitRepositoryFacts {
 
     async fn tracked_blob_oid(&self, workspace: &Path, path: &str) -> Result<String, String> {
         run_git(workspace, &["rev-parse", &format!("HEAD:{path}")]).await
+    }
+
+    async fn blob_at_commit(
+        &self,
+        workspace: &Path,
+        commit: &str,
+        path: &str,
+    ) -> Result<String, String> {
+        run_git(
+            workspace,
+            &["rev-parse", "--verify", &format!("{commit}:{path}")],
+        )
+        .await
     }
 
     async fn hash_file(&self, workspace: &Path, path: &Path) -> Result<String, String> {

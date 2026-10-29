@@ -121,6 +121,18 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
             },
         },
         worktrees: WorktreeCapabilities::default(),
+        proposal_refresh: dto::ProposalRefreshCapability {
+            // A read over the projection and the repository, so it is served
+            // whether or not a command executor is bound.
+            preview_available: true,
+            preview_route: super::proposal_refresh::PREVIEW_ROUTE.to_string(),
+            command: "refresh_proposal".to_string(),
+            reasons: crate::orchestration::proposal_refresh::RefreshReason::LIFECYCLE
+                .iter()
+                .chain(crate::orchestration::proposal_refresh::RefreshReason::COMMAND_TIME.iter())
+                .map(|reason| reason.as_str().to_string())
+                .collect(),
+        },
         parallel: ParallelCapabilities {
             max_concurrent: parallel.max_concurrent,
             vcs_backend: parallel.vcs_backend,

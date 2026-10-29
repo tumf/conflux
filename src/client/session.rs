@@ -270,6 +270,7 @@ pub(crate) fn observation_for_test(changes: Vec<ChangeResource>) -> Observation 
                 vcs_backend: "git".to_string(),
                 blocked_reasons: Vec::new(),
             },
+            proposal_refresh: Default::default(),
         },
         instance: InstanceResponse {
             instance_id: instance_id.clone(),
@@ -586,6 +587,7 @@ pub async fn status(connection: &Connection) -> ResultEnvelope {
                 "parallel_eligible": change.parallel.eligible,
                 "actions": change.actions,
                 "blocker": change.blocker,
+                "acceptance_provenance": change.acceptance_provenance,
                 "execution_state": execution.map(|status| status.execution_state),
                 "current_phase": execution.map(|status| status.current_phase),
                 "last_completed_phase": execution.and_then(|status| status.last_completed_phase),

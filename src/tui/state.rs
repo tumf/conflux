@@ -115,6 +115,8 @@ pub struct ErrorDetailsPopup {
     pub change_id: String,
     /// Complete, untruncated final diagnostic.
     pub error: String,
+    /// Provenance of the latest Acceptance settlement, when one was observed.
+    pub provenance: Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
     /// Popup-local scroll offset; it never moves the Changes list or Logs panel.
     pub scroll: u16,
     /// Result of the last copy attempt, if one has been made.
@@ -124,10 +126,23 @@ pub struct ErrorDetailsPopup {
 impl ErrorDetailsPopup {
     /// The exact plain text `c` places on the clipboard.
     ///
-    /// Stable by contract: `Change: <id>` and `Error: <diagnostic>` on two
-    /// lines, so a pasted report is the same shape every time.
+    /// Stable by contract: `Change: <id>` and `Error: <diagnostic>` on the
+    /// first two lines, so a pasted report is the same shape every time. The
+    /// provenance lines, when present, follow in their fixed order.
     pub fn clipboard_text(&self) -> String {
-        format!("Change: {}\nError: {}", self.change_id, self.error)
+        let mut text = format!("Change: {}\nError: {}", self.change_id, self.error);
+        for (label, value) in self.provenance_lines() {
+            text.push_str(&format!("\n{label}: {value}"));
+        }
+        text
+    }
+
+    /// The provenance lines shared by the popup body and the copy text.
+    pub fn provenance_lines(&self) -> Vec<(&'static str, String)> {
+        self.provenance
+            .as_ref()
+            .map(|provenance| provenance.display_lines())
+            .unwrap_or_default()
     }
 }
 
@@ -154,6 +169,12 @@ pub struct ChangeState {
     pub display_color_cache: Color,
     /// Error message cache for error status
     pub error_message_cache: Option<String>,
+    /// Reducer-derived provenance of the latest Acceptance settlement.
+    ///
+    /// Presentation only: rendered in the details popup and its copy text, never
+    /// read by any workflow decision.
+    pub acceptance_provenance_cache:
+        Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
     /// Whether this change is selected
     pub selected: bool,
     /// Whether this is a newly detected change
@@ -456,6 +477,7 @@ impl ChangeState {
             blocker_detail_cache: None,
             display_color_cache: Color::DarkGray,
             error_message_cache: None,
+            acceptance_provenance_cache: None,
             parallel_eligibility: ParallelEligibility::Eligible,
             has_worktree: false,
             started_at: None,
@@ -628,6 +650,23 @@ impl ChangeState {
                 self.blocker_kind_cache = crate::orchestration::state::BlockerKind::None;
                 self.blocker_detail_cache = None;
             }
+        }
+    }
+
+    /// Whether this row can open the details popup: an `error` row, a
+    /// `stalled` row, or a `blocked` row whose blocker is external.
+    ///
+    /// The native pre-reviewer Acceptance stops settle as `stalled` (holds) and
+    /// external `blocked` (`tool_unavailable`) rather than `error`, and those
+    /// are exactly the rows the provenance lines exist to explain. A dependency
+    /// wait clears itself and has nothing to explain.
+    pub fn can_open_details(&self) -> bool {
+        match self.display_status_cache.as_str() {
+            "error" | "stalled" => true,
+            "blocked" => {
+                self.blocker_kind_cache == crate::orchestration::state::BlockerKind::External
+            }
+            _ => false,
         }
     }
 
@@ -1092,9 +1131,10 @@ impl AppState {
 
     /// Open the Error Details popup for the change under the Changes cursor.
     ///
-    /// Only an `error` row can open it: every other row keeps whatever `Enter`
-    /// already did. Returns whether the popup was opened, so the caller can fall
-    /// through to the pre-existing behavior when it was not.
+    /// Only an `error`, `stalled`, or externally `blocked` row can open it:
+    /// every other row keeps whatever `Enter` already did. Returns whether the
+    /// popup was opened, so the caller can fall through to the pre-existing
+    /// behavior when it was not.
     ///
     /// Opening is presentation only — no workflow-control state changes.
     pub fn open_error_details_popup(&mut self) -> bool {
@@ -1105,16 +1145,24 @@ impl AppState {
         let Some(change) = self.changes.get(self.cursor_index) else {
             return false;
         };
-        if change.display_status_cache != "error" {
+        if !change.can_open_details() {
             return false;
         }
 
-        self.error_details_popup = Some(ErrorDetailsPopup {
-            change_id: change.id.clone(),
-            error: change
+        // A held row has no change-local error; its blocker line is the
+        // operator-facing explanation the row already shows.
+        let error = if change.display_status_cache == "error" {
+            change.error_message_cache.clone()
+        } else {
+            change
                 .error_message_cache
                 .clone()
-                .unwrap_or_else(|| ERROR_DETAILS_UNAVAILABLE.to_string()),
+                .or_else(|| change.blocker_detail_cache.clone())
+        };
+        self.error_details_popup = Some(ErrorDetailsPopup {
+            change_id: change.id.clone(),
+            error: error.unwrap_or_else(|| ERROR_DETAILS_UNAVAILABLE.to_string()),
+            provenance: change.acceptance_provenance_cache.clone(),
             scroll: 0,
             copy_feedback: None,
         });
@@ -1700,6 +1748,111 @@ impl AppState {
         }
     }
 
+    /// Whether the shared refresh table allows `p` on the focused Changes row.
+    pub fn focused_row_refreshable(&self) -> bool {
+        self.view_mode == ViewMode::Changes
+            && self
+                .changes
+                .get(self.cursor_index)
+                .is_some_and(|change| modal_logic::refresh_admission_for_row(change).is_allowed())
+    }
+
+    /// Request the shared refresh preview for the focused row.
+    ///
+    /// Returns `None` — and opens nothing — on an ineligible row, or when no
+    /// base branch was captured to name as the explicit source.
+    pub fn request_proposal_refresh(&mut self) -> Option<TuiCommand> {
+        if self.modal.is_some() || !self.focused_row_refreshable() {
+            return None;
+        }
+        let change_id = self.changes[self.cursor_index].id.clone();
+        let Some(source_ref) = self.base_branch().map(str::to_string) else {
+            let message = format!(
+                "Proposal refresh for '{change_id}' needs a configured base branch to name as \
+                 the source"
+            );
+            self.warning_message = Some(message.clone());
+            self.add_log(LogEntry::warn(message));
+            return None;
+        };
+        Some(TuiCommand::PreviewProposalRefresh {
+            change_id,
+            source_ref,
+        })
+    }
+
+    /// Open the refresh confirmation for a settled preview.
+    ///
+    /// Ignored when another overlay is up or the row stopped being eligible
+    /// while the preview ran.
+    pub fn open_proposal_refresh_confirmation(
+        &mut self,
+        preview: crate::orchestration::proposal_refresh::RefreshPreview,
+    ) {
+        if self.modal.is_some() {
+            return;
+        }
+        if modal_logic::evaluate_proposal_refresh(
+            &preview.change_id,
+            &self.modal_validity_context(),
+        )
+        .is_err()
+        {
+            return;
+        }
+        self.modal = Some(ModalState::ConfirmProposalRefresh {
+            preview: Box::new(preview),
+        });
+    }
+
+    /// Confirm the refresh popup.
+    ///
+    /// Submits the apply with the previewed expectations only when the preview
+    /// itself was eligible; a refused preview just closes. The transaction
+    /// revalidates everything either way.
+    pub fn confirm_proposal_refresh(&mut self) -> Option<TuiCommand> {
+        let Some(ModalState::ConfirmProposalRefresh { preview }) = self.modal.clone() else {
+            return None;
+        };
+        if let Err(invalidation) = modal_logic::evaluate_proposal_refresh(
+            &preview.change_id,
+            &self.modal_validity_context(),
+        ) {
+            self.invalidate_modal_with_report(invalidation, "Proposal refresh");
+            return None;
+        }
+        self.modal = None;
+        let (true, Some(expected_source), Some(expected_head)) = (
+            preview.eligible,
+            preview.source_commit.clone(),
+            preview.candidate_head.clone(),
+        ) else {
+            self.add_log(LogEntry::info(format!(
+                "Proposal refresh closed for '{}' without submitting",
+                preview.change_id
+            )));
+            return None;
+        };
+        self.add_log(LogEntry::info(format!(
+            "Proposal refresh confirmed: {}",
+            preview.change_id
+        )));
+        Some(TuiCommand::RefreshProposal {
+            change_id: preview.change_id.clone(),
+            source_ref: preview.source_ref.clone(),
+            expected_source,
+            expected_head,
+        })
+    }
+
+    /// Close the refresh popup without submitting anything.
+    pub fn cancel_proposal_refresh(&mut self) {
+        if matches!(self.modal, Some(ModalState::ConfirmProposalRefresh { .. })) {
+            self.modal = None;
+            self.add_log(LogEntry::info("Proposal refresh canceled".to_string()));
+        }
+    }
+
     /// Dismiss the focused `merged` row immediately, with no confirmation.
     ///
     /// Presentation only: it hides a reviewed row from this process's Changes
@@ -2001,7 +2154,7 @@ impl AppState {
         self.prune_stale_error_details_popup();
     }
 
-    /// Close an Error Details popup whose change has left `error`.
+    /// Close an Error Details popup whose change can no longer open it.
     ///
     /// A retry is the common case: once the row is queued again, the popup would
     /// otherwise keep presenting a diagnostic that no longer describes the
@@ -2014,7 +2167,7 @@ impl AppState {
         let still_failed = self
             .changes
             .iter()
-            .any(|change| change.id == popup.change_id && change.display_status_cache == "error");
+            .any(|change| change.id == popup.change_id && change.can_open_details());
         if !still_failed {
             self.error_details_popup = None;
         }
@@ -2044,6 +2197,25 @@ impl AppState {
             if let Some(detail) = error_details.get(&change.id) {
                 change.error_message_cache = Some(detail.clone());
             }
+        }
+    }
+
+    /// Sync the latest Acceptance provenance per change from the reducer.
+    ///
+    /// Presentation only: it feeds the details popup and its copy text and is
+    /// never read by scheduling, retry, acceptance, archive, or merge.
+    pub fn apply_acceptance_provenance_from_reducer(
+        &mut self,
+        provenance: &HashMap<
+            String,
+            crate::orchestration::acceptance::provenance::AcceptanceProvenance,
+        >,
+    ) {
+        for change in &mut self.changes {
+            change.acceptance_provenance_cache = provenance.get(&change.id).cloned();
+        }
+        if let Some(popup) = self.error_details_popup.as_mut() {
+            popup.provenance = provenance.get(&popup.change_id).cloned();
         }
     }
 
@@ -3595,6 +3767,7 @@ mod tests {
             blocker_detail_cache: None,
             display_color_cache: Color::DarkGray,
             error_message_cache: None,
+            acceptance_provenance_cache: None,
             selected: false,
             is_new: false,
             parallel_eligibility: ParallelEligibility::Eligible,
@@ -4753,12 +4926,89 @@ mod tests {
         );
     }
 
+    /// The details popup opens on exactly the rows provenance explains:
+    /// `error`, `stalled`, and externally `blocked`. A dependency wait does not.
+    #[test]
+    fn acceptance_provenance_details_popup_opens_on_explainable_rows_only() {
+        use crate::orchestration::state::BlockerKind;
+
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        for (status, kind, opens) in [
+            ("error", BlockerKind::None, true),
+            ("stalled", BlockerKind::None, true),
+            ("blocked", BlockerKind::External, true),
+            ("blocked", BlockerKind::Dependency, false),
+            ("applying", BlockerKind::None, false),
+            ("not queued", BlockerKind::None, false),
+        ] {
+            app.close_error_details_popup();
+            app.changes[0].set_display_status_cache(status);
+            app.changes[0].blocker_kind_cache = kind;
+            assert_eq!(
+                app.changes[0].can_open_details(),
+                opens,
+                "{status} {kind:?}"
+            );
+            assert_eq!(app.open_error_details_popup(), opens, "{status} {kind:?}");
+            assert_eq!(app.error_details_popup.is_some(), opens);
+        }
+    }
+
+    /// A held row has no change-local error; the popup shows its blocker line
+    /// and the reducer's provenance, and the copy text appends the provenance
+    /// after the two stable lines.
+    #[test]
+    fn acceptance_provenance_popup_carries_the_record_into_the_copy_text() {
+        use crate::orchestration::state::BlockerKind;
+
+        let record = crate::orchestration::acceptance::provenance::native_tool_unavailable_for_test(
+            "test-change",
+        );
+        let mut app = AppState::new(vec![create_test_change("test-change", 0, 1)]);
+        app.changes[0].set_display_status_cache("blocked");
+        app.changes[0].blocker_kind_cache = BlockerKind::External;
+        app.changes[0].blocker_detail_cache = Some("missing-tool is absent".to_string());
+        app.apply_acceptance_provenance_from_reducer(&HashMap::from([(
+            "test-change".to_string(),
+            record.clone(),
+        )]));
+
+        assert!(app.open_error_details_popup());
+        let popup = app.error_details_popup.as_ref().expect("popup");
+        assert_eq!(popup.error, "missing-tool is absent");
+        assert_eq!(popup.provenance.as_ref(), Some(&record));
+
+        let copy = popup.clipboard_text();
+        let lines: Vec<&str> = copy.lines().collect();
+        assert_eq!(lines[0], "Change: test-change");
+        assert_eq!(lines[1], "Error: missing-tool is absent");
+        assert_eq!(
+            &lines[2..],
+            &[
+                "Decision: native_verification (reviewer not started)",
+                "Reason: tool_unavailable",
+                "Verification: focused-gate in openspec/changes/test-change/proposal.md",
+                "Candidate: 0123456789ab proposal fedcba987654",
+                "Command: missing-tool, 2 arguments, env: API_TOKEN, RUST_LOG",
+                "Next: satisfy_environment",
+                "Source proposal: diverged from main@abcdefabcdef",
+            ]
+        );
+
+        // A later reducer sync reaches the open popup too, and an absent
+        // record leaves the two-line shape untouched.
+        app.apply_acceptance_provenance_from_reducer(&HashMap::new());
+        let popup = app.error_details_popup.as_ref().expect("popup");
+        assert_eq!(popup.clipboard_text().lines().count(), 2);
+    }
+
     /// The copied text is stable by contract.
     #[test]
     fn error_details_clipboard_text_is_stable_plain_text() {
         let popup = ErrorDetailsPopup {
             change_id: "alpha".to_string(),
             error: "Apply failed: stalled".to_string(),
+            provenance: None,
             scroll: 0,
             copy_feedback: None,
         };
@@ -4782,6 +5032,7 @@ mod tests {
             blocker_detail_cache: None,
             display_color_cache: Color::Cyan,
             error_message_cache: None,
+            acceptance_provenance_cache: None,
             selected: false,
             is_new: false,
             parallel_eligibility: ParallelEligibility::Eligible,
@@ -4813,6 +5064,7 @@ mod tests {
             blocker_detail_cache: None,
             display_color_cache: Color::Cyan,
             error_message_cache: None,
+            acceptance_provenance_cache: None,
             selected: false,
             is_new: false,
             parallel_eligibility: ParallelEligibility::Eligible,
@@ -4848,6 +5100,7 @@ mod tests {
             blocker_detail_cache: None,
             display_color_cache: Color::Cyan,
             error_message_cache: None,
+            acceptance_provenance_cache: None,
             selected: false,
             is_new: false,
             parallel_eligibility: ParallelEligibility::Eligible,

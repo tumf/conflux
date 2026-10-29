@@ -606,6 +606,15 @@ pub enum ExecutionEvent {
     AcceptanceStarted { change_id: String, command: String },
     /// Acceptance completed for a change
     AcceptanceCompleted { change_id: String },
+    /// One Acceptance invocation settled, attributed to who decided it and
+    /// which candidate was judged.
+    ///
+    /// Observability only: the reducer keeps the record in process memory for
+    /// the change row and the details popup, and no routing decision reads it.
+    AcceptanceSettled {
+        change_id: String,
+        provenance: Box<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
+    },
     /// Acceptance failed for a change
     #[allow(dead_code)]
     AcceptanceFailed { change_id: String, error: String },
@@ -952,6 +961,7 @@ pub fn classify_event(event: &ExecutionEvent) -> (&'static str, EventOwnership) 
         E::ArchiveOutput { .. } => ("ArchiveOutput", State),
         E::AcceptanceStarted { .. } => ("AcceptanceStarted", State),
         E::AcceptanceCompleted { .. } => ("AcceptanceCompleted", State),
+        E::AcceptanceSettled { .. } => ("AcceptanceSettled", State),
         E::AcceptanceFailed { .. } => ("AcceptanceFailed", State),
         E::ChangeRejected { .. } => ("ChangeRejected", State),
         E::RejectionReviewCompleted { .. } => ("RejectionReviewCompleted", State),

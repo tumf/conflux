@@ -35,6 +35,7 @@ pub const SUPPORTED_V2_PATHS: &[&str] = &[
     "/api/v2/execution-contract",
     "/api/v2/executions/{execution_id}/sink",
     "/api/v2/proposals/{change_id}/subscription",
+    "/api/v2/proposals/{change_id}/refresh-preview",
     "/api/v2/changes",
     "/api/v2/changes/{change_id}",
     "/api/v2/logs",
@@ -165,6 +166,7 @@ worktree lands or what it is cut from.";
         crate::web::remote_control_api::proposal_subscriptions::get_subscription,
         crate::web::remote_control_api::proposal_subscriptions::put_subscription,
         crate::web::remote_control_api::proposal_subscriptions::delete_subscription,
+        crate::web::remote_control_api::proposal_refresh::preview,
         crate::web::remote_control_api::reads::list_changes,
         crate::web::remote_control_api::reads::get_change,
         crate::web::remote_control_api::reads::logs,
@@ -211,6 +213,12 @@ worktree lands or what it is cut from.";
             // by the proposal an operator names rather than by an execution ID
             // that does not exist until the owner admits work.
             crate::web::remote_control_api::dto::ProposalSubscriptionCapability,
+            // Candidate proposal refresh: a read-only preview plus one fenced
+            // command whose result reports what Git actually holds.
+            crate::web::remote_control_api::dto::ProposalRefreshCapability,
+            crate::web::remote_control_api::dto::RefreshEffects,
+            crate::web::remote_control_api::dto::RefreshPreviewResponse,
+            crate::web::remote_control_api::dto::RefreshProposalResult,
             crate::web::remote_control_api::dto::ProposalSubscriptionRequest,
             crate::web::remote_control_api::dto::ProposalSubscriptionResponse,
             crate::web::remote_control_api::dto::OwnerExecutionContract,
@@ -251,6 +259,14 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::worktrees::WorktreeResource,
             crate::web::remote_control_api::worktrees::WorktreeResponse,
             crate::web::remote_control_api::worktrees::WorktreesResponse,
+            // Acceptance decision provenance: identities and closed tokens.
+            crate::orchestration::acceptance::provenance::AcceptanceProvenance,
+            crate::orchestration::acceptance::provenance::CandidateDivergence,
+            crate::orchestration::acceptance::provenance::DecisionSource,
+            crate::orchestration::acceptance::provenance::DivergenceStatus,
+            crate::orchestration::acceptance::provenance::DivergenceUnknownReason,
+            crate::orchestration::acceptance::provenance::ReasonCode,
+            crate::orchestration::acceptance::provenance::Remediation,
         )
     ),
     tags(
