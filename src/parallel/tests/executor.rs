@@ -446,15 +446,29 @@ async fn metadata_read_failure_blocks_dispatch_even_without_analyzer_dependencie
                 .is_empty(),
             "{change_id} must not dispatch"
         );
-        let mut saw_metadata_error = false;
+        let mut change_local_errors = 0;
         while let Ok(event) = event_rx.try_recv() {
-            if let ExecutionEvent::Error { message } = event {
-                saw_metadata_error |= message.contains("dependency metadata could not be read");
+            match event {
+                ExecutionEvent::ProcessingError { id, error } => {
+                    assert_eq!(id, change_id);
+                    assert!(
+                        error.contains(&format!("openspec/changes/{change_id}/proposal.md")),
+                        "{error}"
+                    );
+                    change_local_errors += 1;
+                }
+                ExecutionEvent::Error { message } => {
+                    panic!("{change_id} metadata failure must stay change-local: {message}")
+                }
+                ExecutionEvent::DependencyBlocked { .. } => {
+                    panic!("{change_id} metadata failure must not be a dependency wait")
+                }
+                _ => {}
             }
         }
-        assert!(
-            saw_metadata_error,
-            "{change_id} metadata failure must block dispatch visibly"
+        assert_eq!(
+            change_local_errors, 1,
+            "{change_id} metadata failure must block dispatch visibly as a change-local error"
         );
     }
 }
@@ -773,6 +787,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         reject_wait_changes: HashSet::new(),
         merge_wait_changes: HashSet::new(),
         dependency_blocker_fingerprints: HashMap::new(),
+        proposal_metadata_error_epochs: HashMap::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
         cancel_token: None,

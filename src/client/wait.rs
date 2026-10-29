@@ -1850,4 +1850,95 @@ mod tests {
         replaced.execution.instance_id = "i-replacement".to_string();
         assert!(settled_stop(&replaced, "alpha", Disposition::KeepObserving).is_none());
     }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Queued proposal metadata error: released through the owner's projection
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// The real `/api/v2` projection of `state`, through the owner's WebState.
+    async fn projected_rows(state: &OrchestratorState, ids: &[&str]) -> Vec<ChangeResource> {
+        let changes: Vec<crate::openspec::Change> = ids
+            .iter()
+            .map(|id| crate::openspec::Change {
+                id: id.to_string(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                last_modified: String::new(),
+                dependencies: Vec::new(),
+                metadata: crate::openspec::ProposalMetadata::default(),
+            })
+            .collect();
+        let web = crate::web::state::WebState::new(&changes);
+        web.set_shared_state(std::sync::Arc::new(tokio::sync::RwLock::new(state.clone())))
+            .await;
+        web.sync_remote_control_projection().await;
+        web.remote_control().projection().snapshot().0.changes
+    }
+
+    /// A wait on a proposal the scheduler refused is released as the existing
+    /// `change_requires_action`, carrying the bounded diagnostic and no
+    /// invented Acceptance provenance — instead of observing `queued` forever.
+    #[tokio::test]
+    async fn queued_proposal_diagnostic_releases_wait_as_change_requires_action() {
+        use crate::parallel::queue_state::ProposalMetadataFailure;
+
+        let diagnostic = ProposalMetadataFailure::InvalidMetadata.diagnostic("alpha");
+        let mut state = OrchestratorState::new(vec!["alpha".to_string(), "beta".to_string()], 0);
+        state.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
+        state.apply_command(ReducerCommand::AddToQueue("beta".to_string()));
+
+        // Before the scheduler publishes, `queued` is work the owner advances.
+        let before = observation(
+            projected_rows(&state, &["alpha", "beta"]).await,
+            Vec::new(),
+            1,
+        );
+        assert_keeps_observing(
+            evaluate_stop_wait(&before, "alpha", true).await,
+            "plain queued keeps observing",
+        );
+
+        state.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: diagnostic.clone(),
+        });
+        let rows = projected_rows(&state, &["alpha", "beta"]).await;
+        let alpha = rows
+            .iter()
+            .find(|row| row.id == "alpha")
+            .expect("alpha row");
+        assert_eq!(alpha.display_status, "error");
+        assert_eq!(alpha.error_detail.as_deref(), Some(diagnostic.as_str()));
+        assert!(
+            alpha.blocker.is_none(),
+            "no self-dependency or external hold"
+        );
+        assert!(alpha.acceptance_provenance.is_none());
+
+        let after = observation(rows, Vec::new(), 2);
+        for first in [true, false] {
+            let envelope = settled(evaluate_stop_wait(&after, "alpha", first).await);
+            assert_eq!(envelope.outcome, Outcome::ChangeRequiresAction);
+            assert_eq!(envelope.exit_code(), 27);
+            assert_eq!(envelope.detail["observed_status"], "error");
+            assert_eq!(envelope.detail["commands_submitted"], 0);
+            let detail = envelope.detail["error_detail"]
+                .as_str()
+                .expect("error_detail");
+            assert!(
+                detail.contains("openspec/changes/alpha/proposal.md")
+                    && detail.contains("explicitly Retry"),
+                "{detail}"
+            );
+            let object = envelope.detail.as_object().expect("detail object");
+            assert!(!object.contains_key("acceptance_provenance"));
+            assert!(!object.contains_key("blocker"));
+        }
+
+        // The unrelated queued row is still ordinary work.
+        assert_keeps_observing(
+            evaluate_stop_wait(&after, "beta", false).await,
+            "an unrelated queued row keeps observing",
+        );
+    }
 }

@@ -33,6 +33,8 @@ mod manual_resolve_continuation;
 #[cfg(test)]
 mod per_change_upstream;
 #[cfg(test)]
+mod queued_proposal_diagnostic;
+#[cfg(test)]
 mod reanalysis_trigger_lifetime;
 #[cfg(test)]
 mod reducer_snapshot_contention;
