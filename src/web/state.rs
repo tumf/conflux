@@ -80,6 +80,10 @@ pub struct ChangeStatus {
     /// advertise a kill the shared transaction refuses.
     #[serde(default)]
     pub managed_process_live: bool,
+    /// Provenance of the latest Acceptance settlement this owner observed.
+    #[serde(default)]
+    pub acceptance_provenance:
+        Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
 }
 
 impl From<&Change> for ChangeStatus {
@@ -115,6 +119,7 @@ impl From<&Change> for ChangeStatus {
             worktree: None,
             attention: AttentionState::None,
             managed_process_live: false,
+            acceptance_provenance: None,
         }
     }
 }
@@ -287,6 +292,11 @@ fn apply_reducer_derived_operator_state(
         change.error_detail = runtime
             .and_then(ChangeRuntimeState::error_message)
             .map(crate::events::sanitize_detail);
+        // Copied verbatim: the record holds identities, counts, names, and
+        // closed tokens only, so there is nothing to sanitize.
+        change.acceptance_provenance = runtime
+            .and_then(|rt| rt.acceptance_provenance.as_deref())
+            .cloned();
     }
 }
 

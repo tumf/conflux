@@ -1455,3 +1455,454 @@ async fn required_verification_fail_closed_empty_allowlist_still_proceeds() {
     assert!(!manifest.has_gates());
     assert!(!manifest.is_declaration_invalid());
 }
+
+// ============================================================================
+// Acceptance provenance: who decided, about which candidate
+// ============================================================================
+
+use crate::events::ExecutionEvent;
+use crate::orchestration::acceptance::provenance::{
+    AcceptanceProvenance, DecisionSource, DivergenceStatus, DivergenceUnknownReason, ReasonCode,
+    Remediation,
+};
+
+const ARG_SENTINEL: &str = "ARG-SENTINEL-7f3a91";
+const ENV_SENTINEL: &str = "ENV-SENTINEL-c4e2b8";
+
+/// Run one invocation with a live event channel and return the provenance
+/// records it published, in order.
+async fn accept_with_provenance(
+    fixture: &Fixture,
+    config: &OrchestratorConfig,
+) -> (AcceptanceResult, Vec<AcceptanceProvenance>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    let ai_runner = runner(3600);
+    let mut agent = AgentRunner::new(config.clone());
+    let tail = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+    let (result, _) = scoped_acceptance_root_for_test(
+        fixture.external.path().to_path_buf(),
+        execute_acceptance_in_workspace(
+            fixture.change(),
+            fixture.path(),
+            &mut agent,
+            Some(tx),
+            None,
+            &ai_runner,
+            config,
+            &tail,
+            &history,
+            Some("main"),
+            None,
+            crate::orchestration::acceptance::AcceptanceCommandMode::Normal,
+        ),
+    )
+    .await
+    .or_fail("acceptance must return a typed result");
+    let mut records = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::AcceptanceSettled {
+            change_id,
+            provenance,
+        } = event
+        {
+            assert_eq!(change_id, fixture.change());
+            records.push(*provenance);
+        }
+    }
+    (result, records)
+}
+
+fn only(records: Vec<AcceptanceProvenance>) -> AcceptanceProvenance {
+    assert_eq!(
+        records.len(),
+        1,
+        "exactly one record per settlement: {records:?}"
+    );
+    records.into_iter().next().expect("one record")
+}
+
+async fn git_out(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .await
+        .or_fail("git runs");
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+async fn candidate_proposal_blob(fixture: &Fixture) -> String {
+    git_out(
+        fixture.path(),
+        &[
+            "rev-parse",
+            &format!("HEAD:openspec/changes/{}/proposal.md", fixture.change()),
+        ],
+    )
+    .await
+}
+
+/// A reviewer that emits a canonical FAIL with one finding.
+fn failing_reviewer() -> String {
+    format!(
+        "sh -c 'touch {REVIEWER_MARKER}; echo ACCEPTANCE: FAIL; echo; echo FINDINGS:; echo - \
+         missing regression coverage'"
+    )
+}
+
+/// A defective required declaration settles natively, before any reviewer,
+/// naming the defect, the declaration, and the exact candidate content judged.
+#[tokio::test]
+async fn acceptance_provenance_declaration_invalid_is_a_native_stop() {
+    let change = "acceptance-provenance-declaration";
+    let gate_root = TempDir::new().or_fail("unexpected error");
+    let (command, counter) = counting_gate(gate_root.path());
+    let fixture = Fixture::new(
+        change,
+        &proposal_with_declarations(&[declaration_yaml(
+            change,
+            "shell-gate",
+            &format!("{command} && true"),
+        )]),
+    )
+    .await;
+    let config = config_with_reviewer(canonical_reviewer());
+
+    let (result, records) = accept_with_provenance(&fixture, &config).await;
+
+    assert!(
+        matches!(result, AcceptanceResult::Fail { .. }),
+        "{result:?}"
+    );
+    assert!(!fixture.reviewer_started());
+    assert_eq!(gate_runs(&counter), 0);
+    let record = only(records);
+    let manifest = fixture.manifests().await.load().expect("manifest");
+    assert_eq!(record.decision_source, DecisionSource::NativeVerification);
+    assert!(!record.reviewer_started);
+    assert_eq!(record.reason_code, ReasonCode::DeclarationInvalid);
+    assert_eq!(
+        record.defect_code.as_deref(),
+        Some(manifest.declaration_defects[0].code.as_str())
+    );
+    assert_eq!(record.verification_id.as_deref(), Some("shell-gate"));
+    assert_eq!(
+        record.declaration_path,
+        Some(format!("openspec/changes/{change}/proposal.md"))
+    );
+    assert_eq!(
+        record.candidate_commit.as_deref(),
+        Some(manifest.candidate_commit_oid.as_str())
+    );
+    assert_eq!(
+        record.change_input_digest.as_deref(),
+        Some(manifest.change_input_digest.as_str())
+    );
+    assert_eq!(
+        record.proposal_content_id,
+        Some(candidate_proposal_blob(&fixture).await)
+    );
+    // The candidate *is* `main` here, so the bound base carries the same blob.
+    assert_eq!(
+        record.candidate_divergence.status,
+        DivergenceStatus::Identical
+    );
+    assert_eq!(record.remediation, Remediation::FixDeclaration);
+    assert!(fixture.porcelain_status().await.is_empty());
+}
+
+/// A missing executable settles as `tool_unavailable`, names the unresolved
+/// token, and recommends satisfying the environment.
+#[tokio::test]
+async fn acceptance_provenance_tool_unavailable_names_the_unresolved_program() {
+    let change = "acceptance-provenance-tool";
+    let fixture = Fixture::new(
+        change,
+        &proposal_with_declarations(&[declaration_yaml(
+            change,
+            "missing-tool",
+            "cflx-definitely-missing-tool check --all",
+        )]),
+    )
+    .await;
+    let config = config_with_reviewer(canonical_reviewer());
+
+    let (result, records) = accept_with_provenance(&fixture, &config).await;
+
+    assert!(
+        matches!(result, AcceptanceResult::Stalled { .. }),
+        "{result:?}"
+    );
+    assert!(!fixture.reviewer_started());
+    let record = only(records);
+    assert_eq!(record.decision_source, DecisionSource::NativeVerification);
+    assert_eq!(record.reason_code, ReasonCode::ToolUnavailable);
+    assert_eq!(
+        record.program.as_deref(),
+        Some("cflx-definitely-missing-tool")
+    );
+    assert_eq!(record.argument_count, Some(2));
+    assert_eq!(record.verification_id.as_deref(), Some("missing-tool"));
+    assert_eq!(record.remediation, Remediation::SatisfyEnvironment);
+}
+
+/// A failing gate whose declaration carries a sentinel argument and a sentinel
+/// assignment value settles as `gate_failed` with counts and names — and
+/// neither sentinel reaches the record, the API row, the popup lines, the copy
+/// text, the settlement log line, or `diagnostics.json`.
+#[tokio::test]
+async fn acceptance_provenance_failed_gate_is_redacted_on_every_surface() {
+    let change = "acceptance-provenance-redacted";
+    let gate_root = TempDir::new().or_fail("unexpected error");
+    let script = gate_root.path().join("fail.sh");
+    std::fs::write(&script, "exit 1\n").or_fail("unexpected error");
+    let command = format!(
+        "SECRET_TOKEN={ENV_SENTINEL} sh {} --token={ARG_SENTINEL}",
+        script.display()
+    );
+    let fixture = Fixture::new(
+        change,
+        &proposal_with_declarations(&[declaration_yaml(change, "failing-gate", &command)]),
+    )
+    .await;
+    let config = config_with_reviewer(canonical_reviewer());
+
+    let (result, records) = accept_with_provenance(&fixture, &config).await;
+
+    assert!(
+        matches!(result, AcceptanceResult::Fail { .. }),
+        "{result:?}"
+    );
+    assert!(!fixture.reviewer_started());
+    let record = only(records);
+    assert_eq!(record.reason_code, ReasonCode::GateFailed);
+    assert_eq!(record.remediation, Remediation::RepairCandidate);
+    assert_eq!(record.verification_id.as_deref(), Some("failing-gate"));
+    assert_eq!(record.argument_count, Some(2));
+    assert_eq!(record.env_names, vec!["SECRET_TOKEN".to_string()]);
+    assert!(
+        record
+            .program
+            .as_deref()
+            .is_some_and(|program| program.ends_with("/sh")),
+        "the resolved executable is named: {:?}",
+        record.program
+    );
+
+    let mut surfaces = vec![
+        serde_json::to_string(&record).or_fail("serializes"),
+        record.log_line(change),
+    ];
+
+    // The API row, through the reducer and the production projection.
+    #[cfg(feature = "web-monitoring")]
+    {
+        let reducer = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(vec![change.to_string()], 0),
+        ));
+        let web_state = crate::web::state::WebState::new(&[crate::openspec::Change {
+            id: change.to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: Default::default(),
+        }]);
+        web_state.set_shared_state(reducer.clone()).await;
+        let event = ExecutionEvent::AcceptanceSettled {
+            change_id: change.to_string(),
+            provenance: Box::new(record.clone()),
+        };
+        reducer.write().await.apply_execution_event(&event);
+        web_state.apply_execution_event(&event).await;
+        web_state.sync_remote_control_projection().await;
+        let (snapshot, _, _) = web_state.remote_control().projection().snapshot();
+        let row = snapshot
+            .changes
+            .iter()
+            .find(|row| row.id == change)
+            .or_fail("the change is projected");
+        assert_eq!(row.acceptance_provenance.as_ref(), Some(&record));
+        surfaces.push(serde_json::to_string(row).or_fail("serializes"));
+    }
+
+    // The popup lines and the copy text.
+    let popup = crate::tui::ErrorDetailsPopup {
+        change_id: change.to_string(),
+        error: "Acceptance failed".to_string(),
+        provenance: Some(record.clone()),
+        scroll: 0,
+        copy_feedback: None,
+    };
+    let copy = popup.clipboard_text();
+    assert!(copy.contains("Command: "), "{copy}");
+    assert!(copy.contains("env: SECRET_TOKEN"), "{copy}");
+    surfaces.push(copy);
+
+    if let Ok(diagnostics) = std::fs::read_to_string(fixture.manifests().await.diagnostics_path()) {
+        surfaces.push(diagnostics);
+    }
+
+    for surface in &surfaces {
+        assert!(
+            !surface.contains(ARG_SENTINEL),
+            "argument value leaked: {surface}"
+        );
+        assert!(
+            !surface.contains(ENV_SENTINEL),
+            "environment value leaked: {surface}"
+        );
+    }
+}
+
+/// Reviewer verdicts are labeled as such: the reviewer really started, no gate
+/// is named, and the remediation follows the verdict.
+#[tokio::test]
+async fn acceptance_provenance_reviewer_verdicts_are_distinctly_labeled() {
+    for (change, reviewer, reason, remediation) in [
+        (
+            "acceptance-provenance-reviewer-fail",
+            failing_reviewer(),
+            ReasonCode::ReviewerFail,
+            Remediation::RepairCandidate,
+        ),
+        (
+            "acceptance-provenance-reviewer-pass",
+            canonical_reviewer(),
+            ReasonCode::ReviewerPass,
+            Remediation::None,
+        ),
+    ] {
+        let fixture = Fixture::new(change, PROPOSAL_WITHOUT_GATES).await;
+        let config = config_with_reviewer(reviewer);
+
+        let (_, records) = accept_with_provenance(&fixture, &config).await;
+
+        assert!(fixture.reviewer_started());
+        let record = only(records);
+        assert_eq!(record.decision_source, DecisionSource::Reviewer, "{change}");
+        assert!(record.reviewer_started);
+        assert_eq!(record.reason_code, reason);
+        assert!(record.verification_id.is_none());
+        assert!(record.declaration_path.is_none());
+        assert!(record.program.is_none());
+        assert_eq!(record.remediation, remediation);
+        assert_eq!(
+            record.proposal_content_id,
+            Some(candidate_proposal_blob(&fixture).await)
+        );
+    }
+}
+
+/// A candidate on its own branch, reviewed against `main`.
+async fn branched_fixture(
+    change: &str,
+    base_proposal: Option<&str>,
+    candidate_proposal: &str,
+) -> Fixture {
+    let repo = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo.path()).await;
+    let change_dir = repo.path().join("openspec/changes").join(change);
+    if let Some(base) = base_proposal {
+        std::fs::create_dir_all(&change_dir).or_fail("unexpected error");
+        std::fs::write(change_dir.join("proposal.md"), base).or_fail("unexpected error");
+        commit_all(repo.path(), "Base proposal").await;
+    }
+    git_out(repo.path(), &["checkout", "-b", "candidate"]).await;
+    std::fs::create_dir_all(&change_dir).or_fail("unexpected error");
+    std::fs::write(change_dir.join("proposal.md"), candidate_proposal).or_fail("unexpected error");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] 1. done\n",
+    )
+    .or_fail("unexpected error");
+    commit_all(repo.path(), &format!("Apply: {change}")).await;
+    Fixture {
+        repo,
+        external: TempDir::new().or_fail("unexpected error"),
+        change: change.to_string(),
+    }
+}
+
+/// Divergence compares the bound review base only: a base whose `proposal.md`
+/// differs is `diverged` with both identities, and turns a declaration defect
+/// into `refresh_candidate`; a base without the proposal is `unknown`.
+#[tokio::test]
+async fn acceptance_provenance_divergence_uses_the_bound_review_base() {
+    let change = "acceptance-provenance-diverged";
+    let invalid =
+        proposal_with_declarations(&[declaration_yaml(change, "shell-gate", "sh -c true && true")]);
+    let fixture = branched_fixture(change, Some(PROPOSAL_WITHOUT_GATES), &invalid).await;
+    let config = config_with_reviewer(canonical_reviewer());
+
+    let (_, records) = accept_with_provenance(&fixture, &config).await;
+
+    let record = only(records);
+    let main = git_out(fixture.path(), &["rev-parse", "main"]).await;
+    let base_blob = git_out(
+        fixture.path(),
+        &[
+            "rev-parse",
+            &format!("main:openspec/changes/{change}/proposal.md"),
+        ],
+    )
+    .await;
+    let divergence = &record.candidate_divergence;
+    assert_eq!(record.reason_code, ReasonCode::DeclarationInvalid);
+    assert_eq!(divergence.status, DivergenceStatus::Diverged);
+    assert_eq!(divergence.source_ref.as_deref(), Some("main"));
+    assert_eq!(divergence.source_commit.as_deref(), Some(main.as_str()));
+    assert_eq!(divergence.source_blob.as_deref(), Some(base_blob.as_str()));
+    assert_eq!(
+        divergence.candidate_blob,
+        Some(candidate_proposal_blob(&fixture).await)
+    );
+    assert_eq!(record.remediation, Remediation::RefreshCandidate);
+
+    let change = "acceptance-provenance-source-missing";
+    let fixture = branched_fixture(change, None, PROPOSAL_WITHOUT_GATES).await;
+    let (_, records) = accept_with_provenance(&fixture, &config).await;
+    let record = only(records);
+    assert_eq!(
+        record.candidate_divergence.status,
+        DivergenceStatus::Unknown
+    );
+    assert_eq!(
+        record.candidate_divergence.reason,
+        Some(DivergenceUnknownReason::SourceProposalMissing)
+    );
+}
+
+/// The record is not authority: admission for the same workspace is identical
+/// with the external state root present and deleted after a settlement.
+#[tokio::test]
+async fn acceptance_provenance_state_root_loss_changes_no_admission() {
+    use crate::orchestration::operator_command::AcceptanceAdmissionPort;
+
+    let change = "acceptance-provenance-state-root";
+    let fixture = Fixture::new(change, PROPOSAL_WITHOUT_GATES).await;
+    let config = config_with_reviewer(canonical_reviewer());
+    let (_, records) = accept_with_provenance(&fixture, &config).await;
+    assert_eq!(only(records).reason_code, ReasonCode::ReviewerPass);
+
+    let workspace = fixture.path().to_path_buf();
+    let admission = WorkspaceAcceptanceAdmission::with_holds(
+        move |_change: &str| Some(workspace.clone()),
+        config.get_accept_skill(),
+        None,
+        Arc::new(LiveAcceptanceHolds::new()),
+    );
+    let classify = || {
+        scoped_acceptance_root_for_test(
+            fixture.external.path().to_path_buf(),
+            admission.classify(fixture.change()),
+        )
+    };
+    let with_state = classify().await;
+    std::fs::remove_dir_all(fixture.external.path()).or_fail("state root removable");
+    let without_state = classify().await;
+    assert_eq!(with_state, without_state);
+    assert_eq!(without_state, AcceptanceAdmission::Admit);
+}

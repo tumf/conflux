@@ -16,10 +16,9 @@ The Changes panel SHALL display an `Enter: details` key hint when the cursor is 
 #### Scenario: Non-error row does not advertise details action
 
 - **GIVEN** the TUI is rendering the Changes view
-- **AND** the cursor is on a change whose display status is not `error`
+- **AND** the cursor is on a change whose display status is not `error`, not `stalled`, and not `blocked` with blocker kind `external`
 - **WHEN** the Changes panel key hints are rendered
 - **THEN** the hints SHALL NOT include `Enter: details`
-
 
 #### Scenario: Stalled and externally blocked rows advertise details action
 

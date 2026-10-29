@@ -252,6 +252,7 @@ mod tests {
             blocker_detail_cache: None,
             display_color_cache: Color::DarkGray,
             error_message_cache: None,
+            acceptance_provenance_cache: None,
             selected: false,
             is_new: false,
             parallel_eligibility: ParallelEligibility::Eligible,

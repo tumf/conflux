@@ -586,6 +586,7 @@ pub async fn status(connection: &Connection) -> ResultEnvelope {
                 "parallel_eligible": change.parallel.eligible,
                 "actions": change.actions,
                 "blocker": change.blocker,
+                "acceptance_provenance": change.acceptance_provenance,
                 "execution_state": execution.map(|status| status.execution_state),
                 "current_phase": execution.map(|status| status.current_phase),
                 "last_completed_phase": execution.and_then(|status| status.last_completed_phase),

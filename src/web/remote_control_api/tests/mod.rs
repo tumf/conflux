@@ -3,6 +3,7 @@
 //! Split by concern so a failure names the property that broke rather than just
 //! "the API". Shared fixtures live here.
 
+mod acceptance_provenance_tests;
 mod accepted_command_tests;
 mod auth_tests;
 mod command_tests;
@@ -244,6 +245,7 @@ pub(crate) fn change_resource(change_id: &str, display_status: &str) -> ChangeRe
         timing: ChangeTiming::default(),
         latest_activity: None,
         worktree: None,
+        acceptance_provenance: None,
     }
 }
 

@@ -2042,6 +2042,106 @@ pub(crate) async fn emit_acceptance_execution_hold(
     }
 }
 
+/// What one Acceptance invocation did on the way to its result, recorded as it
+/// happens so the settlement can be attributed without re-deriving anything.
+///
+/// Filled by [`run_acceptance_invocation`] at exactly two points — when the
+/// boundary is frozen and when a reviewer subprocess is actually spawned — and
+/// read once, after the invocation returns, by [`settle_acceptance_provenance`].
+#[derive(Default)]
+pub(crate) struct AcceptanceSettlementTrace {
+    pub manifest:
+        Option<crate::orchestration::acceptance::execution_manifest::AcceptanceExecutionManifest>,
+    pub gates: crate::orchestration::acceptance::execution_manifest::GateResults,
+    pub verdict: Option<crate::orchestration::acceptance::gate_execution::GateVerdict>,
+    pub reviewer_started: bool,
+}
+
+/// Map a typed Acceptance result to its settlement kind.
+///
+/// Exhaustive on purpose: a new result variant fails to compile here rather
+/// than silently publishing no provenance. `None` is the one non-settlement —
+/// an explicit `CONTINUE` asks for another invocation, and the record that
+/// invocation settles with is the one worth publishing.
+pub(crate) fn acceptance_settlement_kind(
+    result: &crate::orchestration::AcceptanceResult,
+    trace: &AcceptanceSettlementTrace,
+) -> Option<crate::orchestration::acceptance::provenance::SettlementKind> {
+    use crate::orchestration::acceptance::gate_execution::GateVerdict;
+    use crate::orchestration::acceptance::provenance::{ReasonCode, SettlementKind};
+    use crate::orchestration::AcceptanceResult as R;
+
+    let reviewer_started = trace.reviewer_started;
+    let reason = match result {
+        R::Continue => return None,
+        R::Pass => ReasonCode::ReviewerPass,
+        R::Fail { .. } if reviewer_started => ReasonCode::ReviewerFail,
+        R::Fail { .. } => match trace.verdict {
+            Some(GateVerdict::DeclarationInvalid { .. }) => ReasonCode::DeclarationInvalid,
+            _ => ReasonCode::GateFailed,
+        },
+        R::Stalled { .. } if reviewer_started => ReasonCode::ReviewerStalled,
+        // The only pre-reviewer `Stalled` is the gate phase's external
+        // prerequisite, which is a missing declared tool.
+        R::Stalled { .. } => ReasonCode::ToolUnavailable,
+        R::PermissionStalled { .. } => ReasonCode::ReviewerPermissionStalled,
+        R::CommandFailed { .. } => ReasonCode::ReviewerCommandFailed,
+        // Both protocol errors are "the reviewer produced no usable verdict".
+        R::MissingVerdict { .. } | R::MalformedFinding { .. } | R::BareBlocker { .. } => {
+            ReasonCode::ReviewerMissingVerdict
+        }
+        R::RuntimeLimit { .. } => ReasonCode::ReviewDeadlineExhausted,
+        R::ExecutionHold { hold } => ReasonCode::from_hold_category(hold.category),
+        R::Cancelled => ReasonCode::Cancelled,
+    };
+    Some(SettlementKind {
+        reason,
+        reviewer_started,
+    })
+}
+
+/// Build, log, and publish the provenance of one settled invocation.
+///
+/// Observability only. Nothing here can change the result being returned:
+/// identity resolution failures become `null` fields, and a closed event
+/// channel loses the record, never the verdict.
+pub(crate) async fn settle_acceptance_provenance(
+    change_id: &str,
+    workspace_path: &Path,
+    result: &crate::orchestration::AcceptanceResult,
+    trace: &AcceptanceSettlementTrace,
+    event_tx: Option<&mpsc::Sender<ParallelEvent>>,
+) -> Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance> {
+    use crate::orchestration::acceptance::provenance::{
+        build_provenance, resolve_candidate_identity, BoundaryFacts,
+    };
+    use crate::orchestration::acceptance::verification_evidence::GitRepositoryFacts;
+
+    let kind = acceptance_settlement_kind(result, trace)?;
+    let identity =
+        resolve_candidate_identity(&GitRepositoryFacts, workspace_path, trace.manifest.as_ref())
+            .await;
+    let boundary = match (&trace.manifest, &trace.verdict) {
+        (Some(manifest), Some(verdict)) => Some(BoundaryFacts {
+            manifest,
+            gates: &trace.gates,
+            verdict,
+        }),
+        _ => None,
+    };
+    let provenance = build_provenance(change_id, boundary, kind, identity);
+    info!(change_id = change_id, "{}", provenance.log_line(change_id));
+    if let Some(tx) = event_tx {
+        let _ = tx
+            .send(ParallelEvent::AcceptanceSettled {
+                change_id: change_id.to_string(),
+                provenance: Box::new(provenance.clone()),
+            })
+            .await;
+    }
+    Some(provenance)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_acceptance_in_workspace(
     change_id: &str,
@@ -2056,6 +2156,54 @@ pub async fn execute_acceptance_in_workspace(
     base_branch: Option<&str>,
     protocol_retry: Option<crate::orchestration::acceptance::AcceptanceProtocolRetry>,
     command_mode: crate::orchestration::acceptance::AcceptanceCommandMode,
+) -> Result<(crate::orchestration::AcceptanceResult, u32)> {
+    let mut trace = AcceptanceSettlementTrace::default();
+    let provenance_tx = event_tx.clone();
+    let outcome = run_acceptance_invocation(
+        change_id,
+        workspace_path,
+        agent,
+        event_tx,
+        cancel_token,
+        ai_runner,
+        config,
+        acceptance_tail_injected,
+        acceptance_history,
+        base_branch,
+        protocol_retry,
+        command_mode,
+        &mut trace,
+    )
+    .await;
+    if let Ok((result, _)) = &outcome {
+        settle_acceptance_provenance(
+            change_id,
+            workspace_path,
+            result,
+            &trace,
+            provenance_tx.as_ref(),
+        )
+        .await;
+    }
+    outcome
+}
+
+/// One Acceptance invocation, recording what it did into `trace`.
+#[allow(clippy::too_many_arguments)]
+async fn run_acceptance_invocation(
+    change_id: &str,
+    workspace_path: &Path,
+    agent: &mut AgentRunner,
+    event_tx: Option<mpsc::Sender<ParallelEvent>>,
+    cancel_token: Option<&CancellationToken>,
+    ai_runner: &AiCommandRunner,
+    config: &OrchestratorConfig,
+    acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
+    acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
+    base_branch: Option<&str>,
+    protocol_retry: Option<crate::orchestration::acceptance::AcceptanceProtocolRetry>,
+    command_mode: crate::orchestration::acceptance::AcceptanceCommandMode,
+    trace: &mut AcceptanceSettlementTrace,
 ) -> Result<(crate::orchestration::AcceptanceResult, u32)> {
     use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
 
@@ -2234,6 +2382,9 @@ pub async fn execute_acceptance_in_workspace(
     // reviewer would only consume budget to rediscover what the runtime knows.
     if let Some(boundary) = boundary.as_ref() {
         use crate::orchestration::acceptance::gate_execution::GateVerdict;
+        trace.manifest = Some(boundary.manifest.clone());
+        trace.gates = boundary.gates.clone();
+        trace.verdict = Some(boundary.verdict.clone());
         // Both gate-decided `fail` verdicts — a declared gate that ran and
         // failed, and required declarations that could not be supervised at
         // all — record a real attempt against the candidate and reach the
@@ -2464,6 +2615,9 @@ pub async fn execute_acceptance_in_workspace(
             Some(change_id),
         )
         .await?;
+    // From here on, whatever this invocation settles with was observed with a
+    // reviewer subprocess in existence.
+    trace.reviewer_started = true;
 
     // Create output collector for history
     let mut output_collector = crate::history::OutputCollector::new();

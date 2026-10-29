@@ -1071,6 +1071,31 @@ pub struct ChangeResource {
     pub latest_activity: Option<ChangeActivity>,
     /// Managed worktree relation; `null` when no worktree exists.
     pub worktree: Option<ChangeWorktree>,
+    /// Who decided the latest Acceptance settlement this owner incarnation
+    /// observed, and about which candidate.
+    ///
+    /// Additive and nullable: `null` for a change with no settlement in this
+    /// incarnation and after owner restart. Identities, counts, environment
+    /// names, and closed tokens only — never a command argument value, an
+    /// environment value, prompt text, or process output.
+    ///
+    /// `decision_source`: `native_verification` | `reviewer`.
+    /// `reason_code`: `declaration_invalid` | `gate_failed` | `tool_unavailable` |
+    /// `gate_deadline_exhausted` | `state_path_unavailable` |
+    /// `legacy_target_evidence` | `manifest_malformed` | `runtime_defect` |
+    /// `reviewer_pass` | `reviewer_fail` | `reviewer_stalled` |
+    /// `reviewer_permission_stalled` | `reviewer_command_failed` |
+    /// `reviewer_missing_verdict` | `review_deadline_exhausted` |
+    /// `review_cleanup_unproven` | `cancelled`.
+    /// `remediation`: `fix_declaration` | `satisfy_environment` |
+    /// `repair_candidate` | `retry` | `refresh_candidate` | `none`.
+    /// `candidate_divergence.status`: `identical` | `diverged` | `unknown`.
+    ///
+    /// Observability only: no command admission, retry classification,
+    /// archive, merge, or next-action decision reads it.
+    #[serde(default)]
+    pub acceptance_provenance:
+        Option<crate::orchestration::acceptance::provenance::AcceptanceProvenance>,
 }
 
 /// Aggregate counts over the projected changes.
