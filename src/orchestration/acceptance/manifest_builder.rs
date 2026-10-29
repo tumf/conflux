@@ -212,6 +212,9 @@ pub async fn build_manifest<F: RepositoryFacts>(
         gates.push(ManifestGate {
             verification_id: request.verification_id,
             argv: request.argv,
+            env_names: request.env.names(),
+            env_binding_digest: request.env.digest(),
+            env: request.env,
             cwd: request.cwd,
             automation_path: request.automation_path,
             automation_blob_oid,

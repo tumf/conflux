@@ -67,6 +67,8 @@ fn evidence() -> VerificationEvidence {
             "orchestration::acceptance".to_string(),
             "--lib".to_string(),
         ],
+        env_names: Vec::new(),
+        env_binding_digest: empty_env_binding_digest(),
         cwd: ".".to_string(),
         automation_path: "src/orchestration/acceptance.rs".to_string(),
         automation_blob_oid: BLOB.to_string(),
@@ -717,6 +719,8 @@ struct FakeSupervisor {
     exit_code: i32,
     output: Vec<u8>,
     calls: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Bindings handed to each call, so parser-to-supervisor wiring is asserted.
+    envs: Arc<Mutex<Vec<EnvBindings>>>,
     /// Mutation applied to the fake repository while the command "runs".
     during: Arc<dyn Fn() + Send + Sync>,
 }
@@ -727,6 +731,7 @@ impl FakeSupervisor {
             exit_code: 0,
             output: b"test result: ok".to_vec(),
             calls: Arc::new(Mutex::new(Vec::new())),
+            envs: Arc::new(Mutex::new(Vec::new())),
             during: Arc::new(|| {}),
         }
     }
@@ -734,8 +739,14 @@ impl FakeSupervisor {
 
 #[async_trait]
 impl CommandSupervisor for FakeSupervisor {
-    async fn run(&self, argv: &[String], _cwd: &Path) -> Result<SupervisedOutcome, String> {
+    async fn run(
+        &self,
+        argv: &[String],
+        env: &EnvBindings,
+        _cwd: &Path,
+    ) -> Result<SupervisedOutcome, String> {
         self.calls.lock().unwrap().push(argv.to_vec());
+        self.envs.lock().unwrap().push(env.clone());
         (self.during)();
         Ok(SupervisedOutcome {
             exit_code: self.exit_code,
@@ -1248,4 +1259,317 @@ fn a_tool_that_reports_no_version_records_none() {
     // `/bin/echo --version` echoes the flag; that is not a version.
     assert_eq!(usable_tool_version("--version\n"), None);
     assert_eq!(usable_tool_version("   \n"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Leading environment assignments (`rerun_leading_env`)
+// ---------------------------------------------------------------------------
+
+/// A value no Conflux-generated metadata may ever contain.
+const ENV_SENTINEL: &str = "rerun-leading-env-sentinel-7f3a9c";
+
+fn declaration_with(command: &str) -> VerificationDeclaration {
+    VerificationDeclaration {
+        rerun: Some(command.to_string()),
+        evidence: Some(command.to_string()),
+        ..declaration()
+    }
+}
+
+fn request_with(command: &str) -> VerificationRequest {
+    eligible_request(&declaration_with(command))
+        .unwrap_or_else(|reason| panic!("'{command}' must be eligible: {}", reason.code()))
+}
+
+fn bindings_of(request: &VerificationRequest) -> Vec<(String, String)> {
+    request.env.pairs().to_vec()
+}
+
+fn pair(name: &str, value: &str) -> (String, String) {
+    (name.to_string(), value.to_string())
+}
+
+#[test]
+fn rerun_leading_env_parses_quoting_empty_values_duplicates_and_explicit_env() {
+    type Case<'a> = (&'a str, Vec<(String, String)>, Vec<&'a str>);
+    let cases: Vec<Case> = vec![
+        (
+            "'A=hello world' cmd",
+            vec![pair("A", "hello world")],
+            vec!["cmd"],
+        ),
+        ("A=x=y cmd", vec![pair("A", "x=y")], vec!["cmd"]),
+        ("A= cmd", vec![pair("A", "")], vec!["cmd"]),
+        (
+            "A=1 B=2 cmd",
+            vec![pair("A", "1"), pair("B", "2")],
+            vec!["cmd"],
+        ),
+        ("A=1 A=2 cmd", vec![pair("A", "2")], vec!["cmd"]),
+        ("env A=1 cmd", vec![], vec!["env", "A=1", "cmd"]),
+        ("cmd a=b", vec![], vec!["cmd", "a=b"]),
+        (
+            "_X1=v cargo test --lib k=v",
+            vec![pair("_X1", "v")],
+            vec!["cargo", "test", "--lib", "k=v"],
+        ),
+    ];
+    for (command, bindings, argv) in cases {
+        let request = request_with(command);
+        assert_eq!(bindings_of(&request), bindings, "bindings of '{command}'");
+        assert_eq!(request.argv, argv, "argv of '{command}'");
+    }
+}
+
+#[test]
+fn rerun_leading_env_invalid_names_and_assignment_only_are_declaration_defects() {
+    for command in ["1ABC=x cmd", "A-B=x cmd", "=x cmd", "A=1 9B=2 cmd"] {
+        let reason = eligible_request(&declaration_with(command)).unwrap_err();
+        assert_eq!(
+            reason.code(),
+            "declaration_invalid_assignment",
+            "'{command}'"
+        );
+    }
+    let reason =
+        eligible_request(&declaration_with(&format!("1BAD={ENV_SENTINEL} cmd"))).unwrap_err();
+    assert!(
+        !reason.detail().contains(ENV_SENTINEL),
+        "detail never echoes text"
+    );
+    assert!(!reason.detail().contains("1BAD"), "{}", reason.detail());
+    for command in ["A=1", "A=1 B=2"] {
+        let reason = eligible_request(&declaration_with(command)).unwrap_err();
+        assert_eq!(reason.code(), "declaration_missing_command", "'{command}'");
+    }
+}
+
+#[test]
+fn rerun_leading_env_shell_constructs_are_still_shell_syntax() {
+    for command in [
+        "FOO=$BAR cmd",
+        "A=1 cmd | tee out",
+        "A=1 cmd > out",
+        "A=1 cmd && other",
+        "A=$(id) cmd",
+    ] {
+        let reason = eligible_request(&declaration_with(command)).unwrap_err();
+        assert_eq!(reason.code(), "declaration_shell_syntax", "'{command}'");
+    }
+}
+
+#[test]
+fn rerun_leading_env_digest_is_canonical_and_identity_bearing() {
+    let digest = |command: &str| request_with(command).env.digest();
+    // The empty-bindings digest is SHA-256 of the empty byte string.
+    assert_eq!(
+        empty_env_binding_digest(),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(digest("cmd"), empty_env_binding_digest());
+    // Canonical order: assignment order does not matter, the last duplicate does.
+    assert_eq!(digest("A=1 B=2 cmd"), digest("B=2 A=1 cmd"));
+    assert_eq!(digest("A=0 A=1 cmd"), digest("A=1 cmd"));
+    let mut hasher = Sha256::new();
+    hasher.update(b"A\x001\x00B\x002\x00");
+    assert_eq!(digest("A=1 B=2 cmd"), format!("{:x}", hasher.finalize()));
+    // Any value, name, or presence change moves it.
+    for other in ["A=2 cmd", "A=1 B=1 cmd", "cmd", "AA=1 cmd"] {
+        assert_ne!(digest("A=1 cmd"), digest(other), "'{other}'");
+    }
+    assert_eq!(request_with("B=2 A=1 cmd").env.names(), vec!["A", "B"]);
+}
+
+#[test]
+fn rerun_leading_env_redacted_rendering_and_debug_never_show_values() {
+    let request = request_with(&format!("SECRET={ENV_SENTINEL} OTHER=x cargo test --lib"));
+    assert_eq!(
+        request.render(),
+        "OTHER=<redacted> SECRET=<redacted> cargo test --lib"
+    );
+    let debug = format!("{request:?}");
+    assert!(!debug.contains(ENV_SENTINEL), "{debug}");
+    assert!(debug.contains("SECRET=<redacted>"), "{debug}");
+}
+
+#[tokio::test]
+async fn rerun_leading_env_bindings_reach_the_supervisor_and_the_envelope_by_digest() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let facts = FakeFacts::new();
+    let supervisor = FakeSupervisor::succeeding();
+    let request = request_with(&format!(
+        "DJANGO_SETTINGS_MODULE={ENV_SENTINEL} cargo test orchestration::acceptance --lib"
+    ));
+    let outcome = executor(&workspace, facts.clone(), supervisor.clone())
+        .capture(&request)
+        .await;
+    let CaptureOutcome::Captured { evidence, .. } = &outcome else {
+        panic!("expected capture, got {outcome:?}");
+    };
+
+    // The supervisor was handed the executable argv and the bindings apart.
+    assert_eq!(
+        *supervisor.calls.lock().unwrap(),
+        vec![request.argv.clone()]
+    );
+    assert_eq!(
+        supervisor.envs.lock().unwrap()[0].pairs(),
+        [pair("DJANGO_SETTINGS_MODULE", ENV_SENTINEL)]
+    );
+    assert_eq!(evidence.argv[0], "cargo");
+    assert_eq!(evidence.env_names, vec!["DJANGO_SETTINGS_MODULE"]);
+    assert_eq!(evidence.env_binding_digest, request.env.digest());
+
+    // Neither the stored envelope nor any report carries the value.
+    let store = store_of(&workspace);
+    let stored = std::fs::read_to_string(
+        store
+            .directory()
+            .join(format!("{}.json", request.verification_id)),
+    )
+    .expect("envelope written");
+    assert!(stored.contains("DJANGO_SETTINGS_MODULE"));
+    assert!(!stored.contains(ENV_SENTINEL), "{stored}");
+    assert!(!outcome.to_json().to_string().contains(ENV_SENTINEL));
+    assert!(!format!("{outcome:?}").contains(ENV_SENTINEL));
+
+    // The same declaration reuses it; reports stay value-free.
+    let plan = plan_reuse(
+        &facts,
+        &target_of(&workspace),
+        &store,
+        &[declaration_with(&format!(
+            "DJANGO_SETTINGS_MODULE={ENV_SENTINEL} cargo test orchestration::acceptance --lib"
+        ))],
+        ReusePolicy::default(),
+    )
+    .await;
+    assert_eq!(plan.reused_ids(), vec!["bound-evidence-tests"]);
+    for decision in &plan.decisions {
+        assert!(!decision.summary().contains(ENV_SENTINEL));
+    }
+    assert!(!plan.to_json().to_string().contains(ENV_SENTINEL));
+}
+
+#[test]
+fn rerun_leading_env_binding_change_reruns_with_env_binding_digest() {
+    let recorded = request_with("A=1 cargo test orchestration::acceptance --lib");
+    let record = VerificationEvidence {
+        env_names: recorded.env.names(),
+        env_binding_digest: recorded.env.digest(),
+        ..evidence()
+    };
+    assert!(
+        evaluate_reuse(&recorded, &record, &current(), ReusePolicy::default()).is_reuse(),
+        "the exact bindings reuse"
+    );
+    for changed in [
+        format!("A={ENV_SENTINEL} cargo test orchestration::acceptance --lib"),
+        "A=1 B=1 cargo test orchestration::acceptance --lib".to_string(),
+        "cargo test orchestration::acceptance --lib".to_string(),
+    ] {
+        let decision = evaluate_reuse(
+            &request_with(&changed),
+            &record,
+            &current(),
+            ReusePolicy::default(),
+        );
+        assert_eq!(
+            mismatch_field(&decision),
+            "env_binding_digest",
+            "'{changed}'"
+        );
+        assert!(!decision.summary().contains(ENV_SENTINEL));
+        assert!(!decision.to_json().to_string().contains(ENV_SENTINEL));
+    }
+}
+
+#[test]
+fn rerun_leading_env_pre_field_envelope_reads_as_empty_bindings() {
+    let mut value = serde_json::to_value(evidence()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("env_names");
+    object.remove("env_binding_digest");
+    let legacy = parse_evidence(&serde_json::to_vec(&value).unwrap()).expect("still parses");
+    assert_eq!(legacy.env_binding_digest, empty_env_binding_digest());
+    assert!(legacy.env_names.is_empty());
+
+    assert!(
+        evaluate_reuse(&request(), &legacy, &current(), ReusePolicy::default()).is_reuse(),
+        "an assignment-free declaration still reuses a pre-field envelope"
+    );
+    let with_env = request_with("A=1 cargo test orchestration::acceptance --lib");
+    assert_eq!(
+        mismatch_field(&evaluate_reuse(
+            &with_env,
+            &legacy,
+            &current(),
+            ReusePolicy::default()
+        )),
+        "env_binding_digest"
+    );
+}
+
+#[test]
+fn rerun_leading_env_short_binding_digest_is_malformed() {
+    let record = VerificationEvidence {
+        env_binding_digest: "abc".to_string(),
+        ..evidence()
+    };
+    let bytes = serde_json::to_vec(&record).unwrap();
+    assert!(matches!(
+        parse_evidence(&bytes),
+        Err(EvidenceDefect::Malformed(_))
+    ));
+}
+
+/// Real child process, production supervisor, no shell.
+#[tokio::test]
+async fn rerun_leading_env_direct_supervisor_applies_bindings_to_the_child_only() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let request =
+        request_with("DJANGO_SETTINGS_MODULE=config.test_settings printenv DJANGO_SETTINGS_MODULE");
+    assert_eq!(request.argv, vec!["printenv", "DJANGO_SETTINGS_MODULE"]);
+    assert!(std::env::var_os("DJANGO_SETTINGS_MODULE").is_none());
+
+    let with = DirectCommandSupervisor
+        .run(&request.argv, &request.env, workspace.path())
+        .await
+        .expect("printenv spawns");
+    assert_eq!(with.exit_code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&with.output).trim(),
+        "config.test_settings"
+    );
+
+    let without = DirectCommandSupervisor
+        .run(&request.argv, &EnvBindings::default(), workspace.path())
+        .await
+        .expect("printenv spawns");
+    assert_ne!(without.exit_code, 0, "unset without the binding");
+
+    assert!(
+        std::env::var_os("DJANGO_SETTINGS_MODULE").is_none(),
+        "the owner environment is unchanged"
+    );
+}
+
+/// Bound supervision of a binding-carrying child keeps the deadline path.
+#[tokio::test]
+async fn rerun_leading_env_bounded_supervision_still_terminates_the_group() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let request = request_with("GATE_MODE=slow sleep 30");
+    let run = DirectCommandSupervisor
+        .run_bounded(
+            &request.argv,
+            &request.env,
+            workspace.path(),
+            Some(Duration::from_millis(100)),
+        )
+        .await
+        .expect("sleep spawns");
+    let SupervisedRun::DeadlineExhausted(report) = run else {
+        panic!("expected deadline exhaustion, got {run:?}");
+    };
+    assert!(report.is_confirmed(), "{}", report.diagnostics());
 }

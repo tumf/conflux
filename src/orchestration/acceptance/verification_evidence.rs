@@ -17,8 +17,8 @@
 //!   claim, and an envelope that does not carry the runtime's own authority
 //!   marking is rejected before any field is compared.
 //! * **Validation is an all-fields conjunction.** [`evaluate_reuse`] has no
-//!   partial score and no freshness heuristic. Commit, tree, argv, cwd,
-//!   automation blob, tool identity, artifact digest, exit code, and clean state
+//!   partial score and no freshness heuristic. Commit, tree, argv, environment
+//!   binding digest, cwd, automation blob, tool identity, artifact digest, exit code, and clean state
 //!   must *all* match; the first mismatch is the rerun reason.
 //! * **Nothing lives inside the target.** The envelope and its artifact are
 //!   written into a Conflux-owned store below the resolved state root, never
@@ -53,6 +53,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::openspec::{
     VerificationCompletionRole, VerificationDeclaration, VerificationExecutionClass,
@@ -163,6 +164,17 @@ pub struct VerificationEvidence {
     pub review_range: String,
     /// Exact argv, as an array. Never a shell string.
     pub argv: Vec<String>,
+    /// Sorted, distinct names of the effective environment bindings the child
+    /// ran with. Names only: a value is never persisted.
+    #[serde(default)]
+    pub env_names: Vec<String>,
+    /// Full-length digest of the effective bindings (see [`EnvBindings::digest`]).
+    ///
+    /// Defaulted to the empty-bindings digest, so an envelope written before
+    /// this binding existed still matches an assignment-free declaration and
+    /// reruns for one that carries assignments.
+    #[serde(default = "empty_env_binding_digest")]
+    pub env_binding_digest: String,
     /// Working directory, normalized repository-relative (`.` for the root).
     pub cwd: String,
     /// Repository-relative path of the declared automation file.
@@ -210,6 +222,8 @@ impl VerificationEvidence {
             "review_base_commit": self.review_base_commit,
             "review_range": self.review_range,
             "argv": self.argv,
+            "env_names": self.env_names,
+            "env_binding_digest": self.env_binding_digest,
             "cwd": self.cwd,
             "automation_path": self.automation_path,
             "automation_blob_oid": self.automation_blob_oid,
@@ -353,6 +367,7 @@ pub fn parse_evidence(bytes: &[u8]) -> Result<VerificationEvidence, EvidenceDefe
         ("automation_blob_oid", &record.automation_blob_oid),
         ("artifact_digest", &record.artifact_digest),
         ("tool.executable_digest", &record.tool.executable_digest),
+        ("env_binding_digest", &record.env_binding_digest),
     ] {
         if !is_full_length_object_id(value) {
             return Err(EvidenceDefect::Malformed(format!(
@@ -428,6 +443,11 @@ pub enum IneligibleReason {
     /// command text, so a detail can be shown without echoing a value a later
     /// syntax extension may need to redact.
     ShellSyntax(String),
+    /// A leading token contains `=` before the executable but its name part is
+    /// not an identifier. Carries the token's 1-based position, never its text.
+    InvalidAssignment(usize),
+    /// Every token is a `NAME=value` assignment; no executable remains.
+    AssignmentOnly,
 }
 
 impl IneligibleReason {
@@ -440,6 +460,8 @@ impl IneligibleReason {
             Self::MissingCommand => "declaration_missing_command",
             Self::MissingAutomation => "declaration_missing_automation",
             Self::ShellSyntax(_) => "declaration_shell_syntax",
+            Self::InvalidAssignment(_) => "declaration_invalid_assignment",
+            Self::AssignmentOnly => "declaration_missing_command",
         }
     }
 
@@ -458,6 +480,13 @@ impl IneligibleReason {
             Self::ShellSyntax(construct) => {
                 format!("command is not a plain argv the runtime can supervise: {construct}")
             }
+            Self::InvalidAssignment(position) => format!(
+                "token {position} precedes the executable and contains '=', but its name is not \
+                 an identifier matching [A-Za-z_][A-Za-z0-9_]*"
+            ),
+            Self::AssignmentOnly => {
+                "command consists only of NAME=value assignments; no executable remains".to_string()
+            }
         }
     }
 }
@@ -466,9 +495,156 @@ impl IneligibleReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationRequest {
     pub verification_id: String,
+    /// Executable plus arguments. Never contains a leading assignment.
     pub argv: Vec<String>,
+    /// Effective environment bindings applied to the supervised child only.
+    pub env: EnvBindings,
     pub cwd: String,
     pub automation_path: String,
+}
+
+impl VerificationRequest {
+    /// The command as an operator or reviewer may see it: `NAME=<redacted>`
+    /// per binding, then the executable argv. See [`render_command`].
+    pub fn render(&self) -> String {
+        render_command(&self.env.names(), &self.argv)
+    }
+}
+
+/// Placeholder rendered in place of every environment binding value.
+pub const REDACTED_VALUE: &str = "<redacted>";
+
+/// The one renderer for a declared command.
+///
+/// Every place Conflux shows a declared command — reuse summaries, `verify`
+/// reports, the reviewer boundary context, diagnostics — goes through here, so
+/// a binding is always `NAME=<redacted>` and its value cannot be printed by a
+/// call site that forgot to redact. It takes *names*, not bindings, on purpose:
+/// a caller holding only persisted metadata can render, and a caller holding
+/// values has nothing to pass them through.
+pub fn render_command(env_names: &[String], argv: &[String]) -> String {
+    env_names
+        .iter()
+        .map(|name| format!("{name}={REDACTED_VALUE}"))
+        .chain(argv.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Effective environment bindings of one declared command.
+///
+/// Ordered by first appearance, one entry per name, each holding the *last*
+/// value assigned to it. The values exist only in memory, for the child's
+/// environment and for [`Self::digest`]: this type implements neither
+/// `Serialize` nor a value-printing `Debug`, so a value cannot leak into a
+/// persisted record, a log line, or a `{:?}` diagnostic by accident.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct EnvBindings(Vec<(String, String)>);
+
+impl std::fmt::Debug for EnvBindings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(name, _)| format!("{name}={REDACTED_VALUE}")),
+            )
+            .finish()
+    }
+}
+
+impl EnvBindings {
+    /// Fold assignments in order: the last value of a repeated name wins, and
+    /// the name keeps its first-seen position.
+    pub fn from_assignments<I, N, V>(assignments: I) -> Self
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: Into<String>,
+        V: Into<String>,
+    {
+        let mut bindings: Vec<(String, String)> = Vec::new();
+        for (name, value) in assignments {
+            let (name, value) = (name.into(), value.into());
+            match bindings.iter_mut().find(|(existing, _)| *existing == name) {
+                Some(slot) => slot.1 = value,
+                None => bindings.push((name, value)),
+            }
+        }
+        Self(bindings)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The effective pairs, for applying to a child process builder.
+    pub fn pairs(&self) -> &[(String, String)] {
+        &self.0
+    }
+
+    /// Sorted, distinct names. Safe to persist and render.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.0.iter().map(|(name, _)| name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    /// Full-length SHA-256 hex over the canonical bindings: pairs sorted by
+    /// name, each encoded as `name NUL value NUL`. The empty-bindings digest is
+    /// the digest of the empty byte string.
+    pub fn digest(&self) -> String {
+        let mut sorted: Vec<&(String, String)> = self.0.iter().collect();
+        sorted.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut hasher = Sha256::new();
+        for (name, value) in sorted {
+            hasher.update(name.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(value.as_bytes());
+            hasher.update([0u8]);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+/// Digest of no bindings at all — what an envelope without the field means.
+pub fn empty_env_binding_digest() -> String {
+    EnvBindings::default().digest()
+}
+
+/// Whether `name` is a POSIX-style environment variable name.
+fn is_env_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+/// Split a tokenized declared command into its leading assignments and the
+/// executable argv.
+///
+/// Leading tokens of the form `NAME=value` are consumed in order; the first
+/// token without `=` is the executable and every later token is an ordinary
+/// argument, `=` or not. A leading token that has `=` but whose name is not an
+/// identifier is refused rather than run as an executable named after it.
+pub fn split_leading_assignments(
+    tokens: Vec<String>,
+) -> Result<(EnvBindings, Vec<String>), IneligibleReason> {
+    let mut assignments = Vec::new();
+    let mut tokens = tokens.into_iter().enumerate().peekable();
+    while let Some((index, token)) = tokens.next_if(|(_, token)| token.contains('=')) {
+        let (name, value) = token.split_once('=').unwrap_or((token.as_str(), ""));
+        if !is_env_name(name) {
+            return Err(IneligibleReason::InvalidAssignment(index + 1));
+        }
+        assignments.push((name.to_string(), value.to_string()));
+    }
+    let argv: Vec<String> = tokens.map(|(_, token)| token).collect();
+    if argv.is_empty() {
+        return Err(IneligibleReason::AssignmentOnly);
+    }
+    Ok((EnvBindings::from_assignments(assignments), argv))
 }
 
 /// Shell metacharacters that mean the declared command is not a plain argv.
@@ -580,7 +756,8 @@ pub fn eligible_request(
         .map(str::trim)
         .filter(|command| !command.is_empty())
         .ok_or(IneligibleReason::MissingCommand)?;
-    let argv = supervisable_argv(command).map_err(IneligibleReason::ShellSyntax)?;
+    let tokens = supervisable_argv(command).map_err(IneligibleReason::ShellSyntax)?;
+    let (env, argv) = split_leading_assignments(tokens)?;
     let automation_path = declaration
         .automation
         .as_deref()
@@ -593,6 +770,7 @@ pub fn eligible_request(
     Ok(VerificationRequest {
         verification_id: id.to_string(),
         argv,
+        env,
         cwd: ".".to_string(),
         automation_path: automation_path.to_string(),
     })
@@ -836,6 +1014,15 @@ pub fn evaluate_reuse(
             current: request.argv.join(" "),
         });
     }
+    // Digests on both sides, never values: the mismatch detail is printed.
+    let current_env_digest = request.env.digest();
+    if record.env_binding_digest != current_env_digest {
+        return rerun(RerunReason::Mismatch {
+            field: "env_binding_digest",
+            recorded: record.env_binding_digest.clone(),
+            current: current_env_digest,
+        });
+    }
     if record.cwd != request.cwd {
         return rerun(RerunReason::Mismatch {
             field: "cwd",
@@ -1034,7 +1221,13 @@ pub enum SupervisedRun {
 /// The runtime's own process supervision.
 #[async_trait]
 pub trait CommandSupervisor: Send + Sync {
-    async fn run(&self, argv: &[String], cwd: &Path) -> Result<SupervisedOutcome, String>;
+    /// Run `argv` in `cwd` with `env` applied to the child only.
+    async fn run(
+        &self,
+        argv: &[String],
+        env: &EnvBindings,
+        cwd: &Path,
+    ) -> Result<SupervisedOutcome, String>;
 
     /// Run under a finite budget the supervisor itself enforces.
     ///
@@ -1047,13 +1240,14 @@ pub trait CommandSupervisor: Send + Sync {
     async fn run_bounded(
         &self,
         argv: &[String],
+        env: &EnvBindings,
         cwd: &Path,
         budget: Option<Duration>,
     ) -> Result<SupervisedRun, String> {
         let Some(budget) = budget else {
-            return self.run(argv, cwd).await.map(SupervisedRun::Completed);
+            return self.run(argv, env, cwd).await.map(SupervisedRun::Completed);
         };
-        match tokio::time::timeout(budget, self.run(argv, cwd)).await {
+        match tokio::time::timeout(budget, self.run(argv, env, cwd)).await {
             Ok(result) => result.map(SupervisedRun::Completed),
             Err(_) => Ok(SupervisedRun::DeadlineExhausted(Box::new(
                 crate::process_manager::ProcessGroupCleanupReport::not_applicable(
@@ -1527,7 +1721,7 @@ where
         let started_at = self.clock.now();
         let outcome = match self
             .supervisor
-            .run_bounded(&request.argv, &cwd, budget)
+            .run_bounded(&request.argv, &request.env, &cwd, budget)
             .await
         {
             Ok(SupervisedRun::Completed(outcome)) => outcome,
@@ -1652,6 +1846,8 @@ where
                 .map(|review| review.range.clone())
                 .unwrap_or_default(),
             argv: request.argv.clone(),
+            env_names: request.env.names(),
+            env_binding_digest: request.env.digest(),
             cwd: request.cwd.clone(),
             automation_path: request.automation_path.clone(),
             automation_blob_oid: before.automation_blob_oid.clone(),
@@ -1947,8 +2143,13 @@ pub struct DirectCommandSupervisor;
 
 #[async_trait]
 impl CommandSupervisor for DirectCommandSupervisor {
-    async fn run(&self, argv: &[String], cwd: &Path) -> Result<SupervisedOutcome, String> {
-        match self.run_bounded(argv, cwd, None).await? {
+    async fn run(
+        &self,
+        argv: &[String],
+        env: &EnvBindings,
+        cwd: &Path,
+    ) -> Result<SupervisedOutcome, String> {
+        match self.run_bounded(argv, env, cwd, None).await? {
             SupervisedRun::Completed(outcome) => Ok(outcome),
             // Unreachable: an unbounded run has no deadline to exhaust. Reported
             // as a supervision failure rather than panicked on, because a
@@ -1963,6 +2164,7 @@ impl CommandSupervisor for DirectCommandSupervisor {
     async fn run_bounded(
         &self,
         argv: &[String],
+        env: &EnvBindings,
         cwd: &Path,
         budget: Option<Duration>,
     ) -> Result<SupervisedRun, String> {
@@ -1972,6 +2174,10 @@ impl CommandSupervisor for DirectCommandSupervisor {
             .split_first()
             .ok_or_else(|| "verification argv is empty".to_string())?;
         let mut command = tokio::process::Command::new(program);
+        // Bindings go on this child's builder and nowhere else: no `set_var`
+        // on the owner, no `sh -c`, no `env` intermediary. The child inherits
+        // the owner environment with these layered on top.
+        command.envs(env.pairs().iter().map(|(name, value)| (name, value)));
         command
             .args(arguments)
             .current_dir(cwd)

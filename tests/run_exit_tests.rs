@@ -2290,3 +2290,182 @@ fn required_verification_fail_closed_verify_runs_nothing_and_keeps_evidence() {
         String::from_utf8_lossy(&status.stdout)
     );
 }
+
+// ─── Leading environment assignments in declared commands (real binary) ────
+
+/// The POSIX prefix form runs for real: the child sees the value, the
+/// assignment-free twin fails, and the owner environment is untouched.
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn rerun_leading_env_verify_runs_the_prefix_form_through_the_real_binary() {
+    let project = FailClosedProject::new();
+    let change = "leading-env";
+    assert!(std::env::var_os("DJANGO_SETTINGS_MODULE").is_none());
+    project.write_change(
+        change,
+        &[required_gate(
+            change,
+            "env-gate",
+            "DJANGO_SETTINGS_MODULE=config.test_settings printenv DJANGO_SETTINGS_MODULE",
+        )],
+    );
+
+    let plan = project.cflx(&["openspec", "verify", change, "--plan", "--json"]);
+    assert!(
+        plan.status.success(),
+        "--plan must succeed: {}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
+    assert_eq!(plan["verifications"][0]["outcome"], "rerun", "{plan}");
+
+    let run = project.cflx(&["openspec", "verify", change, "--json"]);
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "the child must observe its binding: {stdout} {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("run JSON");
+    let captured = &report["verifications"][0];
+    assert_eq!(captured["outcome"], "captured", "{report}");
+    assert_eq!(
+        captured["evidence"]["argv"],
+        serde_json::json!(["printenv", "DJANGO_SETTINGS_MODULE"])
+    );
+    assert_eq!(
+        captured["evidence"]["env_names"],
+        serde_json::json!(["DJANGO_SETTINGS_MODULE"])
+    );
+    let artifact = captured["artifact_location"].as_str().expect("artifact");
+    assert!(
+        !Path::new(artifact).starts_with(project.repo.path()),
+        "the artifact lives outside the repository: {artifact}"
+    );
+    assert_eq!(
+        fs::read_to_string(artifact).unwrap().trim(),
+        "config.test_settings"
+    );
+
+    // The same command without the assignment exits non-zero.
+    project.write_change(
+        change,
+        &[required_gate(
+            change,
+            "env-gate",
+            "printenv DJANGO_SETTINGS_MODULE",
+        )],
+    );
+    let bare = project.cflx(&["openspec", "verify", change, "--json"]);
+    assert_eq!(bare.status.code(), Some(1), "unset without the binding");
+    let bare: serde_json::Value = serde_json::from_slice(&bare.stdout).expect("run JSON");
+    assert_eq!(bare["verifications"][0]["outcome"], "command_failed");
+
+    assert!(
+        std::env::var_os("DJANGO_SETTINGS_MODULE").is_none(),
+        "the test process environment is unchanged"
+    );
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(project.repo.path())
+        .output()
+        .unwrap();
+    assert!(status.stdout.is_empty(), "nothing written inside the repo");
+}
+
+/// A non-echoing child proves that no Conflux-generated metadata — `verify`
+/// text and JSON reports, plan reports, or anything under the state root —
+/// carries an assignment value. Raw child output is a separate artifact and
+/// this child prints nothing.
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn rerun_leading_env_verify_metadata_never_carries_an_assignment_value() {
+    const SENTINEL: &str = "rerun-leading-env-sentinel-a4c2e9";
+    let project = FailClosedProject::new();
+    let change = "leading-env-secret";
+    project.write_change(
+        change,
+        &[required_gate(
+            change,
+            "secret-gate",
+            &format!("SECRET_TOKEN={SENTINEL} true"),
+        )],
+    );
+
+    let mut outputs = Vec::new();
+    for args in [
+        vec!["openspec", "verify", change, "--plan", "--json"],
+        vec!["openspec", "verify", change, "--plan"],
+        vec!["openspec", "verify", change, "--json"],
+        vec!["openspec", "verify", change],
+        vec!["openspec", "verify", change, "--plan", "--json"],
+    ] {
+        let output = project.cflx(&args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        outputs.push((args, output));
+    }
+    for (args, output) in &outputs {
+        for stream in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(stream);
+            assert!(!text.contains(SENTINEL), "{args:?} leaked: {text}");
+        }
+    }
+    let first_run: serde_json::Value =
+        serde_json::from_slice(&outputs[2].1.stdout).expect("run JSON");
+    assert_eq!(
+        first_run["verifications"][0]["evidence"]["env_names"],
+        serde_json::json!(["SECRET_TOKEN"])
+    );
+    let replan: serde_json::Value =
+        serde_json::from_slice(&outputs[4].1.stdout).expect("plan JSON");
+    assert_eq!(replan["verifications"][0]["verification_id"], "secret-gate");
+
+    let state = project.state_snapshot();
+    assert!(
+        state
+            .keys()
+            .any(|path| path.ends_with("gates/secret-gate.json")),
+        "an envelope was written: {:?}",
+        state.keys().collect::<Vec<_>>()
+    );
+    for (path, bytes) in &state {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(SENTINEL),
+            "{} carries the value",
+            path.display()
+        );
+    }
+
+    // An invalid assignment is a declaration defect: non-zero, typed, value-free.
+    project.write_change(
+        change,
+        &[required_gate(
+            change,
+            "secret-gate",
+            &format!("1BAD={SENTINEL} true"),
+        )],
+    );
+    let refused = project.cflx(&["openspec", "verify", change, "--json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let refused_text = String::from_utf8_lossy(&refused.stdout).to_string();
+    assert!(!refused_text.contains(SENTINEL), "{refused_text}");
+    let refused: serde_json::Value = serde_json::from_str(&refused_text).expect("JSON");
+    assert_eq!(
+        refused["declaration_defects"][0]["code"],
+        "declaration_invalid_assignment"
+    );
+    assert_eq!(refused["declaration_defects"][0]["field"], "rerun");
+    let strict = project.cflx(&["openspec", "validate", change, "--strict"]);
+    assert!(!strict.status.success(), "strict validation fails");
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(
+        stderr.contains("(declaration_invalid_assignment)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(SENTINEL), "{stderr}");
+}

@@ -30,6 +30,8 @@ struct FakeFacts {
     tool: Option<ToolIdentity>,
     artifact_digest: Option<String>,
     resolve_calls: Arc<Mutex<Vec<String>>>,
+    /// Every program `resolve_tool` was asked for.
+    tool_programs: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeFacts {
@@ -46,6 +48,7 @@ impl FakeFacts {
             }),
             artifact_digest: None,
             resolve_calls: Arc::new(Mutex::new(Vec::new())),
+            tool_programs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -82,11 +85,8 @@ impl RepositoryFacts for FakeFacts {
     async fn porcelain_status(&self, _workspace: &Path) -> Result<String, String> {
         Ok(String::new())
     }
-    async fn resolve_tool(
-        &self,
-        _workspace: &Path,
-        _program: &str,
-    ) -> Result<ToolIdentity, String> {
+    async fn resolve_tool(&self, _workspace: &Path, program: &str) -> Result<ToolIdentity, String> {
+        self.tool_programs.lock().unwrap().push(program.to_string());
         self.tool
             .clone()
             .ok_or_else(|| "executable is not on PATH".to_string())
@@ -427,4 +427,95 @@ fn acceptance_execution_boundary_workspace_resolution_stays_inside_the_base() {
 
     assert_eq!(resolve("alpha"), Some(base.path().join("alpha")));
     assert_eq!(resolve("missing"), None);
+}
+
+// ============================================================================
+// Leading environment assignments (`rerun_leading_env`)
+// ============================================================================
+
+const ENV_SENTINEL: &str = "rerun-leading-env-sentinel-5b81d2";
+
+fn workspace_with_command(change_id: &str, command: &str) -> tempfile::TempDir {
+    let workspace = workspace_with_change(change_id);
+    let proposal = PROPOSAL.replace("cargo test focused --lib", command);
+    std::fs::write(
+        workspace
+            .path()
+            .join("openspec/changes")
+            .join(change_id)
+            .join("proposal.md"),
+        proposal,
+    )
+    .unwrap();
+    workspace
+}
+
+#[tokio::test]
+async fn rerun_leading_env_manifest_resolves_the_executable_and_persists_no_value() {
+    let command = format!("DJANGO_SETTINGS_MODULE={ENV_SENTINEL} cargo test focused --lib");
+    let workspace = workspace_with_command("alpha", &format!("'{command}'"));
+    let facts = FakeFacts::new();
+    let manifest = build(&facts, &workspace, "alpha").await;
+
+    assert_eq!(
+        facts.tool_programs.lock().unwrap().as_slice(),
+        ["cargo".to_string()],
+        "the tool is resolved from the executable, never from an assignment"
+    );
+    let gate = &manifest.gates[0];
+    assert_eq!(gate.argv, vec!["cargo", "test", "focused", "--lib"]);
+    assert_eq!(gate.env_names, vec!["DJANGO_SETTINGS_MODULE"]);
+    assert_eq!(
+        gate.env_binding_digest,
+        crate::orchestration::acceptance::verification_evidence::EnvBindings::from_assignments([(
+            "DJANGO_SETTINGS_MODULE",
+            ENV_SENTINEL
+        )])
+        .digest()
+    );
+    // The values stay in memory for the runtime that starts the child.
+    assert_eq!(
+        gate.request().env.pairs(),
+        [(
+            "DJANGO_SETTINGS_MODULE".to_string(),
+            ENV_SENTINEL.to_string()
+        )]
+    );
+
+    // Persisted and reviewer-facing projections carry names and digest only.
+    let stored = serde_json::to_string(&manifest).unwrap();
+    assert!(stored.contains("DJANGO_SETTINGS_MODULE"));
+    assert!(!stored.contains(ENV_SENTINEL), "{stored}");
+    let review = manifest.to_review_json();
+    assert!(!review.to_string().contains(ENV_SENTINEL), "{review}");
+    assert_eq!(
+        review["declared_blocking_verifications"][0]["command"],
+        "DJANGO_SETTINGS_MODULE=<redacted> cargo test focused --lib"
+    );
+    assert_eq!(
+        review["declared_blocking_verifications"][0]["env_names"],
+        serde_json::json!(["DJANGO_SETTINGS_MODULE"])
+    );
+    assert!(!format!("{manifest:?}").contains(ENV_SENTINEL));
+}
+
+#[tokio::test]
+async fn rerun_leading_env_invalid_assignment_freezes_a_declaration_defect() {
+    let workspace = workspace_with_command("alpha", &format!("'1BAD={ENV_SENTINEL} cargo test'"));
+    let facts = FakeFacts::new();
+    let manifest = build(&facts, &workspace, "alpha").await;
+
+    assert!(manifest.gates.is_empty());
+    assert_eq!(manifest.declaration_defects.len(), 1);
+    let defect = &manifest.declaration_defects[0];
+    assert_eq!(defect.code, "declaration_invalid_assignment");
+    assert_eq!(defect.field, "rerun");
+    assert_eq!(defect.verification_id, "focused-gate");
+    assert!(
+        facts.tool_programs.lock().unwrap().is_empty(),
+        "a defective declaration is never resolved against PATH"
+    );
+    assert!(!serde_json::to_string(&manifest)
+        .unwrap()
+        .contains(ENV_SENTINEL));
 }
