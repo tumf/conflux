@@ -385,6 +385,14 @@ async fn production_status_paths_preserve_conflicted_classification() {
     let root = dir.path();
     git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "commit.gpgsign", "false"]);
+    // The direct merge below masks global/system config, so the identity it
+    // needs must live in this fixture's own repository. Without it the merge
+    // fails before creating any conflict.
+    git(root, &["config", "--local", "user.name", "cflx"]);
+    git(
+        root,
+        &["config", "--local", "user.email", "cflx@example.com"],
+    );
     write(root, "conflict.txt", "base\n");
     git(root, &["add", "-A"]);
     git(root, &["commit", "-q", "-m", "base"]);
@@ -403,7 +411,39 @@ async fn production_status_paths_preserve_conflicted_classification() {
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .unwrap();
-    assert!(!merged.status.success(), "the fixture merge must conflict");
+    // Exit 1 is a content conflict; any other failure (for example 128 for a
+    // missing identity) is a broken fixture, not a conflicted index.
+    assert_eq!(
+        merged.status.code(),
+        Some(1),
+        "the fixture merge must stop on a content conflict: stdout={} stderr={}",
+        String::from_utf8_lossy(&merged.stdout),
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    assert!(
+        root.join(".git/MERGE_HEAD").exists(),
+        "the conflicted merge must be in progress"
+    );
+    let unmerged = git(root, &["ls-files", "--unmerged", "--", "conflict.txt"]);
+    let mut stages: Vec<&str> = unmerged
+        .lines()
+        .map(|line| {
+            let (meta, path) = line.split_once('\t').expect("ls-files entry has a path");
+            assert_eq!(
+                path, "conflict.txt",
+                "unexpected unmerged path: {unmerged:?}"
+            );
+            meta.split_whitespace()
+                .nth(2)
+                .expect("ls-files entry has a stage")
+        })
+        .collect();
+    stages.sort_unstable();
+    assert_eq!(
+        stages,
+        vec!["1", "2", "3"],
+        "conflict.txt must carry unmerged stages 1, 2 and 3: {unmerged:?}"
+    );
 
     let porcelain = crate::vcs::git::commands::porcelain_status(root)
         .await

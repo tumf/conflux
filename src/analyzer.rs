@@ -208,6 +208,12 @@ pub struct ParallelizationAnalyzer {
     /// repository it is analyzing, and a shadow judge must never be able to
     /// read a proposal from somewhere else.
     repo_root: PathBuf,
+    /// Test-only, instance-local opt-in: wait until the shadow judge task has
+    /// actually finished before collecting it. Fixtures that must observe a
+    /// completed judge use this instead of inferring completion from files the
+    /// child writes; every other analyzer keeps the production deadline.
+    #[cfg(test)]
+    wait_for_shadow_judge_completion: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +249,8 @@ impl ParallelizationAnalyzer {
             ai_runner,
             config,
             repo_root,
+            #[cfg(test)]
+            wait_for_shadow_judge_completion: false,
         }
     }
 
@@ -332,6 +340,24 @@ impl ParallelizationAnalyzer {
         let command_outcome = self
             .execute_analysis_command(&prompt, changes, &mut on_output)
             .await;
+
+        // Fixture-only completion barrier: observe the real judge task finish
+        // (child exit, output drains, and the task itself) before the normal
+        // collection below runs. Yield cooperatively so the current-thread
+        // runtime keeps driving the child; the timeout is only a hang guard.
+        #[cfg(test)]
+        if self.wait_for_shadow_judge_completion {
+            let run = shadow
+                .as_ref()
+                .expect("fixture precondition: the opted-in analyzer must start a shadow judge");
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while !run.handle.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("fixture precondition: the shadow judge task never finished");
+        }
 
         // Conventional completion is the judge's return deadline, whether the
         // conventional path produced a result or an error: a judge that has not
@@ -3100,32 +3126,48 @@ That's all."#;
                 "prose-judge",
                 &format!("printf '%s' 'they are independent because {SECRET}'"),
             );
-            let analyzer = create_test_analyzer_with(
+            let mut analyzer = create_test_analyzer_with(
                 runtime_config(
-                    format!(
-                        "while [ ! -f '{}' ]; do sleep 0.01; done; printf '%s' '{ANALYZE_JSON}'",
-                        repo.path().join("prose-judge.request").display()
-                    ),
+                    format!("printf '%s' '{ANALYZE_JSON}'"),
                     vec![judge.display().to_string()],
                 ),
                 repo.path().to_path_buf(),
             );
+            // The ordering this fixture needs is "the judge task finished before
+            // collection", which only the task handle itself can prove.
+            analyzer.wait_for_shadow_judge_completion = true;
 
             let (capture, _guard) = capture_analyzer_tracing().await;
             let result = analyze(&analyzer, &queued_pair()).await;
             let records = capture.records();
 
+            assert!(
+                judge_ran(repo.path(), "prose-judge"),
+                "the real judge child must have run"
+            );
             assert_eq!(
                 result.order,
                 vec!["queued-a".to_string(), "queued-b".to_string()]
             );
+            let failures: Vec<_> = records
+                .iter()
+                .filter(|(_, fields)| fields.contains("outcome="))
+                .collect();
+            assert_eq!(
+                failures.len(),
+                1,
+                "a malformed response is reported as exactly one bounded category: {records:?}"
+            );
+            let (level, fields) = failures[0];
+            assert_eq!(*level, tracing::Level::WARN, "{records:?}");
             assert!(
-                records
-                    .iter()
-                    .any(|(level, fields)| *level == tracing::Level::WARN
-                        && fields.contains("outcome=\"invalid_json\"")
-                        && fields.contains("expected_answers=2")),
+                fields.contains("outcome=\"invalid_json\"")
+                    && fields.contains("expected_answers=2"),
                 "a malformed response is reported as one bounded category: {records:?}"
+            );
+            assert!(
+                !fields.contains("outcome=\"cancelled\""),
+                "a finished judge must not be reported as cancelled: {records:?}"
             );
             for (_, fields) in &records {
                 assert!(

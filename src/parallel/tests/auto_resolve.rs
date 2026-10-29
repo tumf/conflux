@@ -401,6 +401,11 @@ async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action()
     }
     executor.set_shared_orchestrator_state(shared.clone());
 
+    // Lane promotion below spawns a real retry that reaches `attempt_merge` and
+    // the process-global base lane. Share the fixture serialization lock with
+    // every other lane-entering test, and keep it until the spawned retry's
+    // actual result has been received and handled.
+    let _merge_lock_test_guard = crate::parallel::merge_lock_test_mutex().lock().await;
     executor
         .pending_merge_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
