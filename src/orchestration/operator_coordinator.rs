@@ -457,6 +457,23 @@ pub enum OperatorIntent {
         /// Target change.
         change_id: String,
     },
+    /// Refresh one candidate's `proposal.md` from an explicit source commit.
+    ///
+    /// An ordinary intent: eligibility, expectations, and the Git commit all run
+    /// under the held gate, so a concurrent Start cannot admit the change while
+    /// its candidate is being written. It publishes no outcome event and
+    /// advances no revision, because the row's lifecycle fields are unchanged by
+    /// design — the commit in the candidate worktree is the whole effect.
+    RefreshProposal {
+        /// Target change.
+        change_id: String,
+        /// Explicit source ref.
+        source_ref: String,
+        /// Full commit ID the source ref must still resolve to.
+        expected_source: String,
+        /// Full commit ID the candidate `HEAD` must still be at.
+        expected_head: String,
+    },
 }
 
 /// What an accepted command actually did, in the shared service vocabulary.
@@ -853,6 +870,22 @@ impl OperatorApplication {
                 self.apply_queue_intent(&change_id, queued).await
             }
             OperatorIntent::SetAllExecutionMarks => self.apply_bulk_marks().await,
+            OperatorIntent::RefreshProposal {
+                change_id,
+                source_ref,
+                expected_source,
+                expected_head,
+            } => {
+                self.apply_refresh_proposal(
+                    crate::orchestration::proposal_refresh::RefreshRequest {
+                        change_id,
+                        source_ref,
+                        expected_source,
+                        expected_head,
+                    },
+                )
+                .await
+            }
             // Routed before the gate was taken.
             OperatorIntent::StopAndDequeue { .. } | OperatorIntent::ForceStopChange { .. } => {
                 unreachable!("a two-phase intent is routed before the ordinary transaction")
@@ -999,6 +1032,20 @@ impl OperatorApplication {
     async fn apply_bulk_marks(&self) -> ApplicationResult {
         match self.run_control.operator().set_all_execution_marks().await {
             Ok(outcome) => self.publish_operator_outcome(outcome).await,
+            Err(error) => ApplicationResult::failed(RunControlError::Operator(error)),
+        }
+    }
+
+    /// Apply one candidate proposal refresh under the held gate.
+    ///
+    /// No outcome is dispatched either way: the settled result is the command's
+    /// own record, and the unchanged admitted revision is the truthful one.
+    async fn apply_refresh_proposal(
+        &self,
+        request: crate::orchestration::proposal_refresh::RefreshRequest,
+    ) -> ApplicationResult {
+        match self.run_control.operator().refresh_proposal(&request).await {
+            Ok(outcome) => ApplicationResult::operator(outcome, None),
             Err(error) => ApplicationResult::failed(RunControlError::Operator(error)),
         }
     }
@@ -1297,6 +1344,9 @@ pub(crate) fn operator_outcome_event(outcome: &OperatorOutcome) -> Option<Execut
         // giving the same fact a second authority.
         OperatorOutcome::Dequeued { .. } | OperatorOutcome::ForceStopped { .. } => None,
         OperatorOutcome::NoOp { .. } => None,
+        // A refresh changes no reducer-owned field, so there is no delta to
+        // broadcast; its record is the only settlement.
+        OperatorOutcome::ProposalRefreshed(_) => None,
     }
 }
 

@@ -38,6 +38,10 @@ mod convergence_tests;
 #[cfg(test)]
 mod mark_settlement_tests;
 
+/// Candidate proposal refresh: the TUI adapter submits the shared intent.
+#[cfg(all(test, feature = "web-monitoring"))]
+mod proposal_refresh_tests;
+
 /// TUI ↔ `/api/v2` parity for mode-independent Start/F5 retry routing.
 #[cfg(all(test, feature = "web-monitoring"))]
 mod change_error_f5_retry_tests;
@@ -273,12 +277,21 @@ pub struct CommandFeedback {
     /// Set when the operator must be told the command was refused or changed
     /// nothing.
     pub warning: Option<String>,
+    /// A shared refresh preview to open the confirmation popup with.
+    ///
+    /// Presentation state only: it is the preview's own identities that the
+    /// popup later submits, and the shared transaction revalidates all of them.
+    pub refresh_preview: Option<Box<crate::orchestration::proposal_refresh::RefreshPreview>>,
 }
 
 impl CommandFeedback {
     /// A command that did what it was asked to do.
     fn accepted(log: LogEntry) -> Self {
-        Self { log, warning: None }
+        Self {
+            log,
+            warning: None,
+            refresh_preview: None,
+        }
     }
 
     /// A refusal or a no-op, surfaced as well as logged.
@@ -286,7 +299,31 @@ impl CommandFeedback {
         Self {
             log: LogEntry::warn(message.clone()),
             warning: Some(message),
+            refresh_preview: None,
         }
+    }
+}
+
+/// How a settled `refresh_proposal` reads to an operator.
+///
+/// The same sentence `/api/v2` records, so an operator and a remote client are
+/// told the same facts — including the effects a refusal left behind.
+fn describe_refresh_proposal(result: ApplicationResult) -> CommandFeedback {
+    match result.outcome {
+        Ok(ApplicationOutcome::Operator(OperatorOutcome::ProposalRefreshed(report))) => {
+            CommandFeedback::accepted(LogEntry::success(format!(
+                "Proposal refresh: {}",
+                report.describe()
+            )))
+        }
+        Ok(other) => {
+            debug!(
+                "Proposal refresh produced an unexpected outcome: {:?}",
+                other
+            );
+            CommandFeedback::accepted(LogEntry::info("Proposal refresh settled"))
+        }
+        Err(error) => CommandFeedback::refused(format!("Proposal refresh refused: {error}")),
     }
 }
 
@@ -796,6 +833,43 @@ pub async fn handle_tui_command(
                 let _ = feedback.send(settled).await;
             });
         }
+        TuiCommand::PreviewProposalRefresh {
+            change_id,
+            source_ref,
+        } => {
+            // A read: Git observation only, no command record and no intent. It
+            // runs off this loop so a slow repository never stalls rendering,
+            // and its answer comes back on the feedback channel to open the
+            // confirmation.
+            let service = ctx.application.run_control().operator();
+            let feedback = ctx.feedback.clone();
+            tokio::spawn(async move {
+                let preview = service
+                    .preview_proposal_refresh(&change_id, &source_ref)
+                    .await;
+                let mut settled = CommandFeedback::accepted(LogEntry::info(format!(
+                    "Proposal refresh preview for '{change_id}' from '{source_ref}'"
+                )));
+                settled.refresh_preview = Some(Box::new(preview));
+                let _ = feedback.send(settled).await;
+            });
+        }
+        TuiCommand::RefreshProposal {
+            change_id,
+            source_ref,
+            expected_source,
+            expected_head,
+        } => {
+            // Adapter only: eligibility, expectations, the hook-enabled commit,
+            // and the truthful effects all belong to the shared transaction.
+            let intent = OperatorIntent::RefreshProposal {
+                change_id,
+                source_ref,
+                expected_source,
+                expected_head,
+            };
+            submit(ctx, intent, describe_refresh_proposal);
+        }
         TuiCommand::ResolveMerge(id) => {
             // Adapter only: the shared transaction owns the reducer intent, the
             // single-resolver reservation, FIFO ordering, duplicate rejection,
@@ -861,6 +935,9 @@ pub fn apply_command_feedback(app: &mut AppState, feedback: CommandFeedback) {
         app.warning_message = Some(warning);
     }
     app.add_log(feedback.log);
+    if let Some(preview) = feedback.refresh_preview {
+        app.open_proposal_refresh_confirmation(*preview);
+    }
 }
 
 #[cfg(test)]

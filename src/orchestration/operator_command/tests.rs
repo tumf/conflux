@@ -3595,3 +3595,6 @@ fn force_stop_change_never_reaches_process_wide_force_stop() {
         "the only kill route is the managed ownership port"
     );
 }
+
+/// Candidate proposal refresh through the shared service.
+mod refresh;

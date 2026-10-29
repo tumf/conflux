@@ -16,6 +16,7 @@ mod force_stop_change_tests;
 mod operator_snapshot_tests;
 mod parallel_control_tests;
 mod projection_tests;
+mod proposal_refresh_tests;
 mod read_tests;
 mod registry_tests;
 mod stop_result_tests;

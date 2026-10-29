@@ -61,6 +61,8 @@ pub mod control;
 #[cfg(feature = "web-monitoring")]
 pub mod mcp;
 #[cfg(feature = "web-monitoring")]
+pub mod refresh;
+#[cfg(feature = "web-monitoring")]
 pub mod repo;
 #[cfg(feature = "web-monitoring")]
 mod session;
@@ -340,10 +342,32 @@ fn operation_of(subcommand: &str) -> Option<Operation> {
         "stop" => Some(Operation::ControlStop),
         "force-stop" => Some(Operation::ControlForceStop),
         "force-stop-change" => Some(Operation::ControlForceStopChange),
+        // The apply form; a usage failure that asked for `--dry-run` is
+        // re-labelled by [`refresh_operation_of`].
+        "refresh-proposal" => Some(Operation::ControlRefreshProposal),
         "wait" => Some(Operation::Wait),
         // `mcp` is a server, not an operation: a usage failure there has no
         // envelope to belong to, so it keeps Clap's human behavior.
         _ => None,
+    }
+}
+
+/// Which `refresh-proposal` form a rejected invocation asked for.
+///
+/// Read from argv rather than from the parsed matches, for the same reason
+/// `--json` is: parsing stops at the first rejected argument. An invocation that
+/// named `--dry-run` asked for the read, so it is reported as the preview
+/// operation; every other one as the apply.
+fn refresh_operation_of(argv: &[OsString]) -> Operation {
+    let dry_run = argv
+        .iter()
+        .skip(1)
+        .take_while(|arg| *arg != END_OF_OPTIONS)
+        .any(|arg| arg == "--dry-run");
+    if dry_run {
+        Operation::RefreshProposalPreview
+    } else {
+        Operation::ControlRefreshProposal
     }
 }
 
@@ -392,6 +416,9 @@ pub fn json_usage_operation(argv: &[OsString]) -> Option<Operation> {
     let client = matches.subcommand_matches("client")?;
     if let Some(subscribe) = client.subcommand_matches("subscribe") {
         return Some(subscribe_operation_of(subscribe.subcommand_name()));
+    }
+    if client.subcommand_name() == Some("refresh-proposal") {
+        return Some(refresh_operation_of(argv));
     }
     Some(
         client
@@ -511,6 +538,15 @@ pub async fn run(args: ClientArgs) -> i32 {
             Operation::Wait,
             OutputMode::from_json_flag(wait.json),
             Some(wait.change_id.clone()),
+        ),
+        ClientCommands::RefreshProposal(refresh) => (
+            if refresh.dry_run {
+                Operation::RefreshProposalPreview
+            } else {
+                Operation::ControlRefreshProposal
+            },
+            OutputMode::from_json_flag(refresh.json),
+            Some(refresh.change_id.clone()),
         ),
         ClientCommands::Subscribe(subscribe) => match &subscribe.command {
             ClientSubscribeCommands::Set(set) => (
@@ -633,6 +669,28 @@ async fn execute(args: ClientArgs, operation: Operation) -> ResultEnvelope {
         }
         ClientCommands::Wait(wait) => {
             wait::run(&connection, &wait.change_id, wait.timeout.deadline()).await
+        }
+        ClientCommands::RefreshProposal(refresh) => {
+            let form = match (
+                refresh.dry_run,
+                refresh.expected_source,
+                refresh.expected_head,
+            ) {
+                (true, None, None) => refresh::Form::Preview,
+                (false, Some(expected_source), Some(expected_head)) => refresh::Form::Apply {
+                    expected_source,
+                    expected_head,
+                },
+                // Clap's argument group already refuses every other shape; this
+                // arm keeps the refusal typed if that ever regresses.
+                _ => {
+                    return ResultEnvelope::new(operation, Outcome::UsageError).with_message(
+                        "refresh-proposal takes exactly one of --dry-run or both \
+                         --expected-source and --expected-head",
+                    )
+                }
+            };
+            refresh::run(&connection, &refresh.change_id, &refresh.source_ref, form).await
         }
         ClientCommands::Subscribe(args) => match args.command {
             ClientSubscribeCommands::Set(set) => {

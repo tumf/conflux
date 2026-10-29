@@ -22,6 +22,7 @@ use crate::orchestration::operator_command::{
     is_active_status, is_final_status, is_markable_status, ForceStopAdmission, MarkExclusion,
     OperatorMode, QueueIntentRoute, RetryRoute,
 };
+use crate::orchestration::proposal_refresh::{classify_refresh_proposal, RefreshAdmission};
 use crate::orchestration::state::BlockerKind;
 use crate::web::state::OrchestratorStateSnapshot;
 
@@ -571,6 +572,7 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
                     change.blocker.as_ref(),
                     change.parallel.eligible,
                     change.managed_process_live,
+                    change.worktree.is_some(),
                 ),
                 display_status,
                 progress_status: change.status.clone(),
@@ -643,6 +645,7 @@ fn classify_actions(
     blocker: Option<&ChangeBlocker>,
     parallel_eligible: bool,
     managed_process_live: bool,
+    has_worktree: bool,
 ) -> ChangeActions {
     let final_status = is_final_status(display_status);
     let route = classify_queue_intent_route(mode, display_status);
@@ -724,6 +727,26 @@ fn classify_actions(
             }
         };
 
+    // The projected row is tracked by definition; the worktree relation and the
+    // live-process fact are the remaining inputs of the shared refresh table.
+    let refresh_blocker = match blocker.map(|blocker| blocker.kind) {
+        Some(DtoBlockerKind::Dependency) => BlockerKind::Dependency,
+        Some(DtoBlockerKind::External) => BlockerKind::External,
+        _ => BlockerKind::None,
+    };
+    let refresh_proposal = match classify_refresh_proposal(
+        display_status,
+        refresh_blocker,
+        true,
+        has_worktree,
+        managed_process_live,
+    ) {
+        RefreshAdmission::Allowed => ActionEligibility::allowed(),
+        RefreshAdmission::Refused(reason) => {
+            ActionEligibility::blocked(ActionBlockedReason::from_refresh_reason(reason))
+        }
+    };
+
     ChangeActions {
         set_execution_mark,
         set_queue_intent,
@@ -731,6 +754,7 @@ fn classify_actions(
         stop_and_dequeue,
         force_stop_change,
         resolve_merge,
+        refresh_proposal,
     }
 }
 
@@ -753,6 +777,27 @@ pub fn change_actions_for_test(
         blocker,
         true,
         false,
+        false,
+    )
+}
+
+/// Action eligibility with an explicit worktree relation, for tests and fixtures
+/// that must exercise the candidate proposal refresh rule.
+#[doc(hidden)]
+#[allow(dead_code)] // Used by unit tests and by `tests/client_cli_tests.rs`.
+pub fn change_actions_with_worktree_for_test(
+    app_mode: &str,
+    display_status: &str,
+    blocker: Option<&ChangeBlocker>,
+    has_worktree: bool,
+) -> ChangeActions {
+    classify_actions(
+        OperatorMode::from_app_mode(app_mode),
+        display_status,
+        blocker,
+        true,
+        false,
+        has_worktree,
     )
 }
 
@@ -771,6 +816,7 @@ pub fn change_actions_with_live_process_for_test(
         None,
         true,
         managed_process_live,
+        false,
     )
 }
 
@@ -787,6 +833,7 @@ pub fn parallel_change_actions_for_test(
         display_status,
         None,
         parallel_eligible,
+        false,
         false,
     )
 }

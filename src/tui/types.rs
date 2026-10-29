@@ -224,6 +224,15 @@ pub enum ModalState {
         /// The change ID being confirmed for force-kill
         change_id: String,
     },
+    /// Candidate proposal refresh confirmation, opened from the shared preview.
+    ///
+    /// Presentation only: the preview's own identities are what an `Enter`
+    /// submits as expectations, and the shared transaction revalidates all of
+    /// them, so a stale popup can at worst be refused.
+    ConfirmProposalRefresh {
+        /// The shared preview the popup was opened for.
+        preview: Box<crate::orchestration::proposal_refresh::RefreshPreview>,
+    },
 }
 
 impl ModalState {
@@ -235,6 +244,7 @@ impl ModalState {
             ModalState::ConfirmDirtyDiscard { .. } => "Discard Changes",
             ModalState::ConfirmAheadDiscard { .. } => "Discard Commits",
             ModalState::ConfirmForceKill { .. } => "Confirm Kill",
+            ModalState::ConfirmProposalRefresh { .. } => "Refresh Proposal",
         }
     }
 

@@ -6982,3 +6982,587 @@ mod enabled {
         }
     }
 }
+
+// ============================================================================
+// candidate_proposal_refresh
+// ============================================================================
+//
+// The compiled CLI against a real router on a real Unix socket, backed by the
+// production application transaction and a disposable real-Git candidate under
+// a temporary directory. Nothing here touches a live owner or pushes anything.
+
+#[cfg(feature = "web-monitoring")]
+mod candidate_proposal_refresh {
+    use super::*;
+
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use conflux::orchestration::operator_command::{
+        ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, ParallelRuntime,
+        WorktreeBaseDirCandidates,
+    };
+    use conflux::orchestration::operator_coordinator::CoreMode;
+    use conflux::orchestration::run_control::{ResolveReservations, RunControlService};
+    use conflux::orchestration::state::OrchestratorState;
+    use conflux::web::remote_control_api::auth::RemoteControlAuth;
+    use conflux::web::remote_control_api::{router, RemoteControlState};
+    use conflux::web::state::WebState;
+
+    const CHANGE: &str = "alpha";
+    const PROPOSAL: &str = "openspec/changes/alpha/proposal.md";
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// `develop` with a corrected proposal; a candidate worktree with an
+    /// applied implementation commit and the stale one.
+    struct Candidate {
+        dir: tempfile::TempDir,
+        root: PathBuf,
+        worktree: PathBuf,
+    }
+
+    impl Candidate {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(&root).unwrap();
+            git(&root, &["init", "-q", "-b", "develop"]);
+            git(&root, &["config", "user.name", "cflx"]);
+            git(&root, &["config", "user.email", "cflx@example.com"]);
+            git(&root, &["config", "commit.gpgsign", "false"]);
+            let hooks = root.join(".git/hooks");
+            std::fs::create_dir_all(&hooks).unwrap();
+            git(
+                &root,
+                &["config", "core.hooksPath", hooks.to_str().unwrap()],
+            );
+            write(&root, PROPOSAL, "verification: stale\n");
+            write(&root, "src/lib.rs", "pub fn base() {}\n");
+            git(&root, &["add", "-A"]);
+            git(&root, &["commit", "-q", "-m", "base"]);
+            let worktree = dir.path().join("worktrees").join(CHANGE);
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    CHANGE,
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            write(&worktree, "src/impl.rs", "pub fn applied() {}\n");
+            git(&worktree, &["add", "-A"]);
+            git(&worktree, &["commit", "-q", "-m", "Apply: alpha"]);
+            write(&root, PROPOSAL, "verification: corrected\n");
+            git(&root, &["commit", "-q", "-am", "correct proposal"]);
+            Self {
+                dir,
+                root,
+                worktree,
+            }
+        }
+
+        fn head(&self) -> String {
+            git(&self.worktree, &["rev-parse", "HEAD"])
+        }
+
+        fn hook(&self, body: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.root.join(".git/hooks/pre-commit");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// An isolated owner serving the production router on a temp socket.
+    struct Owner {
+        socket: String,
+        shutdown: tokio_util::sync::CancellationToken,
+        serve: tokio::task::JoinHandle<()>,
+        reducer: Arc<tokio::sync::RwLock<OrchestratorState>>,
+        _socket_dir: tempfile::TempDir,
+    }
+
+    impl Owner {
+        /// `command_capable: false` is a headless `cflx run`: reads only.
+        async fn start(candidate: &Candidate, command_capable: bool) -> Self {
+            let reducer = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+                vec![CHANGE.to_string()],
+                4,
+            )));
+            reducer.write().await.apply_execution_event(
+                &conflux::events::ExecutionEvent::ProcessingError {
+                    id: CHANGE.to_string(),
+                    error: "stale verification declaration".to_string(),
+                },
+            );
+            let marks = Arc::new(ExecutionMarkStore::new());
+            let parallel = Arc::new(ParallelRuntime::new());
+            let listing = conflux::openspec::Change {
+                id: CHANGE.to_string(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+                metadata: Default::default(),
+            };
+            let web_state = Arc::new(WebState::new(std::slice::from_ref(&listing)));
+            web_state.set_shared_state(reducer.clone()).await;
+            web_state.set_execution_marks(marks.clone()).await;
+            web_state
+                .seed_workspace_observation_for_tests(&[listing], "select")
+                .await;
+            web_state
+                .seed_worktree_paths_for_tests(
+                    candidate.root.clone(),
+                    HashMap::from([(CHANGE.to_string(), candidate.worktree.clone())]),
+                )
+                .await;
+
+            let runtime = web_state.remote_control();
+            if command_capable {
+                let service = Arc::new(
+                    OperatorCommandService::new(
+                        reducer.clone(),
+                        Arc::new(conflux::tui::queue::DynamicQueue::new()),
+                        Arc::new(NoopQueueHooks),
+                        marks.clone(),
+                    )
+                    .with_parallel(parallel.clone())
+                    .with_candidate_worktrees(Arc::new(
+                        WorktreeBaseDirCandidates::new(
+                            candidate.root.clone(),
+                            candidate.worktree.parent().unwrap().to_path_buf(),
+                        ),
+                    )),
+                );
+                let run_control = Arc::new(RunControlService::new(
+                    reducer.clone(),
+                    service,
+                    Arc::new(NoScheduler),
+                    Arc::new(ResolveReservations::new()),
+                    parallel,
+                ));
+                let (executor, application) =
+                    conflux::web::remote_control_api::executor::wired_for_test(
+                        reducer.clone(),
+                        run_control,
+                        web_state.clone(),
+                        Arc::new(CoreMode::new()),
+                    );
+                runtime.bind(Arc::new(executor)).await;
+                runtime.bind_gate(application.gate()).await;
+            }
+
+            let socket_dir = tempfile::tempdir().unwrap();
+            let socket_path = socket_dir.path().join("cflx-api.sock");
+            let auth = RemoteControlAuth::new(None, &[]).unwrap();
+            let app = router(
+                RemoteControlState::new(runtime.projection(), Arc::new(auth), runtime.clone())
+                    .with_gate(runtime.gate())
+                    .with_execution_facts(runtime.execution_facts())
+                    .with_execution_contract(runtime.execution_contract())
+                    .with_refresh_paths(web_state.clone()),
+            );
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let serve = tokio::spawn({
+                let shutdown = shutdown.clone();
+                async move {
+                    let _ = axum::serve(listener, app)
+                        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+                        .await;
+                }
+            });
+            Self {
+                socket: socket_path.display().to_string(),
+                shutdown,
+                serve,
+                reducer,
+                _socket_dir: socket_dir,
+            }
+        }
+
+        async fn cli(&self, cwd: &Path, tail: &[&str]) -> Output {
+            let mut args = vec![
+                "client".to_string(),
+                "--unix-socket".to_string(),
+                self.socket.clone(),
+            ];
+            args.extend(tail.iter().map(|arg| arg.to_string()));
+            let cwd = cwd.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                run_cli(&cwd, &args, &[])
+            })
+            .await
+            .unwrap()
+        }
+
+        async fn stop(self) {
+            self.shutdown.cancel();
+            let _ = self.serve.await;
+        }
+    }
+
+    /// The one boundary this test does not cross: a refresh never launches.
+    struct NoScheduler;
+
+    #[async_trait::async_trait]
+    impl conflux::orchestration::run_control::RunSchedulerPort for NoScheduler {
+        fn is_running(&self) -> bool {
+            false
+        }
+        async fn prepare_run(
+            &self,
+            _targets: Vec<String>,
+            _explicit_retry: bool,
+        ) -> Result<conflux::orchestration::run_control::RunPermit, String> {
+            panic!("a proposal refresh must never prepare a run")
+        }
+        async fn notify_scheduler(&self) {}
+        async fn cancel_run(&self) {}
+        fn set_graceful_stop(&self, _requested: bool) {}
+        async fn stop_activity(&self) -> conflux::tui::stop_classification::StopActivitySnapshot {
+            use conflux::tui::stop_classification::{
+                ExecutionEvidence, ShutdownWorkEvidence, StopActivitySnapshot,
+            };
+            StopActivitySnapshot {
+                execution_handles: ExecutionEvidence::Known { registered: 0 },
+                reducer_agent_execution_active: false,
+                shutdown_work: ShutdownWorkEvidence::Known { pending: false },
+            }
+        }
+    }
+
+    fn envelope(output: &Output) -> serde_json::Value {
+        let stdout = stdout_of(output);
+        let trimmed = stdout.trim();
+        assert!(
+            !trimmed.contains('\n'),
+            "JSON stdout must be exactly one object, got:\n{stdout}"
+        );
+        serde_json::from_str(trimmed)
+            .unwrap_or_else(|e| panic!("stdout must be one JSON envelope, got {stdout:?}: {e}"))
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+    async fn candidate_proposal_refresh_cli_previews_then_applies_against_an_isolated_owner() {
+        let candidate = Candidate::new();
+        let owner = Owner::start(&candidate, true).await;
+        let cwd = candidate.dir.path();
+        let before = candidate.head();
+
+        let preview = owner
+            .cli(
+                cwd,
+                &[
+                    "refresh-proposal",
+                    CHANGE,
+                    "--source-ref",
+                    "develop",
+                    "--dry-run",
+                    "--json",
+                ],
+            )
+            .await;
+        let previewed = envelope(&preview);
+        assert_eq!(
+            previewed["operation"],
+            "refresh_proposal_preview",
+            "{}",
+            stderr_of(&preview)
+        );
+        assert_eq!(previewed["outcome"], "previewed");
+        assert_eq!(previewed["ok"], true);
+        assert_eq!(previewed["change_id"], CHANGE);
+        assert_eq!(preview.status.code(), Some(0));
+        assert_eq!(previewed["detail"]["eligible"], true);
+        assert_eq!(previewed["detail"]["commands_submitted"], 0);
+        assert_eq!(previewed["detail"]["candidate_head"], before);
+        assert!(previewed["detail"]["patch"]
+            .as_str()
+            .unwrap()
+            .contains("+verification: corrected"));
+        assert_eq!(candidate.head(), before, "a preview writes nothing");
+
+        let source = previewed["detail"]["source_commit"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let applied = owner
+            .cli(
+                cwd,
+                &[
+                    "refresh-proposal",
+                    CHANGE,
+                    "--source-ref",
+                    "develop",
+                    "--expected-source",
+                    &source,
+                    "--expected-head",
+                    &before,
+                    "--json",
+                ],
+            )
+            .await;
+        let refreshed = envelope(&applied);
+        assert_eq!(
+            refreshed["operation"],
+            "control_refresh_proposal",
+            "{}",
+            stderr_of(&applied)
+        );
+        assert_eq!(refreshed["outcome"], "refreshed", "{refreshed}");
+        assert_eq!(applied.status.code(), Some(0));
+        assert_eq!(refreshed["detail"]["candidate_head_before"], before);
+        let after = candidate.head();
+        assert_ne!(after, before);
+        assert_eq!(refreshed["detail"]["candidate_head_after"], after);
+        assert_eq!(refreshed["detail"]["effects"]["committed"], true);
+        assert_eq!(git(&candidate.worktree, &["rev-parse", "HEAD^"]), before);
+        assert_eq!(owner.reducer.read().await.display_status(CHANGE), "error");
+
+        // Fresh expectations on an already-refreshed candidate: unchanged.
+        let again = owner
+            .cli(
+                cwd,
+                &[
+                    "refresh-proposal",
+                    CHANGE,
+                    "--source-ref",
+                    "develop",
+                    "--expected-source",
+                    &source,
+                    "--expected-head",
+                    &after,
+                    "--json",
+                ],
+            )
+            .await;
+        let unchanged = envelope(&again);
+        assert_eq!(unchanged["outcome"], "unchanged", "{unchanged}");
+        assert_eq!(again.status.code(), Some(0));
+        owner.stop().await;
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+    async fn candidate_proposal_refresh_cli_reports_a_hook_refusal_with_exit_28_and_effects() {
+        let candidate = Candidate::new();
+        let owner = Owner::start(&candidate, true).await;
+        let head = candidate.head();
+        let source = git(&candidate.root, &["rev-parse", "develop"]);
+        candidate.hook("echo refused-by-hook >&2\nexit 1");
+
+        let output = owner
+            .cli(
+                candidate.dir.path(),
+                &[
+                    "refresh-proposal",
+                    CHANGE,
+                    "--source-ref",
+                    "develop",
+                    "--expected-source",
+                    &source,
+                    "--expected-head",
+                    &head,
+                    "--json",
+                ],
+            )
+            .await;
+        let refused = envelope(&output);
+        assert_eq!(refused["outcome"], "refresh_refused", "{refused}");
+        assert_eq!(refused["ok"], false);
+        assert_eq!(output.status.code(), Some(28));
+        assert_eq!(refused["detail"]["reason"], "hook_rejected");
+        assert_eq!(refused["detail"]["effects"]["file_written"], true);
+        assert_eq!(refused["detail"]["effects"]["staged"], true);
+        assert_eq!(refused["detail"]["effects"]["committed"], false);
+        assert_eq!(candidate.head(), head);
+        assert!(
+            stderr_of(&output).contains("refresh_refused"),
+            "diagnostics go to stderr"
+        );
+        owner.stop().await;
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+    async fn candidate_proposal_refresh_cli_headless_owner_previews_but_refuses_apply() {
+        let candidate = Candidate::new();
+        let owner = Owner::start(&candidate, false).await;
+        let head = candidate.head();
+        let source = git(&candidate.root, &["rev-parse", "develop"]);
+
+        let preview = owner
+            .cli(
+                candidate.dir.path(),
+                &[
+                    "refresh-proposal",
+                    CHANGE,
+                    "--source-ref",
+                    "develop",
+                    "--dry-run",
+                    "--json",
+                ],
+            )
+            .await;
+        assert_eq!(
+            envelope(&preview)["outcome"],
+            "previewed",
+            "{}",
+            stderr_of(&preview)
+        );
+
+        let applied = owner
+            .cli(
+                candidate.dir.path(),
+                &[
+                    "refresh-proposal",
+                    CHANGE,
+                    "--source-ref",
+                    "develop",
+                    "--expected-source",
+                    &source,
+                    "--expected-head",
+                    &head,
+                    "--json",
+                ],
+            )
+            .await;
+        let refused = envelope(&applied);
+        assert_eq!(refused["outcome"], "owner_not_command_capable", "{refused}");
+        assert_eq!(applied.status.code(), Some(7));
+        assert_eq!(candidate.head(), head);
+        owner.stop().await;
+    }
+
+    #[test]
+    fn candidate_proposal_refresh_cli_refuses_malformed_invocations_before_owner_contact() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A socket that does not exist: any contact would be `owner_not_running`.
+        let socket = tmp.path().join("absent.sock").display().to_string();
+        let full = "a".repeat(40);
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (
+                vec![CHANGE, "--dry-run", "--json"],
+                "refresh_proposal_preview",
+            ),
+            (
+                vec![
+                    CHANGE,
+                    "--source-ref",
+                    "develop",
+                    "--dry-run",
+                    "--expected-source",
+                    &full,
+                    "--json",
+                ],
+                "refresh_proposal_preview",
+            ),
+            (
+                vec![
+                    CHANGE,
+                    "--source-ref",
+                    "develop",
+                    "--expected-source",
+                    &full,
+                    "--json",
+                ],
+                "control_refresh_proposal",
+            ),
+            (
+                vec![
+                    CHANGE,
+                    "--source-ref",
+                    "develop",
+                    "--expected-source",
+                    "abc123",
+                    "--expected-head",
+                    &full,
+                    "--json",
+                ],
+                "control_refresh_proposal",
+            ),
+            (
+                vec![CHANGE, "--source-ref", "develop", "--json"],
+                "control_refresh_proposal",
+            ),
+        ];
+        for (tail, operation) in cases {
+            let mut args = vec![
+                "client",
+                "--unix-socket",
+                socket.as_str(),
+                "refresh-proposal",
+            ];
+            args.extend(tail.iter().copied());
+            let output = run_cli(tmp.path(), &args, &[]);
+            let parsed = envelope(&output);
+            assert_eq!(parsed["outcome"], "usage_error", "{tail:?}: {parsed}");
+            assert_eq!(parsed["operation"], operation, "{tail:?}");
+            assert_eq!(output.status.code(), Some(2), "{tail:?}");
+        }
+    }
+
+    #[test]
+    fn candidate_proposal_refresh_cli_help_and_openapi_document_the_surface() {
+        let tmp = tempfile::tempdir().unwrap();
+        let help = run_cli(tmp.path(), &["client", "refresh-proposal", "--help"], &[]);
+        assert!(help.status.success(), "{}", stderr_of(&help));
+        let help = stdout_of(&help);
+        for needle in [
+            "--source-ref",
+            "--dry-run",
+            "--expected-source",
+            "--expected-head",
+            "refresh_refused",
+            "not a retry",
+            "not exposed over `cflx client mcp`",
+        ] {
+            assert!(help.contains(needle), "help must mention {needle}:\n{help}");
+        }
+
+        let openapi = run_cli(tmp.path(), &["openapi"], &[]);
+        assert!(openapi.status.success(), "{}", stderr_of(&openapi));
+        let document = stdout_of(&openapi);
+        assert!(document.contains("/api/v2/proposals/{change_id}/refresh-preview"));
+        assert!(document.contains("refresh_proposal"));
+        assert!(document.contains("RefreshProposalResult"));
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&document).expect("YAML");
+        let actions = &parsed["components"]["schemas"]["ChangeActions"]["properties"];
+        assert!(
+            actions.get("refresh_proposal").is_some(),
+            "actions.refresh_proposal must be in the contract"
+        );
+    }
+}

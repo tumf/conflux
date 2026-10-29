@@ -52,6 +52,13 @@ pub enum Operation {
     SubscribeGet,
     /// `cflx client subscribe clear`, and `cflx_subscribe` with action `clear`
     SubscribeClear,
+    /// `cflx client refresh-proposal --dry-run`: the read-only preview.
+    RefreshProposalPreview,
+    /// `cflx client refresh-proposal` with both expectations: the apply.
+    ///
+    /// A separate operation from the preview so a caller branching on
+    /// `operation` always knows whether a command was submitted at all.
+    ControlRefreshProposal,
 }
 
 impl Operation {
@@ -69,13 +76,15 @@ impl Operation {
             Self::SubscribeSet => "subscribe_set",
             Self::SubscribeGet => "subscribe_get",
             Self::SubscribeClear => "subscribe_clear",
+            Self::RefreshProposalPreview => "refresh_proposal_preview",
+            Self::ControlRefreshProposal => "control_refresh_proposal",
         }
     }
 }
 
 /// Every operation, in the order the contract advertises them.
 #[allow(dead_code)] // Read by the operation-contract assertions, not by the binary.
-pub const ALL_OPERATIONS: [Operation; 11] = [
+pub const ALL_OPERATIONS: [Operation; 13] = [
     Operation::Status,
     Operation::Wait,
     Operation::ControlMark,
@@ -87,6 +96,8 @@ pub const ALL_OPERATIONS: [Operation; 11] = [
     Operation::SubscribeSet,
     Operation::SubscribeGet,
     Operation::SubscribeClear,
+    Operation::RefreshProposalPreview,
+    Operation::ControlRefreshProposal,
 ];
 
 /// Every stable outcome token this CLI can report.
@@ -137,6 +148,10 @@ pub enum Outcome {
     /// run then does is the owner's, and claiming otherwise would be a
     /// completion claim no command record can support.
     Accepted,
+    /// A candidate proposal refresh preview was read. Nothing was submitted.
+    Previewed,
+    /// One scoped, hook-retaining commit refreshed the candidate's proposal.
+    Refreshed,
 
     // ── Unsuccessful ──────────────────────────────────────────────────────
     /// No Git repository, so no default socket identity exists.
@@ -204,6 +219,14 @@ pub enum Outcome {
     /// subscriptions. A caller told the first would stop talking to the owner
     /// at all; a caller told the second keeps using every other operation.
     UnsupportedOwner,
+    /// An eligible candidate's own repository state refused a proposal refresh.
+    ///
+    /// Distinct from [`Self::TargetIneligible`], which is the owner's published
+    /// lifecycle table: this says the target was eligible and the refresh still
+    /// could not land cleanly — a moved ref, a dirty candidate, a hook. The
+    /// stable reason is `detail.reason` and what Git actually holds afterwards is
+    /// `detail.effects`, which after a hook rejection is a written, staged file.
+    RefreshRefused,
 }
 
 impl Outcome {
@@ -242,6 +265,9 @@ impl Outcome {
             Self::UsageError => "usage_error",
             Self::TransportNotPermitted => "transport_not_permitted",
             Self::UnsupportedOwner => "unsupported_owner",
+            Self::Previewed => "previewed",
+            Self::Refreshed => "refreshed",
+            Self::RefreshRefused => "refresh_refused",
         }
     }
 
@@ -262,6 +288,8 @@ impl Outcome {
                 | Self::Unchanged
                 | Self::Stopped
                 | Self::Accepted
+                | Self::Previewed
+                | Self::Refreshed
         )
     }
 
@@ -281,7 +309,9 @@ impl Outcome {
             | Self::Unmarked
             | Self::Unchanged
             | Self::Stopped
-            | Self::Accepted => 0,
+            | Self::Accepted
+            | Self::Previewed
+            | Self::Refreshed => 0,
             Self::UsageError => 2,
             Self::NotInRepository => 3,
             Self::OwnerNotRunning => 4,
@@ -305,6 +335,7 @@ impl Outcome {
             Self::TransportNotPermitted => 25,
             Self::UnsupportedOwner => 26,
             Self::ChangeRequiresAction => 27,
+            Self::RefreshRefused => 28,
         }
     }
 }
@@ -314,7 +345,7 @@ impl Outcome {
 /// Read by the CLI's own contract assertions, which is what stops an added
 /// variant from silently reusing an exit status.
 #[allow(dead_code)] // Read by the outcome-contract assertions, not by the binary.
-pub const ALL_OUTCOMES: [Outcome; 32] = [
+pub const ALL_OUTCOMES: [Outcome; 35] = [
     Outcome::Observed,
     Outcome::Completed,
     Outcome::Subscribed,
@@ -324,6 +355,8 @@ pub const ALL_OUTCOMES: [Outcome; 32] = [
     Outcome::Unchanged,
     Outcome::Stopped,
     Outcome::Accepted,
+    Outcome::Previewed,
+    Outcome::Refreshed,
     Outcome::NotInRepository,
     Outcome::OwnerNotRunning,
     Outcome::AuthenticationFailed,
@@ -347,6 +380,7 @@ pub const ALL_OUTCOMES: [Outcome; 32] = [
     Outcome::UsageError,
     Outcome::TransportNotPermitted,
     Outcome::UnsupportedOwner,
+    Outcome::RefreshRefused,
 ];
 
 /// The single object a `--json` invocation writes to stdout.
@@ -540,8 +574,36 @@ mod tests {
                 // an intent" and gets its own token for exactly that reason.
                 "stopped",
                 "accepted",
+                // A read-only refresh preview, and one verified refresh commit.
+                "previewed",
+                "refreshed",
             ]
         );
+    }
+
+    #[test]
+    fn candidate_proposal_refresh_outcomes_and_operations_are_stable() {
+        assert_eq!(Outcome::RefreshRefused.as_str(), "refresh_refused");
+        assert_eq!(Outcome::RefreshRefused.exit_code(), 28);
+        assert!(!Outcome::RefreshRefused.is_success());
+        assert_ne!(
+            Outcome::RefreshRefused.exit_code(),
+            Outcome::TargetIneligible.exit_code()
+        );
+        for outcome in [Outcome::Previewed, Outcome::Refreshed, Outcome::Unchanged] {
+            assert!(outcome.is_success());
+            assert_eq!(outcome.exit_code(), 0);
+        }
+        assert_eq!(
+            Operation::RefreshProposalPreview.as_str(),
+            "refresh_proposal_preview"
+        );
+        assert_eq!(
+            Operation::ControlRefreshProposal.as_str(),
+            "control_refresh_proposal"
+        );
+        assert!(ALL_OPERATIONS.contains(&Operation::ControlRefreshProposal));
+        assert!(ALL_OUTCOMES.contains(&Outcome::RefreshRefused));
     }
 
     /// The manual-action release is a *refusal*, and its exit status is part of
@@ -654,6 +716,8 @@ mod tests {
                 "subscribe_set",
                 "subscribe_get",
                 "subscribe_clear",
+                "refresh_proposal_preview",
+                "control_refresh_proposal",
             ]
         );
         // The retired admission vocabulary must not reappear under a new name:

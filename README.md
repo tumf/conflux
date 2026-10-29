@@ -176,13 +176,17 @@ untouched — `timeout` describes the clock, never the change.
 **Read `outcome`, not prose.** `--json` prints exactly one versioned envelope on
 stdout; diagnostics go to stderr, and each outcome has its own stable exit
 status. The successes are narrow: `observed`, `marked`, `unmarked`, `unchanged`,
-`stopped`, `accepted`, `subscribed`, `cleared`, and `completed`. Everything else —
+`stopped`, `accepted`, `subscribed`, `cleared`, `completed`, `previewed`, and
+`refreshed`. Everything else —
 `owner_not_running`, `owner_not_command_capable`, `owner_restarted`,
 `change_not_found`, `target_ineligible`, `revision_conflict`,
 `transport_not_permitted`, `unsupported_owner`, `partial_intent`,
 `observation_conflict`, `evidence_error`, `change_rejected`,
-`change_requires_action`, `process_failed`, `timeout`, `usage_error` — is a
-non-zero refusal.
+`change_requires_action`, `process_failed`, `timeout`, `usage_error`,
+`refresh_refused` — is a non-zero refusal. `previewed`, `refreshed`, and
+`refresh_refused` (exit `28`) belong to `cflx client refresh-proposal`, which
+carries one corrected `proposal.md` from an explicit `--source-ref` into an
+already-applied candidate as a single hook-retaining commit; see `AGENTS.md`.
 
 **`wait` waits for the owner, not for you.** It holds while the owner can still
 advance the change on its own — `not queued`, `queued`, `blocked`, `applying`,

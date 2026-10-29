@@ -737,6 +737,15 @@ async fn run_tui_loop(
                     accept_skill_name.clone(),
                     config.get_state_base_dir().map(str::to_string),
                 ),
+            ))
+            // Where `refresh_proposal` reads the source ref and writes the
+            // candidate: the same project root and managed-worktree layout the
+            // Acceptance admission port above resolves.
+            .with_candidate_worktrees(Arc::new(
+                crate::orchestration::operator_command::WorktreeBaseDirCandidates::new(
+                    repo_root.clone(),
+                    acceptance_worktree_base_dir.clone(),
+                ),
             )),
         )
     };

@@ -28,6 +28,11 @@ fn closed_command_set_matches_the_advertised_list() {
             "delete_worktree" | "merge_worktree" => {
                 format!(r#"{{"type":"{name}","target":{{"worktree_id":"a"}},"params":{{}}}}"#)
             }
+            "refresh_proposal" => format!(
+                r#"{{"type":"refresh_proposal","change_id":"a","source_ref":"develop","expected_source":"{}","expected_head":"{}"}}"#,
+                "a".repeat(40),
+                "b".repeat(40)
+            ),
             _ => format!(r#"{{"type":"{name}","change_id":"a"}}"#),
         };
         let parsed: CommandSpec =
