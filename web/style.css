@@ -432,6 +432,13 @@ select {
   font-weight: 600;
 }
 
+/* The author `display: flex` above outranks the user-agent `[hidden]` rule,
+   so the renderer's `hidden` toggle needs an explicit hidden-state override.
+   Scoped to the attention summary only: no global `[hidden]` reset. */
+.attention[hidden] {
+  display: none;
+}
+
 .attention-mark {
   flex: 0 0 auto;
   font-weight: 700;
