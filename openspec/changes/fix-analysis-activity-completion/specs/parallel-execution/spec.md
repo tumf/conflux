@@ -22,6 +22,7 @@ The parallel analysis producer SHALL emit the existing AnalysisCompleted present
 #### Scenario: Pending invocation is not complete
 
 - **GIVEN** analysis has started and its future has not returned
-- **WHEN** it is still pending or is interrupted before returning
+- **WHEN** it is still pending or its future is dropped before returning
 - **THEN** no AnalysisCompleted is emitted for an unreturned invocation
-- **AND** existing process-terminal cleanup remains responsible for retiring cancelled process activity
+- **AND** existing process-terminal cleanup remains responsible for retiring activity from a dropped invocation
+- **AND** an analyzer that handles cancellation internally and returns an outcome is a returned invocation and SHALL emit completion

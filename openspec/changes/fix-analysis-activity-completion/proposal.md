@@ -21,13 +21,24 @@ verifications:
     execution_class: repository-local
     completion_role: change-blocking
   - id: analysis-policy-controls
-    requirement: Empty order retry, provenance suppression and scheduler liveness remain unchanged
+    requirement: Empty order retry and scheduler liveness remain unchanged
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: src/parallel/tests/analysis_liveness_loop.rs
-    evidence: "cargo test --locked --offline --lib --features web-monitoring -- analysis_liveness_loop unchanged_analysis_input --nocapture"
-    rerun: "cargo test --locked --offline --lib --features web-monitoring -- analysis_liveness_loop unchanged_analysis_input --nocapture"
+    evidence: "cargo test --locked --offline --lib --features web-monitoring analysis_liveness_loop -- --nocapture"
+    rerun: "cargo test --locked --offline --lib --features web-monitoring analysis_liveness_loop -- --nocapture"
+    prerequisites: []
+    execution_class: repository-local
+    completion_role: change-blocking
+  - id: analysis-input-controls
+    requirement: Unchanged-input suppression and result provenance remain unchanged
+    phase: pre-integration
+    owner: conflux-acceptance
+    trigger: pull-request-validation
+    automation: src/parallel/tests/unchanged_analysis_input.rs
+    evidence: "cargo test --locked --offline --lib --features web-monitoring unchanged_analysis_input -- --nocapture"
+    rerun: "cargo test --locked --offline --lib --features web-monitoring unchanged_analysis_input -- --nocapture"
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -65,10 +76,10 @@ Allowed product change: the one producer event placement and minimal explanatory
 ## Acceptance Criteria and Explicit Completion Conditions
 
 1. Each normal returned attempt emits exactly one Started then one Completed, including healthy output, intentional metadata-only output, recoverable-failure fallback and empty order. Empty order retains bounded retry and never implies AllCompleted. Groups Some and None are verified without changing field spelling.
-2. A channel-gated analyzer leaves analysis activity open while its future is pending. Releasing its result produces the one closing event from production code. Aborting/dropping a still-pending attempt does not fabricate a completion; existing process-terminal cleanup owns retirement.
+2. A channel-gated analyzer leaves analysis activity open while its future is pending. Releasing its result produces the one closing event from production code. Dropping the invocation future before it returns does not fabricate a completion; existing process-terminal cleanup owns retirement. If the analyzer handles cancellation internally and returns an outcome, that is a returned invocation and does emit completion.
 3. Feed actual producer-emitted events through the real dispatcher and `ExecutionFactsStore`: after normal completion `DependencyAnalysis` is absent. If analysis was the only activity, `has_active_work` is false; an unrelated active phase remains active. Tests must never manufacture `AnalysisCompleted` to prove this path.
 4. Usable/empty/fallback results and existing retry/suppression decisions are unchanged. Include a real scheduler-pass/loop observation with no runnable phase or zero capacity, so closing the activity does not require workflow completion or Stop. No AllCompleted or Stopped may be emitted solely to close analysis.
-5. All three declared gates execute nonzero tests; new regression tests fail with the producer emission removed. Synchronize via channels/barriers/event order, with generous hang safeguards only, not short elapsed-time assertions or sleeps. No ignore, single-thread workaround, broad serial annotation, or disabled assertion may hide a regression. Each new default test respects the repository's one-second target.
+5. All four declared gates execute nonzero tests, with selected counts recorded separately for each selector; new regression tests fail with the producer emission removed. Synchronize via channels/barriers/event order, with generous hang safeguards only, not short elapsed-time assertions or sleeps. No ignore, single-thread workaround, broad serial annotation, or disabled assertion may hide a regression. Each new default test respects the repository's one-second target.
 6. Change-scoped diff review confirms the boundary. Strict validation is proposal evidence, not implementation proof. Tests live outside the active change directory so the gate remains valid after archive.
 
 ## Scope and non-goals

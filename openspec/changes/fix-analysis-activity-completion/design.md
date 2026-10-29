@@ -4,7 +4,7 @@
 
 The existing producer is sequential per executor and returns an `AnalysisOutcome`, not a Result. A returned fallback or unusable empty order still ends one invocation. Add exactly one `send_event(...AnalysisCompleted { groups_found }).await` directly after the analyzer await and before inspecting `result.order`. Use `result.groups.as_ref().map_or(0, Vec::len)`. The completed event is already presentation-only and already closes the facts-store activity; no new workflow authority is needed.
 
-Keep the original return object intact. The existing empty-order retry arm must run unchanged after this closing observation, while later capacity-zero paths observe closure without requiring a task to launch. Cancellation that drops a pending producer future cannot run its post-await code; it gets no forged successful-result event. This change does not add a Drop task or asynchronous destructor. Process terminal cleanup remains the existing path.
+Keep the original return object intact. The existing empty-order retry arm must run unchanged after this closing observation, while later capacity-zero paths observe closure without requiring a task to launch. Interruption here means the producer future is dropped before it returns; it cannot run its post-await code and gets no forged completion. If cancellation is handled inside the analyzer and it returns an outcome, the invocation is returned and does emit completion. This change does not add a Drop task or asynchronous destructor. Process terminal cleanup remains the existing path.
 
 ## Discriminating tests
 
