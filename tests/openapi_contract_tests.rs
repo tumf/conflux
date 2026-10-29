@@ -1667,6 +1667,31 @@ fn change_resource() -> ChangeResource {
             path: ".worktrees/a-change".to_string(),
             branch: Some("a-change".to_string()),
         }),
+        // A populated record, so every schema validation over this fixture
+        // also validates the provenance shape the server serializes.
+        acceptance_provenance: Some(
+            conflux::orchestration::acceptance::provenance::AcceptanceProvenance {
+                decision_source:
+                    conflux::orchestration::acceptance::provenance::DecisionSource::NativeVerification,
+                reviewer_started: false,
+                reason_code: conflux::orchestration::acceptance::provenance::ReasonCode::GateFailed,
+                defect_code: None,
+                verification_id: Some("focused-gate".to_string()),
+                declaration_path: Some("openspec/changes/a-change/proposal.md".to_string()),
+                candidate_commit: Some("a".repeat(40)),
+                proposal_content_id: Some("b".repeat(40)),
+                change_input_digest: Some("c".repeat(64)),
+                program: Some("/usr/bin/cargo".to_string()),
+                argument_count: Some(2),
+                env_names: vec!["RUST_LOG".to_string()],
+                remediation:
+                    conflux::orchestration::acceptance::provenance::Remediation::RepairCandidate,
+                candidate_divergence:
+                    conflux::orchestration::acceptance::provenance::CandidateDivergence::unknown(
+                        conflux::orchestration::acceptance::provenance::DivergenceUnknownReason::BaseUnresolvable,
+                    ),
+            },
+        ),
     }
 }
 

@@ -23,6 +23,10 @@ pub mod manifest_builder;
 /// resolved and proven before any declared gate runs, and never inside a target.
 pub mod evidence_location;
 
+/// Who decided an Acceptance settlement, about which candidate: identities and
+/// counts only, never authority.
+pub mod provenance;
+
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{AcceptanceAttempt, OutputCollector};

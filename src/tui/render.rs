@@ -1151,8 +1151,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     if let Some(item) = current_item {
         push_change_row_hints(&mut keys, app, item);
         keys.push("e: edit".to_string());
-        // Advertise the Error Details popup only on a row that can open it.
-        if item.display_status_cache == "error" {
+        // Advertise the details popup only on a row that can open it.
+        if item.can_open_details() {
             keys.push("Enter: details".to_string());
         }
         // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
@@ -1502,8 +1502,8 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     if let Some(item) = current_item {
         push_change_row_hints(&mut keys, app, item);
         keys.push("e: edit".to_string());
-        // Advertise the Error Details popup only on a row that can open it.
-        if item.display_status_cache == "error" {
+        // Advertise the details popup only on a row that can open it.
+        if item.can_open_details() {
             keys.push("Enter: details".to_string());
         }
         // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
@@ -2506,8 +2506,8 @@ fn render_proposal_refresh_popup(
     frame.render_widget(footer, chunks[1]);
 }
 
-/// Body lines of the Error Details popup: the change ID, then the complete
-/// untruncated diagnostic.
+/// Body lines of the Error Details popup: the change ID, the complete
+/// untruncated diagnostic, then the Acceptance provenance lines when present.
 ///
 /// A diagnostic that carries explicit newlines keeps them as separate lines;
 /// anything wider than the popup is wrapped by the caller rather than cut, so no
@@ -2526,6 +2526,16 @@ fn error_details_popup_lines(popup: &ErrorDetailsPopup) -> Vec<Line<'_>> {
             .split('\n')
             .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::LightRed)))),
     );
+    let provenance = popup.provenance_lines();
+    if !provenance.is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(provenance.into_iter().map(|(label, value)| {
+            Line::from(vec![
+                Span::styled(format!("{label}: "), Style::default().fg(Color::Cyan)),
+                Span::styled(value, Style::default().fg(Color::White)),
+            ])
+        }));
+    }
     lines
 }
 
@@ -7470,6 +7480,7 @@ mod tests {
             blocker_detail_cache: None,
             display_color_cache: Color::DarkGray,
             error_message_cache: None,
+            acceptance_provenance_cache: None,
             selected: false,
             is_new: false,
             parallel_eligibility: ParallelEligibility::Eligible,
@@ -7972,6 +7983,93 @@ mod tests {
                 !off_error.contains("Enter: details"),
                 "{mode:?} must not advertise it on a non-error row: {off_error}"
             );
+        }
+    }
+
+    /// `Enter: details` follows the popup's availability exactly: `error`,
+    /// `stalled`, and external `blocked` rows advertise it; a dependency wait
+    /// and every other row do not.
+    #[test]
+    fn acceptance_provenance_details_hint_appears_only_on_explainable_rows() {
+        use crate::orchestration::state::BlockerKind;
+
+        for mode in [AppExecutionMode::Select, AppExecutionMode::Running] {
+            for (status, kind, advertised) in [
+                ("error", BlockerKind::None, true),
+                ("stalled", BlockerKind::None, true),
+                ("blocked", BlockerKind::External, true),
+                ("blocked", BlockerKind::Dependency, false),
+                ("applying", BlockerKind::None, false),
+                ("not queued", BlockerKind::None, false),
+            ] {
+                let mut app = create_test_app(vec![create_test_change("change-a")]);
+                app.execution_mode = mode;
+                if mode == AppExecutionMode::Running {
+                    app.add_log(LogEntry::info("orchestration log"));
+                }
+                app.changes[0].set_display_status_cache(status);
+                app.changes[0].blocker_kind_cache = kind;
+                app.cursor_index = 0;
+
+                let content = buffer_to_string(&render_buffer(&mut app, 200, 24));
+                assert_eq!(
+                    content.contains("Enter: details"),
+                    advertised,
+                    "{mode:?} {status} {kind:?}: {content}"
+                );
+            }
+        }
+    }
+
+    /// The popup renders the provenance lines after the existing two.
+    #[test]
+    fn acceptance_provenance_popup_renders_decision_through_source_proposal() {
+        use crate::orchestration::acceptance::provenance::{
+            native_tool_unavailable_for_test, CandidateDivergence, DivergenceStatus,
+            DivergenceUnknownReason,
+        };
+        use crate::orchestration::state::BlockerKind;
+
+        let record = native_tool_unavailable_for_test("change-a");
+        let identical = CandidateDivergence {
+            status: DivergenceStatus::Identical,
+            reason: None,
+            ..record.candidate_divergence.clone()
+        };
+        let unknown = CandidateDivergence::unknown(DivergenceUnknownReason::BaseUnresolvable);
+        for (divergence, expected) in [
+            (
+                record.candidate_divergence.clone(),
+                "Source proposal: diverged from main@abcdefabcdef",
+            ),
+            (identical, "Source proposal: identical"),
+            (unknown, "Source proposal: unknown (base_unresolvable)"),
+        ] {
+            let mut app = create_test_app(vec![create_test_change("change-a")]);
+            app.changes[0].set_display_status_cache("stalled");
+            app.changes[0].blocker_kind_cache = BlockerKind::None;
+            app.changes[0].acceptance_provenance_cache = Some(
+                crate::orchestration::acceptance::provenance::AcceptanceProvenance {
+                    candidate_divergence: divergence,
+                    ..record.clone()
+                },
+            );
+            app.cursor_index = 0;
+            assert!(app.open_error_details_popup());
+
+            let content = buffer_to_string(&render_buffer(&mut app, 200, 40));
+            for line in [
+                "Change: change-a",
+                "Decision: native_verification (reviewer not started)",
+                "Reason: tool_unavailable",
+                "Verification: focused-gate in openspec/changes/change-a/proposal.md",
+                "Candidate: 0123456789ab proposal fedcba987654",
+                "Command: missing-tool, 2 arguments, env: API_TOKEN, RUST_LOG",
+                "Next: satisfy_environment",
+                expected,
+            ] {
+                assert!(content.contains(line), "missing '{line}':\n{content}");
+            }
         }
     }
 

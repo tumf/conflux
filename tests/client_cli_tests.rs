@@ -1075,6 +1075,7 @@ mod enabled {
             timing: ChangeTiming::default(),
             latest_activity: None,
             worktree: None,
+            acceptance_provenance: None,
         }
     }
 
@@ -6711,6 +6712,272 @@ mod enabled {
             assert!(
                 document.contains("stop_and_dequeue"),
                 "{name} must say the graceful control is unchanged"
+            );
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // acceptance_provenance
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// An owner whose snapshot comes from the production `WebState` projection
+    /// of a real reducer, served on a real socket.
+    struct ProvenanceOwner {
+        reducer: Arc<tokio::sync::RwLock<conflux::orchestration::state::OrchestratorState>>,
+        web_state: Arc<conflux::web::state::WebState>,
+        socket: PathBuf,
+        shutdown: tokio_util::sync::CancellationToken,
+        serve: tokio::task::JoinHandle<()>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl ProvenanceOwner {
+        async fn start(change_ids: &[&str]) -> Self {
+            use conflux::orchestration::state::OrchestratorState;
+            use conflux::web::state::WebState;
+
+            let reducer = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+                change_ids.iter().map(|id| id.to_string()).collect(),
+                0,
+            )));
+            let listings: Vec<conflux::openspec::Change> = change_ids
+                .iter()
+                .map(|id| conflux::openspec::Change {
+                    id: id.to_string(),
+                    completed_tasks: 1,
+                    total_tasks: 1,
+                    last_modified: "now".to_string(),
+                    dependencies: Vec::new(),
+                    metadata: Default::default(),
+                })
+                .collect();
+            let web_state = Arc::new(WebState::new(&listings));
+            web_state.set_shared_state(reducer.clone()).await;
+            web_state
+                .seed_workspace_observation_for_tests(&listings, "select")
+                .await;
+            web_state.sync_remote_control_projection().await;
+
+            let runtime = web_state.remote_control();
+            let dir = tempfile::tempdir().expect("temp dir");
+            let socket = dir.path().join("cflx-api.sock");
+            let auth = RemoteControlAuth::new(None, &[]).expect("auth policy is valid");
+            let app = router(
+                RemoteControlState::new(runtime.projection(), Arc::new(auth), runtime.clone())
+                    .with_gate(runtime.gate())
+                    .with_execution_facts(runtime.execution_facts())
+                    .with_execution_contract(runtime.execution_contract()),
+            );
+            let listener = tokio::net::UnixListener::bind(&socket).expect("binds");
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let serve = tokio::spawn({
+                let shutdown = shutdown.clone();
+                async move {
+                    let _ = axum::serve(listener, app)
+                        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+                        .await;
+                }
+            });
+            Self {
+                reducer,
+                web_state,
+                socket,
+                shutdown,
+                serve,
+                _dir: dir,
+            }
+        }
+
+        /// Reduce one event and publish, the way the owner's dispatch does.
+        async fn event(&self, event: conflux::events::ExecutionEvent) {
+            self.reducer.write().await.apply_execution_event(&event);
+            self.web_state.apply_execution_event(&event).await;
+            self.web_state.sync_remote_control_projection().await;
+        }
+
+        async fn status(&self) -> serde_json::Value {
+            let socket = self.socket.display().to_string();
+            let output = tokio::task::spawn_blocking(move || {
+                let cwd = tempfile::tempdir().expect("temp dir");
+                run_cli(
+                    cwd.path(),
+                    &["client", "--unix-socket", &socket, "status", "--json"],
+                    &[],
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "stderr={}",
+                stderr_of(&output)
+            );
+            let parsed = envelope(&output);
+            assert_eq!(parsed["outcome"], "observed");
+            parsed
+        }
+
+        async fn stop(self) {
+            self.shutdown.cancel();
+            let _ = self.serve.await;
+        }
+    }
+
+    fn provenance_row<'a>(status: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+        status["detail"]["changes"]
+            .as_array()
+            .expect("changes")
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("{id} must be published"))
+    }
+
+    fn native_declaration_invalid(
+    ) -> conflux::orchestration::acceptance::provenance::AcceptanceProvenance {
+        use conflux::orchestration::acceptance::provenance::*;
+        AcceptanceProvenance {
+            decision_source: DecisionSource::NativeVerification,
+            reviewer_started: false,
+            reason_code: ReasonCode::DeclarationInvalid,
+            defect_code: Some("declaration_shell_syntax".to_string()),
+            verification_id: Some("shell-gate".to_string()),
+            declaration_path: Some("openspec/changes/native/proposal.md".to_string()),
+            candidate_commit: Some("a".repeat(40)),
+            proposal_content_id: Some("b".repeat(40)),
+            change_input_digest: Some("c".repeat(64)),
+            program: None,
+            argument_count: None,
+            env_names: Vec::new(),
+            remediation: remediation_for(
+                ReasonCode::DeclarationInvalid,
+                DivergenceStatus::Identical,
+            ),
+            candidate_divergence: CandidateDivergence {
+                status: DivergenceStatus::Identical,
+                source_ref: Some("main".to_string()),
+                source_commit: Some("d".repeat(40)),
+                source_blob: Some("b".repeat(40)),
+                candidate_blob: Some("b".repeat(40)),
+                reason: None,
+            },
+        }
+    }
+
+    fn reviewer_pass() -> conflux::orchestration::acceptance::provenance::AcceptanceProvenance {
+        use conflux::orchestration::acceptance::provenance::*;
+        AcceptanceProvenance {
+            decision_source: DecisionSource::Reviewer,
+            reviewer_started: true,
+            reason_code: ReasonCode::ReviewerPass,
+            defect_code: None,
+            verification_id: None,
+            declaration_path: None,
+            remediation: remediation_for(ReasonCode::ReviewerPass, DivergenceStatus::Identical),
+            ..native_declaration_invalid()
+        }
+    }
+
+    /// The real client reads the published record off the owner: a native
+    /// pre-reviewer stop and a reviewer verdict carry their frozen tokens, and a
+    /// change without a settlement publishes `null`.
+    #[tokio::test]
+    async fn acceptance_provenance_client_status_publishes_native_and_reviewer_settlements() {
+        use conflux::events::ExecutionEvent;
+
+        let owner = ProvenanceOwner::start(&["native", "reviewed", "untouched"]).await;
+        owner
+            .event(ExecutionEvent::AcceptanceFailed {
+                change_id: "native".to_string(),
+                error: "Acceptance failed: 1 invalid required verification declaration(s)"
+                    .to_string(),
+            })
+            .await;
+        owner
+            .event(ExecutionEvent::AcceptanceSettled {
+                change_id: "native".to_string(),
+                provenance: Box::new(native_declaration_invalid()),
+            })
+            .await;
+        owner
+            .event(ExecutionEvent::AcceptanceSettled {
+                change_id: "reviewed".to_string(),
+                provenance: Box::new(reviewer_pass()),
+            })
+            .await;
+
+        let status = owner.status().await;
+
+        let native = &provenance_row(&status, "native")["acceptance_provenance"];
+        assert_eq!(native["decision_source"], "native_verification");
+        assert_eq!(native["reviewer_started"], false);
+        assert_eq!(native["reason_code"], "declaration_invalid");
+        assert_eq!(native["defect_code"], "declaration_shell_syntax");
+        assert_eq!(native["verification_id"], "shell-gate");
+        assert_eq!(
+            native["declaration_path"],
+            "openspec/changes/native/proposal.md"
+        );
+        assert_eq!(native["remediation"], "fix_declaration");
+        assert_eq!(native["candidate_divergence"]["status"], "identical");
+
+        let reviewed = &provenance_row(&status, "reviewed")["acceptance_provenance"];
+        assert_eq!(reviewed["decision_source"], "reviewer");
+        assert_eq!(reviewed["reviewer_started"], true);
+        assert_eq!(reviewed["reason_code"], "reviewer_pass");
+        assert!(reviewed["verification_id"].is_null());
+        assert_eq!(reviewed["remediation"], "none");
+
+        let untouched = provenance_row(&status, "untouched");
+        assert!(
+            untouched
+                .as_object()
+                .expect("row")
+                .contains_key("acceptance_provenance"),
+            "the field is always present on the client row"
+        );
+        assert!(untouched["acceptance_provenance"].is_null());
+
+        owner.stop().await;
+    }
+
+    /// `cflx openapi` documents the nullable field and every frozen token.
+    #[test]
+    fn acceptance_provenance_openapi_documents_the_field_and_every_token() {
+        use conflux::orchestration::acceptance::provenance::{ReasonCode, Remediation};
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let output = run_cli(tmp.path(), &["openapi"], &[]);
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        let document = stdout_of(&output);
+        for needle in [
+            "acceptance_provenance",
+            "AcceptanceProvenance",
+            "CandidateDivergence",
+        ] {
+            assert!(document.contains(needle), "{needle} must be documented");
+        }
+        let mut tokens: Vec<&str> = ReasonCode::ALL.iter().map(|code| code.as_str()).collect();
+        tokens.extend(
+            Remediation::ALL
+                .iter()
+                .map(|remediation| remediation.as_str()),
+        );
+        tokens.extend([
+            "native_verification",
+            "reviewer",
+            "identical",
+            "diverged",
+            "unknown",
+            "no_manifest",
+            "base_unresolvable",
+            "source_proposal_missing",
+            "candidate_proposal_missing",
+        ]);
+        for token in tokens {
+            assert!(
+                document.contains(token),
+                "token '{token}' must be documented"
             );
         }
     }

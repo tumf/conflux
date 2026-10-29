@@ -259,6 +259,14 @@ worktree lands or what it is cut from.";
             crate::web::remote_control_api::worktrees::WorktreeResource,
             crate::web::remote_control_api::worktrees::WorktreeResponse,
             crate::web::remote_control_api::worktrees::WorktreesResponse,
+            // Acceptance decision provenance: identities and closed tokens.
+            crate::orchestration::acceptance::provenance::AcceptanceProvenance,
+            crate::orchestration::acceptance::provenance::CandidateDivergence,
+            crate::orchestration::acceptance::provenance::DecisionSource,
+            crate::orchestration::acceptance::provenance::DivergenceStatus,
+            crate::orchestration::acceptance::provenance::DivergenceUnknownReason,
+            crate::orchestration::acceptance::provenance::ReasonCode,
+            crate::orchestration::acceptance::provenance::Remediation,
         )
     ),
     tags(

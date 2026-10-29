@@ -1092,6 +1092,7 @@ mod tests {
             timing: ChangeTiming::default(),
             latest_activity: None,
             worktree: None,
+            acceptance_provenance: None,
         }
     }
 

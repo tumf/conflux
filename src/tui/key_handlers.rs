@@ -378,8 +378,9 @@ pub async fn handle_enter_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
     use crate::tui::types::ViewMode;
 
     if ctx.app.view_mode != ViewMode::Worktrees {
-        // Enter on an `error` row opens the Error Details popup. Every other
-        // Changes-view row keeps the pre-existing behavior below.
+        // Enter on an `error`, `stalled`, or externally `blocked` row opens the
+        // details popup. Every other Changes-view row keeps the pre-existing
+        // behavior below.
         if ctx.app.open_error_details_popup() {
             return Ok(());
         }
@@ -2834,6 +2835,24 @@ mod tests {
         assert_eq!(popup.error, "Apply failed: stalled");
         assert_eq!(popup.scroll, 0);
         assert!(popup.copy_feedback.is_none());
+    }
+
+    #[tokio::test]
+    async fn acceptance_provenance_enter_opens_details_on_a_stalled_row() {
+        let mut app = routing_app();
+        app.changes[1].set_display_status_cache("stalled");
+        app.changes[1].blocker_detail_cache = Some("acceptance hold".to_string());
+        app.cursor_index = 1;
+
+        let commands = route_key(&mut app, KeyCode::Enter).await;
+
+        assert!(commands.is_empty(), "opening a popup emits no command");
+        let popup = app
+            .error_details_popup
+            .as_ref()
+            .expect("Enter opens the popup");
+        assert_eq!(popup.change_id, "change-b");
+        assert_eq!(popup.error, "acceptance hold");
     }
 
     #[tokio::test]

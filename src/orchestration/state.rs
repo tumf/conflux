@@ -335,6 +335,15 @@ pub struct ChangeRuntimeState {
     /// generic base-dirty preflight. A restart drops it, and the next action is
     /// re-derived from the workspace exactly as before.
     pub manual_resolve_retry: bool,
+    /// Provenance of the latest Acceptance settlement this owner incarnation
+    /// observed for the change.
+    ///
+    /// Observability only, and process-local by construction: it is `None`
+    /// after a restart, is never persisted, and is never read by retry
+    /// eligibility, admission, acceptance, archive, merge, or any other
+    /// next-action decision.
+    pub acceptance_provenance:
+        Option<Box<crate::orchestration::acceptance::provenance::AcceptanceProvenance>>,
 }
 
 impl ChangeRuntimeState {
@@ -1686,6 +1695,20 @@ impl OrchestratorState {
             .collect()
     }
 
+    /// Latest Acceptance provenance per change, for presentation only.
+    pub fn all_acceptance_provenance(
+        &self,
+    ) -> HashMap<String, crate::orchestration::acceptance::provenance::AcceptanceProvenance> {
+        self.change_runtime
+            .iter()
+            .filter_map(|(id, rt)| {
+                rt.acceptance_provenance
+                    .as_deref()
+                    .map(|provenance| (id.clone(), provenance.clone()))
+            })
+            .collect()
+    }
+
     /// Reducer-retained final diagnostics for every change in
     /// [`TerminalState::Error`].
     ///
@@ -2662,6 +2685,13 @@ impl OrchestratorState {
             }
             ExecutionEvent::AcceptanceCompleted { change_id } => {
                 self.on_acceptance_completed(change_id);
+            }
+            ExecutionEvent::AcceptanceSettled {
+                change_id,
+                provenance,
+            } => {
+                // Recorded on the row only; no lifecycle field moves with it.
+                self.runtime_entry(change_id).acceptance_provenance = Some(provenance.clone());
             }
             ExecutionEvent::AcceptanceFailed { change_id, error } => {
                 self.transition_change_to_error(change_id, error.clone());
@@ -8220,5 +8250,78 @@ mod tests {
         assert!(!state.reconcile_dependency_blocker("running", &["alpha".to_string()]));
         assert_eq!(state.display_status("done"), "merged");
         assert_eq!(state.display_status("running"), "applying");
+    }
+
+    fn acceptance_provenance_record(
+    ) -> crate::orchestration::acceptance::provenance::AcceptanceProvenance {
+        use crate::orchestration::acceptance::provenance::{
+            AcceptanceProvenance, CandidateDivergence, DecisionSource, DivergenceUnknownReason,
+            ReasonCode, Remediation,
+        };
+        AcceptanceProvenance {
+            decision_source: DecisionSource::Reviewer,
+            reviewer_started: true,
+            reason_code: ReasonCode::ReviewerFail,
+            defect_code: None,
+            verification_id: None,
+            declaration_path: None,
+            candidate_commit: None,
+            proposal_content_id: None,
+            change_input_digest: None,
+            program: None,
+            argument_count: None,
+            env_names: Vec::new(),
+            remediation: Remediation::RepairCandidate,
+            candidate_divergence: CandidateDivergence::unknown(DivergenceUnknownReason::NoManifest),
+        }
+    }
+
+    /// The settlement record lands on the row, moves no lifecycle field, and is
+    /// gone in a fresh owner incarnation. Retry of a terminal error behaves the
+    /// same whether or not the record exists.
+    #[test]
+    fn acceptance_provenance_is_process_local_and_not_routing_state() {
+        use crate::events::ExecutionEvent;
+
+        let fail = |state: &mut OrchestratorState| {
+            state.apply_execution_event(&ExecutionEvent::AcceptanceFailed {
+                change_id: "c".to_string(),
+                error: "acceptance failed".to_string(),
+            });
+        };
+        let mut with = OrchestratorState::new(vec!["c".to_string()], 0);
+        let mut without = OrchestratorState::new(vec!["c".to_string()], 0);
+        fail(&mut with);
+        fail(&mut without);
+        with.apply_execution_event(&ExecutionEvent::AcceptanceSettled {
+            change_id: "c".to_string(),
+            provenance: Box::new(acceptance_provenance_record()),
+        });
+
+        assert_eq!(
+            with.all_acceptance_provenance().get("c"),
+            Some(&acceptance_provenance_record())
+        );
+        assert!(without.all_acceptance_provenance().is_empty());
+        assert_eq!(with.display_status("c"), "error");
+        assert_eq!(with.display_status("c"), without.display_status("c"));
+        assert_eq!(with.all_error_details(), without.all_error_details());
+        assert_eq!(with.all_blocker_views(), without.all_blocker_views());
+
+        assert_eq!(
+            format!("{:?}", with.retry_terminal_error("c")),
+            format!("{:?}", without.retry_terminal_error("c"))
+        );
+        assert_eq!(with.display_status("c"), without.display_status("c"));
+        assert_eq!(
+            with.change_runtime("c").map(|rt| rt.queue_intent.clone()),
+            without
+                .change_runtime("c")
+                .map(|rt| rt.queue_intent.clone())
+        );
+
+        // A restarted owner is a fresh reducer: nothing to publish.
+        let restarted = OrchestratorState::new(vec!["c".to_string()], 0);
+        assert!(restarted.all_acceptance_provenance().is_empty());
     }
 }

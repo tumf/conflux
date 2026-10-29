@@ -126,7 +126,7 @@ use crate::client::envelope::{Operation, Outcome, ResultEnvelope};
 use crate::client::session::{observe, Connection, Observation};
 use crate::client::transport::Wake;
 use crate::web::remote_control_api::dto::{
-    BlockerKind, ChangeBlocker, ChangeExecutionStatus, OwnerExecutionContract,
+    BlockerKind, ChangeBlocker, ChangeExecutionStatus, ChangeResource, OwnerExecutionContract,
 };
 
 /// Longest gap between authoritative rehydrations.
@@ -524,13 +524,15 @@ async fn evaluate(
     // observation can, and only where the display would otherwise keep the
     // caller waiting for an owner that will never move this episode again.
     if let Some(stopped) = settled_stop(observation, change_id, disposition) {
-        return Step::settled(stopped_execution_envelope(
+        let mut envelope = stopped_execution_envelope(
             change_id,
             instance_id,
             status.unwrap_or_default(),
             error_detail,
             stopped,
-        ));
+        );
+        attach_acceptance_provenance(&mut envelope, change);
+        return Step::settled(envelope);
     }
 
     match disposition {
@@ -563,7 +565,7 @@ async fn evaluate(
                      a new operator action"
                 ),
             };
-            return Step::settled(requires_action_envelope(
+            let mut envelope = requires_action_envelope(
                 change_id,
                 instance_id,
                 status,
@@ -573,7 +575,9 @@ async fn evaluate(
                 error_detail.or_else(|| external.and_then(|blocker| blocker.detail.clone())),
                 external,
                 message,
-            ));
+            );
+            attach_acceptance_provenance(&mut envelope, change);
+            return Step::settled(envelope);
         }
         Disposition::KeepObserving => {
             return Step::KeepObserving {
@@ -746,6 +750,22 @@ fn unknown_change_envelope(
             "commands_submitted": 0,
             "evidence_detail": evidence_detail,
         }))
+}
+
+/// Copy the row's published Acceptance provenance onto a release, verbatim.
+///
+/// Only when the owner published one: the field is the owner's own projection,
+/// and an absent record says nothing a `null` would add.
+fn attach_acceptance_provenance(envelope: &mut ResultEnvelope, change: Option<&ChangeResource>) {
+    let Some(provenance) = change.and_then(|change| change.acceptance_provenance.as_ref()) else {
+        return;
+    };
+    if let (Some(object), Ok(value)) = (
+        envelope.detail.as_object_mut(),
+        serde_json::to_value(provenance),
+    ) {
+        object.insert("acceptance_provenance".to_string(), value);
+    }
 }
 
 /// The release that says "an operator has to look at this".
@@ -1001,6 +1021,7 @@ mod tests {
             timing: ChangeTiming::default(),
             latest_activity: None,
             worktree: None,
+            acceptance_provenance: None,
         }
     }
 

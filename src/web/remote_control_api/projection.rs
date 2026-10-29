@@ -590,6 +590,7 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
                 timing: change.timing.clone(),
                 latest_activity: change.latest_activity.clone(),
                 worktree: change.worktree.clone(),
+                acceptance_provenance: change.acceptance_provenance.clone(),
             }
         })
         .collect();
@@ -1023,6 +1024,20 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
         E::AcceptanceCompleted { change_id } => {
             ("acceptance_completed", Some(change_id.clone()), json!({}))
         }
+        // The record itself is already identities, counts, and closed tokens;
+        // the event carries only the routing-free summary of it.
+        E::AcceptanceSettled {
+            change_id,
+            provenance,
+        } => (
+            "acceptance_settled",
+            Some(change_id.clone()),
+            json!({
+                "decision_source": provenance.decision_source,
+                "reason_code": provenance.reason_code,
+                "remediation": provenance.remediation,
+            }),
+        ),
         E::AcceptanceFailed { change_id, error } => (
             "acceptance_failed",
             Some(change_id.clone()),
