@@ -2703,3 +2703,232 @@ fn verification_declaration_integrity_validate_reports_source_defects() {
         }
     }
 }
+
+// ─── Frontmatter line endings (real binary) ────────────────────────────────
+
+fn crlf_line_endings(content: &str) -> String {
+    content.replace('\n', "\r\n")
+}
+
+/// Every other line CRLF, the rest LF.
+fn mixed_line_endings(content: &str) -> String {
+    content
+        .split_inclusive('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if index % 2 == 0 {
+                line.replace('\n', "\r\n")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect()
+}
+
+fn line_ending_variants(content: &str) -> [(&'static str, String); 3] {
+    [
+        ("lf", content.to_string()),
+        ("crlf", crlf_line_endings(content)),
+        ("mixed", mixed_line_endings(content)),
+    ]
+}
+
+/// A non-echoing gate outside the repository that records each run and exits
+/// with `code`.
+fn counting_cli_gate(dir: &Path, code: i32) -> (String, std::path::PathBuf) {
+    let counter = dir.join("gate-runs.txt");
+    let script = dir.join("gate.sh");
+    fs::write(
+        &script,
+        format!("echo run >> '{}'\nexit {code}\n", counter.display()),
+    )
+    .unwrap();
+    (format!("sh {}", script.display()), counter)
+}
+
+fn cli_gate_runs(counter: &Path) -> usize {
+    fs::read_to_string(counter)
+        .map(|content| content.lines().count())
+        .unwrap_or(0)
+}
+
+impl FailClosedProject {
+    fn proposal_bytes(&self, change: &str) -> String {
+        fs::read_to_string(
+            self.repo
+                .path()
+                .join("openspec/changes")
+                .join(change)
+                .join("proposal.md"),
+        )
+        .unwrap()
+    }
+}
+
+/// LF, CRLF and mixed proposals each select exactly the one declared gate:
+/// validators accept the declaration whatever its future exit, the plan selects
+/// it without running it, and the run executes it once and keeps its outcome.
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn verification_frontmatter_line_endings_cli_selects_and_runs_the_gate() {
+    let project = FailClosedProject::new();
+    for (code, expected_outcome) in [(0, "captured"), (1, "command_failed")] {
+        for label in ["lf", "crlf", "mixed"] {
+            let change = format!("line-endings-{label}-{code}");
+            let gates = tempfile::tempdir().expect("gate dir");
+            let (command, counter) = counting_cli_gate(gates.path(), code);
+            project.write_change(&change, &[required_gate(&change, "valid-gate", &command)]);
+            let lf = project.proposal_bytes(&change);
+            let content = match label {
+                "lf" => lf,
+                "crlf" => crlf_line_endings(&lf),
+                _ => mixed_line_endings(&lf),
+            };
+            if label != "lf" {
+                project.write_raw_proposal(&change, &content);
+            }
+            let committed = project.proposal_bytes(&change);
+            assert_eq!(committed, content, "{label}: bytes kept as written");
+            assert_eq!(committed.contains("\r\n"), label != "lf", "{label}");
+
+            for mode in ["--strict", "--archive-gate"] {
+                let output = project.cflx(&["openspec", "validate", &change, mode]);
+                assert!(
+                    output.status.success(),
+                    "{label} {code} {mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            assert_eq!(cli_gate_runs(&counter), 0, "validation runs nothing");
+
+            let plan = project.cflx(&["openspec", "verify", &change, "--plan", "--json"]);
+            assert_eq!(
+                plan.status.code(),
+                Some(0),
+                "{label} {code}: {}",
+                String::from_utf8_lossy(&plan.stderr)
+            );
+            let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
+            let selected = plan["verifications"].as_array().expect("verifications");
+            assert_eq!(selected.len(), 1, "{label} {code}: {plan}");
+            assert_eq!(selected[0]["verification_id"], "valid-gate");
+            assert_eq!(cli_gate_runs(&counter), 0, "the plan runs nothing");
+
+            let run = project.cflx(&["openspec", "verify", &change, "--json"]);
+            assert_eq!(
+                run.status.code(),
+                Some(code),
+                "{label} {code}: {} {}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            let report: serde_json::Value = serde_json::from_slice(&run.stdout).expect("run JSON");
+            let ran = report["verifications"].as_array().expect("verifications");
+            assert_eq!(ran.len(), 1, "{label} {code}: {report}");
+            assert_eq!(ran[0]["verification_id"], "valid-gate");
+            assert_eq!(ran[0]["outcome"], expected_outcome, "{label}: {report}");
+            assert_eq!(
+                cli_gate_runs(&counter),
+                1,
+                "{label} {code}: ran exactly once"
+            );
+        }
+    }
+}
+
+/// CRLF and mixed sources with a wrong-typed field or no closing delimiter are
+/// refused by both validators and by verify plan/run before any evidence is
+/// read or written; no-frontmatter and empty-list CRLF controls stay valid.
+#[test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+fn verification_frontmatter_line_endings_cli_defective_sources_fail_before_evidence() {
+    let project = FailClosedProject::new();
+    let change = "line-endings-defects";
+    let gates = tempfile::tempdir().expect("gate dir");
+    let (command, counter) = counting_cli_gate(gates.path(), 0);
+    let valid = required_gate(change, "valid-gate", &command);
+
+    // Valid control: real evidence exists that a defective run could reuse.
+    project.write_change(change, std::slice::from_ref(&valid));
+    let first = project.cflx(&["openspec", "verify", change, "--json"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(cli_gate_runs(&counter), 1, "the valid control ran once");
+    let before = project.state_snapshot();
+    assert!(before
+        .keys()
+        .any(|path| path.ends_with("gates/valid-gate.json")));
+
+    let wrong_typed = format!(
+        "---\nverifications:\n{valid}  - id: list-gate\n    rerun: [sh, x]\n    completion_role: change-blocking\n---\n# Fixture\n\n**Change Type**: implementation\n"
+    );
+    let unclosed = format!(
+        "---\nverifications:\n{valid}# Fixture without a closing delimiter\n\n**Change Type**: implementation\n"
+    );
+    for (defect, lf, field) in [
+        ("wrong-typed", wrong_typed, "rerun"),
+        ("unclosed", unclosed, "frontmatter"),
+    ] {
+        for (label, content) in line_ending_variants(&lf).into_iter().skip(1) {
+            project.write_raw_proposal(change, &content);
+            for mode in ["--strict", "--archive-gate"] {
+                let output = project.cflx(&["openspec", "validate", change, mode]);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    !output.status.success(),
+                    "{defect} {label} {mode}: {stderr}"
+                );
+                assert!(
+                    stderr.contains(&format!("{field}: "))
+                        && stderr.contains("(declaration_metadata_invalid)"),
+                    "{defect} {label} {mode}: {stderr}"
+                );
+            }
+            for args in [
+                vec!["openspec", "verify", change, "--plan", "--json"],
+                vec!["openspec", "verify", change, "--json"],
+            ] {
+                let output = project.cflx(&args);
+                assert_eq!(output.status.code(), Some(1), "{defect} {label} {args:?}");
+                let report: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).expect("JSON");
+                let defects = report["declaration_defects"].as_array().unwrap();
+                assert_eq!(defects.len(), 1, "{defect} {label}: {report}");
+                assert_eq!(defects[0]["code"], "declaration_metadata_invalid");
+                assert_eq!(defects[0]["field"], field);
+                assert_eq!(report["verifications"], serde_json::json!([]));
+            }
+            assert_eq!(cli_gate_runs(&counter), 1, "{defect} {label}: nothing ran");
+            assert_eq!(
+                project.state_snapshot(),
+                before,
+                "{defect} {label}: evidence untouched"
+            );
+        }
+    }
+
+    for control in [
+        "# Fixture without frontmatter\r\n",
+        "---\r\nverifications: []\r\n---\r\n# Fixture\r\n",
+    ] {
+        project.write_raw_proposal(change, control);
+        for args in [
+            vec!["openspec", "verify", change, "--plan", "--json"],
+            vec!["openspec", "verify", change, "--json"],
+        ] {
+            let output = project.cflx(&args);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{control:?} {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+            assert_eq!(report["verifications"], serde_json::json!([]), "{report}");
+        }
+    }
+    assert_eq!(cli_gate_runs(&counter), 1, "empty controls run nothing");
+}

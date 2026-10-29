@@ -263,6 +263,20 @@ decode failure into an empty list. The reader decides between three outcomes:
   hold with an all-zero fingerprint and an evidence line naming the proposal path
   and the I/O error kind, so the next attempt stays admissible.
 
+The frontmatter delimiters are found by one scanner shared with strict
+validation metadata, the display metadata, and strict dependency reading. The
+opening line is exactly `---` at the start of the file ending in LF or CRLF; the
+closing line is exactly `---` ending in LF, CRLF, or end of file; LF and CRLF
+may be mixed line by line. So a CRLF proposal declares exactly what its LF
+twin declares — a CRLF opened block without a closing line is still
+`declaration_metadata_invalid`, never "no frontmatter". A lone CR is not a line
+ending, and there is no BOM stripping or whitespace tolerance around the
+delimiters. The scanner only borrows slices: nothing is rewritten, so the
+proposal's commit, blob, and digest identities stay those of its actual bytes,
+and LF and CRLF twins keep distinct content identities. An empty block or a
+null root is empty metadata; strict dependency reading then falls back to the
+body's `## Dependencies` section.
+
 Every defect carries a typed declaration **key**, fixed where the source still
 knows whether an `id` was authored: `{"kind":"id","value":"<trimmed id>"}` for
 an authored ID (even one that is unstorable or literally spelled `<position 3>`),
