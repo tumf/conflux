@@ -423,6 +423,10 @@ pub enum IneligibleReason {
     NotChangeBlocking,
     MissingCommand,
     MissingAutomation,
+    /// The command is not a plain argv. Carries the offending *construct* — a
+    /// metacharacter and its character offset, or `unbalanced quote` — never the
+    /// command text, so a detail can be shown without echoing a value a later
+    /// syntax extension may need to redact.
     ShellSyntax(String),
 }
 
@@ -451,8 +455,8 @@ impl IneligibleReason {
             }
             Self::MissingCommand => "declaration has no evidence/rerun command".to_string(),
             Self::MissingAutomation => "declaration has no automation path".to_string(),
-            Self::ShellSyntax(command) => {
-                format!("command '{command}' is not a plain argv the runtime can supervise")
+            Self::ShellSyntax(construct) => {
+                format!("command is not a plain argv the runtime can supervise: {construct}")
             }
         }
     }
@@ -473,6 +477,74 @@ pub struct VerificationRequest {
 /// or a conditional is not something it can supervise — and pretending otherwise
 /// would bind evidence to a command that never ran that way.
 const SHELL_METACHARACTERS: [char; 9] = ['|', '&', ';', '<', '>', '(', ')', '`', '$'];
+
+/// Split a declared command into the argv the runtime would start, or name the
+/// construct that prevents it.
+///
+/// The error names *what* is wrong — the first shell metacharacter and its
+/// character offset, `unbalanced quote`, `empty argv`, or `blank argument` — and
+/// deliberately never echoes the command itself.
+pub fn supervisable_argv(command: &str) -> Result<Vec<String>, String> {
+    if let Some((offset, metacharacter)) = command
+        .chars()
+        .enumerate()
+        .find(|(_, character)| SHELL_METACHARACTERS.contains(character))
+    {
+        return Err(format!(
+            "shell metacharacter '{metacharacter}' at character offset {offset}"
+        ));
+    }
+    let argv = shlex::split(command).ok_or_else(|| "unbalanced quote".to_string())?;
+    if argv.is_empty() {
+        return Err("empty argv".to_string());
+    }
+    if argv.iter().any(|arg| arg.trim().is_empty()) {
+        return Err("blank argument".to_string());
+    }
+    Ok(argv)
+}
+
+/// A typed, repository-local defect of one proposal's declaration list.
+///
+/// Produced by the shared declaration planner and consumed unchanged by strict
+/// validation, `cflx openspec verify`, and the native Acceptance manifest. It is
+/// a statement about the candidate's own `proposal.md` — never a missing tool,
+/// an external prerequisite, or a runtime defect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationDefect {
+    /// The declared ID, or `<position N>` when the declaration has none.
+    pub verification_id: String,
+    /// 1-based position of the declaration in the proposal's list.
+    pub position: usize,
+    /// The offending field (`id`, `phase`, `execution_class`, `rerun`,
+    /// `evidence`, or `automation`).
+    pub field: String,
+    /// Stable machine-readable code.
+    pub code: String,
+    /// Human-readable detail.
+    pub detail: String,
+}
+
+impl DeclarationDefect {
+    /// Machine-readable projection shared by every consumer.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "verification_id": self.verification_id,
+            "position": self.position,
+            "field": self.field,
+            "code": self.code,
+            "detail": self.detail,
+        })
+    }
+
+    /// `verification '<id>': <field>: <detail> (<code>)`.
+    pub fn summary(&self) -> String {
+        format!(
+            "verification '{}': {}: {} ({})",
+            self.verification_id, self.field, self.detail, self.code
+        )
+    }
+}
 
 /// Derive a supervisable request from a proposal declaration.
 pub fn eligible_request(
@@ -508,12 +580,7 @@ pub fn eligible_request(
         .map(str::trim)
         .filter(|command| !command.is_empty())
         .ok_or(IneligibleReason::MissingCommand)?;
-    if command.contains(SHELL_METACHARACTERS) {
-        return Err(IneligibleReason::ShellSyntax(command.to_string()));
-    }
-    let argv = shlex::split(command)
-        .filter(|argv| !argv.is_empty() && argv.iter().all(|arg| !arg.trim().is_empty()))
-        .ok_or_else(|| IneligibleReason::ShellSyntax(command.to_string()))?;
+    let argv = supervisable_argv(command).map_err(IneligibleReason::ShellSyntax)?;
     let automation_path = declaration
         .automation
         .as_deref()

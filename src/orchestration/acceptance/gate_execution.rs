@@ -105,6 +105,12 @@ where
     S: CommandSupervisor,
     C: Clock,
 {
+    // An invalid required manifest offers no gate to run or reuse. Its gate list
+    // is already empty by construction; this makes the refusal independent of
+    // that invariant.
+    if manifest.is_declaration_invalid() {
+        return GateResults::default();
+    }
     let mut outcomes = Vec::new();
     for gate in &manifest.gates {
         let id = gate.verification_id.as_str();
@@ -241,6 +247,12 @@ where
 pub enum GateVerdict {
     /// Every declared gate succeeded (or none was declared). Semantic review runs.
     Proceed,
+    /// The proposal's required declarations could not all be supervised. A
+    /// `fail` verdict about the candidate's own `proposal.md`: no gate ran, no
+    /// evidence was reused, and no reviewer is started.
+    DeclarationInvalid {
+        defects: Vec<super::verification_evidence::DeclarationDefect>,
+    },
     /// A declared gate failed. A `fail` verdict about the candidate, with the
     /// failing gate's own evidence.
     Failed { evidence: Vec<String> },
@@ -320,6 +332,23 @@ pub fn classify_gate_results(results: &GateResults) -> GateVerdict {
     GateVerdict::Proceed
 }
 
+/// Classify a whole boundary: the frozen manifest plus its gate results.
+///
+/// Declaration defects outrank everything [`classify_gate_results`] can say,
+/// `tool_unavailable` included: a defective declaration was never resolved
+/// against PATH, so no prerequisite or runtime classification about it exists.
+pub fn classify_boundary(
+    manifest: &AcceptanceExecutionManifest,
+    results: &GateResults,
+) -> GateVerdict {
+    if manifest.is_declaration_invalid() {
+        return GateVerdict::DeclarationInvalid {
+            defects: manifest.declaration_defects.clone(),
+        };
+    }
+    classify_gate_results(results)
+}
+
 /// Evaluate reuse for every manifest gate against one observation of Git state.
 ///
 /// Returns a decision per gate in manifest order. A gate with no stored
@@ -335,6 +364,10 @@ pub async fn plan_manifest_reuse<F: RepositoryFacts>(
     use super::verification_evidence::{dirty_entries, EvidenceDefect, RerunReason};
 
     let mut decisions = Vec::new();
+    // No evidence record is read for an invalid required manifest.
+    if manifest.is_declaration_invalid() {
+        return decisions;
+    }
     // One status read for every gate: two reads could straddle a write and let
     // one gate believe the tree was clean while another saw it dirty.
     let dirty = match facts.porcelain_status(workspace).await {

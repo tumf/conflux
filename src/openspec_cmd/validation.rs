@@ -593,6 +593,28 @@ fn validate_verification_declarations(
         }
     }
 
+    // The shared declaration planner Acceptance and `cflx openspec verify` use.
+    // Conditions the per-field checks above already report — each naming the
+    // verification and the field — are not repeated: duplicate IDs, a missing
+    // ID or command, and role conflicts. What this adds is that a required
+    // declaration whose command or automation the runtime cannot supervise
+    // fails here, before Apply, instead of silently leaving the Acceptance
+    // allowlist. Non-required declarations never produce a defect.
+    const REPORTED_ABOVE: [&str; 4] = [
+        "declaration_duplicate_id",
+        "declaration_missing_id",
+        "declaration_missing_command",
+        "declaration_role_conflict",
+    ];
+    for defect in
+        crate::orchestration::acceptance::execution_manifest::plan_declared_gates(&verifications)
+            .defects
+    {
+        if !REPORTED_ABOVE.contains(&defect.code.as_str()) {
+            errors.push(format!("{}: {}", change_id, defect.summary()));
+        }
+    }
+
     if matches!(change_type, Some("implementation" | "hybrid")) && !has_pre_integration {
         errors.push(format!("{}: implementation and hybrid proposals require at least one pre-integration verification with repository-verifiable evidence", change_id));
     }

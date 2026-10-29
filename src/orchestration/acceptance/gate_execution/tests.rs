@@ -65,6 +65,7 @@ fn manifest(gates: Vec<ManifestGate>) -> AcceptanceExecutionManifest {
         },
         executable_identity: TOOL_DIGEST.to_string(),
         gates,
+        declaration_defects: Vec::new(),
         created_at: Utc::now(),
         absolute_deadline_secs: 3600,
         work_budget_secs: 3570,
@@ -822,4 +823,85 @@ fn acceptance_execution_boundary_gate_results_project_typed_statuses() {
     assert_eq!(json["gates"][0]["outcome"], serde_json::json!("executed"));
     assert_eq!(json["gates"][1]["outcome"], serde_json::json!("reused"));
     assert_eq!(results.summary_lines().len(), 2);
+}
+
+// ============================================================================
+// Invalid required manifest: nothing runs, and the verdict outranks everything
+// ============================================================================
+
+fn shell_syntax_defect(
+) -> crate::orchestration::acceptance::verification_evidence::DeclarationDefect {
+    crate::orchestration::acceptance::verification_evidence::DeclarationDefect {
+        verification_id: "alpha-gate".to_string(),
+        position: 1,
+        field: "rerun".to_string(),
+        code: "declaration_shell_syntax".to_string(),
+        detail: "command is not a plain argv the runtime can supervise: unbalanced quote"
+            .to_string(),
+    }
+}
+
+/// Even a manifest that (wrongly) carries a gate beside a defect starts no
+/// command and reads no evidence: the refusal does not depend on the builder's
+/// empty-gate invariant.
+#[tokio::test]
+async fn required_verification_fail_closed_invalid_manifest_runs_and_reuses_nothing() {
+    let workspace = tempfile::tempdir().unwrap();
+    let supervisor = RecordingSupervisor::passing();
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
+    let mut manifest = manifest(vec![gate("alpha-gate")]);
+    manifest.declaration_defects = vec![shell_syntax_defect()];
+
+    let decisions = plan_manifest_reuse(
+        &FakeFacts::new(),
+        &target_of(&workspace),
+        &store_of(&workspace),
+        &manifest,
+        ReusePolicy::default(),
+    )
+    .await;
+    let results =
+        execute_declared_gates(&executor, &manifest, &decisions, GateBudget::unbounded()).await;
+
+    assert!(decisions.is_empty(), "no evidence may be read for reuse");
+    assert!(
+        supervisor.calls().is_empty(),
+        "no declared command may start"
+    );
+    assert!(results.is_empty());
+    assert_eq!(
+        classify_boundary(&manifest, &results),
+        GateVerdict::DeclarationInvalid {
+            defects: vec![shell_syntax_defect()],
+        }
+    );
+}
+
+/// Declaration defects are classified before `tool_unavailable`: a defective
+/// declaration was never resolved against PATH, so it cannot be a prerequisite.
+#[test]
+fn required_verification_fail_closed_defects_outrank_tool_unavailable() {
+    let mut manifest = manifest(Vec::new());
+    manifest.declaration_defects = vec![shell_syntax_defect()];
+    let results = GateResults {
+        outcomes: vec![GateOutcome::Refused {
+            verification_id: "beta-gate".to_string(),
+            code: TOOL_UNAVAILABLE.to_string(),
+            detail: "missing".to_string(),
+        }],
+    };
+
+    assert!(matches!(
+        classify_boundary(&manifest, &results),
+        GateVerdict::DeclarationInvalid { .. }
+    ));
+    // A valid manifest keeps today's classification untouched.
+    assert!(matches!(
+        classify_boundary(&self::manifest(Vec::new()), &results),
+        GateVerdict::ExternalPrerequisite { .. }
+    ));
+    assert_eq!(
+        classify_boundary(&self::manifest(Vec::new()), &GateResults::default()),
+        GateVerdict::Proceed
+    );
 }

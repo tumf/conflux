@@ -26,6 +26,13 @@ captured, and `1` when at least one is neither. A failing command is reported
 with its exit code and artifact path — that is a *command* result, not a verdict
 about the change.
 
+Exit status is also `1` when the proposal's required declarations are invalid
+(see [Declaration defects](#declaration-defects)). Both modes then report the
+defects — one line each in text, a `declaration_defects` array in `--json` — and
+execute nothing, not even a valid declaration beside the defective one. Existing
+evidence is neither read for reuse nor modified. `--verification-id` does not
+narrow that check: duplicates and the required set belong to the whole proposal.
+
 Both artifact spellings travel with every report. The envelope's
 `artifact_path` stays store-relative (`gates/<id>.log`) so the record survives a
 state root that moves; a captured or failed verification also reports
@@ -151,9 +158,11 @@ changed the next action, which is the thing law 1 rules out.
 Only declarations that are:
 
 - `execution_class: repository-local` **and** `completion_role: change-blocking`;
-- a plain argv — a declared command containing `|`, `&&`, `;`, redirection, or
-  `$` substitution is reported as `declaration_shell_syntax`, because the runtime
-  starts a process rather than a shell;
+- a plain argv — a declared command containing any of `|`, `&`, `;`, `<`, `>`,
+  `(`, `)`, `` ` ``, or `$`, or one with an unbalanced quote, is reported as
+  `declaration_shell_syntax`, because the runtime starts a process rather than a
+  shell. For a required declaration that is a [declaration
+  defect](#declaration-defects), never a silent omission;
 - slower than the reuse threshold. Commands measured under 60 seconds stay on the
   ordinary rerun path: they are cheaper to run than to justify. The threshold is
   a repository-tracked constant that the runtime measures itself — proposal prose
@@ -162,6 +171,45 @@ Only declarations that are:
 Deployed, credentialed, device, and observation-only verifications have no local
 reuse decision at all. They are owned elsewhere by design and are absent from the
 plan.
+
+## Declaration defects
+
+A *required* declaration — one whose `completion_role` is `change-blocking` — is
+the proposal's statement that Acceptance must run that command before any
+verdict. One shared declaration planner turns the proposal's declaration list
+into the blocking gate set for strict validation, `cflx openspec verify`, and the
+native Acceptance manifest alike, and it never drops a required declaration it
+cannot supervise. It reports a typed defect instead, naming the verification ID
+(or `<position N>` when the ID is missing), the field, a stable code, and a
+detail that names the offending construct without echoing the command:
+
+| Code | Field | Meaning |
+| --- | --- | --- |
+| `declaration_duplicate_id` | `id` | The same ID is declared more than once, whatever its role. Every occurrence is reported with all positions; nothing is deduplicated. |
+| `declaration_role_conflict` | `phase` / `execution_class` | A change-blocking declaration that is not `pre-integration` / `repository-local`. |
+| `declaration_missing_id` | `id` | A required declaration without an ID. |
+| `declaration_unstorable_id` | `id` | An ID that is not a safe single path component. |
+| `declaration_missing_command` | `rerun` | `rerun` (or `evidence` when `rerun` is absent) is empty. |
+| `declaration_shell_syntax` | `rerun` / `evidence` | The command is not a plain argv: a shell metacharacter (with its character offset), an unbalanced quote, or an empty argv or argument. |
+| `declaration_missing_automation` | `automation` | The automation path is absent, empty, absolute, or parent-traversing. |
+
+Non-required declarations — legacy ones without role metadata and
+`operational-observation` ones — produce neither gates nor defects, so a
+deployed-service `curl … | jq` observation stays valid.
+
+One or more defects make an *invalid required manifest*, which is different from
+a legitimately empty allowlist:
+
+- `cflx openspec validate --strict` and `--archive-gate` fail with
+  `<change-id>: verification '<id>': <field>: <detail> (<code>)`.
+- `cflx openspec verify` exits `1` and runs nothing (see above).
+- Native Acceptance records the defects on the frozen manifest
+  (`declaration_defects`) and settles a typed **`fail` verdict about the
+  candidate**: one `[DECLARATION_INVALID]` finding per defect naming the ID,
+  field, code, detail, and `openspec/changes/<id>/proposal.md`. No gate is run
+  or reused, no evidence is written, no reviewer starts, and no hold is recorded,
+  so the ordinary repair cycle fixes `proposal.md` and retries. A defect is never
+  `tool_unavailable`, an external prerequisite, or a runtime/manifest defect.
 
 ## The authority boundary
 

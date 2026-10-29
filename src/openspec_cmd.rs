@@ -4021,6 +4021,156 @@ mod openspec_list_show_tests {
             .any(|e| e.contains("missing-dep") && e.contains("invalid")));
         assert!(warnings.is_empty());
     }
+
+    // ─── Required verification declarations fail closed ────────────────────
+
+    /// One verification declaration with explicit role metadata.
+    fn fail_closed_declaration(
+        id: &str,
+        phase: &str,
+        owner: &str,
+        class: &str,
+        role: &str,
+        command: &str,
+    ) -> String {
+        format!(
+            "  - id: {id}\n    requirement: validator behavior\n    phase: {phase}\n    owner: {owner}\n    trigger: pull request\n    automation: Cargo.toml\n    evidence: \"{command}\"\n    rerun: \"{command}\"\n    prerequisites: []\n    execution_class: {class}\n    completion_role: {role}\n"
+        )
+    }
+
+    /// A strict-valid implementation change whose verification list is `entries`.
+    fn create_fail_closed_change(root: &Path, change_id: &str, entries: &[String]) {
+        let dir = root.join("openspec/changes").join(change_id);
+        fs::create_dir_all(dir.join("specs/fail-closed")).unwrap();
+        fs::write(
+            dir.join("proposal.md"),
+            format!(
+                "---\nverifications:\n{}---\n# Fail closed fixture\n\n**Change Type**: implementation\n\n## Problem\nvalidator fixture\n",
+                entries.concat()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] 1. validator update (verification: unit - cargo test openspec_cmd --lib; verification-id: local-gate)\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("specs/fail-closed/spec.md"),
+            "## ADDED Requirements\n\n### Requirement: Fail closed\n\nThe validator SHALL fail closed.\n\n#### Scenario: Fail closed\n- **WHEN** validation runs\n- **THEN** it fails closed\n",
+        )
+        .unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        track_file(root, "Cargo.toml");
+    }
+
+    fn required_declaration(id: &str, command: &str) -> String {
+        fail_closed_declaration(
+            id,
+            "pre-integration",
+            "conflux-acceptance",
+            "repository-local",
+            "change-blocking",
+            command,
+        )
+    }
+
+    #[test]
+    fn required_verification_fail_closed_strict_and_archive_gate_reject_shell_syntax() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        create_fail_closed_change(
+            temp.path(),
+            "shell-required",
+            &[required_declaration(
+                "piped-gate",
+                "cargo test | tee out.log",
+            )],
+        );
+
+        let mgr = OpenSpecManager::new();
+        // `--strict` is ("strict", evidence off); `--archive-gate` is strict with
+        // evidence "error", exactly as `main.rs` maps the flags.
+        for evidence in ["off", "error"] {
+            let (is_valid, errors, _warnings) =
+                mgr.validate_change(Some("shell-required"), true, evidence);
+            assert!(
+                !is_valid,
+                "{evidence}: a shell-syntax required gate must fail"
+            );
+            assert!(
+                errors.iter().any(|error| error
+                    .starts_with("shell-required: verification 'piped-gate': rerun: ")
+                    && error.ends_with("(declaration_shell_syntax)")),
+                "{evidence}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_verification_fail_closed_non_required_shell_syntax_stays_valid() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        create_fail_closed_change(
+            temp.path(),
+            "shell-observation",
+            &[
+                required_declaration("local-gate", "cargo test --lib"),
+                fail_closed_declaration(
+                    "deployed-observation",
+                    "post-integration",
+                    "repository-automation",
+                    "deployed-service",
+                    "operational-observation",
+                    "curl -fsS https://example.invalid/health | jq .status",
+                ),
+            ],
+        );
+
+        let mgr = OpenSpecManager::new();
+        let (is_valid, errors, _warnings) =
+            mgr.validate_change(Some("shell-observation"), true, "error");
+
+        assert!(
+            is_valid,
+            "a non-required declaration is never rejected for its command: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_verification_fail_closed_verify_executes_nothing_for_an_invalid_set() {
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("gate-ran");
+        let workspace = temp.path().join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        create_fail_closed_change(
+            &workspace,
+            "invalid-set",
+            &[
+                required_declaration("valid-gate", &format!("touch {}", marker.display())),
+                required_declaration("piped-gate", &format!("touch {} && true", marker.display())),
+            ],
+        );
+
+        for (verification_id, plan_only) in [
+            (None, true),
+            (None, false),
+            // Selecting the valid declaration does not narrow defect evaluation.
+            (Some("valid-gate"), false),
+        ] {
+            let status = verify::verify_in_workspace(
+                &workspace,
+                "invalid-set",
+                verification_id,
+                plan_only,
+                true,
+            )
+            .await
+            .expect("an invalid set is a report, not an error");
+            assert_eq!(status, 1, "{verification_id:?} plan_only={plan_only}");
+        }
+        assert!(!marker.exists(), "no declared command may run");
+    }
 }
 
 #[cfg(test)]
