@@ -2,7 +2,7 @@
 
 ## Ordering
 
-Only ordinary admitted candidates enter this check. Retain authoritative active, terminal, held and revoked-intent exclusions. Strict metadata read errors must be reconciled to the existing ProcessingError projection before blocked-only/no-capacity exits can suppress diagnostics. Recheck the same condition at the existing late dispatch guard to cover a changed file. Current repository state is authoritative; no file/cache marker controls admission. Event deduplication suppresses noise only, never projection.
+Only ordinary admitted candidates enter this check. Retain authoritative active, terminal, held and revoked-intent exclusions. Strict metadata read errors must be reconciled to the existing ProcessingError projection before blocked-only/no-capacity exits can suppress diagnostics. Recheck the same condition at the existing late dispatch guard to cover a changed file. Current repository state is authoritative; no file/cache marker controls admission. Event deduplication suppresses noise only, never projection. A process-local target epoch also covers reducer-event adoption lag and resets on explicit Retry/removal. Scheduler warnings use the same bounded fixed-category text as error_detail, never the raw parser error. All blocking tests are src/ module tests under --lib.
 
 ## User-visible state inventory (existing design retained)
 
