@@ -846,14 +846,13 @@ fn acceptance_execution_boundary_gate_results_project_typed_statuses() {
 
 fn shell_syntax_defect(
 ) -> crate::orchestration::acceptance::verification_evidence::DeclarationDefect {
-    crate::orchestration::acceptance::verification_evidence::DeclarationDefect {
-        verification_id: "alpha-gate".to_string(),
-        position: 1,
-        field: "rerun".to_string(),
-        code: "declaration_shell_syntax".to_string(),
-        detail: "command is not a plain argv the runtime can supervise: unbalanced quote"
-            .to_string(),
-    }
+    crate::orchestration::acceptance::verification_evidence::DeclarationDefect::new(
+        crate::openspec::DeclarationKey::Id("alpha-gate".to_string()),
+        1,
+        "rerun",
+        "declaration_shell_syntax",
+        "command is not a plain argv the runtime can supervise: unbalanced quote".to_string(),
+    )
 }
 
 /// Even a manifest that (wrongly) carries a gate beside a defect starts no

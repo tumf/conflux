@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::openspec::{
-    VerificationCompletionRole, VerificationDeclaration, VerificationExecutionClass,
+    DeclarationKey, VerificationCompletionRole, VerificationDeclaration, VerificationExecutionClass,
 };
 
 /// Envelope schema.
@@ -688,9 +688,15 @@ pub fn supervisable_argv(command: &str) -> Result<Vec<String>, String> {
 /// an external prerequisite, or a runtime defect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeclarationDefect {
-    /// The declared ID, or `<position N>` when the declaration has none.
+    /// Which declaration this is about, fixed by the reader or planner where
+    /// the source still knew whether an `id` was authored. Never reconstructed
+    /// from the label, the position, the code, or prose.
+    pub key: DeclarationKey,
+    /// Display projection of `key`: the declared ID, `<position N>`, or
+    /// `<proposal>`.
     pub verification_id: String,
-    /// 1-based position of the declaration in the proposal's list.
+    /// 1-based position of the declaration in the proposal's list, or `0` for
+    /// a proposal-scoped source defect.
     pub position: usize,
     /// The offending field (`id`, `phase`, `execution_class`, `rerun`,
     /// `evidence`, or `automation`).
@@ -702,7 +708,28 @@ pub struct DeclarationDefect {
 }
 
 impl DeclarationDefect {
+    /// The only construction path: the display label is derived from the key,
+    /// and the occurrence position is carried explicitly.
+    pub fn new(
+        key: DeclarationKey,
+        position: usize,
+        field: &str,
+        code: &str,
+        detail: String,
+    ) -> Self {
+        Self {
+            verification_id: key.label(),
+            key,
+            position,
+            field: field.to_string(),
+            code: code.to_string(),
+            detail,
+        }
+    }
+
     /// Machine-readable projection shared by every consumer.
+    ///
+    /// The five original members are unchanged; `key` is additive.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "verification_id": self.verification_id,
@@ -710,6 +737,7 @@ impl DeclarationDefect {
             "field": self.field,
             "code": self.code,
             "detail": self.detail,
+            "key": self.key,
         })
     }
 

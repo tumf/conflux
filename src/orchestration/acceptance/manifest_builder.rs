@@ -23,7 +23,7 @@ use std::path::Path;
 use chrono::Utc;
 
 use super::execution_manifest::{
-    digest_change_inputs, digest_text, partition_deadline, plan_declared_gates,
+    digest_change_inputs, digest_text, partition_deadline, plan_verification_source,
     AcceptanceExecutionManifest, ManifestGate, SkillIdentity, MANIFEST_SCHEMA,
 };
 use super::verification_evidence::{EvidenceStore, RepositoryFacts, ToolIdentity};
@@ -38,6 +38,14 @@ pub enum ManifestBuildError {
     UnstorableChangeId(String),
     /// Git state could not be observed.
     Unobservable(String),
+    /// The candidate's `proposal.md` is missing or unreadable, so no
+    /// declaration source exists. Distinct from an empty declaration list: the
+    /// executor turns it into the existing manifest-build hold, never a verdict.
+    ProposalUnreadable {
+        /// Workspace-relative proposal path.
+        path: String,
+        kind: std::io::ErrorKind,
+    },
 }
 
 impl ManifestBuildError {
@@ -48,6 +56,9 @@ impl ManifestBuildError {
             }
             Self::Unobservable(error) => {
                 format!("current repository state could not be proven: {error}")
+            }
+            Self::ProposalUnreadable { path, kind } => {
+                format!("proposal {path} could not be read ({kind:?}); no verification manifest can be derived")
             }
         }
     }
@@ -145,7 +156,7 @@ pub async fn build_manifest<F: RepositoryFacts>(
     workspace: &Path,
     store: &EvidenceStore,
     change_id: &str,
-    declarations: &[crate::openspec::VerificationDeclaration],
+    source: &crate::openspec::VerificationSource,
     skill_name: &str,
     review_base: Option<&str>,
     absolute_deadline_secs: u64,
@@ -189,7 +200,7 @@ pub async fn build_manifest<F: RepositoryFacts>(
     // candidate, not a build failure, so it never becomes a
     // `ManifestBuildError` (which would classify as a runtime hold). The plan
     // carries no gate when it carries a defect.
-    let plan = plan_declared_gates(declarations);
+    let plan = plan_verification_source(source);
     let declaration_defects = plan.defects;
     let mut gates = Vec::new();
     for request in plan.gates {
@@ -269,17 +280,27 @@ pub async fn build_manifest_for_workspace<F: RepositoryFacts>(
         .join("openspec/changes")
         .join(change_id)
         .join("proposal.md");
-    let declarations = if proposal_path.is_file() {
-        crate::openspec::parse_proposal_metadata_from_file(&proposal_path).verifications
-    } else {
-        Vec::new()
-    };
+    // An unstorable ID is refused before any path derived from it is read.
+    if !super::execution_manifest::is_storable_change_id(change_id) {
+        return Err(ManifestBuildError::UnstorableChangeId(
+            change_id.to_string(),
+        ));
+    }
+    // The fallible reader, never the tolerant display parser: a decode failure
+    // is a source defect on the manifest, and a missing or unreadable proposal
+    // is a refusal to derive one — neither is an empty declaration list.
+    let source = crate::openspec::read_verification_source(&proposal_path).map_err(|error| {
+        ManifestBuildError::ProposalUnreadable {
+            path: format!("openspec/changes/{change_id}/proposal.md"),
+            kind: error.kind,
+        }
+    })?;
     build_manifest(
         facts,
         workspace,
         store,
         change_id,
-        &declarations,
+        &source,
         skill_name,
         review_base,
         absolute_deadline_secs,

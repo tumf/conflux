@@ -204,12 +204,14 @@ verdict. One shared declaration planner turns the proposal's declaration list
 into the blocking gate set for strict validation, `cflx openspec verify`, and the
 native Acceptance manifest alike, and it never drops a required declaration it
 cannot supervise. It reports a typed defect instead, naming the verification ID
-(or `<position N>` when the ID is missing), the field, a stable code, and a
+(or `<position N>` when the ID is missing, `<proposal>` for a proposal-wide
+source defect), the field, a stable code, and a
 detail that names the offending construct without echoing the command:
 
 | Code | Field | Meaning |
 | --- | --- | --- |
-| `declaration_duplicate_id` | `id` | The same ID is declared more than once, whatever its role. Every occurrence is reported with all positions; nothing is deduplicated. |
+| `declaration_metadata_invalid` | `frontmatter` / `verifications` / the declaration field | The verification metadata itself is structurally malformed (see *Declaration source* below). |
+| `declaration_duplicate_id` | `id` | The same *trimmed* ID is declared more than once, whatever its role (`gate` and `" gate "` collide). Every occurrence is reported with all positions; nothing is deduplicated. |
 | `declaration_role_conflict` | `phase` / `execution_class` | A change-blocking declaration that is not `pre-integration` / `repository-local`. |
 | `declaration_missing_id` | `id` | A required declaration without an ID. |
 | `declaration_unstorable_id` | `id` | An ID that is not a safe single path component. |
@@ -235,6 +237,54 @@ a legitimately empty allowlist:
   or reused, no evidence is written, no reviewer starts, and no hold is recorded,
   so the ordinary repair cycle fixes `proposal.md` and retries. A defect is never
   `tool_unavailable`, an external prerequisite, or a runtime/manifest defect.
+
+### Declaration source
+
+Every execution consumer — strict validation, `cflx openspec verify`, and the
+native Acceptance manifest — reads `proposal.md` through one *fallible*
+verification-source reader, never the tolerant display parser that turns a
+decode failure into an empty list. The reader decides between three outcomes:
+
+- **Legitimately empty**: no frontmatter, no `verifications` key, a bare
+  `verifications:` (null), or `verifications: []`. Zero gates, zero defects;
+  Acceptance proceeds to the reviewer.
+- **Structurally defective**: an opened frontmatter block with no closing
+  `---`, malformed YAML, a root that is not a mapping, a `verifications` value
+  that is not a sequence, an entry that is not a mapping, a known field of the
+  wrong type (`rerun: [cargo, test]`), or an unknown declaration field. Each is a
+  `declaration_metadata_invalid` defect, and the planner rules are not evaluated
+  on a partially decoded list. The detail names only shape, YAML types
+  (`null`, `boolean`, `number`, `string`, `sequence`, `mapping`, `tagged`), and
+  line/column — never a value, a command, or the decoder's own message.
+  Unknown *top-level* keys stay warnings.
+- **Source-unavailable**: `proposal.md` is missing or unreadable. `verify`
+  fails through its proposal-resolution error before resolving the store; native
+  Acceptance derives no manifest and settles the existing `acceptance_manifest_malformed`
+  hold with an all-zero fingerprint and an evidence line naming the proposal path
+  and the I/O error kind, so the next attempt stays admissible.
+
+Every defect carries a typed declaration **key**, fixed where the source still
+knows whether an `id` was authored: `{"kind":"id","value":"<trimmed id>"}` for
+an authored ID (even one that is unstorable or literally spelled `<position 3>`),
+`{"kind":"position","value":N}` for a nameless entry, and `{"kind":"proposal"}`
+with `position: 0` for a defect not attributable to one declaration. The key is
+an additive `key` member of each `declaration_defects` entry; the other five
+members are unchanged.
+
+### Repair identity
+
+Each native `[DECLARATION_INVALID]` finding carries a typed identity beside its
+human text — change ID, declaration key, field, and code — and the repair ledger
+compares that identity, not the prose. Reordering declarations, moving line
+numbers, rewording a detail, or a new candidate commit never changes it, and a
+user ID can never collide with a positional or proposal key. Occurrences sharing
+one identity (both halves of a duplicate) share one automatic repair while every
+finding stays visible; a *different* defect exposed by that repair (the
+duplicate removed, a shell-syntax `rerun` revealed) gets its own first repair;
+the *same* identity still open after its repair stops as
+`repeated_acceptance_finding`. Native findings declare no remediation paths and
+no reviewer ID, and the identity is process-local: after an owner restart it is
+recomputed from the candidate's `proposal.md`.
 
 ## The authority boundary
 
