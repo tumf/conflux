@@ -115,6 +115,59 @@ enum DynamicQueueAdmission {
     Retain,
 }
 
+/// Why the strict proposal/dependency reader refused a queued candidate.
+///
+/// A fixed, bounded category: the published diagnostic never carries the raw
+/// parser error, YAML, scalars, commands, or environment values, so this enum
+/// is all the failure detail that leaves the scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProposalMetadataFailure {
+    /// The proposal file could not be read at all (missing, permissions, not UTF-8).
+    Unreadable,
+    /// The file was read, but its metadata could not be decoded.
+    InvalidMetadata,
+}
+
+impl ProposalMetadataFailure {
+    fn from_error(error: &OrchestratorError) -> Self {
+        match error {
+            OrchestratorError::Io(_) => Self::Unreadable,
+            _ => Self::InvalidMetadata,
+        }
+    }
+
+    fn category(self) -> &'static str {
+        match self {
+            Self::Unreadable => "unreadable proposal",
+            Self::InvalidMetadata => "invalid proposal metadata",
+        }
+    }
+
+    /// The one bounded diagnostic used for `error_detail`, the scheduler
+    /// warning, and the TUI row/details: change, repository-relative location,
+    /// category, and the operator remedy.
+    pub(crate) fn diagnostic(self, change_id: &str) -> String {
+        format!(
+            "Change '{change_id}' cannot start: {} at openspec/changes/{change_id}/proposal.md. \
+             Correct and commit that proposal, then explicitly Retry the change.",
+            self.category()
+        )
+    }
+}
+
+/// One emitted proposal-metadata error, kept only to deduplicate the event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProposalMetadataErrorEpoch {
+    failure: ProposalMetadataFailure,
+    /// Whether a later pass observed the reducer holding this target in error.
+    ///
+    /// Until then a repeated invalid read is reducer-adoption lag and is
+    /// suppressed. Once adopted, a reducer that again shows the target as
+    /// ordinary queued work lost the error (rebuilt projection or a Retry not
+    /// yet drained), so current repository evidence is published again.
+    adopted: bool,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QueuedWorkClass {
@@ -125,6 +178,7 @@ pub(super) enum QueuedWorkClass {
     DependencyBlocked,
     CandidateUnavailable,
     AcceptanceStalled,
+    ProposalMetadataError,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,6 +193,11 @@ pub(super) struct BlockedOnlyQueueClassification {
     /// work, never dispatchable, so ordinary reconciliation cannot re-submit
     /// them and produce a `Blocked -> Blocked` loop.
     pub acceptance_stalled: Vec<String>,
+    /// Ordinary candidates the strict proposal reader refused this pass.
+    ///
+    /// Not a dependency wait: the scheduler reconciles each one to a
+    /// change-local `ProcessingError` before any blocked-only exit.
+    pub proposal_metadata_error: Vec<(String, ProposalMetadataFailure)>,
 }
 
 impl BlockedOnlyQueueClassification {
@@ -153,6 +212,7 @@ impl BlockedOnlyQueueClassification {
             || !self.dependency_blocked.is_empty()
             || !self.candidate_unavailable.is_empty()
             || !self.acceptance_stalled.is_empty()
+            || !self.proposal_metadata_error.is_empty()
     }
 
     pub fn is_blocked_only(&self) -> bool {
@@ -183,6 +243,12 @@ impl BlockedOnlyQueueClassification {
             Some(QueuedWorkClass::AcceptanceStalled)
         } else if self.candidate_unavailable.iter().any(|id| id == change_id) {
             Some(QueuedWorkClass::CandidateUnavailable)
+        } else if self
+            .proposal_metadata_error
+            .iter()
+            .any(|(id, _)| id == change_id)
+        {
+            Some(QueuedWorkClass::ProposalMetadataError)
         } else {
             None
         }
@@ -767,6 +833,75 @@ impl ParallelExecutor {
         }
     }
 
+    /// Settle a strict proposal-read failure into the change-local error path.
+    ///
+    /// Publishes the existing `ProcessingError` with the bounded diagnostic —
+    /// the reducer turns it into `error` plus `error_detail`, and the
+    /// authoritative dispatcher revokes intent exactly as for any change-level
+    /// failure. No process-wide `Error`, no dependency on itself. The epoch only
+    /// suppresses a repeat while the first event awaits reducer adoption; it is
+    /// not admission authority, and the caller withholds the target from
+    /// analysis and dispatch on every pass regardless of it.
+    async fn reconcile_proposal_metadata_error(
+        &mut self,
+        change_id: &str,
+        failure: ProposalMetadataFailure,
+    ) {
+        if let Some(epoch) = self.proposal_metadata_error_epochs.get(change_id) {
+            if !epoch.adopted && epoch.failure == failure {
+                debug!(
+                    change_id,
+                    category = failure.category(),
+                    "Suppressing repeated proposal metadata error while the reducer has not adopted it yet"
+                );
+                return;
+            }
+        }
+        self.proposal_metadata_error_epochs.insert(
+            change_id.to_string(),
+            ProposalMetadataErrorEpoch {
+                failure,
+                adopted: false,
+            },
+        );
+        let message = failure.diagnostic(change_id);
+        warn!("{}", message);
+        send_event(
+            &self.event_tx,
+            ParallelEvent::ProcessingError {
+                id: change_id.to_string(),
+                error: message,
+            },
+        )
+        .await;
+    }
+
+    /// Reconcile this pass's proposal-metadata failures before any exit.
+    ///
+    /// Returns the targets to withhold from the analyzer. Epochs are pruned for
+    /// targets no longer in the scheduler-local candidate list (removal), and a
+    /// target the reducer now holds in terminal error marks its epoch adopted.
+    async fn reconcile_proposal_metadata_errors(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        classification: &BlockedOnlyQueueClassification,
+    ) -> HashSet<String> {
+        self.proposal_metadata_error_epochs
+            .retain(|change_id, _| queued.iter().any(|change| &change.id == change_id));
+        for change_id in &classification.terminal_error_retry_required {
+            if let Some(epoch) = self.proposal_metadata_error_epochs.get_mut(change_id) {
+                epoch.adopted = true;
+            }
+        }
+        let mut withheld = HashSet::new();
+        for (change_id, failure) in &classification.proposal_metadata_error {
+            self.reconcile_proposal_metadata_error(change_id, *failure)
+                .await;
+            withheld.insert(change_id.clone());
+        }
+        withheld
+    }
+
     async fn emit_dependency_blocker_diagnostic(
         &self,
         change_id: &str,
@@ -1062,36 +1197,14 @@ impl ParallelExecutor {
                 {
                     Ok(dependencies) => dependencies,
                     Err(error) => {
-                        let message = format!(
-                            "Change '{}' blocked because dependency metadata could not be read from '{}': {}",
+                        // The proposal changed after the pre-analysis check
+                        // (or that check never saw it): the same change-local
+                        // error contract applies, never a dependency on itself.
+                        self.reconcile_proposal_metadata_error(
                             change_id,
-                            proposal_path.display(),
-                            error
-                        );
-                        warn!("{}", message);
-                        // Unreadable dependency metadata is still a current
-                        // dependency wait: project it before the diagnostic
-                        // gate, so a suppressed duplicate cannot leave the row
-                        // looking plainly `queued`.
-                        self.reconcile_dependency_blocker_projection(
-                            change_id,
-                            std::slice::from_ref(change_id),
+                            ProposalMetadataFailure::from_error(&error),
                         )
                         .await;
-                        if self.should_emit_dependency_blocked_transition(
-                            change_id,
-                            &[(change_id.clone(), DependencyTargetClass::Error)],
-                        ) {
-                            send_event(&self.event_tx, ParallelEvent::Error { message }).await;
-                            send_event(
-                                &self.event_tx,
-                                ParallelEvent::DependencyBlocked {
-                                    change_id: change_id.clone(),
-                                    dependency_ids: vec![change_id.clone()],
-                                },
-                            )
-                            .await;
-                        }
                         continue;
                     }
                 }
@@ -2816,6 +2929,9 @@ impl ParallelExecutor {
             // later blocked observation for it is a new transition rather than a
             // suppressed duplicate.
             self.dependency_blocker_fingerprints.remove(change_id);
+            // An explicit Retry re-reads the proposal: a still-invalid one must
+            // publish its error again rather than be suppressed as a duplicate.
+            self.proposal_metadata_error_epochs.remove(change_id);
             let released_attempts = self.apply_budget.attempts(change_id);
             self.apply_budget.reset(change_id);
             info!(
@@ -2949,6 +3065,9 @@ impl ParallelExecutor {
                 // explicit re-add is a genuine queue addition and may announce
                 // one new bounded blocker transition.
                 self.failed_tracker.clear_blocker_epoch(change_id);
+                // Removal ends the proposal-metadata error epoch too, so a
+                // re-admitted candidate is reconciled from the repository again.
+                self.proposal_metadata_error_epochs.remove(change_id);
                 info!(
                     change_id = %change_id,
                     "Queue reconciliation dropped candidate because reducer queue intent was revoked"
@@ -3485,13 +3604,13 @@ impl ParallelExecutor {
                 {
                     Ok(dependencies) => dependencies,
                     Err(error) => {
-                        warn!(
-                            change_id = %change.id,
-                            proposal = %proposal_path.display(),
-                            error = %error,
-                            "Blocking queue classification because dependency metadata could not be read"
-                        );
-                        classification.dependency_blocked.push(change.id.clone());
+                        // Repairable local data, not a dependency wait: the
+                        // caller turns this into a change-local error before
+                        // any blocked-only exit can hide it.
+                        classification.proposal_metadata_error.push((
+                            change.id.clone(),
+                            ProposalMetadataFailure::from_error(&error),
+                        ));
                         continue;
                     }
                 }
@@ -3845,6 +3964,7 @@ impl ParallelExecutor {
         max_parallelism: usize,
         iteration: u32,
         work_snapshot: &ReducerWorkSnapshot,
+        metadata_withheld: &mut HashSet<String>,
     ) -> ReanalysisFlowDecision {
         // Fail-closed: an incomplete view proves nothing about what is
         // dispatchable, so no analyzer, workspace preparation, or dispatch may
@@ -3860,6 +3980,11 @@ impl ParallelExecutor {
         let classification = self
             .classify_queued_work_with_snapshot(queued, in_flight, work_snapshot)
             .await;
+        // Before every exit below: a blocked-only or no-capacity pass must not
+        // be able to leave an unreadable proposal looking like plain `queued`.
+        *metadata_withheld = self
+            .reconcile_proposal_metadata_errors(queued, &classification)
+            .await;
         if classification.is_blocked_only() {
             info!(
                 dispatchable = classification.dispatchable.len(),
@@ -3869,6 +3994,7 @@ impl ParallelExecutor {
                 dependency_blocked = classification.dependency_blocked.len(),
                 candidate_unavailable = classification.candidate_unavailable.len(),
                 acceptance_stalled = classification.acceptance_stalled.len(),
+                proposal_metadata_error = classification.proposal_metadata_error.len(),
                 "Skipping dependency analysis because queued work is blocked-only"
             );
             self.emit_no_analysis_diagnostic(
@@ -4646,6 +4772,7 @@ impl ParallelExecutor {
             ));
         }
 
+        let mut metadata_withheld = HashSet::new();
         if let Some((should_break, iteration)) = self
             .prepare_dispatch_candidates(
                 queued,
@@ -4653,6 +4780,7 @@ impl ParallelExecutor {
                 max_parallelism,
                 iteration,
                 work_snapshot,
+                &mut metadata_withheld,
             )
             .await
             .into_result()
@@ -4728,9 +4856,16 @@ impl ParallelExecutor {
         // eligible evaluation instead of discarding it with this pass.
         self.spend_pending_retry_bypass();
 
+        // A candidate whose proposal the strict reader refused is never an
+        // analyzer target: it already settled to a change-local error above.
+        let analysis_candidates: Vec<crate::openspec::Change> = queued
+            .iter()
+            .filter(|change| !metadata_withheld.contains(&change.id))
+            .cloned()
+            .collect();
         let attempt = self
             .run_dependency_analysis_attempt(
-                queued,
+                &analysis_candidates,
                 in_flight,
                 iteration,
                 analysis_decision.effective_reason,
