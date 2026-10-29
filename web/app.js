@@ -1791,6 +1791,20 @@ export class OperatorConsole {
       'Dependencies',
       change.dependencies?.length ? change.dependencies.join(', ') : 'None',
     );
+    // Only an `error` row carries a change-local diagnostic. The server already
+    // sanitised and bounded it, so it is shown verbatim as text; trim decides
+    // presence only. Nothing else (logs, activity, blockers) stands in for it.
+    if (change.display_status === 'error') {
+      const detail = change.error_detail;
+      appendDetail(
+        this.doc,
+        list,
+        'Error detail',
+        typeof detail === 'string' && detail.trim().length > 0
+          ? detail
+          : 'Error details unavailable',
+      );
+    }
     details.appendChild(list);
     item.appendChild(details);
 
