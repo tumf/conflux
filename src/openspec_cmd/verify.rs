@@ -407,6 +407,53 @@ mod tests {
         assert_eq!(declared[0].id.as_deref(), Some("local-tests"));
     }
 
+    /// `verify --plan` reports for a declaration carrying a leading assignment
+    /// name the binding and never its value, in text and JSON alike; an invalid
+    /// assignment is a typed defect whose report carries no value either.
+    #[tokio::test]
+    async fn rerun_leading_env_verify_reports_never_carry_a_binding_value() {
+        const SENTINEL: &str = "rerun-leading-env-sentinel-2d6f08";
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let with = |command: String| VerificationDeclaration {
+            rerun: Some(command.clone()),
+            evidence: Some(command),
+            phase: Some("pre-integration".to_string()),
+            ..declaration("local-tests")
+        };
+
+        let declared = vec![with(format!(
+            "DJANGO_SETTINGS_MODULE={SENTINEL} cargo test"
+        ))];
+        assert!(plan_declared_gates(&declared).is_valid());
+        let plan = plan_reuse(
+            &UnobservedFacts,
+            workspace.path(),
+            &EvidenceStore::new(workspace.path().join("../external-acceptance-store")),
+            &declared,
+            ReusePolicy::default(),
+        )
+        .await;
+        assert_eq!(plan.decisions.len(), 1);
+        for decision in &plan.decisions {
+            assert!(!decision.summary().contains(SENTINEL));
+        }
+        assert!(!plan.to_json().to_string().contains(SENTINEL));
+
+        for command in [
+            format!("1BAD={SENTINEL} cargo test"),
+            format!("A={SENTINEL}"),
+        ] {
+            let defects = plan_declared_gates(&[with(command)]).defects;
+            assert_eq!(defects.len(), 1);
+            assert!(matches!(
+                defects[0].code.as_str(),
+                "declaration_invalid_assignment" | "declaration_missing_command"
+            ));
+            assert!(!defects[0].summary().contains(SENTINEL));
+            assert!(!defects[0].to_json().to_string().contains(SENTINEL));
+        }
+    }
+
     /// A proposal declaring one supervisable repository-local verification.
     const PROPOSAL: &str = "---\nverifications:\n  - id: local-tests\n    phase: pre-integration\n    automation: Cargo.toml\n    rerun: cargo test --lib\n    execution_class: repository-local\n    completion_role: change-blocking\n    prerequisites: []\n---\n# Example\n";
 

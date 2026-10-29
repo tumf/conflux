@@ -49,7 +49,8 @@ it captured, and records:
 | Binding | Source |
 | --- | --- |
 | Commit and tree | Full-length `HEAD` and `HEAD^{tree}` object IDs |
-| Command | The exact argv array, never a shell string |
+| Command | The exact argv array, never a shell string — executable plus arguments, with no leading assignment |
+| Environment bindings | `env_names` (sorted, distinct names) and `env_binding_digest`: a full-length SHA-256 over the effective bindings sorted by name, each encoded `name NUL value NUL`. Never a value |
 | Working directory | Normalized repository-relative (`.` for the root) |
 | Automation file | The declared path's blob ID at that commit |
 | Tool | Resolved executable path, its file digest, and its `--version` output |
@@ -62,6 +63,17 @@ heuristic: the first binding that differs is the rerun reason, reported per
 verification ID as a stable code (`binding_mismatch`, `worktree_dirty`,
 `evidence_missing`, `evidence_agent_authored`, …) plus a detail line naming what
 changed.
+
+Environment bindings are identity by digest. Changing a value, adding a name, or
+removing one changes the Acceptance manifest fingerprint and makes an otherwise
+exact record rerun with mismatch field `env_binding_digest`. An envelope written
+before the field existed reads as the digest of empty bindings: it still reuses
+for an assignment-free declaration and reruns for one with assignments. No
+envelope, manifest, log line, report, reviewer context, or API field carries a
+value; every rendered command shows `NAME=<redacted>` followed by the argv. That
+guarantee covers Conflux-generated command metadata only. The raw child output
+artifact is whatever the child printed — a command that echoes its own value
+puts it there — and is not promised safe for unrestricted sharing.
 
 ## Where it lives
 
@@ -162,7 +174,19 @@ Only declarations that are:
   `(`, `)`, `` ` ``, or `$`, or one with an unbalanced quote, is reported as
   `declaration_shell_syntax`, because the runtime starts a process rather than a
   shell. For a required declaration that is a [declaration
-  defect](#declaration-defects), never a silent omission;
+  defect](#declaration-defects), never a silent omission. After that refusal
+  and the POSIX-quote tokenizer, leading `NAME=value` tokens (`NAME` matching
+  `[A-Za-z_][A-Za-z0-9_]*`) are environment assignments, so
+  `DJANGO_SETTINGS_MODULE=config.test_settings uv run pytest` is eligible. The
+  value is everything after the first `=` and may be empty or contain `=` and
+  quoted spaces; repeated names keep the last value. The first token that is not
+  an assignment is the executable, and later `a=b` tokens are ordinary
+  arguments. The bindings are applied to the supervised child only — never to
+  the Conflux process, and never through `sh -c` or `env` — and the tool is
+  resolved from the executable, so a missing executable is still
+  `tool_unavailable`. `env A=1 cmd` stays an ordinary argv whose executable is
+  `env`. Expansion (`$VAR`), substitution, redirection, pipelines, and compound
+  commands remain `declaration_shell_syntax`;
 - slower than the reuse threshold. Commands measured under 60 seconds stay on the
   ordinary rerun path: they are cheaper to run than to justify. The threshold is
   a repository-tracked constant that the runtime measures itself — proposal prose
@@ -189,8 +213,9 @@ detail that names the offending construct without echoing the command:
 | `declaration_role_conflict` | `phase` / `execution_class` | A change-blocking declaration that is not `pre-integration` / `repository-local`. |
 | `declaration_missing_id` | `id` | A required declaration without an ID. |
 | `declaration_unstorable_id` | `id` | An ID that is not a safe single path component. |
-| `declaration_missing_command` | `rerun` | `rerun` (or `evidence` when `rerun` is absent) is empty. |
+| `declaration_missing_command` | `rerun` / `evidence` | `rerun` (or `evidence` when `rerun` is absent) is empty, or consists only of `NAME=value` assignments with no executable. |
 | `declaration_shell_syntax` | `rerun` / `evidence` | The command is not a plain argv: a shell metacharacter (with its character offset), an unbalanced quote, or an empty argv or argument. |
+| `declaration_invalid_assignment` | `rerun` / `evidence` | A token before the executable contains `=` but its name is not an identifier (`1ABC=x cmd`, `A-B=x cmd`, `=x cmd`). The detail names the token position, never its text. |
 | `declaration_missing_automation` | `automation` | The automation path is absent, empty, absolute, or parent-traversing. |
 
 Non-required declarations — legacy ones without role metadata and

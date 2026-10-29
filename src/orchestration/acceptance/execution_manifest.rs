@@ -54,8 +54,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::verification_evidence::{
-    eligible_request, is_storable_verification_id, DeclarationDefect, EvidenceStore,
-    IneligibleReason, ToolIdentity, VerificationRequest,
+    eligible_request, empty_env_binding_digest, is_storable_verification_id, render_command,
+    DeclarationDefect, EnvBindings, EvidenceStore, IneligibleReason, ToolIdentity,
+    VerificationRequest,
 };
 use crate::openspec::{
     VerificationCompletionRole, VerificationDeclaration, VerificationExecutionClass,
@@ -417,7 +418,22 @@ pub fn partition_deadline(absolute_secs: u64) -> DeadlinePartition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestGate {
     pub verification_id: String,
+    /// Executable plus arguments. Never contains a leading assignment.
     pub argv: Vec<String>,
+    /// Sorted, distinct names of the effective environment bindings.
+    #[serde(default)]
+    pub env_names: Vec<String>,
+    /// Full-length digest of the effective bindings — identity by digest,
+    /// never by value.
+    #[serde(default = "empty_env_binding_digest")]
+    pub env_binding_digest: String,
+    /// The binding values themselves, in memory only.
+    ///
+    /// Never serialized: a manifest written to the store carries names and the
+    /// digest, never a value. The manifest is frozen and executed by the same
+    /// owner, so the runtime that starts the child still holds the values.
+    #[serde(skip)]
+    pub env: EnvBindings,
     pub cwd: String,
     pub automation_path: String,
     /// Full-length blob ID of the automation file at the candidate commit, or
@@ -439,6 +455,8 @@ impl ManifestGate {
         serde_json::json!({
             "verification_id": self.verification_id,
             "argv": self.argv,
+            "env_names": self.env_names,
+            "env_binding_digest": self.env_binding_digest,
             "cwd": self.cwd,
             "automation_path": self.automation_path,
             "automation_blob_oid": self.automation_blob_oid,
@@ -455,6 +473,7 @@ impl ManifestGate {
         VerificationRequest {
             verification_id: self.verification_id.clone(),
             argv: self.argv.clone(),
+            env: self.env.clone(),
             cwd: self.cwd.clone(),
             automation_path: self.automation_path.clone(),
         }
@@ -829,7 +848,8 @@ impl AcceptanceExecutionManifest {
                 .iter()
                 .map(|gate| serde_json::json!({
                     "verification_id": gate.verification_id,
-                    "command": gate.argv.join(" "),
+                    "command": render_command(&gate.env_names, &gate.argv),
+                    "env_names": gate.env_names,
                     "automation": gate.automation_path,
                 }))
                 .collect::<Vec<_>>(),
@@ -1505,8 +1525,16 @@ pub fn plan_declared_gates(declarations: &[VerificationDeclaration]) -> Declarat
                 let field = match &reason {
                     IneligibleReason::MissingId | IneligibleReason::UnstorableId(_) => "id",
                     IneligibleReason::MissingCommand => "rerun",
-                    IneligibleReason::ShellSyntax(_) if declaration.rerun.is_none() => "evidence",
-                    IneligibleReason::ShellSyntax(_) => "rerun",
+                    IneligibleReason::ShellSyntax(_)
+                    | IneligibleReason::InvalidAssignment(_)
+                    | IneligibleReason::AssignmentOnly
+                        if declaration.rerun.is_none() =>
+                    {
+                        "evidence"
+                    }
+                    IneligibleReason::ShellSyntax(_)
+                    | IneligibleReason::InvalidAssignment(_)
+                    | IneligibleReason::AssignmentOnly => "rerun",
                     IneligibleReason::MissingAutomation => "automation",
                     // Unreachable after the role checks above; reported under
                     // the role field rather than dropped if that ever changes.

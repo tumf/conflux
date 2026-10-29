@@ -33,6 +33,9 @@ fn gate(id: &str) -> ManifestGate {
     ManifestGate {
         verification_id: id.to_string(),
         argv: vec!["cargo".to_string(), "test".to_string(), id.to_string()],
+        env_names: Vec::new(),
+        env_binding_digest: empty_env_binding_digest(),
+        env: EnvBindings::default(),
         cwd: ".".to_string(),
         automation_path: "src/orchestration/acceptance.rs".to_string(),
         automation_blob_oid: "b".repeat(40),
@@ -1143,4 +1146,83 @@ fn required_verification_fail_closed_manifest_distinguishes_invalid_from_empty()
 
 fn only_defect_list() -> Vec<DeclarationDefect> {
     vec![only_defect(&[required("gate", "cargo test | tee out.log")])]
+}
+
+// ============================================================================
+// Leading environment assignments (`rerun_leading_env`)
+// ============================================================================
+
+/// A manifest gate planned from one real declaration, exactly as the builder
+/// derives identity from it.
+fn gate_from_command(command: &str) -> ManifestGate {
+    let plan = plan_declared_gates(&[required("focused", command)]);
+    assert!(plan.is_valid(), "{:?}", plan.defects);
+    let request = plan.gates.into_iter().next().unwrap();
+    ManifestGate {
+        argv: request.argv.clone(),
+        env_names: request.env.names(),
+        env_binding_digest: request.env.digest(),
+        env: request.env,
+        ..gate("focused")
+    }
+}
+
+#[test]
+fn rerun_leading_env_binding_changes_move_the_manifest_fingerprint() {
+    let fingerprint =
+        |command: &str| manifest("alpha", vec![gate_from_command(command)]).fingerprint();
+    let base = fingerprint("A=1 cargo test focused --lib");
+    assert_eq!(base, fingerprint("A=1 cargo test focused --lib"));
+    for changed in [
+        "A=2 cargo test focused --lib",
+        "A=1 B=1 cargo test focused --lib",
+        "cargo test focused --lib",
+    ] {
+        assert_ne!(base, fingerprint(changed), "'{changed}'");
+    }
+}
+
+#[test]
+fn rerun_leading_env_planner_reports_assignment_defects_on_the_command_field() {
+    let invalid = only_defect(&[required("gate", "A-B=x cargo test")]);
+    assert_eq!(invalid.code, "declaration_invalid_assignment");
+    assert_eq!(invalid.field, "rerun");
+    assert_eq!(invalid.verification_id, "gate");
+
+    let assignment_only = only_defect(&[required("gate", "A=1 B=2")]);
+    assert_eq!(assignment_only.code, "declaration_missing_command");
+    assert_eq!(assignment_only.field, "rerun");
+
+    // With no `rerun`, the defect names the `evidence` field it came from.
+    let evidence_only = only_defect(&[VerificationDeclaration {
+        rerun: None,
+        ..required("gate", "1ABC=x cargo test")
+    }]);
+    assert_eq!(evidence_only.code, "declaration_invalid_assignment");
+    assert_eq!(evidence_only.field, "evidence");
+}
+
+#[test]
+fn rerun_leading_env_stored_manifest_carries_names_and_digest_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = external_store(&temp, "alpha");
+    let sentinel = "rerun-leading-env-sentinel-c40e11";
+    let original = manifest(
+        "alpha",
+        vec![gate_from_command(&format!(
+            "DJANGO_SETTINGS_MODULE={sentinel} cargo test focused --lib"
+        ))],
+    );
+    store.store(&original).expect("manifest must persist");
+    let bytes = std::fs::read_to_string(store.path()).unwrap();
+    assert!(bytes.contains("env_binding_digest"));
+    assert!(bytes.contains("DJANGO_SETTINGS_MODULE"));
+    assert!(!bytes.contains(sentinel), "{bytes}");
+
+    let reloaded = store.load().expect("manifest must reload");
+    assert_eq!(reloaded.fingerprint(), original.fingerprint());
+    assert!(
+        reloaded.gates[0].env.is_empty(),
+        "values are never reloaded"
+    );
 }

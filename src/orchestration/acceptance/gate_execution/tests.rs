@@ -18,8 +18,8 @@ use crate::orchestration::acceptance::execution_manifest::{
     MANIFEST_SCHEMA,
 };
 use crate::orchestration::acceptance::verification_evidence::{
-    EvidenceStore, RerunReason, ReuseDecision, SupervisedOutcome, ToolIdentity,
-    VerificationEvidence, EVIDENCE_AUTHORITY, EVIDENCE_SCHEMA,
+    empty_env_binding_digest, EnvBindings, EvidenceStore, RerunReason, ReuseDecision,
+    SupervisedOutcome, ToolIdentity, VerificationEvidence, EVIDENCE_AUTHORITY, EVIDENCE_SCHEMA,
 };
 
 const COMMIT: &str = "1111111111111111111111111111111111111111";
@@ -40,6 +40,9 @@ fn gate(id: &str) -> ManifestGate {
     ManifestGate {
         verification_id: id.to_string(),
         argv: vec!["cargo".to_string(), "test".to_string(), id.to_string()],
+        env_names: Vec::new(),
+        env_binding_digest: empty_env_binding_digest(),
+        env: EnvBindings::default(),
         cwd: ".".to_string(),
         automation_path: "src/lib.rs".to_string(),
         automation_blob_oid: BLOB.to_string(),
@@ -136,6 +139,8 @@ impl RepositoryFacts for FakeFacts {
 struct RecordingSupervisor {
     exit_code: i32,
     calls: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Bindings handed with each call, so manifest-to-child wiring is asserted.
+    envs: Arc<Mutex<Vec<EnvBindings>>>,
     /// When set, the supervised command never returns on its own.
     hang: bool,
 }
@@ -145,6 +150,7 @@ impl RecordingSupervisor {
         Self {
             exit_code: 0,
             calls: Arc::new(Mutex::new(Vec::new())),
+            envs: Arc::new(Mutex::new(Vec::new())),
             hang: false,
         }
     }
@@ -170,8 +176,14 @@ impl RecordingSupervisor {
 
 #[async_trait]
 impl CommandSupervisor for RecordingSupervisor {
-    async fn run(&self, argv: &[String], _cwd: &Path) -> Result<SupervisedOutcome, String> {
+    async fn run(
+        &self,
+        argv: &[String],
+        env: &EnvBindings,
+        _cwd: &Path,
+    ) -> Result<SupervisedOutcome, String> {
         self.calls.lock().unwrap().push(argv.to_vec());
+        self.envs.lock().unwrap().push(env.clone());
         if self.hang {
             // Never resolves; the caller's bounded timeout is what must end it.
             std::future::pending::<()>().await;
@@ -299,6 +311,8 @@ fn stored_evidence(id: &str) -> VerificationEvidence {
         review_base_commit: BLOB.to_string(),
         review_range: format!("{BLOB}..{COMMIT}"),
         argv: vec!["cargo".to_string(), "test".to_string(), id.to_string()],
+        env_names: Vec::new(),
+        env_binding_digest: empty_env_binding_digest(),
         cwd: ".".to_string(),
         automation_path: "src/lib.rs".to_string(),
         automation_blob_oid: BLOB.to_string(),
@@ -566,6 +580,7 @@ async fn acceptance_execution_boundary_gate_deadline_terminates_and_reaps_a_real
     let run = supervisor
         .run_bounded(
             &["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            &EnvBindings::default(),
             workspace.path(),
             Some(std::time::Duration::from_millis(150)),
         )
@@ -904,4 +919,173 @@ fn required_verification_fail_closed_defects_outrank_tool_unavailable() {
         classify_boundary(&self::manifest(Vec::new()), &GateResults::default()),
         GateVerdict::Proceed
     );
+}
+
+// ============================================================================
+// Leading environment assignments (`rerun_leading_env`)
+// ============================================================================
+
+const ENV_SENTINEL: &str = "rerun-leading-env-sentinel-91be47";
+
+/// A manifest gate planned from one real declared command.
+fn gate_with_command(id: &str, command: &str) -> ManifestGate {
+    let declaration = crate::openspec::VerificationDeclaration {
+        id: Some(id.to_string()),
+        requirement: Some("requirement".to_string()),
+        phase: Some("pre-integration".to_string()),
+        owner: Some("owner".to_string()),
+        trigger: Some("pull-request-validation".to_string()),
+        automation: Some("src/lib.rs".to_string()),
+        evidence: Some(command.to_string()),
+        rerun: Some(command.to_string()),
+        prerequisites: Some(Vec::new()),
+        execution_class: Some("repository-local".to_string()),
+        completion_role: Some("change-blocking".to_string()),
+    };
+    let request =
+        crate::orchestration::acceptance::verification_evidence::eligible_request(&declaration)
+            .expect("eligible");
+    ManifestGate {
+        argv: request.argv.clone(),
+        env_names: request.env.names(),
+        env_binding_digest: request.env.digest(),
+        env: request.env,
+        ..gate(id)
+    }
+}
+
+fn assert_no_sentinel(surface: &str, text: &str) {
+    assert!(
+        !text.contains(ENV_SENTINEL),
+        "{surface} leaked a value: {text}"
+    );
+}
+
+#[tokio::test]
+async fn rerun_leading_env_failed_gate_runs_with_bindings_and_reports_no_value() {
+    let workspace = tempfile::tempdir().unwrap();
+    let supervisor = RecordingSupervisor::failing();
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
+    let manifest = manifest(vec![gate_with_command(
+        "alpha-gate",
+        &format!("SECRET_MODE={ENV_SENTINEL} cargo test alpha-gate"),
+    )]);
+
+    let results = execute_declared_gates(&executor, &manifest, &[], GateBudget::unbounded()).await;
+
+    assert_eq!(
+        supervisor.calls(),
+        vec![vec!["cargo", "test", "alpha-gate"]]
+    );
+    assert_eq!(
+        supervisor.envs.lock().unwrap()[0].pairs(),
+        [("SECRET_MODE".to_string(), ENV_SENTINEL.to_string())]
+    );
+    for line in results.summary_lines() {
+        assert_no_sentinel("gate outcome summary", &line);
+    }
+    assert_no_sentinel("gate results JSON", &results.to_json().to_string());
+    match classify_boundary(&manifest, &results) {
+        GateVerdict::Failed { evidence } => {
+            for line in &evidence {
+                assert_no_sentinel("failure evidence", line);
+            }
+        }
+        other => panic!("a failing gate is a fail verdict, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rerun_leading_env_deadline_hold_evidence_carries_no_value() {
+    let workspace = tempfile::tempdir().unwrap();
+    let executor = executor(&workspace, FakeFacts::new(), RecordingSupervisor::hanging());
+    let manifest = manifest(vec![gate_with_command(
+        "alpha-gate",
+        &format!("SECRET_MODE={ENV_SENTINEL} cargo test alpha-gate"),
+    )]);
+
+    let results = execute_declared_gates(
+        &executor,
+        &manifest,
+        &[],
+        GateBudget::bounded(std::time::Duration::from_millis(20)),
+    )
+    .await;
+
+    match classify_boundary(&manifest, &results) {
+        GateVerdict::Hold { evidence, .. } => {
+            assert!(!evidence.is_empty());
+            for line in &evidence {
+                assert_no_sentinel("execution-hold evidence", line);
+            }
+        }
+        other => panic!("an exhausted gate is a hold, got {other:?}"),
+    }
+}
+
+/// A missing *actual* executable after valid assignments keeps the existing
+/// external-prerequisite contract and names the executable, not an assignment.
+#[tokio::test]
+async fn rerun_leading_env_missing_executable_is_still_tool_unavailable() {
+    let workspace = tempfile::tempdir().unwrap();
+    let supervisor = RecordingSupervisor::passing();
+    let executor = executor(&workspace, FakeFacts::new(), supervisor.clone());
+    let mut unresolved =
+        gate_with_command("alpha-gate", "A=1 definitely-not-installed-tool --flag");
+    unresolved.tool = ToolIdentity::default();
+    let manifest = manifest(vec![unresolved]);
+
+    let results = execute_declared_gates(&executor, &manifest, &[], GateBudget::unbounded()).await;
+
+    assert!(supervisor.calls().is_empty(), "nothing was started");
+    match &results.outcomes[..] {
+        [GateOutcome::Refused { code, detail, .. }] => {
+            assert_eq!(code, TOOL_UNAVAILABLE);
+            assert!(
+                detail.contains("'definitely-not-installed-tool'"),
+                "{detail}"
+            );
+            assert!(!detail.contains("A=1"), "{detail}");
+        }
+        other => panic!("expected tool_unavailable, got {other:?}"),
+    }
+    match classify_boundary(&manifest, &results) {
+        GateVerdict::ExternalPrerequisite { blocker } => {
+            assert_eq!(blocker.category, "infrastructure");
+            assert!(blocker.resumable);
+        }
+        other => panic!("a missing executable is an external prerequisite, got {other:?}"),
+    }
+}
+
+/// An invalid assignment is a declaration defect through the fail-closed path,
+/// never `tool_unavailable` and never an external prerequisite.
+#[test]
+fn rerun_leading_env_invalid_assignment_is_declaration_invalid_not_a_prerequisite() {
+    let declaration = crate::openspec::VerificationDeclaration {
+        id: Some("alpha-gate".to_string()),
+        requirement: Some("requirement".to_string()),
+        phase: Some("pre-integration".to_string()),
+        owner: Some("owner".to_string()),
+        trigger: Some("pull-request-validation".to_string()),
+        automation: Some("src/lib.rs".to_string()),
+        evidence: Some(format!("1BAD={ENV_SENTINEL} cargo test")),
+        rerun: Some(format!("1BAD={ENV_SENTINEL} cargo test")),
+        prerequisites: Some(Vec::new()),
+        execution_class: Some("repository-local".to_string()),
+        completion_role: Some("change-blocking".to_string()),
+    };
+    let plan =
+        crate::orchestration::acceptance::execution_manifest::plan_declared_gates(&[declaration]);
+    let mut invalid = manifest(Vec::new());
+    invalid.declaration_defects = plan.defects;
+
+    match classify_boundary(&invalid, &GateResults::default()) {
+        GateVerdict::DeclarationInvalid { defects } => {
+            assert_eq!(defects.len(), 1);
+            assert_eq!(defects[0].code, "declaration_invalid_assignment");
+            assert_no_sentinel("declaration defect", &defects[0].summary());
+        }
+        other => panic!("an invalid assignment is a declaration defect, got {other:?}"),
+    }
 }
