@@ -4585,6 +4585,19 @@ impl ParallelExecutor {
         in_flight_ids.sort_unstable();
         let analysis_outcome = analyzer(queued, &in_flight_ids, iteration).await;
 
+        // The invocation returned, so its observation episode ends here — before any
+        // empty-order or capacity branch can return. This says nothing about whether
+        // the result is usable; it only closes the activity `AnalysisStarted` opened.
+        // A dropped (never-returned) invocation never reaches this line, and process
+        // terminal cleanup retires its activity instead.
+        send_event(
+            &self.event_tx,
+            ParallelEvent::AnalysisCompleted {
+                groups_found: analysis_outcome.result.groups.as_ref().map_or(0, Vec::len),
+            },
+        )
+        .await;
+
         if analysis_outcome.result.order.is_empty() {
             // An unusable analysis decision must not establish a completed input, or it would
             // suppress every later attempt. It is also not evidence that queued work finished:
