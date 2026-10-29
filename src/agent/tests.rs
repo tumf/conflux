@@ -770,6 +770,7 @@ mod acceptance_execution_boundary_context {
             },
             executable_identity: "f".repeat(64),
             gates,
+            declaration_defects: Vec::new(),
             created_at: chrono::Utc::now(),
             absolute_deadline_secs: 3600,
             work_budget_secs: 3570,

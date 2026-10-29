@@ -101,6 +101,8 @@ The native `cflx openspec validate` implementation MUST enforce deterministic pr
 
 Implementation and hybrid proposals MUST declare at least one pre-integration verification. Spec-only proposals MAY omit verification declarations. A post-integration declaration MUST identify repository automation ownership, trigger, evidence location, rerun action, and prerequisites. Validation MUST NOT access a network, external API, or deployed target to validate any declaration.
 
+In strict and archive-gate modes the validator MUST additionally run the shared declaration planner defined by `proposal-metadata` and fail on every declaration defect it reports, including `declaration_shell_syntax` and `declaration_missing_automation` on a `completion_role: change-blocking` declaration, with a diagnostic naming the change, the verification ID, and the field. Declarations that are not `change-blocking` MUST NOT be rejected for command syntax by this rule.
+
 #### Scenario: strict validation accepts a complete post-integration contract
 
 **Given**: an implementation proposal has a pre-integration verification
@@ -136,6 +138,13 @@ Implementation and hybrid proposals MUST declare at least one pre-integration ve
 **When**: strict validation runs
 **Then**: validation fails with guidance to declare repository-verifiable implementation evidence
 **And**: a spec-only proposal without declarations remains valid
+
+#### Scenario: unsupervisable change-blocking command is rejected
+
+**Given**: an implementation proposal declares a `pre-integration`, `repository-local`, `change-blocking` verification whose `rerun` contains a shell operator such as `|` or `&&`, or whose quotes do not tokenize
+**When**: `cflx openspec validate <id> --strict` or `--archive-gate` runs
+**Then**: validation fails with a diagnostic naming the change, the verification ID, and the `rerun` field
+**And**: the same command text on an `operational-observation` declaration produces no error from this rule
 
 ### Requirement: self-referential-final-validation-task-guard
 

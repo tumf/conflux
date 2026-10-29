@@ -32,9 +32,10 @@ use std::path::{Path, PathBuf};
 use crate::archive_layout;
 use crate::openspec::VerificationDeclaration;
 use crate::orchestration::acceptance::evidence_location::{prepare_store, AcceptanceStore};
+use crate::orchestration::acceptance::execution_manifest::plan_declared_gates;
 use crate::orchestration::acceptance::verification_evidence::{
-    decide_reuse, eligible_request, plan_reuse, CaptureOutcome, EvidenceStore, GitRepositoryFacts,
-    ReusePolicy, RuntimeVerificationExecutor, SystemClock, VerificationRequest,
+    decide_reuse, eligible_request, plan_reuse, CaptureOutcome, DeclarationDefect, EvidenceStore,
+    GitRepositoryFacts, ReusePolicy, RuntimeVerificationExecutor, SystemClock, VerificationRequest,
 };
 
 /// Exit status when at least one selected verification neither reused nor
@@ -239,11 +240,40 @@ async fn run_verifications(
     })
 }
 
+/// Report an invalid required declaration set.
+///
+/// Printed instead of a plan or a run: when the required set as a whole is
+/// invalid, no declared command — not even a valid one — is executed, and no
+/// evidence record is read or written.
+fn report_declaration_defects(change_id: &str, defects: &[DeclarationDefect], json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "change_id": change_id,
+                "declaration_defects": defects
+                    .iter()
+                    .map(DeclarationDefect::to_json)
+                    .collect::<Vec<_>>(),
+                "verifications": [],
+            }))
+            .unwrap_or_default()
+        );
+        return;
+    }
+    println!(
+        "Required verification declarations of '{change_id}' are invalid; nothing was executed."
+    );
+    for defect in defects {
+        println!("{change_id}: {}", defect.summary());
+    }
+}
+
 /// Entry point for `cflx openspec verify`.
 ///
 /// Returns the process exit status: `0` when every selected verification is
 /// reused or freshly captured, and [`EXIT_UNSATISFIED`] when at least one is
-/// neither.
+/// neither — or when the proposal's required declarations are invalid.
 pub async fn cmd_verify(
     change_id: &str,
     verification_id: Option<&str>,
@@ -252,8 +282,36 @@ pub async fn cmd_verify(
 ) -> Result<i32, String> {
     let workspace = std::env::current_dir()
         .map_err(|error| format!("Failed to resolve the current directory: {error}"))?;
-    let workspace: PathBuf = workspace;
-    let selected = select(declarations(&workspace, change_id)?, verification_id)?;
+    verify_in_workspace(
+        &workspace,
+        change_id,
+        verification_id,
+        plan_only,
+        json_output,
+    )
+    .await
+}
+
+/// [`cmd_verify`] against an explicit workspace.
+pub(crate) async fn verify_in_workspace(
+    workspace: &Path,
+    change_id: &str,
+    verification_id: Option<&str>,
+    plan_only: bool,
+    json_output: bool,
+) -> Result<i32, String> {
+    let workspace: PathBuf = workspace.to_path_buf();
+    let declared = declarations(&workspace, change_id)?;
+    // The whole proposal is planned before any selection: duplicates and the
+    // required set are properties of the list, so `--verification-id` cannot
+    // narrow defect evaluation. Defects stop here, before the store is even
+    // resolved, so no evidence is read for reuse or modified.
+    let plan = plan_declared_gates(&declared);
+    if !plan.is_valid() {
+        report_declaration_defects(change_id, &plan.defects, json_output);
+        return Ok(EXIT_UNSATISFIED);
+    }
+    let selected = select(declared, verification_id)?;
     let store = resolve_store(&workspace, change_id)?;
     if plan_only {
         report_plan(&workspace, &store.evidence(), &selected, json_output).await?;

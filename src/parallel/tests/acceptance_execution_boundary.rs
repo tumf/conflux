@@ -1296,3 +1296,162 @@ async fn acceptance_execution_boundary_changed_change_inputs_permit_a_new_attemp
         "changed change inputs must restore eligibility, got {result:?}"
     );
 }
+
+// ============================================================================
+// Invalid required declarations fail closed as a verdict, not a hold
+// ============================================================================
+
+/// One verification declaration entry for a hand-assembled proposal.
+fn declaration_yaml(change: &str, id: &str, command: &str) -> String {
+    format!(
+        "\x20 - id: {id}\n\
+\x20   requirement: the gate passes\n\
+\x20   phase: pre-integration\n\
+\x20   owner: conflux-acceptance\n\
+\x20   trigger: pull-request-validation\n\
+\x20   automation: openspec/changes/{change}/proposal.md\n\
+\x20   evidence: \"{command}\"\n\
+\x20   rerun: \"{command}\"\n\
+\x20   prerequisites: []\n\
+\x20   execution_class: repository-local\n\
+\x20   completion_role: change-blocking\n"
+    )
+}
+
+fn proposal_with_declarations(entries: &[String]) -> String {
+    format!("---\nverifications:\n{}---\n# Change\n", entries.concat())
+}
+
+/// A gate script outside the target that appends one line per execution, so
+/// "ran exactly once" and "never ran" are counts rather than inferences.
+fn counting_gate(external: &Path) -> (String, PathBuf) {
+    let counter = external.join("gate-runs.txt");
+    let script = external.join("gate.sh");
+    std::fs::write(&script, format!("echo run >> '{}'\n", counter.display()))
+        .or_fail("unexpected error");
+    (format!("sh {}", script.display()), counter)
+}
+
+fn gate_runs(counter: &Path) -> usize {
+    std::fs::read_to_string(counter)
+        .map(|content| content.lines().count())
+        .unwrap_or(0)
+}
+
+/// A required declaration the runtime cannot supervise settles as a `fail`
+/// verdict about the candidate: a real attempt with `[DECLARATION_INVALID]`
+/// findings, no reviewer, no gate — not even the valid one beside it — no
+/// evidence, no hold, and a persisted manifest that names the defect.
+#[tokio::test]
+async fn required_verification_fail_closed_invalid_manifest_fails_without_running_anything() {
+    let change = "required-verification-fail-closed-invalid";
+    let gate_root = TempDir::new().or_fail("unexpected error");
+    let (valid_command, counter) = counting_gate(gate_root.path());
+    let proposal = proposal_with_declarations(&[
+        declaration_yaml(change, "valid-gate", &valid_command),
+        declaration_yaml(change, "shell-gate", &format!("{valid_command} && true")),
+    ]);
+    let fixture = Fixture::new(change, &proposal).await;
+    let config = config_with_reviewer(canonical_reviewer());
+
+    let (result, iteration) = fixture.accept(&config, &runner(3600)).await;
+
+    let findings = match result {
+        AcceptanceResult::Fail { findings } => findings,
+        other => panic!("an invalid required manifest must FAIL the candidate, got {other:?}"),
+    };
+    let finding = findings
+        .iter()
+        .map(|finding| finding.text().to_string())
+        .find(|text| text.starts_with("[DECLARATION_INVALID]"))
+        .unwrap_or_else(|| panic!("a [DECLARATION_INVALID] finding is required: {findings:?}"));
+    assert!(finding.contains("'shell-gate'"), "{finding}");
+    assert!(finding.contains("rerun"), "{finding}");
+    assert!(finding.contains("declaration_shell_syntax"), "{finding}");
+    assert!(
+        finding.contains(&format!("openspec/changes/{change}/proposal.md")),
+        "{finding}"
+    );
+    assert!(!finding.contains("tool_unavailable"), "{finding}");
+    assert!(
+        iteration > 0,
+        "a declaration verdict records a real attempt"
+    );
+
+    assert!(
+        !fixture.reviewer_started(),
+        "the AI runner must not be invoked"
+    );
+    assert_eq!(gate_runs(&counter), 0, "no declared gate may be launched");
+    assert!(
+        !fixture.store_root().await.join("gates").exists(),
+        "no evidence may be written"
+    );
+    assert!(
+        crate::orchestration::acceptance::execution_manifest::live_acceptance_holds()
+            .get(change)
+            .is_none(),
+        "a verdict records no execution hold"
+    );
+    let manifest = fixture
+        .manifests()
+        .await
+        .load()
+        .expect("the invalid manifest is persisted for diagnosis");
+    assert!(manifest.gates.is_empty());
+    assert_eq!(manifest.declaration_defects.len(), 1);
+    assert_eq!(
+        manifest.declaration_defects[0].verification_id,
+        "shell-gate"
+    );
+    assert_eq!(manifest.declaration_defects[0].field, "rerun");
+    assert!(fixture.porcelain_status().await.is_empty());
+}
+
+/// One valid required declaration executes its gate exactly once and proceeds
+/// to the reviewer.
+#[tokio::test]
+async fn required_verification_fail_closed_valid_gate_runs_exactly_once() {
+    let change = "required-verification-fail-closed-valid";
+    let gate_root = TempDir::new().or_fail("unexpected error");
+    let (command, counter) = counting_gate(gate_root.path());
+    let fixture = Fixture::new(
+        change,
+        &proposal_with_declarations(&[declaration_yaml(change, "valid-gate", &command)]),
+    )
+    .await;
+    let config = config_with_reviewer(canonical_reviewer());
+
+    let (result, _) = fixture.accept(&config, &runner(3600)).await;
+
+    assert!(matches!(result, AcceptanceResult::Pass), "{result:?}");
+    assert_eq!(
+        gate_runs(&counter),
+        1,
+        "the declared gate runs exactly once"
+    );
+    assert!(fixture.reviewer_started());
+    let manifest = fixture.manifests().await.load().expect("manifest");
+    assert!(!manifest.is_declaration_invalid());
+    assert_eq!(manifest.gates.len(), 1);
+}
+
+/// A legitimately empty allowlist keeps today's behavior: the reviewer runs
+/// with a closed, empty boundary, and the manifest is not an invalid one.
+#[tokio::test]
+async fn required_verification_fail_closed_empty_allowlist_still_proceeds() {
+    let fixture = Fixture::new(
+        "required-verification-fail-closed-empty",
+        PROPOSAL_WITHOUT_GATES,
+    )
+    .await;
+    let config = config_with_reviewer(canonical_reviewer());
+
+    let (result, _) = fixture.accept(&config, &runner(3600)).await;
+
+    assert!(matches!(result, AcceptanceResult::Pass), "{result:?}");
+    assert!(fixture.reviewer_started());
+    let manifest = fixture.manifests().await.load().expect("manifest");
+    assert!(!manifest.has_gates());
+    assert!(!manifest.is_declaration_invalid());
+}

@@ -233,7 +233,9 @@ verifications:
 ---
 ```
 
-Every implementation or hybrid proposal MUST declare at least one complete `pre-integration` verification. Every claimed post-integration outcome MUST use a complete `post-integration` declaration. `id`, `requirement`, `phase`, `owner`, `trigger`, `automation`, `evidence`, `rerun`, and `prerequisites` are required. `pre-integration` requires `owner: conflux-acceptance`; `post-integration` requires `owner: repository-automation`. `automation` must be a safe repository-relative tracked regular file.
+Every implementation or hybrid proposal MUST declare at least one complete `pre-integration` verification. Every claimed post-integration outcome MUST use a complete `post-integration` declaration. `id`, `requirement`, `phase`, `owner`, `trigger`, `automation`, `evidence`, `rerun`, and `prerequisites` are required. `pre-integration` requires `owner: conflux-acceptance`; `post-integration` requires `owner: repository-automation`. `automation` must be a safe repository-relative tracked regular file. Verification IDs must be unique; a duplicated ID is rejected as `declaration_duplicate_id`, never deduplicated.
+
+A `completion_role: change-blocking` declaration's `rerun` (or `evidence` when `rerun` is absent) MUST be a plain argv the runtime can start directly: no `|`, `&`, `;`, `<`, `>`, `(`, `)`, `` ` ``, or `$`, and balanced quotes. Anything else is a `declaration_shell_syntax` defect that fails `cflx openspec validate --strict` and settles Acceptance as a `[DECLARATION_INVALID]` fail. Put pipelines or conditionals in a tracked script and declare `sh path/to/script.sh` instead. Operational-observation commands are not held to this rule.
 
 Classify outcomes structurally. Do not put deployment URLs, external HTTP/API checks, or results available only after default-branch integration into pre-integration checkbox acceptance conditions. Record those as post-integration automation with evidence publication and rerun ownership.
 

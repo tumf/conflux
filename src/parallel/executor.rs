@@ -1676,7 +1676,7 @@ pub(crate) async fn run_acceptance_boundary(
         live_acceptance_holds, partition_deadline, AcceptanceExecutionHold, AcceptanceHoldCategory,
     };
     use crate::orchestration::acceptance::gate_execution::{
-        classify_gate_results, execute_declared_gates, plan_manifest_reuse, GateBudget,
+        classify_boundary, execute_declared_gates, plan_manifest_reuse, GateBudget,
     };
     use crate::orchestration::acceptance::manifest_builder::{
         build_manifest_for_workspace, repository_project_root,
@@ -1810,6 +1810,27 @@ pub(crate) async fn run_acceptance_boundary(
         );
     }
 
+    // An invalid required manifest is a verdict about the candidate's own
+    // declarations. Nothing is run, nothing is reused, no evidence is read or
+    // written, and no hold is recorded — the persisted manifest above is what
+    // explains it.
+    if manifest.is_declaration_invalid() {
+        warn!(
+            change_id = change_id,
+            defects = manifest.declaration_defects.len(),
+            "Acceptance boundary refused: required verification declarations are invalid"
+        );
+        let gates = crate::orchestration::acceptance::execution_manifest::GateResults::default();
+        return Ok(Some(AcceptanceBoundary {
+            verdict: classify_boundary(&manifest, &gates),
+            manifest,
+            gates,
+            review_budget: partition.work_duration(),
+            store,
+            review_base_ref: review_base.map(str::to_string),
+        }));
+    }
+
     let reuse_decisions = plan_manifest_reuse(
         &GitRepositoryFacts,
         workspace_path,
@@ -1903,7 +1924,7 @@ pub(crate) async fn run_acceptance_boundary(
         "Acceptance execution manifest frozen"
     );
     Ok(Some(AcceptanceBoundary {
-        verdict: classify_gate_results(&gates),
+        verdict: classify_boundary(&manifest, &gates),
         manifest,
         gates,
         review_budget,
@@ -2213,54 +2234,91 @@ pub async fn execute_acceptance_in_workspace(
     // reviewer would only consume budget to rediscover what the runtime knows.
     if let Some(boundary) = boundary.as_ref() {
         use crate::orchestration::acceptance::gate_execution::GateVerdict;
-        match &boundary.verdict {
-            GateVerdict::Proceed => {}
+        // Both gate-decided `fail` verdicts — a declared gate that ran and
+        // failed, and required declarations that could not be supervised at
+        // all — record a real attempt against the candidate and reach the
+        // ordinary repair cycle. Neither records a hold.
+        let candidate = &boundary.manifest.candidate_commit_oid;
+        let short_candidate = &candidate[..12.min(candidate.len())];
+        let gate_fail = match &boundary.verdict {
             GateVerdict::Failed { evidence } => {
-                let attempt_number = agent.next_acceptance_attempt_number(change_id);
                 let mut findings = vec![format!(
                     "Declared change-blocking verification failed under runtime supervision \
-                     against candidate {}.",
-                    &boundary.manifest.candidate_commit_oid
-                        [..12.min(boundary.manifest.candidate_commit_oid.len())]
+                     against candidate {short_candidate}."
                 )];
                 findings.extend(evidence.iter().cloned());
-                let findings = crate::acceptance::legacy_findings(findings);
-                let attempt = crate::history::AcceptanceAttempt {
-                    attempt: attempt_number,
-                    passed: false,
-                    duration: start_time_for_gate_phase.elapsed(),
-                    findings: Some(findings.clone()),
-                    exit_code: None,
-                    stdout_tail: None,
-                    stderr_tail: None,
-                    commit_hash: Some(boundary.manifest.candidate_commit_oid.clone()),
-                };
-                agent.record_acceptance_attempt(change_id, attempt.clone());
-                acceptance_history.lock().await.record(change_id, attempt);
-                acceptance_tail_injected.lock().await.remove(change_id);
-                if let Some(ref tx) = event_tx {
-                    let _ = tx
-                        .send(ParallelEvent::Log(
-                            crate::events::LogEntry::error(format!(
-                                "Acceptance failed on a declared change-blocking verification: {}",
-                                evidence.join(" | ")
-                            ))
+                Some((
+                    findings,
+                    format!(
+                        "Acceptance failed on a declared change-blocking verification: {}",
+                        evidence.join(" | ")
+                    ),
+                ))
+            }
+            GateVerdict::DeclarationInvalid { defects } => {
+                let proposal = format!("openspec/changes/{change_id}/proposal.md");
+                let findings: Vec<String> = defects
+                    .iter()
+                    .map(|defect| {
+                        format!(
+                            "[DECLARATION_INVALID] {proposal}: {} — a change-blocking \
+                             verification must be a supervisable declaration; no declared gate \
+                             ran against candidate {short_candidate}.",
+                            defect.summary()
+                        )
+                    })
+                    .collect();
+                Some((
+                    findings,
+                    format!(
+                        "Acceptance failed: {} invalid required verification declaration(s) in \
+                         {proposal}",
+                        defects.len()
+                    ),
+                ))
+            }
+            _ => None,
+        };
+        if let Some((findings, log_message)) = gate_fail {
+            let attempt_number = agent.next_acceptance_attempt_number(change_id);
+            let findings = crate::acceptance::legacy_findings(findings);
+            let attempt = crate::history::AcceptanceAttempt {
+                attempt: attempt_number,
+                passed: false,
+                duration: start_time_for_gate_phase.elapsed(),
+                findings: Some(findings.clone()),
+                exit_code: None,
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: Some(candidate.clone()),
+            };
+            agent.record_acceptance_attempt(change_id, attempt.clone());
+            acceptance_history.lock().await.record(change_id, attempt);
+            acceptance_tail_injected.lock().await.remove(change_id);
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::error(log_message)
                             .with_change_id(change_id)
                             .with_operation("acceptance")
                             .with_iteration(attempt_number),
-                        ))
-                        .await;
-                    let _ = tx
-                        .send(ParallelEvent::AcceptanceCompleted {
-                            change_id: change_id.to_string(),
-                        })
-                        .await;
-                }
-                return Ok((
-                    crate::orchestration::AcceptanceResult::Fail { findings },
-                    attempt_number,
-                ));
+                    ))
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
+                    .await;
             }
+            return Ok((
+                crate::orchestration::AcceptanceResult::Fail { findings },
+                attempt_number,
+            ));
+        }
+        match &boundary.verdict {
+            GateVerdict::Proceed
+            | GateVerdict::Failed { .. }
+            | GateVerdict::DeclarationInvalid { .. } => {}
             GateVerdict::ExternalPrerequisite { blocker } => {
                 let attempt_number = agent.next_acceptance_attempt_number(change_id);
                 if let Some(ref tx) = event_tx {

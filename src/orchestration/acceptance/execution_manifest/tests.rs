@@ -74,6 +74,7 @@ fn manifest(change_id: &str, gates: Vec<ManifestGate>) -> AcceptanceExecutionMan
         },
         executable_identity: "3".repeat(64),
         gates,
+        declaration_defects: Vec::new(),
         created_at: chrono::Utc::now(),
         absolute_deadline_secs: 3600,
         work_budget_secs: 3570,
@@ -106,13 +107,6 @@ fn acceptance_execution_boundary_selects_only_eligible_declarations() {
             "gh workflow run ci",
         ),
         declaration(
-            "deployed-check",
-            "pre-integration",
-            "deployed-service",
-            "change-blocking",
-            "curl https://example.invalid",
-        ),
-        declaration(
             "not-blocking",
             "pre-integration",
             "repository-local",
@@ -120,18 +114,19 @@ fn acceptance_execution_boundary_selects_only_eligible_declarations() {
             "cargo test other --lib",
         ),
         declaration(
-            "shell-pipeline",
+            "observation-pipeline",
             "pre-integration",
             "repository-local",
-            "change-blocking",
+            "operational-observation",
             "cargo test | tee out.log",
         ),
     ];
 
-    let gates = eligible_gates(&declarations);
+    let plan = plan_declared_gates(&declarations);
 
+    assert!(plan.is_valid(), "{:?}", plan.defects);
     assert_eq!(
-        gates
+        plan.gates
             .iter()
             .map(|gate| gate.verification_id.as_str())
             .collect::<Vec<_>>(),
@@ -157,8 +152,9 @@ fn acceptance_execution_boundary_empty_allowlist_is_a_valid_boundary() {
     );
 }
 
-/// Gates are ordered by verification ID and duplicates collapse, so the same
-/// declarations always hash the same way regardless of authoring order.
+/// Gates are ordered by verification ID, so the same declarations always hash
+/// the same way regardless of authoring order. (Duplicates no longer collapse:
+/// they are `declaration_duplicate_id` defects.)
 #[test]
 fn acceptance_execution_boundary_gate_order_is_canonical() {
     let declarations = vec![
@@ -176,19 +172,12 @@ fn acceptance_execution_boundary_gate_order_is_canonical() {
             "change-blocking",
             "cargo test alpha --lib",
         ),
-        declaration(
-            "alpha",
-            "pre-integration",
-            "repository-local",
-            "change-blocking",
-            "cargo test alpha --lib",
-        ),
     ];
 
-    let gates = eligible_gates(&declarations);
+    let plan = plan_declared_gates(&declarations);
 
     assert_eq!(
-        gates
+        plan.gates
             .iter()
             .map(|gate| gate.verification_id.as_str())
             .collect::<Vec<_>>(),
@@ -889,4 +878,269 @@ fn acceptance_execution_boundary_change_input_digest_resists_concatenation() {
     ];
 
     assert_ne!(digest_change_inputs(&split), digest_change_inputs(&joined));
+}
+
+// ============================================================================
+// Shared declaration planner: required declarations fail closed
+// ============================================================================
+
+fn required(id: &str, command: &str) -> VerificationDeclaration {
+    declaration(
+        id,
+        "pre-integration",
+        "repository-local",
+        "change-blocking",
+        command,
+    )
+}
+
+/// The single defect a one-declaration plan produced, with no gate beside it.
+fn only_defect(declarations: &[VerificationDeclaration]) -> DeclarationDefect {
+    let plan = plan_declared_gates(declarations);
+    assert!(
+        plan.gates.is_empty(),
+        "an invalid required manifest offers no gate: {:?}",
+        plan.gates
+    );
+    assert_eq!(plan.defects.len(), 1, "{:?}", plan.defects);
+    plan.defects.into_iter().next().unwrap()
+}
+
+#[test]
+fn required_verification_fail_closed_valid_required_declaration_is_one_gate() {
+    let plan = plan_declared_gates(&[required("gate", "cargo test focused --lib")]);
+
+    assert!(plan.is_valid());
+    assert_eq!(plan.defects, Vec::new());
+    assert_eq!(plan.gates.len(), 1);
+    assert_eq!(plan.gates[0].verification_id, "gate");
+    assert_eq!(
+        plan.gates[0].argv,
+        vec!["cargo", "test", "focused", "--lib"]
+    );
+}
+
+#[test]
+fn required_verification_fail_closed_shell_syntax_is_a_typed_defect() {
+    for (command, construct) in [
+        ("cargo test | tee out.log", "'|' at character offset 11"),
+        ("cargo test && cargo clippy", "'&' at character offset 11"),
+        ("cargo test; cargo clippy", "';' at character offset 10"),
+        ("cargo test > out.log", "'>' at character offset 11"),
+        ("cargo test $(echo focused)", "'$' at character offset 11"),
+        ("cargo test 'focused", "unbalanced quote"),
+    ] {
+        let defect = only_defect(&[required("gate", command)]);
+        assert_eq!(defect.code, "declaration_shell_syntax", "{command}");
+        assert_eq!(defect.field, "rerun", "{command}");
+        assert_eq!(defect.verification_id, "gate");
+        assert_eq!(defect.position, 1);
+        assert!(
+            defect.detail.contains(construct),
+            "{command}: detail must name the construct: {}",
+            defect.detail
+        );
+        assert!(
+            !defect.detail.contains(command),
+            "the detail must not echo the command: {}",
+            defect.detail
+        );
+    }
+}
+
+#[test]
+fn required_verification_fail_closed_evidence_source_is_named_when_rerun_is_absent() {
+    let mut declaration = required("gate", "cargo test | tee out.log");
+    declaration.rerun = None;
+
+    let defect = only_defect(&[declaration]);
+
+    assert_eq!(defect.code, "declaration_shell_syntax");
+    assert_eq!(defect.field, "evidence");
+}
+
+#[test]
+fn required_verification_fail_closed_empty_command_is_a_typed_defect() {
+    let defect = only_defect(&[required("gate", "   ")]);
+
+    assert_eq!(defect.code, "declaration_missing_command");
+    assert_eq!(defect.field, "rerun");
+}
+
+#[test]
+fn required_verification_fail_closed_missing_automation_is_a_typed_defect() {
+    for automation in [None, Some(""), Some("/etc/passwd"), Some("../outside.rs")] {
+        let mut declaration = required("gate", "cargo test --lib");
+        declaration.automation = automation.map(str::to_string);
+
+        let defect = only_defect(&[declaration]);
+
+        assert_eq!(
+            defect.code, "declaration_missing_automation",
+            "{automation:?}"
+        );
+        assert_eq!(defect.field, "automation");
+    }
+}
+
+#[test]
+fn required_verification_fail_closed_identity_defects_name_the_position() {
+    let mut missing = required("ignored", "cargo test --lib");
+    missing.id = None;
+    let defect = only_defect(&[missing]);
+    assert_eq!(defect.code, "declaration_missing_id");
+    assert_eq!(defect.field, "id");
+    assert_eq!(defect.verification_id, "<position 1>");
+
+    let defect = only_defect(&[required("../escape", "cargo test --lib")]);
+    assert_eq!(defect.code, "declaration_unstorable_id");
+    assert_eq!(defect.field, "id");
+}
+
+#[test]
+fn required_verification_fail_closed_duplicate_ids_are_reported_not_deduplicated() {
+    let identical = vec![
+        required("gate", "cargo test --lib"),
+        required("gate", "cargo test --lib"),
+    ];
+    let different = vec![
+        required("gate", "cargo test --lib"),
+        required("other", "cargo test other --lib"),
+        required("gate", "cargo test something-else --lib"),
+    ];
+
+    for (declarations, positions) in [(identical, "1, 2"), (different, "1, 3")] {
+        let plan = plan_declared_gates(&declarations);
+        assert!(
+            plan.gates.is_empty(),
+            "no gate may survive an invalid required manifest: {:?}",
+            plan.gates
+        );
+        let duplicates: Vec<_> = plan
+            .defects
+            .iter()
+            .filter(|defect| defect.code == "declaration_duplicate_id")
+            .collect();
+        assert_eq!(duplicates.len(), 2, "every occurrence is a defect");
+        for defect in duplicates {
+            assert_eq!(defect.verification_id, "gate");
+            assert_eq!(defect.field, "id");
+            assert!(
+                defect.detail.contains(&format!("positions {positions}")),
+                "{}",
+                defect.detail
+            );
+        }
+        assert_eq!(plan.defects.len(), 2, "{:?}", plan.defects);
+    }
+}
+
+#[test]
+fn required_verification_fail_closed_non_required_declarations_are_never_evaluated() {
+    let mut legacy = declaration(
+        "legacy",
+        "pre-integration",
+        "repository-local",
+        "change-blocking",
+        "cargo test | tee legacy.log",
+    );
+    legacy.execution_class = None;
+    legacy.completion_role = None;
+    let observation = declaration(
+        "observation",
+        "post-integration",
+        "deployed-service",
+        "operational-observation",
+        "curl https://example.invalid/$PATH | jq .",
+    );
+
+    let mixed = plan_declared_gates(&[required("gate", "cargo test --lib"), observation.clone()]);
+    assert!(mixed.is_valid(), "{:?}", mixed.defects);
+    assert_eq!(mixed.gates.len(), 1);
+
+    let only_non_required = plan_declared_gates(&[legacy, observation]);
+    assert!(
+        only_non_required.is_valid(),
+        "{:?}",
+        only_non_required.defects
+    );
+    assert!(only_non_required.gates.is_empty());
+    assert!(plan_declared_gates(&[]).is_valid());
+}
+
+#[test]
+fn required_verification_fail_closed_role_conflicts_name_the_field() {
+    let defect = only_defect(&[declaration(
+        "gate",
+        "post-integration",
+        "repository-local",
+        "change-blocking",
+        "cargo test --lib",
+    )]);
+    assert_eq!(defect.code, "declaration_role_conflict");
+    assert_eq!(defect.field, "phase");
+
+    let defect = only_defect(&[declaration(
+        "gate",
+        "pre-integration",
+        "deployed-service",
+        "change-blocking",
+        "cargo test --lib",
+    )]);
+    assert_eq!(defect.code, "declaration_role_conflict");
+    assert_eq!(defect.field, "execution_class");
+}
+
+/// A valid declaration next to a defective one does not become a gate: the
+/// required set is judged as a whole.
+#[test]
+fn required_verification_fail_closed_one_defect_invalidates_every_gate() {
+    let plan = plan_declared_gates(&[
+        required("good", "cargo test --lib"),
+        required("bad", "cargo test | tee out.log"),
+    ]);
+
+    assert!(!plan.is_valid());
+    assert!(plan.gates.is_empty());
+    assert_eq!(plan.defects.len(), 1);
+    assert_eq!(plan.defects[0].verification_id, "bad");
+    assert_eq!(plan.defects[0].position, 2);
+}
+
+/// The frozen manifest records its defects, they move the fingerprint, they
+/// reach the review projection, and a stored manifest that carries a gate
+/// beside a defect is refused rather than trusted.
+#[test]
+fn required_verification_fail_closed_manifest_distinguishes_invalid_from_empty() {
+    let empty = manifest("declaration-invalid", Vec::new());
+    let mut invalid = empty.clone();
+    invalid.declaration_defects = only_defect_list();
+
+    assert!(!empty.is_declaration_invalid());
+    assert!(invalid.is_declaration_invalid());
+    assert_ne!(empty.fingerprint(), invalid.fingerprint());
+    assert_eq!(
+        invalid.to_review_json()["declaration_defects"][0]["code"],
+        "declaration_shell_syntax"
+    );
+    assert_eq!(
+        empty.to_review_json()["declaration_defects"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let round_trip = parse_manifest(&serde_json::to_vec(&invalid).unwrap()).unwrap();
+    assert_eq!(round_trip.declaration_defects, invalid.declaration_defects);
+
+    let mut contradictory = invalid.clone();
+    contradictory.gates = vec![gate("alpha")];
+    assert!(matches!(
+        parse_manifest(&serde_json::to_vec(&contradictory).unwrap()),
+        Err(ManifestDefect::Malformed(_))
+    ));
+}
+
+fn only_defect_list() -> Vec<DeclarationDefect> {
+    vec![only_defect(&[required("gate", "cargo test | tee out.log")])]
 }
