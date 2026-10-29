@@ -995,17 +995,35 @@ async fn idle_stopping_no_work_graceful_stop_settles_on_every_adapter() {
         "the accepted stop really recorded its request on the scheduler"
     );
 
-    let (_repo, executor, mut scheduler_events) = scheduler_over(&wired, graceful_stop);
+    // A pass that still holds a *dispatchable* candidate keeps waiting: the
+    // request has a later boundary to reach, so this control proves the
+    // settlement is "nothing executable is left", not "a stop was asked for".
+    // The candidate is dispatchable only with current reducer intent, so it is
+    // judged by a scheduler over its own reducer that holds that intent, sharing
+    // the same recorded stop request.
+    {
+        let dispatchable = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(vec![ALPHA.to_string()], 10),
+        ));
+        dispatchable.write().await.apply_command(
+            crate::orchestration::state::ReducerCommand::AddToQueue(ALPHA.to_string()),
+        );
+        let (_repo, mut candidate_scheduler, mut candidate_events) =
+            scheduler_over(&wired, graceful_stop.clone());
+        candidate_scheduler.set_shared_orchestrator_state(dispatchable);
+        assert!(
+            !candidate_scheduler
+                .settle_graceful_stop_at_idle_boundary(&[create_test_change(ALPHA)])
+                .await,
+            "a graceful stop still owes the work boundary it asked to stop at"
+        );
+        assert!(
+            candidate_events.try_recv().is_err(),
+            "a scheduler that did not settle publishes no terminal event"
+        );
+    }
 
-    // A pass that still holds a reconciled candidate keeps waiting: the request
-    // has a later boundary to reach, so this control proves the settlement is
-    // "no work is left", not "a stop was asked for".
-    assert!(
-        !executor
-            .settle_graceful_stop_at_idle_boundary(&[create_test_change(ALPHA)])
-            .await,
-        "a graceful stop still owes the work boundary it asked to stop at"
-    );
+    let (_repo, executor, mut scheduler_events) = scheduler_over(&wired, graceful_stop);
 
     assert!(
         executor.settle_graceful_stop_at_idle_boundary(&[]).await,
@@ -1047,6 +1065,100 @@ async fn idle_stopping_no_work_graceful_stop_settles_on_every_adapter() {
             (BETA.to_string(), "not queued".to_string()),
         ],
         "the rows are exactly where the settled run left them"
+    );
+}
+
+/// Verification `blocked-idle-graceful-stop`: the blocked-only neighbor of the
+/// no-work stop. A queued row held behind a dependency that was never proposed
+/// is not an executing phase, so the stop settles there too, and Core, TUI, and
+/// Web all leave `Stopping` for the inactive state.
+///
+/// The row is not completed and not turned into the terminal `stopped` row of a
+/// targeted force-stop: process-wide `Stopped` reconciliation returns ordinary
+/// queued intent to `not queued`, and its execution mark survives.
+#[tokio::test]
+async fn blocked_idle_graceful_stop_settles_on_every_adapter() {
+    let mut wired = arranged(Setup::MarkedOrdinary, true).await;
+    wired.harness.state.write().await.apply_command(
+        crate::orchestration::state::ReducerCommand::AddToQueue(ALPHA.to_string()),
+    );
+    let graceful_stop = wired.harness.scheduler.graceful_stop_flag();
+
+    wired.harness.run(&mut wired.app, TuiCommand::Stop).await;
+    let stopping = wired.settled().await;
+    assert_eq!(
+        (
+            stopping.core_mode,
+            stopping.tui_mode,
+            stopping.web_mode.as_str()
+        ),
+        (
+            OperatorMode::Stopping,
+            AppExecutionMode::Stopping,
+            "stopping"
+        ),
+    );
+    assert_eq!(
+        stopping.statuses[0],
+        (ALPHA.to_string(), "queued".to_string()),
+        "the blocked row is still queued while the stop is pending"
+    );
+
+    let (_repo, executor, mut scheduler_events) = scheduler_over(&wired, graceful_stop);
+    let mut blocked = create_test_change(ALPHA);
+    blocked.dependencies = vec!["never-proposed".to_string()];
+    assert!(
+        executor
+            .settle_graceful_stop_at_idle_boundary(&[blocked])
+            .await,
+        "inactive blocked-only work owes the stop no boundary"
+    );
+    let published = scheduler_events
+        .try_recv()
+        .expect("the scheduler published its own terminal stop at that boundary");
+    assert!(
+        matches!(published, ExecutionEvent::Stopped),
+        "the settlement is the run's one terminal stop, got {published:?}"
+    );
+    assert!(
+        scheduler_events.try_recv().is_err(),
+        "exactly one terminal event"
+    );
+
+    wired.dispatch(published).await;
+    let stopped = wired.settled().await;
+    assert_eq!(
+        (
+            stopped.core_mode,
+            stopped.tui_mode,
+            stopped.tui_idle,
+            stopped.web_mode.as_str(),
+            stopped.web_idle
+        ),
+        (
+            OperatorMode::Stopped,
+            AppExecutionMode::Stopped,
+            false,
+            "stopped",
+            false
+        ),
+        "Core, TUI, and Web all leave Stopping for the inactive state"
+    );
+    assert!(
+        stopped.runs.is_empty() && stopped.explicit_retries.is_empty(),
+        "no run, retry, or queue intent was synthesized to reach the stop"
+    );
+    assert_eq!(
+        stopped.statuses,
+        vec![
+            (ALPHA.to_string(), "not queued".to_string()),
+            (BETA.to_string(), "not queued".to_string()),
+        ],
+        "ordinary queued intent returns to not queued, never completed or stopped"
+    );
+    assert!(
+        wired.harness.marks.is_marked(ALPHA) && wired.harness.marks.is_marked(BETA),
+        "execution marks survive the stop"
     );
 }
 

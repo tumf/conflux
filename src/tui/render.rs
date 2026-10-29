@@ -8150,6 +8150,83 @@ mod tests {
         );
     }
 
+    /// The scheduler's change-local proposal-metadata error reaches the
+    /// existing error row and Error Details popup through the ordinary
+    /// `ProcessingError` event, at normal and narrow sizes, with the remedy
+    /// readable, no invented Acceptance provenance, and unrelated rows intact.
+    #[test]
+    fn queued_proposal_diagnostic_renders_in_existing_error_row_and_details() {
+        use crate::parallel::queue_state::ProposalMetadataFailure;
+
+        let diagnostic = ProposalMetadataFailure::Unreadable.diagnostic("alpha");
+        for (width, height) in [(120u16, 30u16), (80, 24)] {
+            let mut app = create_test_app(vec![
+                create_test_change("alpha"),
+                create_test_change("beta"),
+            ]);
+            app.changes[0].set_display_status_cache("queued");
+            let row_of = |content: &str, id: &str| {
+                content
+                    .lines()
+                    .find(|line| line.contains(id))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| panic!("{id} row rendered at {width}x{height}: {content}"))
+            };
+            let before = buffer_to_string(&render_buffer(&mut app, width, height));
+            let beta_before = row_of(&before, "beta");
+
+            app.handle_orchestrator_event(crate::tui::events::OrchestratorEvent::ProcessingError {
+                id: "alpha".to_string(),
+                error: diagnostic.clone(),
+            });
+            app.cursor_index = 0;
+            let rows = buffer_to_string(&render_buffer(&mut app, width, height));
+            assert!(
+                row_of(&rows, "alpha").contains("[error]"),
+                "{width}x{height}: {rows}"
+            );
+            // Column widths are shared by every row, so the unrelated row is
+            // compared by its own facts rather than byte-for-byte.
+            let beta_after = row_of(&rows, "beta");
+            for row in [&beta_before, &beta_after] {
+                assert!(
+                    row.contains("[not queued]") && row.contains("0/3") && !row.contains("rror"),
+                    "{width}x{height}: unrelated row unchanged: {row}"
+                );
+            }
+            assert!(rows.contains("Enter: details"), "{width}x{height}: {rows}");
+
+            assert!(app.open_error_details_popup());
+            let details = buffer_to_string(&render_buffer(&mut app, width, height));
+            for token in [
+                "Error Details",
+                "Change: alpha",
+                "unreadable proposal",
+                "openspec/changes/alpha/proposal.md",
+                "commit",
+                "Retry",
+                "scroll",
+                "Esc",
+            ] {
+                assert!(
+                    details.contains(token),
+                    "{width}x{height}: missing {token:?}:\n{details}"
+                );
+            }
+            for invented in ["Decision:", "Verification:", "reviewer"] {
+                assert!(
+                    !details.contains(invented),
+                    "{width}x{height}: no Acceptance provenance: {details}"
+                );
+            }
+
+            // Standard scrolling keeps the popup and its diagnostic in place.
+            app.scroll_error_details_popup(1);
+            let scrolled = buffer_to_string(&render_buffer(&mut app, width, height));
+            assert!(scrolled.contains("Error Details"), "{scrolled}");
+        }
+    }
+
     // ========================================================================
     // Merged-row dismissal
     // ========================================================================

@@ -310,11 +310,24 @@ impl ParallelExecutor {
     /// instead would sit in its event-driven wait with no timer and no pending
     /// work to wake it, leaving every frontend in `Stopping` indefinitely.
     ///
-    /// The drain evidence is [`Self::is_fully_drained`] over the evaluation's own
-    /// coherent reducer view, so this settles only the genuinely empty case: a
-    /// blocked-only park, a resolve or reject wait, and a pending merge all keep
-    /// work the stop is still owed, and reach their existing boundary as before.
-    /// An incomplete view has observed nothing and never settles.
+    /// Two boundaries qualify, both judged from the evaluation's own coherent
+    /// reducer view:
+    ///
+    /// - [`Self::is_fully_drained`]: nothing is left at all.
+    /// - The existing blocked-only classification
+    ///   ([`Self::is_blocked_only_scheduler_state_with_snapshot`]) with an empty
+    ///   join set: every remaining candidate is inactive held work — a missing
+    ///   dependency, a terminal error awaiting retry, an Acceptance hold — that
+    ///   no executing phase will ever release. Waiting for its "completion"
+    ///   would wait for a phase that does not exist. That classification
+    ///   already refuses in-flight work, resolve and reject lane waiters, a
+    ///   manual resolver, and a pending merge, so each of those keeps the work
+    ///   the stop is still owed and reaches its existing boundary as before.
+    ///
+    /// A dispatchable candidate is a later boundary, so it never settles here,
+    /// and an incomplete view has observed nothing and never settles. Settling
+    /// executes, retries, and clears nothing: queue intent follows the existing
+    /// process-wide `Stopped` reconciliation like any other graceful stop.
     ///
     /// Emits the run's one terminal `Stopped` and reports whether the caller must
     /// leave its loop.
@@ -328,12 +341,22 @@ impl ParallelExecutor {
         if !self.graceful_stop_requested() || !work_snapshot.is_complete() {
             return false;
         }
-        if !self.is_fully_drained(join_set_empty, queued.is_empty(), in_flight.is_empty()) {
+        if self.is_fully_drained(join_set_empty, queued.is_empty(), in_flight.is_empty()) {
+            info!(
+                "Graceful stop requested with no work remaining; settling the scheduler at this boundary"
+            );
+        } else if join_set_empty
+            && self
+                .is_blocked_only_scheduler_state_with_snapshot(queued, in_flight, work_snapshot)
+                .await
+        {
+            info!(
+                queued = queued.len(),
+                "Graceful stop requested with only inactive blocked work remaining; settling the scheduler at this boundary"
+            );
+        } else {
             return false;
         }
-        info!(
-            "Graceful stop requested with no work remaining; settling the scheduler at this boundary"
-        );
         send_event(&self.event_tx, ParallelEvent::Stopped).await;
         true
     }
@@ -933,11 +956,12 @@ impl ParallelExecutor {
                 break;
             }
 
-            // An accepted graceful stop with nothing left to wait for. This
-            // evaluation is the safe boundary the request asked for, so the run
-            // ends here instead of parking in a wait that no remaining work
-            // could ever end — which is what left the frontends `Stopping` for a
-            // scheduler that had already settled.
+            // An accepted graceful stop with nothing left to wait for — no work
+            // at all, or only inactive blocked work no executing phase will
+            // release. This evaluation is the safe boundary the request asked
+            // for, so the run ends here instead of parking in a wait that no
+            // remaining work could ever end — which is what left the frontends
+            // `Stopping` for a scheduler that had already settled.
             if self
                 .settle_graceful_stop_when_no_work(
                     join_set.is_empty(),

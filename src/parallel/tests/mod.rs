@@ -9,6 +9,8 @@ mod analysis_liveness_loop;
 #[cfg(test)]
 mod auto_resolve;
 #[cfg(test)]
+mod blocked_idle_graceful_stop;
+#[cfg(test)]
 mod capacity_gated_reanalysis;
 #[cfg(test)]
 mod change_error_f5_retry;
@@ -32,6 +34,8 @@ mod manual_resolve;
 mod manual_resolve_continuation;
 #[cfg(test)]
 mod per_change_upstream;
+#[cfg(test)]
+mod queued_proposal_diagnostic;
 #[cfg(test)]
 mod reanalysis_trigger_lifetime;
 #[cfg(test)]

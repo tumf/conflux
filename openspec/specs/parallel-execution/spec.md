@@ -4544,3 +4544,53 @@ The repository MUST implement unify parallel executor construction within the de
 **Given**: code and contracts outside the declared change boundary
 **When**: this change is implemented and archived
 **Then**: public formats and unrelated lifecycle behavior remain unchanged
+
+### Requirement: Inactive blocked-only work is a safe graceful-stop boundary
+
+The scheduler MUST settle an accepted graceful stop when a coherent reducer view and scheduler runtime ownership prove that only inactive blocked work remains and no active task, lane waiter, resolver, merge, push or cleanup boundary is owed. It MUST reuse the existing stopped outcome and cleanup protocol, preserve marks and real blocker/completion evidence under existing stop semantics, and MUST NOT execute blocked work or report completion success.
+
+#### Scenario: Dependency-only park stops without waiting for a nonexistent phase
+
+- **GIVEN** a persistent scheduler is parked with a queued valid proposal blocked by an unmet dependency and no active runtime or cleanup work
+- **WHEN** graceful stop is accepted and wakes that scheduler
+- **THEN** the scheduler settles exactly one Stopped outcome without another external wake
+- **AND** Core, API and TUI leave Stopping and observe an inactive scheduler
+- **AND** no analyzer, Apply, gate or reviewer starts and the target is not completed
+
+#### Scenario: Runtime or incomplete evidence forbids early settlement
+
+- **GIVEN** a stop is pending but a coherent snapshot is unavailable or real task, lane waiter, merge, resolver or cleanup work remains
+- **WHEN** the scheduler evaluates the blocked-only stop boundary
+- **THEN** it does not claim Stopped from absent evidence or an idle display flag
+- **AND** the existing graceful completion and bounded cleanup protocol remains authoritative
+
+#### Scenario: Stop preserves repair and resume semantics
+
+- **GIVEN** inactive held or errored work was stopped with real evidence and marks preserved under the normal stop contract
+- **WHEN** files or marks change without an explicit accepted Start or Retry
+- **THEN** stopped work is not automatically restarted
+- **AND** later explicit Start or Retry follows existing blocker, completion and phase-aware admission rules
+
+### Requirement: Invalid queued proposal metadata is a visible change-local error
+
+Conflux SHALL reconcile an ordinary admitted proposal's strict metadata read/decode failure before any blocked-only short circuit. It SHALL publish the existing change-local Error and bounded actionable error detail, without global Error, fake dependency or reviewer provenance. The detail SHALL identify the repository-relative proposal path and correction/commit/explicit Retry action without echoing raw declarations or environment values. Current state projection SHALL not depend on diagnostic dedup caches.
+
+#### Scenario: Invalid-only queue cannot silently wait
+- **GIVEN** an admitted proposal has unreadable, wrong-typed or unclosed metadata in LF or CRLF
+- **WHEN** the scheduler evaluates ordinary candidates
+- **THEN** the target becomes change-local error with safe detail before analysis or Apply
+- **AND** its client wait returns existing change_requires_action
+- **AND** process mode and unrelated work are preserved
+
+#### Scenario: Local repair requires explicit Retry
+- **GIVEN** the target is errored for invalid proposal metadata
+- **WHEN** only its base proposal is corrected and committed
+- **THEN** the target does not automatically resume
+- **WHEN** the operator explicitly retries it
+- **THEN** fresh valid metadata permits ordinary dispatch once, and still-invalid metadata returns to error without execution
+
+#### Scenario: Repeated observations and genuine dependency controls
+- **GIVEN** one invalid proposal and one valid unrelated or dependency-waiting proposal
+- **WHEN** repeated scheduler observations or a projection reconstruction occur
+- **THEN** invalid current state remains observable without repeated diagnostic floods
+- **AND** genuine dependency resolution and valid empty/no-frontmatter reader behavior are unchanged
